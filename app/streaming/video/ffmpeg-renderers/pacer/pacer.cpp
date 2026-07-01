@@ -211,6 +211,14 @@ int Pacer::cadenceThread(void* context)
 
     VrrCadenceClock cadenceClock(me->m_MaxVideoFps, me->m_DisplayFps);
 
+    // The renderer holds each present back to the pacer's target itself, so
+    // leading the render start by a little extra only costs idle wait, while
+    // arriving late costs a missed blanking gap - bias the lead accordingly.
+    // In classic present mode the renderer presents as soon as it's aligned,
+    // so no extra lead is applied there.
+    const uint64_t leadMarginUs =
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0 ? 0 : 500;
+
     while (!me->m_Stopping) {
         me->m_FrameQueueLock.lock();
 
@@ -251,14 +259,15 @@ int Pacer::cadenceThread(void* context)
             targetUs = me->m_LastRenderTimeUs + minFrameIntervalUs;
         }
 
-        // Wait for render start, not present time - renderFrame() below still has
-        // to do the actual GPU submission and Present() call after we wake up, so
-        // waiting all the way until targetUs here would present late by roughly
-        // m_EstimatedRenderTimeUs every single frame. That's a small but consistent
-        // bias, which is exactly what leaves a residual tear sitting near the frame
-        // edge instead of landing exactly on the panel's refresh boundary.
-        uint64_t targetRenderStartUs = targetUs > me->m_EstimatedRenderTimeUs ?
-            targetUs - me->m_EstimatedRenderTimeUs : targetUs;
+        // Wait for render start, not present time - renderFrame() below still
+        // has to do the CPU submission and wait out the GPU before the flip
+        // can actually happen at targetUs. Waiting all the way until targetUs
+        // here would make every flip late by that much, which is exactly what
+        // leaves tears near the frame edges instead of landing presents on
+        // the panel's refresh boundary.
+        uint64_t renderLeadUs = me->m_EstimatedRenderTimeUs + leadMarginUs;
+        uint64_t targetRenderStartUs = targetUs > renderLeadUs ?
+            targetUs - renderLeadUs : 0;
 
         me->waitUntil(targetRenderStartUs);
 
@@ -267,6 +276,7 @@ int Pacer::cadenceThread(void* context)
             break;
         }
 
+        me->m_VsyncRenderer->setPresentTargetUs(targetUs);
         me->m_VsyncRenderer->waitToRender();
         me->renderFrame(frame);
     }

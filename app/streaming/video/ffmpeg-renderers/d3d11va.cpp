@@ -72,10 +72,14 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_ActiveScanLines(0),
       m_ScanoutPeriodUs(0),
       m_LastPresentAlignmentWaitUs(0),
+      m_PresentTargetUs(0),
       m_AlignHits(0),
       m_AlignGiveUps(0),
       m_AlignWaitTotalUs(0),
       m_AlignStatsStartUs(0),
+      m_PresentReadyFenceValue(0),
+      m_PresentReadyFenceEvent(nullptr),
+      m_PresentReadyFenceFailed(false),
       m_FrameLatencyWaitableObject(nullptr),
       m_OverlayLock(0),
       m_HwDeviceContext(nullptr)
@@ -133,7 +137,11 @@ D3D11VARenderer::~D3D11VARenderer()
     m_RenderD2RFence.Reset();
     m_RenderR2DFence.Reset();
 
-    m_RenderCompleteQuery.Reset();
+    m_PresentReadyFence.Reset();
+    if (m_PresentReadyFenceEvent != nullptr) {
+        CloseHandle(m_PresentReadyFenceEvent);
+        m_PresentReadyFenceEvent = nullptr;
+    }
     m_RenderTargetView.Reset();
     if (m_FrameLatencyWaitableObject != nullptr) {
         CloseHandle(m_FrameLatencyWaitableObject);
@@ -528,8 +536,6 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
     // (with WinUAE as a working tear-free-VSYNC-OFF-under-VRR precedent) - and
     // unlike WaitForVBlank, it's a plain non-blocking query, so we can poll it
     // in a tightly bounded loop instead of risking an open-ended block.
-    m_LastPresentAlignmentWaitUs = 0;
-
     if (!m_KmtAdapterValid || qEnvironmentVariableIntValue("MOONLIGHT_DISABLE_SCANLINE_ALIGN")) {
         return;
     }
@@ -578,7 +584,7 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
     }
 
     uint64_t waitedUs = LiGetMicroseconds() - startUs;
-    m_LastPresentAlignmentWaitUs = waitedUs;
+    m_LastPresentAlignmentWaitUs += waitedUs;
 
     // Outcome telemetry for the residual-tear hunt: every give-up below is a
     // present that went out mid-scan, i.e. one visible tear. This is the
@@ -610,32 +616,87 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
     }
 }
 
-void D3D11VARenderer::waitForGpuRenderComplete()
+bool D3D11VARenderer::signalAndUnlockForPresent()
 {
     // Present() doesn't flip at the instant we call it; the flip executes only
-    // once all queued GPU work for the back buffer has completed. Any rendering
-    // still in flight would push the actual flip past the blanking gap that
-    // waitForVBlankBeforeTearingPresent() is about to align to, re-adding the
-    // exact small-but-consistent late bias (edge tearing) that phase alignment
-    // exists to remove. Block until the GPU has finished this frame so the
-    // scanline-aligned Present() below is the true flip instant.
-    if (m_RenderCompleteQuery == nullptr) {
-        D3D11_QUERY_DESC queryDesc = {};
-        queryDesc.Query = D3D11_QUERY_EVENT;
-        if (FAILED(m_RenderDevice->CreateQuery(&queryDesc, &m_RenderCompleteQuery))) {
-            return;
+    // once all queued GPU work for the back buffer has completed. Measured on
+    // the Ally X: ~2.4ms average Present-to-screen lag (PresentMon
+    // MsUntilDisplayed), which is wider than the entire blanking window when
+    // the stream FPS runs near the display's max refresh - so aligning the
+    // Present() call to the blank is aligning the wrong instant, and the flip
+    // itself still tears. Fence the end of our rendering and wait for the GPU
+    // BEFORE the target-hold and scanline alignment, so Present() becomes the
+    // true flip instant.
+    //
+    // Critically, the wait happens on a fence event with the context lock
+    // RELEASED: decode shares this device on AMD APUs, so a blocking wait
+    // under the lock stalls the decoder for milliseconds every frame (the
+    // mistake that sank the first version of this fix).
+    if (m_PresentReadyFence == nullptr && !m_PresentReadyFenceFailed) {
+        HRESULT hr = m_RenderDevice->CreateFence(0, D3D11_FENCE_FLAG_NONE,
+                                                 IID_PPV_ARGS(&m_PresentReadyFence));
+        if (SUCCEEDED(hr)) {
+            m_PresentReadyFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        }
+
+        if (FAILED(hr) || m_PresentReadyFenceEvent == nullptr) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "No present-ready fence available (%x); presents will lag GPU completion",
+                        hr);
+            m_PresentReadyFence.Reset();
+            m_PresentReadyFenceFailed = true;
         }
     }
 
-    m_RenderDeviceContext->End(m_RenderCompleteQuery.Get());
+    if (m_PresentReadyFence == nullptr) {
+        return false;
+    }
+
+    uint64_t fenceValue = ++m_PresentReadyFenceValue;
+    if (FAILED(m_RenderDeviceContext->Signal(m_PresentReadyFence.Get(), fenceValue))) {
+        m_PresentReadyFenceFailed = true;
+        m_PresentReadyFence.Reset();
+        return false;
+    }
+
     m_RenderDeviceContext->Flush();
 
-    // Bounded so a wedged GPU can't hang the pacing thread forever
-    uint64_t startUs = LiGetMicroseconds();
-    while (m_RenderDeviceContext->GetData(m_RenderCompleteQuery.Get(), nullptr, 0, 0) == S_FALSE &&
-           LiGetMicroseconds() - startUs < 50000) {
-        YieldProcessor();
+    if (m_DecodeDevice == m_RenderDevice) {
+        unlockContext(this);
     }
+
+    if (SUCCEEDED(m_PresentReadyFence->SetEventOnCompletion(fenceValue, m_PresentReadyFenceEvent))) {
+        // Bounded so a wedged GPU can't hang the pacing thread forever
+        WaitForSingleObject(m_PresentReadyFenceEvent, 50);
+    }
+
+    return true;
+}
+
+void D3D11VARenderer::holdUntilPresentTarget()
+{
+    // Hold the flip until the cadence pacer's intended instant. Without this,
+    // a present is released as soon as rendering finishes - up to the whole
+    // render-lead early - which re-scatters the present phase the pacer just
+    // computed and can space flips tighter than the panel's max refresh
+    // (observed as 5.5-7.4ms minimum intervals against an 8.33ms floor).
+    uint64_t targetUs = m_PresentTargetUs;
+    m_PresentTargetUs = 0;
+
+    if (targetUs == 0) {
+        return;
+    }
+
+    uint64_t startUs = LiGetMicroseconds();
+    uint64_t nowUs = startUs;
+    while (nowUs < targetUs) {
+        if (targetUs - nowUs > 1500) {
+            highResolutionSleepUs(targetUs - nowUs - 1000);
+        }
+        nowUs = LiGetMicroseconds();
+    }
+
+    m_LastPresentAlignmentWaitUs += nowUs - startUs;
 }
 
 bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapterNotFound)
@@ -1191,22 +1252,37 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         flags = 0;
     }
 
-    if (m_PresentationMode == PresentationMode::VrrCadence) {
-        // The cadence pacer already timed this present to roughly the right
-        // instant; this is the final phase-alignment step so the tearing
-        // flip actually lands in the panel's blanking gap instead of mid-scan.
-        //
-        // MOONLIGHT_VRR_GPU_SYNC=1 (experimental) additionally blocks until
-        // the GPU has finished this frame first, because the flip really
-        // executes at GPU completion, not at Present(). Opt-in because on
-        // AMD APUs decode and render share one device, so the event query
-        // also waits behind queued decode work - measured several ms of
-        // added per-present time at 116 FPS / 120 Hz, which starved the
-        // cadence (queue backlog, drops, phase-random presents) and tore far
-        // worse than the flip-lag it was meant to fix.
-        if (qEnvironmentVariableIntValue("MOONLIGHT_VRR_GPU_SYNC") != 0) {
-            waitForGpuRenderComplete();
+    if (m_PresentationMode == PresentationMode::VrrCadence &&
+            qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") == 0) {
+        m_LastPresentAlignmentWaitUs = 0;
+
+        // Three-step phase-corrected present (see each helper for rationale):
+        // 1. Fence the GPU and wait for render completion with the context
+        //    lock dropped, so Present() below is the true flip instant and
+        //    the decoder isn't stalled while we wait.
+        // 2. Hold until the pacer's intended present time.
+        // 3. Align the last few ms to the panel's blanking gap.
+        bool unlocked = signalAndUnlockForPresent();
+        if (!unlocked && m_DecodeDevice == m_RenderDevice) {
+            // No fence support: still drop the lock for the waits below.
+            unlockContext(this);
         }
+
+        holdUntilPresentTarget();
+        waitForVBlankBeforeTearingPresent();
+
+        // Reacquire the lock for Present(). Any lock delay from an in-flight
+        // decode submission lands after alignment and only shifts us deeper
+        // into (extended) blanking, which is safe.
+        if (m_DecodeDevice == m_RenderDevice) {
+            lockContext(this);
+        }
+    }
+    else if (m_PresentationMode == PresentationMode::VrrCadence) {
+        // MOONLIGHT_VRR_CLASSIC_PRESENT=1: the original scanline-align-only
+        // behavior, kept as an instant fallback for A/B testing.
+        m_LastPresentAlignmentWaitUs = 0;
+        m_PresentTargetUs = 0;
         waitForVBlankBeforeTearingPresent();
     }
 
@@ -1901,16 +1977,18 @@ uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
     uint64_t waitUs = m_LastPresentAlignmentWaitUs;
     m_LastPresentAlignmentWaitUs = 0;
 
-    // Only report (and thus have Pacer exclude) the alignment wait when the
-    // extended-alignment experiment is active. The state that measured
-    // almost-tear-free on real hardware had the short bounded spin included
-    // in Pacer's render-lead estimate; keep the default path bit-identical
-    // to that tuning.
-    if (qEnvironmentVariableIntValue("MOONLIGHT_VRR_SCANLINE_SLEEP") == 0) {
+    // In classic present mode, keep Pacer's render-lead estimate including
+    // the alignment spin, bit-identical to the pre-target-hold tuning.
+    if (qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0) {
         return 0;
     }
 
     return waitUs;
+}
+
+void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs)
+{
+    m_PresentTargetUs = targetUs;
 }
 
 int D3D11VARenderer::getDecoderCapabilities()

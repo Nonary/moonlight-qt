@@ -245,6 +245,14 @@ public:
         return 0;
     }
 
+    virtual void setPresentTargetUs(uint64_t) {
+        // The cadence pacer's intended present instant for the next
+        // renderFrame() call. Renderers that phase-align their presents must
+        // hold the flip until this time even if the display is already in
+        // its blanking gap - releasing early re-scatters the present phase
+        // the pacer just computed.
+    }
+
     static const char* getPresentationModeName(PresentationMode mode) {
         switch (mode) {
         case PresentationMode::Immediate:

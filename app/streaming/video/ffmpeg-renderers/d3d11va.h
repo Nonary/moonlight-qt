@@ -28,6 +28,7 @@ public:
     virtual PresentationMode getPresentationMode() override;
     virtual const char* getPresentationModeFallbackReason() override;
     virtual uint64_t popPresentAlignmentWaitUs() override;
+    virtual void setPresentTargetUs(uint64_t targetUs) override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
     virtual void waitToRender() override;
@@ -71,7 +72,8 @@ private:
     void resolvePresentationMode(SDL_Window* window, DXGI_SWAP_CHAIN_DESC1* swapChainDesc);
     void logPresentationMode(SDL_Window* window, const DXGI_SWAP_CHAIN_DESC1* swapChainDesc, int outputIndex, const char* fallbackReason);
     void refreshOutput();
-    void waitForGpuRenderComplete();
+    bool signalAndUnlockForPresent();
+    void holdUntilPresentTarget();
     void waitForVBlankBeforeTearingPresent();
 
     int m_DecoderSelectionPass;
@@ -98,11 +100,15 @@ private:
     uint32_t m_ActiveScanLines;
     uint64_t m_ScanoutPeriodUs;
     uint64_t m_LastPresentAlignmentWaitUs;
+    uint64_t m_PresentTargetUs;
     uint32_t m_AlignHits;
     uint32_t m_AlignGiveUps;
     uint64_t m_AlignWaitTotalUs;
     uint64_t m_AlignStatsStartUs;
-    Microsoft::WRL::ComPtr<ID3D11Query> m_RenderCompleteQuery;
+    Microsoft::WRL::ComPtr<ID3D11Fence> m_PresentReadyFence;
+    uint64_t m_PresentReadyFenceValue;
+    HANDLE m_PresentReadyFenceEvent;
+    bool m_PresentReadyFenceFailed;
     HANDLE m_FrameLatencyWaitableObject;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_RenderTargetView;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_VideoBlendState;
