@@ -236,6 +236,15 @@ public:
         return nullptr;
     }
 
+    virtual uint64_t popPresentAlignmentWaitUs() {
+        // Time renderFrame() spent idling for the display's blanking gap
+        // before presenting (VRR phase alignment) rather than doing actual
+        // render work. Cleared on read. Pacer subtracts this from measured
+        // render time so alignment slack doesn't inflate its render-lead
+        // estimate.
+        return 0;
+    }
+
     static const char* getPresentationModeName(PresentationMode mode) {
         switch (mode) {
         case PresentationMode::Immediate:

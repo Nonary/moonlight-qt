@@ -27,6 +27,7 @@ public:
     virtual int getRendererAttributes() override;
     virtual PresentationMode getPresentationMode() override;
     virtual const char* getPresentationModeFallbackReason() override;
+    virtual uint64_t popPresentAlignmentWaitUs() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
     virtual void waitToRender() override;
@@ -70,6 +71,7 @@ private:
     void resolvePresentationMode(SDL_Window* window, DXGI_SWAP_CHAIN_DESC1* swapChainDesc);
     void logPresentationMode(SDL_Window* window, const DXGI_SWAP_CHAIN_DESC1* swapChainDesc, int outputIndex, const char* fallbackReason);
     void refreshOutput();
+    void waitForGpuRenderComplete();
     void waitForVBlankBeforeTearingPresent();
 
     int m_DecoderSelectionPass;
@@ -93,6 +95,10 @@ private:
     bool m_KmtAdapterValid;
     D3DKMT_HANDLE m_KmtAdapter;
     D3DDDI_VIDEO_PRESENT_SOURCE_ID m_KmtVidPnSourceId;
+    uint32_t m_ActiveScanLines;
+    uint64_t m_ScanoutPeriodUs;
+    uint64_t m_LastPresentAlignmentWaitUs;
+    Microsoft::WRL::ComPtr<ID3D11Query> m_RenderCompleteQuery;
     HANDLE m_FrameLatencyWaitableObject;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_RenderTargetView;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_VideoBlendState;

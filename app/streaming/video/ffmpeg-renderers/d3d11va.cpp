@@ -69,6 +69,9 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_KmtAdapterValid(false),
       m_KmtAdapter(0),
       m_KmtVidPnSourceId(0),
+      m_ActiveScanLines(0),
+      m_ScanoutPeriodUs(0),
+      m_LastPresentAlignmentWaitUs(0),
       m_FrameLatencyWaitableObject(nullptr),
       m_OverlayLock(0),
       m_HwDeviceContext(nullptr)
@@ -126,6 +129,7 @@ D3D11VARenderer::~D3D11VARenderer()
     m_RenderD2RFence.Reset();
     m_RenderR2DFence.Reset();
 
+    m_RenderCompleteQuery.Reset();
     m_RenderTargetView.Reset();
     if (m_FrameLatencyWaitableObject != nullptr) {
         CloseHandle(m_FrameLatencyWaitableObject);
@@ -263,6 +267,21 @@ Exit:
     }
 
     return success;
+}
+
+static void highResolutionSleepUs(uint64_t sleepUs)
+{
+    static thread_local HANDLE waitableTimer =
+        CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (waitableTimer == nullptr) {
+        return;
+    }
+
+    LARGE_INTEGER dueTime;
+    dueTime.QuadPart = -((LONGLONG)sleepUs * 10);
+    if (SetWaitableTimer(waitableTimer, &dueTime, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(waitableTimer, INFINITE);
+    }
 }
 
 bool D3D11VARenderer::queryTearingSupport(HRESULT* result)
@@ -420,6 +439,8 @@ void D3D11VARenderer::logPresentationMode(SDL_Window* window,
 void D3D11VARenderer::refreshOutput()
 {
     m_Output.Reset();
+    m_ActiveScanLines = 0;
+    m_ScanoutPeriodUs = 0;
 
     if (m_KmtAdapterValid) {
         D3DKMT_CLOSEADAPTER closeAdapter = {};
@@ -456,6 +477,25 @@ void D3D11VARenderer::refreshOutput()
         m_KmtVidPnSourceId = openAdapter.VidPnSourceId;
         m_KmtAdapterValid = true;
     }
+
+    // Cache the scanout geometry/timing that waitForVBlankBeforeTearingPresent()
+    // needs to estimate the beam's time-to-blank from a raw scanline number.
+    // Scanlines follow the panel's native orientation, not the rotated desktop.
+    if (outputDesc.Rotation == DXGI_MODE_ROTATION_ROTATE90 ||
+            outputDesc.Rotation == DXGI_MODE_ROTATION_ROTATE270) {
+        m_ActiveScanLines = (uint32_t)qMax(0L, outputDesc.DesktopCoordinates.right -
+                                               outputDesc.DesktopCoordinates.left);
+    }
+    else {
+        m_ActiveScanLines = (uint32_t)qMax(0L, outputDesc.DesktopCoordinates.bottom -
+                                               outputDesc.DesktopCoordinates.top);
+    }
+
+    // Under VRR the line clock stays at the max refresh rate's speed and only
+    // the blanking gap stretches, so the current mode's refresh rate gives the
+    // scanout duration regardless of the instantaneous refresh interval.
+    int displayFps = StreamUtils::getDisplayRefreshRate(m_DecoderParams.window);
+    m_ScanoutPeriodUs = displayFps > 0 ? 1000000ULL / displayFps : 0;
 }
 
 void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
@@ -477,21 +517,72 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
     // (with WinUAE as a working tear-free-VSYNC-OFF-under-VRR precedent) - and
     // unlike WaitForVBlank, it's a plain non-blocking query, so we can poll it
     // in a tightly bounded loop instead of risking an open-ended block.
+    m_LastPresentAlignmentWaitUs = 0;
+
     if (!m_KmtAdapterValid || qEnvironmentVariableIntValue("MOONLIGHT_DISABLE_SCANLINE_ALIGN")) {
         return;
     }
 
-    static constexpr uint64_t MAX_WAIT_US = 3000;
+    // Bound the wait at one full scanout period plus scheduling margin, which
+    // is enough to reach the blanking gap from any scan position. A fixed cap
+    // shorter than the scanout (~8.3ms at 120Hz) silently gives up mid-scan
+    // whenever we arrive early in the scanout, presenting a guaranteed
+    // mid-frame tear on exactly the frames that need alignment the most.
+    uint64_t maxWaitUs = m_ScanoutPeriodUs != 0 ? m_ScanoutPeriodUs + 2000 : 3000;
 
     uint64_t startUs = LiGetMicroseconds();
     D3DKMT_GETSCANLINE getScanLine = {};
     getScanLine.hAdapter = m_KmtAdapter;
     getScanLine.VidPnSourceId = m_KmtVidPnSourceId;
 
-    while (LiGetMicroseconds() - startUs < MAX_WAIT_US) {
+    while (LiGetMicroseconds() - startUs < maxWaitUs) {
         if (D3DKMTGetScanLine(&getScanLine) != 0 /* STATUS_SUCCESS */ || getScanLine.InVerticalBlank) {
+            break;
+        }
+
+        // While the beam is still far from the blanking gap, sleep off most of
+        // the remaining scanout instead of hard-spinning a TIME_CRITICAL thread
+        // for up to a whole refresh period; only the final approach spins.
+        // Total lines are padded ~5% over the active count (VBI overhead) so
+        // the estimate errs on waking early, never past the start of the blank.
+        if (m_ActiveScanLines != 0 && m_ScanoutPeriodUs != 0 &&
+                getScanLine.ScanLine < m_ActiveScanLines) {
+            uint64_t remainingUs = (uint64_t)(m_ActiveScanLines - getScanLine.ScanLine) *
+                    m_ScanoutPeriodUs / (m_ActiveScanLines + m_ActiveScanLines / 20);
+            if (remainingUs > 1500) {
+                highResolutionSleepUs(remainingUs - 1000);
+            }
+        }
+    }
+
+    m_LastPresentAlignmentWaitUs = LiGetMicroseconds() - startUs;
+}
+
+void D3D11VARenderer::waitForGpuRenderComplete()
+{
+    // Present() doesn't flip at the instant we call it; the flip executes only
+    // once all queued GPU work for the back buffer has completed. Any rendering
+    // still in flight would push the actual flip past the blanking gap that
+    // waitForVBlankBeforeTearingPresent() is about to align to, re-adding the
+    // exact small-but-consistent late bias (edge tearing) that phase alignment
+    // exists to remove. Block until the GPU has finished this frame so the
+    // scanline-aligned Present() below is the true flip instant.
+    if (m_RenderCompleteQuery == nullptr) {
+        D3D11_QUERY_DESC queryDesc = {};
+        queryDesc.Query = D3D11_QUERY_EVENT;
+        if (FAILED(m_RenderDevice->CreateQuery(&queryDesc, &m_RenderCompleteQuery))) {
             return;
         }
+    }
+
+    m_RenderDeviceContext->End(m_RenderCompleteQuery.Get());
+    m_RenderDeviceContext->Flush();
+
+    // Bounded so a wedged GPU can't hang the pacing thread forever
+    uint64_t startUs = LiGetMicroseconds();
+    while (m_RenderDeviceContext->GetData(m_RenderCompleteQuery.Get(), nullptr, 0, 0) == S_FALSE &&
+           LiGetMicroseconds() - startUs < 50000) {
+        YieldProcessor();
     }
 }
 
@@ -1050,8 +1141,9 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
 
     if (m_PresentationMode == PresentationMode::VrrCadence) {
         // The cadence pacer already timed this present to roughly the right
-        // instant; this is the final phase-alignment step so the tearing
+        // instant; these are the final phase-alignment steps so the tearing
         // flip actually lands in the panel's blanking gap instead of mid-scan.
+        waitForGpuRenderComplete();
         waitForVBlankBeforeTearingPresent();
     }
 
@@ -1739,6 +1831,13 @@ IFFmpegRenderer::PresentationMode D3D11VARenderer::getPresentationMode()
 const char* D3D11VARenderer::getPresentationModeFallbackReason()
 {
     return m_PresentationModeFallbackReason;
+}
+
+uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
+{
+    uint64_t waitUs = m_LastPresentAlignmentWaitUs;
+    m_LastPresentAlignmentWaitUs = 0;
+    return waitUs;
 }
 
 int D3D11VARenderer::getDecoderCapabilities()

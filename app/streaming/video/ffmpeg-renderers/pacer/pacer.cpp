@@ -94,12 +94,20 @@ Pacer::Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats) :
 
 Pacer::~Pacer()
 {
+    // The worker threads check m_Stopping under m_FrameQueueLock in their
+    // condition-wait loops, so it must be set (and the conditions signalled)
+    // while holding that lock. Otherwise a thread that has just tested
+    // m_Stopping but not yet blocked would miss this wakeup and wait forever,
+    // hanging SDL_WaitThread below.
+    m_FrameQueueLock.lock();
     m_Stopping = true;
+    m_PacingQueueNotEmpty.wakeAll();
+    m_RenderQueueNotEmpty.wakeAll();
+    m_VsyncSignalled.wakeAll();
+    m_FrameQueueLock.unlock();
 
-    // Stop the V-sync thread
+    // Stop the V-sync/cadence thread
     if (m_VsyncThread != nullptr) {
-        m_PacingQueueNotEmpty.wakeAll();
-        m_VsyncSignalled.wakeAll();
         SDL_WaitThread(m_VsyncThread, nullptr);
     }
 
@@ -109,7 +117,6 @@ Pacer::~Pacer()
 
     // Stop the render thread
     if (m_RenderThread != nullptr) {
-        m_RenderQueueNotEmpty.wakeAll();
         SDL_WaitThread(m_RenderThread, nullptr);
     }
     else if (m_PresentationMode == IFFmpegRenderer::PresentationMode::VrrCadence &&
@@ -510,6 +517,15 @@ void Pacer::renderFrame(AVFrame* frame)
     recordFrameInterval(beforeRender, afterRender, beforeRender - (uint64_t)frame->pkt_dts);
 
     uint64_t renderTimeUs = afterRender - beforeRender;
+
+    // Don't let the renderer's phase-alignment wait (idling for the panel's
+    // blanking gap before the present) count as render work. Feeding it back
+    // into the estimate would start each render earlier, which just lengthens
+    // the alignment wait it's measuring - drifting latency up instead of
+    // converging on the true render lead time.
+    uint64_t alignmentWaitUs = m_VsyncRenderer->popPresentAlignmentWaitUs();
+    renderTimeUs -= qMin(renderTimeUs, alignmentWaitUs);
+
     uint64_t maxEstimateUs = m_MaxVideoFps != 0 ? 1000000ULL / m_MaxVideoFps : 16666ULL;
     renderTimeUs = qMin(renderTimeUs, maxEstimateUs);
     m_EstimatedRenderTimeUs = (m_EstimatedRenderTimeUs * 7 + renderTimeUs) / 8;
