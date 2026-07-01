@@ -342,6 +342,13 @@ void D3D11VARenderer::resolvePresentationMode(SDL_Window* window, DXGI_SWAP_CHAI
         m_PresentationMode = PresentationMode::Immediate;
         swapChainDesc->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
         m_AllowTearing = true;
+        // Session force-disables V-sync when the stream FPS exceeds the
+        // display's current refresh rate, so surface that possibility - a
+        // panel quietly dropping to 60Hz (power saving) makes VRR appear
+        // "broken" with no other visible signal.
+        fallbackReason = withinDisplayHz ?
+            "V-sync is disabled" :
+            "V-sync auto-disabled: stream FPS exceeds display refresh rate";
     }
     else if (fullscreenExclusive && !forceVrr) {
         m_PresentationMode = PresentationMode::FixedVsync;
