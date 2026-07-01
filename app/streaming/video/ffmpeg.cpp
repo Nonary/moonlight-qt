@@ -10,6 +10,8 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 
+#include <cmath>
+
 #include "ffmpeg-renderers/sdlvid.h"
 #include "ffmpeg-renderers/genhwaccel.h"
 
@@ -58,6 +60,8 @@ extern "C" {
 #define MAX_SPS_EXTRA_SIZE 16
 
 #define FAILED_DECODES_RESET_THRESHOLD 20
+
+#define FRAME_CADENCE_DIAGNOSTIC_LOG_INTERVAL_US 10000000
 
 bool FFmpegVideoDecoder::isHardwareAccelerated()
 {
@@ -236,7 +240,8 @@ FFmpegVideoDecoder::FFmpegVideoDecoder(bool testOnly)
       m_NeedsSpsFixup(false),
       m_TestOnly(testOnly),
       m_CurrentTestMode(TestMode::TestFrameOnly),
-      m_DecoderThread(nullptr)
+      m_DecoderThread(nullptr),
+      m_LastFrameDiagnosticLogUs(0)
 {
     SDL_zero(m_ActiveWndVideoStats);
     SDL_zero(m_LastWndVideoStats);
@@ -496,9 +501,13 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
 
     // Don't bother initializing Pacer if we're not actually going to render
     if (testMode != TestMode::TestFrameOnly) {
+        int rendererAttributes = m_FrontendRenderer->getRendererAttributes();
+        bool enablePacing = params->enableFramePacing ||
+                m_FrontendRenderer->getPresentationMode() == IFFmpegRenderer::PresentationMode::VrrCadence ||
+                (params->enableVsync && (rendererAttributes & RENDERER_ATTRIBUTE_FORCE_PACING));
+
         m_Pacer = new Pacer(m_FrontendRenderer, &m_ActiveWndVideoStats);
-        if (!m_Pacer->initialize(params->window, params->frameRate,
-                                 params->enableFramePacing || (params->enableVsync && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_FORCE_PACING)))) {
+        if (!m_Pacer->initialize(params->window, params->frameRate, enablePacing)) {
             return false;
         }
     }
@@ -766,6 +775,17 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalDecodeTimeUs += src.totalDecodeTimeUs;
     dst.totalPacerTimeUs += src.totalPacerTimeUs;
     dst.totalRenderTimeUs += src.totalRenderTimeUs;
+    dst.totalFrameIntervalUs += src.totalFrameIntervalUs;
+    dst.totalSquaredFrameIntervalUs += src.totalSquaredFrameIntervalUs;
+    dst.frameIntervalSamples += src.frameIntervalSamples;
+
+    if (dst.minFrameIntervalUs == 0) {
+        dst.minFrameIntervalUs = src.minFrameIntervalUs;
+    }
+    else if (src.minFrameIntervalUs != 0) {
+        dst.minFrameIntervalUs = qMin(dst.minFrameIntervalUs, src.minFrameIntervalUs);
+    }
+    dst.maxFrameIntervalUs = qMax(dst.maxFrameIntervalUs, src.maxFrameIntervalUs);
 
     if (dst.minHostProcessingLatency == 0) {
         dst.minHostProcessingLatency = src.minHostProcessingLatency;
@@ -810,6 +830,21 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
     // Start with an empty string
     output[offset] = 0;
+
+    {
+        const char* fallbackReason = m_FrontendRenderer->getPresentationModeFallbackReason();
+        ret = snprintf(&output[offset],
+                       length - offset,
+                       fallbackReason != nullptr ? "Presentation mode: %s (%s)\n" : "Presentation mode: %s\n",
+                       IFFmpegRenderer::getPresentationModeName(m_FrontendRenderer->getPresentationMode()),
+                       fallbackReason != nullptr ? fallbackReason : "");
+        if (ret < 0 || ret >= length - offset) {
+            SDL_assert(false);
+            return;
+        }
+
+        offset += ret;
+    }
 
     switch (m_VideoFormat)
     {
@@ -974,18 +1009,96 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
         offset += ret;
     }
+
+    if (stats.frameIntervalSamples != 0) {
+        double avgIntervalUs = (double)stats.totalFrameIntervalUs / stats.frameIntervalSamples;
+        double variance = ((double)stats.totalSquaredFrameIntervalUs / stats.frameIntervalSamples) -
+                          (avgIntervalUs * avgIntervalUs);
+        double stdDevUs = sqrt(qMax(0.0, variance));
+        double spreadMs = (double)(stats.maxFrameIntervalUs - stats.minFrameIntervalUs) / 1000.0;
+        const char* cadenceSignal;
+
+        if (stats.frameIntervalSamples < 30) {
+            cadenceSignal = "collecting";
+        }
+        else if (spreadMs < 0.75 && stdDevUs < 250.0) {
+            cadenceSignal = "tight/fixed";
+        }
+        else if (spreadMs >= 2.0 && stdDevUs >= 500.0) {
+            cadenceSignal = "variable";
+        }
+        else {
+            cadenceSignal = "mild variation";
+        }
+
+        ret = snprintf(&output[offset],
+                       length - offset,
+                       "Render interval avg/min/max/stddev: %.2f/%.2f/%.2f/%.2f ms\n"
+                       "Cadence signal: %s\n",
+                       avgIntervalUs / 1000.0,
+                       (double)stats.minFrameIntervalUs / 1000.0,
+                       (double)stats.maxFrameIntervalUs / 1000.0,
+                       stdDevUs / 1000.0,
+                       cadenceSignal);
+        if (ret < 0 || ret >= length - offset) {
+            SDL_assert(false);
+            return;
+        }
+
+        offset += ret;
+    }
 }
 
 void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
 {
     if (stats.renderedFps > 0 || stats.renderedFrames != 0) {
-        char videoStatsStr[512];
+        char videoStatsStr[1024];
         stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr));
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "\n%s\n------------------\n%s",
                     title, videoStatsStr);
     }
+}
+
+void FFmpegVideoDecoder::logFrameCadenceDiagnostics(VIDEO_STATS& stats)
+{
+    if (stats.frameIntervalSamples == 0) {
+        return;
+    }
+
+    double avgIntervalUs = (double)stats.totalFrameIntervalUs / stats.frameIntervalSamples;
+    double variance = ((double)stats.totalSquaredFrameIntervalUs / stats.frameIntervalSamples) -
+                      (avgIntervalUs * avgIntervalUs);
+    double stdDevUs = sqrt(qMax(0.0, variance));
+    double spreadMs = (double)(stats.maxFrameIntervalUs - stats.minFrameIntervalUs) / 1000.0;
+    const char* cadenceSignal;
+
+    if (stats.frameIntervalSamples < 30) {
+        cadenceSignal = "collecting";
+    }
+    else if (spreadMs < 0.75 && stdDevUs < 250.0) {
+        cadenceSignal = "tight/fixed";
+    }
+    else if (spreadMs >= 2.0 && stdDevUs >= 500.0) {
+        cadenceSignal = "variable";
+    }
+    else {
+        cadenceSignal = "mild variation";
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Frame cadence: rendered %.2f FPS, interval avg/min/max/stddev %.2f/%.2f/%.2f/%.2f ms, signal %s, samples %u, jitter drops %.2f%%, queue %.2f ms, render %.2f ms",
+                stats.renderedFps,
+                avgIntervalUs / 1000.0,
+                (double)stats.minFrameIntervalUs / 1000.0,
+                (double)stats.maxFrameIntervalUs / 1000.0,
+                stdDevUs / 1000.0,
+                cadenceSignal,
+                stats.frameIntervalSamples,
+                stats.decodedFrames != 0 ? (float)stats.pacerDroppedFrames / stats.decodedFrames * 100 : 0,
+                stats.renderedFrames != 0 ? (double)(stats.totalPacerTimeUs / 1000.0) / stats.renderedFrames : 0,
+                stats.renderedFrames != 0 ? (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames : 0);
 }
 
 IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig* hwDecodeCfg, int pass)
@@ -1814,6 +1927,16 @@ int FFmpegVideoDecoder::decoderThreadProcThunk(void *context)
 
 void FFmpegVideoDecoder::decoderThreadProc()
 {
+    // The VRR cadence pacer runs at TIME_CRITICAL priority so its present timing
+    // is precise, but that's undermined if this thread's own OS scheduling is
+    // jittery - any delay here shows up as frame-arrival jitter the cadence
+    // clock then has to chase.
+#if SDL_VERSION_ATLEAST(2, 0, 9)
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL);
+#else
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+#endif
+
     while (!SDL_AtomicGet(&m_DecoderThreadShouldQuit)) {
         if (m_FramesIn == m_FramesOut) {
             VIDEO_FRAME_HANDLE handle;
@@ -2015,17 +2138,30 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     m_BwTracker.AddBytes(du->fullLength);
 
     // Flip stats windows roughly every second
-    if (LiGetMicroseconds() > m_ActiveWndVideoStats.measurementStartUs + 1000000) {
+    uint64_t now = LiGetMicroseconds();
+    if (now > m_ActiveWndVideoStats.measurementStartUs + 1000000) {
+        VIDEO_STATS lastTwoWndStats = {};
+        bool logCadenceDiagnostics =
+                m_LastFrameDiagnosticLogUs == 0 ||
+                now > m_LastFrameDiagnosticLogUs + FRAME_CADENCE_DIAGNOSTIC_LOG_INTERVAL_US;
+
         // Update overlay stats if it's enabled
-        if (Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug)) {
-            VIDEO_STATS lastTwoWndStats = {};
+        if (Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug) ||
+                logCadenceDiagnostics) {
             addVideoStats(m_LastWndVideoStats, lastTwoWndStats);
             addVideoStats(m_ActiveWndVideoStats, lastTwoWndStats);
+        }
 
+        if (Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug)) {
             stringifyVideoStats(lastTwoWndStats,
                                 Session::get()->getOverlayManager().getOverlayText(Overlay::OverlayDebug),
                                 Session::get()->getOverlayManager().getOverlayMaxTextLength());
             Session::get()->getOverlayManager().setOverlayTextUpdated(Overlay::OverlayDebug);
+        }
+
+        if (logCadenceDiagnostics) {
+            logFrameCadenceDiagnostics(lastTwoWndStats);
+            m_LastFrameDiagnosticLogUs = now;
         }
 
         // Accumulate these values into the global stats

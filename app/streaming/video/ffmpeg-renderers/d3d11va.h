@@ -4,6 +4,7 @@
 
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
+#include <d3dkmthk.h>
 
 extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
@@ -24,8 +25,11 @@ public:
     virtual void notifyOverlayUpdated(Overlay::OverlayType) override;
     virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo) override;
     virtual int getRendererAttributes() override;
+    virtual PresentationMode getPresentationMode() override;
+    virtual const char* getPresentationModeFallbackReason() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
+    virtual void waitToRender() override;
 
     enum PixelShaders {
         GENERIC_YUV_420,
@@ -44,6 +48,12 @@ private:
     bool setupSwapchainDependentResources();
     bool setupVideoTexture(AVHWFramesContext* framesContext); // for !m_BindDecoderOutputTextures
     bool setupTexturePoolViews(AVHWFramesContext* framesContext); // for m_BindDecoderOutputTextures
+    bool createVideoTextureSRV(ID3D11Resource* texture,
+                               D3D11_SRV_DIMENSION viewDimension,
+                               UINT arraySlice,
+                               DXGI_FORMAT srvFormat,
+                               UINT planeSlice,
+                               Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>& srv);
     void renderOverlay(Overlay::OverlayType type);
     bool createOverlayVertexBuffer(Overlay::OverlayType type, int width, int height, Microsoft::WRL::ComPtr<ID3D11Buffer>& newVertexBuffer);
     void bindColorConversion(bool frameChanged, AVFrame* frame);
@@ -56,6 +66,11 @@ private:
                                ID3D11Device5* dev1, ID3D11Device5* dev2,
                                Microsoft::WRL::ComPtr<ID3D11Fence>& dev1Fence,
                                Microsoft::WRL::ComPtr<ID3D11Fence>& dev2Fence);
+    bool queryTearingSupport(HRESULT* result = nullptr);
+    void resolvePresentationMode(SDL_Window* window, DXGI_SWAP_CHAIN_DESC1* swapChainDesc);
+    void logPresentationMode(SDL_Window* window, const DXGI_SWAP_CHAIN_DESC1* swapChainDesc, int outputIndex, const char* fallbackReason);
+    void refreshOutput();
+    void waitForVBlankBeforeTearingPresent();
 
     int m_DecoderSelectionPass;
     int m_DevicesWithFL11Support;
@@ -74,6 +89,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D11DeviceContext4> m_RenderDeviceContext, m_DecodeDeviceContext;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_RenderSharedTextureArray;
     Microsoft::WRL::ComPtr<IDXGISwapChain4> m_SwapChain;
+    Microsoft::WRL::ComPtr<IDXGIOutput> m_Output;
+    bool m_KmtAdapterValid;
+    D3DKMT_HANDLE m_KmtAdapter;
+    D3DDDI_VIDEO_PRESENT_SOURCE_ID m_KmtVidPnSourceId;
+    HANDLE m_FrameLatencyWaitableObject;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_RenderTargetView;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_VideoBlendState;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_OverlayBlendState;
@@ -93,6 +113,10 @@ private:
     AVColorTransferCharacteristic m_LastColorTrc;
 
     bool m_AllowTearing;
+    PresentationMode m_PresentationMode;
+    const char* m_PresentationModeFallbackReason;
+    bool m_TearingSupport;
+    int m_OutputIndex;
 
     std::array<Microsoft::WRL::ComPtr<ID3D11PixelShader>, PixelShaders::_COUNT> m_VideoPixelShaders;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_VideoVertexBuffer;

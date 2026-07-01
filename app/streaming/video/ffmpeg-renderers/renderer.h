@@ -139,6 +139,13 @@ private:
 
 class IFFmpegRenderer : public Overlay::IOverlayRenderer {
 public:
+    enum class PresentationMode {
+        Immediate,
+        FixedVsync,
+        VrrCadence,
+        Auto,
+    };
+
     enum class RendererType {
         Unknown,
         Vulkan,
@@ -216,6 +223,31 @@ public:
     virtual int getRendererAttributes() {
         // No special attributes by default
         return 0;
+    }
+
+    virtual PresentationMode getPresentationMode() {
+        // Most renderers leave presentation policy to the Pacer inputs.
+        return PresentationMode::Auto;
+    }
+
+    virtual const char* getPresentationModeFallbackReason() {
+        // Non-null if getPresentationMode() didn't pick VrrCadence and wants to
+        // explain why (e.g. surfaced in the on-screen debug overlay).
+        return nullptr;
+    }
+
+    static const char* getPresentationModeName(PresentationMode mode) {
+        switch (mode) {
+        case PresentationMode::Immediate:
+            return "Immediate";
+        case PresentationMode::FixedVsync:
+            return "FixedVsync";
+        case PresentationMode::VrrCadence:
+            return "VrrCadence";
+        case PresentationMode::Auto:
+        default:
+            return "Auto";
+        }
     }
 
     virtual int getDecoderColorspace() {

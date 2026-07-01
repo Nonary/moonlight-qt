@@ -1,4 +1,5 @@
 #include "pacer.h"
+#include "vrrcadence.h"
 #include "streaming/streamutils.h"
 
 #ifdef Q_OS_WIN32
@@ -28,6 +29,47 @@ static_assert(PACER_MAX_OUTSTANDING_FRAMES == MAX_QUEUED_FRAMES + 2,
 // to do the render itself, so we can't render right before
 // V-sync happens.
 #define TIMER_SLACK_MS 3
+#define CADENCE_SLEEP_THRESHOLD_US 1000
+#define CADENCE_YIELD_THRESHOLD_US 200
+#define MAX_RECORDED_FRAME_INTERVAL_US 1000000
+#define FRAME_DIAGNOSTIC_DUMP_INTERVAL_US 30000000
+#define FRAME_DIAGNOSTIC_DUMP_SAMPLES 96
+#define RTP_TIMESTAMP_HZ 90000
+
+static uint64_t frameCadenceTimestampUs(AVFrame* frame)
+{
+    if (frame->pts != AV_NOPTS_VALUE && frame->pts >= 0) {
+        return (uint64_t)frame->pts * 1000000ULL / RTP_TIMESTAMP_HZ;
+    }
+
+    return frame->pkt_dts > 0 ? (uint64_t)frame->pkt_dts : 0;
+}
+
+#ifdef Q_OS_WIN32
+static void highResolutionSleepUntilUs(uint64_t targetUs)
+{
+    uint64_t nowUs = LiGetMicroseconds();
+    if (targetUs <= nowUs) {
+        return;
+    }
+
+    static thread_local HANDLE waitableTimer =
+        CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (waitableTimer == nullptr) {
+        SDL_Delay(0);
+        return;
+    }
+
+    LARGE_INTEGER dueTime;
+    dueTime.QuadPart = -((LONGLONG)(targetUs - nowUs) * 10);
+    if (SetWaitableTimer(waitableTimer, &dueTime, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(waitableTimer, INFINITE);
+    }
+    else {
+        SDL_Delay(0);
+    }
+}
+#endif
 
 Pacer::Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats) :
     m_RenderThread(nullptr),
@@ -38,7 +80,14 @@ Pacer::Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats) :
     m_VsyncRenderer(renderer),
     m_MaxVideoFps(0),
     m_DisplayFps(0),
-    m_VideoStats(videoStats)
+    m_VideoStats(videoStats),
+    m_RendererAttributes(0),
+    m_LastRenderTimeUs(0),
+    m_EstimatedRenderTimeUs(1000),
+    m_LastFrameDiagnosticDumpUs(0),
+    m_FrameDiagnosticRingIndex(0),
+    m_FrameDiagnosticRingCount(0),
+    m_PresentationMode(IFFmpegRenderer::PresentationMode::Auto)
 {
 
 }
@@ -63,6 +112,10 @@ Pacer::~Pacer()
         m_RenderQueueNotEmpty.wakeAll();
         SDL_WaitThread(m_RenderThread, nullptr);
     }
+    else if (m_PresentationMode == IFFmpegRenderer::PresentationMode::VrrCadence &&
+             m_VsyncThread != nullptr) {
+        // VRR cadence renders directly on m_VsyncThread, so cleanup happened there.
+    }
     else {
         // Notify the renderer that it is being destroyed soon
         // NB: This must happen on the same thread that calls renderFrame().
@@ -71,8 +124,8 @@ Pacer::~Pacer()
 
     // Delete any remaining unconsumed frames
     while (!m_RenderQueue.isEmpty()) {
-        AVFrame* frame = m_RenderQueue.dequeue();
-        av_frame_free(&frame);
+        RenderQueueEntry entry = m_RenderQueue.dequeue();
+        av_frame_free(&entry.frame);
     }
     while (!m_PacingQueue.isEmpty()) {
         AVFrame* frame = m_PacingQueue.dequeue();
@@ -91,10 +144,15 @@ void Pacer::renderOnMainThread()
     m_FrameQueueLock.lock();
 
     if (!m_RenderQueue.isEmpty()) {
-        AVFrame* frame = m_RenderQueue.dequeue();
+        RenderQueueEntry entry = m_RenderQueue.dequeue();
         m_FrameQueueLock.unlock();
 
-        renderFrame(frame);
+        if (entry.targetPresentUs == 0 || waitUntil(entry.targetPresentUs)) {
+            renderFrame(entry.frame);
+        }
+        else {
+            av_frame_free(&entry.frame);
+        }
     }
     else {
         m_FrameQueueLock.unlock();
@@ -134,6 +192,83 @@ int Pacer::vsyncThread(void *context)
     return 0;
 }
 
+int Pacer::cadenceThread(void* context)
+{
+    Pacer* me = reinterpret_cast<Pacer*>(context);
+
+#if SDL_VERSION_ATLEAST(2, 0, 9)
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL);
+#else
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+#endif
+
+    VrrCadenceClock cadenceClock(me->m_MaxVideoFps, me->m_DisplayFps);
+
+    while (!me->m_Stopping) {
+        me->m_FrameQueueLock.lock();
+
+        while (!me->m_Stopping && me->m_PacingQueue.isEmpty()) {
+            me->m_PacingQueueNotEmpty.wait(&me->m_FrameQueueLock);
+        }
+
+        if (me->m_Stopping) {
+            me->m_FrameQueueLock.unlock();
+            break;
+        }
+
+        // Match the pendulum harness model: present according to content cadence.
+        // If we fall behind, keep the newest decoded frame and drop stale ones.
+        while (me->m_PacingQueue.count() > 1) {
+            AVFrame* staleFrame = me->m_PacingQueue.dequeue();
+            me->m_FrameQueueLock.unlock();
+            me->m_VideoStats->pacerDroppedFrames++;
+            me->maybeLogFrameDiagnostics("vrr cadence queue drop", 0);
+            av_frame_free(&staleFrame);
+            me->m_FrameQueueLock.lock();
+        }
+
+        AVFrame* frame = me->m_PacingQueue.dequeue();
+        me->m_FrameQueueLock.unlock();
+
+        uint64_t targetUs = cadenceClock.nextTargetUs(LiGetMicroseconds(),
+                                                      frameCadenceTimestampUs(frame));
+
+        // Belt-and-suspenders on top of the clock's own max-refresh floor: the
+        // clock only knows the last INTENDED target, not whether the actual
+        // render overran it (common right after a stall/catch-up recovery,
+        // where render work is often heavier than usual). Also clamp against
+        // the last ACTUAL present completion that Pacer itself tracked, so a
+        // late-running render can't leave the next target behind reality.
+        uint64_t minFrameIntervalUs = me->m_DisplayFps > 0 ? (1000000ULL / me->m_DisplayFps) : 0;
+        if (me->m_LastRenderTimeUs != 0 && targetUs < me->m_LastRenderTimeUs + minFrameIntervalUs) {
+            targetUs = me->m_LastRenderTimeUs + minFrameIntervalUs;
+        }
+
+        // Wait for render start, not present time - renderFrame() below still has
+        // to do the actual GPU submission and Present() call after we wake up, so
+        // waiting all the way until targetUs here would present late by roughly
+        // m_EstimatedRenderTimeUs every single frame. That's a small but consistent
+        // bias, which is exactly what leaves a residual tear sitting near the frame
+        // edge instead of landing exactly on the panel's refresh boundary.
+        uint64_t targetRenderStartUs = targetUs > me->m_EstimatedRenderTimeUs ?
+            targetUs - me->m_EstimatedRenderTimeUs : targetUs;
+
+        me->waitUntil(targetRenderStartUs);
+
+        if (me->m_Stopping) {
+            av_frame_free(&frame);
+            break;
+        }
+
+        me->m_VsyncRenderer->waitToRender();
+        me->renderFrame(frame);
+    }
+
+    me->m_VsyncRenderer->cleanupRenderContext();
+
+    return 0;
+}
+
 int Pacer::renderThread(void* context)
 {
     Pacer* me = reinterpret_cast<Pacer*>(context);
@@ -163,10 +298,22 @@ int Pacer::renderThread(void* context)
             break;
         }
 
-        AVFrame* frame = me->m_RenderQueue.dequeue();
+        RenderQueueEntry entry = me->m_RenderQueue.dequeue();
         me->m_FrameQueueLock.unlock();
 
-        me->renderFrame(frame);
+        if (entry.targetPresentUs != 0) {
+            uint64_t targetRenderStartUs =
+                entry.targetPresentUs > me->m_EstimatedRenderTimeUs ?
+                    entry.targetPresentUs - me->m_EstimatedRenderTimeUs :
+                    entry.targetPresentUs;
+
+            if (!me->waitUntil(targetRenderStartUs)) {
+                av_frame_free(&entry.frame);
+                break;
+            }
+        }
+
+        me->renderFrame(entry.frame);
     }
 
     // Notify the renderer that it is being destroyed soon
@@ -176,10 +323,10 @@ int Pacer::renderThread(void* context)
     return 0;
 }
 
-void Pacer::enqueueFrameForRenderingAndUnlock(AVFrame *frame)
+void Pacer::enqueueFrameForRenderingAndUnlock(AVFrame* frame, uint64_t targetPresentUs)
 {
     dropFrameForEnqueue(m_RenderQueue);
-    m_RenderQueue.enqueue(frame);
+    m_RenderQueue.enqueue({ frame, targetPresentUs });
 
     m_FrameQueueLock.unlock();
 
@@ -237,6 +384,7 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
         // Drop the lock while we call av_frame_free()
         m_FrameQueueLock.unlock();
         m_VideoStats->pacerDroppedFrames++;
+        maybeLogFrameDiagnostics("pacing queue drop", 0);
         av_frame_free(&frame);
         m_FrameQueueLock.lock();
     }
@@ -264,8 +412,19 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing)
     m_MaxVideoFps = maxVideoFps;
     m_DisplayFps = StreamUtils::getDisplayRefreshRate(window);
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
+    m_PresentationMode = m_VsyncRenderer->getPresentationMode();
 
-    if (enablePacing) {
+    if (m_PresentationMode == IFFmpegRenderer::PresentationMode::Auto) {
+        m_PresentationMode = enablePacing ?
+            IFFmpegRenderer::PresentationMode::FixedVsync :
+            IFFmpegRenderer::PresentationMode::Immediate;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Presentation mode: %s",
+                IFFmpegRenderer::getPresentationModeName(m_PresentationMode));
+
+    if (enablePacing && m_PresentationMode == IFFmpegRenderer::PresentationMode::FixedVsync) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Frame pacing: target %d Hz with %d FPS stream",
                     m_DisplayFps, m_MaxVideoFps);
@@ -307,7 +466,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing)
             m_VsyncSource = nullptr;
         }
     }
-    else {
+    else if (m_PresentationMode != IFFmpegRenderer::PresentationMode::VrrCadence) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Frame pacing disabled: target %d Hz with %d FPS stream",
                     m_DisplayFps, m_MaxVideoFps);
@@ -316,8 +475,15 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing)
     if (m_VsyncSource != nullptr) {
         m_VsyncThread = SDL_CreateThread(Pacer::vsyncThread, "PacerVsync", this);
     }
+    else if (m_PresentationMode == IFFmpegRenderer::PresentationMode::VrrCadence) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "VRR cadence pacing: direct render target %d Hz with %d FPS stream",
+                    m_DisplayFps, m_MaxVideoFps);
+        m_VsyncThread = SDL_CreateThread(Pacer::cadenceThread, "PacerCadence", this);
+    }
 
-    if (m_VsyncRenderer->isRenderThreadSupported()) {
+    if (m_VsyncRenderer->isRenderThreadSupported() &&
+            m_PresentationMode != IFFmpegRenderer::PresentationMode::VrrCadence) {
         m_RenderThread = SDL_CreateThread(Pacer::renderThread, "PacerRender", this);
     }
 
@@ -341,6 +507,12 @@ void Pacer::renderFrame(AVFrame* frame)
 
     m_VideoStats->totalRenderTimeUs += (afterRender - beforeRender);
     m_VideoStats->renderedFrames++;
+    recordFrameInterval(beforeRender, afterRender, beforeRender - (uint64_t)frame->pkt_dts);
+
+    uint64_t renderTimeUs = afterRender - beforeRender;
+    uint64_t maxEstimateUs = m_MaxVideoFps != 0 ? 1000000ULL / m_MaxVideoFps : 16666ULL;
+    renderTimeUs = qMin(renderTimeUs, maxEstimateUs);
+    m_EstimatedRenderTimeUs = (m_EstimatedRenderTimeUs * 7 + renderTimeUs) / 8;
 
     // Wait until after next frame to free this one to ensure the GPU
     // doesn't stall or read garbage if the backing buffer gets returned
@@ -379,16 +551,139 @@ void Pacer::renderFrame(AVFrame* frame)
 
     // Catch up if we're several frames ahead
     while (m_RenderQueue.count() > frameDropTarget) {
-        AVFrame* frame = m_RenderQueue.dequeue();
+        RenderQueueEntry entry = m_RenderQueue.dequeue();
 
         // Drop the lock while we call av_frame_free()
         m_FrameQueueLock.unlock();
         m_VideoStats->pacerDroppedFrames++;
-        av_frame_free(&frame);
+        maybeLogFrameDiagnostics("render queue drop", 0);
+        av_frame_free(&entry.frame);
         m_FrameQueueLock.lock();
     }
 
     m_FrameQueueLock.unlock();
+}
+
+bool Pacer::waitUntil(uint64_t targetUs)
+{
+    return waitForVrrCadenceTargetUs(targetUs,
+                                     []() { return LiGetMicroseconds(); },
+#ifdef Q_OS_WIN32
+                                     [](uint64_t sleepUntilUs) { highResolutionSleepUntilUs(sleepUntilUs); },
+#else
+                                     [](uint64_t) { SDL_Delay(0); },
+#endif
+                                     []() { SDL_Delay(0); },
+                                     [this]() { return m_Stopping; });
+}
+
+void Pacer::recordFrameInterval(uint64_t beforeRenderUs, uint64_t afterRenderUs, uint64_t queueDelayUs)
+{
+    uint32_t intervalUs = 0;
+
+    if (m_LastRenderTimeUs != 0) {
+        uint64_t intervalUs64 = afterRenderUs - m_LastRenderTimeUs;
+
+        if (intervalUs64 <= MAX_RECORDED_FRAME_INTERVAL_US) {
+            intervalUs = (uint32_t)intervalUs64;
+            m_VideoStats->totalFrameIntervalUs += intervalUs;
+            m_VideoStats->totalSquaredFrameIntervalUs += (uint64_t)intervalUs * intervalUs;
+            m_VideoStats->frameIntervalSamples++;
+
+            if (m_VideoStats->minFrameIntervalUs == 0) {
+                m_VideoStats->minFrameIntervalUs = intervalUs;
+            }
+            else {
+                m_VideoStats->minFrameIntervalUs = qMin(m_VideoStats->minFrameIntervalUs, intervalUs);
+            }
+
+            m_VideoStats->maxFrameIntervalUs = qMax(m_VideoStats->maxFrameIntervalUs, intervalUs);
+        }
+    }
+
+    m_LastRenderTimeUs = afterRenderUs;
+
+    FrameDiagnosticSample& sample = m_FrameDiagnosticRing[m_FrameDiagnosticRingIndex];
+    sample.intervalUs = intervalUs;
+    sample.queueDelayUs = queueDelayUs <= UINT32_MAX ? (uint32_t)queueDelayUs : UINT32_MAX;
+    sample.renderUs = (uint32_t)(afterRenderUs - beforeRenderUs);
+
+    m_FrameDiagnosticRingIndex = (m_FrameDiagnosticRingIndex + 1) % PACER_FRAME_DIAGNOSTIC_RING_SIZE;
+    m_FrameDiagnosticRingCount = qMin<uint32_t>(m_FrameDiagnosticRingCount + 1, PACER_FRAME_DIAGNOSTIC_RING_SIZE);
+
+    if (intervalUs != 0) {
+        uint32_t expectedIntervalUs = m_MaxVideoFps != 0 ? 1000000 / m_MaxVideoFps : 0;
+        uint32_t longIntervalThresholdUs = qMax(expectedIntervalUs * 5 / 2, expectedIntervalUs + 20000);
+        uint32_t shortIntervalThresholdUs = expectedIntervalUs / 3;
+
+        if (expectedIntervalUs != 0 && intervalUs >= longIntervalThresholdUs) {
+            maybeLogFrameDiagnostics("long render interval", intervalUs);
+        }
+        else if (shortIntervalThresholdUs != 0 && intervalUs <= shortIntervalThresholdUs) {
+            maybeLogFrameDiagnostics("short render interval", intervalUs);
+        }
+    }
+}
+
+void Pacer::maybeLogFrameDiagnostics(const char* reason, uint32_t intervalUs)
+{
+    uint64_t now = LiGetMicroseconds();
+
+    if (m_LastFrameDiagnosticDumpUs != 0 &&
+            now <= m_LastFrameDiagnosticDumpUs + FRAME_DIAGNOSTIC_DUMP_INTERVAL_US) {
+        return;
+    }
+
+    logFrameDiagnostics(reason, intervalUs);
+    m_LastFrameDiagnosticDumpUs = now;
+}
+
+void Pacer::logFrameDiagnostics(const char* reason, uint32_t triggerIntervalUs)
+{
+    if (m_FrameDiagnosticRingCount == 0) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Frame cadence anomaly: %s, no frame-level samples available yet",
+                    reason);
+        return;
+    }
+
+    char samples[1536];
+    int offset = 0;
+    uint32_t count = qMin<uint32_t>(m_FrameDiagnosticRingCount, FRAME_DIAGNOSTIC_DUMP_SAMPLES);
+    uint32_t start = (m_FrameDiagnosticRingIndex + PACER_FRAME_DIAGNOSTIC_RING_SIZE - count) %
+            PACER_FRAME_DIAGNOSTIC_RING_SIZE;
+
+    samples[0] = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const FrameDiagnosticSample& sample =
+                m_FrameDiagnosticRing[(start + i) % PACER_FRAME_DIAGNOSTIC_RING_SIZE];
+        int ret = snprintf(&samples[offset],
+                           sizeof(samples) - offset,
+                           "%s%.2f/%.2f/%.2f",
+                           i != 0 ? "," : "",
+                           sample.intervalUs / 1000.0,
+                           sample.queueDelayUs / 1000.0,
+                           sample.renderUs / 1000.0);
+        if (ret < 0 || ret >= (int)sizeof(samples) - offset) {
+            break;
+        }
+
+        offset += ret;
+    }
+
+    if (triggerIntervalUs != 0) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Frame cadence anomaly: %s at %.2f ms. Recent frames interval/queue/render ms: %s",
+                    reason,
+                    triggerIntervalUs / 1000.0,
+                    samples);
+    }
+    else {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Frame cadence anomaly: %s. Recent frames interval/queue/render ms: %s",
+                    reason,
+                    samples);
+    }
 }
 
 void Pacer::dropFrameForEnqueue(QQueue<AVFrame*>& queue)
@@ -400,6 +695,15 @@ void Pacer::dropFrameForEnqueue(QQueue<AVFrame*>& queue)
     }
 }
 
+void Pacer::dropFrameForEnqueue(QQueue<RenderQueueEntry>& queue)
+{
+    SDL_assert(queue.size() <= MAX_QUEUED_FRAMES);
+    if (queue.size() == MAX_QUEUED_FRAMES) {
+        RenderQueueEntry entry = queue.dequeue();
+        av_frame_free(&entry.frame);
+    }
+}
+
 void Pacer::submitFrame(AVFrame* frame)
 {
     // Make sure initialize() has been called
@@ -407,7 +711,8 @@ void Pacer::submitFrame(AVFrame* frame)
 
     // Queue the frame and possibly wake up the render thread
     m_FrameQueueLock.lock();
-    if (m_VsyncSource != nullptr) {
+    if (m_VsyncSource != nullptr ||
+            m_PresentationMode == IFFmpegRenderer::PresentationMode::VrrCadence) {
         dropFrameForEnqueue(m_PacingQueue);
         m_PacingQueue.enqueue(frame);
         m_FrameQueueLock.unlock();

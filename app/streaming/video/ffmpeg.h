@@ -54,6 +54,8 @@ private:
 
     void logVideoStats(VIDEO_STATS& stats, const char* title);
 
+    void logFrameCadenceDiagnostics(VIDEO_STATS& stats);
+
     void addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst);
 
     bool createFrontendRenderer(PDECODER_PARAMETERS params, bool useAlternateFrontend);
@@ -132,6 +134,7 @@ private:
     TestMode m_CurrentTestMode;
     SDL_Thread* m_DecoderThread;
     SDL_atomic_t m_DecoderThreadShouldQuit;
+    uint64_t m_LastFrameDiagnosticLogUs;
 
     // Data buffers in the queued DU are not valid
     QQueue<DECODE_UNIT> m_FrameInfoQueue;

@@ -7,11 +7,14 @@
 #include <QMutex>
 #include <QWaitCondition>
 
+#include <array>
+
 // The maximum number of frames pacer will ever hold is:
 // - 3 frames in the pacing queue
 // - 1 frame removed from the render queue in the process of rendering
 // - 1 frame for deferred free
 #define PACER_MAX_OUTSTANDING_FRAMES (3 + 1 + 1)
+#define PACER_FRAME_DIAGNOSTIC_RING_SIZE 180
 
 class IVsyncSource {
 public:
@@ -44,19 +47,42 @@ public:
     void renderOnMainThread();
 
 private:
+    struct FrameDiagnosticSample {
+        uint32_t intervalUs;
+        uint32_t queueDelayUs;
+        uint32_t renderUs;
+    };
+
+    struct RenderQueueEntry {
+        AVFrame* frame;
+        uint64_t targetPresentUs;
+    };
+
     static int vsyncThread(void* context);
+
+    static int cadenceThread(void* context);
 
     static int renderThread(void* context);
 
     void handleVsync(int timeUntilNextVsyncMillis);
 
-    void enqueueFrameForRenderingAndUnlock(AVFrame* frame);
+    void enqueueFrameForRenderingAndUnlock(AVFrame* frame, uint64_t targetPresentUs = 0);
 
     void renderFrame(AVFrame* frame);
 
+    bool waitUntil(uint64_t targetUs);
+
+    void recordFrameInterval(uint64_t beforeRenderUs, uint64_t afterRenderUs, uint64_t queueDelayUs);
+
+    void maybeLogFrameDiagnostics(const char* reason, uint32_t intervalUs);
+
+    void logFrameDiagnostics(const char* reason, uint32_t triggerIntervalUs);
+
     void dropFrameForEnqueue(QQueue<AVFrame*>& queue);
 
-    QQueue<AVFrame*> m_RenderQueue;
+    void dropFrameForEnqueue(QQueue<RenderQueueEntry>& queue);
+
+    QQueue<RenderQueueEntry> m_RenderQueue;
     QQueue<AVFrame*> m_PacingQueue;
     QQueue<int> m_PacingQueueHistory;
     QQueue<int> m_RenderQueueHistory;
@@ -75,4 +101,11 @@ private:
     int m_DisplayFps;
     PVIDEO_STATS m_VideoStats;
     int m_RendererAttributes;
+    uint64_t m_LastRenderTimeUs;
+    uint64_t m_EstimatedRenderTimeUs;
+    uint64_t m_LastFrameDiagnosticDumpUs;
+    std::array<FrameDiagnosticSample, PACER_FRAME_DIAGNOSTIC_RING_SIZE> m_FrameDiagnosticRing;
+    uint32_t m_FrameDiagnosticRingIndex;
+    uint32_t m_FrameDiagnosticRingCount;
+    IFFmpegRenderer::PresentationMode m_PresentationMode;
 };
