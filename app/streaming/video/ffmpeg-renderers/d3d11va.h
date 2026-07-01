@@ -98,6 +98,10 @@ private:
     uint32_t m_ActiveScanLines;
     uint64_t m_ScanoutPeriodUs;
     uint64_t m_LastPresentAlignmentWaitUs;
+    uint32_t m_AlignHits;
+    uint32_t m_AlignGiveUps;
+    uint64_t m_AlignWaitTotalUs;
+    uint64_t m_AlignStatsStartUs;
     Microsoft::WRL::ComPtr<ID3D11Query> m_RenderCompleteQuery;
     HANDLE m_FrameLatencyWaitableObject;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_RenderTargetView;

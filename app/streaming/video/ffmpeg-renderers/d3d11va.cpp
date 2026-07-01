@@ -72,6 +72,10 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_ActiveScanLines(0),
       m_ScanoutPeriodUs(0),
       m_LastPresentAlignmentWaitUs(0),
+      m_AlignHits(0),
+      m_AlignGiveUps(0),
+      m_AlignWaitTotalUs(0),
+      m_AlignStatsStartUs(0),
       m_FrameLatencyWaitableObject(nullptr),
       m_OverlayLock(0),
       m_HwDeviceContext(nullptr)
@@ -530,20 +534,31 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
         return;
     }
 
-    // Bound the wait at one full scanout period plus scheduling margin, which
-    // is enough to reach the blanking gap from any scan position. A fixed cap
-    // shorter than the scanout (~8.3ms at 120Hz) silently gives up mid-scan
-    // whenever we arrive early in the scanout, presenting a guaranteed
-    // mid-frame tear on exactly the frames that need alignment the most.
-    uint64_t maxWaitUs = m_ScanoutPeriodUs != 0 ? m_ScanoutPeriodUs + 2000 : 3000;
+    // Default: a tightly bounded 3ms pure spin, exactly the behavior of the
+    // build that reached almost-tear-free on real hardware. When the stream
+    // FPS runs close to the display's max refresh (e.g. 116 FPS on 120Hz),
+    // the panel is actively scanning ~96% of every cycle and the blanking
+    // window is only a few hundred microseconds wide, so a present that
+    // misses it is better off tearing quickly: waiting out the rest of the
+    // scanout makes the present late, which backs up the pacing queue, drops
+    // frames, and turns the phase error random - measurably MORE tearing.
+    //
+    // MOONLIGHT_VRR_SCANLINE_SLEEP=1 (experimental) instead bounds the wait
+    // at a full scanout period and sleeps the approach using the scanline
+    // position estimate. Only ever a win when the stream FPS leaves the
+    // panel real VRR headroom; regressed badly at 116/120 on the Ally X.
+    const bool extendedAlign = qEnvironmentVariableIntValue("MOONLIGHT_VRR_SCANLINE_SLEEP") != 0;
+    uint64_t maxWaitUs = (extendedAlign && m_ScanoutPeriodUs != 0) ? m_ScanoutPeriodUs + 2000 : 3000;
 
     uint64_t startUs = LiGetMicroseconds();
     D3DKMT_GETSCANLINE getScanLine = {};
     getScanLine.hAdapter = m_KmtAdapter;
     getScanLine.VidPnSourceId = m_KmtVidPnSourceId;
 
+    bool reachedBlank = false;
     while (LiGetMicroseconds() - startUs < maxWaitUs) {
         if (D3DKMTGetScanLine(&getScanLine) != 0 /* STATUS_SUCCESS */ || getScanLine.InVerticalBlank) {
+            reachedBlank = true;
             break;
         }
 
@@ -552,7 +567,7 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
         // for up to a whole refresh period; only the final approach spins.
         // Total lines are padded ~5% over the active count (VBI overhead) so
         // the estimate errs on waking early, never past the start of the blank.
-        if (m_ActiveScanLines != 0 && m_ScanoutPeriodUs != 0 &&
+        if (extendedAlign && m_ActiveScanLines != 0 && m_ScanoutPeriodUs != 0 &&
                 getScanLine.ScanLine < m_ActiveScanLines) {
             uint64_t remainingUs = (uint64_t)(m_ActiveScanLines - getScanLine.ScanLine) *
                     m_ScanoutPeriodUs / (m_ActiveScanLines + m_ActiveScanLines / 20);
@@ -562,7 +577,37 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
         }
     }
 
-    m_LastPresentAlignmentWaitUs = LiGetMicroseconds() - startUs;
+    uint64_t waitedUs = LiGetMicroseconds() - startUs;
+    m_LastPresentAlignmentWaitUs = waitedUs;
+
+    // Outcome telemetry for the residual-tear hunt: every give-up below is a
+    // present that went out mid-scan, i.e. one visible tear. This is the
+    // ground truth to A/B the experimental modes against.
+    if (reachedBlank) {
+        m_AlignHits++;
+    }
+    else {
+        m_AlignGiveUps++;
+    }
+    m_AlignWaitTotalUs += waitedUs;
+
+    uint64_t nowUs = startUs + waitedUs;
+    if (m_AlignStatsStartUs == 0) {
+        m_AlignStatsStartUs = nowUs;
+    }
+    else if (nowUs - m_AlignStatsStartUs >= 10000000) {
+        uint32_t total = m_AlignHits + m_AlignGiveUps;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "VRR scanline align: %u in-blank, %u mid-scan tears (%.1f%%), avg wait %.2f ms",
+                    m_AlignHits,
+                    m_AlignGiveUps,
+                    total != 0 ? m_AlignGiveUps * 100.0 / total : 0.0,
+                    total != 0 ? (m_AlignWaitTotalUs / 1000.0) / total : 0.0);
+        m_AlignHits = 0;
+        m_AlignGiveUps = 0;
+        m_AlignWaitTotalUs = 0;
+        m_AlignStatsStartUs = nowUs;
+    }
 }
 
 void D3D11VARenderer::waitForGpuRenderComplete()
@@ -1148,9 +1193,20 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
 
     if (m_PresentationMode == PresentationMode::VrrCadence) {
         // The cadence pacer already timed this present to roughly the right
-        // instant; these are the final phase-alignment steps so the tearing
+        // instant; this is the final phase-alignment step so the tearing
         // flip actually lands in the panel's blanking gap instead of mid-scan.
-        waitForGpuRenderComplete();
+        //
+        // MOONLIGHT_VRR_GPU_SYNC=1 (experimental) additionally blocks until
+        // the GPU has finished this frame first, because the flip really
+        // executes at GPU completion, not at Present(). Opt-in because on
+        // AMD APUs decode and render share one device, so the event query
+        // also waits behind queued decode work - measured several ms of
+        // added per-present time at 116 FPS / 120 Hz, which starved the
+        // cadence (queue backlog, drops, phase-random presents) and tore far
+        // worse than the flip-lag it was meant to fix.
+        if (qEnvironmentVariableIntValue("MOONLIGHT_VRR_GPU_SYNC") != 0) {
+            waitForGpuRenderComplete();
+        }
         waitForVBlankBeforeTearingPresent();
     }
 
@@ -1844,6 +1900,16 @@ uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
 {
     uint64_t waitUs = m_LastPresentAlignmentWaitUs;
     m_LastPresentAlignmentWaitUs = 0;
+
+    // Only report (and thus have Pacer exclude) the alignment wait when the
+    // extended-alignment experiment is active. The state that measured
+    // almost-tear-free on real hardware had the short bounded spin included
+    // in Pacer's render-lead estimate; keep the default path bit-identical
+    // to that tuning.
+    if (qEnvironmentVariableIntValue("MOONLIGHT_VRR_SCANLINE_SLEEP") == 0) {
+        return 0;
+    }
+
     return waitUs;
 }
 
