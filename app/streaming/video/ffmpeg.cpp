@@ -297,6 +297,16 @@ void FFmpegVideoDecoder::reset()
         Session::get()->getOverlayManager().setOverlayRenderer(nullptr);
     }
 
+    // Log the final stats while the renderers are still alive, since
+    // stringifyVideoStats() queries the frontend renderer.
+    if (m_CurrentTestMode != TestMode::TestFrameOnly) {
+        logVideoStats(m_GlobalVideoStats, "Global video stats");
+    }
+    else {
+        // Test-only decoders can't have any frames submitted
+        SDL_assert(m_GlobalVideoStats.totalFrames == 0);
+    }
+
     // If we have a separate frontend renderer, free that first
     if (m_FrontendRenderer != m_BackendRenderer) {
         delete m_FrontendRenderer;
@@ -305,14 +315,6 @@ void FFmpegVideoDecoder::reset()
     delete m_BackendRenderer;
 
     m_FrontendRenderer = m_BackendRenderer = nullptr;
-
-    if (m_CurrentTestMode != TestMode::TestFrameOnly) {
-        logVideoStats(m_GlobalVideoStats, "Global video stats");
-    }
-    else {
-        // Test-only decoders can't have any frames submitted
-        SDL_assert(m_GlobalVideoStats.totalFrames == 0);
-    }
 }
 
 bool FFmpegVideoDecoder::initializeRendererInternal(IFFmpegRenderer* renderer, PDECODER_PARAMETERS params)
@@ -831,7 +833,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
     // Start with an empty string
     output[offset] = 0;
 
-    {
+    if (m_FrontendRenderer != nullptr) {
         const char* fallbackReason = m_FrontendRenderer->getPresentationModeFallbackReason();
         ret = snprintf(&output[offset],
                        length - offset,
