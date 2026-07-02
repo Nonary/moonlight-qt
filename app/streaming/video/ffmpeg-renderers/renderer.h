@@ -253,6 +253,15 @@ public:
         // the pacer just computed.
     }
 
+    virtual uint64_t getLastPresentUs() {
+        // Timestamp of the most recent Present() call (the true flip instant
+        // for renderers that fence GPU completion beforehand), or 0 if
+        // unknown. The cadence pacer clamps successive present targets
+        // against this rather than renderFrame()'s return time, which runs
+        // later by the alignment wait and Present overhead.
+        return 0;
+    }
+
     static const char* getPresentationModeName(PresentationMode mode) {
         switch (mode) {
         case PresentationMode::Immediate:

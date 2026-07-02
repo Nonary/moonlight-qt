@@ -29,6 +29,7 @@ public:
     virtual const char* getPresentationModeFallbackReason() override;
     virtual uint64_t popPresentAlignmentWaitUs() override;
     virtual void setPresentTargetUs(uint64_t targetUs) override;
+    virtual uint64_t getLastPresentUs() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
     virtual void waitToRender() override;
@@ -101,6 +102,7 @@ private:
     uint64_t m_ScanoutPeriodUs;
     uint64_t m_LastPresentAlignmentWaitUs;
     uint64_t m_PresentTargetUs;
+    uint64_t m_LastPresentUs;
     uint32_t m_AlignHits;
     uint32_t m_AlignGiveUps;
     uint64_t m_AlignWaitTotalUs;

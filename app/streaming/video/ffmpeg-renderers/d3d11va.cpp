@@ -73,6 +73,7 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_ScanoutPeriodUs(0),
       m_LastPresentAlignmentWaitUs(0),
       m_PresentTargetUs(0),
+      m_LastPresentUs(0),
       m_AlignHits(0),
       m_AlignGiveUps(0),
       m_AlignWaitTotalUs(0),
@@ -1287,6 +1288,7 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     }
 
     // Present according to the selected presentation mode
+    m_LastPresentUs = LiGetMicroseconds();
     hr = m_SwapChain->Present(0, flags);
 
     if (m_DecodeDevice == m_RenderDevice) {
@@ -1989,6 +1991,11 @@ uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
 void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs)
 {
     m_PresentTargetUs = targetUs;
+}
+
+uint64_t D3D11VARenderer::getLastPresentUs()
+{
+    return m_LastPresentUs;
 }
 
 int D3D11VARenderer::getDecoderCapabilities()

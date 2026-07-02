@@ -219,6 +219,15 @@ int Pacer::cadenceThread(void* context)
     const uint64_t leadMarginUs =
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0 ? 0 : 500;
 
+    // Rolling ~500ms of pacing queue depth, mirroring the hysteresis the
+    // handleVsync/renderFrame paths already use. Network jitter routinely
+    // delivers frames in a gap-then-pair pattern; dropping the older frame of
+    // every pair (the old zero-tolerance policy here) turned each burst into
+    // a visible skip - measured at 3-8% of all frames on Wi-Fi.
+    QQueue<int> queueDepthHistory;
+    const int queueDepthHistoryCap =
+        me->m_MaxVideoFps > 0 ? qMax(me->m_MaxVideoFps / 2, 1) : 60;
+
     while (!me->m_Stopping) {
         me->m_FrameQueueLock.lock();
 
@@ -231,9 +240,32 @@ int Pacer::cadenceThread(void* context)
             break;
         }
 
-        // Match the pendulum harness model: present according to content cadence.
-        // If we fall behind, keep the newest decoded frame and drop stale ones.
-        while (me->m_PacingQueue.count() > 1) {
+        while (queueDepthHistory.count() >= queueDepthHistoryCap) {
+            queueDepthHistory.dequeue();
+        }
+        queueDepthHistory.enqueue(me->m_PacingQueue.count());
+
+        // Absorb transient bursts instead of dropping them: keep up to a one
+        // frame backlog (drained via the catch-up target below) and only fall
+        // back to keep-newest when the backlog has persisted a full history
+        // window - that means presents genuinely can't keep up with delivery
+        // and holding more frames would just be permanent added latency.
+        int frameDropTarget = 2;
+        if (queueDepthHistory.count() == queueDepthHistoryCap) {
+            bool persistentBacklog = true;
+            for (int depth : std::as_const(queueDepthHistory)) {
+                if (depth <= 1) {
+                    persistentBacklog = false;
+                    break;
+                }
+            }
+            if (persistentBacklog) {
+                frameDropTarget = 1;
+                queueDepthHistory.clear();
+            }
+        }
+
+        while (me->m_PacingQueue.count() > frameDropTarget) {
             AVFrame* staleFrame = me->m_PacingQueue.dequeue();
             me->m_FrameQueueLock.unlock();
             me->m_VideoStats->pacerDroppedFrames++;
@@ -243,6 +275,7 @@ int Pacer::cadenceThread(void* context)
         }
 
         AVFrame* frame = me->m_PacingQueue.dequeue();
+        bool backlogged = !me->m_PacingQueue.isEmpty();
         me->m_FrameQueueLock.unlock();
 
         uint64_t targetUs = cadenceClock.nextTargetUs(LiGetMicroseconds(),
@@ -250,13 +283,38 @@ int Pacer::cadenceThread(void* context)
 
         // Belt-and-suspenders on top of the clock's own max-refresh floor: the
         // clock only knows the last INTENDED target, not whether the actual
-        // render overran it (common right after a stall/catch-up recovery,
-        // where render work is often heavier than usual). Also clamp against
-        // the last ACTUAL present completion that Pacer itself tracked, so a
-        // late-running render can't leave the next target behind reality.
+        // flip overran it (common right after a stall/catch-up recovery,
+        // where render work is often heavier than usual). Clamp against the
+        // last ACTUAL flip instant so a late-running render can't leave the
+        // next target behind reality.
+        //
+        // The flip instant must be the renderer's Present() call time, NOT
+        // renderFrame()'s return time: the latter runs later by the scanline
+        // alignment wait plus Present overhead, and flooring the next target
+        // on it paces presents slower than frames arrive. That backlog is
+        // dropped as "vrr cadence queue drop" (measured 16%+ of the stream),
+        // and the over-spaced targets land mid-scan, lengthening the next
+        // alignment wait - a self-reinforcing tearing/dropping regime.
         uint64_t minFrameIntervalUs = me->m_DisplayFps > 0 ? (1000000ULL / me->m_DisplayFps) : 0;
-        if (me->m_LastRenderTimeUs != 0 && targetUs < me->m_LastRenderTimeUs + minFrameIntervalUs) {
-            targetUs = me->m_LastRenderTimeUs + minFrameIntervalUs;
+        uint64_t lastFlipUs = me->m_VsyncRenderer->getLastPresentUs();
+        if (lastFlipUs == 0) {
+            // Renderer doesn't report its present instant; fall back to
+            // renderFrame() completion (the old, slightly-late behavior).
+            lastFlipUs = me->m_LastRenderTimeUs;
+        }
+        if (lastFlipUs != 0 && targetUs < lastFlipUs + minFrameIntervalUs) {
+            targetUs = lastFlipUs + minFrameIntervalUs;
+        }
+
+        // While another frame is already waiting behind this one, drain at the
+        // panel's max refresh rather than the content cadence. Presenting a
+        // burst's frames slightly early for a few frames is far less visible
+        // than skipping one of them outright, and once the backlog clears we
+        // return to the clock's cadence.
+        if (backlogged && lastFlipUs != 0) {
+            uint64_t catchUpUs = qMax(lastFlipUs + minFrameIntervalUs,
+                                      LiGetMicroseconds());
+            targetUs = qMin(targetUs, catchUpUs);
         }
 
         // Wait for render start, not present time - renderFrame() below still
