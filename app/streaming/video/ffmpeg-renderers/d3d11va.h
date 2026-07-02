@@ -28,7 +28,7 @@ public:
     virtual PresentationMode getPresentationMode() override;
     virtual const char* getPresentationModeFallbackReason() override;
     virtual uint64_t popPresentAlignmentWaitUs() override;
-    virtual void setPresentTargetUs(uint64_t targetUs) override;
+    virtual void setPresentTargetUs(uint64_t targetUs, bool catchUp) override;
     virtual uint64_t getLastPresentUs() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
@@ -74,7 +74,7 @@ private:
     void logPresentationMode(SDL_Window* window, const DXGI_SWAP_CHAIN_DESC1* swapChainDesc, int outputIndex, const char* fallbackReason);
     void refreshOutput();
     bool signalAndUnlockForPresent();
-    void holdUntilPresentTarget();
+    uint64_t holdUntilPresentTarget();
     void waitForVBlankBeforeTearingPresent();
 
     int m_DecoderSelectionPass;
@@ -102,9 +102,11 @@ private:
     uint64_t m_ScanoutPeriodUs;
     uint64_t m_LastPresentAlignmentWaitUs;
     uint64_t m_PresentTargetUs;
+    bool m_PresentCatchUp;
     uint64_t m_LastPresentUs;
     uint32_t m_AlignHits;
     uint32_t m_AlignGiveUps;
+    uint32_t m_AlignSkips;
     uint64_t m_AlignWaitTotalUs;
     uint64_t m_AlignStatsStartUs;
     Microsoft::WRL::ComPtr<ID3D11Fence> m_PresentReadyFence;

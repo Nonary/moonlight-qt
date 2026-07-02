@@ -18,25 +18,34 @@ public:
         // this is guaranteed to tear mid-scan since the panel is still mid-way
         // through the previous refresh.
         m_MinFrameIntervalUs = maxRefreshFps > 0 ? (1000000ULL / maxRefreshFps) : 0;
+        m_SmoothedIntervalUs = m_NominalFrameIntervalUs;
         m_LastSourceTimeUs = 0;
         m_LastTargetTimeUs = 0;
     }
 
     uint64_t nextTargetUs(uint64_t nowUs, uint64_t sourceTimeUs)
     {
+        // Track the content cadence as a smoothed average rather than using
+        // each raw timestamp delta. A game vsynced on the host quantizes its
+        // frame times to whole refresh slots (~87fps on a 120Hz host arrives
+        // as alternating 8.3ms/16.7ms deltas); pacing presents by the raw
+        // deltas reproduces that alternation 1:1 on the VRR panel, which
+        // reads as judder during camera pans. Pacing by the average converts
+        // it into a near-even cadence instead. The EMA (1/8 weight) still
+        // follows genuine content rate changes within a handful of frames.
+        if (m_LastSourceTimeUs != 0 && sourceTimeUs > m_LastSourceTimeUs) {
+            uint64_t sourceDeltaUs = sourceTimeUs - m_LastSourceTimeUs;
+            if (sourceDeltaUs >= m_NominalFrameIntervalUs / 2 &&
+                    sourceDeltaUs <= m_NominalFrameIntervalUs * 4) {
+                m_SmoothedIntervalUs =
+                    (m_SmoothedIntervalUs * 7 + sourceDeltaUs) / 8;
+            }
+        }
+
         uint64_t targetUs = nowUs;
 
         if (m_LastTargetTimeUs != 0) {
-            uint64_t frameIntervalUs = m_NominalFrameIntervalUs;
-
-            if (m_LastSourceTimeUs != 0 &&
-                    sourceTimeUs > m_LastSourceTimeUs) {
-                uint64_t sourceDeltaUs = sourceTimeUs - m_LastSourceTimeUs;
-                if (sourceDeltaUs >= m_NominalFrameIntervalUs / 2 &&
-                        sourceDeltaUs <= m_NominalFrameIntervalUs * 2) {
-                    frameIntervalUs = sourceDeltaUs;
-                }
-            }
+            uint64_t frameIntervalUs = m_SmoothedIntervalUs;
 
             targetUs = m_LastTargetTimeUs + frameIntervalUs;
 
@@ -60,9 +69,24 @@ public:
         return targetUs;
     }
 
+    void rebaseTarget(uint64_t targetUs)
+    {
+        // The pacer presented earlier than our schedule (latency catch-up).
+        // Build subsequent targets from the instant actually used, otherwise
+        // the schedule stays permanently late relative to frame delivery and
+        // the catch-up never converges.
+        m_LastTargetTimeUs = targetUs;
+    }
+
+    uint64_t smoothedIntervalUs() const
+    {
+        return m_SmoothedIntervalUs;
+    }
+
 private:
     uint64_t m_NominalFrameIntervalUs;
     uint64_t m_MinFrameIntervalUs;
+    uint64_t m_SmoothedIntervalUs;
     uint64_t m_LastSourceTimeUs;
     uint64_t m_LastTargetTimeUs;
 };

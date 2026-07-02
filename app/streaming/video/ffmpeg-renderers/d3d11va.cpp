@@ -73,9 +73,11 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_ScanoutPeriodUs(0),
       m_LastPresentAlignmentWaitUs(0),
       m_PresentTargetUs(0),
+      m_PresentCatchUp(false),
       m_LastPresentUs(0),
       m_AlignHits(0),
       m_AlignGiveUps(0),
+      m_AlignSkips(0),
       m_AlignWaitTotalUs(0),
       m_AlignStatsStartUs(0),
       m_PresentReadyFenceValue(0),
@@ -605,13 +607,15 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
     else if (nowUs - m_AlignStatsStartUs >= 10000000) {
         uint32_t total = m_AlignHits + m_AlignGiveUps;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "VRR scanline align: %u in-blank, %u mid-scan tears (%.1f%%), avg wait %.2f ms",
+                    "VRR scanline align: %u in-blank, %u mid-scan tears (%.1f%%), avg wait %.2f ms, %u skipped-late",
                     m_AlignHits,
                     m_AlignGiveUps,
                     total != 0 ? m_AlignGiveUps * 100.0 / total : 0.0,
-                    total != 0 ? (m_AlignWaitTotalUs / 1000.0) / total : 0.0);
+                    total != 0 ? (m_AlignWaitTotalUs / 1000.0) / total : 0.0,
+                    m_AlignSkips);
         m_AlignHits = 0;
         m_AlignGiveUps = 0;
+        m_AlignSkips = 0;
         m_AlignWaitTotalUs = 0;
         m_AlignStatsStartUs = nowUs;
     }
@@ -674,21 +678,28 @@ bool D3D11VARenderer::signalAndUnlockForPresent()
     return true;
 }
 
-void D3D11VARenderer::holdUntilPresentTarget()
+uint64_t D3D11VARenderer::holdUntilPresentTarget()
 {
     // Hold the flip until the cadence pacer's intended instant. Without this,
     // a present is released as soon as rendering finishes - up to the whole
     // render-lead early - which re-scatters the present phase the pacer just
     // computed and can space flips tighter than the panel's max refresh
     // (observed as 5.5-7.4ms minimum intervals against an 8.33ms floor).
+    //
+    // Returns how far past the target we already were on entry (0 if we
+    // held), so the caller knows the schedule is running behind.
     uint64_t targetUs = m_PresentTargetUs;
     m_PresentTargetUs = 0;
 
     if (targetUs == 0) {
-        return;
+        return 0;
     }
 
     uint64_t startUs = LiGetMicroseconds();
+    if (startUs > targetUs) {
+        return startUs - targetUs;
+    }
+
     uint64_t nowUs = startUs;
     while (nowUs < targetUs) {
         if (targetUs - nowUs > 1500) {
@@ -698,6 +709,7 @@ void D3D11VARenderer::holdUntilPresentTarget()
     }
 
     m_LastPresentAlignmentWaitUs += nowUs - startUs;
+    return 0;
 }
 
 bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapterNotFound)
@@ -1269,8 +1281,22 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
             unlockContext(this);
         }
 
-        holdUntilPresentTarget();
-        waitForVBlankBeforeTearingPresent();
+        // Skip the blanking-gap alignment when presentation is running
+        // behind frame delivery: either the pacer flagged this present as
+        // backlog drain (catch-up), or we reached the hold already past the
+        // intended flip time. Waiting for the blank in that state slips the
+        // schedule further and the resulting backlog is dropped outright -
+        // a frame that may tear beats a dropped one. Alignment resumes as
+        // soon as the schedule is back on time.
+        bool catchUp = m_PresentCatchUp;
+        m_PresentCatchUp = false;
+        uint64_t behindTargetUs = holdUntilPresentTarget();
+        if (catchUp || behindTargetUs > 2000) {
+            m_AlignSkips++;
+        }
+        else {
+            waitForVBlankBeforeTearingPresent();
+        }
 
         // Reacquire the lock for Present(). Any lock delay from an in-flight
         // decode submission lands after alignment and only shifts us deeper
@@ -1988,9 +2014,10 @@ uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
     return waitUs;
 }
 
-void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs)
+void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp)
 {
     m_PresentTargetUs = targetUs;
+    m_PresentCatchUp = catchUp;
 }
 
 uint64_t D3D11VARenderer::getLastPresentUs()

@@ -214,10 +214,13 @@ int Pacer::cadenceThread(void* context)
     // The renderer holds each present back to the pacer's target itself, so
     // leading the render start by a little extra only costs idle wait, while
     // arriving late costs a missed blanking gap - bias the lead accordingly.
-    // In classic present mode the renderer presents as soon as it's aligned,
-    // so no extra lead is applied there.
+    // The margin must cover the render time's spread above its EMA, not just
+    // scheduling slop: measured render times swing 3-9ms at 1440p/4K, and a
+    // 500us margin let ~30% of frames overshoot their hold and present
+    // unaligned (phase noise + mid-scan tears). In classic present mode the
+    // renderer presents as soon as it's aligned, so no lead is applied there.
     const uint64_t leadMarginUs =
-        qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0 ? 0 : 500;
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0 ? 0 : 2500;
 
     // Rolling ~500ms of pacing queue depth, mirroring the hysteresis the
     // handleVsync/renderFrame paths already use. Network jitter routinely
@@ -227,6 +230,7 @@ int Pacer::cadenceThread(void* context)
     QQueue<int> queueDepthHistory;
     const int queueDepthHistoryCap =
         me->m_MaxVideoFps > 0 ? qMax(me->m_MaxVideoFps / 2, 1) : 60;
+
 
     while (!me->m_Stopping) {
         me->m_FrameQueueLock.lock();
@@ -278,8 +282,14 @@ int Pacer::cadenceThread(void* context)
         bool backlogged = !me->m_PacingQueue.isEmpty();
         me->m_FrameQueueLock.unlock();
 
-        uint64_t targetUs = cadenceClock.nextTargetUs(LiGetMicroseconds(),
+        uint64_t nowUs = LiGetMicroseconds();
+        uint64_t targetUs = cadenceClock.nextTargetUs(nowUs,
                                                       frameCadenceTimestampUs(frame));
+
+        // The clock's smoothed measurement of the actual content cadence -
+        // the stream's nominal FPS is only an upper bound (a game hovering
+        // at 90fps on a 120fps stream delivers frames every ~11.1ms).
+        uint64_t measuredSourceIntervalUs = cadenceClock.smoothedIntervalUs();
 
         // Belt-and-suspenders on top of the clock's own max-refresh floor: the
         // clock only knows the last INTENDED target, not whether the actual
@@ -306,15 +316,52 @@ int Pacer::cadenceThread(void* context)
             targetUs = lastFlipUs + minFrameIntervalUs;
         }
 
-        // While another frame is already waiting behind this one, drain at the
-        // panel's max refresh rather than the content cadence. Presenting a
-        // burst's frames slightly early for a few frames is far less visible
-        // than skipping one of them outright, and once the backlog clears we
-        // return to the clock's cadence.
-        if (backlogged && lastFlipUs != 0) {
-            uint64_t catchUpUs = qMax(lastFlipUs + minFrameIntervalUs,
-                                      LiGetMicroseconds());
-            targetUs = qMin(targetUs, catchUpUs);
+        // Detect a schedule that has drifted late relative to frame delivery:
+        // a frame should spend roughly one content interval in the pipeline
+        // (decode completion -> pacing queue -> present), so one that is
+        // already older than that plus slack means every subsequent frame
+        // will queue behind us as pure added latency (measured as ~14ms avg
+        // frame queue delay against an 8.3ms frame time).
+        bool staleSchedule = measuredSourceIntervalUs != 0 && frame->pkt_dts > 0 &&
+            nowUs > (uint64_t)frame->pkt_dts +
+                measuredSourceIntervalUs + measuredSourceIntervalUs / 4;
+
+        // Two-tier catch-up, rebasing the clock onto any instant actually
+        // used so the schedule converges back to arrival phase instead of
+        // staying permanently late.
+        //
+        // Genuinely stale (>1.25 content intervals of pipeline age - a real
+        // stall): rush at the panel's max refresh and skip blank alignment;
+        // a possible tear beats compounding lateness into dropped frames.
+        //
+        // Merely backlogged (a transient extra queued frame, routine with
+        // network jitter): drain gently at ~12% tighter than the measured
+        // content cadence with alignment still on. Draining at full panel
+        // rate here would compress an 11.7ms content cadence to 8.3ms for
+        // every absorbed burst - cadence distortion that reads as judder
+        // during camera pans, far more visible than the latency it saves
+        // (measured: ~45% of frames rushed at 85fps content on Wi-Fi).
+        bool rushPresent = false;
+        if (lastFlipUs != 0) {
+            if (staleSchedule) {
+                uint64_t catchUpUs = qMax(lastFlipUs + minFrameIntervalUs,
+                                          LiGetMicroseconds());
+                if (catchUpUs < targetUs) {
+                    targetUs = catchUpUs;
+                    cadenceClock.rebaseTarget(targetUs);
+                }
+                rushPresent = true;
+            }
+            else if (backlogged) {
+                uint64_t drainIntervalUs = qMax(minFrameIntervalUs,
+                                                measuredSourceIntervalUs * 7 / 8);
+                uint64_t drainUs = qMax(lastFlipUs + drainIntervalUs,
+                                        LiGetMicroseconds());
+                if (drainUs < targetUs) {
+                    targetUs = drainUs;
+                    cadenceClock.rebaseTarget(targetUs);
+                }
+            }
         }
 
         // Wait for render start, not present time - renderFrame() below still
@@ -334,7 +381,7 @@ int Pacer::cadenceThread(void* context)
             break;
         }
 
-        me->m_VsyncRenderer->setPresentTargetUs(targetUs);
+        me->m_VsyncRenderer->setPresentTargetUs(targetUs, rushPresent);
         me->m_VsyncRenderer->waitToRender();
         me->renderFrame(frame);
     }
