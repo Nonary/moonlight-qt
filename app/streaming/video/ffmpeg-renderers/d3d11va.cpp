@@ -1281,17 +1281,18 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
             unlockContext(this);
         }
 
-        // Skip the blanking-gap alignment when presentation is running
-        // behind frame delivery: either the pacer flagged this present as
-        // backlog drain (catch-up), or we reached the hold already past the
-        // intended flip time. Waiting for the blank in that state slips the
-        // schedule further and the resulting backlog is dropped outright -
-        // a frame that may tear beats a dropped one. Alignment resumes as
-        // soon as the schedule is back on time.
+        // Skip the blanking-gap alignment only when the pacer flagged this
+        // present as a rush (schedule genuinely late): waiting for the blank
+        // in that state slips the schedule further and the resulting backlog
+        // is dropped outright - a frame that may tear beats a dropped one.
+        // A present that's merely running a little behind its hold still
+        // aligns: when content runs below the panel's max refresh the panel
+        // is sitting in its VRR-extended blanking gap waiting for us, so the
+        // check is nearly free, and skipping it just manufactured tears.
         bool catchUp = m_PresentCatchUp;
         m_PresentCatchUp = false;
-        uint64_t behindTargetUs = holdUntilPresentTarget();
-        if (catchUp || behindTargetUs > 2000) {
+        holdUntilPresentTarget();
+        if (catchUp) {
             m_AlignSkips++;
         }
         else {

@@ -220,7 +220,7 @@ int Pacer::cadenceThread(void* context)
     // unaligned (phase noise + mid-scan tears). In classic present mode the
     // renderer presents as soon as it's aligned, so no lead is applied there.
     const uint64_t leadMarginUs =
-        qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0 ? 0 : 2500;
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0 ? 0 : 4000;
 
     // Rolling ~500ms of pacing queue depth, mirroring the hysteresis the
     // handleVsync/renderFrame paths already use. Network jitter routinely
