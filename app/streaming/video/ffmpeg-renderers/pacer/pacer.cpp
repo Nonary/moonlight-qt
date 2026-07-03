@@ -461,7 +461,16 @@ int Pacer::cadenceThread(void* context)
             // rushes still get only the cadence's real slack (~0 up here),
             // since they are the drain engine and every snap they take
             // pushes the backlog out through the max-refresh floor.
-            alignBudgetUs = qMin((uint64_t)3000, threadSlackUs);
+            //
+            // Deliberately NOT limited by threadSlackUs: near the ceiling
+            // the render time plus reserve exceeds the frame interval, which
+            // strangled the snap to sub-1ms (measured at 116fps: avg budget
+            // 0.8ms, tear line drifting mid-frame again) - while the old
+            // always-spin build proved the pipeline absorbs the full anchor
+            // dose at ~2% drops. The reachability give-up bounds the real
+            // spend to frames whose blank is genuinely catchable, so the
+            // granted width costs far less here than it did there.
+            alignBudgetUs = 3000;
         }
         else {
             // Real headroom: floor at the fixed 3ms spin that reached
