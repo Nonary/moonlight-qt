@@ -231,6 +231,17 @@ int Pacer::cadenceThread(void* context)
     const int queueDepthHistoryCap =
         me->m_MaxVideoFps > 0 ? qMax(me->m_MaxVideoFps / 2, 1) : 60;
 
+    // Near-ceiling taper state for the alignment budget (see below). Starts
+    // in full-alignment and drops to the taper the moment the measured
+    // cadence closes on the panel's max flip spacing; returning to full
+    // requires sustained evidence of real headroom, because the measured
+    // EMA rides host-vsync quantization spikes (one 16.7ms delta in a
+    // ~9.1ms cadence lifts it ~0.9ms for several frames) and a single hard
+    // threshold flip-flops the budget between ~0.6ms and 3ms+, recreating
+    // the exact flip-phase wobble the taper exists to kill.
+    bool alignTapered = false;
+    int alignFullDwell = 0;
+
 
     while (!me->m_Stopping) {
         me->m_FrameQueueLock.lock();
@@ -398,6 +409,30 @@ int Pacer::cadenceThread(void* context)
             (minFrameIntervalUs != 0 &&
              measuredSourceIntervalUs > minFrameIntervalUs + 200) ?
                 measuredSourceIntervalUs - minFrameIntervalUs - 200 : 0;
+
+        // Taper-zone hysteresis: drop to the taper immediately once the
+        // cadence closes to within ~1.35ms of the panel's max flip spacing
+        // (content above ~103fps on 120Hz); rearm full alignment only after
+        // the EMA has shown ~100fps-or-less worth of headroom for a
+        // sustained run. The dwell is a leaky counter rather than a
+        // consecutive requirement so boundary wobble (content hovering
+        // right at ~100fps) makes steady progress instead of resetting.
+        if (measuredSourceIntervalUs < minFrameIntervalUs + 1350) {
+            alignTapered = true;
+            alignFullDwell = 0;
+        }
+        else if (measuredSourceIntervalUs >= minFrameIntervalUs + 1600) {
+            if (alignFullDwell < 24) {
+                alignFullDwell++;
+            }
+            else {
+                alignTapered = false;
+            }
+        }
+        else if (alignFullDwell > 0) {
+            alignFullDwell--;
+        }
+
         uint64_t alignBudgetUs;
         if (rushPresent) {
             // A catch-up present may only spend the cadence's real per-frame
@@ -410,19 +445,19 @@ int Pacer::cadenceThread(void* context)
             alignBudgetUs = qMin(qMin(cadenceSlackUs, threadSlackUs),
                                  (uint64_t)2500);
         }
-        else if (measuredSourceIntervalUs < minFrameIntervalUs + 1550) {
-            // Content within ~1ms of this panel's true tear-free flip
-            // ceiling (empirically ~110fps on the 120Hz Ally X panel, i.e.
-            // ~750us above the nominal max-refresh spacing) has no robust
-            // tear-free operating point: the panel can barely follow, one
-            // torn flip drops it back to a free-running raster, and a fixed
-            // 3ms alignment floor there just flips half the presents onto
-            // scan boundaries and half not - measured as 1.4-4% continuous
-            // pacer drops plus +/-1-3ms flip-phase wobble (judder), which
-            // reads far worse than the slow tear crawl of pure content
-            // cadence. Spend only the cadence's real slack, tapering to
-            // zero at the ceiling - the old proven near-ceiling behavior,
-            // with sub-ms opportunistic blank catches when nearly free.
+        else if (alignTapered) {
+            // Content near this panel's true tear-free flip ceiling
+            // (empirically ~110fps on the 120Hz Ally X panel, i.e. ~750us
+            // above the nominal max-refresh spacing) has no robust tear-free
+            // operating point: the panel can barely follow, one torn flip
+            // drops it back to a free-running raster, and a fixed 3ms
+            // alignment floor there just flips half the presents onto scan
+            // boundaries and half not - measured as 1.4-4% continuous pacer
+            // drops plus +/-1-3ms flip-phase wobble (judder), which reads
+            // far worse than the slow tear crawl of pure content cadence.
+            // Spend only the cadence's real slack, tapering to zero at the
+            // ceiling, with sub-ms opportunistic blank catches when nearly
+            // free.
             alignBudgetUs = qMin(cadenceSlackUs, threadSlackUs);
         }
         else {
