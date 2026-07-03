@@ -394,6 +394,10 @@ int Pacer::cadenceThread(void* context)
         uint64_t renderReserveUs = me->m_EstimatedRenderTimeUs + 1200;
         uint64_t threadSlackUs = measuredSourceIntervalUs > renderReserveUs ?
             measuredSourceIntervalUs - renderReserveUs : 0;
+        uint64_t cadenceSlackUs =
+            (minFrameIntervalUs != 0 &&
+             measuredSourceIntervalUs > minFrameIntervalUs + 200) ?
+                measuredSourceIntervalUs - minFrameIntervalUs - 200 : 0;
         uint64_t alignBudgetUs;
         if (rushPresent) {
             // A catch-up present may only spend the cadence's real per-frame
@@ -403,19 +407,38 @@ int Pacer::cadenceThread(void* context)
             // compounding lateness into dropped frames. With headroom, the
             // drain runs a shade slower but stays aligned, so a jitter storm
             // of rush presents can no longer break the panel's VRR lock.
-            uint64_t cadenceSlackUs =
-                (minFrameIntervalUs != 0 &&
-                 measuredSourceIntervalUs > minFrameIntervalUs + 200) ?
-                    measuredSourceIntervalUs - minFrameIntervalUs - 200 : 0;
             alignBudgetUs = qMin(qMin(cadenceSlackUs, threadSlackUs),
                                  (uint64_t)2500);
         }
+        else if (measuredSourceIntervalUs < minFrameIntervalUs + 1550) {
+            // Content within ~1ms of this panel's true tear-free flip
+            // ceiling (empirically ~110fps on the 120Hz Ally X panel, i.e.
+            // ~750us above the nominal max-refresh spacing) has no robust
+            // tear-free operating point: the panel can barely follow, one
+            // torn flip drops it back to a free-running raster, and a fixed
+            // 3ms alignment floor there just flips half the presents onto
+            // scan boundaries and half not - measured as 1.4-4% continuous
+            // pacer drops plus +/-1-3ms flip-phase wobble (judder), which
+            // reads far worse than the slow tear crawl of pure content
+            // cadence. Spend only the cadence's real slack, tapering to
+            // zero at the ceiling - the old proven near-ceiling behavior,
+            // with sub-ms opportunistic blank catches when nearly free.
+            alignBudgetUs = qMin(cadenceSlackUs, threadSlackUs);
+        }
         else {
-            // Floor at the fixed 3ms spin that reached almost-tear-free on
-            // real hardware, cap at one full scanout cycle plus slack - the
-            // blanking gap recurs within one cycle even on a free-running
-            // raster, so waiting longer than that buys nothing.
-            uint64_t maxAlignUs = qMax((uint64_t)3000, minFrameIntervalUs + 2000);
+            // Real headroom: floor at the fixed 3ms spin that reached
+            // almost-tear-free on real hardware, and with an idle pipeline
+            // allow up to one full scanout cycle plus slack - the blanking
+            // gap recurs within one cycle even on a free-running raster, so
+            // that width guarantees re-capturing the panel's flip lock.
+            // While a backlog exists, cap at the 3ms floor: the wide waits
+            // are only for re-anchoring a free-running raster, and the
+            // render-time estimate this thread-slack math leans on is
+            // clamped to one frame interval, so during a genuine overload
+            // (render time past the interval) the slack is overestimated
+            // and wide waits would deepen the drop cascade.
+            uint64_t maxAlignUs = backlogged ?
+                (uint64_t)3000 : qMax((uint64_t)3000, minFrameIntervalUs + 2000);
             alignBudgetUs = qBound((uint64_t)3000, threadSlackUs, maxAlignUs);
         }
 
