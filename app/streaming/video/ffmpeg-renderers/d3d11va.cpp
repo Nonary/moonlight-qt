@@ -74,10 +74,12 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_LastPresentAlignmentWaitUs(0),
       m_PresentTargetUs(0),
       m_PresentAlignBudgetUs(0),
+      m_PresentVsyncLatch(false),
       m_LastPresentUs(0),
       m_AlignHits(0),
       m_AlignGiveUps(0),
       m_AlignSkips(0),
+      m_AlignVsyncLatches(0),
       m_AlignWaitTotalUs(0),
       m_AlignBudgetTotalUs(0),
       m_AlignStatsStartUs(0),
@@ -374,25 +376,13 @@ void D3D11VARenderer::resolvePresentationMode(SDL_Window* window, DXGI_SWAP_CHAI
         m_PresentationMode = PresentationMode::FixedVsync;
         fallbackReason = "stream FPS exceeds display refresh rate";
     }
-    else if (displayFps > 0 && m_DecoderParams.frameRate > 0 &&
-             1000000 / m_DecoderParams.frameRate < 1000000 / displayFps + 1350 &&
-             !forceVrr) {
-        // A VRR panel can't flip tear-free faster than its scanout cycle
-        // (max refresh period plus VBI and flip-programming overhead -
-        // measured ~110fps on this 120Hz panel), and a stream targeting
-        // within ~1ms of that ceiling leaves adaptive sync no headroom to
-        // absorb jitter: the tearing-allowed cadence path there produces
-        // crawling tears plus continuous pacer drops, while classic
-        // fixed-vsync presentation is tear-free and metronomic with only a
-        // small repeated-frame pulse. Validated side by side by the user at
-        // 116-on-120: fixed vsync reads clearly smoother. The threshold
-        // mirrors the cadence pacer's near-ceiling taper; streams at or
-        // below the panel's sweet spot (~5/6 of max refresh, the settings
-        // dropdown's VRR Optimized rate) still take the VRR cadence path.
-        m_PresentationMode = PresentationMode::FixedVsync;
-        fallbackReason = "stream FPS is above the display's tear-free VRR ceiling";
-    }
     else {
+        // VrrCadence handles content above the panel's tear-free flip
+        // ceiling dynamically: while the measured cadence runs above it,
+        // the pacer requests vsync-latched presents (no tearing flag, flips
+        // latch tear-free at each vblank - classic fixed-vsync feel), and
+        // the moment content falls back below the ceiling, tearing presents
+        // with true VRR pacing resume. No static stream-FPS cutoff needed.
         m_PresentationMode = PresentationMode::VrrCadence;
         swapChainDesc->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
         m_AllowTearing = true;
@@ -657,7 +647,11 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs)
     m_AlignWaitTotalUs += waitedUs;
     m_AlignBudgetTotalUs += maxWaitUs;
 
-    uint64_t nowUs = startUs + waitedUs;
+    logScanlineAlignStatsIfDue(startUs + waitedUs);
+}
+
+void D3D11VARenderer::logScanlineAlignStatsIfDue(uint64_t nowUs)
+{
     if (m_AlignStatsStartUs == 0) {
         m_AlignStatsStartUs = nowUs;
     }
@@ -665,16 +659,18 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs)
         uint32_t attempted = m_AlignHits + m_AlignGiveUps;
         uint32_t total = attempted + m_AlignSkips;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "VRR scanline align: %u in-blank, %u mid-scan tears (%.1f%%), avg wait %.2f ms, avg budget %.2f ms, %u skipped-late",
+                    "VRR scanline align: %u in-blank, %u mid-scan tears (%.1f%%), avg wait %.2f ms, avg budget %.2f ms, %u skipped-late, %u vsync-latched",
                     m_AlignHits,
                     m_AlignGiveUps,
                     attempted != 0 ? m_AlignGiveUps * 100.0 / attempted : 0.0,
                     attempted != 0 ? (m_AlignWaitTotalUs / 1000.0) / attempted : 0.0,
                     total != 0 ? (m_AlignBudgetTotalUs / 1000.0) / total : 0.0,
-                    m_AlignSkips);
+                    m_AlignSkips,
+                    m_AlignVsyncLatches);
         m_AlignHits = 0;
         m_AlignGiveUps = 0;
         m_AlignSkips = 0;
+        m_AlignVsyncLatches = 0;
         m_AlignWaitTotalUs = 0;
         m_AlignBudgetTotalUs = 0;
         m_AlignStatsStartUs = nowUs;
@@ -1315,15 +1311,7 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         m_LastColorTrc = frame->color_trc;
     }
 
-    UINT flags;
-    if (m_AllowTearing) {
-        SDL_assert(m_PresentationMode == PresentationMode::Immediate ||
-                   m_PresentationMode == PresentationMode::VrrCadence);
-        flags = DXGI_PRESENT_ALLOW_TEARING;
-    }
-    else {
-        flags = 0;
-    }
+    bool vsyncLatch = false;
 
     if (m_PresentationMode == PresentationMode::VrrCadence &&
             qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") == 0) {
@@ -1334,29 +1322,42 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         //    lock dropped, so Present() below is the true flip instant and
         //    the decoder isn't stalled while we wait.
         // 2. Hold until the pacer's intended present time.
-        // 3. Align the last few ms to the panel's blanking gap.
+        // 3. Align the last few ms to the panel's blanking gap - unless the
+        //    pacer requested a vsync-latched present (measured content
+        //    cadence above the panel's tear-free flip ceiling): those drop
+        //    the tearing flag below so the flip latches tear-free at the
+        //    display's next vblank, making scan-position alignment moot.
         bool unlocked = signalAndUnlockForPresent();
         if (!unlocked && m_DecodeDevice == m_RenderDevice) {
             // No fence support: still drop the lock for the waits below.
             unlockContext(this);
         }
 
-        // Every present - rush or not - aligns to the blanking gap within
-        // the budget the pacer sized for it from the measured cadence. A
-        // genuinely late rush at near-max-refresh content gets a ~0 budget
-        // and presents immediately (a possible tear still beats compounding
-        // lateness into drops), but skipping alignment outright on every
-        // rush was what broke the panel's VRR lock: one network stall's
-        // burst of deliberately-unaligned presents (454 in one 10s window)
-        // dropped the driver back to a fixed free-running raster and locked
-        // in minutes of ~60% mid-scan tearing that a 3ms wait could never
-        // escape. With headroom, rushes drain a shade slower but aligned,
-        // and normal presents may wait up to a full scanout cycle - which
-        // is what re-captures the blank once the raster is free-running.
+        // Every tearing present - rush or not - aligns to the blanking gap
+        // within the budget the pacer sized for it from the measured
+        // cadence. A genuinely late rush at near-max-refresh content gets a
+        // ~0 budget and presents immediately (a possible tear still beats
+        // compounding lateness into drops), but skipping alignment outright
+        // on every rush was what broke the panel's VRR lock: one network
+        // stall's burst of deliberately-unaligned presents (454 in one 10s
+        // window) dropped the driver back to a fixed free-running raster and
+        // locked in minutes of ~60% mid-scan tearing that a 3ms wait could
+        // never escape. With headroom, rushes drain a shade slower but
+        // aligned, and normal presents may wait up to a full scanout cycle -
+        // which is what re-captures the blank once the raster is
+        // free-running.
         uint64_t alignBudgetUs = m_PresentAlignBudgetUs;
         m_PresentAlignBudgetUs = 0;
+        vsyncLatch = m_PresentVsyncLatch;
+        m_PresentVsyncLatch = false;
         holdUntilPresentTarget();
-        waitForVBlankBeforeTearingPresent(alignBudgetUs);
+        if (vsyncLatch) {
+            m_AlignVsyncLatches++;
+            logScanlineAlignStatsIfDue(LiGetMicroseconds());
+        }
+        else {
+            waitForVBlankBeforeTearingPresent(alignBudgetUs);
+        }
 
         // Reacquire the lock for Present(). Any lock delay from an in-flight
         // decode submission lands after alignment and only shifts us deeper
@@ -1372,7 +1373,22 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         m_LastPresentAlignmentWaitUs = 0;
         m_PresentTargetUs = 0;
         m_PresentAlignBudgetUs = 0;
+        m_PresentVsyncLatch = false;
         waitForVBlankBeforeTearingPresent(3000);
+    }
+
+    UINT flags;
+    if (m_AllowTearing && !vsyncLatch) {
+        SDL_assert(m_PresentationMode == PresentationMode::Immediate ||
+                   m_PresentationMode == PresentationMode::VrrCadence);
+        flags = DXGI_PRESENT_ALLOW_TEARING;
+    }
+    else {
+        // Without DXGI_PRESENT_ALLOW_TEARING, a SyncInterval-0 present on a
+        // flip-model swapchain queues the frame to latch tear-free at the
+        // display's next vblank (replacing any not-yet-shown predecessor) -
+        // exactly what a vsync-latched present wants.
+        flags = 0;
     }
 
     // Present according to the selected presentation mode
@@ -2076,7 +2092,7 @@ uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
     return waitUs;
 }
 
-void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs)
+void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch)
 {
     // The catch-up policy is fully encoded in the pacer's alignment budget
     // (a rush with no cadence slack arrives with ~0), so the flag itself
@@ -2085,6 +2101,7 @@ void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64
 
     m_PresentTargetUs = targetUs;
     m_PresentAlignBudgetUs = alignBudgetUs;
+    m_PresentVsyncLatch = vsyncLatch;
 }
 
 uint64_t D3D11VARenderer::getLastPresentUs()

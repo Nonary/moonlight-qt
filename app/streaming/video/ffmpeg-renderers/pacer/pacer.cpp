@@ -434,7 +434,31 @@ int Pacer::cadenceThread(void* context)
         }
 
         uint64_t alignBudgetUs;
-        if (rushPresent) {
+        bool vsyncLatchPresent = false;
+        if (alignTapered) {
+            // Content near or above this panel's true tear-free flip
+            // ceiling (empirically ~110fps on the 120Hz Ally X panel, i.e.
+            // ~750us above the nominal max-refresh spacing) has no tear-free
+            // operating point for tearing-allowed presents - they can only
+            // choose where tears land - and every phase-anchoring scheme
+            // tried here traded tears against flip-law chatter (the queue
+            // equilibrium straddles the stale threshold once alignment waits
+            // stop inflating service time, and the pacer flip-flops between
+            // rush and snap present timing in 2-8Hz bursts). Classic
+            // vblank-latched presentation is simply better up here: ask the
+            // renderer to present WITHOUT the tearing flag so every flip
+            // latches tear-free at the display's next vblank, while cadence
+            // pacing still spaces the presents at the content rate. This is
+            // the fixed-vsync feel the user validated as clearly smoother at
+            // 116-on-120; the moment measured content falls back below the
+            // ceiling (hysteresis above), tearing presents and true VRR
+            // pacing resume. MOONLIGHT_VRR_NO_LATCH=1 restores the old
+            // tear-and-snap behavior for A/B testing.
+            vsyncLatchPresent =
+                qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_LATCH") == 0;
+            alignBudgetUs = vsyncLatchPresent ? 0 : 3000;
+        }
+        else if (rushPresent) {
             // A catch-up present may only spend the cadence's real per-frame
             // slack (content interval over the panel's max flip spacing). At
             // near-max-refresh content that is ~0 and it presents
@@ -444,33 +468,6 @@ int Pacer::cadenceThread(void* context)
             // of rush presents can no longer break the panel's VRR lock.
             alignBudgetUs = qMin(qMin(cadenceSlackUs, threadSlackUs),
                                  (uint64_t)2500);
-        }
-        else if (alignTapered) {
-            // Content near or above this panel's true tear-free flip
-            // ceiling (empirically ~110fps on the 120Hz Ally X panel, i.e.
-            // ~750us above the nominal max-refresh spacing) has no tear-free
-            // operating point, so the goal shifts from eliminating tears to
-            // controlling WHERE they land. The renderer's alignment wait
-            // gives up instantly when the blanking gap is out of reach, so
-            // this 3ms budget acts as a phase snap rather than a stall:
-            // presents that drift near the blank align to it and reset the
-            // beat phase, the rest go out untouched at content cadence.
-            // That herds the beat's tear line toward the screen edges - the
-            // behavior that made the pre-taper build look almost perfect at
-            // 116fps - instead of letting it crawl mid-frame. Catch-up
-            // rushes still get only the cadence's real slack (~0 up here),
-            // since they are the drain engine and every snap they take
-            // pushes the backlog out through the max-refresh floor.
-            //
-            // Deliberately NOT limited by threadSlackUs: near the ceiling
-            // the render time plus reserve exceeds the frame interval, which
-            // strangled the snap to sub-1ms (measured at 116fps: avg budget
-            // 0.8ms, tear line drifting mid-frame again) - while the old
-            // always-spin build proved the pipeline absorbs the full anchor
-            // dose at ~2% drops. The reachability give-up bounds the real
-            // spend to frames whose blank is genuinely catchable, so the
-            // granted width costs far less here than it did there.
-            alignBudgetUs = 3000;
         }
         else {
             // Real headroom: floor at the fixed 3ms spin that reached
@@ -496,7 +493,8 @@ int Pacer::cadenceThread(void* context)
             break;
         }
 
-        me->m_VsyncRenderer->setPresentTargetUs(targetUs, rushPresent, alignBudgetUs);
+        me->m_VsyncRenderer->setPresentTargetUs(targetUs, rushPresent, alignBudgetUs,
+                                                vsyncLatchPresent);
         me->m_VsyncRenderer->waitToRender();
         me->renderFrame(frame);
     }

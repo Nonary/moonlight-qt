@@ -245,7 +245,7 @@ public:
         return 0;
     }
 
-    virtual void setPresentTargetUs(uint64_t, bool, uint64_t) {
+    virtual void setPresentTargetUs(uint64_t, bool, uint64_t, bool) {
         // The cadence pacer's intended present instant for the next
         // renderFrame() call. Renderers that phase-align their presents must
         // hold the flip until this time even if the display is already in
@@ -256,7 +256,16 @@ public:
         // running behind frame delivery and this present is draining that
         // backlog.
         //
-        // The trailing argument is the blank-alignment budget in
+        // The final bool asks for a vsync-latched present: drop the tearing
+        // flag so the flip latches at the display's next vblank instead of
+        // executing immediately. The pacer requests this while the measured
+        // content cadence runs above the panel's tear-free flip ceiling,
+        // where tearing-allowed presents can only choose where tears land -
+        // classic vblank-latched presentation is tear-free and metronomic
+        // there, and reads clearly smoother (user-validated at 116-on-120).
+        // The alignment budget is moot for latched presents.
+        //
+        // The uint64_t argument is the blank-alignment budget in
         // microseconds: how long past the target the renderer may stall
         // waiting for the display's blanking gap before presenting anyway.
         // The pacer sizes it from the measured content cadence and render

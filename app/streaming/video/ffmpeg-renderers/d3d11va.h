@@ -28,7 +28,7 @@ public:
     virtual PresentationMode getPresentationMode() override;
     virtual const char* getPresentationModeFallbackReason() override;
     virtual uint64_t popPresentAlignmentWaitUs() override;
-    virtual void setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs) override;
+    virtual void setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch) override;
     virtual uint64_t getLastPresentUs() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
@@ -76,6 +76,7 @@ private:
     bool signalAndUnlockForPresent();
     uint64_t holdUntilPresentTarget();
     void waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs);
+    void logScanlineAlignStatsIfDue(uint64_t nowUs);
 
     int m_DecoderSelectionPass;
     int m_DevicesWithFL11Support;
@@ -103,10 +104,12 @@ private:
     uint64_t m_LastPresentAlignmentWaitUs;
     uint64_t m_PresentTargetUs;
     uint64_t m_PresentAlignBudgetUs;
+    bool m_PresentVsyncLatch;
     uint64_t m_LastPresentUs;
     uint32_t m_AlignHits;
     uint32_t m_AlignGiveUps;
     uint32_t m_AlignSkips;
+    uint32_t m_AlignVsyncLatches;
     uint64_t m_AlignWaitTotalUs;
     uint64_t m_AlignBudgetTotalUs;
     uint64_t m_AlignStatsStartUs;
