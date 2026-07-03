@@ -105,6 +105,7 @@ private:
     uint64_t m_PresentTargetUs;
     uint64_t m_PresentAlignBudgetUs;
     bool m_PresentVsyncLatch;
+    bool m_LastPresentLatched;
     uint64_t m_LastPresentUs;
     uint32_t m_AlignHits;
     uint32_t m_AlignGiveUps;

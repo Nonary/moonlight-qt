@@ -75,6 +75,7 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_PresentTargetUs(0),
       m_PresentAlignBudgetUs(0),
       m_PresentVsyncLatch(false),
+      m_LastPresentLatched(false),
       m_LastPresentUs(0),
       m_AlignHits(0),
       m_AlignGiveUps(0),
@@ -1350,6 +1351,7 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         m_PresentAlignBudgetUs = 0;
         vsyncLatch = m_PresentVsyncLatch;
         m_PresentVsyncLatch = false;
+        m_LastPresentLatched = vsyncLatch;
         holdUntilPresentTarget();
         if (vsyncLatch) {
             m_AlignVsyncLatches++;
@@ -1374,6 +1376,7 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         m_PresentTargetUs = 0;
         m_PresentAlignBudgetUs = 0;
         m_PresentVsyncLatch = false;
+        m_LastPresentLatched = false;
         waitForVBlankBeforeTearingPresent(3000);
     }
 
@@ -2075,6 +2078,18 @@ IFFmpegRenderer::PresentationMode D3D11VARenderer::getPresentationMode()
 
 const char* D3D11VARenderer::getPresentationModeFallbackReason()
 {
+    // Surface VrrCadence's live per-frame sub-state in the overlay: presents
+    // switch between tearing+blank-aligned (true VRR pacing, content below
+    // the panel's tear-free flip ceiling) and vsync-latched (content at or
+    // above it) - the mode label alone can't show that, which made the
+    // dynamic switching look inert.
+    if (m_PresentationMode == PresentationMode::VrrCadence &&
+            m_PresentationModeFallbackReason == nullptr) {
+        return m_LastPresentLatched ?
+            "vsync-latched: content at the panel's VRR ceiling" :
+            "true VRR pacing";
+    }
+
     return m_PresentationModeFallbackReason;
 }
 
