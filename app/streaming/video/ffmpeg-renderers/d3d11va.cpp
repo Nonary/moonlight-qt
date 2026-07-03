@@ -29,6 +29,11 @@ typedef struct _VERTEX
 #define CSC_MATRIX_PACKED_ELEMENT_COUNT 12
 #define OFFSETS_ELEMENT_COUNT 3
 
+// Consecutive instant in-blank hits (<500us wait) required before the
+// panel is considered back in VRR flip-following after any mid-scan
+// present or chase; see isVrrRasterLockUncertain().
+#define ALIGN_LOCK_STREAK 4
+
 typedef struct _CSC_CONST_BUF
 {
     // CscMatrix value from above but packed and scaled
@@ -84,6 +89,10 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_AlignWaitTotalUs(0),
       m_AlignBudgetTotalUs(0),
       m_AlignStatsStartUs(0),
+      m_TearForensicHead(0),
+      m_TearForensicCount(0),
+      m_PresentCatchUp(false),
+      m_AlignInstantStreak(0),
       m_PresentReadyFenceValue(0),
       m_PresentReadyFenceEvent(nullptr),
       m_PresentReadyFenceFailed(false),
@@ -530,7 +539,7 @@ void D3D11VARenderer::refreshOutput()
     m_ScanoutPeriodUs = displayFps > 0 ? 1000000ULL / displayFps : 0;
 }
 
-void D3D11VARenderer::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs)
+void D3D11VARenderer::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uint64_t latePastTargetUs, bool catchUpPresent)
 {
     // VRR only changes how long the panel is willing to extend its blanking
     // gap while waiting for us - it does not make a DXGI_PRESENT_ALLOW_TEARING
@@ -585,14 +594,22 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs)
     const bool classicPresent =
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0;
     bool reachedBlank = false;
+    bool spunOut = false;
+    uint32_t entryScanPct = 255;
     for (;;) {
         if (D3DKMTGetScanLine(&getScanLine) != 0 /* STATUS_SUCCESS */ || getScanLine.InVerticalBlank) {
             reachedBlank = true;
             break;
         }
 
+        if (entryScanPct == 255 && m_ActiveScanLines != 0) {
+            entryScanPct = qMin((uint32_t)((uint64_t)getScanLine.ScanLine * 100 /
+                                           m_ActiveScanLines), 199u);
+        }
+
         uint64_t elapsedUs = LiGetMicroseconds() - startUs;
         if (elapsedUs >= maxWaitUs) {
+            spunOut = true;
             break;
         }
 
@@ -636,14 +653,55 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs)
     // present that went out mid-scan, i.e. one visible tear, while a skip is
     // a present that never meaningfully tried (a rush with no cadence slack).
     // This is the ground truth to A/B the budget policy against.
+    // Raster-lock tracking for the pacer's re-anchor. A mid-scan give-up
+    // proves the raster is free-running, and a present that only FOUND the
+    // blank after a chase implies it (a flip-following panel sits in
+    // extended blanking waiting for us; measured waits ~0.1ms). But one
+    // instant hit is NOT proof of re-lock: torn presents' beam positions
+    // measure exactly where a fixed 120Hz raster restarted at the last
+    // flip would put them, and such a raster's own trailing blank catches
+    // a present by luck every few frames - a single-hit disarm measurably
+    // leaked (tear, armed catch, lucky instant hit, disarm, tear again).
+    // Require a sustained streak of instant hits before declaring the
+    // panel locked; staying armed while actually locked costs nothing,
+    // since the wide budget is only spent when a chase is needed.
+    if (!reachedBlank || waitedUs > 500) {
+        m_AlignInstantStreak = 0;
+    }
+    else if (m_AlignInstantStreak < ALIGN_LOCK_STREAK) {
+        m_AlignInstantStreak++;
+    }
+
     if (reachedBlank) {
         m_AlignHits++;
     }
-    else if (maxWaitUs < 500) {
-        m_AlignSkips++;
-    }
     else {
-        m_AlignGiveUps++;
+        if (maxWaitUs < 500) {
+            m_AlignSkips++;
+        }
+        else {
+            m_AlignGiveUps++;
+        }
+
+        // Either way this present goes out mid-scan - one visible tear.
+        // Record what state it was in so the periodic forensics line can
+        // attribute the residual tears to a cause: late render (lateUs
+        // beyond the pacer's margin), rush catch-up (catchUp), phase
+        // compression (gapUs under the panel's ~9.1ms flip ceiling), or
+        // lost VRR flip-following (on-time, well-spaced presents that
+        // still find the beam mid-scan).
+        TearForensicSample& s = m_TearForensics[m_TearForensicHead];
+        s.lateUs = (uint32_t)qMin(latePastTargetUs, (uint64_t)9999999);
+        s.gapUs = (m_LastPresentUs != 0 && startUs > m_LastPresentUs) ?
+            (uint32_t)qMin(startUs - m_LastPresentUs, (uint64_t)9999999) : 0;
+        s.entryScanPct = entryScanPct;
+        s.budgetUs = (uint32_t)maxWaitUs;
+        s.catchUp = catchUpPresent;
+        s.spunOut = spunOut;
+        m_TearForensicHead = (m_TearForensicHead + 1) % 16;
+        if (m_TearForensicCount < 16) {
+            m_TearForensicCount++;
+        }
     }
     m_AlignWaitTotalUs += waitedUs;
     m_AlignBudgetTotalUs += maxWaitUs;
@@ -668,6 +726,42 @@ void D3D11VARenderer::logScanlineAlignStatsIfDue(uint64_t nowUs)
                     total != 0 ? (m_AlignBudgetTotalUs / 1000.0) / total : 0.0,
                     m_AlignSkips,
                     m_AlignVsyncLatches);
+
+        // Per-tear attribution for the window's mid-scan presents. Sample
+        // format: late/gap/scan%/budget in ms, then flags - R = rush
+        // catch-up, S = spun out the full budget (no S = fast give-up, the
+        // beam said the blank was out of reach). Reading it: big late =
+        // render overshoot beat the lead margin; gap under ~9.1 = phase
+        // compression; late ~0 with gap ~content-interval and mid-scan
+        // entry = the driver is not in VRR flip-following.
+        if (m_TearForensicCount > 0) {
+            char forensics[512];
+            int off = 0;
+            for (int i = 0; i < m_TearForensicCount; i++) {
+                const TearForensicSample& s = m_TearForensics[
+                    (m_TearForensicHead + 16 - m_TearForensicCount + i) % 16];
+                int len = SDL_snprintf(forensics + off, sizeof(forensics) - off,
+                                       "%s%.1f/%.1f/%u%%/%.1f%s%s",
+                                       i ? ", " : "",
+                                       s.lateUs / 1000.0,
+                                       s.gapUs / 1000.0,
+                                       s.entryScanPct,
+                                       s.budgetUs / 1000.0,
+                                       s.catchUp ? "R" : "",
+                                       s.spunOut ? "S" : "");
+                if (len < 0 || off + len >= (int)sizeof(forensics) - 1) {
+                    break;
+                }
+                off += len;
+            }
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "VRR tear forensics (last %d of %u): late/gap/scan/budget ms = %s",
+                        m_TearForensicCount,
+                        m_AlignGiveUps + m_AlignSkips,
+                        forensics);
+            m_TearForensicCount = 0;
+        }
+
         m_AlignHits = 0;
         m_AlignGiveUps = 0;
         m_AlignSkips = 0;
@@ -1352,13 +1446,20 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         vsyncLatch = m_PresentVsyncLatch;
         m_PresentVsyncLatch = false;
         m_LastPresentLatched = vsyncLatch;
-        holdUntilPresentTarget();
+        bool catchUpPresent = m_PresentCatchUp;
+        m_PresentCatchUp = false;
+        uint64_t latePastTargetUs = holdUntilPresentTarget();
         if (vsyncLatch) {
+            // Latched presents run classic fixed vsync - by the time we
+            // return to tearing presents the panel is certainly not
+            // flip-following, so the re-anchor must start re-armed.
+            m_AlignInstantStreak = 0;
             m_AlignVsyncLatches++;
             logScanlineAlignStatsIfDue(LiGetMicroseconds());
         }
         else {
-            waitForVBlankBeforeTearingPresent(alignBudgetUs);
+            waitForVBlankBeforeTearingPresent(alignBudgetUs, latePastTargetUs,
+                                              catchUpPresent);
         }
 
         // Reacquire the lock for Present(). Any lock delay from an in-flight
@@ -2109,19 +2210,23 @@ uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
 
 void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch)
 {
-    // The catch-up policy is fully encoded in the pacer's alignment budget
-    // (a rush with no cadence slack arrives with ~0), so the flag itself
-    // isn't consulted here.
-    Q_UNUSED(catchUp);
-
+    // The catch-up policy is fully encoded in the pacer's alignment budget,
+    // so the flag doesn't steer presentation - it's recorded purely so tear
+    // forensics can attribute a mid-scan give-up to the catch-up path.
     m_PresentTargetUs = targetUs;
     m_PresentAlignBudgetUs = alignBudgetUs;
     m_PresentVsyncLatch = vsyncLatch;
+    m_PresentCatchUp = catchUp;
 }
 
 uint64_t D3D11VARenderer::getLastPresentUs()
 {
     return m_LastPresentUs;
+}
+
+bool D3D11VARenderer::isVrrRasterLockUncertain()
+{
+    return m_AlignInstantStreak < ALIGN_LOCK_STREAK;
 }
 
 int D3D11VARenderer::getDecoderCapabilities()

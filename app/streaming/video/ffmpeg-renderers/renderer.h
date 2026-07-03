@@ -278,6 +278,20 @@ public:
         // would compound lateness into dropped frames.
     }
 
+    virtual bool isVrrRasterLockUncertain() {
+        // True while the renderer cannot demonstrate that the panel is in
+        // VRR flip-following (extended blanking, waiting on our flips). A
+        // mid-scan present proves the raster is free-running; a present
+        // that only caught the blank after a measurable chase implies it;
+        // and one instant hit is NOT proof of re-lock (a free-running
+        // raster's own trailing blank catches presents by luck). The
+        // cadence pacer grants presents a full-scanout re-anchor budget
+        // while this is true - which costs nothing when the panel is
+        // actually locked, since the budget is only spent if a chase is
+        // needed.
+        return false;
+    }
+
     virtual uint64_t getLastPresentUs() {
         // Timestamp of the most recent Present() call (the true flip instant
         // for renderers that fence GPU completion beforehand), or 0 if

@@ -33,6 +33,7 @@ public:
         m_SourceTimeCap = cap;
         m_SourceTimeHead = 0;
         m_SourceTimeCount = 0;
+        m_TimestamplessFrames = 0;
     }
 
     uint64_t nextTargetUs(uint64_t nowUs, uint64_t sourceTimeUs)
@@ -59,6 +60,20 @@ public:
         // restart) resets the window. It is also naturally immune to the
         // single-spike EMA rides that the pacer's taper hysteresis was added
         // to absorb.
+        if (sourceTimeUs == 0) {
+            // No usable timestamp on this frame. Track a run length so
+            // warmedUp() can report a stream that never carries timestamps
+            // as warm instead of perpetually cold - there is nothing to
+            // measure, and pacing already free-runs off the nominal
+            // interval in that case.
+            if (m_TimestamplessFrames < 1000) {
+                m_TimestamplessFrames++;
+            }
+        }
+        else {
+            m_TimestamplessFrames = 0;
+        }
+
         if (m_LastSourceTimeUs != 0 && sourceTimeUs > m_LastSourceTimeUs) {
             uint64_t sourceDeltaUs = sourceTimeUs - m_LastSourceTimeUs;
             if (sourceDeltaUs > m_NominalFrameIntervalUs * 4) {
@@ -134,6 +149,20 @@ public:
         return m_SmoothedIntervalUs;
     }
 
+    bool warmedUp() const
+    {
+        // A full window of monotonic samples (~0.5s). Goes false on reset()
+        // and whenever the window restarts - a >4x-nominal stall or a
+        // non-monotonic timestamp - which are exactly the moments the
+        // smoothed interval is least trustworthy (stream bring-up, loading
+        // screens, entering a game). Streams that never carry usable
+        // timestamps report warm: nothing to measure.
+        if (m_TimestamplessFrames >= 32) {
+            return true;
+        }
+        return m_SourceTimeCount >= m_SourceTimeCap;
+    }
+
 private:
     static const int MAX_SOURCE_TIMES = 128;
 
@@ -146,6 +175,7 @@ private:
     int m_SourceTimeCap;
     int m_SourceTimeHead;
     int m_SourceTimeCount;
+    int m_TimestamplessFrames;
 };
 
 template<typename NowFn, typename SleepUntilFn, typename YieldFn, typename StopFn>

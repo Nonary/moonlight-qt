@@ -124,6 +124,7 @@ public:
     Q_PROPERTY(bool absoluteTouchMode MEMBER absoluteTouchMode NOTIFY absoluteTouchModeChanged)
     Q_PROPERTY(bool framePacing MEMBER framePacing NOTIFY framePacingChanged)
     Q_PROPERTY(bool vrrTearing MEMBER vrrTearing NOTIFY vrrTearingChanged)
+    Q_PROPERTY(int vrrCushionUs MEMBER vrrCushionUs NOTIFY vrrCushionUsChanged)
     Q_PROPERTY(bool connectionWarnings MEMBER connectionWarnings NOTIFY connectionWarningsChanged)
     Q_PROPERTY(bool configurationWarnings MEMBER configurationWarnings NOTIFY configurationWarningsChanged)
     Q_PROPERTY(bool richPresence MEMBER richPresence NOTIFY richPresenceChanged)
@@ -166,6 +167,7 @@ public:
     bool absoluteTouchMode;
     bool framePacing;
     bool vrrTearing;
+    int vrrCushionUs;
     bool connectionWarnings;
     bool configurationWarnings;
     bool richPresence;
@@ -213,6 +215,7 @@ signals:
     void windowModeChanged();
     void framePacingChanged();
     void vrrTearingChanged();
+    void vrrCushionUsChanged();
     void connectionWarningsChanged();
     void configurationWarningsChanged();
     void richPresenceChanged();

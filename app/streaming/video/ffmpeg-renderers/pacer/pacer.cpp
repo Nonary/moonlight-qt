@@ -33,6 +33,12 @@ static_assert(PACER_MAX_OUTSTANDING_FRAMES == MAX_QUEUED_FRAMES + 2,
 #define CADENCE_YIELD_THRESHOLD_US 200
 #define MAX_RECORDED_FRAME_INTERVAL_US 1000000
 #define FRAME_DIAGNOSTIC_DUMP_INTERVAL_US 30000000
+
+// Frames rendered this soon after the first render are startup ramp
+// (decoder warmup, stream bring-up stalls of 100-250ms), not pacing
+// signal; they would otherwise pollute the session-wide interval
+// max/stddev and fire a guaranteed cadence-anomaly dump on every launch.
+#define STARTUP_WARMUP_PERIOD_US 1500000
 #define FRAME_DIAGNOSTIC_DUMP_SAMPLES 96
 #define RTP_TIMESTAMP_HZ 90000
 
@@ -81,10 +87,13 @@ Pacer::Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats) :
     m_MaxVideoFps(0),
     m_DisplayFps(0),
     m_VrrTearingPreferred(false),
+    m_VrrCushionUs(4500),
     m_VideoStats(videoStats),
     m_RendererAttributes(0),
     m_LastRenderTimeUs(0),
+    m_FirstRenderTimeUs(0),
     m_EstimatedRenderTimeUs(1000),
+    m_LastNetRenderTimeUs(0),
     m_LastFrameDiagnosticDumpUs(0),
     m_FrameDiagnosticRingIndex(0),
     m_FrameDiagnosticRingCount(0),
@@ -220,8 +229,51 @@ int Pacer::cadenceThread(void* context)
     // 500us margin let ~30% of frames overshoot their hold and present
     // unaligned (phase noise + mid-scan tears). In classic present mode the
     // renderer presents as soon as it's aligned, so no lead is applied there.
-    const uint64_t leadMarginUs =
-        qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0 ? 0 : 4000;
+    //
+    // The margin is ADAPTIVE: the fixed 4ms that validated on real hardware
+    // pays worst-case insurance on every frame, and on a steady scene it is
+    // simply 2-3ms of added display latency. Track how far each render's
+    // net time overshoots the EMA it was scheduled with, and size the margin
+    // to the worst overshoot seen in the recent window plus slack.
+    // Asymmetric on purpose - a single overshoot beyond the current margin
+    // raises it IMMEDIATELY (the next frame is already protected), while
+    // recovery glides down slowly, so one stutter buys seconds of widened
+    // protection but genuinely steady scenes still converge to ~1.5-2.5ms.
+    //
+    // The window/glide/ceiling are sized to how tears actually happened on
+    // real hitchy content (measured 2026-07-03): a render that overshoots
+    // the margin presents late, lands mid-scan, and the aligner rightly
+    // gives up (blank out of reach) - one visible tear per overshoot. With
+    // a 3s window and 50us/frame glide the margin cycled 5.0 -> 2.2 -> 5.0
+    // endlessly, and every glide-down re-exposed the next spike: 2-4% torn
+    // presents in every gameplay window, while the user-validated fixed-4ms
+    // era tore far less. Games hitch on a 5-15s rhythm (loads, shader
+    // comp, combat bursts), so the margin must REMEMBER a spike across
+    // that rhythm: ~12s of overshoot history, a ~10us/frame glide
+    // (~0.9ms/s), and a 6.5ms ceiling that actually covers the measured
+    // 5-6.5ms overshoot tail (7ms+ spikes stay uncovered by choice - rare
+    // enough to eat, and chasing them costs standing latency). Latency
+    // only rises while the content itself demonstrates it is misbehaving.
+    // MOONLIGHT_VRR_FIXED_MARGIN=1 restores the fixed 4ms (or =<us> for a
+    // custom fixed value) for A/B comparison.
+    const bool classicPresent =
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0;
+    const int fixedMarginEnv =
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_FIXED_MARGIN");
+    const bool adaptiveMargin = !classicPresent && fixedMarginEnv == 0;
+    const uint64_t marginFloorUs = 1000;
+    const uint64_t marginCeilUs = 6500;
+    const uint64_t marginSlackUs = 750;
+    const uint64_t marginGlideUs = 10;
+    const int overshootWindowCap = me->m_MaxVideoFps > 0 ?
+        qBound(60, me->m_MaxVideoFps * 12, 1536) : 720;
+    int32_t overshootRing[1536];
+    int overshootHead = 0;
+    int overshootCount = 0;
+    uint64_t lastMarginLogUs = 0;
+    uint64_t lastLoggedMarginUs = 0;
+    uint64_t leadMarginUs =
+        classicPresent ? 0 : (fixedMarginEnv > 1 ? (uint64_t)fixedMarginEnv : 4000);
 
     // Rolling ~500ms of pacing queue depth, mirroring the hysteresis the
     // handleVsync/renderFrame paths already use. Network jitter routinely
@@ -245,14 +297,50 @@ int Pacer::cadenceThread(void* context)
 
     // Standing-latency servo state (see the trim block below).
     // MOONLIGHT_VRR_NO_TRIM=1 disables it for A/B comparison.
+    //
+    // The cushion is the latency-vs-tearing sweet-spot dial. The pre-servo
+    // builds carried a standing 8-9ms queue that measured near-zero tears:
+    // every frame sat ~8ms in the pipeline, so no arrival wobble or render
+    // spike could make a present late. Trimming to a 2.5ms cushion
+    // reclaimed that latency but converted the protection into exposure -
+    // the user judged the result as tearing "a lot" against the old build
+    // on the same content. The default sits in between; the lead margin
+    // covers render-time spikes while this cushion covers arrival jitter,
+    // and the two add. The value comes from the "VRR pacing buffer"
+    // setting in the UI (default 4500), with MOONLIGHT_VRR_CUSHION_US
+    // overriding it for A/B (2500 = old aggressive trim, 6000 = maximum;
+    // clamped because at 100fps content a cushion much past 6ms parks
+    // pipeline age over the 1.25-interval stale threshold and the schedule
+    // thrashes in rush catch-ups).
     const bool latencyTrimEnabled =
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_TRIM") == 0;
+    const int cushionEnv =
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_CUSHION_US");
+    const int cushionCfgUs = cushionEnv > 0 ? cushionEnv :
+        (me->m_VrrCushionUs > 0 ? me->m_VrrCushionUs : 4500);
+    const uint64_t queueCushionUs =
+        qBound((uint64_t)1500, (uint64_t)cushionCfgUs, (uint64_t)6000);
+    const uint64_t trimDeadbandUs = queueCushionUs + 1000;
     const int slackWindowCap =
         me->m_MaxVideoFps > 0 ? qMax(me->m_MaxVideoFps / 2, 16) : 30;
     uint64_t slackWindowMinUs = UINT64_MAX;
     int slackWindowSamples = 0;
     uint64_t trimStepUs = 0;
     uint64_t lastTrimLogUs = 0;
+
+    // Post-stall recovery tuning (the flip-spacing floor, staleSchedule
+    // catch-up, rush-budget floor and cadence-cold latch below). The panel's
+    // tear-free flip ceiling sits ~750us above the nominal max-refresh
+    // spacing (the same hardware measurement the near-ceiling taper
+    // thresholds encode); a tearing-allowed present spaced tighter than that
+    // is a guaranteed mid-scan tear no matter how well it is phase-aligned.
+    // MOONLIGHT_VRR_CLASSIC_RECOVERY=1 restores the old recovery behavior
+    // (nominal-spacing catch-up, zero-budget rush presents, no cadence-cold
+    // latch) for A/B.
+    const bool classicRecovery =
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_RECOVERY") != 0;
+    const uint64_t flipCeilingSlackUs = 750;
+    const uint64_t rushAlignFloorUs = 600;
 
     while (!me->m_Stopping) {
         me->m_FrameQueueLock.lock();
@@ -313,6 +401,76 @@ int Pacer::cadenceThread(void* context)
         // at 90fps on a 120fps stream delivers frames every ~11.1ms).
         uint64_t measuredSourceIntervalUs = cadenceClock.smoothedIntervalUs();
 
+        uint64_t minFrameIntervalUs = me->m_DisplayFps > 0 ? (1000000ULL / me->m_DisplayFps) : 0;
+
+        // Taper-zone hysteresis: drop to the taper immediately once the
+        // cadence closes to within ~1.35ms of the panel's max flip spacing
+        // (content above ~103fps on 120Hz); rearm full alignment only after
+        // the EMA has shown ~100fps-or-less worth of headroom for a
+        // sustained run. The dwell is a leaky counter rather than a
+        // consecutive requirement so boundary wobble (content hovering
+        // right at ~100fps) makes steady progress instead of resetting.
+        //
+        // The entry margin deliberately sits ~600us BELOW the panel's
+        // tear-free flip ceiling (~750us above max-refresh spacing), not at
+        // it: the band between this threshold and the ceiling is the worst
+        // measured operating zone for true VRR, not a usable one. At
+        // 105-109fps content on the 120Hz panel there is near-zero cadence
+        // slack, so alignment waits eat the pipeline's absorb margin -
+        // measured as 36-57% tears with 1.4-4% continuous drops - while the
+        // same content vsync-latched measures 0.0% tears and 0.00% drops.
+        // Do not widen this margin toward the ceiling without hardware
+        // measurements showing that zone has become viable.
+        if (measuredSourceIntervalUs < minFrameIntervalUs + 1350) {
+            alignTapered = true;
+            alignFullDwell = 0;
+        }
+        else if (measuredSourceIntervalUs >= minFrameIntervalUs + 1600) {
+            if (alignFullDwell < 24) {
+                alignFullDwell++;
+            }
+            else {
+                alignTapered = false;
+            }
+        }
+        else if (alignFullDwell > 0) {
+            alignFullDwell--;
+        }
+
+        bool latchAvailable = !me->m_VrrTearingPreferred &&
+            qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_LATCH") == 0;
+
+        // Cadence-cold grace: the clock's sample window restarts on any real
+        // stall (stream bring-up, loading screens, entering a game - all the
+        // places content cadence genuinely ramps), and until it refills
+        // (~0.5s of monotonic timestamps) the measured interval is a warmup
+        // EMA that free-run alignment can't be trusted to schedule against.
+        // The measured early-session tear storms (11-31% tear windows, 41%
+        // of one session's total tears inside the first ~35s) all sat in
+        // these cold spans. Latch tear-free until the window is warm:
+        // content is chaotic at those moments anyway, so the vsync
+        // quantization is imperceptible and the cost lasts under a second
+        // per stall.
+        bool cadenceColdLatch = latchAvailable && !classicRecovery &&
+            !cadenceClock.warmedUp();
+
+        bool vsyncLatchPresent = (alignTapered || cadenceColdLatch) &&
+            latchAvailable;
+
+        // Every free-run spacing floor below uses the measured flip ceiling,
+        // not the nominal max-refresh spacing: a tearing-allowed present
+        // tighter than the ceiling is a guaranteed mid-scan tear. Latched
+        // presents keep the nominal floor - the vblank enforces its own
+        // spacing, and holding taper-zone renders (105-115fps content) to
+        // the wider floor would starve service below the arrival rate.
+        // Tearing-preferred users keep the nominal floor too: they traded
+        // tears for latency.
+        uint64_t flipSpacingFloorUs = minFrameIntervalUs;
+        if (!classicRecovery && !vsyncLatchPresent &&
+            !me->m_VrrTearingPreferred) {
+            flipSpacingFloorUs += flipCeilingSlackUs;
+        }
+
         // Belt-and-suspenders on top of the clock's own max-refresh floor: the
         // clock only knows the last INTENDED target, not whether the actual
         // flip overran it (common right after a stall/catch-up recovery,
@@ -327,15 +485,14 @@ int Pacer::cadenceThread(void* context)
         // dropped as "vrr cadence queue drop" (measured 16%+ of the stream),
         // and the over-spaced targets land mid-scan, lengthening the next
         // alignment wait - a self-reinforcing tearing/dropping regime.
-        uint64_t minFrameIntervalUs = me->m_DisplayFps > 0 ? (1000000ULL / me->m_DisplayFps) : 0;
         uint64_t lastFlipUs = me->m_VsyncRenderer->getLastPresentUs();
         if (lastFlipUs == 0) {
             // Renderer doesn't report its present instant; fall back to
             // renderFrame() completion (the old, slightly-late behavior).
             lastFlipUs = me->m_LastRenderTimeUs;
         }
-        if (lastFlipUs != 0 && targetUs < lastFlipUs + minFrameIntervalUs) {
-            targetUs = lastFlipUs + minFrameIntervalUs;
+        if (lastFlipUs != 0 && targetUs < lastFlipUs + flipSpacingFloorUs) {
+            targetUs = lastFlipUs + flipSpacingFloorUs;
         }
 
         // Detect a schedule that has drifted late relative to frame delivery:
@@ -366,7 +523,14 @@ int Pacer::cadenceThread(void* context)
         bool rushPresent = false;
         if (lastFlipUs != 0) {
             if (staleSchedule) {
-                uint64_t catchUpUs = qMax(lastFlipUs + minFrameIntervalUs,
+                // Catch up at the free-run flip spacing floor (the measured
+                // ceiling, see above): stale bursts emitted at nominal
+                // max-refresh spacing were the dominant steady-state tear
+                // source on hitchy content - measured ~2.5% of presents
+                // (~2 tears/sec at 88fps) clustered around game hitches.
+                // The extra 750us per catch-up frame is immaterial against
+                // the >1.25-interval lateness that triggered the rush.
+                uint64_t catchUpUs = qMax(lastFlipUs + flipSpacingFloorUs,
                                           LiGetMicroseconds());
                 if (catchUpUs < targetUs) {
                     targetUs = catchUpUs;
@@ -375,7 +539,7 @@ int Pacer::cadenceThread(void* context)
                 rushPresent = true;
             }
             else if (backlogged) {
-                uint64_t drainIntervalUs = qMax(minFrameIntervalUs,
+                uint64_t drainIntervalUs = qMax(flipSpacingFloorUs,
                                                 measuredSourceIntervalUs * 7 / 8);
                 uint64_t drainUs = qMax(lastFlipUs + drainIntervalUs,
                                         LiGetMicroseconds());
@@ -392,7 +556,8 @@ int Pacer::cadenceThread(void* context)
         // here would make every flip late by that much, which is exactly what
         // leaves tears near the frame edges instead of landing presents on
         // the panel's refresh boundary.
-        uint64_t renderLeadUs = me->m_EstimatedRenderTimeUs + leadMarginUs;
+        uint64_t schedEstUs = me->m_EstimatedRenderTimeUs;
+        uint64_t renderLeadUs = schedEstUs + leadMarginUs;
 
         // Standing-latency servo. The schedule's phase only ever moves LATER
         // on its own: a stall snaps the clock's target onto the processing
@@ -407,7 +572,7 @@ int Pacer::cadenceThread(void* context)
         // the frame that arrived closest to its slot bounds how phase-late
         // the whole schedule is - and counter it with a per-frame trim rate
         // that spreads that excess over the next window, holding the floor
-        // at a ~2.5-3.5ms cushion. The rate tops out at 250us/frame
+        // at the queueCushionUs shock-absorber. The rate tops out at 250us/frame
         // (~1.5-2.5% cadence compression, far below the 12% drain tier
         // already judged imperceptible), and one late frame in the window
         // vetoes the trim, so links whose jitter genuinely needs the queue
@@ -421,9 +586,10 @@ int Pacer::cadenceThread(void* context)
 
             if (++slackWindowSamples >= slackWindowCap) {
                 uint64_t newStepUs = 0;
-                if (!backlogged && !staleSchedule && slackWindowMinUs > 3500) {
+                if (!backlogged && !staleSchedule &&
+                        slackWindowMinUs > trimDeadbandUs) {
                     newStepUs = qBound((uint64_t)20,
-                                       (slackWindowMinUs - 2500) / (uint64_t)slackWindowCap,
+                                       (slackWindowMinUs - queueCushionUs) / (uint64_t)slackWindowCap,
                                        (uint64_t)250);
                 }
                 if (newStepUs != 0 && trimStepUs == 0 &&
@@ -448,8 +614,8 @@ int Pacer::cadenceThread(void* context)
             }
             else {
                 uint64_t floorUs = nowUs;
-                if (lastFlipUs != 0 && floorUs < lastFlipUs + minFrameIntervalUs) {
-                    floorUs = lastFlipUs + minFrameIntervalUs;
+                if (lastFlipUs != 0 && floorUs < lastFlipUs + flipSpacingFloorUs) {
+                    floorUs = lastFlipUs + flipSpacingFloorUs;
                 }
                 uint64_t trimmedUs = targetUs > trimStepUs ?
                     targetUs - trimStepUs : floorUs;
@@ -491,32 +657,8 @@ int Pacer::cadenceThread(void* context)
              measuredSourceIntervalUs > minFrameIntervalUs + 200) ?
                 measuredSourceIntervalUs - minFrameIntervalUs - 200 : 0;
 
-        // Taper-zone hysteresis: drop to the taper immediately once the
-        // cadence closes to within ~1.35ms of the panel's max flip spacing
-        // (content above ~103fps on 120Hz); rearm full alignment only after
-        // the EMA has shown ~100fps-or-less worth of headroom for a
-        // sustained run. The dwell is a leaky counter rather than a
-        // consecutive requirement so boundary wobble (content hovering
-        // right at ~100fps) makes steady progress instead of resetting.
-        if (measuredSourceIntervalUs < minFrameIntervalUs + 1350) {
-            alignTapered = true;
-            alignFullDwell = 0;
-        }
-        else if (measuredSourceIntervalUs >= minFrameIntervalUs + 1600) {
-            if (alignFullDwell < 24) {
-                alignFullDwell++;
-            }
-            else {
-                alignTapered = false;
-            }
-        }
-        else if (alignFullDwell > 0) {
-            alignFullDwell--;
-        }
-
         uint64_t alignBudgetUs;
-        bool vsyncLatchPresent = false;
-        if (alignTapered) {
+        if (alignTapered || cadenceColdLatch) {
             // Content near or above this panel's true tear-free flip
             // ceiling (empirically ~110fps on the 120Hz Ally X panel, i.e.
             // ~750us above the nominal max-refresh spacing) has no tear-free
@@ -537,20 +679,31 @@ int Pacer::cadenceThread(void* context)
             // MOONLIGHT_VRR_NO_LATCH=1 for A/B) opts into tear-and-snap
             // instead: immediate flips shave a few ms of display latency at
             // the cost of visible tearing.
-            vsyncLatchPresent = !me->m_VrrTearingPreferred &&
-                qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_LATCH") == 0;
             alignBudgetUs = vsyncLatchPresent ? 0 : 3000;
         }
         else if (rushPresent) {
             // A catch-up present may only spend the cadence's real per-frame
-            // slack (content interval over the panel's max flip spacing). At
-            // near-max-refresh content that is ~0 and it presents
-            // immediately, exactly as before: a possible tear still beats
-            // compounding lateness into dropped frames. With headroom, the
-            // drain runs a shade slower but stays aligned, so a jitter storm
-            // of rush presents can no longer break the panel's VRR lock.
+            // slack (content interval over the panel's max flip spacing), so
+            // with headroom the drain runs a shade slower but stays aligned
+            // and a jitter storm of rush presents can no longer break the
+            // panel's VRR lock.
+            //
+            // Floored rather than allowed to starve to zero: a heavy stream
+            // (render time near the content interval) zeroes threadSlackUs,
+            // and a zero-budget rush present goes out blind. With catch-up
+            // spacing held at the flip ceiling the blank is due almost
+            // immediately, so a sub-ms wait usually converts a guaranteed
+            // tear into an aligned flip; 600us is ~5% of an interval and
+            // cannot compound lateness into drops the way an unbounded wait
+            // would. (Content here is below the taper threshold, so
+            // cadenceSlackUs is already >=~1.1ms - the floor only ever
+            // overrides render-bound starvation.)
             alignBudgetUs = qMin(qMin(cadenceSlackUs, threadSlackUs),
                                  (uint64_t)2500);
+            if (!classicRecovery && !me->m_VrrTearingPreferred &&
+                    alignBudgetUs < rushAlignFloorUs) {
+                alignBudgetUs = rushAlignFloorUs;
+            }
         }
         else {
             // Real headroom: floor at the fixed 3ms spin that reached
@@ -567,6 +720,25 @@ int Pacer::cadenceThread(void* context)
             uint64_t maxAlignUs = backlogged ?
                 (uint64_t)3000 : qMax((uint64_t)3000, minFrameIntervalUs + 2000);
             alignBudgetUs = qBound((uint64_t)3000, threadSlackUs, maxAlignUs);
+
+            // Forensics-driven re-anchor: while the renderer cannot prove
+            // the panel is back in VRR flip-following, every floor-spaced
+            // present lands at the free-running raster's whim - and at
+            // heavy render loads threadSlackUs starves this budget to its
+            // 3ms floor, which cannot reach a blank up to a full scanout
+            // away. Measured (2026-07-03 forensics) as the DOMINANT
+            // residual tear population: first as chains of late~0 /
+            // gap~9.1ms give-ups after each trigger tear, then - once a
+            // one-shot re-anchor broke the chains - as an alternating
+            // tear/catch pattern whenever the raster ran fixed-cadence.
+            // Keep the full-scanout budget until the lock is demonstrated;
+            // it costs nothing while the panel is actually following, and
+            // never applies while backlogged, where wide waits deepen a
+            // genuine overload's drop cascade.
+            if (!classicRecovery && !backlogged &&
+                    me->m_VsyncRenderer->isVrrRasterLockUncertain()) {
+                alignBudgetUs = maxAlignUs;
+            }
         }
 
         me->waitUntil(targetRenderStartUs);
@@ -580,6 +752,58 @@ int Pacer::cadenceThread(void* context)
                                                 vsyncLatchPresent);
         me->m_VsyncRenderer->waitToRender();
         me->renderFrame(frame);
+
+        if (adaptiveMargin) {
+            int64_t overshootUs64 =
+                (int64_t)me->m_LastNetRenderTimeUs - (int64_t)schedEstUs;
+            if (overshootUs64 > INT32_MAX) {
+                overshootUs64 = INT32_MAX;
+            }
+            else if (overshootUs64 < INT32_MIN) {
+                overshootUs64 = INT32_MIN;
+            }
+            overshootRing[overshootHead] = (int32_t)overshootUs64;
+            overshootHead = (overshootHead + 1) % overshootWindowCap;
+            if (overshootCount < overshootWindowCap) {
+                overshootCount++;
+            }
+
+            int32_t windowMaxUs = INT32_MIN;
+            for (int i = 0; i < overshootCount; i++) {
+                windowMaxUs = qMax(windowMaxUs, overshootRing[i]);
+            }
+
+            uint64_t targetMarginUs = windowMaxUs > 0 ?
+                qBound(marginFloorUs,
+                       (uint64_t)windowMaxUs + marginSlackUs,
+                       marginCeilUs) :
+                marginFloorUs;
+            if (targetMarginUs > leadMarginUs) {
+                // A render just ran longer than the margin planned for -
+                // protect the very next frame rather than averaging in the
+                // spike over time. Stutter costs more than latency here.
+                leadMarginUs = targetMarginUs;
+            }
+            else if (leadMarginUs > targetMarginUs) {
+                leadMarginUs -= qMin(leadMarginUs - targetMarginUs,
+                                     marginGlideUs);
+            }
+
+            uint64_t marginDeltaUs = leadMarginUs > lastLoggedMarginUs ?
+                leadMarginUs - lastLoggedMarginUs :
+                lastLoggedMarginUs - leadMarginUs;
+            if (marginDeltaUs > 750) {
+                uint64_t logNowUs = LiGetMicroseconds();
+                if (logNowUs - lastMarginLogUs > 30000000ULL) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR lead margin: %.2f ms (worst render overshoot %.2f ms in window)",
+                                leadMarginUs / 1000.0,
+                                windowMaxUs > 0 ? windowMaxUs / 1000.0 : 0.0);
+                    lastMarginLogUs = logNowUs;
+                    lastLoggedMarginUs = leadMarginUs;
+                }
+            }
+        }
     }
 
     me->m_VsyncRenderer->cleanupRenderContext();
@@ -725,10 +949,13 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
     enqueueFrameForRenderingAndUnlock(m_PacingQueue.dequeue());
 }
 
-bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrrTearing)
+bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrrTearing, int vrrCushionUs)
 {
     m_MaxVideoFps = maxVideoFps;
     m_VrrTearingPreferred = enableVrrTearing;
+    if (vrrCushionUs > 0) {
+        m_VrrCushionUs = vrrCushionUs;
+    }
     m_DisplayFps = StreamUtils::getDisplayRefreshRate(window);
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
     m_PresentationMode = m_VsyncRenderer->getPresentationMode();
@@ -838,6 +1065,12 @@ void Pacer::renderFrame(AVFrame* frame)
     uint64_t alignmentWaitUs = m_VsyncRenderer->popPresentAlignmentWaitUs();
     renderTimeUs -= qMin(renderTimeUs, alignmentWaitUs);
 
+    // Unclamped net render time for the cadence thread's adaptive lead
+    // margin - the interval clamp below is right for the EMA (a genuine
+    // overload shouldn't drag the schedule a whole frame early) but would
+    // hide exactly the spikes the margin must cover.
+    m_LastNetRenderTimeUs = renderTimeUs;
+
     uint64_t maxEstimateUs = m_MaxVideoFps != 0 ? 1000000ULL / m_MaxVideoFps : 16666ULL;
     renderTimeUs = qMin(renderTimeUs, maxEstimateUs);
     m_EstimatedRenderTimeUs = (m_EstimatedRenderTimeUs * 7 + renderTimeUs) / 8;
@@ -909,23 +1142,31 @@ void Pacer::recordFrameInterval(uint64_t beforeRenderUs, uint64_t afterRenderUs,
 {
     uint32_t intervalUs = 0;
 
+    if (m_FirstRenderTimeUs == 0) {
+        m_FirstRenderTimeUs = afterRenderUs;
+    }
+    bool startupWarmup = afterRenderUs < m_FirstRenderTimeUs + STARTUP_WARMUP_PERIOD_US;
+
     if (m_LastRenderTimeUs != 0) {
         uint64_t intervalUs64 = afterRenderUs - m_LastRenderTimeUs;
 
         if (intervalUs64 <= MAX_RECORDED_FRAME_INTERVAL_US) {
             intervalUs = (uint32_t)intervalUs64;
-            m_VideoStats->totalFrameIntervalUs += intervalUs;
-            m_VideoStats->totalSquaredFrameIntervalUs += (uint64_t)intervalUs * intervalUs;
-            m_VideoStats->frameIntervalSamples++;
 
-            if (m_VideoStats->minFrameIntervalUs == 0) {
-                m_VideoStats->minFrameIntervalUs = intervalUs;
-            }
-            else {
-                m_VideoStats->minFrameIntervalUs = qMin(m_VideoStats->minFrameIntervalUs, intervalUs);
-            }
+            if (!startupWarmup) {
+                m_VideoStats->totalFrameIntervalUs += intervalUs;
+                m_VideoStats->totalSquaredFrameIntervalUs += (uint64_t)intervalUs * intervalUs;
+                m_VideoStats->frameIntervalSamples++;
 
-            m_VideoStats->maxFrameIntervalUs = qMax(m_VideoStats->maxFrameIntervalUs, intervalUs);
+                if (m_VideoStats->minFrameIntervalUs == 0) {
+                    m_VideoStats->minFrameIntervalUs = intervalUs;
+                }
+                else {
+                    m_VideoStats->minFrameIntervalUs = qMin(m_VideoStats->minFrameIntervalUs, intervalUs);
+                }
+
+                m_VideoStats->maxFrameIntervalUs = qMax(m_VideoStats->maxFrameIntervalUs, intervalUs);
+            }
         }
     }
 
@@ -939,7 +1180,7 @@ void Pacer::recordFrameInterval(uint64_t beforeRenderUs, uint64_t afterRenderUs,
     m_FrameDiagnosticRingIndex = (m_FrameDiagnosticRingIndex + 1) % PACER_FRAME_DIAGNOSTIC_RING_SIZE;
     m_FrameDiagnosticRingCount = qMin<uint32_t>(m_FrameDiagnosticRingCount + 1, PACER_FRAME_DIAGNOSTIC_RING_SIZE);
 
-    if (intervalUs != 0) {
+    if (intervalUs != 0 && !startupWarmup) {
         uint32_t expectedIntervalUs = m_MaxVideoFps != 0 ? 1000000 / m_MaxVideoFps : 0;
         uint32_t longIntervalThresholdUs = qMax(expectedIntervalUs * 5 / 2, expectedIntervalUs + 20000);
         uint32_t shortIntervalThresholdUs = expectedIntervalUs / 3;

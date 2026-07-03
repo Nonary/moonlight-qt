@@ -40,7 +40,7 @@ public:
 
     void submitFrame(AVFrame* frame);
 
-    bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrrTearing);
+    bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrrTearing, int vrrCushionUs);
 
     void signalVsync();
 
@@ -100,10 +100,13 @@ private:
     int m_MaxVideoFps;
     int m_DisplayFps;
     bool m_VrrTearingPreferred;
+    int m_VrrCushionUs;
     PVIDEO_STATS m_VideoStats;
     int m_RendererAttributes;
     uint64_t m_LastRenderTimeUs;
+    uint64_t m_FirstRenderTimeUs;
     uint64_t m_EstimatedRenderTimeUs;
+    uint64_t m_LastNetRenderTimeUs;
     uint64_t m_LastFrameDiagnosticDumpUs;
     std::array<FrameDiagnosticSample, PACER_FRAME_DIAGNOSTIC_RING_SIZE> m_FrameDiagnosticRing;
     uint32_t m_FrameDiagnosticRingIndex;

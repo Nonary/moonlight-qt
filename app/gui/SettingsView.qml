@@ -890,6 +890,59 @@ Flickable {
                     ToolTip.text: qsTr("When the stream FPS runs above your display's tear-free VRR range, present frames immediately for the lowest latency instead of latching them to vsync. May show visible tearing.\nHas no effect at FPS values within the VRR range, where VRR is always tear-free and low-latency.")
                 }
 
+                Label {
+                    width: parent.width
+                    id: vrrCushionTitle
+                    text: qsTr("VRR pacing buffer")
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                }
+
+                AutoResizingComboBox {
+                    // ignore setting the index at first, and actually set it when the component is loaded
+                    Component.onCompleted: {
+                        var savedCushion = StreamingPreferences.vrrCushionUs
+                        currentIndex = 1
+                        for (var i = 0; i < vrrCushionListModel.count; i++) {
+                            var thisCushion = vrrCushionListModel.get(i).val;
+                            if (savedCushion === thisCushion) {
+                                currentIndex = i
+                                break
+                            }
+                        }
+                        activated(currentIndex)
+                    }
+
+                    id: vrrCushionComboBox
+                    enabled: StreamingPreferences.enableVsync
+                    hoverEnabled: true
+                    textRole: "text"
+                    model: ListModel {
+                        id: vrrCushionListModel
+                        ListElement {
+                            text: qsTr("Lowest latency")
+                            val: 2500
+                        }
+                        ListElement {
+                            text: qsTr("Balanced (Recommended)")
+                            val: 4500
+                        }
+                        ListElement {
+                            text: qsTr("Smoothest")
+                            val: 6000
+                        }
+                    }
+                    // ::onActivated must be used, as it only listens for when the index is changed by a human
+                    onActivated : {
+                        StreamingPreferences.vrrCushionUs = model.get(currentIndex).val
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("How long frames may wait in a small buffer that absorbs network and game hiccups during VRR streaming. A larger buffer prevents tearing and stutter when the stream is unsteady; a smaller one shaves a few milliseconds of latency but tears more during hiccups.\nBecause a VRR display refreshes the moment each frame is presented, this buffer replaces the wait for the next fixed vsync tick - so total latency stays comparable to ordinary V-Sync even at the Smoothest setting.")
+                }
+
                 CheckBox {
                     id: enableHdr
                     width: parent.width

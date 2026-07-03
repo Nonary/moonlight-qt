@@ -30,6 +30,7 @@ public:
     virtual uint64_t popPresentAlignmentWaitUs() override;
     virtual void setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch) override;
     virtual uint64_t getLastPresentUs() override;
+    virtual bool isVrrRasterLockUncertain() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
     virtual void waitToRender() override;
@@ -75,7 +76,7 @@ private:
     void refreshOutput();
     bool signalAndUnlockForPresent();
     uint64_t holdUntilPresentTarget();
-    void waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs);
+    void waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uint64_t latePastTargetUs = 0, bool catchUpPresent = false);
     void logScanlineAlignStatsIfDue(uint64_t nowUs);
 
     int m_DecoderSelectionPass;
@@ -114,6 +115,24 @@ private:
     uint64_t m_AlignWaitTotalUs;
     uint64_t m_AlignBudgetTotalUs;
     uint64_t m_AlignStatsStartUs;
+
+    // Per-tear forensics: one sample per mid-scan give-up, dumped alongside
+    // the 10s scanline-align stats to attribute residual tears to a cause
+    // (late render vs rush catch-up vs phase compression vs lost VRR
+    // flip-following).
+    struct TearForensicSample {
+        uint32_t lateUs;        // how far past the pacer's target the hold ended
+        uint32_t gapUs;         // spacing from the previous Present() call
+        uint32_t entryScanPct;  // beam position at align entry, % of active scanout (255 = unknown)
+        uint32_t budgetUs;      // align budget this present carried
+        bool catchUp;           // pacer flagged it as a rush/catch-up present
+        bool spunOut;           // burned the full budget (vs fast predicted-unreachable give-up)
+    };
+    TearForensicSample m_TearForensics[16];
+    int m_TearForensicHead;
+    int m_TearForensicCount;
+    bool m_PresentCatchUp;
+    int m_AlignInstantStreak;
     Microsoft::WRL::ComPtr<ID3D11Fence> m_PresentReadyFence;
     uint64_t m_PresentReadyFenceValue;
     HANDLE m_PresentReadyFenceEvent;
