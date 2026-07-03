@@ -40,7 +40,7 @@ public:
 
     void submitFrame(AVFrame* frame);
 
-    bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing);
+    bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrrTearing);
 
     void signalVsync();
 
@@ -99,6 +99,7 @@ private:
     IFFmpegRenderer* m_VsyncRenderer;
     int m_MaxVideoFps;
     int m_DisplayFps;
+    bool m_VrrTearingPreferred;
     PVIDEO_STATS m_VideoStats;
     int m_RendererAttributes;
     uint64_t m_LastRenderTimeUs;

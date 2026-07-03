@@ -80,6 +80,7 @@ Pacer::Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats) :
     m_VsyncRenderer(renderer),
     m_MaxVideoFps(0),
     m_DisplayFps(0),
+    m_VrrTearingPreferred(false),
     m_VideoStats(videoStats),
     m_RendererAttributes(0),
     m_LastRenderTimeUs(0),
@@ -452,9 +453,11 @@ int Pacer::cadenceThread(void* context)
             // the fixed-vsync feel the user validated as clearly smoother at
             // 116-on-120; the moment measured content falls back below the
             // ceiling (hysteresis above), tearing presents and true VRR
-            // pacing resume. MOONLIGHT_VRR_NO_LATCH=1 restores the old
-            // tear-and-snap behavior for A/B testing.
-            vsyncLatchPresent =
+            // pacing resume. The low-latency VRR settings checkbox (and
+            // MOONLIGHT_VRR_NO_LATCH=1 for A/B) opts into tear-and-snap
+            // instead: immediate flips shave a few ms of display latency at
+            // the cost of visible tearing.
+            vsyncLatchPresent = !me->m_VrrTearingPreferred &&
                 qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_LATCH") == 0;
             alignBudgetUs = vsyncLatchPresent ? 0 : 3000;
         }
@@ -642,9 +645,10 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
     enqueueFrameForRenderingAndUnlock(m_PacingQueue.dequeue());
 }
 
-bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing)
+bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrrTearing)
 {
     m_MaxVideoFps = maxVideoFps;
+    m_VrrTearingPreferred = enableVrrTearing;
     m_DisplayFps = StreamUtils::getDisplayRefreshRate(window);
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
     m_PresentationMode = m_VsyncRenderer->getPresentationMode();

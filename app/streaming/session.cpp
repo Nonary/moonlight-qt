@@ -293,6 +293,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.window = window;
     params.enableVsync = enableVsync;
     params.enableFramePacing = enableFramePacing;
+    params.enableVrrTearing = StreamingPreferences::get()->vrrTearing;
     params.testOnly = testOnly;
     params.vds = vds;
 

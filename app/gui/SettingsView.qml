@@ -874,6 +874,23 @@ Flickable {
                 }
 
                 CheckBox {
+                    id: vrrTearingCheck
+                    width: parent.width
+                    hoverEnabled: true
+                    text: qsTr("Low-latency VRR (allow tearing)")
+                    font.pointSize: 12
+                    enabled: StreamingPreferences.enableVsync
+                    checked: StreamingPreferences.enableVsync && StreamingPreferences.vrrTearing
+                    onCheckedChanged: {
+                        StreamingPreferences.vrrTearing = checked
+                    }
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("When the stream FPS runs above your display's tear-free VRR range, present frames immediately for the lowest latency instead of latching them to vsync. May show visible tearing.\nHas no effect at FPS values within the VRR range, where VRR is always tear-free and low-latency.")
+                }
+
+                CheckBox {
                     id: enableHdr
                     width: parent.width
                     text: qsTr("Enable HDR")
