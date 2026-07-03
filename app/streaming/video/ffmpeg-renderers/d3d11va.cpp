@@ -573,6 +573,8 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs)
     // Query at least once even with a zero budget: a rush present that
     // happens to arrive inside the blanking gap still flips clean for the
     // cost of one syscall.
+    const bool classicPresent =
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0;
     bool reachedBlank = false;
     for (;;) {
         if (D3DKMTGetScanLine(&getScanLine) != 0 /* STATUS_SUCCESS */ || getScanLine.InVerticalBlank) {
@@ -585,17 +587,32 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs)
             break;
         }
 
-        // While the beam is still far from the blanking gap, sleep off most of
-        // the remaining scanout instead of hard-spinning a TIME_CRITICAL thread
-        // for up to a whole refresh period; only the final approach spins.
-        // Total lines are padded ~5% over the active count (VBI overhead) so
-        // the estimate errs on waking early, never past the start of the blank.
-        // The sleep is also clamped to the remaining budget so the beam
-        // estimate can't carry the wait past a tighter bound.
-        if (maxWaitUs > 3500 && m_ActiveScanLines != 0 && m_ScanoutPeriodUs != 0 &&
+        if (m_ActiveScanLines != 0 && m_ScanoutPeriodUs != 0 &&
                 getScanLine.ScanLine < m_ActiveScanLines) {
             uint64_t remainingUs = (uint64_t)(m_ActiveScanLines - getScanLine.ScanLine) *
                     m_ScanoutPeriodUs / (m_ActiveScanLines + m_ActiveScanLines / 20);
+
+            // Give up immediately when the blanking gap is out of reach
+            // within the remaining budget: waiting toward a guaranteed
+            // mid-scan present doesn't move the tear, it only adds latency
+            // and flip-phase noise. This is what turns a small budget into
+            // a phase SNAP - presents already near the blank align to it,
+            // everything else goes out untouched at pure content cadence,
+            // which above the panel's flip ceiling keeps the beat's tear
+            // line herded toward the screen edge instead of crawling
+            // mid-frame. The line-time estimate deliberately errs low
+            // (total lines padded ~5% over active for VBI overhead), so
+            // borderline frames still wait and try. Classic mode keeps the
+            // historical spin-out-the-full-bound behavior for faithful A/B.
+            if (!classicPresent && remainingUs > maxWaitUs - elapsedUs) {
+                break;
+            }
+
+            // While the beam is still far from the blanking gap, sleep off
+            // most of the remaining scanout instead of hard-spinning a
+            // TIME_CRITICAL thread for up to a whole refresh period; only
+            // the final approach spins. Clamped to the remaining budget so
+            // the beam estimate can't carry the wait past a tighter bound.
             remainingUs = qMin(remainingUs, maxWaitUs - elapsedUs);
             if (remainingUs > 1500) {
                 highResolutionSleepUs(remainingUs - 1000);

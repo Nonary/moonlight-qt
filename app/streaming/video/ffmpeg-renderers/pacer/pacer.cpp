@@ -446,19 +446,22 @@ int Pacer::cadenceThread(void* context)
                                  (uint64_t)2500);
         }
         else if (alignTapered) {
-            // Content near this panel's true tear-free flip ceiling
-            // (empirically ~110fps on the 120Hz Ally X panel, i.e. ~750us
-            // above the nominal max-refresh spacing) has no robust tear-free
-            // operating point: the panel can barely follow, one torn flip
-            // drops it back to a free-running raster, and a fixed 3ms
-            // alignment floor there just flips half the presents onto scan
-            // boundaries and half not - measured as 1.4-4% continuous pacer
-            // drops plus +/-1-3ms flip-phase wobble (judder), which reads
-            // far worse than the slow tear crawl of pure content cadence.
-            // Spend only the cadence's real slack, tapering to zero at the
-            // ceiling, with sub-ms opportunistic blank catches when nearly
-            // free.
-            alignBudgetUs = qMin(cadenceSlackUs, threadSlackUs);
+            // Content near or above this panel's true tear-free flip
+            // ceiling (empirically ~110fps on the 120Hz Ally X panel, i.e.
+            // ~750us above the nominal max-refresh spacing) has no tear-free
+            // operating point, so the goal shifts from eliminating tears to
+            // controlling WHERE they land. The renderer's alignment wait
+            // gives up instantly when the blanking gap is out of reach, so
+            // this 3ms budget acts as a phase snap rather than a stall:
+            // presents that drift near the blank align to it and reset the
+            // beat phase, the rest go out untouched at content cadence.
+            // That herds the beat's tear line toward the screen edges - the
+            // behavior that made the pre-taper build look almost perfect at
+            // 116fps - instead of letting it crawl mid-frame. Catch-up
+            // rushes still get only the cadence's real slack (~0 up here),
+            // since they are the drain engine and every snap they take
+            // pushes the backlog out through the max-refresh floor.
+            alignBudgetUs = qMin((uint64_t)3000, threadSlackUs);
         }
         else {
             // Real headroom: floor at the fixed 3ms spin that reached
