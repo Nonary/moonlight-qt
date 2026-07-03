@@ -374,6 +374,24 @@ void D3D11VARenderer::resolvePresentationMode(SDL_Window* window, DXGI_SWAP_CHAI
         m_PresentationMode = PresentationMode::FixedVsync;
         fallbackReason = "stream FPS exceeds display refresh rate";
     }
+    else if (displayFps > 0 && m_DecoderParams.frameRate > 0 &&
+             1000000 / m_DecoderParams.frameRate < 1000000 / displayFps + 1350 &&
+             !forceVrr) {
+        // A VRR panel can't flip tear-free faster than its scanout cycle
+        // (max refresh period plus VBI and flip-programming overhead -
+        // measured ~110fps on this 120Hz panel), and a stream targeting
+        // within ~1ms of that ceiling leaves adaptive sync no headroom to
+        // absorb jitter: the tearing-allowed cadence path there produces
+        // crawling tears plus continuous pacer drops, while classic
+        // fixed-vsync presentation is tear-free and metronomic with only a
+        // small repeated-frame pulse. Validated side by side by the user at
+        // 116-on-120: fixed vsync reads clearly smoother. The threshold
+        // mirrors the cadence pacer's near-ceiling taper; streams at or
+        // below the panel's sweet spot (~5/6 of max refresh, the settings
+        // dropdown's VRR Optimized rate) still take the VRR cadence path.
+        m_PresentationMode = PresentationMode::FixedVsync;
+        fallbackReason = "stream FPS is above the display's tear-free VRR ceiling";
+    }
     else {
         m_PresentationMode = PresentationMode::VrrCadence;
         swapChainDesc->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
