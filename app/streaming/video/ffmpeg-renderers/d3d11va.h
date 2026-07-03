@@ -28,7 +28,7 @@ public:
     virtual PresentationMode getPresentationMode() override;
     virtual const char* getPresentationModeFallbackReason() override;
     virtual uint64_t popPresentAlignmentWaitUs() override;
-    virtual void setPresentTargetUs(uint64_t targetUs, bool catchUp) override;
+    virtual void setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs) override;
     virtual uint64_t getLastPresentUs() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
@@ -75,7 +75,7 @@ private:
     void refreshOutput();
     bool signalAndUnlockForPresent();
     uint64_t holdUntilPresentTarget();
-    void waitForVBlankBeforeTearingPresent();
+    void waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs);
 
     int m_DecoderSelectionPass;
     int m_DevicesWithFL11Support;
@@ -102,12 +102,13 @@ private:
     uint64_t m_ScanoutPeriodUs;
     uint64_t m_LastPresentAlignmentWaitUs;
     uint64_t m_PresentTargetUs;
-    bool m_PresentCatchUp;
+    uint64_t m_PresentAlignBudgetUs;
     uint64_t m_LastPresentUs;
     uint32_t m_AlignHits;
     uint32_t m_AlignGiveUps;
     uint32_t m_AlignSkips;
     uint64_t m_AlignWaitTotalUs;
+    uint64_t m_AlignBudgetTotalUs;
     uint64_t m_AlignStatsStartUs;
     Microsoft::WRL::ComPtr<ID3D11Fence> m_PresentReadyFence;
     uint64_t m_PresentReadyFenceValue;

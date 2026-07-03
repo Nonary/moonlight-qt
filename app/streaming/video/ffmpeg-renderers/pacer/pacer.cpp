@@ -374,6 +374,51 @@ int Pacer::cadenceThread(void* context)
         uint64_t targetRenderStartUs = targetUs > renderLeadUs ?
             targetUs - renderLeadUs : 0;
 
+        // How long the renderer may hold this present past its target while
+        // waiting for the panel's blanking gap. A tearing-allowed present
+        // that goes out mid-scan is a guaranteed visible tear, and a burst
+        // of torn flips knocks the driver out of VRR flip-following into a
+        // fixed-cadence raster; presents then land at random scan phase, a
+        // short fixed wait catches the blank only ~40% of the time, and the
+        // resulting tears keep VRR disengaged - measured as minutes-long
+        // ~60% mid-scan phases at 78fps content the panel could follow
+        // trivially. Sizing the wait from the measured cadence makes
+        // in-blank flips the norm whenever content leaves headroom: rushed
+        // drains stay aligned (prevention) and, once free-running, a wide
+        // wait re-anchors flips to the raster's blank until the driver
+        // re-engages (cure).
+        //
+        // threadSlackUs is the hard wall: waiting longer than the content
+        // interval minus the next frame's render needs would push the next
+        // flip past its own target and snowball into queue drops.
+        uint64_t renderReserveUs = me->m_EstimatedRenderTimeUs + 1200;
+        uint64_t threadSlackUs = measuredSourceIntervalUs > renderReserveUs ?
+            measuredSourceIntervalUs - renderReserveUs : 0;
+        uint64_t alignBudgetUs;
+        if (rushPresent) {
+            // A catch-up present may only spend the cadence's real per-frame
+            // slack (content interval over the panel's max flip spacing). At
+            // near-max-refresh content that is ~0 and it presents
+            // immediately, exactly as before: a possible tear still beats
+            // compounding lateness into dropped frames. With headroom, the
+            // drain runs a shade slower but stays aligned, so a jitter storm
+            // of rush presents can no longer break the panel's VRR lock.
+            uint64_t cadenceSlackUs =
+                (minFrameIntervalUs != 0 &&
+                 measuredSourceIntervalUs > minFrameIntervalUs + 200) ?
+                    measuredSourceIntervalUs - minFrameIntervalUs - 200 : 0;
+            alignBudgetUs = qMin(qMin(cadenceSlackUs, threadSlackUs),
+                                 (uint64_t)2500);
+        }
+        else {
+            // Floor at the fixed 3ms spin that reached almost-tear-free on
+            // real hardware, cap at one full scanout cycle plus slack - the
+            // blanking gap recurs within one cycle even on a free-running
+            // raster, so waiting longer than that buys nothing.
+            uint64_t maxAlignUs = qMax((uint64_t)3000, minFrameIntervalUs + 2000);
+            alignBudgetUs = qBound((uint64_t)3000, threadSlackUs, maxAlignUs);
+        }
+
         me->waitUntil(targetRenderStartUs);
 
         if (me->m_Stopping) {
@@ -381,7 +426,7 @@ int Pacer::cadenceThread(void* context)
             break;
         }
 
-        me->m_VsyncRenderer->setPresentTargetUs(targetUs, rushPresent);
+        me->m_VsyncRenderer->setPresentTargetUs(targetUs, rushPresent, alignBudgetUs);
         me->m_VsyncRenderer->waitToRender();
         me->renderFrame(frame);
     }

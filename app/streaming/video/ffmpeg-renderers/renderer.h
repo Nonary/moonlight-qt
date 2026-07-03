@@ -245,7 +245,7 @@ public:
         return 0;
     }
 
-    virtual void setPresentTargetUs(uint64_t, bool) {
+    virtual void setPresentTargetUs(uint64_t, bool, uint64_t) {
         // The cadence pacer's intended present instant for the next
         // renderFrame() call. Renderers that phase-align their presents must
         // hold the flip until this time even if the display is already in
@@ -254,11 +254,19 @@ public:
         //
         // The bool is the pacer's catch-up flag: true means presentation is
         // running behind frame delivery and this present is draining that
-        // backlog. Renderers should then flip as soon as the hold expires
-        // rather than also waiting out the display's blanking gap - each
-        // blank-alignment wait slips the schedule further, and the backlog
-        // it creates is dropped outright, which is worse than a possible
-        // tear on the drain frames.
+        // backlog.
+        //
+        // The trailing argument is the blank-alignment budget in
+        // microseconds: how long past the target the renderer may stall
+        // waiting for the display's blanking gap before presenting anyway.
+        // The pacer sizes it from the measured content cadence and render
+        // time so the wait can never starve the next frame's render. It is
+        // generous when content runs below the display's max refresh (a
+        // mid-scan present there is a needless guaranteed tear, and a run of
+        // torn flips can knock the driver out of VRR flip-following into a
+        // fixed-cadence raster that keeps tearing for minutes), and near
+        // zero for catch-up presents with no cadence slack, where waiting
+        // would compound lateness into dropped frames.
     }
 
     virtual uint64_t getLastPresentUs() {

@@ -73,12 +73,13 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_ScanoutPeriodUs(0),
       m_LastPresentAlignmentWaitUs(0),
       m_PresentTargetUs(0),
-      m_PresentCatchUp(false),
+      m_PresentAlignBudgetUs(0),
       m_LastPresentUs(0),
       m_AlignHits(0),
       m_AlignGiveUps(0),
       m_AlignSkips(0),
       m_AlignWaitTotalUs(0),
+      m_AlignBudgetTotalUs(0),
       m_AlignStatsStartUs(0),
       m_PresentReadyFenceValue(0),
       m_PresentReadyFenceEvent(nullptr),
@@ -520,7 +521,7 @@ void D3D11VARenderer::refreshOutput()
     m_ScanoutPeriodUs = displayFps > 0 ? 1000000ULL / displayFps : 0;
 }
 
-void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
+void D3D11VARenderer::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs)
 {
     // VRR only changes how long the panel is willing to extend its blanking
     // gap while waiting for us - it does not make a DXGI_PRESENT_ALLOW_TEARING
@@ -543,31 +544,44 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
         return;
     }
 
-    // Default: a tightly bounded 3ms pure spin, exactly the behavior of the
-    // build that reached almost-tear-free on real hardware. When the stream
-    // FPS runs close to the display's max refresh (e.g. 116 FPS on 120Hz),
-    // the panel is actively scanning ~96% of every cycle and the blanking
-    // window is only a few hundred microseconds wide, so a present that
-    // misses it is better off tearing quickly: waiting out the rest of the
-    // scanout makes the present late, which backs up the pacing queue, drops
-    // frames, and turns the phase error random - measurably MORE tearing.
+    // The wait bound is the pacer's per-present budget, sized from the
+    // measured content cadence so waiting can never starve the next frame
+    // (see Pacer::cadenceThread). This replaces the old fixed 3ms spin,
+    // whose cap was exactly what made the free-running-raster state sticky:
+    // once torn flips knock the driver out of VRR flip-following, presents
+    // land at random scan phase and a 3ms window only catches the blank
+    // ~40% of the time, so the tearing regime self-sustains even at content
+    // rates with milliseconds of idle headroom per frame. One scanout cycle
+    // plus slack is always enough waiting: even a free-running raster
+    // passes through its blanking gap within a cycle.
     //
-    // MOONLIGHT_VRR_SCANLINE_SLEEP=1 (experimental) instead bounds the wait
-    // at a full scanout period and sleeps the approach using the scanline
-    // position estimate. Only ever a win when the stream FPS leaves the
-    // panel real VRR headroom; regressed badly at 116/120 on the Ally X.
-    const bool extendedAlign = qEnvironmentVariableIntValue("MOONLIGHT_VRR_SCANLINE_SLEEP") != 0;
-    uint64_t maxWaitUs = (extendedAlign && m_ScanoutPeriodUs != 0) ? m_ScanoutPeriodUs + 2000 : 3000;
+    // MOONLIGHT_VRR_SCANLINE_SLEEP=1 forces the widest bound on every
+    // present regardless of the pacer's budget, for A/B testing.
+    if (qEnvironmentVariableIntValue("MOONLIGHT_VRR_SCANLINE_SLEEP") != 0 && m_ScanoutPeriodUs != 0) {
+        alignBudgetUs = m_ScanoutPeriodUs + 2000;
+    }
+
+    uint64_t maxWaitUs = m_ScanoutPeriodUs != 0 ?
+        qMin(alignBudgetUs, m_ScanoutPeriodUs + 2000) :
+        qMin(alignBudgetUs, (uint64_t)3000);
 
     uint64_t startUs = LiGetMicroseconds();
     D3DKMT_GETSCANLINE getScanLine = {};
     getScanLine.hAdapter = m_KmtAdapter;
     getScanLine.VidPnSourceId = m_KmtVidPnSourceId;
 
+    // Query at least once even with a zero budget: a rush present that
+    // happens to arrive inside the blanking gap still flips clean for the
+    // cost of one syscall.
     bool reachedBlank = false;
-    while (LiGetMicroseconds() - startUs < maxWaitUs) {
+    for (;;) {
         if (D3DKMTGetScanLine(&getScanLine) != 0 /* STATUS_SUCCESS */ || getScanLine.InVerticalBlank) {
             reachedBlank = true;
+            break;
+        }
+
+        uint64_t elapsedUs = LiGetMicroseconds() - startUs;
+        if (elapsedUs >= maxWaitUs) {
             break;
         }
 
@@ -576,10 +590,13 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
         // for up to a whole refresh period; only the final approach spins.
         // Total lines are padded ~5% over the active count (VBI overhead) so
         // the estimate errs on waking early, never past the start of the blank.
-        if (extendedAlign && m_ActiveScanLines != 0 && m_ScanoutPeriodUs != 0 &&
+        // The sleep is also clamped to the remaining budget so the beam
+        // estimate can't carry the wait past a tighter bound.
+        if (maxWaitUs > 3500 && m_ActiveScanLines != 0 && m_ScanoutPeriodUs != 0 &&
                 getScanLine.ScanLine < m_ActiveScanLines) {
             uint64_t remainingUs = (uint64_t)(m_ActiveScanLines - getScanLine.ScanLine) *
                     m_ScanoutPeriodUs / (m_ActiveScanLines + m_ActiveScanLines / 20);
+            remainingUs = qMin(remainingUs, maxWaitUs - elapsedUs);
             if (remainingUs > 1500) {
                 highResolutionSleepUs(remainingUs - 1000);
             }
@@ -590,33 +607,41 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent()
     m_LastPresentAlignmentWaitUs += waitedUs;
 
     // Outcome telemetry for the residual-tear hunt: every give-up below is a
-    // present that went out mid-scan, i.e. one visible tear. This is the
-    // ground truth to A/B the experimental modes against.
+    // present that went out mid-scan, i.e. one visible tear, while a skip is
+    // a present that never meaningfully tried (a rush with no cadence slack).
+    // This is the ground truth to A/B the budget policy against.
     if (reachedBlank) {
         m_AlignHits++;
+    }
+    else if (maxWaitUs < 500) {
+        m_AlignSkips++;
     }
     else {
         m_AlignGiveUps++;
     }
     m_AlignWaitTotalUs += waitedUs;
+    m_AlignBudgetTotalUs += maxWaitUs;
 
     uint64_t nowUs = startUs + waitedUs;
     if (m_AlignStatsStartUs == 0) {
         m_AlignStatsStartUs = nowUs;
     }
     else if (nowUs - m_AlignStatsStartUs >= 10000000) {
-        uint32_t total = m_AlignHits + m_AlignGiveUps;
+        uint32_t attempted = m_AlignHits + m_AlignGiveUps;
+        uint32_t total = attempted + m_AlignSkips;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "VRR scanline align: %u in-blank, %u mid-scan tears (%.1f%%), avg wait %.2f ms, %u skipped-late",
+                    "VRR scanline align: %u in-blank, %u mid-scan tears (%.1f%%), avg wait %.2f ms, avg budget %.2f ms, %u skipped-late",
                     m_AlignHits,
                     m_AlignGiveUps,
-                    total != 0 ? m_AlignGiveUps * 100.0 / total : 0.0,
-                    total != 0 ? (m_AlignWaitTotalUs / 1000.0) / total : 0.0,
+                    attempted != 0 ? m_AlignGiveUps * 100.0 / attempted : 0.0,
+                    attempted != 0 ? (m_AlignWaitTotalUs / 1000.0) / attempted : 0.0,
+                    total != 0 ? (m_AlignBudgetTotalUs / 1000.0) / total : 0.0,
                     m_AlignSkips);
         m_AlignHits = 0;
         m_AlignGiveUps = 0;
         m_AlignSkips = 0;
         m_AlignWaitTotalUs = 0;
+        m_AlignBudgetTotalUs = 0;
         m_AlignStatsStartUs = nowUs;
     }
 }
@@ -1281,23 +1306,22 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
             unlockContext(this);
         }
 
-        // Skip the blanking-gap alignment only when the pacer flagged this
-        // present as a rush (schedule genuinely late): waiting for the blank
-        // in that state slips the schedule further and the resulting backlog
-        // is dropped outright - a frame that may tear beats a dropped one.
-        // A present that's merely running a little behind its hold still
-        // aligns: when content runs below the panel's max refresh the panel
-        // is sitting in its VRR-extended blanking gap waiting for us, so the
-        // check is nearly free, and skipping it just manufactured tears.
-        bool catchUp = m_PresentCatchUp;
-        m_PresentCatchUp = false;
+        // Every present - rush or not - aligns to the blanking gap within
+        // the budget the pacer sized for it from the measured cadence. A
+        // genuinely late rush at near-max-refresh content gets a ~0 budget
+        // and presents immediately (a possible tear still beats compounding
+        // lateness into drops), but skipping alignment outright on every
+        // rush was what broke the panel's VRR lock: one network stall's
+        // burst of deliberately-unaligned presents (454 in one 10s window)
+        // dropped the driver back to a fixed free-running raster and locked
+        // in minutes of ~60% mid-scan tearing that a 3ms wait could never
+        // escape. With headroom, rushes drain a shade slower but aligned,
+        // and normal presents may wait up to a full scanout cycle - which
+        // is what re-captures the blank once the raster is free-running.
+        uint64_t alignBudgetUs = m_PresentAlignBudgetUs;
+        m_PresentAlignBudgetUs = 0;
         holdUntilPresentTarget();
-        if (catchUp) {
-            m_AlignSkips++;
-        }
-        else {
-            waitForVBlankBeforeTearingPresent();
-        }
+        waitForVBlankBeforeTearingPresent(alignBudgetUs);
 
         // Reacquire the lock for Present(). Any lock delay from an in-flight
         // decode submission lands after alignment and only shifts us deeper
@@ -1308,10 +1332,12 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     }
     else if (m_PresentationMode == PresentationMode::VrrCadence) {
         // MOONLIGHT_VRR_CLASSIC_PRESENT=1: the original scanline-align-only
-        // behavior, kept as an instant fallback for A/B testing.
+        // behavior with its fixed 3ms bound, kept as an instant fallback
+        // for A/B testing.
         m_LastPresentAlignmentWaitUs = 0;
         m_PresentTargetUs = 0;
-        waitForVBlankBeforeTearingPresent();
+        m_PresentAlignBudgetUs = 0;
+        waitForVBlankBeforeTearingPresent(3000);
     }
 
     // Present according to the selected presentation mode
@@ -2015,10 +2041,15 @@ uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
     return waitUs;
 }
 
-void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp)
+void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs)
 {
+    // The catch-up policy is fully encoded in the pacer's alignment budget
+    // (a rush with no cadence slack arrives with ~0), so the flag itself
+    // isn't consulted here.
+    Q_UNUSED(catchUp);
+
     m_PresentTargetUs = targetUs;
-    m_PresentCatchUp = catchUp;
+    m_PresentAlignBudgetUs = alignBudgetUs;
 }
 
 uint64_t D3D11VARenderer::getLastPresentUs()
