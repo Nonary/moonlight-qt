@@ -243,6 +243,16 @@ int Pacer::cadenceThread(void* context)
     bool alignTapered = false;
     int alignFullDwell = 0;
 
+    // Standing-latency servo state (see the trim block below).
+    // MOONLIGHT_VRR_NO_TRIM=1 disables it for A/B comparison.
+    const bool latencyTrimEnabled =
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_TRIM") == 0;
+    const int slackWindowCap =
+        me->m_MaxVideoFps > 0 ? qMax(me->m_MaxVideoFps / 2, 16) : 30;
+    uint64_t slackWindowMinUs = UINT64_MAX;
+    int slackWindowSamples = 0;
+    uint64_t trimStepUs = 0;
+    uint64_t lastTrimLogUs = 0;
 
     while (!me->m_Stopping) {
         me->m_FrameQueueLock.lock();
@@ -383,6 +393,76 @@ int Pacer::cadenceThread(void* context)
         // leaves tears near the frame edges instead of landing presents on
         // the panel's refresh boundary.
         uint64_t renderLeadUs = me->m_EstimatedRenderTimeUs + leadMarginUs;
+
+        // Standing-latency servo. The schedule's phase only ever moves LATER
+        // on its own: a stall snaps the clock's target onto the processing
+        // instant of an already-late frame, the stale/drain rebases above
+        // anchor onto instants that are late by construction, and any
+        // residual cadence-rate error compounds open-loop - while
+        // early-arriving frames just wait, so nothing pulls phase back.
+        // Measured: after startup stalls a 60fps stream carried a permanent
+        // 15-24ms frame queue delay (equilibrium just under the
+        // 1.25-interval stale threshold) while pacing 100% in-blank. Track
+        // the MINIMUM estimated queue delay across a half-second window -
+        // the frame that arrived closest to its slot bounds how phase-late
+        // the whole schedule is - and counter it with a per-frame trim rate
+        // that spreads that excess over the next window, holding the floor
+        // at a ~2.5-3.5ms cushion. The rate tops out at 250us/frame
+        // (~1.5-2.5% cadence compression, far below the 12% drain tier
+        // already judged imperceptible), and one late frame in the window
+        // vetoes the trim, so links whose jitter genuinely needs the queue
+        // as a shock absorber keep it (smoothness over latency).
+        if (latencyTrimEnabled && frame->pkt_dts > 0) {
+            uint64_t renderStartEstUs = targetUs > renderLeadUs ?
+                targetUs - renderLeadUs : 0;
+            uint64_t frameQueueEstUs = renderStartEstUs > (uint64_t)frame->pkt_dts ?
+                renderStartEstUs - (uint64_t)frame->pkt_dts : 0;
+            slackWindowMinUs = qMin(slackWindowMinUs, frameQueueEstUs);
+
+            if (++slackWindowSamples >= slackWindowCap) {
+                uint64_t newStepUs = 0;
+                if (!backlogged && !staleSchedule && slackWindowMinUs > 3500) {
+                    newStepUs = qBound((uint64_t)20,
+                                       (slackWindowMinUs - 2500) / (uint64_t)slackWindowCap,
+                                       (uint64_t)250);
+                }
+                if (newStepUs != 0 && trimStepUs == 0 &&
+                        nowUs - lastTrimLogUs > 30000000ULL) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR cadence trim: min queue %.2f ms last window, trimming %u us/frame",
+                                slackWindowMinUs / 1000.0,
+                                (unsigned int)newStepUs);
+                    lastTrimLogUs = nowUs;
+                }
+                trimStepUs = newStepUs;
+                slackWindowMinUs = UINT64_MAX;
+                slackWindowSamples = 0;
+            }
+        }
+
+        if (trimStepUs > 0) {
+            if (staleSchedule || backlogged) {
+                // These paths rebase the schedule phase themselves; trimming
+                // on top of a rebase would over-correct. Re-measure instead.
+                trimStepUs = 0;
+            }
+            else {
+                uint64_t floorUs = nowUs;
+                if (lastFlipUs != 0 && floorUs < lastFlipUs + minFrameIntervalUs) {
+                    floorUs = lastFlipUs + minFrameIntervalUs;
+                }
+                uint64_t trimmedUs = targetUs > trimStepUs ?
+                    targetUs - trimStepUs : floorUs;
+                if (trimmedUs < floorUs) {
+                    trimmedUs = floorUs;
+                }
+                if (trimmedUs < targetUs) {
+                    targetUs = trimmedUs;
+                    cadenceClock.rebaseTarget(targetUs);
+                }
+            }
+        }
+
         uint64_t targetRenderStartUs = targetUs > renderLeadUs ?
             targetUs - renderLeadUs : 0;
 
