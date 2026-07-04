@@ -679,7 +679,19 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, 
         m_AlignHits++;
     }
     else {
-        m_MidScanSinceQuery++;
+        // Tear-position-aware count for the pacer's tear-rate probe: a
+        // tear landing within a few percent of the frame's top or bottom
+        // edge reads as invisible in practice (the user-validated "edge
+        // tearing" regime), so it doesn't count against free-run pacing -
+        // only tears in the visible middle do. A crawling tear line sweeps
+        // the middle and still fails the probe; an edge-pinned one passes.
+        // The align stats line keeps counting every mid-scan present.
+        uint32_t exitScanPct = m_ActiveScanLines != 0 ?
+            (uint32_t)((uint64_t)getScanLine.ScanLine * 100 / m_ActiveScanLines) :
+            50;
+        if (exitScanPct >= 6 && exitScanPct <= 90) {
+            m_MidScanSinceQuery++;
+        }
 
         if (maxWaitUs < 500) {
             m_AlignSkips++;

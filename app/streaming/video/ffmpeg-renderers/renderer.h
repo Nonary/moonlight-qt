@@ -285,12 +285,14 @@ public:
     }
 
     virtual uint32_t popMidScanTearCount() {
-        // Number of presents since the last call that went out mid-scan (a
-        // visible tear) instead of inside the blanking gap. Cleared on
-        // read. The cadence pacer aggregates this into a tear-rate signal
-        // to self-calibrate where tear-free free-run pacing is achievable
-        // on this display/driver stack, instead of hardcoding per-panel
-        // rate limits.
+        // Number of presents since the last call that went out mid-scan
+        // with the tear landing in the VISIBLE MIDDLE of the frame -
+        // renderers that know the beam position should exclude tears
+        // pinned within a few percent of the top/bottom edges, which read
+        // as invisible. Cleared on read. The cadence pacer aggregates this
+        // into a tear-rate signal to self-calibrate where perceptually
+        // tear-free free-run pacing is achievable on this display/driver
+        // stack, instead of hardcoding per-panel rate limits.
         return 0;
     }
 

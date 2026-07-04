@@ -409,6 +409,8 @@ int Pacer::cadenceThread(void* context)
     uint32_t bandTearWindowPresents = 0;
     uint32_t bandTearWindowTears = 0;
     uint64_t bandTearFallbackUntilUs = 0;
+    uint64_t bandTearFallbackPeriodUs = 60000000ULL;
+    uint64_t bandTearFailIntervalUs = 0;
 
     while (!me->m_Stopping) {
         me->m_FrameQueueLock.lock();
@@ -1176,20 +1178,62 @@ int Pacer::cadenceThread(void* context)
         // resets the window so a rate is never judged across a boundary.
         // 15% cleanly separates the measured populations: a working band
         // runs 0.2-2.6% torn, a non-following raster 40-95%.
+        //
+        // The probe itself is the only tearing this regime shows the user,
+        // so it is kept as short and rare as the statistics allow:
+        //  - Early abort: 16 tears is already conclusive against a <3%
+        //    working band, so the probe fails the moment it accumulates
+        //    them (>=24 presents so a single burst can't decide alone) -
+        //    ~0.2s at the measured 70-90% failure rates instead of the
+        //    full 256-present window.
+        //  - Exponential backoff: consecutive failures at the same cadence
+        //    double the latch period (60s up to 8min), so steady-state
+        //    probe cost falls to ~0.1% of wall time. A passing probe or a
+        //    genuine content-rate change (>600us from the failing
+        //    interval) resets the period.
         uint32_t midScanTears = me->m_VsyncRenderer->popMidScanTearCount();
         if (nearBuffered && !vsyncLatchPresent) {
             bandTearWindowPresents++;
             bandTearWindowTears += midScanTears;
-            if (bandTearWindowPresents >= 256) {
-                if (latchAvailable &&
-                        bandTearWindowTears * 100 >= bandTearWindowPresents * 15) {
-                    bandTearFallbackUntilUs = nowUs + 60000000ULL;
+
+            bool probeFailed = false;
+            if (bandTearWindowPresents >= 24 && bandTearWindowTears >= 16) {
+                probeFailed = true;
+            }
+            else if (bandTearWindowPresents >= 256) {
+                probeFailed =
+                    bandTearWindowTears * 100 >= bandTearWindowPresents * 15;
+                if (!probeFailed) {
+                    bandTearFallbackPeriodUs = 60000000ULL;
+                    bandTearFailIntervalUs = 0;
+                    bandTearWindowPresents = 0;
+                    bandTearWindowTears = 0;
+                }
+            }
+
+            if (probeFailed) {
+                if (latchAvailable) {
+                    if (bandTearFailIntervalUs != 0 &&
+                            (measuredSourceIntervalUs >
+                                 bandTearFailIntervalUs + 600 ||
+                             measuredSourceIntervalUs + 600 <
+                                 bandTearFailIntervalUs)) {
+                        // Different content rate than the one that failed
+                        // before - judge it fresh.
+                        bandTearFallbackPeriodUs = 60000000ULL;
+                    }
+                    bandTearFallbackUntilUs = nowUs + bandTearFallbackPeriodUs;
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "VRR tear-rate fallback: %u%% of %u in-band presents tore mid-scan at %.1f fps measured; vsync-latching this content for 60s",
-                                bandTearWindowTears * 100 / bandTearWindowPresents,
+                                "VRR tear-rate fallback: %u of %u in-band presents tore mid-scan at %.1f fps measured; vsync-latching this content for %us",
+                                bandTearWindowTears,
                                 bandTearWindowPresents,
                                 measuredSourceIntervalUs > 0 ?
-                                    1000000.0 / measuredSourceIntervalUs : 0.0);
+                                    1000000.0 / measuredSourceIntervalUs : 0.0,
+                                (unsigned int)(bandTearFallbackPeriodUs / 1000000ULL));
+                    bandTearFailIntervalUs = measuredSourceIntervalUs;
+                    if (bandTearFallbackPeriodUs < 480000000ULL) {
+                        bandTearFallbackPeriodUs *= 2;
+                    }
                 }
                 bandTearWindowPresents = 0;
                 bandTearWindowTears = 0;
