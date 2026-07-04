@@ -28,7 +28,7 @@ public:
     virtual PresentationMode getPresentationMode() override;
     virtual const char* getPresentationModeFallbackReason() override;
     virtual uint64_t popPresentAlignmentWaitUs() override;
-    virtual void setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch) override;
+    virtual void setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch, bool nearBuffered) override;
     virtual uint64_t getLastPresentUs() override;
     virtual bool isVrrRasterLockUncertain() override;
     virtual int getDecoderCapabilities() override;
@@ -107,6 +107,8 @@ private:
     uint64_t m_PresentAlignBudgetUs;
     bool m_PresentVsyncLatch;
     bool m_LastPresentLatched;
+    bool m_PresentNearBuffered;
+    bool m_LastPresentBuffered;
     uint64_t m_LastPresentUs;
     uint32_t m_AlignHits;
     uint32_t m_AlignGiveUps;

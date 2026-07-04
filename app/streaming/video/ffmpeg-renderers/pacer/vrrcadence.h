@@ -21,6 +21,7 @@ public:
         m_SmoothedIntervalUs = m_NominalFrameIntervalUs;
         m_LastSourceTimeUs = 0;
         m_LastTargetTimeUs = 0;
+        m_PhaseReset = false;
 
         // ~Half a second of source timestamps for the windowed cadence mean.
         int cap = nominalFps > 0 ? nominalFps / 2 + 1 : 31;
@@ -34,6 +35,101 @@ public:
         m_SourceTimeHead = 0;
         m_SourceTimeCount = 0;
         m_TimestamplessFrames = 0;
+        m_PendingStallDeltaUs = 0;
+    }
+
+    // Feed a source timestamp into the cadence measurement without scheduling
+    // anything. Every frame's timestamp must pass through here - INCLUDING
+    // frames the pacer drops without presenting. A dropped frame's interval
+    // otherwise vanishes from the window while its time span remains, so the
+    // measured cadence reads drop-inflated, and near the panel ceiling that
+    // error is self-sealing: 116fps content dropped at 10-15% measured as
+    // ~103fps, which sat just above the vsync-latch threshold, which kept the
+    // pacer free-running at the flip-ceiling spacing floor (~110fps), which
+    // caused the very drops corrupting the measurement.
+    void observeSourceTime(uint64_t sourceTimeUs)
+    {
+        if (sourceTimeUs == 0) {
+            // No usable timestamp on this frame. Track a run length so
+            // warmedUp() can report a stream that never carries timestamps
+            // as warm instead of perpetually cold - there is nothing to
+            // measure, and pacing already free-runs off the nominal
+            // interval in that case.
+            if (m_TimestamplessFrames < 1000) {
+                m_TimestamplessFrames++;
+            }
+            return;
+        }
+
+        m_TimestamplessFrames = 0;
+
+        if (m_LastSourceTimeUs != 0 && sourceTimeUs > m_LastSourceTimeUs) {
+            uint64_t sourceDeltaUs = sourceTimeUs - m_LastSourceTimeUs;
+
+            // A stall is a delta far outside the cadence actually being
+            // measured, not the stream's nominal rate. Nominal is only an
+            // upper bound on content fps: a threshold pinned to 4x nominal
+            // sits a mere 3.5% above a 30fps game's real deltas on a 116fps
+            // stream, so ordinary content jitter restarted the window every
+            // few frames, the clock never reported warm, and the pacer
+            // parked in the cadence-cold vsync latch on content VRR handles
+            // trivially.
+            uint64_t stallThresholdUs =
+                (m_SmoothedIntervalUs > m_NominalFrameIntervalUs ?
+                     m_SmoothedIntervalUs : m_NominalFrameIntervalUs) * 4;
+
+            if (sourceDeltaUs > stallThresholdUs) {
+                if (m_PendingStallDeltaUs != 0 &&
+                        sourceDeltaUs < m_PendingStallDeltaUs * 2 &&
+                        m_PendingStallDeltaUs < sourceDeltaUs * 2) {
+                    // Two consecutive over-threshold deltas of similar
+                    // magnitude are a cadence, not a stall - content running
+                    // slower than a quarter of the measured rate (a 24fps
+                    // cutscene right after high-fps gameplay). Adopt it, or
+                    // every subsequent delta re-restarts the window against
+                    // a smoothed interval that can never learn the new rate.
+                    m_SmoothedIntervalUs =
+                        (m_PendingStallDeltaUs + sourceDeltaUs) / 2;
+                    m_PendingStallDeltaUs = 0;
+                }
+                else {
+                    // Genuine stall: restart the window so the gap doesn't
+                    // pollute the mean for the next half second.
+                    m_SourceTimeCount = 0;
+                    m_PendingStallDeltaUs = sourceDeltaUs;
+                }
+            }
+            else {
+                m_PendingStallDeltaUs = 0;
+            }
+
+            m_SourceTimesUs[m_SourceTimeHead] = sourceTimeUs;
+            m_SourceTimeHead = (m_SourceTimeHead + 1) % m_SourceTimeCap;
+            if (m_SourceTimeCount < m_SourceTimeCap) {
+                m_SourceTimeCount++;
+            }
+
+            int intervals = m_SourceTimeCount - 1;
+            if (intervals >= 16) {
+                uint64_t oldestUs = m_SourceTimesUs[
+                    (m_SourceTimeHead + m_SourceTimeCap - m_SourceTimeCount) % m_SourceTimeCap];
+                m_SmoothedIntervalUs = (sourceTimeUs - oldestUs) / (uint64_t)intervals;
+            }
+            else if (sourceDeltaUs >= m_NominalFrameIntervalUs / 2 &&
+                     sourceDeltaUs <= stallThresholdUs) {
+                // Warmup fallback until the window fills: the old EMA. Its
+                // bias is immaterial over a handful of frames.
+                m_SmoothedIntervalUs =
+                    (m_SmoothedIntervalUs * 7 + sourceDeltaUs) / 8;
+            }
+        }
+        else if (m_LastSourceTimeUs != 0 && sourceTimeUs <= m_LastSourceTimeUs) {
+            // Non-monotonic timestamps (stream restart): restart the window.
+            m_SourceTimeCount = 0;
+            m_PendingStallDeltaUs = 0;
+        }
+
+        m_LastSourceTimeUs = sourceTimeUs;
     }
 
     uint64_t nextTargetUs(uint64_t nowUs, uint64_t sourceTimeUs)
@@ -56,57 +152,11 @@ public:
         // every second (measured as the latency trimmer in the pacer
         // re-arming 51 times in 3 minutes chasing regenerating lateness).
         // The windowed mean pairs every gap with its burst; only a genuine
-        // stall (>4x nominal, or a timestamp going backwards on a stream
-        // restart) resets the window. It is also naturally immune to the
-        // single-spike EMA rides that the pacer's taper hysteresis was added
-        // to absorb.
-        if (sourceTimeUs == 0) {
-            // No usable timestamp on this frame. Track a run length so
-            // warmedUp() can report a stream that never carries timestamps
-            // as warm instead of perpetually cold - there is nothing to
-            // measure, and pacing already free-runs off the nominal
-            // interval in that case.
-            if (m_TimestamplessFrames < 1000) {
-                m_TimestamplessFrames++;
-            }
-        }
-        else {
-            m_TimestamplessFrames = 0;
-        }
-
-        if (m_LastSourceTimeUs != 0 && sourceTimeUs > m_LastSourceTimeUs) {
-            uint64_t sourceDeltaUs = sourceTimeUs - m_LastSourceTimeUs;
-            if (sourceDeltaUs > m_NominalFrameIntervalUs * 4) {
-                // Genuine stall: restart the window so the gap doesn't
-                // pollute the mean for the next half second.
-                m_SourceTimeCount = 0;
-            }
-
-            m_SourceTimesUs[m_SourceTimeHead] = sourceTimeUs;
-            m_SourceTimeHead = (m_SourceTimeHead + 1) % m_SourceTimeCap;
-            if (m_SourceTimeCount < m_SourceTimeCap) {
-                m_SourceTimeCount++;
-            }
-
-            int intervals = m_SourceTimeCount - 1;
-            if (intervals >= 16) {
-                uint64_t oldestUs = m_SourceTimesUs[
-                    (m_SourceTimeHead + m_SourceTimeCap - m_SourceTimeCount) % m_SourceTimeCap];
-                m_SmoothedIntervalUs = (sourceTimeUs - oldestUs) / (uint64_t)intervals;
-            }
-            else if (sourceDeltaUs >= m_NominalFrameIntervalUs / 2 &&
-                     sourceDeltaUs <= m_NominalFrameIntervalUs * 4) {
-                // Warmup fallback until the window fills: the old EMA. Its
-                // bias is immaterial over a handful of frames.
-                m_SmoothedIntervalUs =
-                    (m_SmoothedIntervalUs * 7 + sourceDeltaUs) / 8;
-            }
-        }
-        else if (m_LastSourceTimeUs != 0 && sourceTimeUs != 0 &&
-                 sourceTimeUs <= m_LastSourceTimeUs) {
-            // Non-monotonic timestamps (stream restart): restart the window.
-            m_SourceTimeCount = 0;
-        }
+        // stall (>4x the measured cadence, or a timestamp going backwards on
+        // a stream restart) resets the window. It is also naturally immune
+        // to the single-spike EMA rides that the pacer's taper hysteresis
+        // was added to absorb.
+        observeSourceTime(sourceTimeUs);
 
         uint64_t targetUs = nowUs;
 
@@ -116,7 +166,14 @@ public:
             targetUs = m_LastTargetTimeUs + frameIntervalUs;
 
             if (targetUs + frameIntervalUs < nowUs) {
+                // A stall longer than a frame interval: snap the schedule
+                // onto the present. This wipes whatever standing phase
+                // offset (jitter buffer) the pacer had built on top of the
+                // schedule, so report it - the pacer may want to
+                // re-establish that offset in one step rather than
+                // re-learning it over seconds.
                 targetUs = nowUs;
+                m_PhaseReset = true;
             }
 
             // Applies to both the normal path above and the catch-up reset just
@@ -128,9 +185,6 @@ public:
         }
 
         m_LastTargetTimeUs = targetUs;
-        if (sourceTimeUs != 0) {
-            m_LastSourceTimeUs = sourceTimeUs;
-        }
 
         return targetUs;
     }
@@ -149,18 +203,40 @@ public:
         return m_SmoothedIntervalUs;
     }
 
+    bool consumePhaseReset()
+    {
+        bool reset = m_PhaseReset;
+        m_PhaseReset = false;
+        return reset;
+    }
+
     bool warmedUp() const
     {
-        // A full window of monotonic samples (~0.5s). Goes false on reset()
-        // and whenever the window restarts - a >4x-nominal stall or a
-        // non-monotonic timestamp - which are exactly the moments the
-        // smoothed interval is least trustworthy (stream bring-up, loading
-        // screens, entering a game). Streams that never carry usable
-        // timestamps report warm: nothing to measure.
+        // Warm = enough monotonic samples spanning ~0.5s of content. Goes
+        // false on reset() and whenever the window restarts - a genuine
+        // stall or a non-monotonic timestamp - which are exactly the moments
+        // the smoothed interval is least trustworthy (stream bring-up,
+        // loading screens, entering a game). The count path covers content
+        // near the nominal rate; the span path covers slower content, whose
+        // samples cover half a second long before the nominal-rate cap fills
+        // (a 30fps game would otherwise stay "cold" - and vsync-latched -
+        // for 2s after every window restart on a 116fps stream). Streams
+        // that never carry usable timestamps report warm: nothing to
+        // measure.
         if (m_TimestamplessFrames >= 32) {
             return true;
         }
-        return m_SourceTimeCount >= m_SourceTimeCap;
+        if (m_SourceTimeCount >= m_SourceTimeCap) {
+            return true;
+        }
+        if (m_SourceTimeCount >= 17) {
+            uint64_t newestUs = m_SourceTimesUs[
+                (m_SourceTimeHead + m_SourceTimeCap - 1) % m_SourceTimeCap];
+            uint64_t oldestUs = m_SourceTimesUs[
+                (m_SourceTimeHead + m_SourceTimeCap - m_SourceTimeCount) % m_SourceTimeCap];
+            return newestUs - oldestUs >= 500000;
+        }
+        return false;
     }
 
 private:
@@ -176,6 +252,8 @@ private:
     int m_SourceTimeHead;
     int m_SourceTimeCount;
     int m_TimestamplessFrames;
+    uint64_t m_PendingStallDeltaUs;
+    bool m_PhaseReset;
 };
 
 template<typename NowFn, typename SleepUntilFn, typename YieldFn, typename StopFn>

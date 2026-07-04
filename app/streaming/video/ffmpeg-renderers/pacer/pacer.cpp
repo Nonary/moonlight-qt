@@ -320,12 +320,12 @@ int Pacer::cadenceThread(void* context)
         (me->m_VrrCushionUs > 0 ? me->m_VrrCushionUs : 4500);
     const uint64_t queueCushionUs =
         qBound((uint64_t)1500, (uint64_t)cushionCfgUs, (uint64_t)6000);
-    const uint64_t trimDeadbandUs = queueCushionUs + 1000;
     const int slackWindowCap =
         me->m_MaxVideoFps > 0 ? qMax(me->m_MaxVideoFps / 2, 16) : 30;
     uint64_t slackWindowMinUs = UINT64_MAX;
     int slackWindowSamples = 0;
     uint64_t trimStepUs = 0;
+    uint64_t padStepUs = 0;
     uint64_t lastTrimLogUs = 0;
 
     // Post-stall recovery tuning (the flip-spacing floor, staleSchedule
@@ -341,6 +341,59 @@ int Pacer::cadenceThread(void* context)
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_RECOVERY") != 0;
     const uint64_t flipCeilingSlackUs = 750;
     const uint64_t rushAlignFloorUs = 600;
+
+    // Near-ceiling buffered VRR. Content cadence between the taper
+    // threshold (~103fps) and just under the panel's nominal max refresh
+    // used to be handed to the vsync latch wholesale, and latched presents
+    // run a FIXED raster: content quantized to 120Hz slots repeats a frame
+    // on a periodic beat (every ~6 frames at 105fps, every ~29 at 116) -
+    // judder during pans. The panel itself can follow this entire range
+    // exactly like it follows a local game capped a few fps below max
+    // refresh (the classic VRR configuration): in flip-following the panel
+    // waits in vblank for the next flip, so the only real per-flip floor
+    // is the ~8.3ms scanout itself. What actually failed in the old
+    // free-run measurements here (36-57% tears, continuous drops) was
+    // presents inheriting arrival/render jitter with no standing buffer:
+    // any flip that went out tighter than the previous scanout tore, and
+    // bursts of them knocked the driver out of flip-following entirely.
+    // NOTE: the 750us "flip ceiling" slack used by the free-run floors
+    // elsewhere in this thread was measured during exactly those
+    // collapses - a free-running raster tears at ANY spacing - so the band
+    // treats it as a free-run artifact, not a flip-following limit, and
+    // runs on the nominal scanout spacing plus a small guard instead.
+    // So instead of latching the band, decouple flip spacing from the
+    // jitter:
+    //  - hold a deliberate ~one-content-interval standing queue (the
+    //    re-timing buffer: jitter lands on a frame that is already queued,
+    //    not on the flip instant),
+    //  - keep the schedule on the smoothed cadence with the spacing floor
+    //    at nominal-scanout-plus-guard, and
+    //  - move the rush/stale/drain machinery behind the buffer so routine
+    //    wobble can never fire the tight catch-up flips that broke
+    //    flip-following in the first place.
+    // Costs ~5ms of standing latency versus the free-run cushion, only
+    // while content is inside the band. MOONLIGHT_VRR_NO_NEARBUFFER=1
+    // restores the old latch-everything behavior; MOONLIGHT_VRR_BUFFER_GUARD_US
+    // moves the band's fast edge (default 150us over nominal max-refresh
+    // spacing, admitting content to ~117.9fps on 120Hz; raise it if
+    // in-band tearing appears - 1050 recreates the old ~110fps ceiling).
+    const bool nearBufferEnabled = !classicRecovery &&
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_NEARBUFFER") == 0;
+    const int bufferGuardEnv =
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_BUFFER_GUARD_US");
+    const uint64_t bufferGuardUs = bufferGuardEnv > 0 ?
+        (uint64_t)bufferGuardEnv : 150;
+    bool nearBuffered = false;
+    bool prevNearBuffered = false;
+    int nearBufferDwell = 0;
+    uint64_t lastWideReanchorUs = 0;
+    uint64_t lastBufferLogUs = 0;
+    int relockBurstRemaining = 0;
+    uint64_t lastRelockBurstUs = 0;
+    uint64_t lastRelockLogUs = 0;
+    bool bandSnapPending = false;
+    bool overfillDropPending = false;
+    uint64_t lastSnapLogUs = 0;
 
     while (!me->m_Stopping) {
         me->m_FrameQueueLock.lock();
@@ -364,17 +417,24 @@ int Pacer::cadenceThread(void* context)
         // back to keep-newest when the backlog has persisted a full history
         // window - that means presents genuinely can't keep up with delivery
         // and holding more frames would just be permanent added latency.
-        int frameDropTarget = 2;
+        //
+        // In the near-ceiling buffered band the standing queue IS the design
+        // (one frame deliberately in flight as the jitter re-timing buffer),
+        // so the bar shifts up one: tolerate a routine depth of 2 and only
+        // collapse a persistent 3+. (nearBuffered is last iteration's state
+        // here - a one-frame lag on band transitions is harmless.)
+        int steadyDepth = nearBuffered ? 2 : 1;
+        int frameDropTarget = steadyDepth + 1;
         if (queueDepthHistory.count() == queueDepthHistoryCap) {
             bool persistentBacklog = true;
             for (int depth : std::as_const(queueDepthHistory)) {
-                if (depth <= 1) {
+                if (depth <= steadyDepth) {
                     persistentBacklog = false;
                     break;
                 }
             }
             if (persistentBacklog) {
-                frameDropTarget = 1;
+                frameDropTarget = steadyDepth;
                 queueDepthHistory.clear();
             }
         }
@@ -382,6 +442,9 @@ int Pacer::cadenceThread(void* context)
         while (me->m_PacingQueue.count() > frameDropTarget) {
             AVFrame* staleFrame = me->m_PacingQueue.dequeue();
             me->m_FrameQueueLock.unlock();
+            // The clock must see dropped frames' timestamps too or sustained
+            // drops inflate the measured cadence - see observeSourceTime().
+            cadenceClock.observeSourceTime(frameCadenceTimestampUs(staleFrame));
             me->m_VideoStats->pacerDroppedFrames++;
             me->maybeLogFrameDiagnostics("vrr cadence queue drop", 0);
             av_frame_free(&staleFrame);
@@ -389,12 +452,14 @@ int Pacer::cadenceThread(void* context)
         }
 
         AVFrame* frame = me->m_PacingQueue.dequeue();
-        bool backlogged = !me->m_PacingQueue.isEmpty();
+        int queuedBehindCount = me->m_PacingQueue.count();
+        bool backlogged = queuedBehindCount > 0;
         me->m_FrameQueueLock.unlock();
 
         uint64_t nowUs = LiGetMicroseconds();
         uint64_t targetUs = cadenceClock.nextTargetUs(nowUs,
                                                       frameCadenceTimestampUs(frame));
+        bool clockPhaseReset = cadenceClock.consumePhaseReset();
 
         // The clock's smoothed measurement of the actual content cadence -
         // the stream's nominal FPS is only an upper bound (a game hovering
@@ -420,7 +485,11 @@ int Pacer::cadenceThread(void* context)
         // measured as 36-57% tears with 1.4-4% continuous drops - while the
         // same content vsync-latched measures 0.0% tears and 0.00% drops.
         // Do not widen this margin toward the ceiling without hardware
-        // measurements showing that zone has become viable.
+        // measurements showing that zone has become viable. (Those numbers
+        // condemn UNBUFFERED free-run alignment only: the near-ceiling
+        // buffered band below is the sanctioned way to operate in this
+        // zone - it re-times presents behind a standing buffer instead of
+        // aligning jittery ones, which is a different regime.)
         if (measuredSourceIntervalUs < minFrameIntervalUs + 1350) {
             alignTapered = true;
             alignFullDwell = 0;
@@ -454,7 +523,99 @@ int Pacer::cadenceThread(void* context)
         bool cadenceColdLatch = latchAvailable && !classicRecovery &&
             !cadenceClock.warmedUp();
 
-        bool vsyncLatchPresent = (alignTapered || cadenceColdLatch) &&
+        // Band membership for near-ceiling buffered VRR, with hysteresis on
+        // the fast edge only (the slow edge inherits the taper's own
+        // hysteresis via alignTapered). bufferFloorIntervalUs is both the
+        // exit threshold and the in-band flip spacing floor: cadence below
+        // it means content is essentially at or above the panel's max
+        // refresh, where no pacing can keep service at the arrival rate -
+        // that stays the latch's territory. Entry needs the cadence a step
+        // inside the band for a sustained dwell (the windowed mean wobbles
+        // tens of us; without the step, edge content would flap across the
+        // boundary). Exit past the fast edge is immediate: content over
+        // the max refresh backlogs by physics, and the fallback (latch, or
+        // taper free-run for tearing-preferred users) is always safer than
+        // pretending to pace it.
+        // Deliberately NOT gated on latchAvailable: tearing-preferred /
+        // NO_LATCH users have no latch to fall back to, so without the band
+        // their near-ceiling content runs the raw unbuffered free-run that
+        // collapses here (measured 2026-07-04: 108fps content, 0 latched,
+        // budgets pinned at the 3ms floor, 30% jitter drops) - they need
+        // the buffer MORE, not less.
+        //
+        // The fast edge likewise only exists when the latch is available
+        // to hand content to (latched 116-on-120 measured 0.19-0.26ms
+        // interval stddev - steadier than anything free-run can do at zero
+        // cadence slack). Without the latch, everything past the edge is
+        // rush-at-zero-budget free-run - measured 2026-07-04 as 94-97%
+        // torn presents at ~118fps content - and band pacing with the
+        // guard floor beats that outright, so the band keeps ALL tapered
+        // content. This also kills the edge-flapping that unstable content
+        // (measured swinging 105-118fps within seconds) causes: each flap
+        // wiped the standing buffer before it could do its job.
+        // Warm-up matters for ENTRY only. A mid-session content stall
+        // restarts the clock's sample window, and releasing the band on
+        // that (measured 2026-07-04 on hitchy content stalling every few
+        // seconds: "released at 110-115fps" lines that were warmup resets,
+        // not rate changes) tears down every in-band protection at exactly
+        // the moment content is chaotic. The frozen smoothed interval is
+        // still the best cadence estimate available, and the flip floor
+        // holds regardless. (For latch users, the cadence-cold latch
+        // outranks the band below, which is the safer stint there.)
+        uint64_t bufferFloorIntervalUs = minFrameIntervalUs + bufferGuardUs;
+        bool pastFastEdge = latchAvailable &&
+            measuredSourceIntervalUs < bufferFloorIntervalUs;
+        if (!nearBufferEnabled || !alignTapered || pastFastEdge) {
+            nearBuffered = false;
+            nearBufferDwell = 0;
+        }
+        else if (!nearBuffered) {
+            if (cadenceClock.warmedUp() &&
+                    (!latchAvailable ||
+                     measuredSourceIntervalUs >= bufferFloorIntervalUs + 100)) {
+                if (nearBufferDwell < 12) {
+                    nearBufferDwell++;
+                }
+                else {
+                    nearBuffered = true;
+                }
+            }
+            else if (nearBufferDwell > 0) {
+                nearBufferDwell--;
+            }
+        }
+
+        // The clock snapping onto "now" after a stall wipes the standing
+        // buffer's phase offset; re-establish it in one step below rather
+        // than re-learning it over seconds of padding.
+        if (nearBuffered && clockPhaseReset) {
+            bandSnapPending = true;
+        }
+
+        if (nearBuffered != prevNearBuffered) {
+            if (nearBuffered) {
+                // Fresh from a latch spell or free-run chaos the panel is
+                // certainly on a fixed raster; allow the re-lock ritual to
+                // arm immediately, regardless of when the last one ran, and
+                // build the standing buffer in one step.
+                lastRelockBurstUs = 0;
+                bandSnapPending = true;
+            }
+            if (nowUs - lastBufferLogUs > 5000000ULL) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "VRR near-ceiling buffer: %s at %.1f fps measured (interval %.2f ms, band floor %.2f ms)",
+                            nearBuffered ? "engaged" : "released",
+                            measuredSourceIntervalUs > 0 ?
+                                1000000.0 / measuredSourceIntervalUs : 0.0,
+                            measuredSourceIntervalUs / 1000.0,
+                            bufferFloorIntervalUs / 1000.0);
+                lastBufferLogUs = nowUs;
+            }
+            prevNearBuffered = nearBuffered;
+        }
+
+        bool vsyncLatchPresent = ((alignTapered && !nearBuffered) ||
+                                  cadenceColdLatch) &&
             latchAvailable;
 
         // Every free-run spacing floor below uses the measured flip ceiling,
@@ -466,9 +627,24 @@ int Pacer::cadenceThread(void* context)
         // Tearing-preferred users keep the nominal floor too: they traded
         // tears for latency.
         uint64_t flipSpacingFloorUs = minFrameIntervalUs;
-        if (!classicRecovery && !vsyncLatchPresent &&
-            !me->m_VrrTearingPreferred) {
-            flipSpacingFloorUs += flipCeilingSlackUs;
+        if (!classicRecovery && !vsyncLatchPresent) {
+            if (nearBuffered) {
+                // In-band the floor is the band's own guard over nominal
+                // scanout spacing, NOT the 750us free-run ceiling slack:
+                // 116fps content's 8.62ms interval sits BELOW that old
+                // ceiling, and flooring flips at it would service slower
+                // than arrival - permanent backlog and drops. The guard
+                // keeps every flip clear of the previous scanout;
+                // flip-following is what makes that sufficient (see the
+                // band comment above). Applied to tearing-preferred users
+                // too: it costs no latency (it only forbids flips tighter
+                // than the panel can scan), and in-band the raster lock is
+                // the whole game.
+                flipSpacingFloorUs += bufferGuardUs;
+            }
+            else if (!me->m_VrrTearingPreferred) {
+                flipSpacingFloorUs += flipCeilingSlackUs;
+            }
         }
 
         // Belt-and-suspenders on top of the clock's own max-refresh floor: the
@@ -501,9 +677,18 @@ int Pacer::cadenceThread(void* context)
         // already older than that plus slack means every subsequent frame
         // will queue behind us as pure added latency (measured as ~14ms avg
         // frame queue delay against an 8.3ms frame time).
+        uint64_t staleAgeUs =
+            measuredSourceIntervalUs + measuredSourceIntervalUs / 4;
+        if (nearBuffered) {
+            // The deliberate standing buffer holds every frame ~one extra
+            // interval by design, so the stale trigger must sit beyond the
+            // buffer plus jitter - otherwise routine wobble fires
+            // ceiling-spaced rush catch-ups, the exact tight-flip generator
+            // the buffer exists to kill.
+            staleAgeUs += measuredSourceIntervalUs;
+        }
         bool staleSchedule = measuredSourceIntervalUs != 0 && frame->pkt_dts > 0 &&
-            nowUs > (uint64_t)frame->pkt_dts +
-                measuredSourceIntervalUs + measuredSourceIntervalUs / 4;
+            nowUs > (uint64_t)frame->pkt_dts + staleAgeUs;
 
         // Two-tier catch-up, rebasing the clock onto any instant actually
         // used so the schedule converges back to arrival phase instead of
@@ -538,7 +723,10 @@ int Pacer::cadenceThread(void* context)
                 }
                 rushPresent = true;
             }
-            else if (backlogged) {
+            else if (nearBuffered ? queuedBehindCount >= 2 : backlogged) {
+                // In-band, one queued frame is the buffer operating as
+                // designed, not backlog - draining it would just re-expose
+                // the flip to jitter. Only a genuine 2+ pile-up drains.
                 uint64_t drainIntervalUs = qMax(flipSpacingFloorUs,
                                                 measuredSourceIntervalUs * 7 / 8);
                 uint64_t drainUs = qMax(lastFlipUs + drainIntervalUs,
@@ -577,6 +765,53 @@ int Pacer::cadenceThread(void* context)
         // already judged imperceptible), and one late frame in the window
         // vetoes the trim, so links whose jitter genuinely needs the queue
         // as a shock absorber keep it (smoothness over latency).
+        // In-band, the servo's set-point moves up to the deliberate
+        // one-interval buffer and gains a symmetric build direction: the
+        // schedule only ever drifts later on its own, so without an active
+        // pad the buffer would only exist after a lucky stall. The pad
+        // stretches the cadence <=1% until the window-min age reaches the
+        // set-point; the trim shrinks it back identically once content
+        // leaves the band. A deep backlog or stale frame vetoes both.
+        uint64_t effCushionUs = queueCushionUs;
+        if (nearBuffered) {
+            effCushionUs = qMax(effCushionUs, measuredSourceIntervalUs + 500);
+        }
+        uint64_t effDeadbandUs = effCushionUs + 1000;
+        bool servoVeto = staleSchedule ||
+            (nearBuffered ? queuedBehindCount >= 2 : backlogged);
+
+        // One-step buffer snap on band entry and after stall resets. The
+        // gradual pad below moves <=100us/frame (~1.5s to build the full
+        // cushion) - correct for drift, but on hitchy content (host
+        // processing spikes of 400-550ms every few seconds, measured
+        // 2026-07-04) the buffer got wiped faster than it could rebuild
+        // and in-band pacing effectively never had its jitter protection.
+        // A single deliberate phase step is imperceptible (it is latency,
+        // not motion) and buys immediate protection.
+        if (bandSnapPending) {
+            if (nearBuffered && !staleSchedule && frame->pkt_dts > 0) {
+                uint64_t renderStartEstUs = targetUs > renderLeadUs ?
+                    targetUs - renderLeadUs : 0;
+                uint64_t ageUs = renderStartEstUs > (uint64_t)frame->pkt_dts ?
+                    renderStartEstUs - (uint64_t)frame->pkt_dts : 0;
+                if (ageUs + 1000 < effCushionUs) {
+                    uint64_t snapUs = qMin(effCushionUs - ageUs,
+                                           (uint64_t)12000);
+                    targetUs += snapUs;
+                    cadenceClock.rebaseTarget(targetUs);
+                    if (nowUs - lastSnapLogUs > 10000000ULL) {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                    "VRR buffer snap: +%.2f ms to rebuild the standing buffer (age %.2f ms, cushion %.2f ms)",
+                                    snapUs / 1000.0,
+                                    ageUs / 1000.0,
+                                    effCushionUs / 1000.0);
+                        lastSnapLogUs = nowUs;
+                    }
+                }
+            }
+            bandSnapPending = false;
+        }
+
         if (latencyTrimEnabled && frame->pkt_dts > 0) {
             uint64_t renderStartEstUs = targetUs > renderLeadUs ?
                 targetUs - renderLeadUs : 0;
@@ -586,11 +821,34 @@ int Pacer::cadenceThread(void* context)
 
             if (++slackWindowSamples >= slackWindowCap) {
                 uint64_t newStepUs = 0;
-                if (!backlogged && !staleSchedule &&
-                        slackWindowMinUs > trimDeadbandUs) {
+                uint64_t newPadUs = 0;
+                if (!servoVeto && slackWindowMinUs > effDeadbandUs) {
                     newStepUs = qBound((uint64_t)20,
-                                       (slackWindowMinUs - queueCushionUs) / (uint64_t)slackWindowCap,
+                                       (slackWindowMinUs - effCushionUs) / (uint64_t)slackWindowCap,
                                        (uint64_t)250);
+                }
+                else if (nearBuffered && !servoVeto &&
+                         slackWindowMinUs != UINT64_MAX &&
+                         slackWindowMinUs + 1000 < effCushionUs) {
+                    newPadUs = qBound((uint64_t)20,
+                                      (effCushionUs - slackWindowMinUs) / (uint64_t)slackWindowCap,
+                                      (uint64_t)100);
+                }
+                else if (nearBuffered && !staleSchedule &&
+                         slackWindowMinUs != UINT64_MAX &&
+                         slackWindowMinUs > effCushionUs +
+                             measuredSourceIntervalUs * 3 / 4) {
+                    // Standing overfill: at saturation (arrival rate ~=
+                    // service rate, routine at 116-on-120) the trim servo
+                    // is depth-vetoed and the gentle drain's ~140us/frame
+                    // never catches up, so the queue parks a whole extra
+                    // frame above the cushion - measured 2026-07-04 as a
+                    // standing 17-20ms queue against a 9ms design, sitting
+                    // right at the stale threshold and thrashing it. Shed
+                    // exactly one frame (a single ~8.6ms content skip, at
+                    // most twice a second) instead of letting random
+                    // queue-drop bursts and stale rushes do it messily.
+                    overfillDropPending = true;
                 }
                 if (newStepUs != 0 && trimStepUs == 0 &&
                         nowUs - lastTrimLogUs > 30000000ULL) {
@@ -600,14 +858,24 @@ int Pacer::cadenceThread(void* context)
                                 (unsigned int)newStepUs);
                     lastTrimLogUs = nowUs;
                 }
+                if (newPadUs != 0 && padStepUs == 0 &&
+                        nowUs - lastTrimLogUs > 30000000ULL) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR cadence pad: min queue %.2f ms last window, building buffer %u us/frame toward %.2f ms",
+                                slackWindowMinUs / 1000.0,
+                                (unsigned int)newPadUs,
+                                effCushionUs / 1000.0);
+                    lastTrimLogUs = nowUs;
+                }
                 trimStepUs = newStepUs;
+                padStepUs = newPadUs;
                 slackWindowMinUs = UINT64_MAX;
                 slackWindowSamples = 0;
             }
         }
 
         if (trimStepUs > 0) {
-            if (staleSchedule || backlogged) {
+            if (servoVeto) {
                 // These paths rebase the schedule phase themselves; trimming
                 // on top of a rebase would over-correct. Re-measure instead.
                 trimStepUs = 0;
@@ -627,6 +895,34 @@ int Pacer::cadenceThread(void* context)
                     cadenceClock.rebaseTarget(targetUs);
                 }
             }
+        }
+        else if (padStepUs > 0) {
+            if (servoVeto || !nearBuffered) {
+                padStepUs = 0;
+            }
+            else {
+                targetUs += padStepUs;
+                cadenceClock.rebaseTarget(targetUs);
+            }
+        }
+
+        if (overfillDropPending) {
+            AVFrame* overfillFrame = nullptr;
+            me->m_FrameQueueLock.lock();
+            if (nearBuffered && !me->m_PacingQueue.isEmpty()) {
+                overfillFrame = me->m_PacingQueue.dequeue();
+            }
+            me->m_FrameQueueLock.unlock();
+            if (overfillFrame != nullptr) {
+                // Dropped frames must still feed the cadence clock - see
+                // observeSourceTime().
+                cadenceClock.observeSourceTime(
+                    frameCadenceTimestampUs(overfillFrame));
+                me->m_VideoStats->pacerDroppedFrames++;
+                av_frame_free(&overfillFrame);
+                me->maybeLogFrameDiagnostics("vrr buffer overfill drop", 0);
+            }
+            overfillDropPending = false;
         }
 
         uint64_t targetRenderStartUs = targetUs > renderLeadUs ?
@@ -657,8 +953,50 @@ int Pacer::cadenceThread(void* context)
              measuredSourceIntervalUs > minFrameIntervalUs + 200) ?
                 measuredSourceIntervalUs - minFrameIntervalUs - 200 : 0;
 
+        // Re-lock ritual state. The driver re-enters VRR flip-following
+        // only after a SUSTAINED streak of aligned flips - the 2026-07-03/04
+        // forensics showed single wide re-anchors produce tear/catch
+        // alternation (one flip caught by chase, the next floor-budget flip
+        // tears again, streak never forms). So while the renderer cannot
+        // prove lock, pay for a short burst of consecutive
+        // full-scanout-budget presents; the standing buffer and the raised
+        // in-band stale threshold absorb the cost (~4ms average wait per
+        // present, bounded at 8 presents per 2s = <2% of wall time) as
+        // temporary queue instead of drops. The burst ends early the moment
+        // lock is demonstrated, and the whole mechanism only runs in-band -
+        // out-of-band content has the cadence slack to re-anchor organically.
+        //
+        // Gated on real cadence slack (>=800us, content up to ~107fps):
+        // above that the pipeline is saturated - every present runs
+        // late-past-target, the renderer's out-of-reach fast-give-up fires
+        // before the ritual budget is ever spent, and the burst is pure
+        // churn (measured 2026-07-04: rituals arming every 2s for minutes
+        // at 114-116fps content, avg waits 0.1-0.3ms against 10ms budgets,
+        // zero locks established).
+        if (nearBuffered) {
+            if (relockBurstRemaining > 0 &&
+                    !me->m_VsyncRenderer->isVrrRasterLockUncertain()) {
+                relockBurstRemaining = 0;
+            }
+            else if (relockBurstRemaining == 0 &&
+                     cadenceSlackUs >= 800 &&
+                     me->m_VsyncRenderer->isVrrRasterLockUncertain() &&
+                     nowUs - lastRelockBurstUs > 2000000ULL) {
+                relockBurstRemaining = 8;
+                lastRelockBurstUs = nowUs;
+                if (nowUs - lastRelockLogUs > 10000000ULL) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR re-lock ritual: bursting max-budget aligned presents (raster lock uncertain)");
+                    lastRelockLogUs = nowUs;
+                }
+            }
+        }
+        else {
+            relockBurstRemaining = 0;
+        }
+
         uint64_t alignBudgetUs;
-        if (alignTapered || cadenceColdLatch) {
+        if ((alignTapered || cadenceColdLatch) && !nearBuffered) {
             // Content near or above this panel's true tear-free flip
             // ceiling (empirically ~110fps on the 120Hz Ally X panel, i.e.
             // ~750us above the nominal max-refresh spacing) has no tear-free
@@ -681,6 +1019,16 @@ int Pacer::cadenceThread(void* context)
             // the cost of visible tearing.
             alignBudgetUs = vsyncLatchPresent ? 0 : 3000;
         }
+        else if (relockBurstRemaining > 0) {
+            // Ritual presents take the full-scanout budget even when the
+            // rush/stale machinery wants them out fast: a blind rush flip
+            // mid-ritual resets the renderer's alignment streak and wastes
+            // every wait the ritual already paid for. The rush targeting
+            // (floor-spaced catch-up rebase) still applies - only the
+            // wait-for-blank budget is protected here.
+            relockBurstRemaining--;
+            alignBudgetUs = minFrameIntervalUs + 2000;
+        }
         else if (rushPresent) {
             // A catch-up present may only spend the cadence's real per-frame
             // slack (content interval over the panel's max flip spacing), so
@@ -695,15 +1043,33 @@ int Pacer::cadenceThread(void* context)
             // immediately, so a sub-ms wait usually converts a guaranteed
             // tear into an aligned flip; 600us is ~5% of an interval and
             // cannot compound lateness into drops the way an unbounded wait
-            // would. (Content here is below the taper threshold, so
-            // cadenceSlackUs is already >=~1.1ms - the floor only ever
-            // overrides render-bound starvation.)
+            // would. (Content below the taper threshold has cadenceSlackUs
+            // >=~1.1ms, so there the floor only overrides render-bound
+            // starvation; in the near-ceiling buffered band the slack
+            // itself shrinks toward zero at max refresh and the floor is
+            // load-bearing - the standing buffer absorbs its cost.)
             alignBudgetUs = qMin(qMin(cadenceSlackUs, threadSlackUs),
                                  (uint64_t)2500);
-            if (!classicRecovery && !me->m_VrrTearingPreferred &&
+            if (!classicRecovery &&
+                    (nearBuffered || !me->m_VrrTearingPreferred) &&
                     alignBudgetUs < rushAlignFloorUs) {
+                // In-band the floor applies even for tearing-preferred
+                // users: one blind rush flip can cost the raster lock, and
+                // re-earning it costs far more latency than 600us.
                 alignBudgetUs = rushAlignFloorUs;
             }
+        }
+        else if (nearBuffered) {
+            // Buffered band, lock held (or ritual on cooldown): while the
+            // panel is flip-following, the blank arrives ON our schedule
+            // and the wait measures ~0, so the budget only needs to cover
+            // measurement noise - and it must never exceed the cadence's
+            // true per-frame slack, or alignment waits eat the buffer's
+            // absorb margin (the old free-run collapse in exactly this
+            // band). Re-entry from a lost lock is the re-lock ritual's
+            // job, armed above.
+            alignBudgetUs = qMax(qMin(cadenceSlackUs, (uint64_t)2500),
+                                 rushAlignFloorUs);
         }
         else {
             // Real headroom: floor at the fixed 3ms spin that reached
@@ -732,12 +1098,27 @@ int Pacer::cadenceThread(void* context)
             // one-shot re-anchor broke the chains - as an alternating
             // tear/catch pattern whenever the raster ran fixed-cadence.
             // Keep the full-scanout budget until the lock is demonstrated;
-            // it costs nothing while the panel is actually following, and
-            // never applies while backlogged, where wide waits deepen a
-            // genuine overload's drop cascade.
-            if (!classicRecovery && !backlogged &&
+            // it costs nothing while the panel is actually following.
+            // While backlogged it is RATIONED rather than suppressed: the
+            // old all-or-nothing gate let a jitter-burst backlog pin every
+            // present at the 3ms floor for its whole duration, and with the
+            // raster free-running that was measured (2026-07-04, 90-94fps
+            // content) as 20-30% tear windows - chains of floor-spaced
+            // flips crawling the tear line for hundreds of frames. One wide
+            // wait per second breaks the chain at a bounded cost (~8ms of
+            // extra queue, drained in a few frames of cadence surplus),
+            // where waiting wide on EVERY backlogged present really would
+            // deepen the overload.
+            if (!classicRecovery &&
                     me->m_VsyncRenderer->isVrrRasterLockUncertain()) {
-                alignBudgetUs = maxAlignUs;
+                if (!backlogged) {
+                    alignBudgetUs = maxAlignUs;
+                }
+                else if (nowUs - lastWideReanchorUs > 1000000ULL) {
+                    alignBudgetUs = qMax((uint64_t)3000,
+                                         minFrameIntervalUs + 2000);
+                    lastWideReanchorUs = nowUs;
+                }
             }
         }
 
@@ -749,7 +1130,7 @@ int Pacer::cadenceThread(void* context)
         }
 
         me->m_VsyncRenderer->setPresentTargetUs(targetUs, rushPresent, alignBudgetUs,
-                                                vsyncLatchPresent);
+                                                vsyncLatchPresent, nearBuffered);
         me->m_VsyncRenderer->waitToRender();
         me->renderFrame(frame);
 

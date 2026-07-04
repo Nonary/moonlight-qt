@@ -81,6 +81,8 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_PresentAlignBudgetUs(0),
       m_PresentVsyncLatch(false),
       m_LastPresentLatched(false),
+      m_PresentNearBuffered(false),
+      m_LastPresentBuffered(false),
       m_LastPresentUs(0),
       m_AlignHits(0),
       m_AlignGiveUps(0),
@@ -1446,6 +1448,8 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         vsyncLatch = m_PresentVsyncLatch;
         m_PresentVsyncLatch = false;
         m_LastPresentLatched = vsyncLatch;
+        m_LastPresentBuffered = m_PresentNearBuffered && !vsyncLatch;
+        m_PresentNearBuffered = false;
         bool catchUpPresent = m_PresentCatchUp;
         m_PresentCatchUp = false;
         uint64_t latePastTargetUs = holdUntilPresentTarget();
@@ -1478,6 +1482,8 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         m_PresentAlignBudgetUs = 0;
         m_PresentVsyncLatch = false;
         m_LastPresentLatched = false;
+        m_PresentNearBuffered = false;
+        m_LastPresentBuffered = false;
         waitForVBlankBeforeTearingPresent(3000);
     }
 
@@ -2186,8 +2192,11 @@ const char* D3D11VARenderer::getPresentationModeFallbackReason()
     // dynamic switching look inert.
     if (m_PresentationMode == PresentationMode::VrrCadence &&
             m_PresentationModeFallbackReason == nullptr) {
-        return m_LastPresentLatched ?
-            "vsync-latched: content at the panel's VRR ceiling" :
+        if (m_LastPresentLatched) {
+            return "vsync-latched: content at the panel's VRR ceiling";
+        }
+        return m_LastPresentBuffered ?
+            "true VRR pacing (near-ceiling buffer)" :
             "true VRR pacing";
     }
 
@@ -2208,14 +2217,16 @@ uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
     return waitUs;
 }
 
-void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch)
+void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch, bool nearBuffered)
 {
     // The catch-up policy is fully encoded in the pacer's alignment budget,
     // so the flag doesn't steer presentation - it's recorded purely so tear
-    // forensics can attribute a mid-scan give-up to the catch-up path.
+    // forensics can attribute a mid-scan give-up to the catch-up path. The
+    // near-buffered flag likewise only labels the overlay sub-state.
     m_PresentTargetUs = targetUs;
     m_PresentAlignBudgetUs = alignBudgetUs;
     m_PresentVsyncLatch = vsyncLatch;
+    m_PresentNearBuffered = nearBuffered;
     m_PresentCatchUp = catchUp;
 }
 

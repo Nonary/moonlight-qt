@@ -245,18 +245,18 @@ public:
         return 0;
     }
 
-    virtual void setPresentTargetUs(uint64_t, bool, uint64_t, bool) {
+    virtual void setPresentTargetUs(uint64_t, bool, uint64_t, bool, bool) {
         // The cadence pacer's intended present instant for the next
         // renderFrame() call. Renderers that phase-align their presents must
         // hold the flip until this time even if the display is already in
         // its blanking gap - releasing early re-scatters the present phase
         // the pacer just computed.
         //
-        // The bool is the pacer's catch-up flag: true means presentation is
-        // running behind frame delivery and this present is draining that
-        // backlog.
+        // The first bool is the pacer's catch-up flag: true means
+        // presentation is running behind frame delivery and this present is
+        // draining that backlog.
         //
-        // The final bool asks for a vsync-latched present: drop the tearing
+        // The second bool asks for a vsync-latched present: drop the tearing
         // flag so the flip latches at the display's next vblank instead of
         // executing immediately. The pacer requests this while the measured
         // content cadence runs above the panel's tear-free flip ceiling,
@@ -264,6 +264,12 @@ public:
         // classic vblank-latched presentation is tear-free and metronomic
         // there, and reads clearly smoother (user-validated at 116-on-120).
         // The alignment budget is moot for latched presents.
+        //
+        // The third bool reports that the pacer is running its near-ceiling
+        // buffered mode (content just below the flip ceiling, presents
+        // re-timed behind a deliberate standing buffer). Presentation
+        // mechanics are identical to ordinary tearing presents; renderers
+        // only use it to label diagnostics/overlay state.
         //
         // The uint64_t argument is the blank-alignment budget in
         // microseconds: how long past the target the renderer may stall
