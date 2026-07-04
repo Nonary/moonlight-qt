@@ -442,6 +442,31 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
         return false;
     }
 
+#ifdef HAVE_LIBPLACEBO_VULKAN
+    // PREFER_VULKAN=1: try the Vulkan frontend before the backend's
+    // direct-rendering shortcut below. This must live HERE, not only in the
+    // alternate-frontend block above - that block never runs on Windows
+    // (the renderer-selection loop only does the alternate pass on Unix),
+    // which made the stock PREFER_VULKAN check dead code on Windows. An
+    // explicitly requested attempt must not fail silently, so both
+    // outcomes are logged.
+    if (m_BackendRenderer->getRendererType() != IFFmpegRenderer::RendererType::Vulkan &&
+            qgetenv("PREFER_VULKAN") == "1") {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Trying Vulkan frontend renderer (PREFER_VULKAN)");
+        m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
+        if (initializeRendererInternal(m_FrontendRenderer, params)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Using Vulkan frontend renderer");
+            return true;
+        }
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Requested Vulkan renderer failed to initialize; falling back to the default renderer");
+        delete m_FrontendRenderer;
+        m_FrontendRenderer = nullptr;
+    }
+#endif
+
     if (m_BackendRenderer->isDirectRenderingSupported()) {
         // The backend renderer can render to the display
         m_FrontendRenderer = m_BackendRenderer;
