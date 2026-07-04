@@ -95,6 +95,7 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_TearForensicCount(0),
       m_PresentCatchUp(false),
       m_AlignInstantStreak(0),
+      m_MidScanSinceQuery(0),
       m_PresentReadyFenceValue(0),
       m_PresentReadyFenceEvent(nullptr),
       m_PresentReadyFenceFailed(false),
@@ -678,6 +679,8 @@ void D3D11VARenderer::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, 
         m_AlignHits++;
     }
     else {
+        m_MidScanSinceQuery++;
+
         if (maxWaitUs < 500) {
             m_AlignSkips++;
         }
@@ -2233,6 +2236,15 @@ void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64
 uint64_t D3D11VARenderer::getLastPresentUs()
 {
     return m_LastPresentUs;
+}
+
+uint32_t D3D11VARenderer::popMidScanTearCount()
+{
+    // Only read from the cadence thread, which is also the render thread
+    // for VrrCadence - no synchronization needed.
+    uint32_t count = m_MidScanSinceQuery;
+    m_MidScanSinceQuery = 0;
+    return count;
 }
 
 bool D3D11VARenderer::isVrrRasterLockUncertain()

@@ -395,6 +395,21 @@ int Pacer::cadenceThread(void* context)
     bool overfillDropPending = false;
     uint64_t lastSnapLogUs = 0;
 
+    // Tear-rate feedback: the self-calibrating replacement for hardcoded
+    // per-panel rate limits. Whether a given display/driver stack can
+    // flip-follow near-ceiling free-run presents is not knowable a priori
+    // (this panel proved unable above ~110fps; others may differ), so
+    // measure it: count mid-scan presents across a rolling in-band probe
+    // window, and when the observed tear rate proves chronic, hand this
+    // content to the vsync latch for a while. Expiry re-probes, so a
+    // regime change (different content rate, driver re-engaging) is found
+    // within one probe window (~2-3s of tearing per minute worst-case).
+    // Only meaningful when the latch exists to fall back to;
+    // tearing-preferred users chose cadence-over-tears explicitly.
+    uint32_t bandTearWindowPresents = 0;
+    uint32_t bandTearWindowTears = 0;
+    uint64_t bandTearFallbackUntilUs = 0;
+
     while (!me->m_Stopping) {
         me->m_FrameQueueLock.lock();
 
@@ -562,15 +577,30 @@ int Pacer::cadenceThread(void* context)
         // still the best cadence estimate available, and the flip floor
         // holds regardless. (For latch users, the cadence-cold latch
         // outranks the band below, which is the safer stint there.)
+        // The band is bounded by the measured interval on BOTH sides, not
+        // just by alignTapered: the taper's exit dwell holds it engaged for
+        // ~24 frames after content slows, and a 24fps cutscene that arrives
+        // during that window must not enter the band (measured 2026-07-04:
+        // "engaged at 23.8 fps" - the in-band cushion tracks the interval,
+        // so slow content targeted a 42ms standing buffer, pure latency).
+        // Entry needs the near-ceiling zone proper; the hold releases
+        // instantly once content is clearly slower than ~92fps, where full
+        // free-run has abundant slack and needs no buffer.
         uint64_t bufferFloorIntervalUs = minFrameIntervalUs + bufferGuardUs;
         bool pastFastEdge = latchAvailable &&
             measuredSourceIntervalUs < bufferFloorIntervalUs;
-        if (!nearBufferEnabled || !alignTapered || pastFastEdge) {
+        bool clearlySlowerThanBand =
+            measuredSourceIntervalUs >= minFrameIntervalUs + 2500;
+        bool tearRateFallback = latchAvailable &&
+            nowUs < bandTearFallbackUntilUs;
+        if (!nearBufferEnabled || !alignTapered || pastFastEdge ||
+                clearlySlowerThanBand || tearRateFallback) {
             nearBuffered = false;
             nearBufferDwell = 0;
         }
         else if (!nearBuffered) {
             if (cadenceClock.warmedUp() &&
+                    measuredSourceIntervalUs < minFrameIntervalUs + 1350 &&
                     (!latchAvailable ||
                      measuredSourceIntervalUs >= bufferFloorIntervalUs + 100)) {
                 if (nearBufferDwell < 12) {
@@ -774,7 +804,14 @@ int Pacer::cadenceThread(void* context)
         // leaves the band. A deep backlog or stale frame vetoes both.
         uint64_t effCushionUs = queueCushionUs;
         if (nearBuffered) {
-            effCushionUs = qMax(effCushionUs, measuredSourceIntervalUs + 500);
+            // Clamped so a measurement excursion (stall adopted as cadence
+            // while the band hysteresis is still releasing) can never
+            // target a multi-frame cushion - the buffer is one content
+            // interval by design, and in-band intervals top out around
+            // minFrameInterval + 2.5ms.
+            effCushionUs = qMax(effCushionUs,
+                                qMin(measuredSourceIntervalUs + 500,
+                                     minFrameIntervalUs + 2600));
         }
         uint64_t effDeadbandUs = effCushionUs + 1000;
         bool servoVeto = staleSchedule ||
@@ -1133,6 +1170,35 @@ int Pacer::cadenceThread(void* context)
                                                 vsyncLatchPresent, nearBuffered);
         me->m_VsyncRenderer->waitToRender();
         me->renderFrame(frame);
+
+        // In-band tear-rate probe (see the feedback state above). Counted
+        // only for non-latched in-band presents, and any regime change
+        // resets the window so a rate is never judged across a boundary.
+        // 15% cleanly separates the measured populations: a working band
+        // runs 0.2-2.6% torn, a non-following raster 40-95%.
+        uint32_t midScanTears = me->m_VsyncRenderer->popMidScanTearCount();
+        if (nearBuffered && !vsyncLatchPresent) {
+            bandTearWindowPresents++;
+            bandTearWindowTears += midScanTears;
+            if (bandTearWindowPresents >= 256) {
+                if (latchAvailable &&
+                        bandTearWindowTears * 100 >= bandTearWindowPresents * 15) {
+                    bandTearFallbackUntilUs = nowUs + 60000000ULL;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR tear-rate fallback: %u%% of %u in-band presents tore mid-scan at %.1f fps measured; vsync-latching this content for 60s",
+                                bandTearWindowTears * 100 / bandTearWindowPresents,
+                                bandTearWindowPresents,
+                                measuredSourceIntervalUs > 0 ?
+                                    1000000.0 / measuredSourceIntervalUs : 0.0);
+                }
+                bandTearWindowPresents = 0;
+                bandTearWindowTears = 0;
+            }
+        }
+        else if (bandTearWindowPresents != 0) {
+            bandTearWindowPresents = 0;
+            bandTearWindowTears = 0;
+        }
 
         if (adaptiveMargin) {
             int64_t overshootUs64 =

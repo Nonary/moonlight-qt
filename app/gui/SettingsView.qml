@@ -604,16 +604,20 @@ Flickable {
                                 addRefreshRateOrdered(fpsListModel, refreshRate, qsTr("%1 FPS").arg(refreshRate), false)
                             }
 
-                            // Add a VRR-optimized rate for each display: the
-                            // highest stream FPS the panel can flip tear-free
-                            // with real headroom. A panel's scanout occupies
-                            // nearly its whole max-refresh period (plus VBI and
-                            // flip overhead), so streaming AT max refresh under
-                            // VRR guarantees tears or judder; ~5/6 of max
-                            // refresh leaves the blanking margin adaptive sync
-                            // needs to absorb jitter (e.g. 120Hz -> 100 FPS,
-                            // 144Hz -> 120 FPS). Added after the native rates
-                            // so a matching native rate keeps its plain label.
+                            // Add two VRR-optimized rates for each display,
+                            // after the native rates so a matching native rate
+                            // keeps its plain label:
+                            //  - "VRR": the community-standard VRR cap
+                            //    (refresh - refresh^2/3600, the Blur Busters
+                            //    formula; 120Hz -> 116 FPS, 144Hz -> 138).
+                            //    The highest rate adaptive sync can follow,
+                            //    with the client absorbing delivery jitter in
+                            //    a ~1-frame pacing buffer.
+                            //  - "Low-latency VRR": ~5/6 of max refresh
+                            //    (120Hz -> 100 FPS, 144Hz -> 120). Leaves
+                            //    enough per-frame slack that pacing needs only
+                            //    a minimal standing buffer - the lowest-latency
+                            //    tear-free operating point, at fewer frames.
                             var vrrDone = false
                             for (var vrrDisplayIndex = 0; !vrrDone; vrrDisplayIndex++) {
                                 var vrrRefreshRate = SystemProperties.getRefreshRate(vrrDisplayIndex);
@@ -623,8 +627,11 @@ Flickable {
                                 }
 
                                 if (vrrRefreshRate >= 60) {
-                                    var vrrFps = Math.floor(vrrRefreshRate * 5 / 6 / 5) * 5
-                                    addRefreshRateOrdered(fpsListModel, vrrFps, qsTr("VRR Optimized (%1 FPS)").arg(vrrFps), false)
+                                    var vrrMaxFps = Math.floor(vrrRefreshRate - vrrRefreshRate * vrrRefreshRate / 3600)
+                                    addRefreshRateOrdered(fpsListModel, vrrMaxFps, qsTr("VRR (%1 FPS)").arg(vrrMaxFps), false)
+
+                                    var vrrLowLatencyFps = Math.floor(vrrRefreshRate * 5 / 6 / 5) * 5
+                                    addRefreshRateOrdered(fpsListModel, vrrLowLatencyFps, qsTr("Low-latency VRR (%1 FPS)").arg(vrrLowLatencyFps), false)
                                 }
                             }
 

@@ -30,6 +30,7 @@ public:
     virtual uint64_t popPresentAlignmentWaitUs() override;
     virtual void setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch, bool nearBuffered) override;
     virtual uint64_t getLastPresentUs() override;
+    virtual uint32_t popMidScanTearCount() override;
     virtual bool isVrrRasterLockUncertain() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
@@ -135,6 +136,7 @@ private:
     int m_TearForensicCount;
     bool m_PresentCatchUp;
     int m_AlignInstantStreak;
+    uint32_t m_MidScanSinceQuery;
     Microsoft::WRL::ComPtr<ID3D11Fence> m_PresentReadyFence;
     uint64_t m_PresentReadyFenceValue;
     HANDLE m_PresentReadyFenceEvent;
