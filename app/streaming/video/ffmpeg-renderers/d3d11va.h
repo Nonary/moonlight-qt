@@ -1,10 +1,10 @@
 #pragma once
 
 #include "renderer.h"
+#include "pacer/vrrpresenter.h"
 
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
-#include <d3dkmthk.h>
 
 extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
@@ -76,9 +76,6 @@ private:
     void logPresentationMode(SDL_Window* window, const DXGI_SWAP_CHAIN_DESC1* swapChainDesc, int outputIndex, const char* fallbackReason);
     void refreshOutput();
     bool signalAndUnlockForPresent();
-    uint64_t holdUntilPresentTarget();
-    void waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uint64_t latePastTargetUs = 0, bool catchUpPresent = false);
-    void logScanlineAlignStatsIfDue(uint64_t nowUs);
 
     int m_DecoderSelectionPass;
     int m_DevicesWithFL11Support;
@@ -98,45 +95,13 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_RenderSharedTextureArray;
     Microsoft::WRL::ComPtr<IDXGISwapChain4> m_SwapChain;
     Microsoft::WRL::ComPtr<IDXGIOutput> m_Output;
-    bool m_KmtAdapterValid;
-    D3DKMT_HANDLE m_KmtAdapter;
-    D3DDDI_VIDEO_PRESENT_SOURCE_ID m_KmtVidPnSourceId;
-    uint32_t m_ActiveScanLines;
-    uint64_t m_ScanoutPeriodUs;
-    uint64_t m_LastPresentAlignmentWaitUs;
-    uint64_t m_PresentTargetUs;
-    uint64_t m_PresentAlignBudgetUs;
-    bool m_PresentVsyncLatch;
-    bool m_LastPresentLatched;
-    bool m_PresentNearBuffered;
-    bool m_LastPresentBuffered;
-    uint64_t m_LastPresentUs;
-    uint32_t m_AlignHits;
-    uint32_t m_AlignGiveUps;
-    uint32_t m_AlignSkips;
-    uint32_t m_AlignVsyncLatches;
-    uint64_t m_AlignWaitTotalUs;
-    uint64_t m_AlignBudgetTotalUs;
-    uint64_t m_AlignStatsStartUs;
 
-    // Per-tear forensics: one sample per mid-scan give-up, dumped alongside
-    // the 10s scanline-align stats to attribute residual tears to a cause
-    // (late render vs rush catch-up vs phase compression vs lost VRR
-    // flip-following).
-    struct TearForensicSample {
-        uint32_t lateUs;        // how far past the pacer's target the hold ended
-        uint32_t gapUs;         // spacing from the previous Present() call
-        uint32_t entryScanPct;  // beam position at align entry, % of active scanout (255 = unknown)
-        uint32_t budgetUs;      // align budget this present carried
-        bool catchUp;           // pacer flagged it as a rush/catch-up present
-        bool spunOut;           // burned the full budget (vs fast predicted-unreachable give-up)
-    };
-    TearForensicSample m_TearForensics[16];
-    int m_TearForensicHead;
-    int m_TearForensicCount;
-    bool m_PresentCatchUp;
-    int m_AlignInstantStreak;
-    uint32_t m_MidScanSinceQuery;
+    // Executes the cadence pacer's per-present intent (target hold, blank
+    // alignment, latch bookkeeping) and owns the display scanline source.
+    // Renderer-agnostic; this class only supplies GPU fencing, the Present
+    // call, and display attach notifications.
+    VrrPresenter m_VrrPresenter;
+
     Microsoft::WRL::ComPtr<ID3D11Fence> m_PresentReadyFence;
     uint64_t m_PresentReadyFenceValue;
     HANDLE m_PresentReadyFenceEvent;
