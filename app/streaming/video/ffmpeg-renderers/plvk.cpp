@@ -619,14 +619,6 @@ void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
     // would pass Session's check but fail this one.
     const bool withinDisplayHz = params->frameRate <= displayFps + 5;
 
-    // VRR cadence pacing needs a present path that never blocks awaiting a
-    // vblank: the pacer times the present call itself, so a FIFO queue that
-    // latches flips on its own schedule would re-pace everything downstream
-    // of the hold. Immediate is preferred (under a VRR compositor our
-    // commits drive the flip timing; with direct scanout it can also tear
-    // for phase alignment). Mailbox still lets the cadence through - the
-    // compositor just picks the latest commit - it only takes away tearing,
-    // which Wayland composition wouldn't have offered anyway.
     const bool haveImmediate =
         isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, VK_PRESENT_MODE_IMMEDIATE_KHR);
     const bool haveMailbox =
@@ -641,10 +633,10 @@ void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
     const bool vrrCadenceUsable = false;
     fallbackReason = "VRR cadence is not validated for Vulkan on Windows";
 #else
-    const bool vrrCadenceUsable = haveImmediate || haveMailbox;
-    if (!vrrCadenceUsable) {
-        fallbackReason = "no non-blocking Vulkan present mode available";
-    }
+    // VrrCadence presents vsync-latched (FIFO) here - see the present-mode
+    // mapping below - and FIFO is always supported, so cadence pacing has
+    // no present-mode prerequisite on this platform.
+    const bool vrrCadenceUsable = true;
 #endif
 
     if (disableVrr && params->enableVsync) {
@@ -686,6 +678,28 @@ void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
         // platforms like X11 that lack a VSyncSource implementation for Pacer.
         m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     }
+    else if (m_PresentationMode == PresentationMode::VrrCadence) {
+        // Vsync-latched presents, paced by the cadence clock. There is no
+        // scan-position source on this platform, so a tearing (immediate)
+        // flip can never be phase-aligned - under direct scanout it lands
+        // mid-scan and visibly tears (observed at 116fps-on-120Hz, KWin
+        // direct scanout, 2026-07-05). FIFO latches every flip at a vblank
+        // instead: with VRR active the vblank happens when our paced present
+        // arrives (the cadence still drives the panel), and on a fixed-rate
+        // raster this degrades to the classic vsync-latch regime the pacer
+        // already runs near the panel's ceiling. The pacer holds each frame
+        // to its target before queuing and never queues a second one, so the
+        // FIFO queue cannot re-pace the flips it latches.
+        //
+        // MOONLIGHT_VRR_NO_LATCH=1 opts back into immediate flips to A/B the
+        // few ms of latency this trades away (tears under direct scanout).
+        if (qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_LATCH") && haveImmediate) {
+            m_VkPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        }
+        else {
+            m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+        }
+    }
     else if (haveImmediate) {
         m_VkPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
     }
@@ -710,8 +724,8 @@ void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
         // display-level scan-position source on this platform (the Windows
         // side opens a D3DKMT adapter here), so blank alignment and tear
         // forensics are inert - the presenter still executes the pacer's
-        // present-target holds and vsync-latch bookkeeping, and a compositor
-        // never shows a torn frame anyway.
+        // present-target holds and vsync-latch bookkeeping, and the FIFO
+        // present mode above latches the flips tear-free instead.
         SDL_DisplayMode mode = {};
         int displayIndex = SDL_GetWindowDisplayIndex(params->window);
         uint32_t activeScanLines = 0;

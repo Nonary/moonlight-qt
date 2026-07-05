@@ -127,7 +127,17 @@ uint32_t VrrPresenter::popMidScanTearCount()
 
 bool VrrPresenter::isRasterLockUncertain() const
 {
-    return m_AlignInstantStreak < ALIGN_LOCK_STREAK;
+#ifdef Q_OS_WIN32
+    if (m_KmtAdapterValid) {
+        return m_AlignInstantStreak < ALIGN_LOCK_STREAK;
+    }
+#endif
+
+    // Without a scan-position source there is nothing to measure and no
+    // alignment wait to spend - presents latch tear-free at the platform's
+    // discretion instead - so never report the uncertainty that makes the
+    // pacer pay for re-lock rituals.
+    return false;
 }
 
 bool VrrPresenter::prepareToPresent()
