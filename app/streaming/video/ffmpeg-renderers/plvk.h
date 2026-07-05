@@ -1,6 +1,7 @@
 #pragma once
 
 #include "renderer.h"
+#include "pacer/vrrpresenter.h"
 
 #ifdef Q_OS_WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -48,6 +49,13 @@ public:
     virtual void notifyOverlayUpdated(Overlay::OverlayType) override;
     virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO) override;
     virtual int getRendererAttributes() override;
+    virtual PresentationMode getPresentationMode() override;
+    virtual const char* getPresentationModeFallbackReason() override;
+    virtual uint64_t popPresentAlignmentWaitUs() override;
+    virtual void setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch, bool nearBuffered) override;
+    virtual uint64_t getLastPresentUs() override;
+    virtual uint32_t popMidScanTearCount() override;
+    virtual bool isVrrRasterLockUncertain() override;
     virtual int getDecoderColorspace() override;
     virtual int getDecoderColorRange() override;
     virtual int getDecoderCapabilities() override;
@@ -62,6 +70,7 @@ private:
     void beginRenderTiming();
     void endRenderTiming();
 
+    void resolvePresentationMode(PDECODER_PARAMETERS params);
     bool createSwapchain(int depth);
     bool createOverlay(pl_overlay* overlay, SDL_Surface* surface);
     bool mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
@@ -114,6 +123,11 @@ private:
     // Pending swapchain state shared between waitToRender(), renderFrame(), and cleanupRenderContext()
     pl_swapchain_frame m_SwapchainFrame = {};
     bool m_HasPendingSwapchainFrame = false;
+
+    // VRR cadence pacing state (see resolvePresentationMode())
+    PresentationMode m_PresentationMode = PresentationMode::Auto;
+    const char* m_PresentationModeFallbackReason = nullptr;
+    VrrPresenter m_VrrPresenter;
 
     // Overlay state
     SDL_SpinLock m_OverlayLock = 0;

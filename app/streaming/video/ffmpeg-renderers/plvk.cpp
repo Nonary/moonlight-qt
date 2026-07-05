@@ -3,6 +3,8 @@
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
 
+#include <Limelight.h>
+
 // Implementation in plvk_c.c
 #define PL_LIBAV_IMPLEMENTATION 0
 #include <libplacebo/utils/libav.h>
@@ -493,42 +495,8 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
-    if (params->enableVsync) {
-        // FIFO mode improves frame pacing compared with Mailbox, especially for
-        // platforms like X11 that lack a VSyncSource implementation for Pacer.
-        m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
-    }
-    else {
-        // We want immediate mode for V-Sync disabled if possible
-        if (isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, VK_PRESENT_MODE_IMMEDIATE_KHR)) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Using Immediate present mode with V-Sync disabled");
-            m_VkPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-        }
-        else {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Immediate present mode is not supported by the Vulkan driver. Latency may be higher than normal with V-Sync disabled.");
-
-            // FIFO Relaxed can tear if the frame is running late
-            if (isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Using FIFO Relaxed present mode with V-Sync disabled");
-                m_VkPresentMode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
-            }
-            // Mailbox at least provides non-blocking behavior
-            else if (isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, VK_PRESENT_MODE_MAILBOX_KHR)) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Using Mailbox present mode with V-Sync disabled");
-                m_VkPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-            }
-            // FIFO is always supported
-            else {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Using FIFO present mode with V-Sync disabled");
-                m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
-            }
-        }
-    }
+    // Select the presentation mode (and the Vulkan present mode serving it)
+    resolvePresentationMode(params);
 
     // Start with a swapchain that is double-buffered for lowest display latency
     if (!createSwapchain(1)) {
@@ -630,6 +598,128 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     return true;
 }
 
+
+void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
+{
+    const bool disableVrr = qEnvironmentVariableIntValue("MOONLIGHT_DISABLE_VRR") != 0;
+    const bool forceVrr = qEnvironmentVariableIntValue("MOONLIGHT_FORCE_VRR") != 0 && !disableVrr;
+    const int displayFps = StreamUtils::getDisplayRefreshRate(params->window);
+    const bool withinDisplayHz = params->frameRate <= displayFps;
+
+    // VRR cadence pacing needs a present path that never blocks awaiting a
+    // vblank: the pacer times the present call itself, so a FIFO queue that
+    // latches flips on its own schedule would re-pace everything downstream
+    // of the hold. Immediate is preferred (under a VRR compositor our
+    // commits drive the flip timing; with direct scanout it can also tear
+    // for phase alignment). Mailbox still lets the cadence through - the
+    // compositor just picks the latest commit - it only takes away tearing,
+    // which Wayland composition wouldn't have offered anyway.
+    const bool haveImmediate =
+        isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, VK_PRESENT_MODE_IMMEDIATE_KHR);
+    const bool haveMailbox =
+        isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, VK_PRESENT_MODE_MAILBOX_KHR);
+
+    const char* fallbackReason = nullptr;
+
+#ifdef Q_OS_WIN32
+    // D3D11VA is the reference VRR cadence integration on Windows; Vulkan
+    // presents there go through DWM/DXGI interop with flip semantics that
+    // haven't been validated against the cadence pacer yet.
+    const bool vrrCadenceUsable = false;
+    fallbackReason = "VRR cadence is not validated for Vulkan on Windows";
+#else
+    const bool vrrCadenceUsable = haveImmediate || haveMailbox;
+    if (!vrrCadenceUsable) {
+        fallbackReason = "no non-blocking Vulkan present mode available";
+    }
+#endif
+
+    if (disableVrr && params->enableVsync) {
+        m_PresentationMode = PresentationMode::FixedVsync;
+        fallbackReason = "MOONLIGHT_DISABLE_VRR is set";
+    }
+    else if (forceVrr && vrrCadenceUsable) {
+        m_PresentationMode = PresentationMode::VrrCadence;
+        fallbackReason = "MOONLIGHT_FORCE_VRR is set";
+    }
+    else if (!params->enableVsync) {
+        m_PresentationMode = PresentationMode::Immediate;
+        // Session force-disables V-sync when the stream FPS exceeds the
+        // display's current refresh rate, so surface that possibility - a
+        // panel quietly dropping to 60Hz (power saving) makes VRR appear
+        // "broken" with no other visible signal.
+        fallbackReason = withinDisplayHz ?
+            "V-sync is disabled" :
+            "V-sync auto-disabled: stream FPS exceeds display refresh rate";
+    }
+    else if (!vrrCadenceUsable) {
+        m_PresentationMode = PresentationMode::FixedVsync;
+        // fallbackReason was set above
+    }
+    else if (!withinDisplayHz) {
+        m_PresentationMode = PresentationMode::FixedVsync;
+        fallbackReason = "stream FPS exceeds display refresh rate";
+    }
+    else {
+        // VrrCadence handles content above the panel's tear-free flip
+        // ceiling dynamically (see D3D11VARenderer::resolvePresentationMode),
+        // so no static stream-FPS cutoff below the refresh rate is needed.
+        m_PresentationMode = PresentationMode::VrrCadence;
+    }
+
+    // Map the presentation mode onto a Vulkan present mode
+    if (m_PresentationMode == PresentationMode::FixedVsync) {
+        // FIFO mode improves frame pacing compared with Mailbox, especially for
+        // platforms like X11 that lack a VSyncSource implementation for Pacer.
+        m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+    }
+    else if (haveImmediate) {
+        m_VkPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
+    // FIFO Relaxed can tear if the frame is running late
+    else if (m_PresentationMode == PresentationMode::Immediate &&
+             isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Immediate present mode is not supported by the Vulkan driver. Latency may be higher than normal with V-Sync disabled.");
+        m_VkPresentMode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    }
+    // Mailbox at least provides non-blocking behavior
+    else if (haveMailbox) {
+        m_VkPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+    }
+    // FIFO is always supported
+    else {
+        m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+    }
+
+    if (m_PresentationMode == PresentationMode::VrrCadence) {
+        // Hand the presenter the scanout geometry/timing. There is no
+        // display-level scan-position source on this platform (the Windows
+        // side opens a D3DKMT adapter here), so blank alignment and tear
+        // forensics are inert - the presenter still executes the pacer's
+        // present-target holds and vsync-latch bookkeeping, and a compositor
+        // never shows a torn frame anyway.
+        SDL_DisplayMode mode = {};
+        int displayIndex = SDL_GetWindowDisplayIndex(params->window);
+        uint32_t activeScanLines = 0;
+        if (displayIndex >= 0 && SDL_GetCurrentDisplayMode(displayIndex, &mode) == 0) {
+            activeScanLines = (uint32_t)qMax(mode.h, 0);
+        }
+        m_VrrPresenter.attachDisplay(nullptr, activeScanLines,
+                                     displayFps > 0 ? 1000000ULL / displayFps : 0);
+    }
+
+    m_PresentationModeFallbackReason = fallbackReason;
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Vulkan presentation mode: %s (%s)%s%s",
+                getPresentationModeName(m_PresentationMode),
+                m_VkPresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "Immediate" :
+                m_VkPresentMode == VK_PRESENT_MODE_MAILBOX_KHR ? "Mailbox" :
+                m_VkPresentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "FIFO Relaxed" : "FIFO",
+                fallbackReason != nullptr ? " - " : "",
+                fallbackReason != nullptr ? fallbackReason : "");
+}
 
 bool PlVkRenderer::createSwapchain(int depth)
 {
@@ -1082,8 +1172,29 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
         // NB: We must fallthrough to call pl_swapchain_submit_frame()
     }
 
+    if (m_PresentationMode == PresentationMode::VrrCadence) {
+        // A queued Vulkan present executes only once its wait semaphores
+        // signal, so presenting straight after pl_render_image() would slide
+        // the flip past the pacer's target by the render's GPU time. Fence
+        // the rendering now so the present below is the true flip instant,
+        // then let the presenter hold it to the pacer's target.
+        //
+        // (pl_swapchain_submit_frame() still submits one final layout
+        // transition the present waits on - microseconds of GPU work, noise
+        // next to the millisecond-scale cadence this paces.)
+        pl_gpu_finish(m_Vulkan->gpu);
+
+        // The returned vsync-latch flag needs no mechanical action here:
+        // Vulkan's present mode is fixed per-swapchain and composited
+        // presentation never tears, so latched and tearing presents issue
+        // identically - the presenter just tracks the regime for the pacer
+        // and the overlay's sub-state line.
+        m_VrrPresenter.prepareToPresent();
+    }
+
     // Submit the frame for display and swap buffers
     m_HasPendingSwapchainFrame = false;
+    m_VrrPresenter.notePresent(LiGetMicroseconds());
     if (!pl_swapchain_submit_frame(m_Swapchain)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "pl_swapchain_submit_frame() failed");
@@ -1262,6 +1373,56 @@ int PlVkRenderer::getRendererAttributes()
 {
     // This renderer supports HDR (including tone mapping to SDR displays)
     return RENDERER_ATTRIBUTE_HDR_SUPPORT;
+}
+
+IFFmpegRenderer::PresentationMode PlVkRenderer::getPresentationMode()
+{
+    return m_PresentationMode;
+}
+
+const char* PlVkRenderer::getPresentationModeFallbackReason()
+{
+    // Surface VrrCadence's live per-frame sub-state in the overlay: presents
+    // switch between free-run cadence pacing (content below the panel's
+    // flip ceiling) and vsync-latched (content at or above it) - the mode
+    // label alone can't show that, which made the dynamic switching look
+    // inert.
+    if (m_PresentationMode == PresentationMode::VrrCadence &&
+            m_PresentationModeFallbackReason == nullptr) {
+        if (m_VrrPresenter.lastPresentLatched()) {
+            return "vsync-latched: content at the panel's VRR ceiling";
+        }
+        return m_VrrPresenter.lastPresentBuffered() ?
+            "true VRR pacing (near-ceiling buffer)" :
+            "true VRR pacing";
+    }
+
+    return m_PresentationModeFallbackReason;
+}
+
+uint64_t PlVkRenderer::popPresentAlignmentWaitUs()
+{
+    return m_VrrPresenter.popAlignmentWaitUs();
+}
+
+void PlVkRenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch, bool nearBuffered)
+{
+    m_VrrPresenter.setPresentTarget(targetUs, catchUp, alignBudgetUs, vsyncLatch, nearBuffered);
+}
+
+uint64_t PlVkRenderer::getLastPresentUs()
+{
+    return m_VrrPresenter.lastPresentUs();
+}
+
+uint32_t PlVkRenderer::popMidScanTearCount()
+{
+    return m_VrrPresenter.popMidScanTearCount();
+}
+
+bool PlVkRenderer::isVrrRasterLockUncertain()
+{
+    return m_VrrPresenter.isRasterLockUncertain();
 }
 
 int PlVkRenderer::getDecoderColorspace()
