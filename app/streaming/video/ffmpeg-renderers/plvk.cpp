@@ -498,8 +498,15 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     // Select the presentation mode (and the Vulkan present mode serving it)
     resolvePresentationMode(params);
 
-    // Start with a swapchain that is double-buffered for lowest display latency
-    if (!createSwapchain(1)) {
+    // Start with a swapchain that is double-buffered for lowest display latency.
+    //
+    // In VrrCadence mode, take one more image: swap_buffers() blocks until the
+    // oldest in-flight present completes, and at depth 1 that chains every
+    // frame to the previous flip's completion feedback - under a compositor
+    // that can be most of a refresh interval, serializing the cadence loop
+    // below the content rate. The pacer already holds each flip to its
+    // target, so the extra image adds pipelining headroom, not queue latency.
+    if (!createSwapchain(m_PresentationMode == PresentationMode::VrrCadence ? 2 : 1)) {
         return false;
     }
 
@@ -984,6 +991,18 @@ void PlVkRenderer::endRenderTiming()
 
 void PlVkRenderer::waitToRender()
 {
+    // In VrrCadence mode the pacer already handed us the frame via
+    // prepareFrameForPresent(), which acquired the swapchain image and
+    // submitted the render - nothing left to wait on here.
+    if (m_PreparedFrame != nullptr) {
+        return;
+    }
+
+    acquireSwapchainFrame();
+}
+
+void PlVkRenderer::acquireSwapchainFrame()
+{
     // Check if the GPU has failed before doing anything else
     if (pl_gpu_is_failed(m_Vulkan->gpu)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -991,6 +1010,13 @@ void PlVkRenderer::waitToRender()
         SDL_Event event;
         event.type = SDL_RENDER_DEVICE_RESET;
         SDL_PushEvent(&event);
+        return;
+    }
+
+    // An image acquired earlier but never presented (a failed render) must
+    // not be acquired again - pl_swapchain_start_frame() requires a matching
+    // pl_swapchain_submit_frame() before the next acquisition.
+    if (m_HasPendingSwapchainFrame) {
         return;
     }
 
@@ -1002,10 +1028,13 @@ void PlVkRenderer::waitToRender()
     //
     // NB: This seems to cause performance problems with the Windows display stack
     // (particularly on Nvidia) so we will only do this for non-Windows platforms.
+    uint64_t beforeSwapWaitUs = LiGetMicroseconds();
     pl_swapchain_swap_buffers(m_Swapchain);
+    noteCadenceStage(StageSwapWait, LiGetMicroseconds() - beforeSwapWaitUs);
 #endif
 
     // Handle the swapchain being resized
+    uint64_t beforeAcquireUs = LiGetMicroseconds();
     int vkDrawableW, vkDrawableH;
     SDL_Vulkan_GetDrawableSize(m_Window, &vkDrawableW, &vkDrawableH);
     if (!pl_swapchain_resize(m_Swapchain, &vkDrawableW, &vkDrawableH)) {
@@ -1021,6 +1050,7 @@ void PlVkRenderer::waitToRender()
     // renderFrame() wasn't called after waitToRender().
     if (pl_swapchain_start_frame(m_Swapchain, &m_SwapchainFrame)) {
         m_HasPendingSwapchainFrame = true;
+        noteCadenceStage(StageAcquire, LiGetMicroseconds() - beforeAcquireUs);
 
 #ifdef PLVK_USE_EARLY_RENDER_TO_WAIT
         // This is a workaround for MoltenVK which lazily fetches a drawable when the
@@ -1045,6 +1075,10 @@ void PlVkRenderer::waitToRender()
 
 void PlVkRenderer::cleanupRenderContext()
 {
+    // A frame prepared but never presented may already be freed by the pacer
+    // at this point - drop the (never-dereferenced) marker.
+    m_PreparedFrame = nullptr;
+
     // We have to submit a pending swapchain frame before shutting down
     // in order to release a mutex that pl_swapchain_start_frame() acquires.
     if (m_HasPendingSwapchainFrame) {
@@ -1053,19 +1087,96 @@ void PlVkRenderer::cleanupRenderContext()
     }
 }
 
-void PlVkRenderer::renderFrame(AVFrame *frame)
+void PlVkRenderer::prepareFrameForPresent(AVFrame *frame)
 {
-    pl_frame mappedFrame, targetFrame;
-
-    // If waitToRender() failed to get the next swapchain frame, skip
-    // rendering this frame. It probably means the window is occluded.
-    if (!m_HasPendingSwapchainFrame) {
+    // Only the VrrCadence pacer calls this ahead of renderFrame(). In that
+    // mode the acquire-render-fence chain runs serialized on the cadence
+    // thread, and milliseconds of GPU-side scaling work must overlap the
+    // pacer's sleep to render start or the loop can't cycle at the content's
+    // frame interval.
+    if (m_PresentationMode != PresentationMode::VrrCadence) {
         return;
     }
 
+    acquireSwapchainFrame();
+    if (!m_HasPendingSwapchainFrame) {
+        // Window occluded or swapchain recreation failed - renderFrame()
+        // will skip this frame.
+        return;
+    }
+
+    uint64_t beforeSubmitUs = LiGetMicroseconds();
+    if (!submitVideoRender(frame)) {
+        // Mapping failed (logged internally); renderFrame() will retry the
+        // full render path.
+        return;
+    }
+
+    // Kick the recorded work to the GPU now so it renders during the pacer's
+    // sleep; renderFrame()'s pl_gpu_finish() then only pays the residual.
+    pl_gpu_flush(m_Vulkan->gpu);
+    noteCadenceStage(StageRenderSubmit, LiGetMicroseconds() - beforeSubmitUs);
+
+    m_PreparedFrame = frame;
+}
+
+void PlVkRenderer::noteCadenceStage(CadenceStage stage, uint64_t durationUs)
+{
+    if (m_PresentationMode != PresentationMode::VrrCadence) {
+        return;
+    }
+
+    m_CadenceStageSumUs[stage] += durationUs;
+    m_CadenceStageMaxUs[stage] = qMax(m_CadenceStageMaxUs[stage], durationUs);
+    if (stage == StagePresent) {
+        m_CadenceStageFrames++;
+    }
+}
+
+void PlVkRenderer::logCadenceStagesIfDue()
+{
+    uint64_t nowUs = LiGetMicroseconds();
+    if (m_CadenceStageLastLogUs == 0) {
+        m_CadenceStageLastLogUs = nowUs;
+        return;
+    }
+    if (nowUs - m_CadenceStageLastLogUs < 5000000 || m_CadenceStageFrames == 0) {
+        return;
+    }
+
+    uint32_t frames = m_CadenceStageFrames;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "VrrCadence pipeline avg/max ms over %u frames: "
+                "present-wait %.2f/%.2f, acquire %.2f/%.2f, "
+                "render-submit %.2f/%.2f, gpu-finish %.2f/%.2f, "
+                "target-hold %.2f/%.2f, present %.2f/%.2f",
+                frames,
+                m_CadenceStageSumUs[StageSwapWait] / 1000.0 / frames,
+                m_CadenceStageMaxUs[StageSwapWait] / 1000.0,
+                m_CadenceStageSumUs[StageAcquire] / 1000.0 / frames,
+                m_CadenceStageMaxUs[StageAcquire] / 1000.0,
+                m_CadenceStageSumUs[StageRenderSubmit] / 1000.0 / frames,
+                m_CadenceStageMaxUs[StageRenderSubmit] / 1000.0,
+                m_CadenceStageSumUs[StageGpuFinish] / 1000.0 / frames,
+                m_CadenceStageMaxUs[StageGpuFinish] / 1000.0,
+                m_CadenceStageSumUs[StageTargetHold] / 1000.0 / frames,
+                m_CadenceStageMaxUs[StageTargetHold] / 1000.0,
+                m_CadenceStageSumUs[StagePresent] / 1000.0 / frames,
+                m_CadenceStageMaxUs[StagePresent] / 1000.0);
+
+    memset(m_CadenceStageSumUs, 0, sizeof(m_CadenceStageSumUs));
+    memset(m_CadenceStageMaxUs, 0, sizeof(m_CadenceStageMaxUs));
+    m_CadenceStageFrames = 0;
+    m_CadenceStageLastLogUs = nowUs;
+}
+
+bool PlVkRenderer::submitVideoRender(AVFrame *frame)
+{
+    pl_frame mappedFrame, targetFrame;
+
     if (!mapAvFrameToPlacebo(frame, &mappedFrame)) {
         // This function logs internally
-        return;
+        return false;
     }
 
     // Adjust the swapchain if the colorspace of incoming frames has changed
@@ -1095,6 +1206,7 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
     overlays.reserve(Overlay::OverlayMax);
 
     pl_frame_from_swapchain(&targetFrame, &m_SwapchainFrame);
+    m_LastSwapchainColorspace = targetFrame.color;
 
     // We perform minimal processing under the overlay lock to avoid blocking threads updating the overlay
     SDL_AtomicLock(&m_OverlayLock);
@@ -1177,7 +1289,37 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
     if (!pl_render_image(m_Renderer, &mappedFrame, &targetFrame, &pl_render_fast_params)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "pl_render_image() failed");
-        // NB: We must fallthrough to call pl_swapchain_submit_frame()
+        // NB: The caller must still submit the swapchain frame
+    }
+
+    // The recorded commands reference the mapped planes and any replaced
+    // overlay textures; libplacebo defers the underlying Vulkan destruction
+    // until those commands complete, so both can be released right away and
+    // no mapping state has to outlive this call.
+    for (pl_tex& texture : texturesToDestroy) {
+        pl_tex_destroy(m_Vulkan->gpu, &texture);
+    }
+    unmapAvFrameFromPlacebo(frame, &mappedFrame);
+
+    return true;
+}
+
+void PlVkRenderer::renderFrame(AVFrame *frame)
+{
+    // If waitToRender()/prepareFrameForPresent() failed to get the next
+    // swapchain frame, skip rendering this frame. It probably means the
+    // window is occluded.
+    if (!m_HasPendingSwapchainFrame) {
+        m_PreparedFrame = nullptr;
+        return;
+    }
+
+    bool framePrepared = (m_PreparedFrame == frame);
+    m_PreparedFrame = nullptr;
+
+    if (!framePrepared && !submitVideoRender(frame)) {
+        // This function logs internally
+        return;
     }
 
     if (m_PresentationMode == PresentationMode::VrrCadence) {
@@ -1185,12 +1327,17 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
         // signal, so presenting straight after pl_render_image() would slide
         // the flip past the pacer's target by the render's GPU time. Fence
         // the rendering now so the present below is the true flip instant,
-        // then let the presenter hold it to the pacer's target.
+        // then let the presenter hold it to the pacer's target. For a frame
+        // prepared before the pacer's sleep, the GPU has been rendering all
+        // through it and this only pays the residual.
         //
         // (pl_swapchain_submit_frame() still submits one final layout
         // transition the present waits on - microseconds of GPU work, noise
         // next to the millisecond-scale cadence this paces.)
+        uint64_t beforeFinishUs = LiGetMicroseconds();
         pl_gpu_finish(m_Vulkan->gpu);
+        uint64_t afterFinishUs = LiGetMicroseconds();
+        noteCadenceStage(StageGpuFinish, afterFinishUs - beforeFinishUs);
 
         // The returned vsync-latch flag needs no mechanical action here:
         // Vulkan's present mode is fixed per-swapchain and composited
@@ -1198,11 +1345,13 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
         // identically - the presenter just tracks the regime for the pacer
         // and the overlay's sub-state line.
         m_VrrPresenter.prepareToPresent();
+        noteCadenceStage(StageTargetHold, LiGetMicroseconds() - afterFinishUs);
     }
 
     // Submit the frame for display and swap buffers
     m_HasPendingSwapchainFrame = false;
-    m_VrrPresenter.notePresent(LiGetMicroseconds());
+    uint64_t beforePresentUs = LiGetMicroseconds();
+    m_VrrPresenter.notePresent(beforePresentUs);
     if (!pl_swapchain_submit_frame(m_Swapchain)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "pl_swapchain_submit_frame() failed");
@@ -1211,8 +1360,10 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
         SDL_Event event;
         event.type = SDL_RENDER_DEVICE_RESET;
         SDL_PushEvent(&event);
-        goto UnmapExit;
+        return;
     }
+    noteCadenceStage(StagePresent, LiGetMicroseconds() - beforePresentUs);
+    logCadenceStagesIfDue();
 
 #ifndef PLVK_USE_EARLY_RENDER_TO_WAIT
     endRenderTiming();
@@ -1227,11 +1378,11 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
             SDL_Event event;
             event.type = SDL_RENDER_DEVICE_RESET;
             SDL_PushEvent(&event);
-            goto UnmapExit;
+            return;
         }
 
         // Restore the swapchain's colorspace from the previous swapchain frame
-        pl_swapchain_colorspace_hint(m_Swapchain, &targetFrame.color);
+        pl_swapchain_colorspace_hint(m_Swapchain, &m_LastSwapchainColorspace);
     }
 #endif
 
@@ -1240,14 +1391,6 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
     // to avoid some performance problems on Nvidia GPUs.
     pl_swapchain_swap_buffers(m_Swapchain);
 #endif
-
-UnmapExit:
-    // Delete any textures that need to be destroyed
-    for (pl_tex& texture : texturesToDestroy) {
-        pl_tex_destroy(m_Vulkan->gpu, &texture);
-    }
-
-    unmapAvFrameFromPlacebo(frame, &mappedFrame);
 }
 
 bool PlVkRenderer::testRenderFrame(AVFrame *frame)

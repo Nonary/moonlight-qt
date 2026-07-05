@@ -200,6 +200,20 @@ public:
         // Don't wait by default
     }
 
+    // Called by the pacer in VrrCadence mode the moment a frame is committed
+    // to presentation - potentially a full render lead before renderFrame().
+    // Renderers whose rendering has significant GPU-side cost may submit that
+    // work here so the hardware renders during the pacer's sleep to render
+    // start; waitToRender()/renderFrame() for the same frame must then skip
+    // the already-done work and pay only the residual completion wait and the
+    // present itself. The frame pointer stays valid through the matching
+    // renderFrame() call. A serialized submit-fence-present chain that fits
+    // in the render lead doesn't need this (see d3d11va); a chain that
+    // exceeds the content's frame interval can't keep cadence without it.
+    virtual void prepareFrameForPresent(AVFrame*) {
+        // No early preparation by default - renderFrame() does all the work
+    }
+
     // Called on the same thread as renderFrame() during destruction of the renderer
     virtual void cleanupRenderContext() {
         // Nothing

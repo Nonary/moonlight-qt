@@ -1136,6 +1136,12 @@ int Pacer::cadenceThread(void* context)
             }
         }
 
+        // The frame is committed to presentation from here on - hand it to
+        // the renderer before sleeping so GPU-heavy renderers can overlap
+        // their rendering with the wait (the flip itself is still held to
+        // targetUs by the presenter).
+        me->m_VsyncRenderer->prepareFrameForPresent(frame);
+
         me->waitUntil(targetRenderStartUs);
 
         if (me->m_Stopping) {

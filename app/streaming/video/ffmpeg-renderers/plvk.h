@@ -45,6 +45,7 @@ public:
     virtual void renderFrame(AVFrame* frame) override;
     virtual bool testRenderFrame(AVFrame* frame) override;
     virtual void waitToRender() override;
+    virtual void prepareFrameForPresent(AVFrame* frame) override;
     virtual void cleanupRenderContext() override;
     virtual void notifyOverlayUpdated(Overlay::OverlayType) override;
     virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO) override;
@@ -69,6 +70,24 @@ private:
 
     void beginRenderTiming();
     void endRenderTiming();
+
+    void acquireSwapchainFrame();
+    bool submitVideoRender(AVFrame* frame);
+
+    // Per-stage timing for the VrrCadence render pipeline, aggregated and
+    // logged periodically so a pacing shortfall names the stage that ate the
+    // frame interval instead of showing up only as an opaque render time.
+    enum CadenceStage {
+        StageSwapWait,      // pl_swapchain_swap_buffers (wait for queued presents)
+        StageAcquire,       // pl_swapchain_resize + pl_swapchain_start_frame
+        StageRenderSubmit,  // AVFrame map + pl_render_image + flush
+        StageGpuFinish,     // residual pl_gpu_finish before the flip
+        StageTargetHold,    // deliberate hold to the pacer's present target
+        StagePresent,       // pl_swapchain_submit_frame
+        StageCount
+    };
+    void noteCadenceStage(CadenceStage stage, uint64_t durationUs);
+    void logCadenceStagesIfDue();
 
     void resolvePresentationMode(PDECODER_PARAMETERS params);
     bool createSwapchain(int depth);
@@ -124,10 +143,22 @@ private:
     pl_swapchain_frame m_SwapchainFrame = {};
     bool m_HasPendingSwapchainFrame = false;
 
+    // The frame whose rendering prepareFrameForPresent() already submitted.
+    // Compared by identity in renderFrame() and never dereferenced - the
+    // mapped frame state is fully released inside submitVideoRender().
+    AVFrame* m_PreparedFrame = nullptr;
+
+    // The colorspace of the most recently rendered swapchain frame
+    pl_color_space m_LastSwapchainColorspace = {};
+
     // VRR cadence pacing state (see resolvePresentationMode())
     PresentationMode m_PresentationMode = PresentationMode::Auto;
     const char* m_PresentationModeFallbackReason = nullptr;
     VrrPresenter m_VrrPresenter;
+    uint64_t m_CadenceStageSumUs[StageCount] = {};
+    uint64_t m_CadenceStageMaxUs[StageCount] = {};
+    uint32_t m_CadenceStageFrames = 0;
+    uint64_t m_CadenceStageLastLogUs = 0;
 
     // Overlay state
     SDL_SpinLock m_OverlayLock = 0;
