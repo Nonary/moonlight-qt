@@ -3,6 +3,7 @@
 
 #include <QGuiApplication>
 #include <QLibraryInfo>
+#include <QOperatingSystemVersion>
 
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
@@ -95,6 +96,15 @@ SystemProperties::SystemProperties()
     hasDiscordIntegration = true;
 #else
     hasDiscordIntegration = false;
+#endif
+
+#ifdef Q_OS_WIN32
+    // The composition swapchain API behind OS-scheduled VRR presentation
+    // ships in Windows 11 (build 22000+)
+    supportsOsScheduledVrr =
+        QOperatingSystemVersion::current() >= QOperatingSystemVersion::Windows11;
+#else
+    supportsOsScheduledVrr = false;
 #endif
 
     // These will be queried asynchronously to avoid blocking the UI

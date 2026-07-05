@@ -295,6 +295,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.enableFramePacing = enableFramePacing;
     params.enableVrrTearing = StreamingPreferences::get()->vrrTearing;
     params.vrrCushionUs = StreamingPreferences::get()->vrrCushionUs;
+    params.enableOsScheduledVrr = StreamingPreferences::get()->osScheduledVrr;
     params.testOnly = testOnly;
     params.vds = vds;
 

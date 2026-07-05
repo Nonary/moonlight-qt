@@ -951,6 +951,24 @@ Flickable {
                 }
 
                 CheckBox {
+                    id: osScheduledVrrCheck
+                    width: parent.width
+                    hoverEnabled: true
+                    text: qsTr("Smoothest VRR (OS-scheduled presentation)")
+                    font.pointSize: 12
+                    visible: SystemProperties.supportsOsScheduledVrr
+                    enabled: StreamingPreferences.enableVsync
+                    checked: StreamingPreferences.enableVsync && StreamingPreferences.osScheduledVrr
+                    onCheckedChanged: {
+                        StreamingPreferences.osScheduledVrr = checked
+                    }
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Hands frame presentation to the Windows 11 display scheduler for the smoothest, completely tear-free VRR streaming at any frame rate.\nAdds about one frame of display latency that Moonlight's performance stats cannot measure.\nRequires Windows 11. If your system or GPU driver doesn't support it, Moonlight automatically falls back to standard VRR pacing.")
+                }
+
+                CheckBox {
                     id: enableHdr
                     width: parent.width
                     text: qsTr("Enable HDR")

@@ -25,6 +25,7 @@ public:
     Q_PROPERTY(bool hasDiscordIntegration MEMBER hasDiscordIntegration CONSTANT)
     Q_PROPERTY(bool usesMaterial3Theme MEMBER usesMaterial3Theme CONSTANT)
     Q_PROPERTY(QString versionString MEMBER versionString CONSTANT)
+    Q_PROPERTY(bool supportsOsScheduledVrr MEMBER supportsOsScheduledVrr CONSTANT)
 
     // Properties queried asynchronously (startAsyncLoad() must be called!)
     Q_PROPERTY(bool hasHardwareAcceleration MEMBER hasHardwareAcceleration NOTIFY hasHardwareAccelerationChanged)
@@ -66,6 +67,7 @@ private:
     bool hasDiscordIntegration;
     QString versionString;
     bool usesMaterial3Theme;
+    bool supportsOsScheduledVrr;
 
     // Properties only set if startAsyncLoad() is called
     bool hasHardwareAcceleration;

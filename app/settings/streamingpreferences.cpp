@@ -36,6 +36,7 @@
 #define SER_FRAMEPACING "framepacing"
 #define SER_VRRTEARING "vrrtearing"
 #define SER_VRRCUSHION "vrrcushion"
+#define SER_OSSCHEDULEDVRR "osscheduledvrr"
 #define SER_CONNWARNINGS "connwarnings"
 #define SER_CONFWARNINGS "confwarnings"
 #define SER_UIDISPLAYMODE "uidisplaymode"
@@ -141,6 +142,7 @@ void StreamingPreferences::reload()
     framePacing = settings.value(SER_FRAMEPACING, false).toBool();
     vrrTearing = settings.value(SER_VRRTEARING, false).toBool();
     vrrCushionUs = settings.value(SER_VRRCUSHION, 4500).toInt();
+    osScheduledVrr = settings.value(SER_OSSCHEDULEDVRR, false).toBool();
     connectionWarnings = settings.value(SER_CONNWARNINGS, true).toBool();
     configurationWarnings = settings.value(SER_CONFWARNINGS, true).toBool();
     richPresence = settings.value(SER_RICHPRESENCE, true).toBool();
@@ -341,6 +343,7 @@ void StreamingPreferences::save()
     settings.setValue(SER_FRAMEPACING, framePacing);
     settings.setValue(SER_VRRTEARING, vrrTearing);
     settings.setValue(SER_VRRCUSHION, vrrCushionUs);
+    settings.setValue(SER_OSSCHEDULEDVRR, osScheduledVrr);
     settings.setValue(SER_CONNWARNINGS, connectionWarnings);
     settings.setValue(SER_CONFWARNINGS, configurationWarnings);
     settings.setValue(SER_RICHPRESENCE, richPresence);
