@@ -1,4 +1,5 @@
 #include "vrrpresenter.h"
+#include "highressleep.h"
 
 #include <SDL.h>
 #include <Limelight.h>
@@ -7,27 +8,6 @@
 // hit is not proof (a free-running raster's own trailing blank catches a
 // present or chase by luck); see isRasterLockUncertain().
 #define ALIGN_LOCK_STREAK 4
-
-static void highResolutionSleepUs(uint64_t sleepUs)
-{
-#ifdef Q_OS_WIN32
-    static thread_local HANDLE waitableTimer =
-        CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (waitableTimer == nullptr) {
-        return;
-    }
-
-    LARGE_INTEGER dueTime;
-    dueTime.QuadPart = -((LONGLONG)sleepUs * 10);
-    if (SetWaitableTimer(waitableTimer, &dueTime, 0, nullptr, nullptr, FALSE)) {
-        WaitForSingleObject(waitableTimer, INFINITE);
-    }
-#else
-    // No sub-millisecond timer abstraction here yet; only Windows renderers
-    // adopt VRR cadence pacing today.
-    SDL_Delay((Uint32)(sleepUs / 1000));
-#endif
-}
 
 VrrPresenter::VrrPresenter() :
 #ifdef Q_OS_WIN32
@@ -230,7 +210,7 @@ uint64_t VrrPresenter::holdUntilPresentTarget()
     uint64_t nowUs = startUs;
     while (nowUs < targetUs) {
         if (targetUs - nowUs > 1500) {
-            highResolutionSleepUs(targetUs - nowUs - 1000);
+            HighResSleep::sleepUntilUs(targetUs - 1000);
         }
         nowUs = LiGetMicroseconds();
     }
@@ -342,7 +322,7 @@ void VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uin
             // the beam estimate can't carry the wait past a tighter bound.
             remainingUs = qMin(remainingUs, maxWaitUs - elapsedUs);
             if (remainingUs > 1500) {
-                highResolutionSleepUs(remainingUs - 1000);
+                HighResSleep::sleepUs(remainingUs - 1000);
             }
         }
     }

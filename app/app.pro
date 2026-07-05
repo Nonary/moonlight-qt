@@ -257,6 +257,7 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/sdlvid.cpp \
         streaming/video/ffmpeg-renderers/swframemapper.cpp \
         streaming/video/ffmpeg-renderers/pacer/pacer.cpp \
+        streaming/video/ffmpeg-renderers/pacer/highressleep.cpp \
         streaming/video/ffmpeg-renderers/pacer/vrrpresenter.cpp
 
     HEADERS += \
@@ -266,6 +267,7 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/sdlvid.h \
         streaming/video/ffmpeg-renderers/swframemapper.h \
         streaming/video/ffmpeg-renderers/pacer/pacer.h \
+        streaming/video/ffmpeg-renderers/pacer/highressleep.h \
         streaming/video/ffmpeg-renderers/pacer/vrrcadence.h \
         streaming/video/ffmpeg-renderers/pacer/vrrpresenter.h
 }

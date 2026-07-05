@@ -1,5 +1,6 @@
 #include "pacer.h"
 #include "vrrcadence.h"
+#include "highressleep.h"
 #include "streaming/streamutils.h"
 
 #ifdef Q_OS_WIN32
@@ -50,32 +51,6 @@ static uint64_t frameCadenceTimestampUs(AVFrame* frame)
 
     return frame->pkt_dts > 0 ? (uint64_t)frame->pkt_dts : 0;
 }
-
-#ifdef Q_OS_WIN32
-static void highResolutionSleepUntilUs(uint64_t targetUs)
-{
-    uint64_t nowUs = LiGetMicroseconds();
-    if (targetUs <= nowUs) {
-        return;
-    }
-
-    static thread_local HANDLE waitableTimer =
-        CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (waitableTimer == nullptr) {
-        SDL_Delay(0);
-        return;
-    }
-
-    LARGE_INTEGER dueTime;
-    dueTime.QuadPart = -((LONGLONG)(targetUs - nowUs) * 10);
-    if (SetWaitableTimer(waitableTimer, &dueTime, 0, nullptr, nullptr, FALSE)) {
-        WaitForSingleObject(waitableTimer, INFINITE);
-    }
-    else {
-        SDL_Delay(0);
-    }
-}
-#endif
 
 Pacer::Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats) :
     m_RenderThread(nullptr),
@@ -1620,11 +1595,7 @@ bool Pacer::waitUntil(uint64_t targetUs)
 {
     return waitForVrrCadenceTargetUs(targetUs,
                                      []() { return LiGetMicroseconds(); },
-#ifdef Q_OS_WIN32
-                                     [](uint64_t sleepUntilUs) { highResolutionSleepUntilUs(sleepUntilUs); },
-#else
-                                     [](uint64_t) { SDL_Delay(0); },
-#endif
+                                     [](uint64_t sleepUntilUs) { HighResSleep::sleepUntilUs(sleepUntilUs); },
                                      []() { SDL_Delay(0); },
                                      [this]() { return m_Stopping; });
 }
