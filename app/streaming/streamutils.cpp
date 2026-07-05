@@ -158,6 +158,18 @@ void StreamUtils::screenSpaceToNormalizedDeviceCoords(SDL_Rect* src, SDL_FRect* 
 
 int StreamUtils::getDisplayRefreshRate(SDL_Window* window)
 {
+    // Authoritative override for displays the windowing system misreports.
+    // Under gamescope the advertised mode follows the compositor's OUTPUT
+    // refresh, so if this is needed to un-stick VRR eligibility, first make
+    // sure the display is actually being driven at its full rate (SteamOS
+    // Settings -> Display, or the per-game refresh slider) - forcing a
+    // refresh the compositor isn't flipping at just paces frames into a
+    // slower queue.
+    static const int overrideFps = qEnvironmentVariableIntValue("MOONLIGHT_DISPLAY_FPS");
+    if (overrideFps > 0) {
+        return overrideFps;
+    }
+
     int displayIndex = SDL_GetWindowDisplayIndex(window);
     if (displayIndex < 0) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,

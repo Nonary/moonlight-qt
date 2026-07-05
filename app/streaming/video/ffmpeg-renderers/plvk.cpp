@@ -604,7 +604,13 @@ void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
     const bool disableVrr = qEnvironmentVariableIntValue("MOONLIGHT_DISABLE_VRR") != 0;
     const bool forceVrr = qEnvironmentVariableIntValue("MOONLIGHT_FORCE_VRR") != 0 && !disableVrr;
     const int displayFps = StreamUtils::getDisplayRefreshRate(params->window);
-    const bool withinDisplayHz = params->frameRate <= displayFps;
+
+    // Same +5 slack Session uses before force-disabling V-sync: display
+    // refresh reporting rounds down (119 for a 119.98Hz mode), and content
+    // a hair above the panel is exactly what the pacer's vsync-latch regime
+    // is for. Without the slack, a 120 FPS stream on a "119Hz" display
+    // would pass Session's check but fail this one.
+    const bool withinDisplayHz = params->frameRate <= displayFps + 5;
 
     // VRR cadence pacing needs a present path that never blocks awaiting a
     // vblank: the pacer times the present call itself, so a FIFO queue that
@@ -712,11 +718,13 @@ void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
     m_PresentationModeFallbackReason = fallbackReason;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Vulkan presentation mode: %s (%s)%s%s",
+                "Vulkan presentation mode: %s (%s, %d FPS stream on %d Hz display)%s%s",
                 getPresentationModeName(m_PresentationMode),
                 m_VkPresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "Immediate" :
                 m_VkPresentMode == VK_PRESENT_MODE_MAILBOX_KHR ? "Mailbox" :
                 m_VkPresentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "FIFO Relaxed" : "FIFO",
+                params->frameRate,
+                displayFps,
                 fallbackReason != nullptr ? " - " : "",
                 fallbackReason != nullptr ? fallbackReason : "");
 }
