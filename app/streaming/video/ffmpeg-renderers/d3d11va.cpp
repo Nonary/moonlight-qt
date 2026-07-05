@@ -70,6 +70,8 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_PresentReadyFenceEvent(nullptr),
       m_PresentReadyFenceFailed(false),
       m_FrameLatencyWaitableObject(nullptr),
+      m_UsePmSwapchain(false),
+      m_PmTargetUs(0),
       m_OverlayLock(0),
       m_HwDeviceContext(nullptr)
 {
@@ -891,29 +893,61 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     SDL_GetWindowWMInfo(params->window, &info);
     SDL_assert(info.subsystem == SDL_SYSWM_WINDOWS);
 
-    // Always use windowed or borderless windowed mode.. SDL does mode-setting for us in
-    // full-screen exclusive mode (SDL_WINDOW_FULLSCREEN), so this actually works out okay.
-    ComPtr<IDXGISwapChain1> swapChain;
-    hr = m_Factory->CreateSwapChainForHwnd(m_RenderDevice.Get(),
-                                           info.info.win.window,
-                                           &swapChainDesc,
-                                           nullptr,
-                                           nullptr,
-                                           &swapChain);
-
-    if (FAILED(hr)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "IDXGIFactory::CreateSwapChainForHwnd() failed: %x",
-                     hr);
-        return false;
+    // Composition swapchain with OS-scheduled target-time presents in
+    // place of the DXGI swapchain + VrrPresenter execution. Driven by the
+    // "Smoothest VRR" setting; MOONLIGHT_COMP_SWAPCHAIN overrides both
+    // ways. Only meaningful when the cadence pacer is producing targets.
+    bool useCompSwapchain = m_DecoderParams.enableOsScheduledVrr;
+    if (Utils::getEnvironmentVariableOverride("MOONLIGHT_COMP_SWAPCHAIN", &useCompSwapchain)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Using MOONLIGHT_COMP_SWAPCHAIN to override OS-scheduled VRR setting: %d",
+                    useCompSwapchain);
+    }
+    if (useCompSwapchain) {
+        if (m_PresentationMode != PresentationMode::VrrCadence) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "OS-scheduled VRR unavailable: presentation mode is not VRR cadence");
+        }
+        else if (m_PmSwapchain.initialize(m_RenderDevice.Get(),
+                                          info.info.win.window,
+                                          m_DisplayWidth, m_DisplayHeight,
+                                          swapChainDesc.Format)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Using composition swapchain: pacer targets become OS present "
+                        "target times (no app-side hold/alignment)");
+            m_UsePmSwapchain = true;
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Composition swapchain unavailable; falling back to DXGI swapchain");
+        }
     }
 
-    hr = swapChain.As(&m_SwapChain);
-    if (FAILED(hr)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "IDXGISwapChain::QueryInterface(IDXGISwapChain4) failed: %x",
-                     hr);
-        return false;
+    // Always use windowed or borderless windowed mode.. SDL does mode-setting for us in
+    // full-screen exclusive mode (SDL_WINDOW_FULLSCREEN), so this actually works out okay.
+    if (!m_UsePmSwapchain) {
+        ComPtr<IDXGISwapChain1> swapChain;
+        hr = m_Factory->CreateSwapChainForHwnd(m_RenderDevice.Get(),
+                                               info.info.win.window,
+                                               &swapChainDesc,
+                                               nullptr,
+                                               nullptr,
+                                               &swapChain);
+
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "IDXGIFactory::CreateSwapChainForHwnd() failed: %x",
+                         hr);
+            return false;
+        }
+
+        hr = swapChain.As(&m_SwapChain);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "IDXGISwapChain::QueryInterface(IDXGISwapChain4) failed: %x",
+                         hr);
+            return false;
+        }
     }
 
     // Disable Alt+Enter, PrintScreen, and window message snooping. This makes
@@ -1029,6 +1063,28 @@ void D3D11VARenderer::waitToRender()
 
 void D3D11VARenderer::renderFrame(AVFrame* frame)
 {
+    // Composition swapchain: pick a presentation buffer BEFORE taking the
+    // context lock - the availability wait must not stall the decoder on
+    // shared-device systems. The wait is surfaced via
+    // popPresentAlignmentWaitUs() so the pacer doesn't count it as render
+    // work.
+    ID3D11RenderTargetView* renderTarget;
+    if (m_UsePmSwapchain) {
+        renderTarget = m_PmSwapchain.acquireBuffer();
+        if (renderTarget == nullptr) {
+            if (m_PmSwapchain.isLost()) {
+                SDL_Event event;
+                event.type = SDL_RENDER_DEVICE_RESET;
+                SDL_PushEvent(&event);
+            }
+            // Otherwise all buffers are still queued; drop this frame.
+            return;
+        }
+    }
+    else {
+        renderTarget = m_RenderTargetView.Get();
+    }
+
     // Acquire the context lock for rendering to prevent concurrent
     // access from inside FFmpeg's decoding code
     if (m_DecodeDevice == m_RenderDevice) {
@@ -1037,11 +1093,11 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
 
     // Clear the back buffer
     const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    m_RenderDeviceContext->ClearRenderTargetView(m_RenderTargetView.Get(), clearColor);
+    m_RenderDeviceContext->ClearRenderTargetView(renderTarget, clearColor);
 
     // Bind the back buffer. This needs to be done each time,
     // because the render target view will be unbound by Present().
-    m_RenderDeviceContext->OMSetRenderTargets(1, m_RenderTargetView.GetAddressOf(), nullptr);
+    m_RenderDeviceContext->OMSetRenderTargets(1, &renderTarget, nullptr);
 
     // Render our video frame with the aspect-ratio adjusted viewport
     renderVideo(frame);
@@ -1056,24 +1112,59 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     if (frame->color_trc != m_LastColorTrc) {
         if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
             // Switch to Rec 2020 PQ (SMPTE ST 2084) colorspace for HDR10 rendering
-            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-            if (FAILED(hr)) {
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                             "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) failed: %x",
-                             hr);
+            if (m_UsePmSwapchain) {
+                m_PmSwapchain.setColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, true);
+            }
+            else {
+                hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                if (FAILED(hr)) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                                 "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) failed: %x",
+                                 hr);
+                }
             }
         }
         else {
             // Restore default sRGB colorspace
-            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-            if (FAILED(hr)) {
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                             "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) failed: %x",
-                             hr);
+            if (m_UsePmSwapchain) {
+                m_PmSwapchain.setColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, false);
+            }
+            else {
+                hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+                if (FAILED(hr)) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                                 "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) failed: %x",
+                                 hr);
+                }
             }
         }
 
         m_LastColorTrc = frame->color_trc;
+    }
+
+    if (m_UsePmSwapchain) {
+        // Submit the queued GPU work now: a PM Present has no DXGI-style
+        // implicit flush, and an unflushed frame never becomes "ready" to
+        // display. The OS then gates the flip on GPU completion plus the
+        // pacer's target time - no app-side hold or scanline alignment.
+        m_RenderDeviceContext->Flush();
+
+        if (m_DecodeDevice == m_RenderDevice) {
+            unlockContext(this);
+        }
+
+        bool presented = m_PmSwapchain.present(m_PmTargetUs);
+
+        // Report the expected flip instant (not this deliberately-early
+        // present call) so the pacer's flip-spacing floor stays truthful.
+        m_VrrPresenter.notePresent(m_PmSwapchain.lastExpectedFlipUs());
+
+        if (!presented) {
+            SDL_Event event;
+            event.type = SDL_RENDER_DEVICE_RESET;
+            SDL_PushEvent(&event);
+        }
+        return;
     }
 
     bool vsyncLatch = false;
@@ -1557,6 +1648,12 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
     }
 
     if (stateInfo->stateChangeFlags & WINDOW_STATE_CHANGE_SIZE) {
+        // The composition swapchain's buffer ring and DComp tree are
+        // size-dependent; recreate the whole renderer on resize.
+        if (m_UsePmSwapchain) {
+            return false;
+        }
+
         // Resize our swapchain and reconstruct size-dependent resources
 
         DXGI_SWAP_CHAIN_DESC1 swapchainDesc;
@@ -1809,6 +1906,9 @@ const char* D3D11VARenderer::getPresentationModeFallbackReason()
     // dynamic switching look inert.
     if (m_PresentationMode == PresentationMode::VrrCadence &&
             m_PresentationModeFallbackReason == nullptr) {
+        if (m_UsePmSwapchain) {
+            return "composition swapchain (OS-scheduled presents)";
+        }
         if (m_VrrPresenter.lastPresentLatched()) {
             return "vsync-latched: content at the panel's VRR ceiling";
         }
@@ -1822,11 +1922,22 @@ const char* D3D11VARenderer::getPresentationModeFallbackReason()
 
 uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
 {
+    if (m_UsePmSwapchain) {
+        // No alignment waits exist in this mode; the analogous
+        // non-render idle time is waiting for a presentation buffer.
+        return m_PmSwapchain.popAcquireWaitUs();
+    }
+
     return m_VrrPresenter.popAlignmentWaitUs();
 }
 
 void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch, bool nearBuffered)
 {
+    // In composition swapchain mode the target goes to the OS as a present
+    // target time; the align budget/latch/buffer flags describe app-side
+    // execution mechanics that don't exist there.
+    m_PmTargetUs = targetUs;
+
     m_VrrPresenter.setPresentTarget(targetUs, catchUp, alignBudgetUs,
                                     vsyncLatch, nearBuffered);
 }
@@ -1838,11 +1949,21 @@ uint64_t D3D11VARenderer::getLastPresentUs()
 
 uint32_t D3D11VARenderer::popMidScanTearCount()
 {
+    if (m_UsePmSwapchain) {
+        // PM presents never tear; the pacer's tear probe stays quiet.
+        return 0;
+    }
+
     return m_VrrPresenter.popMidScanTearCount();
 }
 
 bool D3D11VARenderer::isVrrRasterLockUncertain()
 {
+    if (m_UsePmSwapchain) {
+        // No raster-lock rituals to trigger; the OS owns flip execution.
+        return false;
+    }
+
     return m_VrrPresenter.isRasterLockUncertain();
 }
 
@@ -2066,6 +2187,22 @@ bool D3D11VARenderer::setupRenderingResources()
 bool D3D11VARenderer::setupSwapchainDependentResources()
 {
     HRESULT hr;
+
+    // The composition swapchain path acquires a per-frame render target
+    // from its own buffer ring; only the viewport applies here.
+    if (m_UsePmSwapchain) {
+        D3D11_VIEWPORT viewport;
+
+        viewport.TopLeftX = 0;
+        viewport.TopLeftY = 0;
+        viewport.Width = m_DisplayWidth;
+        viewport.Height = m_DisplayHeight;
+        viewport.MinDepth = 0;
+        viewport.MaxDepth = 1;
+
+        m_RenderDeviceContext->RSSetViewports(1, &viewport);
+        return true;
+    }
 
     // Create our render target view
     {

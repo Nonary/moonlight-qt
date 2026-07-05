@@ -2,6 +2,7 @@
 
 #include "renderer.h"
 #include "pacer/vrrpresenter.h"
+#include "pmswapchain.h"
 
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
@@ -101,6 +102,15 @@ private:
     // Renderer-agnostic; this class only supplies GPU fencing, the Present
     // call, and display attach notifications.
     VrrPresenter m_VrrPresenter;
+
+    // "Smoothest VRR (OS-scheduled presentation)" setting (env override:
+    // MOONLIGHT_COMP_SWAPCHAIN): the Windows 11 composition swapchain
+    // replaces the DXGI swapchain AND the VrrPresenter's target
+    // hold/scanline alignment - the pacer's targets are handed to the OS as
+    // per-present target times instead. m_SwapChain is null in this mode.
+    PmSwapchain m_PmSwapchain;
+    bool m_UsePmSwapchain;
+    uint64_t m_PmTargetUs;
 
     Microsoft::WRL::ComPtr<ID3D11Fence> m_PresentReadyFence;
     uint64_t m_PresentReadyFenceValue;
