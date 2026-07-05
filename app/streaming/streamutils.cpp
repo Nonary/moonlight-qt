@@ -18,6 +18,11 @@
 #include <SDL_syswm.h>
 #endif
 
+#ifdef HAVE_DRM
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#endif
+
 #ifdef Q_OS_LINUX
 #include <sys/auxv.h>
 
@@ -156,6 +161,66 @@ void StreamUtils::screenSpaceToNormalizedDeviceCoords(SDL_Rect* src, SDL_FRect* 
     dst->h = (float)src->h / (viewportHeight / 2.0f);
 }
 
+#ifdef HAVE_DRM
+// Refresh rate of the display hardware is actually scanning out at, straight
+// from the kernel's CRTC state - but only when exactly one CRTC is active,
+// since without a window position there is no way to pick between several.
+// This exists because compositors lie: gamescope's XWayland advertises a
+// fixed 60Hz mode to X11 clients regardless of the real output mode, so a
+// 120Hz display looks like 60Hz to SDL and VRR eligibility dies on the spot.
+// Under gamescope exactly one output is active by construction, which is
+// precisely when this query is unambiguous.
+static int getSingleActiveDrmRefreshRate()
+{
+    int activeRefresh = 0;
+    int activeCrtcCount = 0;
+
+    for (int cardIndex = 0; cardIndex < 4; cardIndex++) {
+        char cardPath[64];
+        snprintf(cardPath, sizeof(cardPath), "/dev/dri/card%d", cardIndex);
+
+        int fd = open(cardPath, O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+
+        drmModeRes* resources = drmModeGetResources(fd);
+        if (resources == nullptr) {
+            // Render-only or non-KMS node
+            close(fd);
+            continue;
+        }
+
+        for (int i = 0; i < resources->count_crtcs; i++) {
+            drmModeCrtc* crtc = drmModeGetCrtc(fd, resources->crtcs[i]);
+            if (crtc == nullptr) {
+                continue;
+            }
+
+            if (crtc->mode_valid) {
+                activeCrtcCount++;
+
+                int refresh = crtc->mode.vrefresh;
+                if (refresh == 0 && crtc->mode.htotal != 0 && crtc->mode.vtotal != 0) {
+                    // Some drivers leave vrefresh unpopulated
+                    refresh = (int)((crtc->mode.clock * 1000LL +
+                                     (crtc->mode.htotal * crtc->mode.vtotal) / 2) /
+                                    (crtc->mode.htotal * crtc->mode.vtotal));
+                }
+                activeRefresh = refresh;
+            }
+
+            drmModeFreeCrtc(crtc);
+        }
+
+        drmModeFreeResources(resources);
+        close(fd);
+    }
+
+    return activeCrtcCount == 1 ? activeRefresh : 0;
+}
+#endif
+
 int StreamUtils::getDisplayRefreshRate(SDL_Window* window)
 {
     // Authoritative override for displays the windowing system misreports.
@@ -210,6 +275,20 @@ int StreamUtils::getDisplayRefreshRate(SDL_Window* window)
                     "Refresh rate unknown; assuming 60 Hz");
         mode.refresh_rate = 60;
     }
+
+#ifdef HAVE_DRM
+    // The kernel's scanout state outranks the windowing system's advertised
+    // mode when there's only one active display to be on (see
+    // getSingleActiveDrmRefreshRate() for why they disagree).
+    int drmRefreshRate = getSingleActiveDrmRefreshRate();
+    if (drmRefreshRate > 0 && drmRefreshRate != mode.refresh_rate) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Display refresh rate: %d Hz via DRM scanout state (windowing system advertised %d Hz)",
+                    drmRefreshRate,
+                    mode.refresh_rate);
+        return drmRefreshRate;
+    }
+#endif
 
     return mode.refresh_rate;
 }
