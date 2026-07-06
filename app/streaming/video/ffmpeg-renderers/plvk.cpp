@@ -608,8 +608,9 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
 
 void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
 {
-    const bool disableVrr = qEnvironmentVariableIntValue("MOONLIGHT_DISABLE_VRR") != 0;
-    const bool forceVrr = qEnvironmentVariableIntValue("MOONLIGHT_FORCE_VRR") != 0 && !disableVrr;
+    const bool envDisableVrr = qEnvironmentVariableIntValue("MOONLIGHT_DISABLE_VRR") != 0;
+    const bool forceVrr = qEnvironmentVariableIntValue("MOONLIGHT_FORCE_VRR") != 0 && !envDisableVrr;
+    const bool disableVrr = envDisableVrr || (!params->enableVrr && !forceVrr);
     const int displayFps = StreamUtils::getDisplayRefreshRate(params->window);
 
     // Same +5 slack Session uses before force-disabling V-sync: display
@@ -641,7 +642,9 @@ void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
 
     if (disableVrr && params->enableVsync) {
         m_PresentationMode = PresentationMode::FixedVsync;
-        fallbackReason = "MOONLIGHT_DISABLE_VRR is set";
+        fallbackReason = envDisableVrr ?
+            "MOONLIGHT_DISABLE_VRR is set" :
+            "VRR is disabled in settings";
     }
     else if (forceVrr && vrrCadenceUsable) {
         m_PresentationMode = PresentationMode::VrrCadence;

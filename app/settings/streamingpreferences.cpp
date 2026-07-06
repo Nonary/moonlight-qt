@@ -34,6 +34,7 @@
 #define SER_ABSTOUCHMODE "abstouchmode"
 #define SER_STARTWINDOWED "startwindowed"
 #define SER_FRAMEPACING "framepacing"
+#define SER_ENABLEVRR "enablevrr"
 #define SER_VRRTEARING "vrrtearing"
 #define SER_VRRCUSHION "vrrcushion"
 #define SER_OSSCHEDULEDVRR "osscheduledvrr"
@@ -140,6 +141,7 @@ void StreamingPreferences::reload()
     absoluteMouseMode = settings.value(SER_ABSMOUSEMODE, false).toBool();
     absoluteTouchMode = settings.value(SER_ABSTOUCHMODE, true).toBool();
     framePacing = settings.value(SER_FRAMEPACING, false).toBool();
+    enableVrr = settings.value(SER_ENABLEVRR, false).toBool();
     vrrTearing = settings.value(SER_VRRTEARING, false).toBool();
     vrrCushionUs = settings.value(SER_VRRCUSHION, 4500).toInt();
     osScheduledVrr = settings.value(SER_OSSCHEDULEDVRR, false).toBool();
@@ -341,6 +343,7 @@ void StreamingPreferences::save()
     settings.setValue(SER_ABSMOUSEMODE, absoluteMouseMode);
     settings.setValue(SER_ABSTOUCHMODE, absoluteTouchMode);
     settings.setValue(SER_FRAMEPACING, framePacing);
+    settings.setValue(SER_ENABLEVRR, enableVrr);
     settings.setValue(SER_VRRTEARING, vrrTearing);
     settings.setValue(SER_VRRCUSHION, vrrCushionUs);
     settings.setValue(SER_OSSCHEDULEDVRR, osScheduledVrr);

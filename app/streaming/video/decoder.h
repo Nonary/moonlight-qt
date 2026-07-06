@@ -48,6 +48,7 @@ typedef struct _DECODER_PARAMETERS {
     int frameRate;
     bool enableVsync;
     bool enableFramePacing;
+    bool enableVrr;
     bool enableVrrTearing;
     int vrrCushionUs;
     bool enableOsScheduledVrr;

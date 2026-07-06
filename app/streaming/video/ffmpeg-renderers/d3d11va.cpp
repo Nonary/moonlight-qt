@@ -288,8 +288,9 @@ bool D3D11VARenderer::queryTearingSupport(HRESULT* result)
 
 void D3D11VARenderer::resolvePresentationMode(SDL_Window* window, DXGI_SWAP_CHAIN_DESC1* swapChainDesc)
 {
-    const bool disableVrr = qEnvironmentVariableIntValue("MOONLIGHT_DISABLE_VRR") != 0;
-    const bool forceVrr = qEnvironmentVariableIntValue("MOONLIGHT_FORCE_VRR") != 0 && !disableVrr;
+    const bool envDisableVrr = qEnvironmentVariableIntValue("MOONLIGHT_DISABLE_VRR") != 0;
+    const bool forceVrr = qEnvironmentVariableIntValue("MOONLIGHT_FORCE_VRR") != 0 && !envDisableVrr;
+    const bool disableVrr = envDisableVrr || (!m_DecoderParams.enableVrr && !forceVrr);
     const Uint32 windowFlags = SDL_GetWindowFlags(window);
     const bool fullscreenExclusive = (windowFlags & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN;
     const int displayFps = StreamUtils::getDisplayRefreshRate(window);
@@ -303,7 +304,9 @@ void D3D11VARenderer::resolvePresentationMode(SDL_Window* window, DXGI_SWAP_CHAI
 
     if (disableVrr && m_DecoderParams.enableVsync) {
         m_PresentationMode = PresentationMode::FixedVsync;
-        fallbackReason = "MOONLIGHT_DISABLE_VRR is set";
+        fallbackReason = envDisableVrr ?
+            "MOONLIGHT_DISABLE_VRR is set" :
+            "VRR is disabled in settings";
     }
     else if (!m_TearingSupport) {
         m_PresentationMode = m_DecoderParams.enableVsync ?
