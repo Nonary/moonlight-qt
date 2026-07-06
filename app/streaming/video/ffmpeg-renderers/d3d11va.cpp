@@ -69,6 +69,10 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_PresentReadyFenceValue(0),
       m_PresentReadyFenceEvent(nullptr),
       m_PresentReadyFenceFailed(false),
+      m_RenderPhaseSubmitTotalUs(0),
+      m_RenderPhaseGpuWaitTotalUs(0),
+      m_RenderPhaseSamples(0),
+      m_RenderPhaseLastLogUs(0),
       m_FrameLatencyWaitableObject(nullptr),
       m_UsePmSwapchain(false),
       m_PmTargetUs(0),
@@ -676,11 +680,15 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
                             "Avoiding texture sharing on known broken GPU vendor");
                 separateDevices = false;
             }
-            else if (adapterDesc.VendorId == 0x1002) { // AMD
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Avoiding separate D3D11VA decode/render devices on AMD");
-                separateDevices = false;
-            }
+            // AMD is deliberately NOT excluded here. An earlier revision
+            // forced shared devices on AMD, which put decode and render on
+            // one immediate context - the pre-present GPU fence then waited
+            // behind the next frame's decode, inflating measured render
+            // times from 3-4ms to 11-13ms under sustained load (Radeon
+            // 890M, measured 2026-07-06; separate devices reclaimed ~2ms
+            // and halved jitter drops with no decode side effects).
+            // D3D11VA_FORCE_SEPARATE_DEVICES=0 restores sharing if an AMD
+            // driver misbehaves.
         }
     }
 
@@ -878,6 +886,27 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
 
     resolvePresentationMode(params->window, &swapChainDesc);
 
+    if (m_PresentationMode == PresentationMode::VrrCadence) {
+        // Ask the driver to prioritize this device's GPU submissions. VRR
+        // cadence pacing fences GPU completion before every present, so
+        // the frame's GPU work gates the flip instant directly and any
+        // queueing behind DWM or other clients costs pacing slack
+        // (measured 2026-07-06: the whole per-frame chain is ~3.5ms at
+        // full clocks, so priority - not throughput - is what matters).
+        // Only this mode justifies maximum priority; the other
+        // presentation modes present on a vsync cadence that hides
+        // ordinary queueing. Best-effort: drivers may clamp or ignore it,
+        // and under HAGS it can be a no-op.
+        ComPtr<IDXGIDevice> dxgiDevice;
+        if (SUCCEEDED(m_RenderDevice.As(&dxgiDevice))) {
+            HRESULT prioHr = dxgiDevice->SetGPUThreadPriority(7);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "SetGPUThreadPriority(7) for VRR cadence pacing: %s (%x)",
+                        SUCCEEDED(prioHr) ? "accepted" : "rejected",
+                        prioHr);
+        }
+    }
+
     // DXVA2 may let us take over for FSE V-sync off cases. However, if we don't have DXGI_FEATURE_PRESENT_ALLOW_TEARING
     // then we should not attempt to do this unless there's no other option (HDR, DXVA2 failed in pass 1, etc).
     if (m_PresentationMode == PresentationMode::Immediate && !m_AllowTearing &&
@@ -1063,6 +1092,8 @@ void D3D11VARenderer::waitToRender()
 
 void D3D11VARenderer::renderFrame(AVFrame* frame)
 {
+    uint64_t renderEntryUs = LiGetMicroseconds();
+
     // Composition swapchain: pick a presentation buffer BEFORE taking the
     // context lock - the availability wait must not stall the decoder on
     // shared-device systems. The wait is surfaced via
@@ -1176,7 +1207,32 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         // decoder isn't stalled while we wait. The presenter then executes
         // the pacer's intent: hold to the target instant, then align to the
         // blanking gap or record a vsync-latched present.
+        //
+        // Phase accounting: everything from renderFrame entry to here was
+        // CPU submission; the fence wait inside signalAndUnlockForPresent
+        // is GPU latency (the frame's decode tail on the decode device,
+        // the decoder-texture copy, and the draw). The pacer sees only the
+        // sum, and the two halves call for entirely different
+        // optimizations, so log the split.
+        uint64_t submitDoneUs = LiGetMicroseconds();
         bool unlocked = signalAndUnlockForPresent();
+        uint64_t gpuDoneUs = LiGetMicroseconds();
+        m_RenderPhaseSubmitTotalUs += submitDoneUs - renderEntryUs;
+        m_RenderPhaseGpuWaitTotalUs += gpuDoneUs - submitDoneUs;
+        m_RenderPhaseSamples++;
+        if (gpuDoneUs - m_RenderPhaseLastLogUs > 30000000ULL) {
+            if (m_RenderPhaseLastLogUs != 0 && m_RenderPhaseSamples > 0) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "D3D11 render phases: cpu-submit avg %.2f ms, gpu-wait avg %.2f ms over %u frames",
+                            m_RenderPhaseSubmitTotalUs / 1000.0 / m_RenderPhaseSamples,
+                            m_RenderPhaseGpuWaitTotalUs / 1000.0 / m_RenderPhaseSamples,
+                            m_RenderPhaseSamples);
+            }
+            m_RenderPhaseSubmitTotalUs = 0;
+            m_RenderPhaseGpuWaitTotalUs = 0;
+            m_RenderPhaseSamples = 0;
+            m_RenderPhaseLastLogUs = gpuDoneUs;
+        }
         if (!unlocked && m_DecodeDevice == m_RenderDevice) {
             // No fence support: still drop the lock for the waits below.
             unlockContext(this);

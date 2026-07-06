@@ -116,6 +116,15 @@ private:
     uint64_t m_PresentReadyFenceValue;
     HANDLE m_PresentReadyFenceEvent;
     bool m_PresentReadyFenceFailed;
+
+    // Render-phase accounting: the pacer's "render time" is opaque (CPU
+    // submission + a GPU fence wait that covers the frame's decode tail,
+    // the decoder-texture copy, and the draw). Split it so a log window
+    // shows WHERE the milliseconds go.
+    uint64_t m_RenderPhaseSubmitTotalUs;
+    uint64_t m_RenderPhaseGpuWaitTotalUs;
+    uint32_t m_RenderPhaseSamples;
+    uint64_t m_RenderPhaseLastLogUs;
     HANDLE m_FrameLatencyWaitableObject;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_RenderTargetView;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_VideoBlendState;
