@@ -2,6 +2,12 @@
 #include "vrrcadence.h"
 #include "streaming/streamutils.h"
 
+#include <QDateTime>
+#include <QMap>
+#include <QSettings>
+#include <QStringList>
+#include <QVector>
+
 #ifdef Q_OS_WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -76,6 +82,322 @@ static void highResolutionSleepUntilUs(uint64_t targetUs)
     }
 }
 #endif
+
+// Cross-session VRR calibration cache. The cadence thread's feedback loops
+// re-learn the same hardware facts on every stream: which content rates this
+// display/driver stack chronically tears at in the near-ceiling band (the
+// tear-rate probe pays for that answer in visible tears - and pays again
+// after every content-rate wobble, stream restart, and app launch: measured
+// 2026-07-04/06 as 7-10 probe tear-bursts per session because the old
+// single-slot ladder forgot each rate the moment the content moved >600us
+// away from it), and how much lead margin this pipeline typically needs
+// (every session restarts at the fixed 4ms default and re-converges).
+// Both are stable properties of the panel + refresh mode + stream rate, so
+// they are remembered in the settings store, keyed by that identity.
+//
+// Deliberately NOT cached: anything re-measured cheaply and invisibly
+// (render-time EMA, servo trim, cadence measurement). Safety properties:
+// verdicts expire after two weeks so a driver/OS update gets a fresh
+// judgement; a probe PASS decays the matching verdict (halves its period)
+// instead of the old erase-everything reset - post-latch probes routinely
+// pass for a few seconds while the raster is still aligned from the latch
+// spell and then fail again, and a full reset on those blips is what kept
+// the ladder pinned at 60s; and chronic verdicts only skip the probe, never
+// the fallback's own expiry re-probe, so a regime change is still found
+// within one latch period. MOONLIGHT_VRR_NO_CALIBRATION_CACHE=1 disables
+// load and save.
+struct VrrTearVerdict {
+    uint32_t intervalUs;     // measured content interval that failed (fixed at creation)
+    uint32_t periodSecs;     // latch period last applied for this rate
+    uint32_t failCount;
+    qint64 lastSeenSecs;
+    bool latchedThisSession; // one probe-free pre-latch per stream (not persisted)
+};
+
+class VrrCalibrationStore
+{
+public:
+    static constexpr uint32_t kMatchToleranceUs = 600;   // same rate-identity window as the old single-slot ladder
+    static constexpr uint32_t kBasePeriodSecs = 60;
+    static constexpr uint32_t kMaxPeriodSecs = 480;
+    static constexpr uint32_t kChronicPeriodSecs = 240;  // pre-latch without a probe at or above this
+
+    VrrCalibrationStore() :
+        m_Enabled(false),
+        m_Dirty(false),
+        m_SeedMarginUs(0),
+        m_MarginSumUs(0),
+        m_MarginSamples(0),
+        m_LastFlushUs(0)
+    {
+    }
+
+    void load(const QString& key)
+    {
+        m_Key = key;
+        m_Enabled = !m_Key.isEmpty() &&
+            qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_CALIBRATION_CACHE") == 0;
+        if (!m_Enabled) {
+            return;
+        }
+
+        QSettings settings;
+        settings.beginGroup(QStringLiteral("VrrCalibration"));
+        settings.beginGroup(m_Key);
+
+        qint64 nowSecs = QDateTime::currentSecsSinceEpoch();
+        qint64 savedSecs = settings.value(QStringLiteral("ts")).toLongLong();
+        if (savedSecs > 0 && nowSecs - savedSecs <= kTtlSecs) {
+            int marginUs = settings.value(QStringLiteral("leadmarginus")).toInt();
+            if (marginUs > 0) {
+                m_SeedMarginUs = (uint64_t)marginUs;
+            }
+        }
+
+        if (savedSecs > 0 && nowSecs - savedSecs <= kTtlSecs) {
+            const QStringList bands =
+                settings.value(QStringLiteral("bandleadmargins")).toString()
+                    .split(QLatin1Char(';'), Qt::SkipEmptyParts);
+            for (const QString& serialized : bands) {
+                const QStringList fields = serialized.split(QLatin1Char(':'));
+                if (fields.count() != 2) {
+                    continue;
+                }
+                int bandFps = fields[0].toInt();
+                uint32_t marginUs = fields[1].toUInt();
+                if (bandFps >= 10 && bandFps <= 240 && marginUs > 0) {
+                    m_BandSeeds.insert(bandFps, marginUs);
+                }
+            }
+        }
+
+        const QStringList verdicts =
+            settings.value(QStringLiteral("tearverdicts")).toString()
+                .split(QLatin1Char(';'), Qt::SkipEmptyParts);
+        for (const QString& serialized : verdicts) {
+            const QStringList fields = serialized.split(QLatin1Char(':'));
+            if (fields.count() != 4) {
+                continue;
+            }
+            VrrTearVerdict verdict = {};
+            verdict.intervalUs = fields[0].toUInt();
+            verdict.periodSecs = qMin(fields[1].toUInt(), kMaxPeriodSecs);
+            verdict.failCount = fields[2].toUInt();
+            verdict.lastSeenSecs = fields[3].toLongLong();
+            verdict.latchedThisSession = false;
+            if (verdict.intervalUs == 0 || verdict.periodSecs < kBasePeriodSecs ||
+                    nowSecs - verdict.lastSeenSecs > kTtlSecs ||
+                    m_Verdicts.count() >= kVerdictCap) {
+                continue;
+            }
+            m_Verdicts.append(verdict);
+        }
+
+        if (m_SeedMarginUs != 0 || !m_Verdicts.isEmpty()) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "VRR calibration cache: restored %d tear verdict(s), lead margin %.2f ms [%s]",
+                        (int)m_Verdicts.count(),
+                        m_SeedMarginUs / 1000.0,
+                        qUtf8Printable(m_Key));
+        }
+    }
+
+    uint64_t seedLeadMarginUs() const
+    {
+        return m_SeedMarginUs;
+    }
+
+    // Lead-margin history is kept PER CONTENT-RATE BAND (nearest 10fps).
+    // Content rate is variable by design under VRR - a game swings from a
+    // 10fps loading screen or paused desktop to 110fps gameplay - and the
+    // regimes have genuinely different render behavior (idle GPU clocks
+    // make low-rate renders slow and spiky, saturated clocks make
+    // high-rate renders fast and tight). One global average lets a stretch
+    // of desktop idling poison the seed that 110fps gameplay starts from.
+    uint64_t seedLeadMarginForBandUs(int bandFps) const
+    {
+        return m_BandSeeds.value(bandFps, 0);
+    }
+
+    void noteLeadMargin(uint64_t marginUs, int bandFps)
+    {
+        m_MarginSumUs += marginUs;
+        m_MarginSamples++;
+        if (bandFps > 0) {
+            BandAccum& accum = m_BandAccums[bandFps];
+            accum.sumUs += marginUs;
+            accum.samples++;
+        }
+    }
+
+    VrrTearVerdict* findVerdict(uint64_t intervalUs)
+    {
+        int i = findIndex(intervalUs);
+        return i >= 0 ? &m_Verdicts[i] : nullptr;
+    }
+
+    // Records a failed tear-rate probe and returns the latch period to apply:
+    // the next rung of this rate's own ladder (base for a first offense),
+    // resuming from wherever earlier streams and sessions left it.
+    uint32_t recordTearFail(uint64_t intervalUs, uint64_t nowUs)
+    {
+        qint64 nowSecs = QDateTime::currentSecsSinceEpoch();
+        uint32_t periodSecs = kBasePeriodSecs;
+        int i = findIndex(intervalUs);
+        if (i >= 0) {
+            periodSecs = qMin(m_Verdicts[i].periodSecs * 2, kMaxPeriodSecs);
+            m_Verdicts[i].periodSecs = periodSecs;
+            m_Verdicts[i].failCount++;
+            m_Verdicts[i].lastSeenSecs = nowSecs;
+            m_Verdicts[i].latchedThisSession = true;
+        }
+        else {
+            if (m_Verdicts.count() >= kVerdictCap) {
+                int oldest = 0;
+                for (int j = 1; j < m_Verdicts.count(); j++) {
+                    if (m_Verdicts[j].lastSeenSecs < m_Verdicts[oldest].lastSeenSecs) {
+                        oldest = j;
+                    }
+                }
+                m_Verdicts.removeAt(oldest);
+            }
+            VrrTearVerdict verdict = {};
+            verdict.intervalUs = (uint32_t)intervalUs;
+            verdict.periodSecs = periodSecs;
+            verdict.failCount = 1;
+            verdict.lastSeenSecs = nowSecs;
+            verdict.latchedThisSession = true;
+            m_Verdicts.append(verdict);
+        }
+
+        m_Dirty = true;
+        // Persist fail verdicts promptly: the process has a history of not
+        // reaching a clean teardown, and losing the ladder means paying the
+        // probe's tears all over again next session. The write lands while
+        // presents are vsync-latched anyway, where a millisecond of settings
+        // I/O is invisible.
+        flushIfDue(nowUs, 5000000ULL);
+        return periodSecs;
+    }
+
+    void recordTearPass(uint64_t intervalUs)
+    {
+        int i = findIndex(intervalUs);
+        if (i < 0) {
+            return;
+        }
+        if (m_Verdicts[i].periodSecs <= kBasePeriodSecs) {
+            m_Verdicts.removeAt(i);
+        }
+        else {
+            m_Verdicts[i].periodSecs /= 2;
+        }
+        m_Dirty = true;
+    }
+
+    void saveOnExit()
+    {
+        if (m_Enabled && (m_Dirty || m_MarginSamples >= kMinMarginSamples)) {
+            persist();
+        }
+    }
+
+private:
+    static constexpr qint64 kTtlSecs = 14LL * 24 * 60 * 60;
+    static constexpr int kVerdictCap = 12;
+    // ~10s of frames minimum before a session's margin average is considered
+    // representative enough to overwrite the stored seed.
+    static constexpr uint64_t kMinMarginSamples = 1000;
+
+    int findIndex(uint64_t intervalUs) const
+    {
+        for (int i = 0; i < m_Verdicts.count(); i++) {
+            uint64_t deltaUs = intervalUs > m_Verdicts[i].intervalUs ?
+                intervalUs - m_Verdicts[i].intervalUs :
+                m_Verdicts[i].intervalUs - intervalUs;
+            if (deltaUs <= kMatchToleranceUs) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    void flushIfDue(uint64_t nowUs, uint64_t minGapUs)
+    {
+        if (!m_Enabled || !m_Dirty) {
+            return;
+        }
+        if (m_LastFlushUs != 0 && nowUs - m_LastFlushUs < minGapUs) {
+            return;
+        }
+        persist();
+        m_LastFlushUs = nowUs;
+    }
+
+    void persist()
+    {
+        QSettings settings;
+        settings.beginGroup(QStringLiteral("VrrCalibration"));
+        settings.beginGroup(m_Key);
+        settings.setValue(QStringLiteral("ts"),
+                          QDateTime::currentSecsSinceEpoch());
+
+        uint64_t marginUs = m_MarginSamples >= kMinMarginSamples ?
+            m_MarginSumUs / m_MarginSamples : m_SeedMarginUs;
+        if (marginUs != 0) {
+            settings.setValue(QStringLiteral("leadmarginus"), (int)marginUs);
+        }
+
+        // Fold this session's per-band averages into the stored seeds. A
+        // band must have ~5s of dwell time at its own rate to qualify
+        // (sample counts alone would let high-rate bands qualify in a
+        // second while 10fps bands never do), and existing seeds blend
+        // 50/50 rather than being replaced so one unusual session doesn't
+        // erase a band's history. Bands untouched this session carry over.
+        for (auto it = m_BandAccums.constBegin(); it != m_BandAccums.constEnd(); ++it) {
+            if (it.value().samples < (quint64)it.key() * 5) {
+                continue;
+            }
+            uint32_t avgUs = (uint32_t)(it.value().sumUs / it.value().samples);
+            uint32_t oldSeedUs = m_BandSeeds.value(it.key(), 0);
+            m_BandSeeds.insert(it.key(),
+                               oldSeedUs != 0 ? (oldSeedUs + avgUs) / 2 : avgUs);
+        }
+        QStringList bandsOut;
+        for (auto it = m_BandSeeds.constBegin(); it != m_BandSeeds.constEnd(); ++it) {
+            bandsOut.append(QString(QStringLiteral("%1:%2"))
+                            .arg(it.key()).arg(it.value()));
+        }
+        settings.setValue(QStringLiteral("bandleadmargins"),
+                          bandsOut.join(QLatin1Char(';')));
+
+        QStringList serialized;
+        for (const VrrTearVerdict& v : m_Verdicts) {
+            serialized.append(QString(QStringLiteral("%1:%2:%3:%4"))
+                              .arg(v.intervalUs).arg(v.periodSecs)
+                              .arg(v.failCount).arg(v.lastSeenSecs));
+        }
+        settings.setValue(QStringLiteral("tearverdicts"),
+                          serialized.join(QLatin1Char(';')));
+        m_Dirty = false;
+    }
+
+    struct BandAccum {
+        quint64 sumUs;
+        quint64 samples;
+    };
+
+    QString m_Key;
+    bool m_Enabled;
+    bool m_Dirty;
+    QVector<VrrTearVerdict> m_Verdicts;
+    QMap<int, uint32_t> m_BandSeeds;
+    QMap<int, BandAccum> m_BandAccums;
+    uint64_t m_SeedMarginUs;
+    uint64_t m_MarginSumUs;
+    uint64_t m_MarginSamples;
+    uint64_t m_LastFlushUs;
+};
 
 Pacer::Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats) :
     m_RenderThread(nullptr),
@@ -221,6 +543,11 @@ int Pacer::cadenceThread(void* context)
 
     VrrCadenceClock cadenceClock(me->m_MaxVideoFps, me->m_DisplayFps);
 
+    // Cross-session memory for the tear-rate ladder and the adaptive lead
+    // margin (see VrrCalibrationStore above). Owned by this thread alone.
+    VrrCalibrationStore calibration;
+    calibration.load(me->m_VrrCalibrationKey);
+
     // The renderer holds each present back to the pacer's target itself, so
     // leading the render start by a little extra only costs idle wait, while
     // arriving late costs a missed blanking gap - bias the lead accordingly.
@@ -272,8 +599,29 @@ int Pacer::cadenceThread(void* context)
     int overshootCount = 0;
     uint64_t lastMarginLogUs = 0;
     uint64_t lastLoggedMarginUs = 0;
+
+    // Content-rate band scoping for the margin (nearest 10fps, with a
+    // short dwell so boundary wobble doesn't thrash it). On a REGIME jump
+    // (>=2 bands, e.g. 10fps desktop -> 110fps gameplay) the overshoot
+    // window is stale evidence from different GPU-clock behavior: drop it
+    // and restart from the new band's own cached history instead of
+    // gliding down from the old regime's margin over seconds. Adjacent
+    // band drift (109 <-> 111fps) keeps the window - same regime.
+    int marginBandFps = 0;
+    int marginBandCandidate = 0;
+    uint64_t marginBandCandidateSinceUs = 0;
+    uint64_t lastBandSeedLogUs = 0;
     uint64_t leadMarginUs =
         classicPresent ? 0 : (fixedMarginEnv > 1 ? (uint64_t)fixedMarginEnv : 4000);
+    if (adaptiveMargin && calibration.seedLeadMarginUs() != 0) {
+        // Start where this configuration typically lives instead of the
+        // one-size default: a heavy (4K) pipeline gets its full protection
+        // from the first frame rather than after the first stutter, and a
+        // light one starts without the default's extra standing latency.
+        // Either way the adaptive loop takes over within its ~12s window.
+        leadMarginUs = qBound(marginFloorUs, calibration.seedLeadMarginUs(),
+                              marginCeilUs);
+    }
 
     // Rolling ~500ms of pacing queue depth, mirroring the hysteresis the
     // handleVsync/renderFrame paths already use. Network jitter routinely
@@ -406,11 +754,13 @@ int Pacer::cadenceThread(void* context)
     // within one probe window (~2-3s of tearing per minute worst-case).
     // Only meaningful when the latch exists to fall back to;
     // tearing-preferred users chose cadence-over-tears explicitly.
+    // The per-rate ladder (latch period doubling per repeat offense) lives
+    // in the calibration store so it survives content-rate wobble, stream
+    // restarts, and sessions - the old single-slot version restarted every
+    // rate at 60s whenever content moved >600us away and back.
     uint32_t bandTearWindowPresents = 0;
     uint32_t bandTearWindowTears = 0;
     uint64_t bandTearFallbackUntilUs = 0;
-    uint64_t bandTearFallbackPeriodUs = 60000000ULL;
-    uint64_t bandTearFailIntervalUs = 0;
 
     while (!me->m_Stopping) {
         me->m_FrameQueueLock.lock();
@@ -482,6 +832,62 @@ int Pacer::cadenceThread(void* context)
         // the stream's nominal FPS is only an upper bound (a game hovering
         // at 90fps on a 120fps stream delivers frames every ~11.1ms).
         uint64_t measuredSourceIntervalUs = cadenceClock.smoothedIntervalUs();
+
+        if (adaptiveMargin && cadenceClock.warmedUp() &&
+                measuredSourceIntervalUs != 0) {
+            int fpsNow = (int)(1000000ULL / measuredSourceIntervalUs);
+            int band = qBound(10, ((fpsNow + 5) / 10) * 10, 240);
+            if (band == marginBandFps) {
+                marginBandCandidate = 0;
+            }
+            else if (band != marginBandCandidate) {
+                marginBandCandidate = band;
+                marginBandCandidateSinceUs = nowUs;
+            }
+            else if (nowUs - marginBandCandidateSinceUs > 700000ULL) {
+                int prevBand = marginBandFps;
+                marginBandFps = band;
+                marginBandCandidate = 0;
+
+                uint64_t bandSeedUs =
+                    calibration.seedLeadMarginForBandUs(band);
+                if (prevBand == 0) {
+                    // First warm band of the stream: the margin holds no
+                    // stale regime yet, so only RAISE it toward the band's
+                    // history (dropping below live early-session evidence
+                    // would shed real protection).
+                    if (bandSeedUs != 0) {
+                        leadMarginUs = qMax(leadMarginUs,
+                                            qBound(marginFloorUs, bandSeedUs,
+                                                   marginCeilUs));
+                    }
+                }
+                else if (qAbs(band - prevBand) >= 20) {
+                    // Regime jump: the overshoot window measured a
+                    // different GPU-clock regime. Restart the evidence
+                    // window and stand the margin on this band's own
+                    // history (or keep the current value when the band is
+                    // unknown - the glide takes over from there). A wrong
+                    // seed self-corrects in one frame: any overshoot past
+                    // it raises the margin immediately.
+                    overshootHead = 0;
+                    overshootCount = 0;
+                    if (bandSeedUs != 0) {
+                        uint64_t seededUs = qBound(marginFloorUs, bandSeedUs,
+                                                   marginCeilUs);
+                        if (seededUs != leadMarginUs &&
+                                nowUs - lastBandSeedLogUs > 10000000ULL) {
+                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                        "VRR lead margin: %.2f ms from %dfps band history (was %.2f ms from %dfps regime)",
+                                        seededUs / 1000.0, band,
+                                        leadMarginUs / 1000.0, prevBand);
+                            lastBandSeedLogUs = nowUs;
+                        }
+                        leadMarginUs = seededUs;
+                    }
+                }
+            }
+        }
 
         uint64_t minFrameIntervalUs = me->m_DisplayFps > 0 ? (1000000ULL / me->m_DisplayFps) : 0;
 
@@ -644,6 +1050,31 @@ int Pacer::cadenceThread(void* context)
                 lastBufferLogUs = nowUs;
             }
             prevNearBuffered = nearBuffered;
+        }
+
+        // Cached tear verdict: when earlier streams proved this content rate
+        // chronically tears in-band on this display (ladder at or past the
+        // chronic rung), latch immediately instead of paying the probe's
+        // visible tear burst to rediscover it. One shot per rate per stream,
+        // and only ever skips the probe - the fallback expiry still re-probes,
+        // so an improved regime (driver update, different stack behavior) is
+        // found within one latch period and the pass decay unwinds the
+        // verdict from there.
+        if (nearBuffered && latchAvailable && nowUs >= bandTearFallbackUntilUs) {
+            VrrTearVerdict* verdict =
+                calibration.findVerdict(measuredSourceIntervalUs);
+            if (verdict != nullptr && !verdict->latchedThisSession &&
+                    verdict->periodSecs >= VrrCalibrationStore::kChronicPeriodSecs) {
+                verdict->latchedThisSession = true;
+                bandTearFallbackUntilUs = nowUs +
+                    (uint64_t)verdict->periodSecs * 1000000ULL;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "VRR tear-rate cache: %.1f fps measured tore chronically before (%u failures); vsync-latching for %us without a probe",
+                            measuredSourceIntervalUs > 0 ?
+                                1000000.0 / measuredSourceIntervalUs : 0.0,
+                            verdict->failCount,
+                            verdict->periodSecs);
+            }
         }
 
         bool vsyncLatchPresent = ((alignTapered && !nearBuffered) ||
@@ -1204,8 +1635,9 @@ int Pacer::cadenceThread(void* context)
                 probeFailed =
                     bandTearWindowTears * 100 >= bandTearWindowPresents * 15;
                 if (!probeFailed) {
-                    bandTearFallbackPeriodUs = 60000000ULL;
-                    bandTearFailIntervalUs = 0;
+                    // The band demonstrably works at this rate right now;
+                    // decay any stored verdict for it one rung.
+                    calibration.recordTearPass(measuredSourceIntervalUs);
                     bandTearWindowPresents = 0;
                     bandTearWindowTears = 0;
                 }
@@ -1213,27 +1645,20 @@ int Pacer::cadenceThread(void* context)
 
             if (probeFailed) {
                 if (latchAvailable) {
-                    if (bandTearFailIntervalUs != 0 &&
-                            (measuredSourceIntervalUs >
-                                 bandTearFailIntervalUs + 600 ||
-                             measuredSourceIntervalUs + 600 <
-                                 bandTearFailIntervalUs)) {
-                        // Different content rate than the one that failed
-                        // before - judge it fresh.
-                        bandTearFallbackPeriodUs = 60000000ULL;
-                    }
-                    bandTearFallbackUntilUs = nowUs + bandTearFallbackPeriodUs;
+                    // Each content rate climbs its own ladder in the
+                    // calibration store, resuming from wherever earlier
+                    // streams left it.
+                    uint32_t fallbackSecs = calibration.recordTearFail(
+                        measuredSourceIntervalUs, nowUs);
+                    bandTearFallbackUntilUs = nowUs +
+                        (uint64_t)fallbackSecs * 1000000ULL;
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                                 "VRR tear-rate fallback: %u of %u in-band presents tore mid-scan at %.1f fps measured; vsync-latching this content for %us",
                                 bandTearWindowTears,
                                 bandTearWindowPresents,
                                 measuredSourceIntervalUs > 0 ?
                                     1000000.0 / measuredSourceIntervalUs : 0.0,
-                                (unsigned int)(bandTearFallbackPeriodUs / 1000000ULL));
-                    bandTearFailIntervalUs = measuredSourceIntervalUs;
-                    if (bandTearFallbackPeriodUs < 480000000ULL) {
-                        bandTearFallbackPeriodUs *= 2;
-                    }
+                                fallbackSecs);
                 }
                 bandTearWindowPresents = 0;
                 bandTearWindowTears = 0;
@@ -1280,6 +1705,11 @@ int Pacer::cadenceThread(void* context)
                                      marginGlideUs);
             }
 
+            // Feed the margin into the calibration store under the current
+            // content-rate band - each band's average becomes that band's
+            // starting point in later sessions.
+            calibration.noteLeadMargin(leadMarginUs, marginBandFps);
+
             uint64_t marginDeltaUs = leadMarginUs > lastLoggedMarginUs ?
                 leadMarginUs - lastLoggedMarginUs :
                 lastLoggedMarginUs - leadMarginUs;
@@ -1296,6 +1726,8 @@ int Pacer::cadenceThread(void* context)
             }
         }
     }
+
+    calibration.saveOnExit();
 
     me->m_VsyncRenderer->cleanupRenderContext();
 
@@ -1516,6 +1948,24 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, b
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "VRR cadence pacing: direct render target %d Hz with %d FPS stream",
                     m_DisplayFps, m_MaxVideoFps);
+
+        // Identity for the cross-session calibration cache: the tear-rate
+        // verdicts and typical lead margin are properties of the panel, its
+        // refresh mode, and the stream's rate cap. Stream resolution also
+        // influences the lead margin, but it isn't known here - the margin
+        // seed is only a starting point the adaptive loop corrects within
+        // seconds, so the coarser key is acceptable.
+        int displayIndex = SDL_GetWindowDisplayIndex(window);
+        const char* displayName = displayIndex >= 0 ?
+            SDL_GetDisplayName(displayIndex) : nullptr;
+        m_VrrCalibrationKey = QString(QStringLiteral("%1|%2Hz|%3fps"))
+            .arg(displayName != nullptr ?
+                 QString::fromUtf8(displayName) : QStringLiteral("display"))
+            .arg(m_DisplayFps)
+            .arg(m_MaxVideoFps);
+        m_VrrCalibrationKey.replace(QLatin1Char('/'), QLatin1Char('_'));
+        m_VrrCalibrationKey.replace(QLatin1Char('\\'), QLatin1Char('_'));
+
         m_VsyncThread = SDL_CreateThread(Pacer::cadenceThread, "PacerCadence", this);
     }
 
