@@ -1593,6 +1593,15 @@ bool PlVkRenderer::isVrrRasterLockUncertain()
     return m_VrrPresenter.isRasterLockUncertain();
 }
 
+bool PlVkRenderer::arePresentsVsyncLatched()
+{
+    // VrrCadence maps to FIFO on this platform (see resolvePresentationMode):
+    // every flip latches at a vblank, and only MOONLIGHT_VRR_NO_LATCH=1 opts
+    // into tearing-capable immediate presents.
+    return m_PresentationMode == PresentationMode::VrrCadence &&
+           m_VkPresentMode == VK_PRESENT_MODE_FIFO_KHR;
+}
+
 int PlVkRenderer::getDecoderColorspace()
 {
     // We rely on libplacebo for color conversion, pick colorspace with the same primaries as sRGB

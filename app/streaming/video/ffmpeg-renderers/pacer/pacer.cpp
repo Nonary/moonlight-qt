@@ -196,6 +196,17 @@ int Pacer::cadenceThread(void* context)
 
     VrrCadenceClock cadenceClock(me->m_MaxVideoFps, me->m_DisplayFps);
 
+    // On renderers whose presents all latch at a vblank (plvk FIFO), the
+    // display enforces no flip spacing of its own under VRR flip-following -
+    // the panel flips the moment a present arrives - so any catch-up tier
+    // that spaces flips at the hardware floor scans out at max refresh and
+    // shows up on the display's refresh readout as spikes far above the
+    // content rate (observed 2026-07-05: 100fps content bouncing the OSD to
+    // 118Hz). Those tiers must self-limit relative to the measured cadence
+    // here; on scan-position renderers (D3D11) the alignment machinery
+    // already spaces them.
+    const bool latchedPresents = me->m_VsyncRenderer->arePresentsVsyncLatched();
+
     // The renderer holds each present back to the pacer's target itself, so
     // leading the render start by a little extra only costs idle wait, while
     // arriving late costs a missed blanking gap - bias the lead accordingly.
@@ -369,6 +380,11 @@ int Pacer::cadenceThread(void* context)
     bool bandSnapPending = false;
     bool overfillDropPending = false;
     uint64_t lastSnapLogUs = 0;
+
+    // Post-band-release grace (see the staleSchedule block). Sized to one
+    // servo window so the trim machinery gets a full measurement cycle to
+    // start draining before the stale/drain tiers may fire again.
+    int bandStaleGraceFrames = 0;
 
     // Tear-rate feedback: the self-calibrating replacement for hardcoded
     // per-panel rate limits. Whether a given display/driver stack can
@@ -686,6 +702,7 @@ int Pacer::cadenceThread(void* context)
         // frame queue delay against an 8.3ms frame time).
         uint64_t staleAgeUs =
             measuredSourceIntervalUs + measuredSourceIntervalUs / 4;
+        bool bandDrainGrace = false;
         if (nearBuffered) {
             // The deliberate standing buffer holds every frame ~one extra
             // interval by design, so the stale trigger must sit beyond the
@@ -693,6 +710,22 @@ int Pacer::cadenceThread(void* context)
             // ceiling-spaced rush catch-ups, the exact tight-flip generator
             // the buffer exists to kill.
             staleAgeUs += measuredSourceIntervalUs;
+            bandStaleGraceFrames = slackWindowCap;
+        }
+        else if (bandStaleGraceFrames > 0) {
+            // The band just released with its deliberate ~one-interval
+            // standing buffer still queued. Without a grace period the very
+            // first out-of-band frame reads over the 1.25-interval stale
+            // threshold and fires a max-rate rush burst - on content
+            // hovering at the band edge (measured 2026-07-05: 96-105fps
+            // wobble flapping engage/release every few seconds) that made
+            // every release a refresh-rate spike on the panel. Keep the
+            // in-band stale and drain thresholds briefly so the latency
+            // trim servo drains the buffer at its gentle per-frame rate
+            // instead.
+            staleAgeUs += measuredSourceIntervalUs;
+            bandStaleGraceFrames--;
+            bandDrainGrace = true;
         }
         bool staleSchedule = measuredSourceIntervalUs != 0 && frame->pkt_dts > 0 &&
             nowUs > (uint64_t)frame->pkt_dts + staleAgeUs;
@@ -722,7 +755,20 @@ int Pacer::cadenceThread(void* context)
                 // (~2 tears/sec at 88fps) clustered around game hitches.
                 // The extra 750us per catch-up frame is immaterial against
                 // the >1.25-interval lateness that triggered the rush.
-                uint64_t catchUpUs = qMax(lastFlipUs + flipSpacingFloorUs,
+                uint64_t rushSpacingUs = flipSpacingFloorUs;
+                if (latchedPresents) {
+                    // A latched present under VRR flip-following scans out
+                    // the instant it arrives - the display enforces no
+                    // spacing - so a floor-spaced rush burst slams the
+                    // panel to max refresh (100fps content reading 118Hz
+                    // on the OSD). Cap the rush at the drain tier's
+                    // ~12%-tighter-than-content spacing; the few extra
+                    // frames of convergence are invisible next to the
+                    // >1.25-interval lateness that triggered the rush.
+                    rushSpacingUs = qMax(rushSpacingUs,
+                                         measuredSourceIntervalUs * 7 / 8);
+                }
+                uint64_t catchUpUs = qMax(lastFlipUs + rushSpacingUs,
                                           LiGetMicroseconds());
                 if (catchUpUs < targetUs) {
                     targetUs = catchUpUs;
@@ -730,7 +776,8 @@ int Pacer::cadenceThread(void* context)
                 }
                 rushPresent = true;
             }
-            else if (nearBuffered ? queuedBehindCount >= 2 : backlogged) {
+            else if ((nearBuffered || bandDrainGrace) ?
+                         queuedBehindCount >= 2 : backlogged) {
                 // In-band, one queued frame is the buffer operating as
                 // designed, not backlog - draining it would just re-expose
                 // the flip to jitter. Only a genuine 2+ pile-up drains.
@@ -792,7 +839,8 @@ int Pacer::cadenceThread(void* context)
         }
         uint64_t effDeadbandUs = effCushionUs + 1000;
         bool servoVeto = staleSchedule ||
-            (nearBuffered ? queuedBehindCount >= 2 : backlogged);
+            ((nearBuffered || bandDrainGrace) ?
+                 queuedBehindCount >= 2 : backlogged);
 
         // One-step buffer snap on band entry and after stall resets. The
         // gradual pad below moves <=100us/frame (~1.5s to build the full
@@ -1424,7 +1472,15 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
 bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrrTearing, int vrrCushionUs)
 {
     m_MaxVideoFps = maxVideoFps;
-    m_VrrTearingPreferred = enableVrrTearing;
+    // A tearing preference only means something when the renderer can
+    // actually present with tearing. On renderers whose presents all latch
+    // at a vblank anyway (plvk's FIFO VrrCadence path), honoring it would
+    // strip the pacer's vsync-latch fallback and flip-spacing slack - all
+    // of tearing-preferred pacing's cost with none of its latency benefit
+    // (observed 2026-07-05: 100fps content flipping at the panel ceiling
+    // on every catch-up because vrrtearing=true removed the +750us floor).
+    m_VrrTearingPreferred = enableVrrTearing &&
+        !m_VsyncRenderer->arePresentsVsyncLatched();
     if (vrrCushionUs > 0) {
         m_VrrCushionUs = vrrCushionUs;
     }

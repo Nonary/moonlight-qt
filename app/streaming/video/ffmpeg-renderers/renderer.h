@@ -333,6 +333,20 @@ public:
         return 0;
     }
 
+    virtual bool arePresentsVsyncLatched() {
+        // True when every present latches at a display vblank regardless of
+        // the pacer's tearing preference (e.g. a FIFO swapchain with no
+        // tearing-capable present path in use). Two pacer policies hinge on
+        // this: the tearing preference is meaningless (honoring it would
+        // strip the latch fallback and flip-spacing slack for zero latency
+        // benefit), and under VRR flip-following the display does NOT
+        // enforce spacing on latched presents - the "vblank" happens the
+        // moment the present arrives - so floor-spaced catch-up bursts scan
+        // out at the panel's max refresh and read as the refresh readout
+        // spiking far above the content rate.
+        return false;
+    }
+
     static const char* getPresentationModeName(PresentationMode mode) {
         switch (mode) {
         case PresentationMode::Immediate:

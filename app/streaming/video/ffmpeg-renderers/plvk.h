@@ -57,6 +57,7 @@ public:
     virtual uint64_t getLastPresentUs() override;
     virtual uint32_t popMidScanTearCount() override;
     virtual bool isVrrRasterLockUncertain() override;
+    virtual bool arePresentsVsyncLatched() override;
     virtual int getDecoderColorspace() override;
     virtual int getDecoderColorRange() override;
     virtual int getDecoderCapabilities() override;
