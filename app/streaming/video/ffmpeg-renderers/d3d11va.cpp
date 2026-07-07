@@ -1266,8 +1266,15 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     }
 
     // Present according to the selected presentation mode
-    m_VrrPresenter.notePresent(LiGetMicroseconds());
+    uint64_t presentCallStartUs = LiGetMicroseconds();
+    m_VrrPresenter.notePresent(presentCallStartUs);
     hr = m_SwapChain->Present(0, flags);
+    if (m_PresentationMode == PresentationMode::VrrCadence) {
+        // Separate retire-queue backpressure inside Present() from render
+        // work - see VrrPresenter::notePresentDuration().
+        m_VrrPresenter.notePresentDuration(
+            LiGetMicroseconds() - presentCallStartUs);
+    }
 
     if (m_DecodeDevice == m_RenderDevice) {
         // Release the context lock

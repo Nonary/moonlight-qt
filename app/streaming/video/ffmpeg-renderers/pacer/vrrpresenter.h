@@ -91,6 +91,19 @@ public:
         m_LastPresentUs = presentUs;
     }
 
+    // Record how long the present call itself took. A tearing present
+    // returns in the driver's fixed submission overhead; wall time beyond
+    // that is the swapchain blocking on a flip retire (queue-full
+    // BACKPRESSURE), which no amount of earlier render start can avoid.
+    // The excess over a self-calibrating baseline (rolling minimum, i.e.
+    // this driver's own measured no-block cost) is folded into the
+    // alignment-wait report so the pacer's render estimate, adaptive lead
+    // margin, and render-tail handoff never schedule around it - measured
+    // 2026-07-06 at near-ceiling rates as the whole "render" estimate
+    // riding at the flip retire interval and inflating the standing
+    // buffer toward its clamp.
+    void notePresentDuration(uint64_t presentDurationUs);
+
 private:
     uint64_t holdUntilPresentTarget();
     void waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs,
@@ -139,4 +152,12 @@ private:
     int m_TearForensicCount;
     int m_AlignInstantStreak;
     uint32_t m_MidScanSinceQuery;
+
+    // Present-call baseline for notePresentDuration(): two half-windows of
+    // rolling minimum so the baseline tracks the driver's real submission
+    // overhead (and re-learns it after driver/mode changes) without a
+    // single lucky fast call pinning it forever.
+    uint64_t m_PresentBaseCurMinUs;
+    uint64_t m_PresentBasePrevMinUs;
+    uint32_t m_PresentBaseCount;
 };

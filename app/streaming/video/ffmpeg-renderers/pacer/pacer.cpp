@@ -12,6 +12,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include "dxvsyncsource.h"
+#else
+#include <time.h>
 #endif
 
 #ifdef HAS_WAYLAND
@@ -763,6 +765,61 @@ int Pacer::cadenceThread(void* context)
     uint64_t padStepUs = 0;
     uint64_t lastTrimLogUs = 0;
 
+    // Measured cushion need. The cushion dial and the in-band 5/8-interval
+    // floor are static insurance budgets; the quantity they insure against
+    // is measurable: the spread of pipeline ages (max - min of the servo's
+    // own queue-delay estimate) across a window in which the schedule held
+    // still is exactly the arrival turbulence the buffer absorbed. Track
+    // the worst spread over the last ~24 CLEAN half-second windows (windows
+    // where the trim/pad servo moved the phase, a snap fired, or a
+    // veto-grade event hit are self-distorted and excluded), and let the
+    // effective cushion THIN below the static budgets toward that
+    // measurement plus a guard - never fatten above them, so a chaotic
+    // link behaves exactly like the static design and a calm one stops
+    // paying insurance it provably doesn't need. Entirely
+    // measurement-derived, so it sizes itself per device and per link.
+    // MOONLIGHT_VRR_STATIC_CUSHION=1 disables the thinning for A/B.
+    const bool staticCushion =
+        qEnvironmentVariableIntValue("MOONLIGHT_VRR_STATIC_CUSHION") != 0;
+    uint64_t slackWindowMaxUs = 0;
+    bool slackWindowTainted = false;
+    uint32_t jitterSpreadRingUs[24];
+    int jitterSpreadHead = 0;
+    int jitterSpreadCount = 0;
+    int taintedWindowStreak = 0;
+    uint64_t jitterNeedUs = UINT64_MAX;  // UINT64_MAX until enough clean windows
+    uint64_t lastCushionLogUs = 0;
+
+    // Scale-free pacing geometry. Every zone and guard below that used to
+    // be a fixed microsecond offset is expressed as a fraction (per-mille)
+    // of the panel's scanout period, anchored to the value it validated at
+    // on the 8.33ms/120Hz reference panel - a fixed 1350us entry zone
+    // means "16% of a scanout" there but would mean 32% on a 240Hz panel
+    // and 8% at 60Hz, silently moving every behavioral boundary. Fractions
+    // keep the zones meaning the same thing on any refresh rate.
+    // Deliberately NOT scaled: human-latency quantities (the cushion dial
+    // bounds, lead-margin caps, snap sizes, jitter guards) - perceived
+    // delay is absolute time regardless of panel speed - and content-
+    // domain constants (the ~22fps cadence-adoption bound). Env overrides
+    // stay absolute microseconds: they are user-facing measurement knobs.
+    const uint64_t scanoutPeriodUs =
+        me->m_DisplayFps > 0 ? 1000000ULL / me->m_DisplayFps : 8333;
+    auto scanoutFracUs = [scanoutPeriodUs](uint64_t perMille) {
+        return scanoutPeriodUs * perMille / 1000;
+    };
+    const uint64_t flipGuardDefaultUs = scanoutFracUs(18);      // 150us on the reference panel
+    const uint64_t ritualSlackDefaultUs = scanoutFracUs(96);    // 800us
+    const uint64_t taperEntryZoneUs = scanoutFracUs(162);       // 1350us
+    const uint64_t taperExitZoneUs = scanoutFracUs(192);        // 1600us
+    const uint64_t bandSlowReleaseZoneUs = scanoutFracUs(300);  // 2500us
+    const uint64_t bandEntryStepUs = scanoutFracUs(12);         // 100us
+    const uint64_t cushionClampZoneUs = scanoutFracUs(312);     // 2600us
+    const uint64_t cadenceSlackGuardUs = scanoutFracUs(24);     // 200us
+    const uint64_t alignSpinFloorUs = scanoutFracUs(360);       // 3000us
+    const uint64_t alignWideExtraUs = scanoutFracUs(240);       // 2000us
+    const uint64_t rushBudgetCapUs = scanoutFracUs(300);        // 2500us
+    const uint64_t scheduleGuardUs = scanoutFracUs(60);         // 500us
+
     // Post-stall recovery tuning (the flip-spacing floor, staleSchedule
     // catch-up, rush-budget floor and cadence-cold latch below).
     // MOONLIGHT_VRR_CLASSIC_RECOVERY=1 restores the old recovery behavior
@@ -786,8 +843,8 @@ int Pacer::cadenceThread(void* context)
     const int flipSlackEnv =
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_FLIP_SLACK_US");
     const uint64_t flipCeilingSlackUs = flipSlackEnv > 0 ?
-        (uint64_t)flipSlackEnv : 150;
-    const uint64_t rushAlignFloorUs = 600;
+        (uint64_t)flipSlackEnv : flipGuardDefaultUs;
+    const uint64_t rushAlignFloorUs = scanoutFracUs(72);  // 600us on the reference panel
 
     // Near-ceiling buffered VRR. Content cadence between the taper
     // threshold (~103fps) and just under the panel's nominal max refresh
@@ -831,10 +888,11 @@ int Pacer::cadenceThread(void* context)
     const int bufferGuardEnv =
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_BUFFER_GUARD_US");
     const uint64_t bufferGuardUs = bufferGuardEnv > 0 ?
-        (uint64_t)bufferGuardEnv : 150;
+        (uint64_t)bufferGuardEnv : flipGuardDefaultUs;
     bool nearBuffered = false;
     bool prevNearBuffered = false;
     int nearBufferDwell = 0;
+    int bandRearmDwell = 0;
     uint64_t lastWideReanchorUs = 0;
     uint64_t lastBufferLogUs = 0;
     // Slack gate for the re-lock ritual (see the ritual block in the loop).
@@ -844,7 +902,7 @@ int Pacer::cadenceThread(void* context)
     const int ritualSlackEnv =
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_RITUAL_MIN_SLACK_US");
     const uint64_t ritualMinSlackUs = ritualSlackEnv > 0 ?
-        (uint64_t)ritualSlackEnv : 800;
+        (uint64_t)ritualSlackEnv : ritualSlackDefaultUs;
     int relockBurstRemaining = 0;
     uint64_t lastRelockBurstUs = 0;
     uint64_t lastRelockLogUs = 0;
@@ -1029,11 +1087,11 @@ int Pacer::cadenceThread(void* context)
         // buffered band below is the sanctioned way to operate in this
         // zone - it re-times presents behind a standing buffer instead of
         // aligning jittery ones, which is a different regime.)
-        if (measuredSourceIntervalUs < minFrameIntervalUs + 1350) {
+        if (measuredSourceIntervalUs < minFrameIntervalUs + taperEntryZoneUs) {
             alignTapered = true;
             alignFullDwell = 0;
         }
-        else if (measuredSourceIntervalUs >= minFrameIntervalUs + 1600) {
+        else if (measuredSourceIntervalUs >= minFrameIntervalUs + taperExitZoneUs) {
             if (alignFullDwell < 24) {
                 alignFullDwell++;
             }
@@ -1114,19 +1172,46 @@ int Pacer::cadenceThread(void* context)
         bool pastFastEdge = latchAvailable &&
             measuredSourceIntervalUs < bufferFloorIntervalUs;
         bool clearlySlowerThanBand =
-            measuredSourceIntervalUs >= minFrameIntervalUs + 2500;
+            measuredSourceIntervalUs >= minFrameIntervalUs + bandSlowReleaseZoneUs;
         bool tearRateFallback = latchAvailable &&
             nowUs < bandTearFallbackUntilUs;
-        if (!nearBufferEnabled || !alignTapered || pastFastEdge ||
+        if (!nearBufferEnabled || pastFastEdge ||
                 clearlySlowerThanBand || tearRateFallback) {
             nearBuffered = false;
             nearBufferDwell = 0;
+            bandRearmDwell = 0;
+        }
+        else if (!alignTapered) {
+            // The taper re-arming (content showing sustained headroom below
+            // ~min+1600) is a DWELLED band release, not an instant one.
+            // Content oscillating across the boundary (measured 2026-07-06:
+            // 89-108fps swings, band released at 94.8/100.5fps and
+            // re-engaged at 104-108 every 5-20s) paid a full buffer
+            // teardown and snap rebuild per crossing - a standing-latency
+            // sawtooth. The leaky counter (~0.35s at these rates,
+            // content-relative so it scales with any panel/rate) rides out
+            // boundary wobble; a genuine slowdown still releases instantly
+            // via clearlySlowerThanBand above, so slow content never pays
+            // the in-band cushion for long.
+            if (!nearBuffered) {
+                nearBufferDwell = 0;
+                bandRearmDwell = 0;
+            }
+            else if (bandRearmDwell < 36) {
+                bandRearmDwell++;
+            }
+            else {
+                nearBuffered = false;
+                nearBufferDwell = 0;
+                bandRearmDwell = 0;
+            }
         }
         else if (!nearBuffered) {
+            bandRearmDwell = 0;
             if (cadenceClock.warmedUp() &&
-                    measuredSourceIntervalUs < minFrameIntervalUs + 1350 &&
+                    measuredSourceIntervalUs < minFrameIntervalUs + taperEntryZoneUs &&
                     (!latchAvailable ||
-                     measuredSourceIntervalUs >= bufferFloorIntervalUs + 100)) {
+                     measuredSourceIntervalUs >= bufferFloorIntervalUs + bandEntryStepUs)) {
                 if (nearBufferDwell < 12) {
                     nearBufferDwell++;
                 }
@@ -1137,6 +1222,9 @@ int Pacer::cadenceThread(void* context)
             else if (nearBufferDwell > 0) {
                 nearBufferDwell--;
             }
+        }
+        else if (bandRearmDwell > 0) {
+            bandRearmDwell--;
         }
 
         // The clock snapping onto "now" after a stall wipes the standing
@@ -1308,11 +1396,18 @@ int Pacer::cadenceThread(void* context)
         // target for A/B; fixed-margin/classic builds keep it too,
         // since without the adaptive margin there is no tail
         // measurement to hand off.
+        // The measured need (worst clean-window spread + guard, see the
+        // jitter ring above) may only ever THIN the cushion below the
+        // static budgets - same one-way philosophy as the render-tail cap.
         uint64_t effCushionUs = queueCushionUs;
+        if (jitterNeedUs != UINT64_MAX) {
+            effCushionUs = qBound((uint64_t)1500, jitterNeedUs,
+                                  queueCushionUs);
+        }
         if (nearBuffered) {
             uint64_t bandTargetUs;
             if (fixedNearBufferTarget || !adaptiveMargin) {
-                bandTargetUs = measuredSourceIntervalUs + 500;
+                bandTargetUs = measuredSourceIntervalUs + scheduleGuardUs;
             }
             else {
                 // The render tail may only ever THIN the buffer below the
@@ -1325,14 +1420,17 @@ int Pacer::cadenceThread(void* context)
                 // backpressure back as a bigger standing buffer deepens
                 // the very queue causing it - a 20-26ms measured spiral
                 // against the validated ~9ms design.
-                bandTargetUs = qMin(qMax(queueCushionUs,
-                                         measuredSourceIntervalUs * 5 / 8) +
-                                        renderTailBeyondMarginUs,
-                                    measuredSourceIntervalUs + 500);
+                uint64_t staticBaseUs = qMax(queueCushionUs,
+                                             measuredSourceIntervalUs * 5 / 8);
+                uint64_t baseUs = jitterNeedUs != UINT64_MAX ?
+                    qBound((uint64_t)1500, jitterNeedUs, staticBaseUs) :
+                    staticBaseUs;
+                bandTargetUs = qMin(baseUs + renderTailBeyondMarginUs,
+                                    measuredSourceIntervalUs + scheduleGuardUs);
             }
             effCushionUs = qMax(effCushionUs,
                                 qMin(bandTargetUs,
-                                     minFrameIntervalUs + 2600));
+                                     minFrameIntervalUs + cushionClampZoneUs));
         }
 
         // Detect a schedule that has drifted late relative to frame delivery:
@@ -1466,6 +1564,7 @@ int Pacer::cadenceThread(void* context)
                                            (uint64_t)12000);
                     targetUs += snapUs;
                     cadenceClock.rebaseTarget(targetUs);
+                    slackWindowTainted = true;
                     if (nowUs - lastSnapLogUs > 10000000ULL) {
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                                     "VRR buffer snap: +%.2f ms to rebuild the standing buffer (age %.2f ms, cushion %.2f ms)",
@@ -1485,6 +1584,10 @@ int Pacer::cadenceThread(void* context)
             uint64_t frameQueueEstUs = renderStartEstUs > (uint64_t)frame->pkt_dts ?
                 renderStartEstUs - (uint64_t)frame->pkt_dts : 0;
             slackWindowMinUs = qMin(slackWindowMinUs, frameQueueEstUs);
+            slackWindowMaxUs = qMax(slackWindowMaxUs, frameQueueEstUs);
+            if (servoVeto) {
+                slackWindowTainted = true;
+            }
 
             if (++slackWindowSamples >= slackWindowCap) {
                 uint64_t newStepUs = 0;
@@ -1540,9 +1643,66 @@ int Pacer::cadenceThread(void* context)
                                 effCushionUs / 1000.0);
                     lastTrimLogUs = nowUs;
                 }
+                // A window qualifies for the jitter measurement only if the
+                // schedule held still throughout: no trim/pad motion, no
+                // snap, no veto-grade event. What remains in max-min is the
+                // routine arrival turbulence the cushion exists to absorb
+                // (stalls and backlogs are the rush machinery's job, priced
+                // separately).
+                // Sustained chaos safety valve: a measurement frozen from a
+                // calmer era must not keep the cushion thin while the link
+                // is demonstrably turbulent. If no window has qualified for
+                // ~10s straight, forget the measurement and stand the
+                // static budgets back up until clean evidence returns.
+                if (slackWindowTainted || trimStepUs != 0 || padStepUs != 0) {
+                    if (++taintedWindowStreak >= 20) {
+                        jitterSpreadCount = 0;
+                        jitterNeedUs = UINT64_MAX;
+                    }
+                }
+                else {
+                    taintedWindowStreak = 0;
+                }
+                if (!staticCushion && !slackWindowTainted &&
+                        trimStepUs == 0 && padStepUs == 0 &&
+                        slackWindowMinUs != UINT64_MAX) {
+                    uint64_t spreadUs = slackWindowMaxUs - slackWindowMinUs;
+                    jitterSpreadRingUs[jitterSpreadHead] =
+                        (uint32_t)qMin(spreadUs, (uint64_t)UINT32_MAX);
+                    jitterSpreadHead = (jitterSpreadHead + 1) % 24;
+                    if (jitterSpreadCount < 24) {
+                        jitterSpreadCount++;
+                    }
+                    // ~4s of clean evidence before thinning begins; until
+                    // then the static budgets stand.
+                    if (jitterSpreadCount >= 8) {
+                        uint64_t worstUs = 0;
+                        for (int i = 0; i < jitterSpreadCount; i++) {
+                            worstUs = qMax(worstUs,
+                                           (uint64_t)jitterSpreadRingUs[i]);
+                        }
+                        uint64_t newNeedUs = worstUs + 750;
+                        uint64_t deltaUs = jitterNeedUs == UINT64_MAX ? newNeedUs :
+                            (newNeedUs > jitterNeedUs ? newNeedUs - jitterNeedUs :
+                                                        jitterNeedUs - newNeedUs);
+                        if (deltaUs > 1000 &&
+                                nowUs - lastCushionLogUs > 30000000ULL) {
+                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                        "VRR cushion: measured arrival spread %.2f ms over last %d clean windows (need %.2f ms, dial %.2f ms)",
+                                        worstUs / 1000.0,
+                                        jitterSpreadCount,
+                                        newNeedUs / 1000.0,
+                                        queueCushionUs / 1000.0);
+                            lastCushionLogUs = nowUs;
+                        }
+                        jitterNeedUs = newNeedUs;
+                    }
+                }
                 trimStepUs = newStepUs;
                 padStepUs = newPadUs;
                 slackWindowMinUs = UINT64_MAX;
+                slackWindowMaxUs = 0;
+                slackWindowTainted = false;
                 slackWindowSamples = 0;
             }
         }
@@ -1623,8 +1783,8 @@ int Pacer::cadenceThread(void* context)
             measuredSourceIntervalUs - renderReserveUs : 0;
         uint64_t cadenceSlackUs =
             (minFrameIntervalUs != 0 &&
-             measuredSourceIntervalUs > minFrameIntervalUs + 200) ?
-                measuredSourceIntervalUs - minFrameIntervalUs - 200 : 0;
+             measuredSourceIntervalUs > minFrameIntervalUs + cadenceSlackGuardUs) ?
+                measuredSourceIntervalUs - minFrameIntervalUs - cadenceSlackGuardUs : 0;
 
         // Re-lock ritual state. The driver re-enters VRR flip-following
         // only after a SUSTAINED streak of aligned flips - the 2026-07-03/04
@@ -1698,7 +1858,7 @@ int Pacer::cadenceThread(void* context)
             // MOONLIGHT_VRR_NO_LATCH=1 for A/B) opts into tear-and-snap
             // instead: immediate flips shave a few ms of display latency at
             // the cost of visible tearing.
-            alignBudgetUs = vsyncLatchPresent ? 0 : 3000;
+            alignBudgetUs = vsyncLatchPresent ? 0 : alignSpinFloorUs;
         }
         else if (relockBurstRemaining > 0) {
             // Ritual presents take the full-scanout budget even when the
@@ -1708,7 +1868,7 @@ int Pacer::cadenceThread(void* context)
             // (floor-spaced catch-up rebase) still applies - only the
             // wait-for-blank budget is protected here.
             relockBurstRemaining--;
-            alignBudgetUs = minFrameIntervalUs + 2000;
+            alignBudgetUs = minFrameIntervalUs + alignWideExtraUs;
         }
         else if (rushPresent) {
             // A catch-up present may only spend the cadence's real per-frame
@@ -1730,7 +1890,7 @@ int Pacer::cadenceThread(void* context)
             // itself shrinks toward zero at max refresh and the floor is
             // load-bearing - the standing buffer absorbs its cost.)
             alignBudgetUs = qMin(qMin(cadenceSlackUs, threadSlackUs),
-                                 (uint64_t)2500);
+                                 rushBudgetCapUs);
             if (!classicRecovery &&
                     (nearBuffered || !me->m_VrrTearingPreferred) &&
                     alignBudgetUs < rushAlignFloorUs) {
@@ -1749,7 +1909,7 @@ int Pacer::cadenceThread(void* context)
             // absorb margin (the old free-run collapse in exactly this
             // band). Re-entry from a lost lock is the re-lock ritual's
             // job, armed above.
-            alignBudgetUs = qMax(qMin(cadenceSlackUs, (uint64_t)2500),
+            alignBudgetUs = qMax(qMin(cadenceSlackUs, rushBudgetCapUs),
                                  rushAlignFloorUs);
         }
         else {
@@ -1765,8 +1925,9 @@ int Pacer::cadenceThread(void* context)
             // (render time past the interval) the slack is overestimated
             // and wide waits would deepen the drop cascade.
             uint64_t maxAlignUs = backlogged ?
-                (uint64_t)3000 : qMax((uint64_t)3000, minFrameIntervalUs + 2000);
-            alignBudgetUs = qBound((uint64_t)3000, threadSlackUs, maxAlignUs);
+                alignSpinFloorUs : qMax(alignSpinFloorUs,
+                                        minFrameIntervalUs + alignWideExtraUs);
+            alignBudgetUs = qBound(alignSpinFloorUs, threadSlackUs, maxAlignUs);
 
             // Forensics-driven re-anchor: while the renderer cannot prove
             // the panel is back in VRR flip-following, every floor-spaced
@@ -1796,8 +1957,8 @@ int Pacer::cadenceThread(void* context)
                     alignBudgetUs = maxAlignUs;
                 }
                 else if (nowUs - lastWideReanchorUs > 1000000ULL) {
-                    alignBudgetUs = qMax((uint64_t)3000,
-                                         minFrameIntervalUs + 2000);
+                    alignBudgetUs = qMax(alignSpinFloorUs,
+                                         minFrameIntervalUs + alignWideExtraUs);
                     lastWideReanchorUs = nowUs;
                 }
             }
@@ -2292,7 +2453,22 @@ bool Pacer::waitUntil(uint64_t targetUs)
 #ifdef Q_OS_WIN32
                                      [](uint64_t sleepUntilUs) { highResolutionSleepUntilUs(sleepUntilUs); },
 #else
-                                     [](uint64_t) { SDL_Delay(0); },
+                                     // POSIX high-resolution sleep (the old
+                                     // SDL_Delay(0) fallback busy-yielded a
+                                     // whole core through every wait, which
+                                     // a Vulkan/Wayland adopter of cadence
+                                     // pacing would inherit).
+                                     [](uint64_t sleepUntilUs) {
+                                         uint64_t nowUs = LiGetMicroseconds();
+                                         if (sleepUntilUs <= nowUs) {
+                                             return;
+                                         }
+                                         uint64_t sleepUs = sleepUntilUs - nowUs;
+                                         struct timespec ts;
+                                         ts.tv_sec = (time_t)(sleepUs / 1000000);
+                                         ts.tv_nsec = (long)((sleepUs % 1000000) * 1000);
+                                         nanosleep(&ts, nullptr);
+                                     },
 #endif
                                      []() { SDL_Delay(0); },
                                      [this]() { return m_Stopping; });

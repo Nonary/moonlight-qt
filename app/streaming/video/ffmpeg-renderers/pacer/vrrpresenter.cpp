@@ -3,6 +3,10 @@
 #include <SDL.h>
 #include <Limelight.h>
 
+#ifndef Q_OS_WIN32
+#include <time.h>
+#endif
+
 // Lock re-entry demands a sustained streak of instant blank hits: a single
 // hit is not proof (a free-running raster's own trailing blank catches a
 // present or chase by luck); see isRasterLockUncertain().
@@ -23,9 +27,14 @@ static void highResolutionSleepUs(uint64_t sleepUs)
         WaitForSingleObject(waitableTimer, INFINITE);
     }
 #else
-    // No sub-millisecond timer abstraction here yet; only Windows renderers
-    // adopt VRR cadence pacing today.
-    SDL_Delay((Uint32)(sleepUs / 1000));
+    // POSIX high-resolution sleep so a Vulkan/Wayland adopter of this class
+    // gets the same sub-millisecond hold precision the Windows path has -
+    // SDL_Delay's ~1ms-plus granularity would scatter present phase by more
+    // than the zones being paced.
+    struct timespec ts;
+    ts.tv_sec = (time_t)(sleepUs / 1000000);
+    ts.tv_nsec = (long)((sleepUs % 1000000) * 1000);
+    nanosleep(&ts, nullptr);
 #endif
 }
 
@@ -56,8 +65,34 @@ VrrPresenter::VrrPresenter() :
     m_TearForensicHead(0),
     m_TearForensicCount(0),
     m_AlignInstantStreak(0),
-    m_MidScanSinceQuery(0)
+    m_MidScanSinceQuery(0),
+    m_PresentBaseCurMinUs(UINT64_MAX),
+    m_PresentBasePrevMinUs(UINT64_MAX),
+    m_PresentBaseCount(0)
 {
+}
+
+void VrrPresenter::notePresentDuration(uint64_t presentDurationUs)
+{
+    // Baseline = the smaller of two ~128-present half-window minimums: the
+    // driver's own measured no-block present cost, per device by
+    // construction. Excess over it is retire-queue backpressure and joins
+    // the alignment-wait report the pacer already excludes from render
+    // accounting.
+    if (presentDurationUs < m_PresentBaseCurMinUs) {
+        m_PresentBaseCurMinUs = presentDurationUs;
+    }
+    uint64_t baselineUs = m_PresentBaseCurMinUs < m_PresentBasePrevMinUs ?
+        m_PresentBaseCurMinUs : m_PresentBasePrevMinUs;
+    if (++m_PresentBaseCount >= 128) {
+        m_PresentBasePrevMinUs = m_PresentBaseCurMinUs;
+        m_PresentBaseCurMinUs = UINT64_MAX;
+        m_PresentBaseCount = 0;
+    }
+
+    if (presentDurationUs > baselineUs) {
+        m_LastPresentAlignmentWaitUs += presentDurationUs - baselineUs;
+    }
 }
 
 VrrPresenter::~VrrPresenter()
@@ -276,12 +311,18 @@ void VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uin
     //
     // MOONLIGHT_VRR_SCANLINE_SLEEP=1 forces the widest bound on every
     // present regardless of the pacer's budget, for A/B testing.
+    // Scale-free bounds: the over-scanout slack and the instant-hit
+    // discriminator below are fractions of this display's scanout period
+    // (anchored to their validated values on the 8.33ms/120Hz reference),
+    // not fixed microseconds - see the pacing-geometry block in
+    // Pacer::cadenceThread for the rationale.
+    uint64_t scanoutSlackUs = m_ScanoutPeriodUs * 240 / 1000;  // 2000us on the reference
     if (qEnvironmentVariableIntValue("MOONLIGHT_VRR_SCANLINE_SLEEP") != 0 && m_ScanoutPeriodUs != 0) {
-        alignBudgetUs = m_ScanoutPeriodUs + 2000;
+        alignBudgetUs = m_ScanoutPeriodUs + scanoutSlackUs;
     }
 
     uint64_t maxWaitUs = m_ScanoutPeriodUs != 0 ?
-        qMin(alignBudgetUs, m_ScanoutPeriodUs + 2000) :
+        qMin(alignBudgetUs, m_ScanoutPeriodUs + scanoutSlackUs) :
         qMin(alignBudgetUs, (uint64_t)3000);
 
     uint64_t startUs = LiGetMicroseconds();
@@ -366,7 +407,9 @@ void VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uin
     // Require a sustained streak of instant hits before declaring the
     // panel locked; staying armed while actually locked costs nothing,
     // since the wide budget is only spent when a chase is needed.
-    if (!reachedBlank || waitedUs > 500) {
+    uint64_t instantHitUs = m_ScanoutPeriodUs != 0 ?
+        m_ScanoutPeriodUs * 60 / 1000 : 500;  // 500us on the reference panel
+    if (!reachedBlank || waitedUs > instantHitUs) {
         m_AlignInstantStreak = 0;
     }
     else if (m_AlignInstantStreak < ALIGN_LOCK_STREAK) {
