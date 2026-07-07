@@ -879,13 +879,20 @@ bool Session::initialize(QQuickWindow* qtWindow)
         m_SupportedVideoFormats.deprioritizeByMask(~VIDEO_FORMAT_MASK_10BIT);
     }
 
-    switch (m_Preferences->windowMode)
+    // VRR streaming requires the composed presentation path, so exclusive
+    // fullscreen is coerced to borderless windowed when VRR is enabled.
+    StreamingPreferences::WindowMode windowMode = m_Preferences->windowMode;
+    if (m_Preferences->enableVrr && windowMode == StreamingPreferences::WM_FULLSCREEN) {
+        windowMode = StreamingPreferences::WM_FULLSCREEN_DESKTOP;
+    }
+
+    switch (windowMode)
     {
     default:
         // Normally we'd default to fullscreen desktop when starting in windowed
         // mode, but in the case of a slow GPU, we want to use real fullscreen
         // to allow the display to assist with the video scaling work.
-        if (WMUtils::isGpuSlow()) {
+        if (WMUtils::isGpuSlow() && !m_Preferences->enableVrr) {
             m_FullScreenFlag = SDL_WINDOW_FULLSCREEN;
             break;
         }

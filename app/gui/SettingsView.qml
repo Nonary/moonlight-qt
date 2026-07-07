@@ -591,8 +591,19 @@ Flickable {
                         }
 
                         function reinitialize() {
-                            // Add native refresh rate for all attached displays
-                            var done = false
+                            // Rebuild the list from scratch so entries excluded
+                            // by the current settings (like native rates in VRR
+                            // mode) don't linger from a previous initialization
+                            fpsListModel.clear()
+                            addRefreshRateOrdered(fpsListModel, 30, qsTr("30 FPS"), false)
+                            addRefreshRateOrdered(fpsListModel, 60, qsTr("60 FPS"), false)
+
+                            // Add native refresh rate for all attached displays.
+                            // With VRR enabled, these are omitted: running at
+                            // the panel's full refresh rate leaves adaptive
+                            // sync no headroom, so only the VRR-derived rates
+                            // are offered.
+                            var done = StreamingPreferences.enableVrr
                             for (var displayIndex = 0; !done; displayIndex++) {
                                 var refreshRate = SystemProperties.getRefreshRate(displayIndex);
                                 if (refreshRate === 0) {
@@ -667,19 +678,9 @@ Flickable {
                             languageChanged.connect(reinitialize)
                         }
 
+                        // Populated by reinitialize()
                         model: ListModel {
                             id: fpsListModel
-                            // Other elements may be added at runtime
-                            ListElement {
-                                text: qsTr("30 FPS")
-                                video_fps: "30"
-                                is_custom: false
-                            }
-                            ListElement {
-                                text: qsTr("60 FPS")
-                                video_fps: "60"
-                                is_custom: false
-                            }
                         }
 
                         id: fpsComboBox
@@ -770,10 +771,14 @@ Flickable {
                     function createModel() {
                         var model = Qt.createQmlObject('import QtQuick 2.0; ListModel {}', parent, '')
 
-                        model.append({
-                                         text: qsTr("Fullscreen"),
-                                         val: StreamingPreferences.WM_FULLSCREEN
-                                     })
+                        // Exclusive fullscreen is unavailable with VRR enabled,
+                        // which requires borderless windowed or windowed mode
+                        if (!StreamingPreferences.enableVrr) {
+                            model.append({
+                                             text: qsTr("Fullscreen"),
+                                             val: StreamingPreferences.WM_FULLSCREEN
+                                         })
+                        }
 
                         model.append({
                                          text: qsTr("Borderless windowed"),
@@ -841,6 +846,72 @@ Flickable {
                     ToolTip.timeout: 5000
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("Fullscreen generally provides the best performance, but borderless windowed may work better with features like macOS Spaces, Alt+Tab, screenshot tools, on-screen overlays, etc.")
+                }
+
+                CheckBox {
+                    id: enableVrrCheck
+                    width: parent.width
+                    hoverEnabled: true
+                    text: qsTr("Enable VRR (variable refresh rate)")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.enableVrr
+                    onCheckedChanged: {
+                        if (checked === StreamingPreferences.enableVrr) {
+                            // Initial binding evaluation - nothing changed
+                            return
+                        }
+
+                        StreamingPreferences.enableVrr = checked
+
+                        if (checked) {
+                            // VRR pacing runs on the V-Sync presentation path
+                            vsyncCheck.checked = true
+                            StreamingPreferences.enableVsync = true
+
+                            // VRR requires borderless windowed or windowed mode
+                            if (StreamingPreferences.windowMode === StreamingPreferences.WM_FULLSCREEN) {
+                                StreamingPreferences.windowMode = StreamingPreferences.WM_FULLSCREEN_DESKTOP
+                            }
+
+                            // Default the FPS selection to the VRR rate of the
+                            // fastest attached display
+                            var vrrFps = 0
+                            for (var displayIndex = 0; ; displayIndex++) {
+                                var refreshRate = SystemProperties.getRefreshRate(displayIndex)
+                                if (refreshRate === 0) {
+                                    break
+                                }
+
+                                if (refreshRate >= 60) {
+                                    var thisVrrFps = Math.floor(refreshRate - refreshRate * refreshRate / 3600)
+                                    if (thisVrrFps > vrrFps) {
+                                        vrrFps = thisVrrFps
+                                    }
+                                }
+                            }
+
+                            if (vrrFps > 0 && StreamingPreferences.fps !== vrrFps) {
+                                StreamingPreferences.fps = vrrFps
+
+                                if (StreamingPreferences.autoAdjustBitrate) {
+                                    StreamingPreferences.bitrateKbps = StreamingPreferences.getDefaultBitrate(StreamingPreferences.width,
+                                                                                                              StreamingPreferences.height,
+                                                                                                              StreamingPreferences.fps,
+                                                                                                              StreamingPreferences.enableYUV444)
+                                    slider.value = StreamingPreferences.bitrateKbps
+                                }
+                            }
+                        }
+
+                        // Rebuild the FPS and display mode lists to reflect the
+                        // entries allowed by the new setting
+                        fpsComboBox.reinitialize()
+                        windowModeComboBox.reinitialize()
+                    }
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Paces the stream for a variable refresh rate (G-SYNC / FreeSync) display.\nEnabling this selects the VRR-optimized FPS rate, hides FPS options that exceed your display's VRR range, and uses borderless windowed mode (VRR requires a windowed presentation mode).")
                 }
 
                 Row {

@@ -123,6 +123,7 @@ public:
     Q_PROPERTY(bool absoluteMouseMode MEMBER absoluteMouseMode NOTIFY absoluteMouseModeChanged)
     Q_PROPERTY(bool absoluteTouchMode MEMBER absoluteTouchMode NOTIFY absoluteTouchModeChanged)
     Q_PROPERTY(bool framePacing MEMBER framePacing NOTIFY framePacingChanged)
+    Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
     Q_PROPERTY(bool vrrTearing MEMBER vrrTearing NOTIFY vrrTearingChanged)
     Q_PROPERTY(int vrrCushionUs MEMBER vrrCushionUs NOTIFY vrrCushionUsChanged)
     Q_PROPERTY(bool osScheduledVrr MEMBER osScheduledVrr NOTIFY osScheduledVrrChanged)
@@ -167,6 +168,7 @@ public:
     bool absoluteMouseMode;
     bool absoluteTouchMode;
     bool framePacing;
+    bool enableVrr;
     bool vrrTearing;
     int vrrCushionUs;
     bool osScheduledVrr;
@@ -216,6 +218,7 @@ signals:
     void uiDisplayModeChanged();
     void windowModeChanged();
     void framePacingChanged();
+    void enableVrrChanged();
     void vrrTearingChanged();
     void vrrCushionUsChanged();
     void osScheduledVrrChanged();
