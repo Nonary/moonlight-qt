@@ -80,6 +80,8 @@ public:
 
             if (sourceDeltaUs > stallThresholdUs) {
                 if (m_PendingStallDeltaUs != 0 &&
+                        sourceDeltaUs <= MAX_ADOPTABLE_INTERVAL_US &&
+                        m_PendingStallDeltaUs <= MAX_ADOPTABLE_INTERVAL_US &&
                         sourceDeltaUs < m_PendingStallDeltaUs * 2 &&
                         m_PendingStallDeltaUs < sourceDeltaUs * 2) {
                     // Two consecutive over-threshold deltas of similar
@@ -88,6 +90,18 @@ public:
                     // cutscene right after high-fps gameplay). Adopt it, or
                     // every subsequent delta re-restarts the window against
                     // a smoothed interval that can never learn the new rate.
+                    //
+                    // Bounded at ~22fps: real cutscene/menu cadences live at
+                    // 24-30fps (33-42ms), while HOST HITCHES on a struggling
+                    // game arrive as similar consecutive 60-80ms gaps every
+                    // few seconds (measured 2026-07-06) and were adopted as
+                    // a fake 13-16fps "cadence" - the schedule then paced
+                    // 60-80ms against ~9ms arrivals until the window
+                    // re-warmed, a stale-rush tear chain measured at 30-50%
+                    // mid-scan for the duration. Slower than the bound is
+                    // always treated as a stall; genuinely sub-22fps content
+                    // (loading screens) just presents on arrival via the
+                    // stall snap, which is the right behavior for it anyway.
                     m_SmoothedIntervalUs =
                         (m_PendingStallDeltaUs + sourceDeltaUs) / 2;
                     m_PendingStallDeltaUs = 0;
@@ -241,6 +255,9 @@ public:
 
 private:
     static const int MAX_SOURCE_TIMES = 128;
+    // Slowest delta pair adoptable as a real content cadence (~22fps); see
+    // the adoption branch in observeSourceTime().
+    static const uint64_t MAX_ADOPTABLE_INTERVAL_US = 45000;
 
     uint64_t m_NominalFrameIntervalUs;
     uint64_t m_MinFrameIntervalUs;
