@@ -672,6 +672,37 @@ Flickable {
                             lastIndexValue = currentIndex
                         }
 
+                        // Select the VRR-optimized frame rate entry for the
+                        // fastest VRR-capable display, using the same
+                        // Blur Busters cap formula reinitialize() uses to
+                        // build the list (refresh - refresh^2/3600).
+                        function selectVrrFps() {
+                            var bestRefreshRate = 0
+                            for (var displayIndex = 0; ; displayIndex++) {
+                                var refreshRate = SystemProperties.getRefreshRate(displayIndex)
+                                if (refreshRate === 0) {
+                                    break
+                                }
+                                if (refreshRate > bestRefreshRate) {
+                                    bestRefreshRate = refreshRate
+                                }
+                            }
+
+                            // reinitialize() only adds VRR entries for displays of 60Hz+
+                            if (bestRefreshRate < 60) {
+                                return
+                            }
+
+                            var vrrFps = Math.floor(bestRefreshRate - bestRefreshRate * bestRefreshRate / 3600)
+                            for (var i = 0; i < fpsListModel.count; i++) {
+                                if (!fpsListModel.get(i).is_custom && parseInt(fpsListModel.get(i).video_fps) === vrrFps) {
+                                    currentIndex = i
+                                    updateBitrateForSelection()
+                                    break
+                                }
+                            }
+                        }
+
                         // ignore setting the index at first, and actually set it when the component is loaded
                         Component.onCompleted: {
                             reinitialize()
@@ -758,308 +789,300 @@ Flickable {
                     }
                 }
 
-                Label {
+                Row {
                     width: parent.width
-                    id: windowModeTitle
-                    text: qsTr("Display mode")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                    visible: SystemProperties.hasDesktopEnvironment
-                }
+                    spacing: 10
 
-                AutoResizingComboBox {
-                    function createModel() {
-                        var model = Qt.createQmlObject('import QtQuick 2.0; ListModel {}', parent, '')
+                    Column {
+                        width: (parent.width - parent.spacing) / 2
+                        spacing: 5
 
-                        // Exclusive fullscreen is unavailable with VRR enabled,
-                        // which requires borderless windowed or windowed mode
-                        if (!StreamingPreferences.enableVrr) {
-                            model.append({
-                                             text: qsTr("Fullscreen"),
-                                             val: StreamingPreferences.WM_FULLSCREEN
-                                         })
+                        Label {
+                            width: parent.width
+                            id: windowModeTitle
+                            text: qsTr("Display mode")
+                            font.pointSize: 12
+                            wrapMode: Text.Wrap
+                            visible: SystemProperties.hasDesktopEnvironment
                         }
 
-                        model.append({
-                                         text: qsTr("Borderless windowed"),
-                                         val: StreamingPreferences.WM_FULLSCREEN_DESKTOP
-                                     })
+                        AutoResizingComboBox {
+                            function createModel() {
+                                var model = Qt.createQmlObject('import QtQuick 2.0; ListModel {}', parent, '')
 
-                        model.append({
-                                         text: qsTr("Windowed"),
-                                         val: StreamingPreferences.WM_WINDOWED
-                                     })
+                                model.append({
+                                                 text: qsTr("Fullscreen"),
+                                                 val: StreamingPreferences.WM_FULLSCREEN
+                                             })
 
+                                model.append({
+                                                 text: qsTr("Borderless windowed"),
+                                                 val: StreamingPreferences.WM_FULLSCREEN_DESKTOP
+                                             })
 
-                        // Set the recommended option based on the OS
-                        for (var i = 0; i < model.count; i++) {
-                            var thisWm = model.get(i).val;
-                            if (thisWm === StreamingPreferences.recommendedFullScreenMode) {
-                                model.get(i).text += " " + qsTr("(Recommended)")
-                                model.move(i, 0, 1)
-                                break
-                            }
-                        }
-
-                        return model
-                    }
+                                model.append({
+                                                 text: qsTr("Windowed"),
+                                                 val: StreamingPreferences.WM_WINDOWED
+                                             })
 
 
-                    // This is used on initialization and upon retranslation
-                    function reinitialize() {
-                        if (!visible) {
-                            // Do nothing if the control won't even be visible
-                            return
-                        }
-
-                        model = createModel()
-                        currentIndex = 0
-
-                        // Set the current value based on the saved preferences
-                        var savedWm = StreamingPreferences.windowMode
-                        for (var i = 0; i < model.count; i++) {
-                             var thisWm = model.get(i).val;
-                             if (savedWm === thisWm) {
-                                 currentIndex = i
-                                 break
-                             }
-                        }
-
-                        activated(currentIndex)
-                    }
-
-                    Component.onCompleted: {
-                        reinitialize()
-                        languageChanged.connect(reinitialize)
-                    }
-
-                    id: windowModeComboBox
-                    visible: SystemProperties.hasDesktopEnvironment
-                    enabled: !SystemProperties.rendererAlwaysFullScreen
-                    hoverEnabled: true
-                    textRole: "text"
-                    onActivated: {
-                        StreamingPreferences.windowMode = model.get(currentIndex).val
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Fullscreen generally provides the best performance, but borderless windowed may work better with features like macOS Spaces, Alt+Tab, screenshot tools, on-screen overlays, etc.")
-                }
-
-                CheckBox {
-                    id: enableVrrCheck
-                    width: parent.width
-                    hoverEnabled: true
-                    text: qsTr("Enable VRR (variable refresh rate)")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.enableVrr
-                    onCheckedChanged: {
-                        if (checked === StreamingPreferences.enableVrr) {
-                            // Initial binding evaluation - nothing changed
-                            return
-                        }
-
-                        StreamingPreferences.enableVrr = checked
-
-                        if (checked) {
-                            // VRR pacing runs on the V-Sync presentation path
-                            vsyncCheck.checked = true
-                            StreamingPreferences.enableVsync = true
-
-                            // VRR requires borderless windowed or windowed mode
-                            if (StreamingPreferences.windowMode === StreamingPreferences.WM_FULLSCREEN) {
-                                StreamingPreferences.windowMode = StreamingPreferences.WM_FULLSCREEN_DESKTOP
-                            }
-
-                            // Default the FPS selection to the VRR rate of the
-                            // fastest attached display
-                            var vrrFps = 0
-                            for (var displayIndex = 0; ; displayIndex++) {
-                                var refreshRate = SystemProperties.getRefreshRate(displayIndex)
-                                if (refreshRate === 0) {
-                                    break
-                                }
-
-                                if (refreshRate >= 60) {
-                                    var thisVrrFps = Math.floor(refreshRate - refreshRate * refreshRate / 3600)
-                                    if (thisVrrFps > vrrFps) {
-                                        vrrFps = thisVrrFps
+                                // Set the recommended option based on the OS
+                                for (var i = 0; i < model.count; i++) {
+                                    var thisWm = model.get(i).val;
+                                    if (thisWm === StreamingPreferences.recommendedFullScreenMode) {
+                                        model.get(i).text += " " + qsTr("(Recommended)")
+                                        model.move(i, 0, 1)
+                                        break
                                     }
                                 }
+
+                                return model
                             }
 
-                            if (vrrFps > 0 && StreamingPreferences.fps !== vrrFps) {
-                                StreamingPreferences.fps = vrrFps
 
-                                if (StreamingPreferences.autoAdjustBitrate) {
-                                    StreamingPreferences.bitrateKbps = StreamingPreferences.getDefaultBitrate(StreamingPreferences.width,
-                                                                                                              StreamingPreferences.height,
-                                                                                                              StreamingPreferences.fps,
-                                                                                                              StreamingPreferences.enableYUV444)
-                                    slider.value = StreamingPreferences.bitrateKbps
+                            // This is used on initialization and upon retranslation
+                            function reinitialize() {
+                                if (!visible) {
+                                    // Do nothing if the control won't even be visible
+                                    return
+                                }
+
+                                model = createModel()
+                                currentIndex = 0
+
+                                // While VRR is enabled, streaming always uses borderless
+                                // windowed mode, so display that without overwriting the
+                                // saved preference (it is restored when VRR is disabled).
+                                var targetWm = StreamingPreferences.enableVrr ?
+                                        StreamingPreferences.WM_FULLSCREEN_DESKTOP :
+                                        StreamingPreferences.windowMode
+                                for (var i = 0; i < model.count; i++) {
+                                     var thisWm = model.get(i).val;
+                                     if (targetWm === thisWm) {
+                                         currentIndex = i
+                                         break
+                                     }
+                                }
+
+                                if (!StreamingPreferences.enableVrr) {
+                                    activated(currentIndex)
                                 }
                             }
+
+                            Component.onCompleted: {
+                                reinitialize()
+                                languageChanged.connect(reinitialize)
+                            }
+
+                            // Re-resolve the displayed mode when VRR is toggled
+                            property bool vrrForced: StreamingPreferences.enableVrr
+                            onVrrForcedChanged: {
+                                reinitialize()
+                            }
+
+                            id: windowModeComboBox
+                            visible: SystemProperties.hasDesktopEnvironment
+                            enabled: !SystemProperties.rendererAlwaysFullScreen && !StreamingPreferences.enableVrr
+                            hoverEnabled: true
+                            textRole: "text"
+                            onActivated: {
+                                StreamingPreferences.windowMode = model.get(currentIndex).val
+                            }
+
+                            ToolTip.delay: 1000
+                            ToolTip.timeout: 5000
+                            ToolTip.visible: hovered
+                            ToolTip.text: StreamingPreferences.enableVrr ?
+                                              qsTr("Borderless windowed mode is required for VRR streaming and will be used while VRR is enabled.")
+                                            :
+                                              qsTr("Fullscreen generally provides the best performance, but borderless windowed may work better with features like macOS Spaces, Alt+Tab, screenshot tools, on-screen overlays, etc.")
                         }
 
-                        // Rebuild the FPS and display mode lists to reflect the
-                        // entries allowed by the new setting
-                        fpsComboBox.reinitialize()
-                        windowModeComboBox.reinitialize()
-                    }
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Paces the stream for a variable refresh rate (G-SYNC / FreeSync) display.\nEnabling this selects the VRR-optimized FPS rate, hides FPS options that exceed your display's VRR range, and uses borderless windowed mode (VRR requires a windowed presentation mode).")
-                }
+                        Row {
+                            spacing: 5
+                            width: parent.width
 
-                Row {
-                    spacing: 5
-                    width: parent.width
+                            CheckBox {
+                                id: vsyncCheck
+                                hoverEnabled: true
+                                text: qsTr("V-Sync")
+                                font.pointSize:  12
+                                checked: StreamingPreferences.enableVsync
+                                onCheckedChanged: {
+                                    StreamingPreferences.enableVsync = checked
+                                }
 
-                    CheckBox {
-                        id: vsyncCheck
-                        hoverEnabled: true
-                        text: qsTr("V-Sync")
-                        font.pointSize:  12
-                        checked: StreamingPreferences.enableVsync
-                        onCheckedChanged: {
-                            StreamingPreferences.enableVsync = checked
-                        }
+                                ToolTip.delay: 1000
+                                ToolTip.timeout: 5000
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("Disabling V-Sync allows sub-frame rendering latency, but it can display visible tearing")
+                            }
 
-                        ToolTip.delay: 1000
-                        ToolTip.timeout: 5000
-                        ToolTip.visible: hovered
-                        ToolTip.text: qsTr("Disabling V-Sync allows sub-frame rendering latency, but it can display visible tearing")
-                    }
-
-                    CheckBox {
-                        id: framePacingCheck
-                        hoverEnabled: true
-                        text: qsTr("Frame pacing")
-                        font.pointSize:  12
-                        enabled: StreamingPreferences.enableVsync
-                        checked: StreamingPreferences.enableVsync && StreamingPreferences.framePacing
-                        onCheckedChanged: {
-                            StreamingPreferences.framePacing = checked
-                        }
-                        ToolTip.delay: 1000
-                        ToolTip.timeout: 5000
-                        ToolTip.visible: hovered
-                        ToolTip.text: qsTr("Frame pacing reduces micro-stutter by delaying frames that come in too early")
-                    }
-                }
-
-                CheckBox {
-                    id: vrrTearingCheck
-                    width: parent.width
-                    hoverEnabled: true
-                    text: qsTr("Low-latency VRR (allow tearing)")
-                    font.pointSize: 12
-                    enabled: StreamingPreferences.enableVsync
-                    checked: StreamingPreferences.enableVsync && StreamingPreferences.vrrTearing
-                    onCheckedChanged: {
-                        StreamingPreferences.vrrTearing = checked
-                    }
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("When the stream FPS runs above your display's tear-free VRR range, present frames immediately for the lowest latency instead of latching them to vsync. May show visible tearing.\nHas no effect at FPS values within the VRR range, where VRR is always tear-free and low-latency.")
-                }
-
-                Label {
-                    width: parent.width
-                    id: vrrCushionTitle
-                    text: qsTr("VRR pacing buffer")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
-
-                AutoResizingComboBox {
-                    // ignore setting the index at first, and actually set it when the component is loaded
-                    Component.onCompleted: {
-                        var savedCushion = StreamingPreferences.vrrCushionUs
-                        currentIndex = 1
-                        for (var i = 0; i < vrrCushionListModel.count; i++) {
-                            var thisCushion = vrrCushionListModel.get(i).val;
-                            if (savedCushion === thisCushion) {
-                                currentIndex = i
-                                break
+                            CheckBox {
+                                id: framePacingCheck
+                                hoverEnabled: true
+                                text: qsTr("Frame pacing")
+                                font.pointSize:  12
+                                enabled: StreamingPreferences.enableVsync
+                                checked: StreamingPreferences.enableVsync && StreamingPreferences.framePacing
+                                onCheckedChanged: {
+                                    StreamingPreferences.framePacing = checked
+                                }
+                                ToolTip.delay: 1000
+                                ToolTip.timeout: 5000
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("Frame pacing reduces micro-stutter by delaying frames that come in too early")
                             }
                         }
-                        activated(currentIndex)
-                    }
 
-                    id: vrrCushionComboBox
-                    enabled: StreamingPreferences.enableVsync
-                    hoverEnabled: true
-                    textRole: "text"
-                    model: ListModel {
-                        id: vrrCushionListModel
-                        ListElement {
-                            text: qsTr("Lowest latency")
-                            val: 2500
+                        CheckBox {
+                            id: enableHdr
+                            width: parent.width
+                            text: qsTr("Enable HDR")
+                            font.pointSize: 12
+
+                            enabled: SystemProperties.supportsHdr
+                            checked: enabled && StreamingPreferences.enableHdr
+                            onCheckedChanged: {
+                                StreamingPreferences.enableHdr = checked
+                            }
+
+                            // Updating StreamingPreferences.videoCodecConfig is handled above
+
+                            ToolTip.delay: 1000
+                            ToolTip.timeout: 5000
+                            ToolTip.visible: hovered
+                            ToolTip.text: enabled ?
+                                              qsTr("The stream will be HDR-capable, but some games may require an HDR monitor on your host PC to enable HDR mode.")
+                                            :
+                                              qsTr("HDR streaming is not supported on this PC.")
                         }
-                        ListElement {
-                            text: qsTr("Balanced (Recommended)")
-                            val: 4500
+                    }
+
+                    GroupBox {
+                        id: vrrSettingsGroupBox
+                        width: (parent.width - parent.spacing) / 2
+                        padding: 12
+                        title: "<font color=\"skyblue\">" + qsTr("Variable Refresh Rate (VRR)") + "</font>"
+                        font.pointSize: 12
+
+                        Column {
+                            anchors.fill: parent
+                            spacing: 5
+
+                            CheckBox {
+                                id: enableVrrCheck
+                                width: parent.width
+                                hoverEnabled: true
+                                text: qsTr("Enable VRR")
+                                font.pointSize: 12
+                                enabled: StreamingPreferences.enableVsync
+                                checked: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                                onCheckedChanged: {
+                                    StreamingPreferences.enableVrr = checked
+                                }
+                                // ::onToggled only fires for user interaction, so the
+                                // saved FPS selection isn't overridden on settings load
+                                onToggled: {
+                                    if (checked) {
+                                        fpsComboBox.selectVrrFps()
+                                    }
+                                }
+                                ToolTip.delay: 1000
+                                ToolTip.timeout: 5000
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("Paces each frame to your display's variable refresh rate (G-Sync, FreeSync) for smooth, tear-free streaming at lower latency than fixed V-Sync.\nEnabling VRR selects the recommended VRR frame rate for your display and forces borderless windowed mode while streaming.")
+                            }
+
+                            CheckBox {
+                                id: vrrTearingCheck
+                                width: parent.width
+                                hoverEnabled: true
+                                text: qsTr("Low-latency VRR (allow tearing)")
+                                font.pointSize: 12
+                                enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                                checked: StreamingPreferences.vrrTearing
+                                onCheckedChanged: {
+                                    StreamingPreferences.vrrTearing = checked
+                                }
+                                ToolTip.delay: 1000
+                                ToolTip.timeout: 5000
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("When the stream FPS runs above your display's tear-free VRR range, present frames immediately for the lowest latency instead of latching them to vsync. May show visible tearing.\nHas no effect at FPS values within the VRR range, where VRR is always tear-free and low-latency.")
+                            }
+
+                            Label {
+                                width: parent.width
+                                id: vrrCushionTitle
+                                text: qsTr("VRR pacing buffer")
+                                font.pointSize: 12
+                                wrapMode: Text.Wrap
+                            }
+
+                            AutoResizingComboBox {
+                                // ignore setting the index at first, and actually set it when the component is loaded
+                                Component.onCompleted: {
+                                    var savedCushion = StreamingPreferences.vrrCushionUs
+                                    currentIndex = 1
+                                    for (var i = 0; i < vrrCushionListModel.count; i++) {
+                                        var thisCushion = vrrCushionListModel.get(i).val;
+                                        if (savedCushion === thisCushion) {
+                                            currentIndex = i
+                                            break
+                                        }
+                                    }
+                                    activated(currentIndex)
+                                }
+
+                                id: vrrCushionComboBox
+                                enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                                hoverEnabled: true
+                                textRole: "text"
+                                model: ListModel {
+                                    id: vrrCushionListModel
+                                    ListElement {
+                                        text: qsTr("Lowest latency")
+                                        val: 2500
+                                    }
+                                    ListElement {
+                                        text: qsTr("Balanced (Recommended)")
+                                        val: 4500
+                                    }
+                                    ListElement {
+                                        text: qsTr("Smoothest")
+                                        val: 6000
+                                    }
+                                }
+                                // ::onActivated must be used, as it only listens for when the index is changed by a human
+                                onActivated : {
+                                    StreamingPreferences.vrrCushionUs = model.get(currentIndex).val
+                                }
+
+                                ToolTip.delay: 1000
+                                ToolTip.timeout: 5000
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("How long frames may wait in a small buffer that absorbs network and game hiccups during VRR streaming. A larger buffer prevents tearing and stutter when the stream is unsteady; a smaller one shaves a few milliseconds of latency but tears more during hiccups.\nBecause a VRR display refreshes the moment each frame is presented, this buffer replaces the wait for the next fixed vsync tick - so total latency stays comparable to ordinary V-Sync even at the Smoothest setting.")
+                            }
+
+                            CheckBox {
+                                id: osScheduledVrrCheck
+                                width: parent.width
+                                hoverEnabled: true
+                                text: qsTr("Smoothest VRR (OS-scheduled presentation)")
+                                font.pointSize: 12
+                                visible: SystemProperties.supportsOsScheduledVrr
+                                enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                                checked: StreamingPreferences.osScheduledVrr
+                                onCheckedChanged: {
+                                    StreamingPreferences.osScheduledVrr = checked
+                                }
+                                ToolTip.delay: 1000
+                                ToolTip.timeout: 5000
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("Hands frame presentation to the Windows 11 display scheduler for the smoothest, completely tear-free VRR streaming at any frame rate.\nAdds about one frame of display latency that Moonlight's performance stats cannot measure.\nRequires Windows 11. If your system or GPU driver doesn't support it, Moonlight automatically falls back to standard VRR pacing.")
+                            }
                         }
-                        ListElement {
-                            text: qsTr("Smoothest")
-                            val: 6000
-                        }
                     }
-                    // ::onActivated must be used, as it only listens for when the index is changed by a human
-                    onActivated : {
-                        StreamingPreferences.vrrCushionUs = model.get(currentIndex).val
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("How long frames may wait in a small buffer that absorbs network and game hiccups during VRR streaming. A larger buffer prevents tearing and stutter when the stream is unsteady; a smaller one shaves a few milliseconds of latency but tears more during hiccups.\nBecause a VRR display refreshes the moment each frame is presented, this buffer replaces the wait for the next fixed vsync tick - so total latency stays comparable to ordinary V-Sync even at the Smoothest setting.")
-                }
-
-                CheckBox {
-                    id: osScheduledVrrCheck
-                    width: parent.width
-                    hoverEnabled: true
-                    text: qsTr("Smoothest VRR (OS-scheduled presentation)")
-                    font.pointSize: 12
-                    visible: SystemProperties.supportsOsScheduledVrr
-                    enabled: StreamingPreferences.enableVsync
-                    checked: StreamingPreferences.enableVsync && StreamingPreferences.osScheduledVrr
-                    onCheckedChanged: {
-                        StreamingPreferences.osScheduledVrr = checked
-                    }
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Hands frame presentation to the Windows 11 display scheduler for the smoothest, completely tear-free VRR streaming at any frame rate.\nAdds about one frame of display latency that Moonlight's performance stats cannot measure.\nRequires Windows 11. If your system or GPU driver doesn't support it, Moonlight automatically falls back to standard VRR pacing.")
-                }
-
-                CheckBox {
-                    id: enableHdr
-                    width: parent.width
-                    text: qsTr("Enable HDR")
-                    font.pointSize: 12
-
-                    enabled: SystemProperties.supportsHdr
-                    checked: enabled && StreamingPreferences.enableHdr
-                    onCheckedChanged: {
-                        StreamingPreferences.enableHdr = checked
-                    }
-
-                    // Updating StreamingPreferences.videoCodecConfig is handled above
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: enabled ?
-                                      qsTr("The stream will be HDR-capable, but some games may require an HDR monitor on your host PC to enable HDR mode.")
-                                    :
-                                      qsTr("HDR streaming is not supported on this PC.")
                 }
             }
         }
@@ -1250,39 +1273,39 @@ Flickable {
                             val: StreamingPreferences.LANG_EN
                         }
                         ListElement {
-                            text: "Français" // French
+                            text: "FranÃ§ais" // French
                             val: StreamingPreferences.LANG_FR
                         }
                         ListElement {
-                            text: "简体中文" // Simplified Chinese
+                            text: "ç®€ä½“ä¸­æ–‡" // Simplified Chinese
                             val: StreamingPreferences.LANG_ZH_CN
                         }
                         ListElement {
-                            text: "Norwegian Bokmål"
+                            text: "Norwegian BokmÃ¥l"
                             val: StreamingPreferences.LANG_NB_NO
                         }
                         ListElement {
-                            text: "русский" // Russian
+                            text: "Ñ€ÑƒÑÑÐºÐ¸Ð¹" // Russian
                             val: StreamingPreferences.LANG_RU
                         }
                         ListElement {
-                            text: "Español" // Spanish
+                            text: "EspaÃ±ol" // Spanish
                             val: StreamingPreferences.LANG_ES
                         }
                         ListElement {
-                            text: "日本語" // Japanese
+                            text: "æ—¥æœ¬èªž" // Japanese
                             val: StreamingPreferences.LANG_JA
                         }
                         ListElement {
-                            text: "Tiếng Việt" // Vietnamese
+                            text: "Tiáº¿ng Viá»‡t" // Vietnamese
                             val: StreamingPreferences.LANG_VI
                         }
                         ListElement {
-                            text: "ภาษาไทย" // Thai
+                            text: "à¸ à¸²à¸©à¸²à¹„à¸—à¸¢" // Thai
                             val: StreamingPreferences.LANG_TH
                         }
                         ListElement {
-                            text: "한국어" // Korean
+                            text: "í•œêµ­ì–´" // Korean
                             val: StreamingPreferences.LANG_KO
                         }
                         ListElement {
@@ -1298,27 +1321,27 @@ Flickable {
                             val: StreamingPreferences.LANG_SV
                         }
                         ListElement {
-                            text: "Türkçe" // Turkish
+                            text: "TÃ¼rkÃ§e" // Turkish
                             val: StreamingPreferences.LANG_TR
                         }
                         /* ListElement {
-                            text: "Українська" // Ukrainian
+                            text: "Ð£ÐºÑ€Ð°Ñ—Ð½ÑÑŒÐºÐ°" // Ukrainian
                             val: StreamingPreferences.LANG_UK
                         } */
                         ListElement {
-                            text: "繁體中文" // Traditional Chinese
+                            text: "ç¹é«”ä¸­æ–‡" // Traditional Chinese
                             val: StreamingPreferences.LANG_ZH_TW
                         }
                         ListElement {
-                            text: "Português" // Portuguese
+                            text: "PortuguÃªs" // Portuguese
                             val: StreamingPreferences.LANG_PT
                         }
                         ListElement {
-                            text: "Português do Brasil" // Brazilian Portuguese
+                            text: "PortuguÃªs do Brasil" // Brazilian Portuguese
                             val: StreamingPreferences.LANG_PT_BR
                         }
                         ListElement {
-                            text: "Ελληνικά" // Greek
+                            text: "Î•Î»Î»Î·Î½Î¹ÎºÎ¬" // Greek
                             val: StreamingPreferences.LANG_EL
                         }
                         ListElement {
@@ -1326,27 +1349,27 @@ Flickable {
                             val: StreamingPreferences.LANG_IT
                         }
                         /* ListElement {
-                            text: "हिन्दी, हिंदी" // Hindi
+                            text: "à¤¹à¤¿à¤¨à¥à¤¦à¥€, à¤¹à¤¿à¤‚à¤¦à¥€" // Hindi
                             val: StreamingPreferences.LANG_HI
                         } */
                         ListElement {
-                            text: "Język polski" // Polish
+                            text: "JÄ™zyk polski" // Polish
                             val: StreamingPreferences.LANG_PL
                         }
                         ListElement {
-                            text: "Čeština" // Czech
+                            text: "ÄŒeÅ¡tina" // Czech
                             val: StreamingPreferences.LANG_CS
                         }
                         /* ListElement {
-                            text: "עִבְרִית" // Hebrew
+                            text: "×¢Ö´×‘Ö°×¨Ö´×™×ª" // Hebrew
                             val: StreamingPreferences.LANG_HE
                         } */
                         /* ListElement {
-                            text: "کرمانجیی خواروو" // Central Kurdish
+                            text: "Ú©Ø±Ù…Ø§Ù†Ø¬ÛŒÛŒ Ø®ÙˆØ§Ø±ÙˆÙˆ" // Central Kurdish
                             val: StreamingPreferences.LANG_CKB
                         } */
                         /* ListElement {
-                            text: "Lietuvių kalba" // Lithuanian
+                            text: "LietuviÅ³ kalba" // Lithuanian
                             val: StreamingPreferences.LANG_LT
                         } */
                         /* ListElement {
@@ -1354,7 +1377,7 @@ Flickable {
                             val: StreamingPreferences.LANG_ET
                         } */
                         ListElement {
-                            text: "Български" // Bulgarian
+                            text: "Ð‘ÑŠÐ»Ð³Ð°Ñ€ÑÐºÐ¸" // Bulgarian
                             val: StreamingPreferences.LANG_BG
                         }
                         /* ListElement {
@@ -1362,7 +1385,7 @@ Flickable {
                             val: StreamingPreferences.LANG_EO
                         } */
                         ListElement {
-                            text: "தமிழ்" // Tamil
+                            text: "à®¤à®®à®¿à®´à¯" // Tamil
                             val: StreamingPreferences.LANG_TA
                         }
                     }

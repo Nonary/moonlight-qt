@@ -1,42 +1,13 @@
 #include "vrrpresenter.h"
+#include "highressleep.h"
 
 #include <SDL.h>
 #include <Limelight.h>
-
-#ifndef Q_OS_WIN32
-#include <time.h>
-#endif
 
 // Lock re-entry demands a sustained streak of instant blank hits: a single
 // hit is not proof (a free-running raster's own trailing blank catches a
 // present or chase by luck); see isRasterLockUncertain().
 #define ALIGN_LOCK_STREAK 4
-
-static void highResolutionSleepUs(uint64_t sleepUs)
-{
-#ifdef Q_OS_WIN32
-    static thread_local HANDLE waitableTimer =
-        CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (waitableTimer == nullptr) {
-        return;
-    }
-
-    LARGE_INTEGER dueTime;
-    dueTime.QuadPart = -((LONGLONG)sleepUs * 10);
-    if (SetWaitableTimer(waitableTimer, &dueTime, 0, nullptr, nullptr, FALSE)) {
-        WaitForSingleObject(waitableTimer, INFINITE);
-    }
-#else
-    // POSIX high-resolution sleep so a Vulkan/Wayland adopter of this class
-    // gets the same sub-millisecond hold precision the Windows path has -
-    // SDL_Delay's ~1ms-plus granularity would scatter present phase by more
-    // than the zones being paced.
-    struct timespec ts;
-    ts.tv_sec = (time_t)(sleepUs / 1000000);
-    ts.tv_nsec = (long)((sleepUs % 1000000) * 1000);
-    nanosleep(&ts, nullptr);
-#endif
-}
 
 VrrPresenter::VrrPresenter() :
 #ifdef Q_OS_WIN32
@@ -182,7 +153,17 @@ uint32_t VrrPresenter::popMidScanTearCount()
 
 bool VrrPresenter::isRasterLockUncertain() const
 {
-    return m_AlignInstantStreak < ALIGN_LOCK_STREAK;
+#ifdef Q_OS_WIN32
+    if (m_KmtAdapterValid) {
+        return m_AlignInstantStreak < ALIGN_LOCK_STREAK;
+    }
+#endif
+
+    // Without a scan-position source there is nothing to measure and no
+    // alignment wait to spend - presents latch tear-free at the platform's
+    // discretion instead - so never report the uncertainty that makes the
+    // pacer pay for re-lock rituals.
+    return false;
 }
 
 bool VrrPresenter::prepareToPresent()
@@ -265,7 +246,7 @@ uint64_t VrrPresenter::holdUntilPresentTarget()
     uint64_t nowUs = startUs;
     while (nowUs < targetUs) {
         if (targetUs - nowUs > 1500) {
-            highResolutionSleepUs(targetUs - nowUs - 1000);
+            HighResSleep::sleepUntilUs(targetUs - 1000);
         }
         nowUs = LiGetMicroseconds();
     }
@@ -383,7 +364,7 @@ void VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uin
             // the beam estimate can't carry the wait past a tighter bound.
             remainingUs = qMin(remainingUs, maxWaitUs - elapsedUs);
             if (remainingUs > 1500) {
-                highResolutionSleepUs(remainingUs - 1000);
+                HighResSleep::sleepUs(remainingUs - 1000);
             }
         }
     }

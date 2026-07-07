@@ -200,6 +200,20 @@ public:
         // Don't wait by default
     }
 
+    // Called by the pacer in VrrCadence mode the moment a frame is committed
+    // to presentation - potentially a full render lead before renderFrame().
+    // Renderers whose rendering has significant GPU-side cost may submit that
+    // work here so the hardware renders during the pacer's sleep to render
+    // start; waitToRender()/renderFrame() for the same frame must then skip
+    // the already-done work and pay only the residual completion wait and the
+    // present itself. The frame pointer stays valid through the matching
+    // renderFrame() call. A serialized submit-fence-present chain that fits
+    // in the render lead doesn't need this (see d3d11va); a chain that
+    // exceeds the content's frame interval can't keep cadence without it.
+    virtual void prepareFrameForPresent(AVFrame*) {
+        // No early preparation by default - renderFrame() does all the work
+    }
+
     // Called on the same thread as renderFrame() during destruction of the renderer
     virtual void cleanupRenderContext() {
         // Nothing
@@ -317,6 +331,20 @@ public:
         // against this rather than renderFrame()'s return time, which runs
         // later by the alignment wait and Present overhead.
         return 0;
+    }
+
+    virtual bool arePresentsVsyncLatched() {
+        // True when every present latches at a display vblank regardless of
+        // the pacer's tearing preference (e.g. a FIFO swapchain with no
+        // tearing-capable present path in use). Two pacer policies hinge on
+        // this: the tearing preference is meaningless (honoring it would
+        // strip the latch fallback and flip-spacing slack for zero latency
+        // benefit), and under VRR flip-following the display does NOT
+        // enforce spacing on latched presents - the "vblank" happens the
+        // moment the present arrives - so floor-spaced catch-up bursts scan
+        // out at the panel's max refresh and read as the refresh readout
+        // spiking far above the content rate.
+        return false;
     }
 
     static const char* getPresentationModeName(PresentationMode mode) {

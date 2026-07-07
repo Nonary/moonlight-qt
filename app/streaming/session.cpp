@@ -293,9 +293,10 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.window = window;
     params.enableVsync = enableVsync;
     params.enableFramePacing = enableFramePacing;
-    params.enableVrrTearing = StreamingPreferences::get()->vrrTearing;
+    params.enableVrr = StreamingPreferences::get()->enableVrr;
+    params.enableVrrTearing = StreamingPreferences::get()->vrrTearing && params.enableVrr;
     params.vrrCushionUs = StreamingPreferences::get()->vrrCushionUs;
-    params.enableOsScheduledVrr = StreamingPreferences::get()->osScheduledVrr;
+    params.enableOsScheduledVrr = StreamingPreferences::get()->osScheduledVrr && params.enableVrr;
     params.testOnly = testOnly;
     params.vds = vds;
 
@@ -552,7 +553,7 @@ bool Session::populateDecoderProperties(SDL_Window* window)
 
 Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *preferences)
     : m_Preferences(preferences ? preferences : StreamingPreferences::get()),
-      m_IsFullScreen(m_Preferences->windowMode != StreamingPreferences::WM_WINDOWED || !WMUtils::isRunningDesktopEnvironment()),
+      m_IsFullScreen(m_Preferences->windowMode != StreamingPreferences::WM_WINDOWED || m_Preferences->enableVrr || !WMUtils::isRunningDesktopEnvironment()),
       m_Computer(computer),
       m_App(app),
       m_Window(nullptr),
@@ -592,7 +593,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
         // (notched or notchless), override the fullscreen mode to ensure it works as expected.
         // - SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES=0 will place the video underneath the notch
         // - SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES=1 will place the video below the notch
-        bool shouldUseFullScreenSpaces = m_Preferences->windowMode != StreamingPreferences::WM_FULLSCREEN;
+        bool shouldUseFullScreenSpaces = m_Preferences->windowMode != StreamingPreferences::WM_FULLSCREEN || m_Preferences->enableVrr;
         SDL_DisplayMode desktopMode;
         SDL_Rect safeArea;
         for (int displayIndex = 0; StreamUtils::getNativeDesktopMode(displayIndex, &desktopMode, &safeArea); displayIndex++) {
@@ -879,10 +880,14 @@ bool Session::initialize(QQuickWindow* qtWindow)
         m_SupportedVideoFormats.deprioritizeByMask(~VIDEO_FORMAT_MASK_10BIT);
     }
 
-    // VRR streaming requires the composed presentation path, so exclusive
-    // fullscreen is coerced to borderless windowed when VRR is enabled.
     StreamingPreferences::WindowMode windowMode = m_Preferences->windowMode;
-    if (m_Preferences->enableVrr && windowMode == StreamingPreferences::WM_FULLSCREEN) {
+    if (m_Preferences->enableVrr && windowMode != StreamingPreferences::WM_FULLSCREEN_DESKTOP) {
+        // VRR pacing needs flip presentation on the desktop compositor's
+        // native mode; exclusive fullscreen can trigger a modeset and
+        // windowed mode can't get direct scanout, so both break adaptive
+        // sync on some platforms.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Forcing borderless windowed mode because VRR is enabled");
         windowMode = StreamingPreferences::WM_FULLSCREEN_DESKTOP;
     }
 
