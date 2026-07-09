@@ -419,9 +419,11 @@ int Pacer::cadenceThread(void* context)
     // Closed-loop queue-age control. The UI selects how much measured timing
     // variation the policy may insure (2.5/4.5/6ms); it is not a fixed wait.
     // Near the refresh ceiling the controller also owns a bounded phase and
-    // acquisition reserve. It attacks on measured starvation, releases only
-    // after clean evidence, and never learns stalls or recovery motion as
-    // normal. MOONLIGHT_VRR_NO_TRIM=1 disables all queue-age feedback for A/B.
+    // acquisition reserve. Initial acquisition is driven by actual age;
+    // steady-state changes require window-level evidence so isolated source
+    // gaps cannot trigger a rebuffer cycle. The controller never learns stalls
+    // or recovery motion as normal. MOONLIGHT_VRR_NO_TRIM=1 disables all
+    // queue-age feedback for A/B.
     const bool queueAgeServoEnabled =
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_TRIM") == 0;
     const int queueAgeEnv =
@@ -566,6 +568,7 @@ int Pacer::cadenceThread(void* context)
     const uint64_t ritualMinSlackUs = ritualSlackEnv > 0 ?
         (uint64_t)ritualSlackEnv : ritualSlackDefaultUs;
     int relockBurstRemaining = 0;
+    int relockFailureCount = 0;
     uint64_t lastRelockBurstUs = 0;
     uint64_t lastRelockLogUs = 0;
     bool overfillDropPending = false;
@@ -587,8 +590,9 @@ int Pacer::cadenceThread(void* context)
     // content to the vsync latch for a while. Expiry re-probes, so a
     // regime change (different content rate, driver re-engaging) is found
     // within one probe window (at most 64 frames, about 0.5-0.7s here).
-    // Only meaningful when the latch exists to fall back to;
-    // tearing-preferred users chose cadence-over-tears explicitly.
+    // Only meaningful when the renderer has a non-tearing present path.
+    // Standard policy uses the calibration ladder; low-latency tearing uses
+    // a short fallback only after the probe measures a sustained storm.
     // The per-rate ladder (latch period doubling per repeat offense) lives
     // for this stream, so content-rate wobble cannot reset every returning
     // rate to a fresh 60s fallback as the old single-slot version did.
@@ -722,6 +726,8 @@ int Pacer::cadenceThread(void* context)
                 if (prevBand != 0 && qAbs(band - prevBand) >= 20) {
                     resetQueueAgeWindow();
                     queueAgeController.resetLearning();
+                    relockFailureCount = 0;
+                    lastRelockBurstUs = 0;
                     if (nearBuffered) {
                         queueAgeController.enterNearCeiling(
                             measuredSourceIntervalUs);
@@ -781,8 +787,10 @@ int Pacer::cadenceThread(void* context)
             alignFullDwell--;
         }
 
-        bool latchAvailable = !me->m_VrrTearingPreferred &&
+        bool latchSupported =
             qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_LATCH") == 0;
+        bool preferenceLatchAvailable = !me->m_VrrTearingPreferred &&
+            latchSupported;
 
         // Cadence-cold grace: the clock's sample window restarts on any real
         // stall (stream bring-up, loading screens, entering a game - all the
@@ -795,7 +803,7 @@ int Pacer::cadenceThread(void* context)
         // content is chaotic at those moments anyway, so the vsync
         // quantization is preferable to an unstable tear burst and the cost
         // lasts under a second per stall.
-        bool cadenceColdLatch = latchAvailable && !classicRecovery &&
+        bool cadenceColdLatch = preferenceLatchAvailable && !classicRecovery &&
             !cadenceClock.warmedUp();
 
         // Band membership for near-ceiling buffered VRR, with hysteresis on
@@ -811,7 +819,7 @@ int Pacer::cadenceThread(void* context)
         // the max refresh backlogs by physics, and the fallback (latch, or
         // taper free-run for tearing-preferred users) is always safer than
         // pretending to pace it.
-        // Deliberately NOT gated on latchAvailable: tearing-preferred /
+        // Deliberately NOT gated on the user's latch preference: tearing-preferred /
         // NO_LATCH users have no latch to fall back to, so without the band
         // their near-ceiling content runs the raw unbuffered free-run that
         // collapses here (measured 2026-07-04: 108fps content, 0 latched,
@@ -847,11 +855,11 @@ int Pacer::cadenceThread(void* context)
         // instantly once content is clearly slower than ~92fps, where full
         // free-run has abundant slack and needs no buffer.
         uint64_t bufferFloorIntervalUs = minFrameIntervalUs + bufferGuardUs;
-        bool pastFastEdge = latchAvailable &&
+        bool pastFastEdge = preferenceLatchAvailable &&
             measuredSourceIntervalUs < bufferFloorIntervalUs;
         bool clearlySlowerThanBand =
             measuredSourceIntervalUs >= minFrameIntervalUs + bandSlowReleaseZoneUs;
-        bool tearRateFallback = latchAvailable &&
+        bool tearRateFallback = latchSupported &&
             nowUs < bandTearFallbackUntilUs;
         if (!nearBufferEnabled || pastFastEdge ||
                 clearlySlowerThanBand || tearRateFallback) {
@@ -889,7 +897,7 @@ int Pacer::cadenceThread(void* context)
             bandRearmDwell = 0;
             if (cadenceClock.warmedUp() &&
                     measuredSourceIntervalUs < minFrameIntervalUs + taperEntryZoneUs &&
-                    (!latchAvailable ||
+                    (!preferenceLatchAvailable ||
                      measuredSourceIntervalUs >= bufferFloorIntervalUs + bandEntryStepUs)) {
                 if (nearBufferDwell < 12) {
                     nearBufferDwell++;
@@ -906,15 +914,14 @@ int Pacer::cadenceThread(void* context)
             bandRearmDwell--;
         }
 
-        // The clock snapping onto "now" after a stall wipes the standing
-        // phase offset. Mark the first usable post-render age as acquisition
-        // evidence so recovery is based on observed readiness, not a planned
-        // render-start estimate that may already be behind the renderer.
+        // A source/render stall invalidates the current statistics and phase
+        // correction. Do not reacquire a standing reserve here: a gap longer
+        // than the reserve cannot be hidden, and rebuilding after every gap
+        // creates a drop/rebuffer cycle on genuinely variable content.
         if (clockPhaseReset) {
             resetQueueAgeWindow();
             if (nearBuffered) {
-                queueAgeController.restoreSafety(measuredSourceIntervalUs);
-                queueAcquisitionPending = true;
+                queueAcquisitionPending = false;
             }
             else {
                 queueAgeController.leaveNearCeiling();
@@ -926,14 +933,13 @@ int Pacer::cadenceThread(void* context)
         if (nearBuffered != prevNearBuffered) {
             resetQueueAgeWindow();
             if (nearBuffered) {
-                // Fresh from a latch spell or free-run chaos the panel is
-                // certainly on a fixed raster; allow the re-lock ritual to
-                // arm immediately, regardless of when the last one ran. The
-                // first usable actual-age sample below drives acquisition.
-                lastRelockBurstUs = 0;
                 bool resumeRecentState = lastNearBufferReleaseUs != 0 &&
                     nowUs - lastNearBufferReleaseUs <= 5000000ULL;
                 if (!resumeRecentState) {
+                    // A genuinely fresh regime gets an immediate lock attempt.
+                    // Brief band-edge wobble retains failed-attempt backoff.
+                    relockFailureCount = 0;
+                    lastRelockBurstUs = 0;
                     queueAgeController.enterNearCeiling(
                         measuredSourceIntervalUs);
                 }
@@ -971,7 +977,8 @@ int Pacer::cadenceThread(void* context)
         // so an improved regime (driver update, different stack behavior) is
         // found within one latch period and the pass decay unwinds the
         // verdict from there.
-        if (nearBuffered && latchAvailable && nowUs >= bandTearFallbackUntilUs) {
+        if (nearBuffered && preferenceLatchAvailable &&
+                nowUs >= bandTearFallbackUntilUs) {
             VrrTearVerdict* verdict =
                 calibration.findVerdict(measuredSourceIntervalUs);
             if (verdict != nullptr && !verdict->latchedThisSession &&
@@ -1017,7 +1024,7 @@ int Pacer::cadenceThread(void* context)
 
         bool vsyncLatchPresent = ((alignTapered && !nearBuffered) ||
                                   cadenceColdLatch) &&
-            latchAvailable;
+            (preferenceLatchAvailable || tearRateFallback);
 
         // Every free-run spacing floor below adds a small guard over the
         // nominal max-refresh spacing so no flip is asked to go out tighter
@@ -1308,12 +1315,10 @@ int Pacer::cadenceThread(void* context)
         // alternation (one flip caught by chase, the next floor-budget flip
         // tears again, streak never forms). So while the renderer cannot
         // prove lock, pay for a short burst of consecutive
-        // full-scanout-budget presents; the standing buffer and the raised
-        // in-band stale threshold absorb the cost (~4ms average wait per
-        // present, bounded at 8 presents per 2s = <2% of wall time) as
-        // temporary queue instead of drops. The burst ends early the moment
-        // lock is demonstrated, and the whole mechanism only runs in-band -
-        // out-of-band content has the cadence slack to re-anchor organically.
+        // full-scanout-budget presents. Failed bursts back off from 2s to 4s
+        // and then 8s; repeating a known-failing wide wait every 2s consumed
+        // render headroom without improving the measured tear rate. The burst
+        // ends early and resets backoff the moment lock is demonstrated.
         //
         // Gated on real cadence slack (default >=800us, content up to
         // ~107fps): above that the pipeline was saturated - every present
@@ -1329,11 +1334,13 @@ int Pacer::cadenceThread(void* context)
             if (relockBurstRemaining > 0 &&
                     !me->m_VsyncRenderer->isVrrRasterLockUncertain()) {
                 relockBurstRemaining = 0;
+                relockFailureCount = 0;
             }
             else if (relockBurstRemaining == 0 &&
                      cadenceSlackUs >= ritualMinSlackUs &&
                      me->m_VsyncRenderer->isVrrRasterLockUncertain() &&
-                     nowUs - lastRelockBurstUs > 2000000ULL) {
+                     nowUs - lastRelockBurstUs >
+                         (2000000ULL << qMin(relockFailureCount, 2))) {
                 relockBurstRemaining = 8;
                 lastRelockBurstUs = nowUs;
                 if (nowUs - lastRelockLogUs > 10000000ULL) {
@@ -1366,10 +1373,10 @@ int Pacer::cadenceThread(void* context)
             // the fixed-vsync feel the user validated as clearly smoother at
             // 116-on-120; the moment measured content falls back below the
             // ceiling (hysteresis above), tearing presents and true VRR
-            // pacing resume. The low-latency VRR settings checkbox (and
-            // MOONLIGHT_VRR_NO_LATCH=1 for A/B) opts into tear-and-snap
-            // instead: immediate flips shave a few ms of display latency at
-            // the cost of visible tearing.
+            // pacing resume. The low-latency VRR setting keeps immediate
+            // recovery here, but its measured tear probe can still latch
+            // briefly if this becomes a sustained storm.
+            // MOONLIGHT_VRR_NO_LATCH=1 is the strict tear-and-snap A/B path.
             alignBudgetUs = vsyncLatchPresent ? 0 : alignSpinFloorUs;
         }
         else if (relockBurstRemaining > 0) {
@@ -1380,6 +1387,10 @@ int Pacer::cadenceThread(void* context)
             // (floor-spaced catch-up rebase) still applies - only the
             // wait-for-blank budget is protected here.
             relockBurstRemaining--;
+            if (relockBurstRemaining == 0 &&
+                    me->m_VsyncRenderer->isVrrRasterLockUncertain()) {
+                relockFailureCount = qMin(relockFailureCount + 1, 2);
+            }
             recoveryAlignmentPresent = true;
             alignBudgetUs = minFrameIntervalUs + alignWideExtraUs;
         }
@@ -1556,11 +1567,10 @@ int Pacer::cadenceThread(void* context)
                 queueAgeWindowTainted = true;
             }
 
-            // Only a genuinely near-empty queue is a steady-state readiness
-            // miss. A normal 3-7ms age below a safety-inclusive target is not
-            // starvation and must not keep restoring protection forever.
-            // Entry/reset acquisition is separate: its first usable sample
-            // may request bounded recovery, but only from the measured age.
+            // Only a fresh band/rate acquisition may request fast bounded
+            // recovery. A single near-empty steady-state sample commonly
+            // follows a source gap or long render; padding after the fact
+            // cannot hide that gap and instead starts a rebuffer cycle.
             bool acquisitionSample = queueAcquisitionPending && nearBuffered &&
                 !staleSchedule && !servoVeto &&
                 !postDropRecoverySuppressed;
@@ -1569,13 +1579,8 @@ int Pacer::cadenceThread(void* context)
             if (acquisitionSample) {
                 queueAcquisitionPending = false;
             }
-            bool readinessNearMiss =
-                VrrQueueAgeController::isReadinessNearMiss(
-                    frameQueueAgeUs, postDropRecoverySuppressed);
             if (nearBuffered && !staleSchedule && !servoVeto &&
-                    (readinessNearMiss || acquisitionShortfall)) {
-                bool protectionChanged = readinessNearMiss &&
-                    queueAgeController.restoreSafety(measuredSourceIntervalUs);
+                    acquisitionShortfall) {
                 phaseAdvanceUs = 0;
                 VrrQueueAgeController::Target recoveryTarget =
                     queueAgeController.target(
@@ -1588,11 +1593,6 @@ int Pacer::cadenceThread(void* context)
                 phaseDelayUs = 0;
                 fastRecoveryRemainingUs = recoveryDeficitUs;
                 queueAgeWindowTainted = true;
-                if (protectionChanged) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "VRR queue protection restored after %.2f ms readiness near miss",
-                                frameQueueAgeUs / 1000.0);
-                }
                 uint64_t queueFeedbackNowUs = LiGetMicroseconds();
                 if (acquisitionShortfall && recoveryDeficitUs != 0 &&
                         queueFeedbackNowUs - lastQueueAcquisitionLogUs >
@@ -1718,11 +1718,12 @@ int Pacer::cadenceThread(void* context)
         // raster lock exits after a short burst without eventually treating
         // isolated healthy tears as a cumulative failure. The final 64-frame
         // verdict catches less extreme failures in about half a second.
-        //  - Exponential backoff: consecutive failures at the same cadence
-        //    double the latch period (60s up to 8min), so steady-state
-        //    probe cost falls to ~0.1% of wall time. A passing probe or a
-        //    genuine content-rate change (>600us from the failing
-        //    interval) resets the period.
+        //  - Standard policy: consecutive failures at the same cadence
+        //    double the latch period (60s up to 8min), so steady-state probe
+        //    cost falls to ~0.1% of wall time. A passing probe or a genuine
+        //    rate change resets the period.
+        //  - Low-latency policy: latch for eight seconds, then retry. This
+        //    bounds added latency while preventing a storm from persisting.
         if (nearBuffered && !vsyncLatchPresent) {
             bandTearWindowPresents++;
             bandTearWindowTears += midScanTears;
@@ -1753,7 +1754,7 @@ int Pacer::cadenceThread(void* context)
             }
 
             if (probeFailed) {
-                if (latchAvailable) {
+                if (preferenceLatchAvailable) {
                     // Each content rate climbs its own per-stream ladder,
                     // resuming after temporary content-rate changes.
                     uint32_t fallbackSecs = calibration.recordTearFail(
@@ -1763,6 +1764,24 @@ int Pacer::cadenceThread(void* context)
                         (uint64_t)fallbackSecs * 1000000ULL;
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                                 "VRR tear-rate fallback: %u of %u in-band presents tore mid-scan at %.1f fps measured; vsync-latching this content for %us",
+                                bandTearWindowTears,
+                                bandTearWindowPresents,
+                                measuredSourceIntervalUs > 0 ?
+                                    1000000.0 / measuredSourceIntervalUs : 0.0,
+                                fallbackSecs);
+                }
+                else if (latchSupported && me->m_VrrTearingPreferred) {
+                    // "Allow tearing" remains immediate in healthy true VRR,
+                    // but it must not permit a measured tear storm to persist.
+                    // Eight seconds is long enough to make the bad interval
+                    // visually quiet without turning this preference into a
+                    // permanent fixed-vsync mode; expiry automatically probes
+                    // true VRR again. No queue reserve is added.
+                    const uint32_t fallbackSecs = 8;
+                    bandTearFallbackUntilUs = nowUs +
+                        (uint64_t)fallbackSecs * 1000000ULL;
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR low-latency tear rescue: %u of %u in-band presents tore visibly at %.1f fps measured; temporarily vsync-latching for %us",
                                 bandTearWindowTears,
                                 bandTearWindowPresents,
                                 measuredSourceIntervalUs > 0 ?

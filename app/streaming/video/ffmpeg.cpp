@@ -1019,7 +1019,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         ret = snprintf(&output[offset],
                        length - offset,
                        "Frames dropped by your network connection: %.2f%%\n"
-                       "Frames dropped due to network jitter: %.2f%%\n"
+                       "Frames dropped by client rendering/pacing: %.2f%%\n"
                        "Average network latency: %s\n"
                        "Average decoding time: %.2f ms\n"
                        "Average frame queue delay: %.2f ms\n"
@@ -1116,8 +1116,8 @@ void FFmpegVideoDecoder::logFrameCadenceDiagnostics(VIDEO_STATS& stats)
     }
 
     // Drop attribution (2026-07-08 multi-stream diagnostic): the two drop
-    // counters distinguish the two client-side failure modes, both of which
-    // the overlay blames on the network. PACER drops (pacerDroppedFrames) =
+    // counters distinguish the two client-side failure modes. PACER drops
+    // (pacerDroppedFrames) =
     // present/render backpressure: the pacer sheds decoded frames it can't
     // present in time. NETWORK drops (networkDroppedFrames) = gaps in the
     // HOST frame numbers reaching submitDecodeUnit, which the CLIENT

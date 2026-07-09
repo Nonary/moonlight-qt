@@ -135,12 +135,6 @@ public:
         return staleSchedule || scheduleRecoveryRebased;
     }
 
-    static bool isReadinessNearMiss(uint64_t queueAgeUs,
-                                    bool recoverySuppressed)
-    {
-        return !recoverySuppressed && queueAgeUs < 1000;
-    }
-
     void resetLearning()
     {
         m_SpreadHead = 0;
@@ -162,19 +156,6 @@ public:
         m_RecoveryCleanWindows = 0;
         m_CleanSafetyWindows = 0;
         m_SafetyReserveUs = 0;
-    }
-
-    bool restoreSafety(uint64_t sourceIntervalUs)
-    {
-        bool recoveryWasActive = m_RecoveryCleanWindows != 0;
-        m_RecoveryCleanWindows = kRecoveryHoldWindows;
-        m_CleanSafetyWindows = 0;
-        uint64_t restoredUs = safetyReserveLimitUs(sourceIntervalUs);
-        if (restoredUs <= m_SafetyReserveUs) {
-            return !recoveryWasActive;
-        }
-        m_SafetyReserveUs = restoredUs;
-        return true;
     }
 
     // lowAgeUs/highAgeUs are robust distribution bounds (currently p10/p90),

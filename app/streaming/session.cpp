@@ -16,6 +16,9 @@
 #endif
 
 #ifdef Q_OS_WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
 // Scaling the icon down on Win32 looks dreadful, so render at lower res
 #define ICON_SIZE 32
 #else
@@ -667,6 +670,31 @@ bool Session::initialize(QQuickWindow* qtWindow)
 
     m_StreamConfig.fps = m_Preferences->fps;
     m_StreamConfig.bitrate = m_Preferences->bitrateKbps;
+
+#ifdef Q_OS_WIN32
+    // High-rate VRR can become presentation-bound under a laptop's battery
+    // power limit even after opting out of Windows execution throttling. Use
+    // the existing low-latency VRR rate for battery-started sessions; this
+    // leaves enough render headroom to avoid irregular client-side drops and
+    // does not mutate the saved AC-powered preference.
+    if (m_Preferences->enableVrr &&
+            qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_BATTERY_FPS_CAP") == 0) {
+        SYSTEM_POWER_STATUS powerStatus = {};
+        int displayHz = StreamUtils::getDisplayRefreshRate(testWindow);
+        int batteryVrrFps = displayHz >= 60 ?
+            qMax(30, (displayHz * 5 / 6 / 5) * 5) : 0;
+        if (GetSystemPowerStatus(&powerStatus) &&
+                powerStatus.ACLineStatus == 0 && batteryVrrFps != 0 &&
+                m_StreamConfig.fps > batteryVrrFps &&
+                m_StreamConfig.fps <= displayHz) {
+            int requestedFps = m_StreamConfig.fps;
+            m_StreamConfig.fps = batteryVrrFps;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Battery-powered VRR: capped stream from %d to %d FPS for %d Hz display headroom",
+                        requestedFps, m_StreamConfig.fps, displayHz);
+        }
+    }
+#endif
 
 #ifndef STEAM_LINK
     // Opt-in to all encryption features if we detect that the platform

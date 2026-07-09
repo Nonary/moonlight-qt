@@ -96,8 +96,15 @@ static void acquireVrrPowerState()
 
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
 
+    SYSTEM_POWER_STATUS powerStatus = {};
+    const char* powerSource = "unknown power";
+    if (GetSystemPowerStatus(&powerStatus)) {
+        powerSource = powerStatus.ACLineStatus == 0 ? "battery" :
+            (powerStatus.ACLineStatus == 1 ? "AC" : "unknown power");
+    }
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "VRR cadence pacing: requested full-performance power state and disabled system/display sleep");
+                "VRR cadence pacing: requested full-performance power state and disabled system/display sleep (%s)",
+                powerSource);
 }
 
 static void releaseVrrPowerState()

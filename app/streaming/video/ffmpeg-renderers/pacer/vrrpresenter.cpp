@@ -30,6 +30,7 @@ VrrPresenter::VrrPresenter() :
     m_AlignGiveUps(0),
     m_AlignSkips(0),
     m_AlignVsyncLatches(0),
+    m_AlignRescueLatches(0),
     m_AlignWaitTotalUs(0),
     m_AlignBudgetTotalUs(0),
     m_AlignStatsStartUs(0),
@@ -183,8 +184,9 @@ bool VrrPresenter::prepareToPresent()
     m_PresentAlignBudgetUs = 0;
     bool vsyncLatch = m_PresentVsyncLatch;
     m_PresentVsyncLatch = false;
+    bool nearBuffered = m_PresentNearBuffered;
     m_LastPresentLatched = vsyncLatch;
-    m_LastPresentBuffered = m_PresentNearBuffered && !vsyncLatch;
+    m_LastPresentBuffered = nearBuffered && !vsyncLatch;
     m_PresentNearBuffered = false;
     bool catchUpPresent = m_PresentCatchUp;
     m_PresentCatchUp = false;
@@ -199,8 +201,22 @@ bool VrrPresenter::prepareToPresent()
         logAlignStatsIfDue(LiGetMicroseconds());
     }
     else {
-        waitForVBlankBeforeTearingPresent(alignBudgetUs, latePastTargetUs,
-                                          catchUpPresent);
+        // When true VRR has real headroom, an isolated on-time blank miss is
+        // cheaper to latch once than to emit a visible tear and lose raster
+        // lock. Do not rescue late/catch-up or near-ceiling presents: latching
+        // those would turn overload into repeated fixed-vsync judder. The
+        // pacer's tear-rate fallback handles a chronic near-ceiling failure.
+        uint64_t rescueLateLimitUs = m_ScanoutPeriodUs != 0 ?
+            m_ScanoutPeriodUs * 30 / 1000 : 250;
+        bool rescueOnMiss = !nearBuffered && !catchUpPresent &&
+            latePastTargetUs <= rescueLateLimitUs;
+        bool aligned = waitForVBlankBeforeTearingPresent(
+            alignBudgetUs, latePastTargetUs, catchUpPresent, rescueOnMiss);
+        if (!aligned && rescueOnMiss) {
+            vsyncLatch = true;
+            m_LastPresentLatched = true;
+            m_LastPresentBuffered = false;
+        }
     }
 
     return vsyncLatch;
@@ -255,7 +271,10 @@ uint64_t VrrPresenter::holdUntilPresentTarget()
     return 0;
 }
 
-void VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uint64_t latePastTargetUs, bool catchUpPresent)
+bool VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs,
+                                                     uint64_t latePastTargetUs,
+                                                     bool catchUpPresent,
+                                                     bool rescueOnMiss)
 {
 #ifdef Q_OS_WIN32
     // VRR only changes how long the panel is willing to extend its blanking
@@ -276,7 +295,7 @@ void VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uin
     // unlike WaitForVBlank, it's a plain non-blocking query, so we can poll it
     // in a tightly bounded loop instead of risking an open-ended block.
     if (!m_KmtAdapterValid || qEnvironmentVariableIntValue("MOONLIGHT_DISABLE_SCANLINE_ALIGN")) {
-        return;
+        return true;
     }
 
     // The wait bound is the pacer's per-present budget, sized from the
@@ -400,6 +419,11 @@ void VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uin
     if (reachedBlank) {
         m_AlignHits++;
     }
+    else if (rescueOnMiss) {
+        // This present will go out without ALLOW_TEARING and latch at the
+        // next vblank. It is a measured avoided tear, not a tear sample.
+        m_AlignRescueLatches++;
+    }
     else {
         // Tear-position-aware count for the pacer's tear-rate probe: a
         // tear landing within a few percent of the frame's top or bottom
@@ -446,10 +470,13 @@ void VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uin
     m_AlignBudgetTotalUs += maxWaitUs;
 
     logAlignStatsIfDue(startUs + waitedUs);
+    return reachedBlank;
 #else
     Q_UNUSED(alignBudgetUs);
     Q_UNUSED(latePastTargetUs);
     Q_UNUSED(catchUpPresent);
+    Q_UNUSED(rescueOnMiss);
+    return true;
 #endif
 }
 
@@ -459,13 +486,15 @@ void VrrPresenter::logAlignStatsIfDue(uint64_t nowUs)
         m_AlignStatsStartUs = nowUs;
     }
     else if (nowUs - m_AlignStatsStartUs >= 10000000) {
-        uint32_t attempted = m_AlignHits + m_AlignGiveUps;
+        uint32_t attempted = m_AlignHits + m_AlignGiveUps +
+            m_AlignRescueLatches;
         uint32_t total = attempted + m_AlignSkips;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "VRR scanline align: %u in-blank, %u mid-scan tears (%.1f%%), avg wait %.2f ms, avg budget %.2f ms, %u skipped-late, %u vsync-latched",
+                    "VRR scanline align: %u in-blank, %u mid-scan tears (%.1f%%), %u misses rescued tear-free, avg wait %.2f ms, avg budget %.2f ms, %u skipped-late, %u policy-latched",
                     m_AlignHits,
                     m_AlignGiveUps,
                     attempted != 0 ? m_AlignGiveUps * 100.0 / attempted : 0.0,
+                    m_AlignRescueLatches,
                     attempted != 0 ? (m_AlignWaitTotalUs / 1000.0) / attempted : 0.0,
                     total != 0 ? (m_AlignBudgetTotalUs / 1000.0) / total : 0.0,
                     m_AlignSkips,
@@ -510,6 +539,7 @@ void VrrPresenter::logAlignStatsIfDue(uint64_t nowUs)
         m_AlignGiveUps = 0;
         m_AlignSkips = 0;
         m_AlignVsyncLatches = 0;
+        m_AlignRescueLatches = 0;
         m_AlignWaitTotalUs = 0;
         m_AlignBudgetTotalUs = 0;
         m_AlignStatsStartUs = nowUs;

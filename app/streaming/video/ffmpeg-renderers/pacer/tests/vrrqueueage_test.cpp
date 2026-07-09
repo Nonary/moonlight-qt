@@ -115,10 +115,6 @@ void testPhaseDecisionUsesOneSetpoint()
                VrrQueueAgeController::shouldDiscardPhaseAdvance(false, true) &&
                VrrQueueAgeController::shouldDiscardPhaseAdvance(true, false),
            "only an actual recovery rebase or stale catch-up invalidates trim");
-    expect(VrrQueueAgeController::isReadinessNearMiss(999, false) &&
-               !VrrQueueAgeController::isReadinessNearMiss(1000, false) &&
-               !VrrQueueAgeController::isReadinessNearMiss(0, true),
-           "post-drop near-zero age must not be classified as starvation");
 }
 
 void testFastAttackAndBoundedRelease()
@@ -167,7 +163,7 @@ void testColdEntryConvergesAfterEightCleanWindows()
            "cold entry must become learned on the eighth clean window");
 }
 
-void testTaintFreezesUntilExplicitRecovery()
+void testTaintFreezesUntilFreshAcquisition()
 {
     VrrQueueAgeController controller(6000, false);
     observeLowSpread(controller, 8);
@@ -190,10 +186,11 @@ void testTaintFreezesUntilExplicitRecovery()
                frozen.safetyReserveUs == settled.safetyReserveUs,
            "unusable evidence must not mutate learned or safety reserves");
 
-    controller.restoreSafety(kSourceIntervalUs);
+    controller.leaveNearCeiling();
+    controller.enterNearCeiling(kSourceIntervalUs);
     auto recovered = target(controller, true);
     expect(!recovered.learned && recovered.safetyReserveUs > 0,
-           "an explicit readiness near miss should restore protection");
+           "a fresh near-ceiling acquisition should restore protection");
 
     observeLowSpread(controller, 7, true);
     expect(!target(controller, true).learned,
@@ -285,7 +282,7 @@ int main()
     testPhaseDecisionUsesOneSetpoint();
     testFastAttackAndBoundedRelease();
     testColdEntryConvergesAfterEightCleanWindows();
-    testTaintFreezesUntilExplicitRecovery();
+    testTaintFreezesUntilFreshAcquisition();
     testRateResetAndPresetSeparation();
     testBoundsAndLowFpsHeadroom();
 
