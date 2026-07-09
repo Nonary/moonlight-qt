@@ -73,6 +73,8 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_RenderPhaseGpuWaitTotalUs(0),
       m_RenderPhaseSamples(0),
       m_RenderPhaseLastLogUs(0),
+      m_RenderPhaseSubmitMinUs(UINT64_MAX),
+      m_RenderPhaseGpuWaitMinUs(UINT64_MAX),
       m_FrameLatencyWaitableObject(nullptr),
       m_UsePmSwapchain(false),
       m_PmTargetUs(0),
@@ -844,6 +846,33 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
         }
     }
 
+    // Multi-stream-degradation diagnostic (2026-07-08): report the ACTUAL
+    // adapter the render device landed on. m_AdapterIndex is only the
+    // SDL-preferred index (from SDL_DXGIGetOutputInfo); createDeviceByAdapterIndex
+    // can silently fall back to another GPU without updating it. If a follow-up
+    // stream lands on a different adapter than the first - e.g. a stale SDL DXGI
+    // enumeration hands back a second-best output - decode->render becomes a
+    // cross-adapter copy and render cost balloons. Log it once per stream so
+    // stream 1 and stream 2 can be diffed at a glance.
+    {
+        ComPtr<IDXGIDevice> renderDxgiDevice;
+        ComPtr<IDXGIAdapter> renderAdapter;
+        DXGI_ADAPTER_DESC renderAdapterDesc = {};
+        if (SUCCEEDED(m_RenderDevice.As(&renderDxgiDevice)) &&
+                SUCCEEDED(renderDxgiDevice->GetAdapter(&renderAdapter)) &&
+                SUCCEEDED(renderAdapter->GetDesc(&renderAdapterDesc))) {
+            char adapterName[256] = "unknown";
+            WideCharToMultiByte(CP_UTF8, 0, renderAdapterDesc.Description, -1,
+                                adapterName, sizeof(adapterName), nullptr, nullptr);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "D3D11VA device: render adapter '%s' (SDL-preferred index %d), %llu MB dedicated, %s decode/render devices",
+                        adapterName,
+                        m_AdapterIndex,
+                        (unsigned long long)(renderAdapterDesc.DedicatedVideoMemory / (1024ULL * 1024ULL)),
+                        m_DecodeDevice == m_RenderDevice ? "shared" : "separate");
+        }
+    }
+
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
     swapChainDesc.Stereo = FALSE;
     swapChainDesc.SampleDesc.Count = 1;
@@ -1222,17 +1251,50 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         uint64_t gpuDoneUs = LiGetMicroseconds();
         m_RenderPhaseSubmitTotalUs += submitDoneUs - renderEntryUs;
         m_RenderPhaseGpuWaitTotalUs += gpuDoneUs - submitDoneUs;
+        if (submitDoneUs - renderEntryUs < m_RenderPhaseSubmitMinUs) {
+            m_RenderPhaseSubmitMinUs = submitDoneUs - renderEntryUs;
+        }
+        if (gpuDoneUs - submitDoneUs < m_RenderPhaseGpuWaitMinUs) {
+            m_RenderPhaseGpuWaitMinUs = gpuDoneUs - submitDoneUs;
+        }
         m_RenderPhaseSamples++;
-        if (gpuDoneUs - m_RenderPhaseLastLogUs > 30000000ULL) {
+        // Multi-stream-degradation diagnostic (2026-07-08): 5s window so a
+        // short test stream still emits a line; per-window MINIMA (a high
+        // gpu-wait min = the GPU is sustained-slow/downclocked - even a
+        // no-contention frame costs more; a low min with a high avg =
+        // intermittent contention); shared-vs-separate device state (the
+        // eb911054 split); and the process's LOCAL video-memory footprint (a
+        // per-stream climb across stream 1 -> 2 -> 3 = a leaked device/surface
+        // pool from the prior stream, vs a flat footprint with a high gpu-wait
+        // = the GPU simply running at a lower clock).
+        if (gpuDoneUs - m_RenderPhaseLastLogUs > 5000000ULL) {
             if (m_RenderPhaseLastLogUs != 0 && m_RenderPhaseSamples > 0) {
+                double vramMb = -1.0;
+                ComPtr<IDXGIAdapter1> diagAdapter;
+                if (m_Factory != nullptr &&
+                        SUCCEEDED(m_Factory->EnumAdapters1(m_AdapterIndex, &diagAdapter))) {
+                    ComPtr<IDXGIAdapter3> diagAdapter3;
+                    DXGI_QUERY_VIDEO_MEMORY_INFO memInfo = {};
+                    if (SUCCEEDED(diagAdapter.As(&diagAdapter3)) &&
+                            SUCCEEDED(diagAdapter3->QueryVideoMemoryInfo(
+                                0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo))) {
+                        vramMb = memInfo.CurrentUsage / (1024.0 * 1024.0);
+                    }
+                }
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "D3D11 render phases: cpu-submit avg %.2f ms, gpu-wait avg %.2f ms over %u frames",
+                            "D3D11 render phases: cpu-submit avg %.2f (min %.2f) ms, gpu-wait avg %.2f (min %.2f) ms over %u frames, %s devices, process VRAM %.0f MB",
                             m_RenderPhaseSubmitTotalUs / 1000.0 / m_RenderPhaseSamples,
+                            m_RenderPhaseSubmitMinUs / 1000.0,
                             m_RenderPhaseGpuWaitTotalUs / 1000.0 / m_RenderPhaseSamples,
-                            m_RenderPhaseSamples);
+                            m_RenderPhaseGpuWaitMinUs / 1000.0,
+                            m_RenderPhaseSamples,
+                            m_DecodeDevice == m_RenderDevice ? "shared" : "separate",
+                            vramMb);
             }
             m_RenderPhaseSubmitTotalUs = 0;
             m_RenderPhaseGpuWaitTotalUs = 0;
+            m_RenderPhaseSubmitMinUs = UINT64_MAX;
+            m_RenderPhaseGpuWaitMinUs = UINT64_MAX;
             m_RenderPhaseSamples = 0;
             m_RenderPhaseLastLogUs = gpuDoneUs;
         }

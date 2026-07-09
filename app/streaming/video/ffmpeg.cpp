@@ -1115,8 +1115,21 @@ void FFmpegVideoDecoder::logFrameCadenceDiagnostics(VIDEO_STATS& stats)
         cadenceSignal = "mild variation";
     }
 
+    // Drop attribution (2026-07-08 multi-stream diagnostic): the two drop
+    // counters distinguish the two client-side failure modes, both of which
+    // the overlay blames on the network. PACER drops (pacerDroppedFrames) =
+    // present/render backpressure: the pacer sheds decoded frames it can't
+    // present in time. NETWORK drops (networkDroppedFrames) = gaps in the
+    // HOST frame numbers reaching submitDecodeUnit, which the CLIENT
+    // manufactures when its decode thread stalls and moonlight-common-c's
+    // decode-unit queue overflows -> IDR flush (look for "Video decode unit
+    // queue overflow" nearby in the log). received/expected shows the gap
+    // magnitude. If NETWORK drops climb on stream 2 while the real link is
+    // fine, this is the false-network chain; if PACER drops climb instead,
+    // it's present-side. Either way the root cause is upstream render/present
+    // slowness (see the "D3D11 render phases" gpu-wait line).
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Frame cadence: rendered %.2f FPS, interval avg/min/max/stddev %.2f/%.2f/%.2f/%.2f ms, signal %s, samples %u, jitter drops %.2f%%, queue %.2f ms, render %.2f ms",
+                "Frame cadence: rendered %.2f FPS, interval avg/min/max/stddev %.2f/%.2f/%.2f/%.2f ms, signal %s, samples %u, pacer drops %.2f%%, network drops %.2f%% (%u recv / %u expected), queue %.2f ms, render %.2f ms",
                 stats.renderedFps,
                 avgIntervalUs / 1000.0,
                 (double)stats.minFrameIntervalUs / 1000.0,
@@ -1125,6 +1138,9 @@ void FFmpegVideoDecoder::logFrameCadenceDiagnostics(VIDEO_STATS& stats)
                 cadenceSignal,
                 stats.frameIntervalSamples,
                 stats.decodedFrames != 0 ? (float)stats.pacerDroppedFrames / stats.decodedFrames * 100 : 0,
+                stats.totalFrames != 0 ? (float)stats.networkDroppedFrames / stats.totalFrames * 100 : 0,
+                stats.receivedFrames,
+                stats.totalFrames,
                 stats.renderedFrames != 0 ? (double)(stats.totalPacerTimeUs / 1000.0) / stats.renderedFrames : 0,
                 stats.renderedFrames != 0 ? (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames : 0);
 }

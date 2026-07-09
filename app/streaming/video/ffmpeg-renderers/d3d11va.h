@@ -125,6 +125,12 @@ private:
     uint64_t m_RenderPhaseGpuWaitTotalUs;
     uint32_t m_RenderPhaseSamples;
     uint64_t m_RenderPhaseLastLogUs;
+    // Per-window minima: a high gpu-wait MIN means the GPU is sustained-slow
+    // (downclocked/underpowered - the whole no-load frame costs more), while a
+    // low min with a high avg means intermittent contention. This is the
+    // multi-stream-degradation discriminator (see the phase log in renderFrame).
+    uint64_t m_RenderPhaseSubmitMinUs;
+    uint64_t m_RenderPhaseGpuWaitMinUs;
     HANDLE m_FrameLatencyWaitableObject;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_RenderTargetView;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_VideoBlendState;
