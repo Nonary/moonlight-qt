@@ -1623,6 +1623,30 @@ int Pacer::cadenceThread(void* context)
                                         minFrameIntervalUs + alignWideExtraUs);
             alignBudgetUs = qBound(alignSpinFloorUs, threadSlackUs, maxAlignUs);
 
+            // The floor above guarantees at least alignSpinFloorUs (3ms)
+            // regardless of cadenceSlackUs, but content moderately below the
+            // panel's max refresh - inside a high-refresh VRR window, not yet
+            // tapered or near-ceiling-buffered - can have real VRR headroom
+            // well under that: 90fps on a 120Hz panel has ~2.8ms of cadence
+            // slack, 100fps has ~1.7ms. Spending the 3ms floor there waits
+            // past the panel's actual extendable-blanking window on every
+            // present, so service quietly runs slower than arrival - the
+            // frame COUNT stays correctly bounded (dropFrameForEnqueue still
+            // caps it), but each present's target keeps inheriting the
+            // previous one's lateness (see the flip-spacing floor's
+            // lastFlipUs clamp above), so the standing schedule/queue DELAY
+            // creeps upward indefinitely instead of settling - the trim
+            // servo further up can only claw back queue-side slack, not an
+            // align wait that is structurally too wide for what this content
+            // rate can afford. Bound the steady-state budget by the same
+            // cadenceSlackUs the rush and near-buffered branches already
+            // respect; the raster-lock-uncertain override just below
+            // deliberately spends wider than this to re-anchor a free-running
+            // raster and is left alone.
+            if (cadenceSlackUs != 0 && cadenceSlackUs < alignBudgetUs) {
+                alignBudgetUs = cadenceSlackUs;
+            }
+
             // Forensics-driven re-anchor: while the renderer cannot prove
             // the panel is back in VRR flip-following, every floor-spaced
             // present lands at the free-running raster's whim - and at
