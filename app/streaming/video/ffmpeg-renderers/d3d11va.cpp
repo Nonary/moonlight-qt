@@ -55,6 +55,68 @@ static const std::array<const char*, D3D11VARenderer::PixelShaders::_COUNT> k_Vi
     "d3d11_y410_pixel.fxc",
 };
 
+// Process-wide power/QoS requests for VRR cadence pacing. VRR cadence fences
+// GPU completion before every present and schedules against a fixed content
+// interval (see the SetGPUThreadPriority(7) comment in initialize()), so it
+// is far more sensitive to the process being deprioritized than ordinary
+// vsync presentation, which just rides the next compositor tick regardless.
+// Two things measurably hurt it that Windows will otherwise do on its own:
+//
+//  - Execution-speed throttling (aka Efficiency Mode / EcoQoS), which
+//    Windows applies more readily on battery. Measured 2026-07-08 on a
+//    Radeon 890M laptop: the per-frame CPU submission phase roughly doubled
+//    (0.4ms -> 0.8ms) on battery with no change in GPU work, consistent with
+//    the process being quietly throttled - and that alone was enough to
+//    start dropping frames at a content rate that ran perfectly on AC.
+//  - System/display sleep. A streaming session driven purely by a game
+//    controller doesn't reset Windows' idle timer the way keyboard/mouse
+//    input does, so a long controller-only session can let the system sleep
+//    or the display turn off under an still-active stream.
+//
+// Refcounted (not a plain set/clear pair) because this is genuinely
+// process-wide OS state while D3D11VARenderer instances are not: a
+// capability-probe renderer and the real stream renderer can be transiently
+// alive at once, and both requesting/releasing independently must not let
+// one instance's teardown cancel another's still-active request.
+static volatile LONG s_VrrPowerRequests = 0;
+
+static void acquireVrrPowerState()
+{
+    if (InterlockedIncrement(&s_VrrPowerRequests) != 1) {
+        // Another instance already holds the request.
+        return;
+    }
+
+    PROCESS_POWER_THROTTLING_STATE throttlingState = {};
+    throttlingState.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttlingState.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    throttlingState.StateMask = 0; // 0 = opt OUT of throttling for this control
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                          &throttlingState, sizeof(throttlingState));
+
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "VRR cadence pacing: requested full-performance power state and disabled system/display sleep");
+}
+
+static void releaseVrrPowerState()
+{
+    if (InterlockedDecrement(&s_VrrPowerRequests) != 0) {
+        // Another instance still holds the request.
+        return;
+    }
+
+    PROCESS_POWER_THROTTLING_STATE throttlingState = {};
+    throttlingState.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttlingState.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    throttlingState.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED; // opt back IN (system default)
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                          &throttlingState, sizeof(throttlingState));
+
+    SetThreadExecutionState(ES_CONTINUOUS);
+}
+
 D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
     : IFFmpegRenderer(RendererType::D3D11VA),
       m_DecoderSelectionPass(decoderSelectionPass),
@@ -65,6 +127,7 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_PresentationMode(PresentationMode::Auto),
       m_PresentationModeFallbackReason(nullptr),
       m_TearingSupport(false),
+      m_HoldingVrrPowerRequest(false),
       m_OutputIndex(-1),
       m_PresentReadyFenceValue(0),
       m_PresentReadyFenceEvent(nullptr),
@@ -89,6 +152,11 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
 D3D11VARenderer::~D3D11VARenderer()
 {
     DwmEnableMMCSS(FALSE);
+
+    if (m_HoldingVrrPowerRequest) {
+        releaseVrrPowerState();
+        m_HoldingVrrPowerRequest = false;
+    }
 
     SDL_DestroyMutex(m_ContextLock);
 
@@ -937,6 +1005,12 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
                         SUCCEEDED(prioHr) ? "accepted" : "rejected",
                         prioHr);
         }
+
+        // See acquireVrrPowerState() above: VRR cadence pacing needs the
+        // process running at full speed and the system awake for as long as
+        // this renderer is streaming.
+        acquireVrrPowerState();
+        m_HoldingVrrPowerRequest = true;
     }
 
     // DXVA2 may let us take over for FSE V-sync off cases. However, if we don't have DXGI_FEATURE_PRESENT_ALLOW_TEARING

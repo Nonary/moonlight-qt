@@ -154,6 +154,11 @@ private:
     PresentationMode m_PresentationMode;
     const char* m_PresentationModeFallbackReason;
     bool m_TearingSupport;
+    // Whether this instance holds the process-wide VRR power/QoS request
+    // (see acquireVrrPowerState() in the .cpp). Tracked per-instance so the
+    // destructor releases it exactly once even if initialize() is ever
+    // called again on the same object.
+    bool m_HoldingVrrPowerRequest;
     int m_OutputIndex;
 
     std::array<Microsoft::WRL::ComPtr<ID3D11PixelShader>, PixelShaders::_COUNT> m_VideoPixelShaders;
