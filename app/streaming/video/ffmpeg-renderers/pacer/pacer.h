@@ -113,9 +113,4 @@ private:
     uint32_t m_FrameDiagnosticRingIndex;
     uint32_t m_FrameDiagnosticRingCount;
     IFFmpegRenderer::PresentationMode m_PresentationMode;
-
-    // Identity of the display + refresh + stream-rate configuration the
-    // cadence thread's calibration cache is keyed by (empty when the
-    // renderer isn't in VRR cadence mode).
-    QString m_VrrCalibrationKey;
 };
