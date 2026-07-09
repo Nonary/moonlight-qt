@@ -622,12 +622,12 @@ Flickable {
                             //    (refresh - refresh^2/3600, the Blur Busters
                             //    formula; 120Hz -> 116 FPS, 144Hz -> 138).
                             //    The highest rate adaptive sync can follow,
-                            //    with the client absorbing delivery jitter in
-                            //    a ~1-frame pacing buffer.
+                            //    with the client using an adaptive timing
+                            //    reserve to decouple delivery jitter.
                             //  - "Low-latency VRR": ~5/6 of max refresh
                             //    (120Hz -> 100 FPS, 144Hz -> 120). Leaves
                             //    enough per-frame slack that pacing needs only
-                            //    a minimal standing buffer - the lowest-latency
+                            //    a minimal timing reserve - the lowest-latency
                             //    tear-free operating point, at fewer frames.
                             var vrrDone = false
                             for (var vrrDisplayIndex = 0; !vrrDone; vrrDisplayIndex++) {
@@ -1008,13 +1008,13 @@ Flickable {
                                 ToolTip.delay: 1000
                                 ToolTip.timeout: 5000
                                 ToolTip.visible: hovered
-                                ToolTip.text: qsTr("When the stream FPS runs above your display's tear-free VRR range, present frames immediately for the lowest latency instead of latching them to vsync. May show visible tearing.\nHas no effect at FPS values within the VRR range, where VRR is always tear-free and low-latency.")
+                                ToolTip.text: qsTr("Prefers immediate presentation when tear-free VRR pacing cannot keep up, instead of latching frames to fixed vsync. This reduces recovery latency but can show visible tearing near or above the display's VRR limit.")
                             }
 
                             Label {
                                 width: parent.width
                                 id: vrrCushionTitle
-                                text: qsTr("VRR pacing buffer")
+                                text: qsTr("VRR pacing policy")
                                 font.pointSize: 12
                                 wrapMode: Text.Wrap
                             }
@@ -1061,7 +1061,7 @@ Flickable {
                                 ToolTip.delay: 1000
                                 ToolTip.timeout: 5000
                                 ToolTip.visible: hovered
-                                ToolTip.text: qsTr("How long frames may wait in a small buffer that absorbs network and game hiccups during VRR streaming. A larger buffer prevents tearing and stutter when the stream is unsteady; a smaller one shaves a few milliseconds of latency but tears more during hiccups.\nBecause a VRR display refreshes the moment each frame is presented, this buffer replaces the wait for the next fixed vsync tick - so total latency stays comparable to ordinary V-Sync even at the Smoothest setting.")
+                                ToolTip.text: qsTr("Controls the latency-versus-smoothness policy for VRR pacing. Moonlight automatically raises its timing reserve when frames approach starvation, then gradually reduces it after sustained stable delivery. Lowest latency limits that reserve most aggressively; Smoothest keeps more protection for variable frame delivery.")
                             }
 
                             CheckBox {

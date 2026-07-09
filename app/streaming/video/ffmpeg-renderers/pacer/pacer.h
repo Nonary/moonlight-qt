@@ -69,7 +69,8 @@ private:
 
     void enqueueFrameForRenderingAndUnlock(AVFrame* frame, uint64_t targetPresentUs = 0);
 
-    void renderFrame(AVFrame* frame);
+    // Returns decode-completion-to-render-start queue age in microseconds.
+    uint64_t renderFrame(AVFrame* frame);
 
     bool waitUntil(uint64_t targetUs);
 

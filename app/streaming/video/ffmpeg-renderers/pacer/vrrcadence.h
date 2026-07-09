@@ -182,10 +182,10 @@ public:
             if (targetUs + frameIntervalUs < nowUs) {
                 // A stall longer than a frame interval: snap the schedule
                 // onto the present. This wipes whatever standing phase
-                // offset (jitter buffer) the pacer had built on top of the
-                // schedule, so report it - the pacer may want to
-                // re-establish that offset in one step rather than
-                // re-learning it over seconds.
+                // offset the pacer had built on top of the schedule, so
+                // report it. The pacer can reacquire from the first usable
+                // actual-age sample with bounded phase motion instead of
+                // treating the old offset as still valid.
                 targetUs = nowUs;
                 m_PhaseReset = true;
             }

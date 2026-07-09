@@ -1,9 +1,12 @@
 #include "pacer.h"
 #include "vrrcadence.h"
+#include "vrrqueueage.h"
 #include "highressleep.h"
 #include "streaming/streamutils.h"
 
 #include <QVector>
+
+#include <array>
 
 #ifdef Q_OS_WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -65,7 +68,7 @@ struct VrrTearVerdict {
     uint32_t periodSecs;     // latch period last applied for this rate
     uint32_t failCount;
     uint64_t lastSeenUs;
-    uint32_t renderStampUs;  // net render estimate when this rate last failed (0 = unknown/legacy)
+    uint32_t renderStampUs;  // net render estimate when this rate last failed (0 = unknown)
     bool latchedThisSession; // one probe-free pre-latch per stream (not persisted)
 };
 
@@ -103,12 +106,10 @@ public:
     }
 
     // Records a failed tear-rate probe and returns the latch period to apply:
-    // the next rung of this rate's own ladder (base for a first offense),
-    // resuming from wherever earlier streams and sessions left it. The
-    // render stamp refreshes on every fail - a rate that still tears under
-    // the current renderer is current evidence, and the ladder position is
-    // kept (the failure is panel/driver physics, so a faster render does
-    // not restart it).
+    // the next rung of this rate's own per-stream ladder (base for a first
+    // offense). The render stamp refreshes on every fail: a rate that still
+    // tears under the current renderer is current evidence, so a faster
+    // render does not restart its ladder during the same stream.
     uint32_t recordTearFail(uint64_t intervalUs, uint64_t nowUs,
                             uint64_t renderEstUs)
     {
@@ -387,15 +388,11 @@ int Pacer::cadenceThread(void* context)
     uint64_t lastMarginLogUs = 0;
     uint64_t lastLoggedMarginUs = 0;
 
-    // Content-rate band scoping for the margin (nearest 10fps, with a
-    // short dwell so boundary wobble doesn't thrash it). On a REGIME jump
-    // (>=2 bands, e.g. 10fps desktop -> 110fps gameplay) the overshoot
-    // window is stale evidence from different GPU-clock behavior: drop it
-    // and let the new regime build its own live margin. Adjacent band drift
-    // (109 <-> 111fps) keeps the window - same regime.
-    int marginBandFps = 0;
-    int marginBandCandidate = 0;
-    uint64_t marginBandCandidateSinceUs = 0;
+    // Scope learned timing evidence to a content-rate regime. A material rate
+    // jump invalidates both queue-age spread and render-overshoot history.
+    int timingBandFps = 0;
+    int timingBandCandidate = 0;
+    uint64_t timingBandCandidateSinceUs = 0;
     uint64_t leadMarginUs =
         classicPresent ? 0 : (fixedMarginEnv > 1 ? (uint64_t)fixedMarginEnv : 4000);
 
@@ -405,8 +402,8 @@ int Pacer::cadenceThread(void* context)
     // every pair (the old zero-tolerance policy here) turned each burst into
     // a visible skip - measured at 3-8% of all frames on Wi-Fi.
     QQueue<int> queueDepthHistory;
-    const int queueDepthHistoryCap =
-        me->m_MaxVideoFps > 0 ? qMax(me->m_MaxVideoFps / 2, 1) : 60;
+    int queueDepthHistoryCap =
+        VrrQueueAgeController::windowSampleCount(0, me->m_MaxVideoFps);
 
     // Near-ceiling taper state for the alignment budget (see below). Starts
     // in full-alignment and drops to the taper the moment the measured
@@ -419,63 +416,48 @@ int Pacer::cadenceThread(void* context)
     bool alignTapered = false;
     int alignFullDwell = 0;
 
-    // Standing-latency servo state (see the trim block below).
-    // MOONLIGHT_VRR_NO_TRIM=1 disables it for A/B comparison.
-    //
-    // The cushion is the latency-vs-tearing sweet-spot dial. The pre-servo
-    // builds carried a standing 8-9ms queue that measured near-zero tears:
-    // every frame sat ~8ms in the pipeline, so no arrival wobble or render
-    // spike could make a present late. Trimming to a 2.5ms cushion
-    // reclaimed that latency but converted the protection into exposure -
-    // the user judged the result as tearing "a lot" against the old build
-    // on the same content. The default sits in between; the lead margin
-    // covers render-time spikes while this cushion covers arrival jitter,
-    // and the two add. The value comes from the "VRR pacing buffer"
-    // setting in the UI (default 4500), with MOONLIGHT_VRR_CUSHION_US
-    // overriding it for A/B (2500 = old aggressive trim, 6000 = maximum;
-    // clamped because at 100fps content a cushion much past 6ms parks
-    // pipeline age over the 1.25-interval stale threshold and the schedule
-    // thrashes in rush catch-ups).
-    const bool latencyTrimEnabled =
+    // Closed-loop queue-age control. The UI selects how much measured timing
+    // variation the policy may insure (2.5/4.5/6ms); it is not a fixed wait.
+    // Near the refresh ceiling the controller also owns a bounded phase and
+    // acquisition reserve. It attacks on measured starvation, releases only
+    // after clean evidence, and never learns stalls or recovery motion as
+    // normal. MOONLIGHT_VRR_NO_TRIM=1 disables all queue-age feedback for A/B.
+    const bool queueAgeServoEnabled =
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_TRIM") == 0;
-    const int cushionEnv =
+    const int queueAgeEnv =
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_CUSHION_US");
-    const int cushionCfgUs = cushionEnv > 0 ? cushionEnv :
+    const int queueAgeCfgUs = queueAgeEnv > 0 ? queueAgeEnv :
         (me->m_VrrCushionUs > 0 ? me->m_VrrCushionUs : 4500);
-    const uint64_t queueCushionUs =
-        qBound((uint64_t)1500, (uint64_t)cushionCfgUs, (uint64_t)6000);
-    const int slackWindowCap =
-        me->m_MaxVideoFps > 0 ? qMax(me->m_MaxVideoFps / 2, 16) : 30;
-    uint64_t slackWindowMinUs = UINT64_MAX;
-    int slackWindowSamples = 0;
-    uint64_t trimStepUs = 0;
-    uint64_t padStepUs = 0;
-    uint64_t lastTrimLogUs = 0;
-
-    // Measured cushion need. The cushion dial and the in-band 5/8-interval
-    // floor are static insurance budgets; the quantity they insure against
-    // is measurable: the spread of pipeline ages (max - min of the servo's
-    // own queue-delay estimate) across a window in which the schedule held
-    // still is exactly the arrival turbulence the buffer absorbed. Track
-    // the worst spread over the last ~24 CLEAN half-second windows (windows
-    // where the trim/pad servo moved the phase, a snap fired, or a
-    // veto-grade event hit are self-distorted and excluded), and let the
-    // effective cushion THIN below the static budgets toward that
-    // measurement plus a guard - never fatten above them, so a chaotic
-    // link behaves exactly like the static design and a calm one stops
-    // paying insurance it provably doesn't need. Entirely
-    // measurement-derived, so it sizes itself per device and per link.
-    // MOONLIGHT_VRR_STATIC_CUSHION=1 disables the thinning for A/B.
-    const bool staticCushion =
+    const uint64_t configuredPolicyCapUs =
+        qBound((uint64_t)1500, (uint64_t)queueAgeCfgUs, (uint64_t)6000);
+    // MOONLIGHT_VRR_STATIC_CUSHION=1 keeps the conservative policy target.
+    const bool forceStaticQueueTarget =
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_STATIC_CUSHION") != 0;
-    uint64_t slackWindowMaxUs = 0;
-    bool slackWindowTainted = false;
-    uint32_t jitterSpreadRingUs[24];
-    int jitterSpreadHead = 0;
-    int jitterSpreadCount = 0;
-    int taintedWindowStreak = 0;
-    uint64_t jitterNeedUs = UINT64_MAX;  // UINT64_MAX until enough clean windows
-    uint64_t lastCushionLogUs = 0;
+    VrrQueueAgeController queueAgeController(configuredPolicyCapUs,
+                                               forceStaticQueueTarget);
+    int queueAgeWindowSamples = 0;
+    bool queueAgeWindowTainted = false;
+    uint64_t phaseAdvanceUs = 0;
+    uint64_t phaseDelayUs = 0;
+    uint64_t fastRecoveryRemainingUs = 0;
+    uint64_t previousQueueAgeMedianUs = 0;
+    bool queueAcquisitionPending = false;
+    uint32_t lastObservedPacerDropCount =
+        me->m_VideoStats->pacerDroppedFrames;
+    int postDropRecoverySuppressFrames = 0;
+    std::array<uint32_t, 120> queueAgeWindowUs = {};
+    uint64_t lastQueueServoLogUs = 0;
+    uint64_t lastQueueTargetLogUs = 0;
+    uint64_t lastLoggedQueueTargetUs = 0;
+    uint64_t lastQueueAcquisitionLogUs = 0;
+    auto resetQueueAgeWindow = [&]() {
+        queueAgeWindowSamples = 0;
+        queueAgeWindowTainted = false;
+        phaseAdvanceUs = 0;
+        phaseDelayUs = 0;
+        fastRecoveryRemainingUs = 0;
+        previousQueueAgeMedianUs = 0;
+    };
 
     // Scale-free pacing geometry. Every zone and guard below that used to
     // be a fixed microsecond offset is expressed as a fraction (per-mille)
@@ -484,8 +466,8 @@ int Pacer::cadenceThread(void* context)
     // means "16% of a scanout" there but would mean 32% on a 240Hz panel
     // and 8% at 60Hz, silently moving every behavioral boundary. Fractions
     // keep the zones meaning the same thing on any refresh rate.
-    // Deliberately NOT scaled: human-latency quantities (the cushion dial
-    // bounds, lead-margin caps, snap sizes, jitter guards) - perceived
+    // Deliberately NOT scaled: human-latency quantities (the policy reserve
+    // bounds, lead-margin caps, acquisition limits, jitter guards) - perceived
     // delay is absolute time regardless of panel speed - and content-
     // domain constants (the ~22fps cadence-adoption bound). Env overrides
     // stay absolute microseconds: they are user-facing measurement knobs.
@@ -500,7 +482,7 @@ int Pacer::cadenceThread(void* context)
     const uint64_t taperExitZoneUs = scanoutFracUs(192);        // 1600us
     const uint64_t bandSlowReleaseZoneUs = scanoutFracUs(300);  // 2500us
     const uint64_t bandEntryStepUs = scanoutFracUs(12);         // 100us
-    const uint64_t cushionClampZoneUs = scanoutFracUs(312);     // 2600us
+    const uint64_t queueAgeClampZoneUs = scanoutFracUs(312);    // 2600us
     const uint64_t cadenceSlackGuardUs = scanoutFracUs(24);     // 200us
     const uint64_t alignSpinFloorUs = scanoutFracUs(360);       // 3000us
     const uint64_t alignWideExtraUs = scanoutFracUs(240);       // 2000us
@@ -552,18 +534,11 @@ int Pacer::cadenceThread(void* context)
     // collapses - a free-running raster tears at ANY spacing - so the band
     // treats it as a free-run artifact, not a flip-following limit, and
     // runs on the nominal scanout spacing plus a small guard instead.
-    // So instead of latching the band, decouple flip spacing from the
-    // jitter:
-    //  - hold a deliberate ~one-content-interval standing queue (the
-    //    re-timing buffer: jitter lands on a frame that is already queued,
-    //    not on the flip instant),
-    //  - keep the schedule on the smoothed cadence with the spacing floor
-    //    at nominal-scanout-plus-guard, and
-    //  - move the rush/stale/drain machinery behind the buffer so routine
-    //    wobble can never fire the tight catch-up flips that broke
-    //    flip-following in the first place.
-    // Costs ~5ms of standing latency versus the free-run cushion, only
-    // while content is inside the band. MOONLIGHT_VRR_NO_NEARBUFFER=1
+    // So instead of latching the band, decouple flip spacing from arrival
+    // timing with a time-based queue-age target, keep the smoothed schedule
+    // above nominal scanout plus a guard, and reserve catch-up for genuine
+    // excess. Queue depth remains an overflow signal, not the latency target.
+    // MOONLIGHT_VRR_NO_NEARBUFFER=1
     // restores the old latch-everything behavior; MOONLIGHT_VRR_BUFFER_GUARD_US
     // moves the band's fast edge (default 150us over nominal max-refresh
     // spacing, admitting content to ~117.9fps on 120Hz; raise it if
@@ -593,20 +568,15 @@ int Pacer::cadenceThread(void* context)
     int relockBurstRemaining = 0;
     uint64_t lastRelockBurstUs = 0;
     uint64_t lastRelockLogUs = 0;
-    bool bandSnapPending = false;
     bool overfillDropPending = false;
-    uint64_t lastSnapLogUs = 0;
-
-    // The slice of the measured render tail the margin is not allowed to
-    // cover (windowed worst overshoot past the margin ceiling). Updated in
-    // the adaptive-margin block below; the in-band buffer target adds it,
-    // so the queue picks up exactly the render risk the margin hands off.
-    uint64_t renderTailBeyondMarginUs = 0;
+    uint64_t overfillDropDeadlineUs = 0;
 
     // Post-band-release grace (see the staleSchedule block). Sized to one
     // servo window so the trim machinery gets a full measurement cycle to
     // start draining before the stale/drain tiers may fire again.
     int bandStaleGraceFrames = 0;
+    uint64_t lastNearQueueAgeTargetUs = 0;
+    uint64_t lastNearBufferReleaseUs = 0;
 
     // Tear-rate feedback: the self-calibrating replacement for hardcoded
     // per-panel rate limits. Whether a given display/driver stack can
@@ -616,13 +586,12 @@ int Pacer::cadenceThread(void* context)
     // window, and when the observed tear rate proves chronic, hand this
     // content to the vsync latch for a while. Expiry re-probes, so a
     // regime change (different content rate, driver re-engaging) is found
-    // within one probe window (~2-3s of tearing per minute worst-case).
+    // within one probe window (at most 64 frames, about 0.5-0.7s here).
     // Only meaningful when the latch exists to fall back to;
     // tearing-preferred users chose cadence-over-tears explicitly.
     // The per-rate ladder (latch period doubling per repeat offense) lives
-    // in the calibration store so it survives content-rate wobble, stream
-    // restarts, and sessions - the old single-slot version restarted every
-    // rate at 60s whenever content moved >600us away and back.
+    // for this stream, so content-rate wobble cannot reset every returning
+    // rate to a fresh 60s fallback as the old single-slot version did.
     uint32_t bandTearWindowPresents = 0;
     uint32_t bandTearWindowTears = 0;
     uint64_t bandTearFallbackUntilUs = 0;
@@ -639,6 +608,36 @@ int Pacer::cadenceThread(void* context)
             break;
         }
 
+        // The overfill detector decides after rendering the preceding frame.
+        // Service its request here, before advancing the next presentation
+        // target, but only with an immediately available replacement. Feeding
+        // the skipped timestamp to the cadence clock preserves source-rate
+        // measurement while not advancing the target removes approximately
+        // one source interval of parked phase latency.
+        if (overfillDropPending &&
+                LiGetMicroseconds() <= overfillDropDeadlineUs &&
+                me->m_PacingQueue.count() >= 2) {
+            AVFrame* overfillFrame = me->m_PacingQueue.dequeue();
+            me->m_FrameQueueLock.unlock();
+            cadenceClock.observeSourceTime(
+                frameCadenceTimestampUs(overfillFrame));
+            me->m_VideoStats->pacerDroppedFrames++;
+            av_frame_free(&overfillFrame);
+            me->maybeLogFrameDiagnostics("vrr buffer overfill drop", 0);
+            overfillDropPending = false;
+            overfillDropDeadlineUs = 0;
+            // A coalescing drop is a one-interval phase discontinuity. Start
+            // a fresh distribution and cancel the correction that diagnosed
+            // it rather than trimming the same excess twice.
+            resetQueueAgeWindow();
+            continue;
+        }
+        // Without an immediate replacement, discard the old overfill request.
+        // Keep the next frame instead of turning a transient depth change into
+        // an additional visible skip.
+        overfillDropPending = false;
+        overfillDropDeadlineUs = 0;
+
         while (queueDepthHistory.count() >= queueDepthHistoryCap) {
             queueDepthHistory.dequeue();
         }
@@ -650,12 +649,10 @@ int Pacer::cadenceThread(void* context)
         // window - that means presents genuinely can't keep up with delivery
         // and holding more frames would just be permanent added latency.
         //
-        // In the near-ceiling buffered band the standing queue IS the design
-        // (one frame deliberately in flight as the jitter re-timing buffer),
-        // so the bar shifts up one: tolerate a routine depth of 2 and only
-        // collapse a persistent 3+. (nearBuffered is last iteration's state
-        // here - a one-frame lag on band transitions is harmless.)
-        int steadyDepth = nearBuffered ? 2 : 1;
+        // Queue age, not band membership, determines whether a successor is
+        // useful. Tolerate one transient successor in every mode, but never
+        // let near-ceiling pacing turn it into a permanent extra frame.
+        constexpr int steadyDepth = 1;
         int frameDropTarget = steadyDepth + 1;
         if (queueDepthHistory.count() == queueDepthHistoryCap) {
             bool persistentBacklog = true;
@@ -671,6 +668,7 @@ int Pacer::cadenceThread(void* context)
             }
         }
 
+        bool cadenceQueueDropped = false;
         while (me->m_PacingQueue.count() > frameDropTarget) {
             AVFrame* staleFrame = me->m_PacingQueue.dequeue();
             me->m_FrameQueueLock.unlock();
@@ -680,7 +678,13 @@ int Pacer::cadenceThread(void* context)
             me->m_VideoStats->pacerDroppedFrames++;
             me->maybeLogFrameDiagnostics("vrr cadence queue drop", 0);
             av_frame_free(&staleFrame);
+            cadenceQueueDropped = true;
             me->m_FrameQueueLock.lock();
+        }
+        if (cadenceQueueDropped) {
+            resetQueueAgeWindow();
+            overfillDropPending = false;
+            overfillDropDeadlineUs = 0;
         }
 
         AVFrame* frame = me->m_PacingQueue.dequeue();
@@ -697,29 +701,42 @@ int Pacer::cadenceThread(void* context)
         // the stream's nominal FPS is only an upper bound (a game hovering
         // at 90fps on a 120fps stream delivers frames every ~11.1ms).
         uint64_t measuredSourceIntervalUs = cadenceClock.smoothedIntervalUs();
+        queueDepthHistoryCap = VrrQueueAgeController::windowSampleCount(
+            measuredSourceIntervalUs, me->m_MaxVideoFps);
 
-        if (adaptiveMargin && cadenceClock.warmedUp() &&
-                measuredSourceIntervalUs != 0) {
+        if (cadenceClock.warmedUp() && measuredSourceIntervalUs != 0) {
             int fpsNow = (int)(1000000ULL / measuredSourceIntervalUs);
             int band = qBound(10, ((fpsNow + 5) / 10) * 10, 240);
-            if (band == marginBandFps) {
-                marginBandCandidate = 0;
+            if (band == timingBandFps) {
+                timingBandCandidate = 0;
             }
-            else if (band != marginBandCandidate) {
-                marginBandCandidate = band;
-                marginBandCandidateSinceUs = nowUs;
+            else if (band != timingBandCandidate) {
+                timingBandCandidate = band;
+                timingBandCandidateSinceUs = nowUs;
             }
-            else if (nowUs - marginBandCandidateSinceUs > 700000ULL) {
-                int prevBand = marginBandFps;
-                marginBandFps = band;
-                marginBandCandidate = 0;
+            else if (nowUs - timingBandCandidateSinceUs > 700000ULL) {
+                int prevBand = timingBandFps;
+                timingBandFps = band;
+                timingBandCandidate = 0;
 
                 if (prevBand != 0 && qAbs(band - prevBand) >= 20) {
-                    // Regime jump: the overshoot window measured a
-                    // different GPU-clock regime. Restart the evidence window
-                    // and let this band build its own live overshoot history.
-                    overshootHead = 0;
-                    overshootCount = 0;
+                    resetQueueAgeWindow();
+                    queueAgeController.resetLearning();
+                    if (nearBuffered) {
+                        queueAgeController.enterNearCeiling(
+                            measuredSourceIntervalUs);
+                        queueAcquisitionPending = true;
+                        lastNearBufferReleaseUs = 0;
+                    }
+                    else {
+                        queueAgeController.leaveNearCeiling();
+                        queueAcquisitionPending = false;
+                        lastNearBufferReleaseUs = 0;
+                    }
+                    if (adaptiveMargin) {
+                        overshootHead = 0;
+                        overshootCount = 0;
+                    }
                 }
             }
         }
@@ -776,8 +793,8 @@ int Pacer::cadenceThread(void* context)
         // of one session's total tears inside the first ~35s) all sat in
         // these cold spans. Latch tear-free until the window is warm:
         // content is chaotic at those moments anyway, so the vsync
-        // quantization is imperceptible and the cost lasts under a second
-        // per stall.
+        // quantization is preferable to an unstable tear burst and the cost
+        // lasts under a second per stall.
         bool cadenceColdLatch = latchAvailable && !classicRecovery &&
             !cadenceClock.warmedUp();
 
@@ -824,8 +841,8 @@ int Pacer::cadenceThread(void* context)
         // just by alignTapered: the taper's exit dwell holds it engaged for
         // ~24 frames after content slows, and a 24fps cutscene that arrives
         // during that window must not enter the band (measured 2026-07-04:
-        // "engaged at 23.8 fps" - the in-band cushion tracks the interval,
-        // so slow content targeted a 42ms standing buffer, pure latency).
+        // "engaged at 23.8 fps" - the old interval-sized target became a
+        // 42ms standing delay, pure latency).
         // Entry needs the near-ceiling zone proper; the hold releases
         // instantly once content is clearly slower than ~92fps, where full
         // free-run has abundant slack and needs no buffer.
@@ -847,13 +864,14 @@ int Pacer::cadenceThread(void* context)
             // ~min+1600) is a DWELLED band release, not an instant one.
             // Content oscillating across the boundary (measured 2026-07-06:
             // 89-108fps swings, band released at 94.8/100.5fps and
-            // re-engaged at 104-108 every 5-20s) paid a full buffer
-            // teardown and snap rebuild per crossing - a standing-latency
-            // sawtooth. The leaky counter (~0.35s at these rates,
+            // re-engaged at 104-108 every 5-20s) repeatedly discarded the
+            // controller's evidence and rebuilt protection, creating a
+            // standing-latency sawtooth. The leaky counter (~0.35s at these
+            // rates,
             // content-relative so it scales with any panel/rate) rides out
             // boundary wobble; a genuine slowdown still releases instantly
             // via clearlySlowerThanBand above, so slow content never pays
-            // the in-band cushion for long.
+            // the in-band queue target for long.
             if (!nearBuffered) {
                 nearBufferDwell = 0;
                 bandRearmDwell = 0;
@@ -889,20 +907,48 @@ int Pacer::cadenceThread(void* context)
         }
 
         // The clock snapping onto "now" after a stall wipes the standing
-        // buffer's phase offset; re-establish it in one step below rather
-        // than re-learning it over seconds of padding.
-        if (nearBuffered && clockPhaseReset) {
-            bandSnapPending = true;
+        // phase offset. Mark the first usable post-render age as acquisition
+        // evidence so recovery is based on observed readiness, not a planned
+        // render-start estimate that may already be behind the renderer.
+        if (clockPhaseReset) {
+            resetQueueAgeWindow();
+            if (nearBuffered) {
+                queueAgeController.restoreSafety(measuredSourceIntervalUs);
+                queueAcquisitionPending = true;
+            }
+            else {
+                queueAgeController.leaveNearCeiling();
+                queueAcquisitionPending = false;
+                lastNearBufferReleaseUs = 0;
+            }
         }
 
         if (nearBuffered != prevNearBuffered) {
+            resetQueueAgeWindow();
             if (nearBuffered) {
                 // Fresh from a latch spell or free-run chaos the panel is
                 // certainly on a fixed raster; allow the re-lock ritual to
-                // arm immediately, regardless of when the last one ran, and
-                // build the standing buffer in one step.
+                // arm immediately, regardless of when the last one ran. The
+                // first usable actual-age sample below drives acquisition.
                 lastRelockBurstUs = 0;
-                bandSnapPending = true;
+                bool resumeRecentState = lastNearBufferReleaseUs != 0 &&
+                    nowUs - lastNearBufferReleaseUs <= 5000000ULL;
+                if (!resumeRecentState) {
+                    queueAgeController.enterNearCeiling(
+                        measuredSourceIntervalUs);
+                }
+                queueAcquisitionPending = !resumeRecentState;
+                lastNearBufferReleaseUs = 0;
+            }
+            else {
+                // Band-edge rate wobble is not a new timing regime. Retain
+                // near-ceiling recovery/safety progress for five seconds so
+                // a quick re-entry resumes convergence. Learned spread can
+                // still update out of band; a long absence, phase reset, or
+                // material rate change forces reacquisition above.
+                lastNearBufferReleaseUs = clockPhaseReset ? 0 : nowUs;
+                phaseDelayUs = 0;
+                queueAcquisitionPending = false;
             }
             if (nowUs - lastBufferLogUs > 5000000ULL) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -917,7 +963,7 @@ int Pacer::cadenceThread(void* context)
             prevNearBuffered = nearBuffered;
         }
 
-        // Cached tear verdict: when earlier streams proved this content rate
+        // Cached tear verdict: when earlier probes in this stream proved this rate
         // chronically tears in-band on this display (ladder at or past the
         // chronic rung), latch immediately instead of paying the probe's
         // visible tear burst to rediscover it. One shot per rate per stream,
@@ -1025,102 +1071,55 @@ int Pacer::cadenceThread(void* context)
             targetUs = lastFlipUs + flipSpacingFloorUs;
         }
 
-        // Effective cushion: the latency servo's set-point (see the servo
-        // below) and the yardstick the stale/overfill thresholds are sized
-        // from, computed up here because the stale detection needs it.
-        // In-band it is the buffer target, sized from what actually
-        // threatens the flip instead of a blanket interval. The original
-        // fixed one-content-interval target dates from the shared-device
-        // render era (net render 8-13ms, stddev ~7ms), when the lead
-        // margin's ceiling could not cover the render tail and the
-        // standing buffer had to double as render-spike insurance. The
-        // render path now runs ~3.5-4ms (2026-07-06 phase-split
-        // telemetry), and the margin already starts every render early
-        // by the measured worst overshoot - an overshoot within the
-        // margin never consumes queue at all - so a full interval
-        // double-pays that protection as standing latency. The target is
-        //  - the cushion dial (the arrival-jitter budget, the same
-        //    meaning it has out of band),
-        //  - floored at 5/8 interval so the band always holds real
-        //    deliberate depth (the flip-decoupling it exists for) even
-        //    on a minimal dial,
-        //  - plus the render tail the margin provably cannot cover
-        //    right now: it grows the frame after a ceiling-busting
-        //    overshoot and decays with the ~12s overshoot window, so
-        //    the buffer re-fattens exactly when render misbehaves
-        //    (battery power states, shader-comp storms) and thins back
-        //    to the dial when it proves steady.
-        // Clamped as before so a measurement excursion (stall adopted
-        // as cadence while the band hysteresis is still releasing) can
-        // never target a multi-frame cushion.
-        // MOONLIGHT_VRR_FIXED_NEARBUFFER=1 restores the one-interval
-        // target for A/B; fixed-margin/classic builds keep it too,
-        // since without the adaptive margin there is no tail
-        // measurement to hand off.
-        // The measured need (worst clean-window spread + guard, see the
-        // jitter ring above) may only ever THIN the cushion below the
-        // static budgets - same one-way philosophy as the render-tail cap.
-        uint64_t effCushionUs = queueCushionUs;
-        if (jitterNeedUs != UINT64_MAX) {
-            effCushionUs = qBound((uint64_t)1500, jitterNeedUs,
-                                  queueCushionUs);
-        }
+        // One explicit total queue-age target feeds the servo and every
+        // stale/overfill threshold. Render-call overshoot is owned by the
+        // lead-margin controller; adding it here delayed render start without
+        // increasing render lead and double-counted present backpressure.
+        VrrQueueAgeController::Target queueTarget = queueAgeController.target(
+            nearBuffered, fixedNearBufferTarget, measuredSourceIntervalUs,
+            minFrameIntervalUs, scheduleGuardUs, queueAgeClampZoneUs);
+        uint64_t targetQueueAgeUs = queueTarget.queueAgeUs;
         if (nearBuffered) {
-            uint64_t bandTargetUs;
-            if (fixedNearBufferTarget || !adaptiveMargin) {
-                bandTargetUs = measuredSourceIntervalUs + scheduleGuardUs;
-            }
-            else {
-                // The render tail may only ever THIN the buffer below the
-                // old fixed one-interval design, never fatten it past that.
-                // At near-ceiling saturation the "render overshoots" the
-                // margin window sees are present-queue backpressure, not
-                // GPU work (wall render time == the flip retire interval;
-                // measured 2026-07-06 at 112-115fps as 17ms overshoots
-                // that pinned this target at its clamp), and feeding
-                // backpressure back as a bigger standing buffer deepens
-                // the very queue causing it - a 20-26ms measured spiral
-                // against the validated ~9ms design.
-                uint64_t staticBaseUs = qMax(queueCushionUs,
-                                             measuredSourceIntervalUs * 5 / 8);
-                uint64_t baseUs = jitterNeedUs != UINT64_MAX ?
-                    qBound((uint64_t)1500, jitterNeedUs, staticBaseUs) :
-                    staticBaseUs;
-                bandTargetUs = qMin(baseUs + renderTailBeyondMarginUs,
-                                    measuredSourceIntervalUs + scheduleGuardUs);
-            }
-            effCushionUs = qMax(effCushionUs,
-                                qMin(bandTargetUs,
-                                     minFrameIntervalUs + cushionClampZoneUs));
+            lastNearQueueAgeTargetUs = targetQueueAgeUs;
+        }
+        int queueAgeWindowSampleCap = VrrQueueAgeController::windowSampleCount(
+            measuredSourceIntervalUs, me->m_MaxVideoFps);
+
+        uint64_t queueTargetLogDeltaUs =
+            lastLoggedQueueTargetUs > targetQueueAgeUs ?
+                lastLoggedQueueTargetUs - targetQueueAgeUs :
+                targetQueueAgeUs - lastLoggedQueueTargetUs;
+        bool queueTargetRose = targetQueueAgeUs > lastLoggedQueueTargetUs;
+        if (lastLoggedQueueTargetUs == 0 ||
+                (queueTargetLogDeltaUs >= 500 &&
+                 (queueTargetRose || nowUs - lastQueueTargetLogUs > 5000000ULL))) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "VRR queue target: %.2f ms (%s policy %.2f ms, phase %.2f ms, safety %.2f ms)",
+                        targetQueueAgeUs / 1000.0,
+                        queueTarget.learned ? "learned" : "conservative",
+                        queueTarget.policyReserveUs / 1000.0,
+                        queueTarget.phaseReserveUs / 1000.0,
+                        queueTarget.safetyReserveUs / 1000.0);
+            lastQueueTargetLogUs = nowUs;
+            lastLoggedQueueTargetUs = targetQueueAgeUs;
         }
 
-        // Detect a schedule that has drifted late relative to frame delivery:
-        // a frame should spend roughly one content interval in the pipeline
-        // (decode completion -> pacing queue -> present), so one that is
-        // already older than that plus slack means every subsequent frame
-        // will queue behind us as pure added latency (measured as ~14ms avg
-        // frame queue delay against an 8.3ms frame time).
+        // Detect decode-to-render age that is too old to be deliberate phase
+        // reserve. Near ceiling, leave one source interval above the current
+        // target so routine timing variation does not trigger catch-up.
         uint64_t staleAgeUs =
             measuredSourceIntervalUs + measuredSourceIntervalUs / 4;
         bool bandDrainGrace = false;
         if (nearBuffered) {
-            // The deliberate standing buffer holds frames longer by design,
-            // so the stale trigger must sit beyond the buffer plus jitter -
-            // otherwise routine wobble fires ceiling-spaced rush catch-ups,
-            // the exact tight-flip generator the buffer exists to kill. It
-            // is sized from the ACTUAL buffer target: the old flat
-            // one-interval add dated from the fixed one-interval buffer,
-            // and against the thinner render-aware target it let post-hitch
-            // queues park a full interval above design (~19.4ms trigger vs
-            // a ~6ms set-point at 116fps) before anything rushed them out,
-            // leaving the 250us/frame trim to grind the excess off over
-            // seconds.
+            // Keep recovery one source interval beyond the live target.
+            // Anything younger is timing variation the queue is meant to
+            // absorb; anything older is excess that should converge.
             staleAgeUs = qMax(staleAgeUs,
-                              effCushionUs + measuredSourceIntervalUs);
-            bandStaleGraceFrames = slackWindowCap;
+                              targetQueueAgeUs + measuredSourceIntervalUs);
+            bandStaleGraceFrames = queueAgeWindowSampleCap;
         }
         else if (bandStaleGraceFrames > 0) {
-            // The band just released with its deliberate standing buffer
+            // The band just released with its deliberate queue-age reserve
             // still queued. Without a grace period the very first
             // out-of-band frame reads over the 1.25-interval stale
             // threshold and fires a max-rate rush burst - on content
@@ -1131,9 +1130,14 @@ int Pacer::cadenceThread(void* context)
             // trim servo drains the buffer at its gentle per-frame rate
             // instead.
             staleAgeUs = qMax(staleAgeUs,
-                              effCushionUs + measuredSourceIntervalUs);
+                              qMax(targetQueueAgeUs,
+                                   lastNearQueueAgeTargetUs) +
+                                  measuredSourceIntervalUs);
             bandStaleGraceFrames--;
             bandDrainGrace = true;
+            if (bandStaleGraceFrames == 0) {
+                lastNearQueueAgeTargetUs = 0;
+            }
         }
         bool staleSchedule = measuredSourceIntervalUs != 0 && frame->pkt_dts > 0 &&
             nowUs > (uint64_t)frame->pkt_dts + staleAgeUs;
@@ -1142,9 +1146,9 @@ int Pacer::cadenceThread(void* context)
         // used so the schedule converges back to arrival phase instead of
         // staying permanently late.
         //
-        // Genuinely stale (>1.25 content intervals of pipeline age - a real
-        // stall): rush at the panel's max refresh and skip blank alignment;
-        // a possible tear beats compounding lateness into dropped frames.
+        // Genuinely stale (the 1.25-interval baseline out of band, or target
+        // plus one interval near ceiling): rush and skip blank alignment; a
+        // possible tear beats compounding lateness into dropped frames.
         //
         // Merely backlogged (a transient extra queued frame, routine with
         // network jitter): drain gently at ~12% tighter than the measured
@@ -1154,6 +1158,7 @@ int Pacer::cadenceThread(void* context)
         // during camera pans, far more visible than the latency it saves
         // (measured: ~45% of frames rushed at 85fps content on Wi-Fi).
         bool rushPresent = false;
+        bool scheduleRecoveryRebased = false;
         if (lastFlipUs != 0) {
             if (staleSchedule) {
                 // Catch up at the free-run flip spacing floor (guarded
@@ -1181,14 +1186,15 @@ int Pacer::cadenceThread(void* context)
                 if (catchUpUs < targetUs) {
                     targetUs = catchUpUs;
                     cadenceClock.rebaseTarget(targetUs);
+                    scheduleRecoveryRebased = true;
                 }
                 rushPresent = true;
             }
             else if ((nearBuffered || bandDrainGrace) ?
                          queuedBehindCount >= 2 : backlogged) {
-                // In-band, one queued frame is the buffer operating as
-                // designed, not backlog - draining it would just re-expose
-                // the flip to jitter. Only a genuine 2+ pile-up drains.
+                // Queue age controls latency. Queue depth is only a pressure
+                // guard here: tolerate one transient successor while service
+                // is saturated, but drain a persistent 2+ successor pile-up.
                 uint64_t drainIntervalUs = qMax(flipSpacingFloorUs,
                                                 measuredSourceIntervalUs * 7 / 8);
                 uint64_t drainUs = qMax(lastFlipUs + drainIntervalUs,
@@ -1196,6 +1202,7 @@ int Pacer::cadenceThread(void* context)
                 if (drainUs < targetUs) {
                     targetUs = drainUs;
                     cadenceClock.rebaseTarget(targetUs);
+                    scheduleRecoveryRebased = true;
                 }
             }
         }
@@ -1209,211 +1216,29 @@ int Pacer::cadenceThread(void* context)
         uint64_t schedEstUs = me->m_EstimatedRenderTimeUs;
         uint64_t renderLeadUs = schedEstUs + leadMarginUs;
 
-        // Standing-latency servo. The schedule's phase only ever moves LATER
-        // on its own: a stall snaps the clock's target onto the processing
-        // instant of an already-late frame, the stale/drain rebases above
-        // anchor onto instants that are late by construction, and any
-        // residual cadence-rate error compounds open-loop - while
-        // early-arriving frames just wait, so nothing pulls phase back.
-        // Measured: after startup stalls a 60fps stream carried a permanent
-        // 15-24ms frame queue delay (equilibrium just under the
-        // 1.25-interval stale threshold) while pacing 100% in-blank. Track
-        // the MINIMUM estimated queue delay across a half-second window -
-        // the frame that arrived closest to its slot bounds how phase-late
-        // the whole schedule is - and counter it with a per-frame trim rate
-        // that spreads that excess over the next window, holding the floor
-        // at the queueCushionUs shock-absorber. The rate tops out at 250us/frame
-        // (~1.5-2.5% cadence compression, far below the 12% drain tier
-        // already judged imperceptible), and one late frame in the window
-        // vetoes the trim, so links whose jitter genuinely needs the queue
-        // as a shock absorber keep it (smoothness over latency).
-        // In-band, the servo's set-point moves up to the deliberate
-        // one-interval buffer and gains a symmetric build direction: the
-        // schedule only ever drifts later on its own, so without an active
-        // pad the buffer would only exist after a lucky stall. The pad
-        // stretches the cadence <=1% until the window-min age reaches the
-        // set-point; the trim shrinks it back identically once content
-        // leaves the band. A deep backlog or stale frame vetoes both.
-        uint64_t effDeadbandUs = effCushionUs + 1000;
+        // Phase is closed on actual queue age. Robust window percentiles below
+        // distinguish standing excess from isolated low/high samples; bounded
+        // per-frame motion corrects it without turning ordinary variation into
+        // catch-up judder. Stale or deeply backlogged frames taint learning.
         bool servoVeto = staleSchedule ||
             ((nearBuffered || bandDrainGrace) ?
                  queuedBehindCount >= 2 : backlogged);
 
-        // One-step buffer snap on band entry and after stall resets. The
-        // gradual pad below moves <=100us/frame (~1.5s to build the full
-        // cushion) - correct for drift, but on hitchy content (host
-        // processing spikes of 400-550ms every few seconds, measured
-        // 2026-07-04) the buffer got wiped faster than it could rebuild
-        // and in-band pacing effectively never had its jitter protection.
-        // A single deliberate phase step is imperceptible (it is latency,
-        // not motion) and buys immediate protection.
-        if (bandSnapPending) {
-            if (nearBuffered && !staleSchedule && frame->pkt_dts > 0) {
-                uint64_t renderStartEstUs = targetUs > renderLeadUs ?
-                    targetUs - renderLeadUs : 0;
-                uint64_t ageUs = renderStartEstUs > (uint64_t)frame->pkt_dts ?
-                    renderStartEstUs - (uint64_t)frame->pkt_dts : 0;
-                if (ageUs + 1000 < effCushionUs) {
-                    uint64_t snapUs = qMin(effCushionUs - ageUs,
-                                           (uint64_t)12000);
-                    targetUs += snapUs;
-                    cadenceClock.rebaseTarget(targetUs);
-                    slackWindowTainted = true;
-                    if (nowUs - lastSnapLogUs > 10000000ULL) {
-                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "VRR buffer snap: +%.2f ms to rebuild the standing buffer (age %.2f ms, cushion %.2f ms)",
-                                    snapUs / 1000.0,
-                                    ageUs / 1000.0,
-                                    effCushionUs / 1000.0);
-                        lastSnapLogUs = nowUs;
-                    }
-                }
-            }
-            bandSnapPending = false;
-        }
-
-        if (latencyTrimEnabled && frame->pkt_dts > 0) {
-            uint64_t renderStartEstUs = targetUs > renderLeadUs ?
-                targetUs - renderLeadUs : 0;
-            uint64_t frameQueueEstUs = renderStartEstUs > (uint64_t)frame->pkt_dts ?
-                renderStartEstUs - (uint64_t)frame->pkt_dts : 0;
-            slackWindowMinUs = qMin(slackWindowMinUs, frameQueueEstUs);
-            slackWindowMaxUs = qMax(slackWindowMaxUs, frameQueueEstUs);
-            if (servoVeto) {
-                slackWindowTainted = true;
-            }
-
-            if (++slackWindowSamples >= slackWindowCap) {
-                uint64_t newStepUs = 0;
-                uint64_t newPadUs = 0;
-                if (!servoVeto && slackWindowMinUs > effDeadbandUs) {
-                    newStepUs = qBound((uint64_t)20,
-                                       (slackWindowMinUs - effCushionUs) / (uint64_t)slackWindowCap,
-                                       (uint64_t)250);
-                }
-                else if (nearBuffered && !servoVeto &&
-                         slackWindowMinUs != UINT64_MAX &&
-                         slackWindowMinUs + 1000 < effCushionUs) {
-                    newPadUs = qBound((uint64_t)20,
-                                      (effCushionUs - slackWindowMinUs) / (uint64_t)slackWindowCap,
-                                      (uint64_t)100);
-                }
-                else if (nearBuffered && !staleSchedule &&
-                         slackWindowMinUs != UINT64_MAX &&
-                         slackWindowMinUs > effCushionUs +
-                             measuredSourceIntervalUs / 2) {
-                    // Standing overfill: at saturation (arrival rate ~=
-                    // service rate, routine at 116-on-120) the trim servo
-                    // is depth-vetoed and the gentle drain's ~140us/frame
-                    // never catches up, so the queue parks a whole extra
-                    // frame above the cushion - measured 2026-07-04 as a
-                    // standing 17-20ms queue against a 9ms design, sitting
-                    // right at the stale threshold and thrashing it. Shed
-                    // exactly one frame (a single ~8.6ms content skip, at
-                    // most twice a second) instead of letting random
-                    // queue-drop bursts and stale rushes do it messily.
-                    // Half an interval of persistent WINDOW-MIN excess
-                    // (tightened from 3/4 alongside the render-aware
-                    // target) is unambiguous: the pad/trim servo holds the
-                    // min at the cushion when healthy, a parked frame
-                    // shows up as a full interval, and jitter alone never
-                    // lifts the half-second minimum that far.
-                    overfillDropPending = true;
-                }
-                if (newStepUs != 0 && trimStepUs == 0 &&
-                        nowUs - lastTrimLogUs > 30000000ULL) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "VRR cadence trim: min queue %.2f ms last window, trimming %u us/frame",
-                                slackWindowMinUs / 1000.0,
-                                (unsigned int)newStepUs);
-                    lastTrimLogUs = nowUs;
-                }
-                if (newPadUs != 0 && padStepUs == 0 &&
-                        nowUs - lastTrimLogUs > 30000000ULL) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "VRR cadence pad: min queue %.2f ms last window, building buffer %u us/frame toward %.2f ms",
-                                slackWindowMinUs / 1000.0,
-                                (unsigned int)newPadUs,
-                                effCushionUs / 1000.0);
-                    lastTrimLogUs = nowUs;
-                }
-                // A window qualifies for the jitter measurement only if the
-                // schedule held still throughout: no trim/pad motion, no
-                // snap, no veto-grade event. What remains in max-min is the
-                // routine arrival turbulence the cushion exists to absorb
-                // (stalls and backlogs are the rush machinery's job, priced
-                // separately).
-                // Sustained chaos safety valve: a measurement frozen from a
-                // calmer era must not keep the cushion thin while the link
-                // is demonstrably turbulent. If no window has qualified for
-                // ~10s straight, forget the measurement and stand the
-                // static budgets back up until clean evidence returns.
-                if (slackWindowTainted || trimStepUs != 0 || padStepUs != 0) {
-                    if (++taintedWindowStreak >= 20) {
-                        jitterSpreadCount = 0;
-                        jitterNeedUs = UINT64_MAX;
-                    }
-                }
-                else {
-                    taintedWindowStreak = 0;
-                }
-                if (!staticCushion && !slackWindowTainted &&
-                        trimStepUs == 0 && padStepUs == 0 &&
-                        slackWindowMinUs != UINT64_MAX) {
-                    uint64_t spreadUs = slackWindowMaxUs - slackWindowMinUs;
-                    jitterSpreadRingUs[jitterSpreadHead] =
-                        (uint32_t)qMin(spreadUs, (uint64_t)UINT32_MAX);
-                    jitterSpreadHead = (jitterSpreadHead + 1) % 24;
-                    if (jitterSpreadCount < 24) {
-                        jitterSpreadCount++;
-                    }
-                    // ~4s of clean evidence before thinning begins; until
-                    // then the static budgets stand.
-                    if (jitterSpreadCount >= 8) {
-                        uint64_t worstUs = 0;
-                        for (int i = 0; i < jitterSpreadCount; i++) {
-                            worstUs = qMax(worstUs,
-                                           (uint64_t)jitterSpreadRingUs[i]);
-                        }
-                        uint64_t newNeedUs = worstUs + 750;
-                        uint64_t deltaUs = jitterNeedUs == UINT64_MAX ? newNeedUs :
-                            (newNeedUs > jitterNeedUs ? newNeedUs - jitterNeedUs :
-                                                        jitterNeedUs - newNeedUs);
-                        if (deltaUs > 1000 &&
-                                nowUs - lastCushionLogUs > 30000000ULL) {
-                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                        "VRR cushion: measured arrival spread %.2f ms over last %d clean windows (need %.2f ms, dial %.2f ms)",
-                                        worstUs / 1000.0,
-                                        jitterSpreadCount,
-                                        newNeedUs / 1000.0,
-                                        queueCushionUs / 1000.0);
-                            lastCushionLogUs = nowUs;
-                        }
-                        jitterNeedUs = newNeedUs;
-                    }
-                }
-                trimStepUs = newStepUs;
-                padStepUs = newPadUs;
-                slackWindowMinUs = UINT64_MAX;
-                slackWindowMaxUs = 0;
-                slackWindowTainted = false;
-                slackWindowSamples = 0;
-            }
-        }
-
-        if (trimStepUs > 0) {
-            if (servoVeto) {
-                // These paths rebase the schedule phase themselves; trimming
-                // on top of a rebase would over-correct. Re-measure instead.
-                trimStepUs = 0;
+        if (phaseAdvanceUs > 0) {
+            if (VrrQueueAgeController::shouldDiscardPhaseAdvance(
+                    staleSchedule, scheduleRecoveryRebased)) {
+                // A catch-up/drain rebase moves phase discontinuously. Discard
+                // the old trim and re-measure. Ordinary backlog no longer
+                // vetoes trimming unless its drain actually moved the target.
+                phaseAdvanceUs = 0;
             }
             else {
                 uint64_t floorUs = nowUs;
                 if (lastFlipUs != 0 && floorUs < lastFlipUs + flipSpacingFloorUs) {
                     floorUs = lastFlipUs + flipSpacingFloorUs;
                 }
-                uint64_t trimmedUs = targetUs > trimStepUs ?
-                    targetUs - trimStepUs : floorUs;
+                uint64_t trimmedUs = targetUs > phaseAdvanceUs ?
+                    targetUs - phaseAdvanceUs : floorUs;
                 if (trimmedUs < floorUs) {
                     trimmedUs = floorUs;
                 }
@@ -1423,33 +1248,30 @@ int Pacer::cadenceThread(void* context)
                 }
             }
         }
-        else if (padStepUs > 0) {
+        else if (fastRecoveryRemainingUs > 0) {
             if (servoVeto || !nearBuffered) {
-                padStepUs = 0;
+                fastRecoveryRemainingUs = 0;
             }
             else {
-                targetUs += padStepUs;
+                uint64_t fastDelayStepUs = qMin(
+                    fastRecoveryRemainingUs,
+                    qBound((uint64_t)100,
+                           measuredSourceIntervalUs / 32,
+                           (uint64_t)300));
+                targetUs += fastDelayStepUs;
                 cadenceClock.rebaseTarget(targetUs);
+                fastRecoveryRemainingUs -= fastDelayStepUs;
+                queueAgeWindowTainted = true;
             }
         }
-
-        if (overfillDropPending) {
-            AVFrame* overfillFrame = nullptr;
-            me->m_FrameQueueLock.lock();
-            if (nearBuffered && !me->m_PacingQueue.isEmpty()) {
-                overfillFrame = me->m_PacingQueue.dequeue();
+        else if (phaseDelayUs > 0) {
+            if (servoVeto || !nearBuffered) {
+                phaseDelayUs = 0;
             }
-            me->m_FrameQueueLock.unlock();
-            if (overfillFrame != nullptr) {
-                // Dropped frames must still feed the cadence clock - see
-                // observeSourceTime().
-                cadenceClock.observeSourceTime(
-                    frameCadenceTimestampUs(overfillFrame));
-                me->m_VideoStats->pacerDroppedFrames++;
-                av_frame_free(&overfillFrame);
-                me->maybeLogFrameDiagnostics("vrr buffer overfill drop", 0);
+            else {
+                targetUs += phaseDelayUs;
+                cadenceClock.rebaseTarget(targetUs);
             }
-            overfillDropPending = false;
         }
 
         uint64_t targetRenderStartUs = targetUs > renderLeadUs ?
@@ -1500,14 +1322,9 @@ int Pacer::cadenceThread(void* context)
         // pure churn (measured 2026-07-04: rituals arming every 2s for
         // minutes at 114-116fps content, avg waits 0.1-0.3ms against 10ms
         // budgets, zero locks established).
-        // NOTE: that verdict was earned in the shared-device render era,
-        // when net render (8.3-8.6ms) itself consumed the whole interval -
-        // the saturation WAS the render time. The 2026-07-06 render split
-        // cut net render to ~3.5-4ms, which invalidates the evidence
-        // behind the gate but not necessarily its conclusion (the panel
-        // may still refuse to flip-follow up there). The env override
-        // exists to re-ask the panel at 111fps+ in a controlled session,
-        // with the align stats and ritual logs as the verdict.
+        // Renderer changes invalidated the old saturation measurements, but
+        // not the possibility that a panel refuses to flip-follow this close
+        // to its ceiling. The env override keeps that gate testable.
         if (nearBuffered) {
             if (relockBurstRemaining > 0 &&
                     !me->m_VsyncRenderer->isVrrRasterLockUncertain()) {
@@ -1530,6 +1347,7 @@ int Pacer::cadenceThread(void* context)
             relockBurstRemaining = 0;
         }
 
+        bool recoveryAlignmentPresent = cadenceColdLatch;
         uint64_t alignBudgetUs;
         if ((alignTapered || cadenceColdLatch) && !nearBuffered) {
             // Content near or above this panel's true tear-free flip
@@ -1562,6 +1380,7 @@ int Pacer::cadenceThread(void* context)
             // (floor-spaced catch-up rebase) still applies - only the
             // wait-for-blank budget is protected here.
             relockBurstRemaining--;
+            recoveryAlignmentPresent = true;
             alignBudgetUs = minFrameIntervalUs + alignWideExtraUs;
         }
         else if (rushPresent) {
@@ -1673,11 +1492,13 @@ int Pacer::cadenceThread(void* context)
                     me->m_VsyncRenderer->isVrrRasterLockUncertain()) {
                 if (!backlogged) {
                     alignBudgetUs = maxAlignUs;
+                    recoveryAlignmentPresent = true;
                 }
                 else if (nowUs - lastWideReanchorUs > 1000000ULL) {
                     alignBudgetUs = qMax(alignSpinFloorUs,
                                          minFrameIntervalUs + alignWideExtraUs);
                     lastWideReanchorUs = nowUs;
+                    recoveryAlignmentPresent = true;
                 }
             }
         }
@@ -1698,7 +1519,194 @@ int Pacer::cadenceThread(void* context)
         me->m_VsyncRenderer->setPresentTargetUs(targetUs, rushPresent, alignBudgetUs,
                                                 vsyncLatchPresent, nearBuffered);
         me->m_VsyncRenderer->waitToRender();
-        me->renderFrame(frame);
+        const bool frameHasQueueTimestamp = frame->pkt_dts > 0;
+        uint64_t frameQueueAgeUs = me->renderFrame(frame);
+        uint32_t midScanTears = me->m_VsyncRenderer->popMidScanTearCount();
+
+        if (queueAgeServoEnabled && frameHasQueueTimestamp) {
+            // Close the servo on actual decode-completion to render-start
+            // age - the same quantity reported as frame queue delay in
+            // the performance overlay. The old planned-start estimate could
+            // sit a full synchronous render interval in the past at
+            // near-ceiling saturation, so it held a cushion on top of that
+            // unavoidable occupancy and parked one surplus frame.
+            uint32_t currentPacerDropCount =
+                me->m_VideoStats->pacerDroppedFrames;
+            if (currentPacerDropCount != lastObservedPacerDropCount) {
+                // A coalesced frame advances queue age by roughly one source
+                // interval. The following near-zero age is induced catch-up,
+                // not starvation; restart statistics and briefly suppress
+                // protection so a drop cannot immediately rebuild its buffer.
+                resetQueueAgeWindow();
+                postDropRecoverySuppressFrames = 4;
+                lastObservedPacerDropCount = currentPacerDropCount;
+            }
+            bool postDropRecoverySuppressed =
+                postDropRecoverySuppressFrames > 0;
+            if (postDropRecoverySuppressFrames > 0) {
+                postDropRecoverySuppressFrames--;
+            }
+
+            SDL_assert(queueAgeWindowSamples <
+                       (int)queueAgeWindowUs.size());
+            queueAgeWindowUs[queueAgeWindowSamples] =
+                (uint32_t)qMin(frameQueueAgeUs, (uint64_t)UINT32_MAX);
+            if (servoVeto || recoveryAlignmentPresent ||
+                    postDropRecoverySuppressed) {
+                queueAgeWindowTainted = true;
+            }
+
+            // Only a genuinely near-empty queue is a steady-state readiness
+            // miss. A normal 3-7ms age below a safety-inclusive target is not
+            // starvation and must not keep restoring protection forever.
+            // Entry/reset acquisition is separate: its first usable sample
+            // may request bounded recovery, but only from the measured age.
+            bool acquisitionSample = queueAcquisitionPending && nearBuffered &&
+                !staleSchedule && !servoVeto &&
+                !postDropRecoverySuppressed;
+            bool acquisitionShortfall = acquisitionSample &&
+                frameQueueAgeUs + 1000 < targetQueueAgeUs;
+            if (acquisitionSample) {
+                queueAcquisitionPending = false;
+            }
+            bool readinessNearMiss =
+                VrrQueueAgeController::isReadinessNearMiss(
+                    frameQueueAgeUs, postDropRecoverySuppressed);
+            if (nearBuffered && !staleSchedule && !servoVeto &&
+                    (readinessNearMiss || acquisitionShortfall)) {
+                bool protectionChanged = readinessNearMiss &&
+                    queueAgeController.restoreSafety(measuredSourceIntervalUs);
+                phaseAdvanceUs = 0;
+                VrrQueueAgeController::Target recoveryTarget =
+                    queueAgeController.target(
+                        nearBuffered, fixedNearBufferTarget,
+                        measuredSourceIntervalUs, minFrameIntervalUs,
+                        scheduleGuardUs, queueAgeClampZoneUs);
+                uint64_t recoveryDeficitUs =
+                    recoveryTarget.queueAgeUs > frameQueueAgeUs ?
+                        recoveryTarget.queueAgeUs - frameQueueAgeUs : 0;
+                phaseDelayUs = 0;
+                fastRecoveryRemainingUs = recoveryDeficitUs;
+                queueAgeWindowTainted = true;
+                if (protectionChanged) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR queue protection restored after %.2f ms readiness near miss",
+                                frameQueueAgeUs / 1000.0);
+                }
+                uint64_t queueFeedbackNowUs = LiGetMicroseconds();
+                if (acquisitionShortfall && recoveryDeficitUs != 0 &&
+                        queueFeedbackNowUs - lastQueueAcquisitionLogUs >
+                            10000000ULL) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR queue acquisition: measured age %.2f ms, recovering %.2f ms toward %.2f ms",
+                                frameQueueAgeUs / 1000.0,
+                                recoveryDeficitUs / 1000.0,
+                                recoveryTarget.queueAgeUs / 1000.0);
+                    lastQueueAcquisitionLogUs = queueFeedbackNowUs;
+                }
+            }
+            else if (frameQueueAgeUs + 1500 >= targetQueueAgeUs) {
+                fastRecoveryRemainingUs = 0;
+            }
+
+            if (++queueAgeWindowSamples >= queueAgeWindowSampleCap) {
+                VrrQueueAgeController::WindowStatistics queueStats =
+                    VrrQueueAgeController::summarizeWindow(
+                        queueAgeWindowUs.data(), queueAgeWindowSamples);
+                bool learningWindowClean = !queueAgeWindowTainted &&
+                    phaseAdvanceUs == 0 && phaseDelayUs == 0 &&
+                    fastRecoveryRemainingUs == 0;
+                uint64_t oldMeasuredReserveUs =
+                    queueAgeController.measuredReserveUs();
+                VrrQueueAgeController::Target oldQueueTarget =
+                    queueAgeController.target(
+                        nearBuffered, fixedNearBufferTarget,
+                        measuredSourceIntervalUs, minFrameIntervalUs,
+                        scheduleGuardUs, queueAgeClampZoneUs);
+                queueAgeController.observeWindow(
+                    queueStats.p10Us, queueStats.p90Us,
+                    learningWindowClean, nearBuffered);
+                VrrQueueAgeController::Target newQueueTarget =
+                    queueAgeController.target(
+                        nearBuffered, fixedNearBufferTarget,
+                        measuredSourceIntervalUs, minFrameIntervalUs,
+                        scheduleGuardUs, queueAgeClampZoneUs);
+
+                // Typical age controls excess latency even when an isolated
+                // backlog/stale sample tainted learning. Using the absolute
+                // minimum here let one low outlier pin most frames 4-10ms
+                // above target in the field. A coalescing drop is only armed
+                // after one full trim window failed to improve by even 0.5ms.
+                bool overfillEligible = phaseAdvanceUs != 0 &&
+                    previousQueueAgeMedianUs != 0 &&
+                    queueStats.medianUs + 500 >= previousQueueAgeMedianUs;
+                VrrQueueAgeController::PhaseDecisionInput phaseInput = {};
+                phaseInput.stats = queueStats;
+                phaseInput.targetAgeUs = newQueueTarget.queueAgeUs;
+                phaseInput.previousTargetAgeUs = oldQueueTarget.queueAgeUs;
+                phaseInput.sourceIntervalUs = measuredSourceIntervalUs;
+                phaseInput.sampleCount = queueAgeWindowSamples;
+                phaseInput.nearCeiling = nearBuffered;
+                phaseInput.windowTainted = queueAgeWindowTainted;
+                phaseInput.phaseAdvanceActive = phaseAdvanceUs != 0;
+                phaseInput.phaseDelayActive = phaseDelayUs != 0;
+                phaseInput.fastRecoveryActive =
+                    fastRecoveryRemainingUs != 0;
+                phaseInput.staleSchedule = staleSchedule;
+                phaseInput.overfillEligible = overfillEligible;
+                VrrQueueAgeController::PhaseDecision phaseDecision =
+                    VrrQueueAgeController::decidePhase(phaseInput);
+                uint64_t newPhaseAdvanceUs = phaseDecision.advanceUs;
+                uint64_t newPhaseDelayUs = phaseDecision.delayUs;
+
+                if (phaseDecision.requestOverfillDrop) {
+                    // If at least 80% of a window carries half an interval of
+                    // excess after a stalled trim, request one coalescing drop
+                    // when a replacement is immediately available.
+                    overfillDropPending = true;
+                    overfillDropDeadlineUs = LiGetMicroseconds() +
+                        qMax(measuredSourceIntervalUs * 2, (uint64_t)25000);
+                }
+                uint64_t queueNowUs = LiGetMicroseconds();
+                if (newPhaseAdvanceUs != 0 && phaseAdvanceUs == 0 &&
+                        queueNowUs - lastQueueServoLogUs > 30000000ULL) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR queue trim: median age %.2f ms (p20 %.2f), advancing %u us/frame toward %.2f ms",
+                                queueStats.medianUs / 1000.0,
+                                queueStats.p20Us / 1000.0,
+                                (unsigned int)newPhaseAdvanceUs,
+                                newQueueTarget.queueAgeUs / 1000.0);
+                    lastQueueServoLogUs = queueNowUs;
+                }
+                if (newPhaseDelayUs != 0 && phaseDelayUs == 0 &&
+                        queueNowUs - lastQueueServoLogUs > 30000000ULL) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR queue build: median age %.2f ms (p20 %.2f), delaying %u us/frame toward %.2f ms",
+                                queueStats.medianUs / 1000.0,
+                                queueStats.p20Us / 1000.0,
+                                (unsigned int)newPhaseDelayUs,
+                                newQueueTarget.queueAgeUs / 1000.0);
+                    lastQueueServoLogUs = queueNowUs;
+                }
+                uint64_t newMeasuredReserveUs =
+                    queueAgeController.measuredReserveUs();
+                if (learningWindowClean &&
+                        newMeasuredReserveUs != oldMeasuredReserveUs &&
+                        queueNowUs - lastQueueTargetLogUs > 5000000ULL) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR queue learning: p10-p90 %.2f-%.2f ms, measured reserve %.2f ms",
+                                queueStats.p10Us / 1000.0,
+                                queueStats.p90Us / 1000.0,
+                                newMeasuredReserveUs / 1000.0);
+                    lastQueueTargetLogUs = queueNowUs;
+                }
+                phaseAdvanceUs = newPhaseAdvanceUs;
+                phaseDelayUs = newPhaseDelayUs;
+                previousQueueAgeMedianUs = queueStats.medianUs;
+                queueAgeWindowTainted = false;
+                queueAgeWindowSamples = 0;
+            }
+        }
 
         // In-band tear-rate probe (see the feedback state above). Counted
         // only for non-latched in-band presents, and any regime change
@@ -1706,28 +1714,33 @@ int Pacer::cadenceThread(void* context)
         // 15% cleanly separates the measured populations: a working band
         // runs 0.2-2.6% torn, a non-following raster 40-95%.
         //
-        // The probe itself is the only tearing this regime shows the user,
-        // so it is kept as short and rare as the statistics allow:
-        //  - Early abort: 16 tears is already conclusive against a <3%
-        //    working band, so the probe fails the moment it accumulates
-        //    them (>=24 presents so a single burst can't decide alone) -
-        //    ~0.2s at the measured 70-90% failure rates instead of the
-        //    full 256-present window.
+        // The probe itself is visible. Use staged rate tests so a broken
+        // raster lock exits after a short burst without eventually treating
+        // isolated healthy tears as a cumulative failure. The final 64-frame
+        // verdict catches less extreme failures in about half a second.
         //  - Exponential backoff: consecutive failures at the same cadence
         //    double the latch period (60s up to 8min), so steady-state
         //    probe cost falls to ~0.1% of wall time. A passing probe or a
         //    genuine content-rate change (>600us from the failing
         //    interval) resets the period.
-        uint32_t midScanTears = me->m_VsyncRenderer->popMidScanTearCount();
         if (nearBuffered && !vsyncLatchPresent) {
             bandTearWindowPresents++;
             bandTearWindowTears += midScanTears;
 
             bool probeFailed = false;
-            if (bandTearWindowPresents >= 24 && bandTearWindowTears >= 16) {
+            if (bandTearWindowPresents >= 12 &&
+                    bandTearWindowPresents < 24 &&
+                    bandTearWindowTears * 100 >=
+                        bandTearWindowPresents * 30) {
                 probeFailed = true;
             }
-            else if (bandTearWindowPresents >= 256) {
+            else if (bandTearWindowPresents >= 24 &&
+                     bandTearWindowPresents < 64 &&
+                     bandTearWindowTears * 100 >=
+                        bandTearWindowPresents * 20) {
+                probeFailed = true;
+            }
+            else if (bandTearWindowPresents >= 64) {
                 probeFailed =
                     bandTearWindowTears * 100 >= bandTearWindowPresents * 15;
                 if (!probeFailed) {
@@ -1741,9 +1754,8 @@ int Pacer::cadenceThread(void* context)
 
             if (probeFailed) {
                 if (latchAvailable) {
-                    // Each content rate climbs its own ladder in the
-                    // calibration store, resuming from wherever earlier
-                    // streams left it.
+                    // Each content rate climbs its own per-stream ladder,
+                    // resuming after temporary content-rate changes.
                     uint32_t fallbackSecs = calibration.recordTearFail(
                         measuredSourceIntervalUs, nowUs,
                         me->m_EstimatedRenderTimeUs);
@@ -1784,13 +1796,6 @@ int Pacer::cadenceThread(void* context)
             int32_t windowMaxUs = INT32_MIN;
             for (int i = 0; i < overshootCount; i++) {
                 windowMaxUs = qMax(windowMaxUs, overshootRing[i]);
-            }
-
-            renderTailBeyondMarginUs = 0;
-            if (windowMaxUs > 0 &&
-                    (uint64_t)windowMaxUs + marginSlackUs > marginCeilUs) {
-                renderTailBeyondMarginUs =
-                    (uint64_t)windowMaxUs + marginSlackUs - marginCeilUs;
             }
 
             uint64_t targetMarginUs = windowMaxUs > 0 ?
@@ -2070,11 +2075,14 @@ void Pacer::signalVsync()
     m_VsyncSignalled.wakeOne();
 }
 
-void Pacer::renderFrame(AVFrame* frame)
+uint64_t Pacer::renderFrame(AVFrame* frame)
 {
-    // Count time spent in Pacer's queues
+    // Record decode-completion-to-render-start age for the pacing metric.
     uint64_t beforeRender = LiGetMicroseconds();
-    m_VideoStats->totalPacerTimeUs += (beforeRender - (uint64_t)frame->pkt_dts);
+    uint64_t frameQueueAgeUs = frame->pkt_dts > 0 &&
+        beforeRender > (uint64_t)frame->pkt_dts ?
+            beforeRender - (uint64_t)frame->pkt_dts : 0;
+    m_VideoStats->totalPacerTimeUs += frameQueueAgeUs;
 
     // Render it
     m_VsyncRenderer->renderFrame(frame);
@@ -2082,7 +2090,7 @@ void Pacer::renderFrame(AVFrame* frame)
 
     m_VideoStats->totalRenderTimeUs += (afterRender - beforeRender);
     m_VideoStats->renderedFrames++;
-    recordFrameInterval(beforeRender, afterRender, beforeRender - (uint64_t)frame->pkt_dts);
+    recordFrameInterval(beforeRender, afterRender, frameQueueAgeUs);
 
     uint64_t renderTimeUs = afterRender - beforeRender;
 
@@ -2152,6 +2160,7 @@ void Pacer::renderFrame(AVFrame* frame)
     }
 
     m_FrameQueueLock.unlock();
+    return frameQueueAgeUs;
 }
 
 bool Pacer::waitUntil(uint64_t targetUs)
