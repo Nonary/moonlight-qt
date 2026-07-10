@@ -2,6 +2,21 @@
 
 #include <stdint.h>
 
+// Keep tear calibration bands distinct at the rates users actually sweep.
+// A 600 us identity window merged the 100/105/110 FPS intervals (roughly
+// 10.0/9.5/9.1 ms), so a failed probe or fixed-vsync latch at one rate was
+// incorrectly reused at its neighbors. 250 us still absorbs ordinary
+// timestamp quantization while leaving ten-FPS steps as separate regimes.
+static constexpr uint64_t VRR_RATE_IDENTITY_TOLERANCE_US = 250;
+
+static inline bool vrrCadenceRateIdentityMatches(uint64_t firstIntervalUs,
+                                                  uint64_t secondIntervalUs)
+{
+    uint64_t deltaUs = firstIntervalUs > secondIntervalUs ?
+        firstIntervalUs - secondIntervalUs : secondIntervalUs - firstIntervalUs;
+    return deltaUs <= VRR_RATE_IDENTITY_TOLERANCE_US;
+}
+
 // Stale recovery normally uses the display's guarded flip floor. In the
 // smooth policy, high-rate content needs a gentler drain: compressing a
 // 90-96 FPS cadence all the way to a 120 Hz floor creates a visible speed-up
@@ -175,8 +190,11 @@ public:
         m_TimestamplessFrames = 0;
         m_PendingStallDeltaUs = 0;
         resetFasterCadenceCandidate();
+        resetSlowerCadenceCandidate();
         m_FasterCadenceAdopted = false;
         m_FasterCadenceTrusted = false;
+        m_SlowerCadenceAdopted = false;
+        m_SlowerCadenceTrusted = false;
     }
 
     // Feed a source timestamp into the cadence measurement without scheduling
@@ -200,6 +218,7 @@ public:
                 m_TimestamplessFrames++;
             }
             resetFasterCadenceCandidate();
+            resetSlowerCadenceCandidate();
             return;
         }
 
@@ -231,7 +250,7 @@ public:
             // the moving long-window mean from moving the goalpost. Ordinary
             // host-vsync quantization (for example 8.3/16.7 ms around 90 FPS)
             // breaks the streak and remains averaged by the normal window.
-            bool adoptedFasterCadenceThisSample = false;
+            bool adoptedCadenceStepThisSample = false;
             uint64_t fasterReferenceUs = m_FasterCadenceCandidateCount != 0 ?
                 m_FasterCadenceBaselineUs : m_SmoothedIntervalUs;
             bool fasterCadenceCandidate =
@@ -259,12 +278,59 @@ public:
                     m_PendingStallDeltaUs = 0;
                     m_FasterCadenceAdopted = true;
                     m_FasterCadenceTrusted = true;
-                    adoptedFasterCadenceThisSample = true;
+                    adoptedCadenceStepThisSample = true;
                     resetFasterCadenceCandidate();
                 }
             }
             else {
                 resetFasterCadenceCandidate();
+            }
+
+            // Downshifts need the same bounded handoff as upshifts. Without
+            // it, the half-second source window keeps the old near-ceiling
+            // cadence alive through a 60-70 FPS step, and the pacer alternates
+            // between the stale high-rate target and the new arrival times.
+            // Require six consecutive intervals at least 25% slower than the
+            // cadence that began the candidate. This is long enough to reject
+            // an isolated hitch, while adopting a real 60/70 FPS step in
+            // roughly one tenth of a second. The upper bound leaves genuine
+            // stalls to the existing stall/recovery path.
+            if (!adoptedCadenceStepThisSample) {
+                uint64_t slowerReferenceUs =
+                    m_SlowerCadenceCandidateCount != 0 ?
+                        m_SlowerCadenceBaselineUs : m_SmoothedIntervalUs;
+                bool slowerCadenceCandidate =
+                    sourceDeltaUs * 4 >= slowerReferenceUs * 5 &&
+                    sourceDeltaUs <= slowerReferenceUs * 2 &&
+                    sourceDeltaUs <= stallThresholdUs;
+                if (slowerCadenceCandidate) {
+                    if (m_SlowerCadenceCandidateCount == 0) {
+                        m_SlowerCadenceBaselineUs = m_SmoothedIntervalUs;
+                        m_SlowerCadenceTotalUs = 0;
+                    }
+                    m_SlowerCadenceTotalUs += sourceDeltaUs;
+                    m_SlowerCadenceCandidateCount++;
+                    if (m_SlowerCadenceCandidateCount >=
+                            SLOWER_CADENCE_CONFIRM_INTERVALS) {
+                        uint64_t adoptedIntervalUs = m_SlowerCadenceTotalUs /
+                            (uint64_t)m_SlowerCadenceCandidateCount;
+                        m_SmoothedIntervalUs = adoptedIntervalUs >
+                            m_NominalFrameIntervalUs ? adoptedIntervalUs :
+                            m_NominalFrameIntervalUs;
+                        m_SourceTimeCount = 0;
+                        m_PendingStallDeltaUs = 0;
+                        m_SlowerCadenceAdopted = true;
+                        m_SlowerCadenceTrusted = true;
+                        adoptedCadenceStepThisSample = true;
+                        resetSlowerCadenceCandidate();
+                    }
+                }
+                else {
+                    resetSlowerCadenceCandidate();
+                }
+            }
+            else {
+                resetSlowerCadenceCandidate();
             }
 
             if (sourceDeltaUs > stallThresholdUs) {
@@ -273,6 +339,8 @@ public:
                 // dropped-frame batch.
                 m_FasterCadenceAdopted = false;
                 m_FasterCadenceTrusted = false;
+                m_SlowerCadenceAdopted = false;
+                m_SlowerCadenceTrusted = false;
                 if (m_PendingStallDeltaUs != 0 &&
                         sourceDeltaUs <= MAX_ADOPTABLE_INTERVAL_US &&
                         m_PendingStallDeltaUs <= MAX_ADOPTABLE_INTERVAL_US &&
@@ -318,12 +386,12 @@ public:
             }
 
             int intervals = m_SourceTimeCount - 1;
-            if (!adoptedFasterCadenceThisSample && intervals >= 16) {
+            if (!adoptedCadenceStepThisSample && intervals >= 16) {
                 uint64_t oldestUs = m_SourceTimesUs[
                     (m_SourceTimeHead + m_SourceTimeCap - m_SourceTimeCount) % m_SourceTimeCap];
                 m_SmoothedIntervalUs = (sourceTimeUs - oldestUs) / (uint64_t)intervals;
             }
-            else if (!adoptedFasterCadenceThisSample &&
+            else if (!adoptedCadenceStepThisSample &&
                      sourceDeltaUs >= m_NominalFrameIntervalUs / 2 &&
                      sourceDeltaUs <= stallThresholdUs) {
                 // Warmup fallback until the window fills: the old EMA. Its
@@ -345,8 +413,11 @@ public:
             m_SourceTimeCount = 0;
             m_PendingStallDeltaUs = 0;
             resetFasterCadenceCandidate();
+            resetSlowerCadenceCandidate();
             m_FasterCadenceAdopted = false;
             m_FasterCadenceTrusted = false;
+            m_SlowerCadenceAdopted = false;
+            m_SlowerCadenceTrusted = false;
         }
 
         m_LastSourceTimeUs = sourceTimeUs;
@@ -372,17 +443,19 @@ public:
         // every second (measured as the latency trimmer in the pacer
         // re-arming 51 times in 3 minutes chasing regenerating lateness).
         // The windowed mean pairs every gap with its burst. A genuine stall,
-        // a timestamp going backwards on stream restart, or the guarded
-        // sustained rate-upshift detector above resets the window. It is also
+        // a timestamp going backwards on stream restart, or one of the
+        // guarded sustained rate-step detectors above resets the window. It is also
         // naturally immune to the single-spike EMA rides that the pacer's
         // taper hysteresis was added to absorb.
         observeSourceTime(sourceTimeUs);
 
         uint64_t targetUs = nowUs;
-        bool fasterCadenceAdopted = m_FasterCadenceAdopted;
+        bool cadenceStepAdopted = m_FasterCadenceAdopted ||
+            m_SlowerCadenceAdopted;
         m_FasterCadenceAdopted = false;
+        m_SlowerCadenceAdopted = false;
 
-        if (fasterCadenceAdopted) {
+        if (cadenceStepAdopted) {
             // Drop the old slow schedule immediately. The pacer still clamps
             // this target against the last actual flip and the panel's scanout
             // floor, so rebasing removes backlog without over-driving the
@@ -442,7 +515,8 @@ public:
     bool warmedUp() const
     {
         // Warm = enough monotonic samples spanning ~0.5s of content, or a
-        // cadence accepted by the guarded six-interval fast-upshift path.
+        // cadence accepted by one of the guarded six-interval rate-step
+        // paths.
         // Goes false on reset() and whenever the window restarts for a
         // genuine stall or non-monotonic timestamp - exactly the moments the
         // smoothed interval is least trustworthy (stream bring-up, loading
@@ -453,7 +527,8 @@ public:
         // for 2s after every window restart on a 116fps stream). Streams
         // that never carry usable timestamps report warm: nothing to
         // measure.
-        if (m_FasterCadenceTrusted || m_TimestamplessFrames >= 32) {
+        if (m_FasterCadenceTrusted || m_SlowerCadenceTrusted ||
+                m_TimestamplessFrames >= 32) {
             return true;
         }
         if (m_SourceTimeCount >= m_SourceTimeCap) {
@@ -472,6 +547,7 @@ public:
 private:
     static const int MAX_SOURCE_TIMES = 128;
     static const int FASTER_CADENCE_CONFIRM_INTERVALS = 6;
+    static const int SLOWER_CADENCE_CONFIRM_INTERVALS = 6;
     // Slowest delta pair adoptable as a real content cadence (~22fps); see
     // the adoption branch in observeSourceTime().
     static const uint64_t MAX_ADOPTABLE_INTERVAL_US = 45000;
@@ -481,6 +557,13 @@ private:
         m_FasterCadenceBaselineUs = 0;
         m_FasterCadenceTotalUs = 0;
         m_FasterCadenceCandidateCount = 0;
+    }
+
+    void resetSlowerCadenceCandidate()
+    {
+        m_SlowerCadenceBaselineUs = 0;
+        m_SlowerCadenceTotalUs = 0;
+        m_SlowerCadenceCandidateCount = 0;
     }
 
     uint64_t m_NominalFrameIntervalUs;
@@ -499,6 +582,11 @@ private:
     int m_FasterCadenceCandidateCount;
     bool m_FasterCadenceAdopted;
     bool m_FasterCadenceTrusted;
+    uint64_t m_SlowerCadenceBaselineUs;
+    uint64_t m_SlowerCadenceTotalUs;
+    int m_SlowerCadenceCandidateCount;
+    bool m_SlowerCadenceAdopted;
+    bool m_SlowerCadenceTrusted;
     bool m_PhaseReset;
 };
 

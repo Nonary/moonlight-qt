@@ -180,6 +180,18 @@ void testHeadroomFallbackPeriodAvoidsFloorJudder()
            "a first-offense latch should not be lengthened");
 }
 
+void testRateIdentityKeepsTenFpsBandsSeparate()
+{
+    expect(vrrCadenceRateIdentityMatches(9500, 9750),
+           "rate identity should include its 250 us quantization boundary");
+    expect(!vrrCadenceRateIdentityMatches(9500, 9751),
+           "rate identity should split intervals beyond the quantization band");
+    expect(!vrrCadenceRateIdentityMatches(9091, 9524),
+           "110 and 105 FPS must not share a tear verdict");
+    expect(!vrrCadenceRateIdentityMatches(9524, 10000),
+           "105 and 100 FPS must not share a tear verdict");
+}
+
 void testTearProbeWaitsForSettledTransition()
 {
     expect(vrrTearProbeTransitionSettled(false, false, 0, false),
@@ -303,6 +315,38 @@ void testFastCadenceAdoptionRespectsNominalCap()
         expect(!clock.consumePhaseReset(),
                "impossible above-nominal timestamps must not repeatedly rebase");
     }
+}
+
+void testSlowerCadenceDownshiftAdoption()
+{
+    VrrCadenceClock clock(116, 120);
+    uint64_t sourceUs = 1000000;
+    clock.nextTargetUs(sourceUs, sourceUs);
+
+    for (int i = 0; i < 40; i++) {
+        sourceUs += 8621;
+        clock.nextTargetUs(sourceUs, sourceUs);
+    }
+    expect(clock.smoothedIntervalUs() >= 8619 &&
+               clock.smoothedIntervalUs() <= 8622,
+           "the downshift test must begin from an established near-ceiling cadence");
+    clock.consumePhaseReset();
+
+    for (int i = 0; i < 5; i++) {
+        sourceUs += 14286;
+        clock.nextTargetUs(sourceUs, sourceUs);
+    }
+    expect(clock.smoothedIntervalUs() < 13000,
+           "fewer than six slower intervals must not rebase cadence");
+
+    sourceUs += 14286;
+    uint64_t targetUs = clock.nextTargetUs(sourceUs, sourceUs);
+    expect(clock.smoothedIntervalUs() >= 14284 &&
+               clock.smoothedIntervalUs() <= 14288,
+           "six sustained slower intervals must adopt their averaged cadence");
+    expect(targetUs == sourceUs && clock.consumePhaseReset() &&
+               clock.warmedUp(),
+           "slower cadence adoption must discard the old high-rate target phase");
 }
 
 void testRobustWindowStatistics()
@@ -542,10 +586,12 @@ int main()
     testSmoothHighRateCatchUpSpacing();
     testCatchUpTargetHonorsSmoothSpacing();
     testHeadroomFallbackPeriodAvoidsFloorJudder();
+    testRateIdentityKeepsTenFpsBandsSeparate();
     testTearProbeWaitsForSettledTransition();
     testFastCadenceUpshiftAdoption();
     testQuantizedCadenceDoesNotTriggerFastAdoption();
     testFastCadenceAdoptionRespectsNominalCap();
+    testSlowerCadenceDownshiftAdoption();
     testRobustWindowStatistics();
     testPhaseDecisionUsesOneSetpoint();
     testFastAttackAndBoundedRelease();

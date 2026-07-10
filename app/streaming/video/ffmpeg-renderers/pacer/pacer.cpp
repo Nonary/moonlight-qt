@@ -76,7 +76,6 @@ struct VrrTearVerdict {
 class VrrCalibrationStore
 {
 public:
-    static constexpr uint32_t kMatchToleranceUs = 600;   // same rate-identity window as the old single-slot ladder
     static constexpr uint32_t kBasePeriodSecs = 60;
     static constexpr uint32_t kMaxPeriodSecs = 480;
     static constexpr uint32_t kChronicPeriodSecs = 240;  // pre-latch without a probe at or above this
@@ -166,10 +165,8 @@ private:
     int findIndex(uint64_t intervalUs) const
     {
         for (int i = 0; i < m_Verdicts.count(); i++) {
-            uint64_t deltaUs = intervalUs > m_Verdicts[i].intervalUs ?
-                intervalUs - m_Verdicts[i].intervalUs :
-                m_Verdicts[i].intervalUs - intervalUs;
-            if (deltaUs <= kMatchToleranceUs) {
+            if (vrrCadenceRateIdentityMatches(
+                    intervalUs, m_Verdicts[i].intervalUs)) {
                 return i;
             }
         }
@@ -882,11 +879,8 @@ int Pacer::cadenceThread(void* context)
         bool clearlySlowerThanBand =
             measuredSourceIntervalUs >= minFrameIntervalUs + bandSlowReleaseZoneUs;
         if (bandTearFallbackIntervalUs != 0) {
-            uint64_t fallbackRateDeltaUs =
-                measuredSourceIntervalUs > bandTearFallbackIntervalUs ?
-                    measuredSourceIntervalUs - bandTearFallbackIntervalUs :
-                    bandTearFallbackIntervalUs - measuredSourceIntervalUs;
-            if (fallbackRateDeltaUs > VrrCalibrationStore::kMatchToleranceUs) {
+            if (!vrrCadenceRateIdentityMatches(
+                    measuredSourceIntervalUs, bandTearFallbackIntervalUs)) {
                 // A verdict is rate-specific. Do not carry fixed-vsync
                 // latency into materially different content that has not
                 // failed its own true-VRR probe.
@@ -1852,9 +1846,8 @@ int Pacer::cadenceThread(void* context)
         if (nearBuffered && !vsyncLatchPresent &&
                 tearProbeTransitionSettled) {
             if (bandTearProbeIntervalUs == 0 ||
-                    qAbs((qint64)measuredSourceIntervalUs -
-                         (qint64)bandTearProbeIntervalUs) >
-                        VrrCalibrationStore::kMatchToleranceUs) {
+                    !vrrCadenceRateIdentityMatches(
+                        measuredSourceIntervalUs, bandTearProbeIntervalUs)) {
                 // Never blend two materially different content rates into
                 // one verdict. Their raster-following behavior can differ
                 // even while both remain inside the buffered band.
