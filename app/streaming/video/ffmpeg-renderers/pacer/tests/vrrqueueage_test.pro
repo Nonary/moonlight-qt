@@ -5,4 +5,4 @@ TEMPLATE = app
 TARGET = vrrqueueage_test
 
 SOURCES += vrrqueueage_test.cpp
-HEADERS += ../vrrqueueage.h
+HEADERS += ../vrrqueueage.h ../vrrcadence.h

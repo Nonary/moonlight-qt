@@ -131,6 +131,7 @@ private:
     uint32_t m_AlignHits;
     uint32_t m_AlignGiveUps;
     uint32_t m_AlignSkips;
+    uint32_t m_AlignQueryFailures;
     uint32_t m_AlignVsyncLatches;
     uint32_t m_AlignRescueLatches;
     uint64_t m_AlignWaitTotalUs;

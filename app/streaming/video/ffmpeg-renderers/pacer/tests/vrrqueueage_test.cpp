@@ -1,4 +1,5 @@
 #include "../vrrqueueage.h"
+#include "../vrrcadence.h"
 
 #include <cstdio>
 
@@ -43,6 +44,213 @@ void testWindowDurationScalesWithCadence()
            "60 FPS should use a cadence-relative window");
     expect(VrrQueueAgeController::windowSampleCount(33333, 116) == 16,
            "low FPS should retain the 16-sample statistical floor");
+}
+
+void testNearCeilingAlignmentSlack()
+{
+    auto slackFor = [](int streamFps, int displayFps) {
+        uint64_t scanoutUs = 1000000ULL / displayFps;
+        uint64_t cadenceGuardUs = scanoutUs * 24 / 1000;
+        uint64_t flipFloorUs = scanoutUs + scanoutUs * 18 / 1000;
+        uint64_t serviceGuardUs = scanoutUs * 6 / 1000;
+        return vrrCadenceAlignmentSlackUs(
+            1000000ULL / streamFps, scanoutUs, cadenceGuardUs,
+            flipFloorUs, serviceGuardUs);
+    };
+
+    expect(slackFor(58, 60) == 176,
+           "58/60 alignment must stay within its 176 us service slack");
+    expect(slackFor(116, 120) == 88,
+           "116/120 alignment must not retain the old 600 us floor");
+    expect(slackFor(232, 240) == 45,
+           "232/240 alignment geometry must scale with scanout period");
+    expect(slackFor(236, 240) == 0,
+           "content beyond the guarded service ceiling has no align budget");
+
+    uint64_t customFloorUs = 9333;
+    uint64_t customSlackUs = vrrCadenceAlignmentSlackUs(
+        10000, 8333, 199, customFloorUs, 49);
+    expect(customSlackUs == 618 &&
+               customFloorUs + 49 + customSlackUs == 10000,
+           "custom spacing floors must remain inside source cadence");
+}
+
+void testSmoothHighRateCatchUpSpacing()
+{
+    constexpr uint64_t displayIntervalUs = 8333;
+    constexpr uint64_t flipFloorUs = 8483;
+    constexpr uint64_t highRateSourceUs = 11025;
+
+    uint64_t smoothSpacingUs = vrrCatchUpSpacingUs(
+        flipFloorUs, highRateSourceUs, displayIntervalUs, false, true);
+    expect(smoothSpacingUs == 9646,
+           "smooth high-rate recovery should drain at seven-eighths cadence");
+    expect(vrrCadenceAlignmentSlackUs(
+               highRateSourceUs, displayIntervalUs, 199,
+               smoothSpacingUs, 49) == 1330,
+           "gentle catch-up spacing must reduce the remaining align budget");
+
+    expect(vrrCatchUpSpacingUs(
+               flipFloorUs, highRateSourceUs, displayIntervalUs,
+               false, false) == flipFloorUs,
+           "disabled smooth recovery should retain the fastest drain");
+    expect(vrrCatchUpSpacingUs(
+               flipFloorUs, 33333, displayIntervalUs,
+               false, true) == flipFloorUs,
+           "low-FPS upshifts should retain the fastest drain");
+    expect(vrrCatchUpSpacingUs(
+               flipFloorUs, 33333, displayIntervalUs,
+               true, false) == 29166,
+           "latched recovery should keep its rate-independent gentle drain");
+    expect(vrrCatchUpSpacingUs(
+               flipFloorUs, 9100, displayIntervalUs,
+               false, true) == flipFloorUs,
+           "near-ceiling recovery should remain bounded by the flip floor");
+
+    uint64_t fullGentleLimitUs = (displayIntervalUs * 4 + 2) / 3;
+    uint64_t fullFloorLimitUs = (displayIntervalUs * 8 + 4) / 5;
+    uint64_t atGentleLimitUs = vrrCatchUpSpacingUs(
+        flipFloorUs, fullGentleLimitUs, displayIntervalUs, false, true);
+    uint64_t justInsideBlendUs = vrrCatchUpSpacingUs(
+        flipFloorUs, fullGentleLimitUs + 1,
+        displayIntervalUs, false, true);
+    uint64_t justBeforeFloorUs = vrrCatchUpSpacingUs(
+        flipFloorUs, fullFloorLimitUs - 1,
+        displayIntervalUs, false, true);
+    expect(justInsideBlendUs <= atGentleLimitUs &&
+               atGentleLimitUs - justInsideBlendUs <= 4,
+           "the high-rate recovery boundary must not jump pacing phase");
+    expect(justBeforeFloorUs >= flipFloorUs &&
+               justBeforeFloorUs - flipFloorUs <= 4 &&
+               vrrCatchUpSpacingUs(
+                   flipFloorUs, fullFloorLimitUs, displayIntervalUs,
+                   false, true) == flipFloorUs,
+           "the low-rate edge must blend continuously back to fast recovery");
+}
+
+void testTearProbeWaitsForSettledTransition()
+{
+    expect(vrrTearProbeTransitionSettled(false, false, 0, false),
+           "ordinary in-band presents should feed the tear probe");
+    expect(!vrrTearProbeTransitionSettled(true, false, 0, false),
+           "re-lock alignment presents must not poison the tear probe");
+    expect(!vrrTearProbeTransitionSettled(false, true, 0, false),
+           "active queue acquisition must hold off the tear probe");
+    expect(!vrrTearProbeTransitionSettled(false, false, 400, false),
+           "active fast queue recovery must hold off the tear probe");
+    expect(!vrrTearProbeTransitionSettled(false, false, 0, true),
+           "the final fast-recovery present must still be excluded");
+
+    expect(vrrQueueAcquisitionTransitionActive(true, true, true),
+           "usable pending feedback should mark acquisition active");
+    expect(!vrrQueueAcquisitionTransitionActive(false, true, true),
+           "disabled queue feedback must not suppress tear probing");
+    expect(!vrrQueueAcquisitionTransitionActive(true, false, true),
+           "a stream without queue timestamps must not suppress tear probing");
+    expect(!vrrQueueAcquisitionTransitionActive(true, true, false),
+           "completed acquisition must not suppress tear probing");
+
+    expect(vrrQueueAcquisitionOverlapsRecovery(true, true, 1000, false),
+           "a later re-lock must cancel an active fast queue build");
+    expect(vrrQueueAcquisitionOverlapsRecovery(true, true, 0, true),
+           "the final applied fast-build step must trigger remeasurement");
+    expect(!vrrQueueAcquisitionOverlapsRecovery(false, true, 1000, false),
+           "out-of-band recovery must not arm near-ceiling acquisition");
+    expect(!vrrQueueAcquisitionOverlapsRecovery(true, false, 1000, false),
+           "ordinary queue acquisition must remain active without re-lock");
+}
+
+void testFastCadenceUpshiftAdoption()
+{
+    VrrCadenceClock clock(116, 120);
+    uint64_t sourceUs = 1000000;
+    uint64_t targetUs = clock.nextTargetUs(sourceUs, sourceUs);
+
+    for (int i = 0; i < 40; i++) {
+        sourceUs += 33333;
+        targetUs = clock.nextTargetUs(sourceUs, sourceUs);
+    }
+    expect(clock.smoothedIntervalUs() > 32000,
+           "steady 30 FPS content must establish its slow cadence");
+    clock.consumePhaseReset();
+
+    const uint64_t fasterPatternUs[] = {
+        8333, 8333, 16667, 8333, 8333, 16667,
+    };
+    for (int i = 0; i < 5; i++) {
+        sourceUs += fasterPatternUs[i];
+        targetUs = clock.nextTargetUs(sourceUs, sourceUs);
+    }
+    expect(clock.smoothedIntervalUs() > 20000,
+           "fewer than six fast intervals must not rebase cadence");
+
+    sourceUs += fasterPatternUs[5];
+    targetUs = clock.nextTargetUs(sourceUs, sourceUs);
+    expect(clock.smoothedIntervalUs() >= 11110 &&
+               clock.smoothedIntervalUs() <= 11112,
+           "six sustained fast intervals must adopt their averaged cadence");
+    expect(targetUs == sourceUs && clock.consumePhaseReset() &&
+               clock.warmedUp(),
+           "fast cadence adoption must discard the old slow target phase");
+}
+
+void testQuantizedCadenceDoesNotTriggerFastAdoption()
+{
+    VrrCadenceClock clock(116, 120);
+    uint64_t sourceUs = 1000000;
+    clock.observeSourceTime(sourceUs);
+    for (int i = 0; i < 40; i++) {
+        sourceUs += 16667;
+        clock.observeSourceTime(sourceUs);
+    }
+    expect(clock.smoothedIntervalUs() > 16000,
+           "the quantization test must begin from an established 60 FPS cadence");
+
+    const uint64_t quantizedPatternUs[] = { 8333, 8333, 8333, 8333, 16668 };
+    uint64_t minimumObservedUs = 1000000;
+
+    for (int cycle = 0; cycle < 20; cycle++) {
+        for (uint64_t deltaUs : quantizedPatternUs) {
+            sourceUs += deltaUs;
+            clock.observeSourceTime(sourceUs);
+            minimumObservedUs = qMin(minimumObservedUs,
+                                     clock.smoothedIntervalUs());
+        }
+    }
+
+    expect(minimumObservedUs >= 9500 &&
+               clock.smoothedIntervalUs() >= 9900 &&
+               clock.smoothedIntervalUs() <= 10100,
+           "the long host-vsync slot must break fast adoption while the normal window converges near 100 FPS");
+}
+
+void testFastCadenceAdoptionRespectsNominalCap()
+{
+    VrrCadenceClock clock(116, 120);
+    uint64_t sourceUs = 1000000;
+    clock.nextTargetUs(sourceUs, sourceUs);
+    for (int i = 0; i < 40; i++) {
+        sourceUs += 33333;
+        clock.nextTargetUs(sourceUs, sourceUs);
+    }
+    clock.consumePhaseReset();
+    for (int i = 0; i < 6; i++) {
+        sourceUs += 5000;
+        clock.nextTargetUs(sourceUs, sourceUs);
+    }
+
+    expect(clock.smoothedIntervalUs() == 1000000ULL / 116 &&
+               clock.consumePhaseReset(),
+           "fast adoption must clamp and rebase at negotiated FPS");
+
+    for (int i = 0; i < 20; i++) {
+        sourceUs += 5000;
+        clock.nextTargetUs(sourceUs, sourceUs);
+        expect(clock.smoothedIntervalUs() == 1000000ULL / 116,
+               "subsequent timestamp updates must retain the negotiated FPS cap");
+        expect(!clock.consumePhaseReset(),
+               "impossible above-nominal timestamps must not repeatedly rebase");
+    }
 }
 
 void testRobustWindowStatistics()
@@ -278,6 +486,12 @@ void testBoundsAndLowFpsHeadroom()
 int main()
 {
     testWindowDurationScalesWithCadence();
+    testNearCeilingAlignmentSlack();
+    testSmoothHighRateCatchUpSpacing();
+    testTearProbeWaitsForSettledTransition();
+    testFastCadenceUpshiftAdoption();
+    testQuantizedCadenceDoesNotTriggerFastAdoption();
+    testFastCadenceAdoptionRespectsNominalCap();
     testRobustWindowStatistics();
     testPhaseDecisionUsesOneSetpoint();
     testFastAttackAndBoundedRelease();

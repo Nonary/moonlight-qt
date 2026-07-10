@@ -991,7 +991,7 @@ Flickable {
                                 ToolTip.delay: 1000
                                 ToolTip.timeout: 5000
                                 ToolTip.visible: hovered
-                                ToolTip.text: qsTr("Paces each frame to your display's variable refresh rate (G-Sync, FreeSync) for smooth, tear-free streaming at lower latency than fixed V-Sync.\nEnabling VRR selects the recommended VRR frame rate for your display and forces borderless windowed mode while streaming. Battery-powered Windows sessions use the lower VRR rate to retain render headroom without changing your saved frame rate.\nVRR pacing is latency-sensitive, so while streaming it asks Windows to run at full CPU/GPU performance and keeps your system and display from sleeping. This uses more power than standard V-Sync, so expect reduced battery life on a laptop.")
+                                ToolTip.text: qsTr("Paces each frame to your display's variable refresh rate (G-Sync, FreeSync) for smooth, tear-free streaming at lower latency than fixed V-Sync.\nEnabling VRR selects the recommended VRR frame rate for your display and forces borderless windowed mode while streaming.\nVRR pacing is latency-sensitive, so while streaming it asks Windows to run at full CPU/GPU performance and keeps your system and display from sleeping. This uses more power than standard V-Sync, so expect reduced battery life on a laptop.")
                             }
 
                             CheckBox {

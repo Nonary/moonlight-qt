@@ -143,6 +143,7 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_RenderPhaseGpuWaitTotalUs(0),
       m_RenderPhaseSamples(0),
       m_RenderPhaseLastLogUs(0),
+      m_RenderPhaseLogPendingUs(0),
       m_RenderPhaseSubmitMinUs(UINT64_MAX),
       m_RenderPhaseGpuWaitMinUs(UINT64_MAX),
       m_FrameLatencyWaitableObject(nullptr),
@@ -1349,35 +1350,12 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         // pool from the prior stream, vs a flat footprint with a high gpu-wait
         // = the GPU simply running at a lower clock).
         if (gpuDoneUs - m_RenderPhaseLastLogUs > 5000000ULL) {
-            if (m_RenderPhaseLastLogUs != 0 && m_RenderPhaseSamples > 0) {
-                double vramMb = -1.0;
-                ComPtr<IDXGIAdapter1> diagAdapter;
-                if (m_Factory != nullptr &&
-                        SUCCEEDED(m_Factory->EnumAdapters1(m_AdapterIndex, &diagAdapter))) {
-                    ComPtr<IDXGIAdapter3> diagAdapter3;
-                    DXGI_QUERY_VIDEO_MEMORY_INFO memInfo = {};
-                    if (SUCCEEDED(diagAdapter.As(&diagAdapter3)) &&
-                            SUCCEEDED(diagAdapter3->QueryVideoMemoryInfo(
-                                0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo))) {
-                        vramMb = memInfo.CurrentUsage / (1024.0 * 1024.0);
-                    }
-                }
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "D3D11 render phases: cpu-submit avg %.2f (min %.2f) ms, gpu-wait avg %.2f (min %.2f) ms over %u frames, %s devices, process VRAM %.0f MB",
-                            m_RenderPhaseSubmitTotalUs / 1000.0 / m_RenderPhaseSamples,
-                            m_RenderPhaseSubmitMinUs / 1000.0,
-                            m_RenderPhaseGpuWaitTotalUs / 1000.0 / m_RenderPhaseSamples,
-                            m_RenderPhaseGpuWaitMinUs / 1000.0,
-                            m_RenderPhaseSamples,
-                            m_DecodeDevice == m_RenderDevice ? "shared" : "separate",
-                            vramMb);
-            }
-            m_RenderPhaseSubmitTotalUs = 0;
-            m_RenderPhaseGpuWaitTotalUs = 0;
-            m_RenderPhaseSubmitMinUs = UINT64_MAX;
-            m_RenderPhaseGpuWaitMinUs = UINT64_MAX;
-            m_RenderPhaseSamples = 0;
-            m_RenderPhaseLastLogUs = gpuDoneUs;
+            // Querying DXGI memory state and formatting a log here used to
+            // run after the GPU fence but before blank alignment/Present(),
+            // periodically making the telemetry itself miss the flip. Defer
+            // that work until the present has completed and the context lock
+            // is released below.
+            m_RenderPhaseLogPendingUs = gpuDoneUs;
         }
         if (!unlocked && m_DecodeDevice == m_RenderDevice) {
             // No fence support: still drop the lock for the waits below.
@@ -2131,6 +2109,11 @@ const char* D3D11VARenderer::getPresentationModeFallbackReason()
 
 uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
 {
+    // Pacer takes its render-completion timestamp before this callback, so
+    // expensive diagnostic queries cannot inflate the render estimator or
+    // lead-margin controller. The actual Present() is already complete too.
+    logRenderPhaseStats();
+
     if (m_UsePmSwapchain) {
         // No alignment waits exist in this mode; the analogous
         // non-render idle time is waiting for a presentation buffer.
@@ -2138,6 +2121,45 @@ uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
     }
 
     return m_VrrPresenter.popAlignmentWaitUs();
+}
+
+void D3D11VARenderer::logRenderPhaseStats()
+{
+    if (m_RenderPhaseLogPendingUs == 0) {
+        return;
+    }
+
+    uint64_t logNowUs = m_RenderPhaseLogPendingUs;
+    m_RenderPhaseLogPendingUs = 0;
+    if (m_RenderPhaseLastLogUs != 0 && m_RenderPhaseSamples > 0) {
+        double vramMb = -1.0;
+        ComPtr<IDXGIAdapter1> diagAdapter;
+        if (m_Factory != nullptr &&
+                SUCCEEDED(m_Factory->EnumAdapters1(m_AdapterIndex, &diagAdapter))) {
+            ComPtr<IDXGIAdapter3> diagAdapter3;
+            DXGI_QUERY_VIDEO_MEMORY_INFO memInfo = {};
+            if (SUCCEEDED(diagAdapter.As(&diagAdapter3)) &&
+                    SUCCEEDED(diagAdapter3->QueryVideoMemoryInfo(
+                        0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo))) {
+                vramMb = memInfo.CurrentUsage / (1024.0 * 1024.0);
+            }
+        }
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 render phases: cpu-submit avg %.2f (min %.2f) ms, gpu-wait avg %.2f (min %.2f) ms over %u frames, %s devices, process VRAM %.0f MB",
+                    m_RenderPhaseSubmitTotalUs / 1000.0 / m_RenderPhaseSamples,
+                    m_RenderPhaseSubmitMinUs / 1000.0,
+                    m_RenderPhaseGpuWaitTotalUs / 1000.0 / m_RenderPhaseSamples,
+                    m_RenderPhaseGpuWaitMinUs / 1000.0,
+                    m_RenderPhaseSamples,
+                    m_DecodeDevice == m_RenderDevice ? "shared" : "separate",
+                    vramMb);
+    }
+    m_RenderPhaseSubmitTotalUs = 0;
+    m_RenderPhaseGpuWaitTotalUs = 0;
+    m_RenderPhaseSubmitMinUs = UINT64_MAX;
+    m_RenderPhaseGpuWaitMinUs = UINT64_MAX;
+    m_RenderPhaseSamples = 0;
+    m_RenderPhaseLastLogUs = logNowUs;
 }
 
 void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch, bool nearBuffered)

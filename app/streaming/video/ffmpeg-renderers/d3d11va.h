@@ -77,6 +77,7 @@ private:
     void logPresentationMode(SDL_Window* window, const DXGI_SWAP_CHAIN_DESC1* swapChainDesc, int outputIndex, const char* fallbackReason);
     void refreshOutput();
     bool signalAndUnlockForPresent();
+    void logRenderPhaseStats();
 
     int m_DecoderSelectionPass;
     int m_DevicesWithFL11Support;
@@ -125,6 +126,7 @@ private:
     uint64_t m_RenderPhaseGpuWaitTotalUs;
     uint32_t m_RenderPhaseSamples;
     uint64_t m_RenderPhaseLastLogUs;
+    uint64_t m_RenderPhaseLogPendingUs;
     // Per-window minima: a high gpu-wait MIN means the GPU is sustained-slow
     // (downclocked/underpowered - the whole no-load frame costs more), while a
     // low min with a high avg means intermittent contention. This is the

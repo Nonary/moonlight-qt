@@ -2,6 +2,102 @@
 
 #include <stdint.h>
 
+// Stale recovery normally uses the display's guarded flip floor. In the
+// smooth policy, high-rate content needs a gentler drain: compressing a
+// 90-96 FPS cadence all the way to a 120 Hz floor creates a visible speed-up
+// and a slowly walking tear line while raster lock is uncertain. Retain the
+// aggressive floor for explicit low-latency/A-B modes and low-FPS upshifts.
+// The short 90-to-75 FPS blend avoids a target jump when measured cadence
+// straddles the policy boundary. Latched presentation keeps its existing
+// gentle drain at every rate.
+static inline uint64_t vrrCatchUpSpacingUs(
+    uint64_t flipSpacingFloorUs,
+    uint64_t sourceIntervalUs,
+    uint64_t minFrameIntervalUs,
+    bool latchedPresents,
+    bool smoothRecovery)
+{
+    uint64_t gentleDrainUs = sourceIntervalUs * 7 / 8;
+    if (gentleDrainUs < flipSpacingFloorUs) {
+        gentleDrainUs = flipSpacingFloorUs;
+    }
+    if (latchedPresents) {
+        return gentleDrainUs;
+    }
+    if (!smoothRecovery || minFrameIntervalUs == 0 ||
+            gentleDrainUs == flipSpacingFloorUs) {
+        return flipSpacingFloorUs;
+    }
+
+    uint64_t fullGentleLimitUs = (minFrameIntervalUs * 4 + 2) / 3;
+    if (sourceIntervalUs <= fullGentleLimitUs) {
+        return gentleDrainUs;
+    }
+
+    uint64_t fullFloorLimitUs = (minFrameIntervalUs * 8 + 4) / 5;
+    if (sourceIntervalUs >= fullFloorLimitUs) {
+        return flipSpacingFloorUs;
+    }
+
+    uint64_t blendWidthUs = fullFloorLimitUs - fullGentleLimitUs;
+    uint64_t gentleExtraUs = gentleDrainUs - flipSpacingFloorUs;
+    uint64_t blendRemainingUs = fullFloorLimitUs - sourceIntervalUs;
+    return flipSpacingFloorUs +
+        gentleExtraUs * blendRemainingUs / blendWidthUs;
+}
+
+// Maximum time an alignment wait may consume without making the selected
+// flip-spacing floor plus alignment service slower than the source cadence.
+// The cadence guard retains the existing nominal-scanout safety margin; the
+// service guard also covers a larger runtime/env-selected spacing floor.
+static inline uint64_t vrrCadenceAlignmentSlackUs(
+    uint64_t sourceIntervalUs,
+    uint64_t minFrameIntervalUs,
+    uint64_t cadenceGuardUs,
+    uint64_t flipSpacingFloorUs,
+    uint64_t serviceGuardUs)
+{
+    uint64_t cadenceFloorUs = minFrameIntervalUs + cadenceGuardUs;
+    uint64_t serviceFloorUs = flipSpacingFloorUs + serviceGuardUs;
+    uint64_t budgetFloorUs = cadenceFloorUs > serviceFloorUs ?
+        cadenceFloorUs : serviceFloorUs;
+    return sourceIntervalUs > budgetFloorUs ?
+        sourceIntervalUs - budgetFloorUs : 0;
+}
+
+// A long-lived tear-rate verdict must describe normal in-band operation, not
+// the bounded transition used to acquire queue phase and raster lock. The
+// explicit per-present flag covers the final fast-recovery step, where the
+// remaining counter reaches zero before the present is measured.
+static inline bool vrrTearProbeTransitionSettled(
+    bool recoveryAlignmentPresent,
+    bool queueAcquisitionActive,
+    uint64_t fastRecoveryRemainingUs,
+    bool fastQueueRecoveryPresent)
+{
+    return !recoveryAlignmentPresent && !queueAcquisitionActive &&
+        fastRecoveryRemainingUs == 0 && !fastQueueRecoveryPresent;
+}
+
+static inline bool vrrQueueAcquisitionTransitionActive(
+    bool queueAgeServoEnabled,
+    bool frameHasQueueTimestamp,
+    bool queueAcquisitionPending)
+{
+    return queueAgeServoEnabled && frameHasQueueTimestamp &&
+        queueAcquisitionPending;
+}
+
+static inline bool vrrQueueAcquisitionOverlapsRecovery(
+    bool nearBuffered,
+    bool recoveryAlignmentPresent,
+    uint64_t fastRecoveryRemainingUs,
+    bool fastQueueRecoveryPresent)
+{
+    return nearBuffered && recoveryAlignmentPresent &&
+        (fastRecoveryRemainingUs != 0 || fastQueueRecoveryPresent);
+}
+
 class VrrCadenceClock
 {
 public:
@@ -36,6 +132,9 @@ public:
         m_SourceTimeCount = 0;
         m_TimestamplessFrames = 0;
         m_PendingStallDeltaUs = 0;
+        resetFasterCadenceCandidate();
+        m_FasterCadenceAdopted = false;
+        m_FasterCadenceTrusted = false;
     }
 
     // Feed a source timestamp into the cadence measurement without scheduling
@@ -58,6 +157,7 @@ public:
             if (m_TimestamplessFrames < 1000) {
                 m_TimestamplessFrames++;
             }
+            resetFasterCadenceCandidate();
             return;
         }
 
@@ -78,7 +178,59 @@ public:
                 (m_SmoothedIntervalUs > m_NominalFrameIntervalUs ?
                      m_SmoothedIntervalUs : m_NominalFrameIntervalUs) * 4;
 
+            // The half-second mean deliberately rejects individual short
+            // deltas, but after low-FPS gameplay/cutscenes its fixed sample
+            // capacity can span nearly two seconds. A real upward rate step
+            // then services the old slow schedule long enough to overflow the
+            // queue (measured as a 16% drop burst on a 30 -> 85 FPS return).
+            // Adopt only a large, sustained acceleration: six consecutive
+            // usable source intervals at least 1.5x faster than the cadence
+            // that started the candidate. Holding the initial baseline keeps
+            // the moving long-window mean from moving the goalpost. Ordinary
+            // host-vsync quantization (for example 8.3/16.7 ms around 90 FPS)
+            // breaks the streak and remains averaged by the normal window.
+            bool adoptedFasterCadenceThisSample = false;
+            uint64_t fasterReferenceUs = m_FasterCadenceCandidateCount != 0 ?
+                m_FasterCadenceBaselineUs : m_SmoothedIntervalUs;
+            bool fasterCadenceCandidate =
+                m_SmoothedIntervalUs > m_NominalFrameIntervalUs &&
+                sourceDeltaUs >= m_NominalFrameIntervalUs / 2 &&
+                sourceDeltaUs * 3 <= fasterReferenceUs * 2;
+            if (fasterCadenceCandidate) {
+                if (m_FasterCadenceCandidateCount == 0) {
+                    m_FasterCadenceBaselineUs = m_SmoothedIntervalUs;
+                    m_FasterCadenceTotalUs = 0;
+                }
+                m_FasterCadenceTotalUs += sourceDeltaUs;
+                m_FasterCadenceCandidateCount++;
+                if (m_FasterCadenceCandidateCount >=
+                        FASTER_CADENCE_CONFIRM_INTERVALS) {
+                    uint64_t adoptedIntervalUs = m_FasterCadenceTotalUs /
+                        (uint64_t)m_FasterCadenceCandidateCount;
+                    // The negotiated stream FPS is an upper bound. A run of
+                    // quantized/bursty source timestamps may be shorter, but
+                    // must not invent a cadence faster than the host can send.
+                    m_SmoothedIntervalUs = adoptedIntervalUs >
+                        m_NominalFrameIntervalUs ? adoptedIntervalUs :
+                        m_NominalFrameIntervalUs;
+                    m_SourceTimeCount = 0;
+                    m_PendingStallDeltaUs = 0;
+                    m_FasterCadenceAdopted = true;
+                    m_FasterCadenceTrusted = true;
+                    adoptedFasterCadenceThisSample = true;
+                    resetFasterCadenceCandidate();
+                }
+            }
+            else {
+                resetFasterCadenceCandidate();
+            }
+
             if (sourceDeltaUs > stallThresholdUs) {
+                // A stall supersedes any faster-cadence rebase that may have
+                // been detected in an earlier timestamp from the same
+                // dropped-frame batch.
+                m_FasterCadenceAdopted = false;
+                m_FasterCadenceTrusted = false;
                 if (m_PendingStallDeltaUs != 0 &&
                         sourceDeltaUs <= MAX_ADOPTABLE_INTERVAL_US &&
                         m_PendingStallDeltaUs <= MAX_ADOPTABLE_INTERVAL_US &&
@@ -124,23 +276,35 @@ public:
             }
 
             int intervals = m_SourceTimeCount - 1;
-            if (intervals >= 16) {
+            if (!adoptedFasterCadenceThisSample && intervals >= 16) {
                 uint64_t oldestUs = m_SourceTimesUs[
                     (m_SourceTimeHead + m_SourceTimeCap - m_SourceTimeCount) % m_SourceTimeCap];
                 m_SmoothedIntervalUs = (sourceTimeUs - oldestUs) / (uint64_t)intervals;
             }
-            else if (sourceDeltaUs >= m_NominalFrameIntervalUs / 2 &&
+            else if (!adoptedFasterCadenceThisSample &&
+                     sourceDeltaUs >= m_NominalFrameIntervalUs / 2 &&
                      sourceDeltaUs <= stallThresholdUs) {
                 // Warmup fallback until the window fills: the old EMA. Its
                 // bias is immaterial over a handful of frames.
                 m_SmoothedIntervalUs =
                     (m_SmoothedIntervalUs * 7 + sourceDeltaUs) / 8;
             }
+
+            // Source timestamp quantization may momentarily imply a cadence
+            // above the negotiated stream FPS. Keep that upper bound as a
+            // class invariant for both the normal window and warmup EMA, not
+            // only at the fast-adoption instant.
+            if (m_SmoothedIntervalUs < m_NominalFrameIntervalUs) {
+                m_SmoothedIntervalUs = m_NominalFrameIntervalUs;
+            }
         }
         else if (m_LastSourceTimeUs != 0 && sourceTimeUs <= m_LastSourceTimeUs) {
             // Non-monotonic timestamps (stream restart): restart the window.
             m_SourceTimeCount = 0;
             m_PendingStallDeltaUs = 0;
+            resetFasterCadenceCandidate();
+            m_FasterCadenceAdopted = false;
+            m_FasterCadenceTrusted = false;
         }
 
         m_LastSourceTimeUs = sourceTimeUs;
@@ -165,16 +329,25 @@ public:
         // open-loop rate error compounds: the schedule walks a few ms later
         // every second (measured as the latency trimmer in the pacer
         // re-arming 51 times in 3 minutes chasing regenerating lateness).
-        // The windowed mean pairs every gap with its burst; only a genuine
-        // stall (>4x the measured cadence, or a timestamp going backwards on
-        // a stream restart) resets the window. It is also naturally immune
-        // to the single-spike EMA rides that the pacer's taper hysteresis
-        // was added to absorb.
+        // The windowed mean pairs every gap with its burst. A genuine stall,
+        // a timestamp going backwards on stream restart, or the guarded
+        // sustained rate-upshift detector above resets the window. It is also
+        // naturally immune to the single-spike EMA rides that the pacer's
+        // taper hysteresis was added to absorb.
         observeSourceTime(sourceTimeUs);
 
         uint64_t targetUs = nowUs;
+        bool fasterCadenceAdopted = m_FasterCadenceAdopted;
+        m_FasterCadenceAdopted = false;
 
-        if (m_LastTargetTimeUs != 0) {
+        if (fasterCadenceAdopted) {
+            // Drop the old slow schedule immediately. The pacer still clamps
+            // this target against the last actual flip and the panel's scanout
+            // floor, so rebasing removes backlog without over-driving the
+            // display.
+            m_PhaseReset = true;
+        }
+        else if (m_LastTargetTimeUs != 0) {
             uint64_t frameIntervalUs = m_SmoothedIntervalUs;
 
             targetUs = m_LastTargetTimeUs + frameIntervalUs;
@@ -226,18 +399,19 @@ public:
 
     bool warmedUp() const
     {
-        // Warm = enough monotonic samples spanning ~0.5s of content. Goes
-        // false on reset() and whenever the window restarts - a genuine
-        // stall or a non-monotonic timestamp - which are exactly the moments
-        // the smoothed interval is least trustworthy (stream bring-up,
-        // loading screens, entering a game). The count path covers content
+        // Warm = enough monotonic samples spanning ~0.5s of content, or a
+        // cadence accepted by the guarded six-interval fast-upshift path.
+        // Goes false on reset() and whenever the window restarts for a
+        // genuine stall or non-monotonic timestamp - exactly the moments the
+        // smoothed interval is least trustworthy (stream bring-up, loading
+        // screens, entering a game). The count path covers content
         // near the nominal rate; the span path covers slower content, whose
         // samples cover half a second long before the nominal-rate cap fills
         // (a 30fps game would otherwise stay "cold" - and vsync-latched -
         // for 2s after every window restart on a 116fps stream). Streams
         // that never carry usable timestamps report warm: nothing to
         // measure.
-        if (m_TimestamplessFrames >= 32) {
+        if (m_FasterCadenceTrusted || m_TimestamplessFrames >= 32) {
             return true;
         }
         if (m_SourceTimeCount >= m_SourceTimeCap) {
@@ -255,9 +429,17 @@ public:
 
 private:
     static const int MAX_SOURCE_TIMES = 128;
+    static const int FASTER_CADENCE_CONFIRM_INTERVALS = 6;
     // Slowest delta pair adoptable as a real content cadence (~22fps); see
     // the adoption branch in observeSourceTime().
     static const uint64_t MAX_ADOPTABLE_INTERVAL_US = 45000;
+
+    void resetFasterCadenceCandidate()
+    {
+        m_FasterCadenceBaselineUs = 0;
+        m_FasterCadenceTotalUs = 0;
+        m_FasterCadenceCandidateCount = 0;
+    }
 
     uint64_t m_NominalFrameIntervalUs;
     uint64_t m_MinFrameIntervalUs;
@@ -270,6 +452,11 @@ private:
     int m_SourceTimeCount;
     int m_TimestamplessFrames;
     uint64_t m_PendingStallDeltaUs;
+    uint64_t m_FasterCadenceBaselineUs;
+    uint64_t m_FasterCadenceTotalUs;
+    int m_FasterCadenceCandidateCount;
+    bool m_FasterCadenceAdopted;
+    bool m_FasterCadenceTrusted;
     bool m_PhaseReset;
 };
 

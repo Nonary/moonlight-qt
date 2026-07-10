@@ -9,6 +9,7 @@
 #include <QWaitCondition>
 
 #include <array>
+#include <atomic>
 
 // The maximum number of frames pacer will ever hold is:
 // - 3 frames in the pacing queue
@@ -80,12 +81,17 @@ private:
 
     void logFrameDiagnostics(const char* reason, uint32_t triggerIntervalUs);
 
-    void dropFrameForEnqueue(QQueue<AVFrame*>& queue);
+    void notePacerDrop();
 
-    void dropFrameForEnqueue(QQueue<RenderQueueEntry>& queue);
+    AVFrame* dropFrameForEnqueue(QQueue<AVFrame*>& queue);
+
+    AVFrame* dropFrameForEnqueue(QQueue<RenderQueueEntry>& queue);
 
     QQueue<RenderQueueEntry> m_RenderQueue;
     QQueue<AVFrame*> m_PacingQueue;
+    // RTP/decode timestamps from capacity evictions that the cadence thread
+    // still needs to observe to measure the real source rate.
+    QQueue<uint64_t> m_DroppedCadenceTimestamps;
     QQueue<int> m_PacingQueueHistory;
     QQueue<int> m_RenderQueueHistory;
     QMutex m_FrameQueueLock;
@@ -104,6 +110,9 @@ private:
     bool m_VrrTearingPreferred;
     int m_VrrCushionUs;
     PVIDEO_STATS m_VideoStats;
+    // Control state must not depend on the one-second VIDEO_STATS window,
+    // which is cleared asynchronously by the decoder thread.
+    std::atomic<uint32_t> m_PacerDropGeneration { 0 };
     int m_RendererAttributes;
     uint64_t m_LastRenderTimeUs;
     uint64_t m_FirstRenderTimeUs;
