@@ -75,7 +75,7 @@ void testNearCeilingAlignmentSlack()
            "custom spacing floors must remain inside source cadence");
 }
 
-void testSmoothHighRateCatchUpSpacing()
+void testHeadroomScaledCatchUpSpacing()
 {
     constexpr uint64_t displayIntervalUs = 8333;
     constexpr uint64_t flipFloorUs = 8483;
@@ -96,8 +96,8 @@ void testSmoothHighRateCatchUpSpacing()
            "disabled smooth recovery should retain the fastest drain");
     expect(vrrCatchUpSpacingUs(
                flipFloorUs, 33333, displayIntervalUs,
-               false, true) == flipFloorUs,
-           "low-FPS upshifts should retain the fastest drain");
+               false, true) == 20908,
+           "30 FPS smooth recovery should spend half its panel headroom");
     expect(vrrCatchUpSpacingUs(
                flipFloorUs, 33333, displayIntervalUs,
                true, false) == 29166,
@@ -107,25 +107,22 @@ void testSmoothHighRateCatchUpSpacing()
                false, true) == flipFloorUs,
            "near-ceiling recovery should remain bounded by the flip floor");
 
-    uint64_t fullGentleLimitUs = (displayIntervalUs * 4 + 2) / 3;
-    uint64_t fullFloorLimitUs = (displayIntervalUs * 8 + 4) / 5;
-    uint64_t atGentleLimitUs = vrrCatchUpSpacingUs(
-        flipFloorUs, fullGentleLimitUs, displayIntervalUs, false, true);
-    uint64_t justInsideBlendUs = vrrCatchUpSpacingUs(
-        flipFloorUs, fullGentleLimitUs + 1,
-        displayIntervalUs, false, true);
-    uint64_t justBeforeFloorUs = vrrCatchUpSpacingUs(
-        flipFloorUs, fullFloorLimitUs - 1,
-        displayIntervalUs, false, true);
-    expect(justInsideBlendUs <= atGentleLimitUs &&
-               atGentleLimitUs - justInsideBlendUs <= 4,
-           "the high-rate recovery boundary must not jump pacing phase");
-    expect(justBeforeFloorUs >= flipFloorUs &&
-               justBeforeFloorUs - flipFloorUs <= 4 &&
-               vrrCatchUpSpacingUs(
-                   flipFloorUs, fullFloorLimitUs, displayIntervalUs,
-                   false, true) == flipFloorUs,
-           "the low-rate edge must blend continuously back to fast recovery");
+    const int floors[] = { 20, 25, 30, 40, 50, 60, 70 };
+    for (int fps : floors) {
+        uint64_t sourceIntervalUs = 1000000ULL / (uint64_t)fps;
+        uint64_t expectedSpacingUs = flipFloorUs +
+            (sourceIntervalUs - flipFloorUs) / 2;
+        expect(vrrCatchUpSpacingUs(
+                   flipFloorUs, sourceIntervalUs, displayIntervalUs,
+                   false, true) == expectedSpacingUs,
+               "low-FPS recovery must spend half its available headroom");
+    }
+
+    uint64_t eightyFpsSpacingUs = vrrCatchUpSpacingUs(
+        flipFloorUs, 12500, displayIntervalUs, false, true);
+    expect(eightyFpsSpacingUs > flipFloorUs &&
+               eightyFpsSpacingUs < 12500 * 7 / 8,
+           "75-90 FPS recovery must blend smoothly between headroom and gentle drain");
 }
 
 void testCatchUpTargetHonorsSmoothSpacing()
@@ -349,6 +346,43 @@ void testSlowerCadenceDownshiftAdoption()
            "slower cadence adoption must discard the old high-rate target phase");
 }
 
+void testTwentyFpsCadenceLock()
+{
+    VrrCadenceClock clock(116, 120);
+    uint64_t sourceUs = 1000000;
+    clock.nextTargetUs(sourceUs, sourceUs);
+
+    for (int i = 0; i < 20; i++) {
+        sourceUs += 50000;
+        clock.nextTargetUs(sourceUs, sourceUs);
+    }
+
+    expect(clock.smoothedIntervalUs() >= 49999 &&
+               clock.smoothedIntervalUs() <= 50001,
+           "steady 20 FPS delivery must become a supported cadence");
+    expect(clock.warmedUp(),
+           "steady 20 FPS delivery must leave the cadence-cold latch");
+}
+
+void testLongHostHitchesRemainStalls()
+{
+    VrrCadenceClock clock(116, 120);
+    uint64_t sourceUs = 1000000;
+    clock.observeSourceTime(sourceUs);
+    for (int i = 0; i < 40; i++) {
+        sourceUs += 8620;
+        clock.observeSourceTime(sourceUs);
+    }
+
+    sourceUs += 65000;
+    clock.observeSourceTime(sourceUs);
+    sourceUs += 65000;
+    clock.observeSourceTime(sourceUs);
+
+    expect(clock.smoothedIntervalUs() < 20000,
+           "repeated 60-80ms host hitches must remain stalls, not a fake cadence");
+}
+
 void testRobustWindowStatistics()
 {
     uint32_t agesUs[] = {
@@ -390,8 +424,8 @@ void testPhaseDecisionUsesOneSetpoint()
     expect(build.delayUs > 0 && build.advanceUs == 0,
            "median shortage must build gradually near the ceiling");
     input.nearCeiling = false;
-    expect(VrrQueueAgeController::decidePhase(input).delayUs == 0,
-           "out-of-band delivery must not build a standing queue");
+    expect(VrrQueueAgeController::decidePhase(input).delayUs > 0,
+           "out-of-band delivery must build the selected small jitter reserve");
 
     input.nearCeiling = true;
     input.windowTainted = true;
@@ -583,7 +617,7 @@ int main()
 {
     testWindowDurationScalesWithCadence();
     testNearCeilingAlignmentSlack();
-    testSmoothHighRateCatchUpSpacing();
+    testHeadroomScaledCatchUpSpacing();
     testCatchUpTargetHonorsSmoothSpacing();
     testHeadroomFallbackPeriodAvoidsFloorJudder();
     testRateIdentityKeepsTenFpsBandsSeparate();
@@ -592,6 +626,8 @@ int main()
     testQuantizedCadenceDoesNotTriggerFastAdoption();
     testFastCadenceAdoptionRespectsNominalCap();
     testSlowerCadenceDownshiftAdoption();
+    testTwentyFpsCadenceLock();
+    testLongHostHitchesRemainStalls();
     testRobustWindowStatistics();
     testPhaseDecisionUsesOneSetpoint();
     testFastAttackAndBoundedRelease();

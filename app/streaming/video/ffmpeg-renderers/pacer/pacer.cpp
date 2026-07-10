@@ -1230,12 +1230,10 @@ int Pacer::cadenceThread(void* context)
                 // The extra guard per catch-up frame is immaterial against
                 // the >1.25-interval lateness that triggered the rush.
                 // A latched present scans out the instant it arrives, so the
-                // display enforces no spacing. The smooth policy also avoids
-                // full-floor compression for high-rate content, where the
-                // latest trace showed a 22-frame crawling-tear chain. Both
-                // use the drain tier's ~12%-tighter-than-content spacing;
-                // explicit low-latency mode and low-FPS upshifts retain the
-                // fastest recovery.
+                // display enforces no spacing. The smooth policy spends only
+                // part of the cadence headroom: enough to deflate the queue
+                // quickly at low FPS, without bursting at panel refresh and
+                // turning recovery into obvious judder or a tear chain.
                 uint64_t rushSpacingUs = vrrCatchUpSpacingUs(
                     flipSpacingFloorUs, measuredSourceIntervalUs,
                     minFrameIntervalUs, latchedPresents,
@@ -1256,8 +1254,10 @@ int Pacer::cadenceThread(void* context)
                 // Queue age controls latency. Queue depth is only a pressure
                 // guard here: tolerate one transient successor while service
                 // is saturated, but drain a persistent 2+ successor pile-up.
-                uint64_t drainIntervalUs = qMax(flipSpacingFloorUs,
-                                                measuredSourceIntervalUs * 7 / 8);
+                uint64_t drainIntervalUs = vrrCatchUpSpacingUs(
+                    flipSpacingFloorUs, measuredSourceIntervalUs,
+                    minFrameIntervalUs, latchedPresents,
+                    !classicRecovery && preferenceLatchAvailable);
                 uint64_t drainUs = qMax(lastFlipUs + drainIntervalUs,
                                         LiGetMicroseconds());
                 if (drainUs < targetUs) {
@@ -1329,7 +1329,7 @@ int Pacer::cadenceThread(void* context)
             }
         }
         else if (phaseDelayUs > 0) {
-            if (servoVeto || !nearBuffered) {
+            if (servoVeto || vsyncLatchPresent) {
                 phaseDelayUs = 0;
             }
             else {

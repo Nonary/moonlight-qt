@@ -17,14 +17,13 @@ static inline bool vrrCadenceRateIdentityMatches(uint64_t firstIntervalUs,
     return deltaUs <= VRR_RATE_IDENTITY_TOLERANCE_US;
 }
 
-// Stale recovery normally uses the display's guarded flip floor. In the
-// smooth policy, high-rate content needs a gentler drain: compressing a
-// 90-96 FPS cadence all the way to a 120 Hz floor creates a visible speed-up
-// and a slowly walking tear line while raster lock is uncertain. Retain the
-// aggressive floor for explicit low-latency/A-B modes and low-FPS upshifts.
-// The short 90-to-75 FPS blend avoids a target jump when measured cadence
-// straddles the policy boundary. Latched presentation keeps its existing
-// gentle drain at every rate.
+// Stale recovery normally uses the display's guarded flip floor. The smooth
+// policy instead spends a bounded share of the available cadence headroom:
+// high-rate content drains gently at 7/8 cadence, while content below about
+// 75 FPS uses the midpoint between its cadence and the panel floor. This
+// clears a low-FPS queue much faster without bursting 20-60 FPS content at
+// the panel ceiling, which is both obvious judder and hostile to raster lock.
+// Explicit low-latency/A-B modes retain the fastest panel-floor drain.
 static inline uint64_t vrrCatchUpSpacingUs(
     uint64_t flipSpacingFloorUs,
     uint64_t sourceIntervalUs,
@@ -44,30 +43,35 @@ static inline uint64_t vrrCatchUpSpacingUs(
         return flipSpacingFloorUs;
     }
 
+    uint64_t headroomDrainUs = sourceIntervalUs > flipSpacingFloorUs ?
+        flipSpacingFloorUs +
+            (sourceIntervalUs - flipSpacingFloorUs) / 2 :
+        flipSpacingFloorUs;
+
     uint64_t fullGentleLimitUs = (minFrameIntervalUs * 4 + 2) / 3;
     if (sourceIntervalUs <= fullGentleLimitUs) {
         return gentleDrainUs;
     }
 
-    uint64_t fullFloorLimitUs = (minFrameIntervalUs * 8 + 4) / 5;
-    if (sourceIntervalUs >= fullFloorLimitUs) {
-        return flipSpacingFloorUs;
+    uint64_t fullHeadroomLimitUs = (minFrameIntervalUs * 8 + 4) / 5;
+    if (sourceIntervalUs >= fullHeadroomLimitUs) {
+        return headroomDrainUs;
     }
 
-    uint64_t blendWidthUs = fullFloorLimitUs - fullGentleLimitUs;
-    uint64_t gentleExtraUs = gentleDrainUs - flipSpacingFloorUs;
-    uint64_t blendRemainingUs = fullFloorLimitUs - sourceIntervalUs;
-    return flipSpacingFloorUs +
-        gentleExtraUs * blendRemainingUs / blendWidthUs;
+    uint64_t blendWidthUs = fullHeadroomLimitUs - fullGentleLimitUs;
+    uint64_t blendProgressUs = sourceIntervalUs - fullGentleLimitUs;
+    uint64_t blendRemainingUs = fullHeadroomLimitUs - sourceIntervalUs;
+    return (gentleDrainUs * blendRemainingUs +
+            headroomDrainUs * blendProgressUs) / blendWidthUs;
 }
 
 // Select the target for a stale recovery present. Fast recovery retains the
 // historical accelerate-only behavior: it may pull a future target earlier,
 // but never delays one. A gentle spacing policy is different—the spacing is
 // the smoothness bound itself, so an already-scheduled floor-rate target must
-// also move later to honor it. Any added hold is bounded to the difference
-// between the floor and gentle drain (roughly 0.6-1.1 ms in the measured
-// 90-96 FPS case).
+// also move later to honor it. Near the ceiling that remains roughly
+// 0.6-1.1ms; at low FPS it is capped to half of the available panel headroom,
+// the deliberate midpoint between instant queue drain and cadence stability.
 static inline uint64_t vrrCatchUpTargetUs(
     uint64_t lastFlipUs,
     uint64_t currentTargetUs,
@@ -353,15 +357,15 @@ public:
                     // every subsequent delta re-restarts the window against
                     // a smoothed interval that can never learn the new rate.
                     //
-                    // Bounded at ~22fps: real cutscene/menu cadences live at
-                    // 24-30fps (33-42ms), while HOST HITCHES on a struggling
-                    // game arrive as similar consecutive 60-80ms gaps every
+                    // Bounded at ~18fps: real gameplay/cutscene cadences at
+                    // 20-30fps (33-50ms) are supported, while HOST HITCHES on
+                    // a struggling game arrive as similar consecutive 60-80ms gaps every
                     // few seconds (measured 2026-07-06) and were adopted as
                     // a fake 13-16fps "cadence" - the schedule then paced
                     // 60-80ms against ~9ms arrivals until the window
                     // re-warmed, a stale-rush tear chain measured at 30-50%
                     // mid-scan for the duration. Slower than the bound is
-                    // always treated as a stall; genuinely sub-22fps content
+                    // always treated as a stall; genuinely sub-18fps content
                     // (loading screens) just presents on arrival via the
                     // stall snap, which is the right behavior for it anyway.
                     m_SmoothedIntervalUs =
@@ -548,9 +552,10 @@ private:
     static const int MAX_SOURCE_TIMES = 128;
     static const int FASTER_CADENCE_CONFIRM_INTERVALS = 6;
     static const int SLOWER_CADENCE_CONFIRM_INTERVALS = 6;
-    // Slowest delta pair adoptable as a real content cadence (~22fps); see
-    // the adoption branch in observeSourceTime().
-    static const uint64_t MAX_ADOPTABLE_INTERVAL_US = 45000;
+    // Slowest delta pair adoptable as a real content cadence (~18fps). This
+    // includes the requested 20 FPS lower bound while keeping the measured
+    // 60-80ms host-hitch population on the stall path.
+    static const uint64_t MAX_ADOPTABLE_INTERVAL_US = 55000;
 
     void resetFasterCadenceCandidate()
     {

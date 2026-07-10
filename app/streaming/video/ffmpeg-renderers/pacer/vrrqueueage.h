@@ -105,10 +105,15 @@ public:
                     (uint64_t)input.sampleCount,
                 (uint64_t)250);
         }
-        else if (input.nearCeiling && !input.windowTainted &&
-                 !input.phaseAdvanceActive && !input.phaseDelayActive &&
-                 !input.fastRecoveryActive &&
-                 input.stats.medianUs + 1000 < input.targetAgeUs) {
+        else if (!input.windowTainted &&
+                  !input.phaseAdvanceActive && !input.phaseDelayActive &&
+                  !input.fastRecoveryActive &&
+                  input.stats.medianUs + 1000 < input.targetAgeUs) {
+            // A small policy reserve is useful below the panel ceiling too:
+            // it absorbs decode/network arrival jitter before it reaches the
+            // cadence clock. Keeping the build bounded and gradual preserves
+            // low latency while making the selected 2.5/4.5/6ms policy real
+            // for the common 20-80 FPS range.
             uint64_t maxDelayStepUs = 100;
             if (input.targetAgeUs > input.previousTargetAgeUs) {
                 maxDelayStepUs = qBound((uint64_t)100,
