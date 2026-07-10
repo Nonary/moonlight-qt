@@ -156,6 +156,30 @@ void testCatchUpTargetHonorsSmoothSpacing()
            "fast recovery modes must still accelerate a future stale target");
 }
 
+void testHeadroomFallbackPeriodAvoidsFloorJudder()
+{
+    constexpr uint64_t minFrameIntervalUs = 8333;
+    constexpr uint64_t headroomThresholdUs = 1000;
+    constexpr uint32_t basePeriodSecs = 60;
+
+    expect(vrrHeadroomFallbackPeriodSecs(
+               9615, minFrameIntervalUs, headroomThresholdUs,
+               basePeriodSecs, 240) == basePeriodSecs,
+           "headroom rates should return to VRR after the base latch rung");
+    expect(vrrHeadroomFallbackPeriodSecs(
+               9333, minFrameIntervalUs, headroomThresholdUs,
+               basePeriodSecs, 120) == basePeriodSecs,
+           "the headroom threshold should include its exact boundary");
+    expect(vrrHeadroomFallbackPeriodSecs(
+               9200, minFrameIntervalUs, headroomThresholdUs,
+               basePeriodSecs, 240) == 240,
+           "ceiling-adjacent rates should retain the long safety latch");
+    expect(vrrHeadroomFallbackPeriodSecs(
+               9615, minFrameIntervalUs, headroomThresholdUs,
+               basePeriodSecs, 30) == 30,
+           "a first-offense latch should not be lengthened");
+}
+
 void testTearProbeWaitsForSettledTransition()
 {
     expect(vrrTearProbeTransitionSettled(false, false, 0, false),
@@ -517,6 +541,7 @@ int main()
     testNearCeilingAlignmentSlack();
     testSmoothHighRateCatchUpSpacing();
     testCatchUpTargetHonorsSmoothSpacing();
+    testHeadroomFallbackPeriodAvoidsFloorJudder();
     testTearProbeWaitsForSettledTransition();
     testFastCadenceUpshiftAdoption();
     testQuantizedCadenceDoesNotTriggerFastAdoption();

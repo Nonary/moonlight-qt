@@ -71,6 +71,23 @@ static inline uint64_t vrrCatchUpTargetUs(
     return currentTargetUs;
 }
 
+// Fixed-vsync fallback is useful at the panel's physical ceiling, but a long
+// latch at a rate with real VRR headroom turns an isolated overlay/raster
+// disturbance into floor-specific judder. Keep the first safety rung for
+// rates with at least roughly one scanout of source headroom; only the
+// ceiling-adjacent regime may climb the long per-rate ladder.
+static inline uint32_t vrrHeadroomFallbackPeriodSecs(
+    uint64_t sourceIntervalUs,
+    uint64_t minFrameIntervalUs,
+    uint64_t headroomThresholdUs,
+    uint32_t basePeriodSecs,
+    uint32_t requestedPeriodSecs)
+{
+    return sourceIntervalUs >= minFrameIntervalUs + headroomThresholdUs &&
+            requestedPeriodSecs > basePeriodSecs ?
+        basePeriodSecs : requestedPeriodSecs;
+}
+
 // Maximum time an alignment wait may consume without making the selected
 // flip-spacing floor plus alignment service slower than the source cadence.
 // The cadence guard retains the existing nominal-scanout safety margin; the

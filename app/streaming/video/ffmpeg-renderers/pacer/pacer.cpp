@@ -487,6 +487,7 @@ int Pacer::cadenceThread(void* context)
     const uint64_t bandEntryStepUs = scanoutFracUs(12);         // 100us
     const uint64_t queueAgeClampZoneUs = scanoutFracUs(312);    // 2600us
     const uint64_t cadenceSlackGuardUs = scanoutFracUs(24);     // 200us
+    const uint64_t fallbackHeadroomThresholdUs = scanoutFracUs(120); // 1ms
     const uint64_t alignSpinFloorUs = scanoutFracUs(360);       // 3000us
     const uint64_t alignWideExtraUs = scanoutFracUs(240);       // 2000us
     const uint64_t rushBudgetCapUs = scanoutFracUs(300);        // 2500us
@@ -1051,6 +1052,10 @@ int Pacer::cadenceThread(void* context)
                     *verdict, me->m_EstimatedRenderTimeUs);
                 uint32_t latchSecs = regimeImproved ?
                     VrrCalibrationStore::kBasePeriodSecs : verdict->periodSecs;
+                latchSecs = vrrHeadroomFallbackPeriodSecs(
+                    measuredSourceIntervalUs, minFrameIntervalUs,
+                    fallbackHeadroomThresholdUs,
+                    VrrCalibrationStore::kBasePeriodSecs, latchSecs);
                 verdict->latchedThisSession = true;
                 bandTearFallbackUntilUs = nowUs +
                     (uint64_t)latchSecs * 1000000ULL;
@@ -1892,6 +1897,10 @@ int Pacer::cadenceThread(void* context)
                     uint32_t fallbackSecs = calibration.recordTearFail(
                         measuredSourceIntervalUs, nowUs,
                         me->m_EstimatedRenderTimeUs);
+                    fallbackSecs = vrrHeadroomFallbackPeriodSecs(
+                        measuredSourceIntervalUs, minFrameIntervalUs,
+                        fallbackHeadroomThresholdUs,
+                        VrrCalibrationStore::kBasePeriodSecs, fallbackSecs);
                     bandTearFallbackUntilUs = nowUs +
                         (uint64_t)fallbackSecs * 1000000ULL;
                     bandTearFallbackIntervalUs = measuredSourceIntervalUs;
