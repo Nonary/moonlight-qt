@@ -46,6 +46,31 @@ static inline uint64_t vrrCatchUpSpacingUs(
         gentleExtraUs * blendRemainingUs / blendWidthUs;
 }
 
+// Select the target for a stale recovery present. Fast recovery retains the
+// historical accelerate-only behavior: it may pull a future target earlier,
+// but never delays one. A gentle spacing policy is different—the spacing is
+// the smoothness bound itself, so an already-scheduled floor-rate target must
+// also move later to honor it. Any added hold is bounded to the difference
+// between the floor and gentle drain (roughly 0.6-1.1 ms in the measured
+// 90-96 FPS case).
+static inline uint64_t vrrCatchUpTargetUs(
+    uint64_t lastFlipUs,
+    uint64_t currentTargetUs,
+    uint64_t nowUs,
+    uint64_t catchUpSpacingUs,
+    bool enforceMinimumSpacing)
+{
+    uint64_t selectedTargetUs = lastFlipUs + catchUpSpacingUs;
+    if (selectedTargetUs < nowUs) {
+        selectedTargetUs = nowUs;
+    }
+
+    if (selectedTargetUs < currentTargetUs || enforceMinimumSpacing) {
+        return selectedTargetUs;
+    }
+    return currentTargetUs;
+}
+
 // Maximum time an alignment wait may consume without making the selected
 // flip-spacing floor plus alignment service slower than the source cadence.
 // The cadence guard retains the existing nominal-scanout safety margin; the

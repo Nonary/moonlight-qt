@@ -1241,10 +1241,11 @@ int Pacer::cadenceThread(void* context)
                     flipSpacingFloorUs, measuredSourceIntervalUs,
                     minFrameIntervalUs, latchedPresents,
                     !classicRecovery && preferenceLatchAvailable);
-                uint64_t catchUpUs = qMax(lastFlipUs + rushSpacingUs,
-                                          LiGetMicroseconds());
-                if (catchUpUs < targetUs) {
-                    targetUs = catchUpUs;
+                uint64_t selectedCatchUpUs = vrrCatchUpTargetUs(
+                    lastFlipUs, targetUs, LiGetMicroseconds(), rushSpacingUs,
+                    rushSpacingUs > flipSpacingFloorUs);
+                if (selectedCatchUpUs != targetUs) {
+                    targetUs = selectedCatchUpUs;
                     cadenceClock.rebaseTarget(targetUs);
                     scheduleRecoveryRebased = true;
                     activeFlipSpacingUs = rushSpacingUs;

@@ -128,6 +128,34 @@ void testSmoothHighRateCatchUpSpacing()
            "the low-rate edge must blend continuously back to fast recovery");
 }
 
+void testCatchUpTargetHonorsSmoothSpacing()
+{
+    constexpr uint64_t lastFlipUs = 100000;
+    constexpr uint64_t flipFloorUs = 8483;
+    constexpr uint64_t gentleSpacingUs = 9646;
+
+    expect(vrrCatchUpTargetUs(
+               lastFlipUs, 112000, 105000,
+               gentleSpacingUs, true) == 109646,
+           "gentle recovery should still accelerate an overly future target");
+    expect(vrrCatchUpTargetUs(
+               lastFlipUs, 108500, 108000,
+               gentleSpacingUs, true) == 109646,
+           "gentle recovery must delay a floor-spaced stale target");
+    expect(vrrCatchUpTargetUs(
+               lastFlipUs, 108000, 111000,
+               gentleSpacingUs, true) == 111000,
+           "an already elapsed gentle target should rebase onto the present instant");
+    expect(vrrCatchUpTargetUs(
+               lastFlipUs, 108000, 107000,
+               flipFloorUs, false) == 108000,
+           "fast recovery modes must retain accelerate-only target selection");
+    expect(vrrCatchUpTargetUs(
+               lastFlipUs, 112000, 105000,
+               flipFloorUs, false) == 108483,
+           "fast recovery modes must still accelerate a future stale target");
+}
+
 void testTearProbeWaitsForSettledTransition()
 {
     expect(vrrTearProbeTransitionSettled(false, false, 0, false),
@@ -488,6 +516,7 @@ int main()
     testWindowDurationScalesWithCadence();
     testNearCeilingAlignmentSlack();
     testSmoothHighRateCatchUpSpacing();
+    testCatchUpTargetHonorsSmoothSpacing();
     testTearProbeWaitsForSettledTransition();
     testFastCadenceUpshiftAdoption();
     testQuantizedCadenceDoesNotTriggerFastAdoption();
