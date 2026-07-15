@@ -347,6 +347,15 @@ public:
         return false;
     }
 
+    virtual bool canVsyncLatchVrrPresents() {
+        // True if the renderer can honor VrrCadence's per-present request to
+        // latch at vblank instead of presenting immediately. D3D11 can switch
+        // this per present by dropping DXGI_PRESENT_ALLOW_TEARING. Vulkan WSI
+        // cannot switch without recreating the swapchain, so a VrrCadence
+        // swapchain in Immediate mode must report false here.
+        return true;
+    }
+
     static const char* getPresentationModeName(PresentationMode mode) {
         switch (mode) {
         case PresentationMode::Immediate:

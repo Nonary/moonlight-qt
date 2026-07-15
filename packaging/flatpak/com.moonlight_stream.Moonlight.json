@@ -16,7 +16,6 @@
         "--system-talk-name=org.freedesktop.RealtimeKit1",
         "--env=IGNORE_RFI_LATENCY_BUG=1",
         "--env=QT_QUICK_CONTROLS_STYLE=Material",
-        "--env=PREFER_VULKAN=1",
         "--env=LIBVA_DRIVER_NAME=",
         "--unset-env=LIBVA_DRIVER_NAME",
         "--env=LIBVA_DRIVERS_PATH=",
@@ -224,12 +223,20 @@
                     "type": "git",
                     "url": "https://github.com/nonary/moonlight-qt.git",
                     "disable-shallow-clone": true,
-                    "commit": "92553cd4d74fb555c50313f94f5a18b65e0e6af8"
+                    "commit": "36eed89194676b7d83e3808cfab88ab17d13517d"
+                },
+                {
+                    "type": "patch",
+                    "path": "patches/0001-Port-vrr8-pacing-to-Linux.patch"
+                },
+                {
+                    "type": "patch",
+                    "path": "patches/0002-Retire-low-latency-vrr-checkbox.patch"
                 },
                 {
                     "type": "shell",
                     "commands": [
-                        "echo 6.1.0-vrr5 > app/version.txt"
+                        "echo 6.1.0-vrr8 > app/version.txt"
                     ]
                 }
             ]

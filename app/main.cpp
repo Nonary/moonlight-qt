@@ -340,6 +340,31 @@ void handleSignal(int sig)
     send(signalFds[0], &sig, sizeof(sig), 0);
 }
 
+int SDLCALL terminationWatchdogThread(void*)
+{
+    // Steam generally sends only one SIGTERM when stopping a Game Mode title.
+    // A compositor or graphics-driver call can be uninterruptibly blocked
+    // during stream cleanup, so don't leave the client (and potentially Game
+    // Mode) stuck forever waiting for a second signal that may never arrive.
+    SDL_Delay(15000);
+    _Exit(1);
+}
+
+void armTerminationWatchdog()
+{
+    SDL_Thread* thread = SDL_CreateThread(terminationWatchdogThread,
+                                          "Termination Watchdog", nullptr);
+    if (thread != nullptr) {
+        SDL_DetachThread(thread);
+    }
+    else {
+        // We're already handling a termination request. If the watchdog
+        // cannot be created, preserve its guarantee rather than risking an
+        // unbounded shutdown.
+        _Exit(1);
+    }
+}
+
 int SDLCALL signalHandlerThread(void* data)
 {
     Q_UNUSED(data);
@@ -368,6 +393,11 @@ int SDLCALL signalHandlerThread(void* data)
                     // If this is a SIGTERM, set the flag to quit
                     session->setShouldExit();
                     requestedQuit = true;
+
+                    // Give graceful cleanup a chance, but bound it. SteamOS
+                    // normally won't send the second signal that otherwise
+                    // triggers our immediate-exit path below.
+                    armTerminationWatchdog();
                 }
 
                 // Stop the streaming session
@@ -384,6 +414,10 @@ int SDLCALL signalHandlerThread(void* data)
                 // If we're not streaming, we'll close the whole app
                 QCoreApplication::instance()->quit();
                 requestedQuit = true;
+
+                if (sig == SIGTERM) {
+                    armTerminationWatchdog();
+                }
             }
             break;
 

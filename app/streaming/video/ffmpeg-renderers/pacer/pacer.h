@@ -9,6 +9,7 @@
 #include <QWaitCondition>
 
 #include <array>
+#include <atomic>
 
 // The maximum number of frames pacer will ever hold is:
 // - 3 frames in the pacing queue
@@ -41,13 +42,28 @@ public:
 
     void submitFrame(AVFrame* frame);
 
-    bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrrTearing, int vrrCushionUs);
+    bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing,
+                    int vrrCushionUs,
+                    int videoWidth, int videoHeight, int videoFormat,
+                    const QString& hostCacheKey, int routeClass,
+                    const QString& decoderCacheKey);
+
+    void notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info);
 
     void signalVsync();
 
     void renderOnMainThread();
 
 private:
+    enum class PacerDropReason {
+        VrrOverfill,
+        VrrBacklog,
+        VrrStrict,
+        PacingQueue,
+        RenderQueue,
+        Capacity,
+    };
+
     struct FrameDiagnosticSample {
         uint32_t intervalUs;
         uint32_t queueDelayUs;
@@ -69,7 +85,8 @@ private:
 
     void enqueueFrameForRenderingAndUnlock(AVFrame* frame, uint64_t targetPresentUs = 0);
 
-    void renderFrame(AVFrame* frame);
+    // Returns decode-completion-to-render-start queue age in microseconds.
+    uint64_t renderFrame(AVFrame* frame);
 
     bool waitUntil(uint64_t targetUs);
 
@@ -79,12 +96,17 @@ private:
 
     void logFrameDiagnostics(const char* reason, uint32_t triggerIntervalUs);
 
-    void dropFrameForEnqueue(QQueue<AVFrame*>& queue);
+    void notePacerDrop(PacerDropReason reason);
 
-    void dropFrameForEnqueue(QQueue<RenderQueueEntry>& queue);
+    AVFrame* dropFrameForEnqueue(QQueue<AVFrame*>& queue);
+
+    AVFrame* dropFrameForEnqueue(QQueue<RenderQueueEntry>& queue);
 
     QQueue<RenderQueueEntry> m_RenderQueue;
     QQueue<AVFrame*> m_PacingQueue;
+    // RTP/decode timestamps from capacity evictions that the cadence thread
+    // still needs to observe to measure the real source rate.
+    QQueue<uint64_t> m_DroppedCadenceTimestamps;
     QQueue<int> m_PacingQueueHistory;
     QQueue<int> m_RenderQueueHistory;
     QMutex m_FrameQueueLock;
@@ -100,12 +122,15 @@ private:
     IFFmpegRenderer* m_VsyncRenderer;
     int m_MaxVideoFps;
     int m_DisplayFps;
-    bool m_VrrTearingPreferred;
+    bool m_VrrLatchUnavailable;
     int m_VrrCushionUs;
     PVIDEO_STATS m_VideoStats;
+    // Control state must not depend on the one-second VIDEO_STATS window,
+    // which is cleared asynchronously by the decoder thread.
+    std::atomic<uint32_t> m_PacerDropGeneration { 0 };
     int m_RendererAttributes;
     uint64_t m_LastRenderTimeUs;
-    uint64_t m_FirstRenderTimeUs;
+    std::atomic<uint64_t> m_FirstRenderTimeUs;
     uint64_t m_EstimatedRenderTimeUs;
     uint64_t m_LastNetRenderTimeUs;
     uint64_t m_LastFrameDiagnosticDumpUs;
@@ -113,4 +138,9 @@ private:
     uint32_t m_FrameDiagnosticRingIndex;
     uint32_t m_FrameDiagnosticRingCount;
     IFFmpegRenderer::PresentationMode m_PresentationMode;
+    // Strict identity for persistent raw arrival-jitter models. It includes
+    // display, presentation/decode path, route class, stream geometry, and
+    // pixel format.
+    QString m_VrrReserveCacheKey;
+    std::atomic_bool m_VrrReserveCacheInvalidated { false };
 };

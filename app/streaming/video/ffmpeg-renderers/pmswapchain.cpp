@@ -376,8 +376,6 @@ void PmSwapchain::setColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace, bool isHdr)
 
 bool PmSwapchain::present(uint64_t targetUs)
 {
-    drainStatistics();
-
     uint64_t nowUs = LiGetMicroseconds();
 
     // Make long present-stream gaps (network stalls, host hitches) visible
@@ -408,12 +406,12 @@ bool PmSwapchain::present(uint64_t targetUs)
     }
 
     SystemInterruptTime target = {};
-    UINT64 wantedInterrupt = 0;
+    UINT64 wantedInterrupt = targetUs > nowUs ?
+        nowInterrupt + (targetUs - nowUs) * 10 : 0;
     if (sentTargetUs > nowUs) {
         // Translate the pacer's QPC-domain target into interrupt time by
         // offsetting from a now-sample of both clocks.
         target.value = nowInterrupt + (sentTargetUs - nowUs) * 10;
-        wantedInterrupt = nowInterrupt + (targetUs - nowUs) * 10;
         m_LastExpectedFlipUs = targetUs;
     }
     else {
@@ -454,6 +452,10 @@ bool PmSwapchain::present(uint64_t targetUs)
     m_PendingHead = (m_PendingHead + 1) % PENDING_RING;
 
     m_StatPresents++;
+    // Statistics can arrive in bursts. Drain them only after the target and
+    // buffer are safely submitted so telemetry backlog cannot make this
+    // frame miss its requested presentation time.
+    drainStatistics();
     logStatsIfDue(nowUs);
     return true;
 }
@@ -513,7 +515,13 @@ void PmSwapchain::drainStatistics()
         return;
     }
 
-    while (WaitForSingleObject(m_StatsEvent, 0) == WAIT_OBJECT_0) {
+    // Keep telemetry work bounded on the cadence thread. If more records are
+    // queued, the still-signaled event lets the next present continue where
+    // this one stopped.
+    constexpr int MAX_STATS_PER_DRAIN = 32;
+    int drained = 0;
+    while (drained++ < MAX_STATS_PER_DRAIN &&
+           WaitForSingleObject(m_StatsEvent, 0) == WAIT_OBJECT_0) {
         ComPtr<IPresentStatistics> stat;
         if (FAILED(m_Manager->GetNextPresentStatistics(&stat)) || !stat) {
             break;
@@ -602,17 +610,20 @@ void PmSwapchain::drainStatistics()
                 m_LastDisplayedTime = displayed;
 
                 const PendingPresent* pending = lookupPending(stat->GetPresentId());
-                if (pending != nullptr && pending->sentTargetInterruptTime != 0) {
+                if (pending != nullptr && pending->wantedTargetInterruptTime != 0) {
                     // Net error: displayed vs the pacer's WANTED instant
                     // (positive = late). This is what the user experiences;
                     // raw executor lateness = net + compensation.
                     int64_t netError100ns =
-                        (int64_t)(displayed - pending->wantedTargetInterruptTime);
+                        (int64_t)displayed -
+                        (int64_t)pending->wantedTargetInterruptTime;
                     recordTargetError(netError100ns / 10000.0);
 
-                    updateServo(netError100ns / 10);
+                    if (pending->sentTargetInterruptTime != 0) {
+                        updateServo(netError100ns / 10);
+                    }
                 }
-                else {
+                if (pending == nullptr || pending->sentTargetInterruptTime == 0) {
                     m_StatIflipAsap++;
                     if (pending != nullptr &&
                             displayed > pending->presentCallInterruptTime) {

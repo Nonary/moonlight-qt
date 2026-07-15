@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Limelight.h>
+#include <QString>
 #include "SDL_compat.h"
 #include "settings/streamingpreferences.h"
 
@@ -15,6 +16,16 @@ typedef struct _VIDEO_STATS {
     uint32_t totalFrames;
     uint32_t networkDroppedFrames;
     uint32_t pacerDroppedFrames;
+    // Exhaustive attribution for pacerDroppedFrames. Keep these as raw
+    // counts so short diagnostic windows can distinguish a controller drop
+    // from queue/render backpressure without relying on throttled log lines.
+    uint32_t pacerVrrOverfillDroppedFrames;
+    uint32_t pacerVrrBacklogDroppedFrames;
+    uint32_t pacerVrrStrictDroppedFrames;
+    uint32_t pacerPacingQueueDroppedFrames;
+    uint32_t pacerRenderQueueDroppedFrames;
+    uint32_t pacerCapacityDroppedFrames;
+    uint32_t pacerStartupDroppedFrames; // overlapping warm-up subset
     uint16_t minHostProcessingLatency;         // low-res from RTP
     uint16_t maxHostProcessingLatency;         // low-res from RTP
     uint32_t totalHostProcessingLatency;       // low-res from RTP
@@ -22,7 +33,11 @@ typedef struct _VIDEO_STATS {
     uint64_t totalReassemblyTimeUs;            // high-res (1us)
     uint64_t totalDecodeTimeUs;                // high-res (1us)
     uint64_t totalPacerTimeUs;                 // high-res (1us)
+    uint64_t totalPacerPreparationTimeUs;      // high-res (1us), VRR subset
+    uint64_t totalPacerProtectionTimeUs;       // high-res (1us), VRR subset
     uint64_t totalRenderTimeUs;                // high-res (1us)
+    uint64_t totalRenderWorkTimeUs;            // high-res (1us)
+    uint64_t totalPresentAlignmentWaitUs;      // high-res (1us)
     uint64_t totalFrameIntervalUs;             // high-res (1us)
     uint64_t totalSquaredFrameIntervalUs;      // high-res (1us^2)
     uint32_t frameIntervalSamples;
@@ -49,8 +64,9 @@ typedef struct _DECODER_PARAMETERS {
     bool enableVsync;
     bool enableFramePacing;
     bool enableVrr;
-    bool enableVrrTearing;
     int vrrCushionUs;
+    QString vrrCacheHostKey;
+    int vrrCacheRouteClass;
     bool enableOsScheduledVrr;
     bool testOnly;
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;

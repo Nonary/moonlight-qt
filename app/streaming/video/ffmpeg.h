@@ -132,6 +132,7 @@ private:
     bool m_NeedsSpsFixup;
     bool m_TestOnly;
     TestMode m_CurrentTestMode;
+    bool m_UsesVrrCadencePacing;
     SDL_Thread* m_DecoderThread;
     SDL_atomic_t m_DecoderThreadShouldQuit;
     uint64_t m_LastFrameDiagnosticLogUs;

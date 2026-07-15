@@ -682,21 +682,39 @@ void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
         m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     }
     else if (m_PresentationMode == PresentationMode::VrrCadence) {
-        // Vsync-latched presents, paced by the cadence clock. There is no
-        // scan-position source on this platform, so a tearing (immediate)
-        // flip can never be phase-aligned - under direct scanout it lands
-        // mid-scan and visibly tears (observed at 116fps-on-120Hz, KWin
-        // direct scanout, 2026-07-05). FIFO latches every flip at a vblank
-        // instead: with VRR active the vblank happens when our paced present
-        // arrives (the cadence still drives the panel), and on a fixed-rate
-        // raster this degrades to the classic vsync-latch regime the pacer
-        // already runs near the panel's ceiling. The pacer holds each frame
-        // to its target before queuing and never queues a second one, so the
-        // FIFO queue cannot re-pace the flips it latches.
+        // A Wayland compositor owns scanout timing, and Linux provides no
+        // display-level scan-position query that would let VrrPresenter align
+        // an Immediate flip to the panel's blanking interval. Immediate can
+        // therefore visibly tear even while KWin reports that adaptive sync is
+        // active. Mailbox remains non-blocking for the cadence pacer, but the
+        // compositor displays the selected image tear-free at the next VRR
+        // refresh. Because the pacer submits only after its target hold, there
+        // should not normally be multiple frames for Mailbox to supersede.
         //
-        // MOONLIGHT_VRR_NO_LATCH=1 opts back into immediate flips to A/B the
-        // few ms of latency this trades away (tears under direct scanout).
-        if (qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_LATCH") && haveImmediate) {
+        // Keep Immediate for direct Gamescope/X11 presentation, where it is
+        // needed for the compositor/display stack to observe the actual flip
+        // cadence. MOONLIGHT_VRR_FORCE_IMMEDIATE=1 and
+        // MOONLIGHT_VRR_FORCE_LATCH=1 provide explicit A/B overrides.
+        //
+        // If Mailbox is unavailable, FIFO is the tear-free Wayland fallback.
+        const char* videoDriver = SDL_GetCurrentVideoDriver();
+        const bool waylandDesktop = videoDriver != nullptr &&
+            SDL_strcmp(videoDriver, "wayland") == 0;
+        const bool forceImmediate =
+            qEnvironmentVariableIntValue("MOONLIGHT_VRR_FORCE_IMMEDIATE") != 0;
+        const bool forceLatch =
+            qEnvironmentVariableIntValue("MOONLIGHT_VRR_FORCE_LATCH") != 0;
+
+        if (forceLatch) {
+            m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+        }
+        else if (waylandDesktop && !forceImmediate && haveMailbox) {
+            m_VkPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+        }
+        else if (waylandDesktop && !forceImmediate) {
+            m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+        }
+        else if (haveImmediate) {
             m_VkPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
         }
         else {
@@ -1356,11 +1374,11 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
         uint64_t afterFinishUs = LiGetMicroseconds();
         noteCadenceStage(StageGpuFinish, afterFinishUs - beforeFinishUs);
 
-        // The returned vsync-latch flag needs no mechanical action here:
-        // Vulkan's present mode is fixed per-swapchain and composited
-        // presentation never tears, so latched and tearing presents issue
-        // identically - the presenter just tracks the regime for the pacer
-        // and the overlay's sub-state line.
+        // Vulkan present mode is fixed per-swapchain, so the returned
+        // vsync-latch flag cannot change this individual present. The
+        // presenter still applies target holds and tracks the overlay
+        // sub-state; the pacer only requests latch states when the selected
+        // swapchain mode can actually honor them.
         m_VrrPresenter.prepareToPresent();
         noteCadenceStage(StageTargetHold, LiGetMicroseconds() - afterFinishUs);
     }
@@ -1557,6 +1575,11 @@ const char* PlVkRenderer::getPresentationModeFallbackReason()
     // inert.
     if (m_PresentationMode == PresentationMode::VrrCadence &&
             m_PresentationModeFallbackReason == nullptr) {
+        if (m_VkPresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+            return m_VrrPresenter.lastPresentBuffered() ?
+                "true VRR pacing (immediate, near-ceiling buffer)" :
+                "true VRR pacing (immediate)";
+        }
         if (m_VrrPresenter.lastPresentLatched()) {
             return "vsync-latched: content at the panel's VRR ceiling";
         }
@@ -1595,11 +1618,24 @@ bool PlVkRenderer::isVrrRasterLockUncertain()
 
 bool PlVkRenderer::arePresentsVsyncLatched()
 {
-    // VrrCadence maps to FIFO on this platform (see resolvePresentationMode):
-    // every flip latches at a vblank, and only MOONLIGHT_VRR_NO_LATCH=1 opts
-    // into tearing-capable immediate presents.
+    // Only FIFO is a fixed-vsync presentation path. Mailbox is tear-free, but
+    // under a VRR compositor it still follows the cadence of newly submitted
+    // images. Treating Mailbox as fixed-vsync makes the pacer disable its
+    // near-ceiling cadence buffer and route 103-116 FPS content through the
+    // policy-latched path. That exposes host/capture burst timing directly as
+    // 120 Hz refresh spikes on Wayland desktops.
     return m_PresentationMode == PresentationMode::VrrCadence &&
            m_VkPresentMode == VK_PRESENT_MODE_FIFO_KHR;
+}
+
+bool PlVkRenderer::canVsyncLatchVrrPresents()
+{
+    // Vulkan present mode is fixed for the swapchain. FIFO can honor a
+    // fixed-vsync policy for every present. Mailbox is tear-free but remains
+    // cadence-following under VRR, and Immediate can tear; neither can switch
+    // an individual present into fixed-vsync without recreating the swapchain.
+    return m_PresentationMode != PresentationMode::VrrCadence ||
+           arePresentsVsyncLatched();
 }
 
 int PlVkRenderer::getDecoderColorspace()

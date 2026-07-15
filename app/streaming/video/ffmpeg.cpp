@@ -86,6 +86,12 @@ void FFmpegVideoDecoder::setHdrMode(bool enabled)
 
 bool FFmpegVideoDecoder::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
 {
+    // Some renderers consume handled flags in-place. Let the pacer observe
+    // the original display-change notification first so it never saves live
+    // evidence under the previous display's cache identity.
+    if (m_Pacer != nullptr) {
+        m_Pacer->notifyWindowChanged(info);
+    }
     return m_FrontendRenderer->notifyWindowChanged(info);
 }
 
@@ -240,6 +246,7 @@ FFmpegVideoDecoder::FFmpegVideoDecoder(bool testOnly)
       m_NeedsSpsFixup(false),
       m_TestOnly(testOnly),
       m_CurrentTestMode(TestMode::TestFrameOnly),
+      m_UsesVrrCadencePacing(false),
       m_DecoderThread(nullptr),
       m_LastFrameDiagnosticLogUs(0)
 {
@@ -282,6 +289,7 @@ void FFmpegVideoDecoder::reset()
 
     m_FramesIn = m_FramesOut = 0;
     m_FrameInfoQueue.clear();
+    m_UsesVrrCadencePacing = false;
 
     delete m_Pacer;
     m_Pacer = nullptr;
@@ -366,13 +374,50 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
     Q_UNUSED(glIsSlow);
     Q_UNUSED(vulkanIsSlow);
 
+#ifdef HAVE_LIBPLACEBO_VULKAN
+    const bool preferVulkanForVrr =
+#if defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN)
+        params->enableVrr;
+#else
+        false;
+#endif
+    const bool preferVulkanFrontend =
+        preferVulkanForVrr || qgetenv("PREFER_VULKAN") == "1";
+    const char* preferVulkanReason =
+        preferVulkanForVrr ? "VRR" : "PREFER_VULKAN";
+    bool preferredVulkanAttempted = false;
+    auto tryPreferredVulkanFrontend = [this, params, &preferredVulkanAttempted](const char* reason) {
+        preferredVulkanAttempted = true;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Trying Vulkan frontend renderer (%s)", reason);
+        m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
+        if (initializeRendererInternal(m_FrontendRenderer, params)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Using Vulkan frontend renderer");
+            return true;
+        }
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Requested Vulkan renderer failed to initialize; falling back to the default renderer");
+        delete m_FrontendRenderer;
+        m_FrontendRenderer = nullptr;
+        return false;
+    };
+#endif
+
     // For cases where we're already using Vulkan Video decoding, always use the Vulkan renderer too.
     // The alternate frontend logic is primarily for cases where a different renderer like EGL or DRM
     // may provide additional performance or HDR capabilities. Neither of these are true for Vulkan.
     if (useAlternateFrontend && m_BackendRenderer->getRendererType() != IFFmpegRenderer::RendererType::Vulkan) {
+#ifdef HAVE_LIBPLACEBO_VULKAN
+        if (preferVulkanFrontend &&
+                tryPreferredVulkanFrontend(preferVulkanReason)) {
+            return true;
+        }
+#endif
+
         if (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) {
 #ifdef HAVE_LIBPLACEBO_VULKAN
-            if (!vulkanIsSlow) {
+            if (!preferredVulkanAttempted && !vulkanIsSlow) {
                 // The Vulkan renderer can also handle HDR with a supported compositor. We prefer
                 // rendering HDR with Vulkan if possible since it's more fully featured than DRM.
                 m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
@@ -400,7 +445,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
 #endif
 
 #ifdef HAVE_LIBPLACEBO_VULKAN
-            if (vulkanIsSlow) {
+            if (!preferredVulkanAttempted && vulkanIsSlow) {
                 // Try Vulkan even if it's slow because we have no other renderer
                 // that can display HDR properly on Linux.
                 m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
@@ -412,20 +457,6 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
             }
 #endif
         }
-        else
-        {
-#ifdef HAVE_LIBPLACEBO_VULKAN
-            if (qgetenv("PREFER_VULKAN") == "1") {
-                m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
-                if (initializeRendererInternal(m_FrontendRenderer, params)) {
-                    return true;
-                }
-                delete m_FrontendRenderer;
-                m_FrontendRenderer = nullptr;
-            }
-#endif
-        }
-
 #ifdef HAVE_EGL
         // Try EGLRenderer if GL is not slow on this platform
         if (!glIsSlow && m_BackendRenderer->canExportEGL()) {
@@ -443,7 +474,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
     }
 
 #ifdef HAVE_LIBPLACEBO_VULKAN
-    // PREFER_VULKAN=1: try the Vulkan frontend before the backend's
+    // VRR and PREFER_VULKAN=1: try the Vulkan frontend before the backend's
     // direct-rendering shortcut below. This must live HERE, not only in the
     // alternate-frontend block above - that block never runs on Windows
     // (the renderer-selection loop only does the alternate pass on Unix),
@@ -451,19 +482,10 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
     // explicitly requested attempt must not fail silently, so both
     // outcomes are logged.
     if (m_BackendRenderer->getRendererType() != IFFmpegRenderer::RendererType::Vulkan &&
-            qgetenv("PREFER_VULKAN") == "1") {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Trying Vulkan frontend renderer (PREFER_VULKAN)");
-        m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
-        if (initializeRendererInternal(m_FrontendRenderer, params)) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Using Vulkan frontend renderer");
+            preferVulkanFrontend) {
+        if (tryPreferredVulkanFrontend(preferVulkanReason)) {
             return true;
         }
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "Requested Vulkan renderer failed to initialize; falling back to the default renderer");
-        delete m_FrontendRenderer;
-        m_FrontendRenderer = nullptr;
     }
 #endif
 
@@ -519,6 +541,10 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
         return false;
     }
 
+    m_UsesVrrCadencePacing =
+        m_FrontendRenderer->getPresentationMode() ==
+            IFFmpegRenderer::PresentationMode::VrrCadence;
+
     m_RequiredPixelFormat = requiredFormat;
     m_OriginalVideoWidth = params->width;
     m_OriginalVideoHeight = params->height;
@@ -530,12 +556,23 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     if (testMode != TestMode::TestFrameOnly) {
         int rendererAttributes = m_FrontendRenderer->getRendererAttributes();
         bool enablePacing = params->enableFramePacing ||
-                m_FrontendRenderer->getPresentationMode() == IFFmpegRenderer::PresentationMode::VrrCadence ||
+                m_UsesVrrCadencePacing ||
                 (params->enableVsync && (rendererAttributes & RENDERER_ATTRIBUTE_FORCE_PACING));
 
         m_Pacer = new Pacer(m_FrontendRenderer, &m_ActiveWndVideoStats);
+        QString decoderCacheKey = QStringLiteral("%1|backend%2|pixfmt%3")
+            .arg(decoder != nullptr && decoder->name != nullptr ?
+                     QString::fromUtf8(decoder->name) :
+                     QStringLiteral("decoder"))
+            .arg(QString::fromUtf8(m_BackendRenderer->getRendererName()))
+            .arg((int)requiredFormat);
         if (!m_Pacer->initialize(params->window, params->frameRate, enablePacing,
-                                 params->enableVrrTearing, params->vrrCushionUs)) {
+                                 params->vrrCushionUs,
+                                 params->width, params->height,
+                                 params->videoFormat,
+                                 params->vrrCacheHostKey,
+                                 params->vrrCacheRouteClass,
+                                 decoderCacheKey)) {
             return false;
         }
     }
@@ -799,10 +836,21 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalFrames += src.totalFrames;
     dst.networkDroppedFrames += src.networkDroppedFrames;
     dst.pacerDroppedFrames += src.pacerDroppedFrames;
+    dst.pacerVrrOverfillDroppedFrames += src.pacerVrrOverfillDroppedFrames;
+    dst.pacerVrrBacklogDroppedFrames += src.pacerVrrBacklogDroppedFrames;
+    dst.pacerVrrStrictDroppedFrames += src.pacerVrrStrictDroppedFrames;
+    dst.pacerPacingQueueDroppedFrames += src.pacerPacingQueueDroppedFrames;
+    dst.pacerRenderQueueDroppedFrames += src.pacerRenderQueueDroppedFrames;
+    dst.pacerCapacityDroppedFrames += src.pacerCapacityDroppedFrames;
+    dst.pacerStartupDroppedFrames += src.pacerStartupDroppedFrames;
     dst.totalReassemblyTimeUs += src.totalReassemblyTimeUs;
     dst.totalDecodeTimeUs += src.totalDecodeTimeUs;
     dst.totalPacerTimeUs += src.totalPacerTimeUs;
+    dst.totalPacerPreparationTimeUs += src.totalPacerPreparationTimeUs;
+    dst.totalPacerProtectionTimeUs += src.totalPacerProtectionTimeUs;
     dst.totalRenderTimeUs += src.totalRenderTimeUs;
+    dst.totalRenderWorkTimeUs += src.totalRenderWorkTimeUs;
+    dst.totalPresentAlignmentWaitUs += src.totalPresentAlignmentWaitUs;
     dst.totalFrameIntervalUs += src.totalFrameIntervalUs;
     dst.totalSquaredFrameIntervalUs += src.totalSquaredFrameIntervalUs;
     dst.frameIntervalSamples += src.frameIntervalSamples;
@@ -1019,13 +1067,21 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         ret = snprintf(&output[offset],
                        length - offset,
                        "Frames dropped by your network connection: %.2f%%\n"
-                       "Frames dropped due to network jitter: %.2f%%\n"
+                       "Frames dropped by client rendering/pacing: %.2f%%\n"
+                       "Pacer causes O/B/S/P/R/C: %u/%u/%u/%u/%u/%u (startup %u)\n"
                        "Average network latency: %s\n"
                        "Average decoding time: %.2f ms\n"
-                       "Average frame queue delay: %.2f ms\n"
-                       "Average rendering time (including monitor V-sync latency): %.2f ms\n",
+                       "Average frame queue age (decode to render start): %.2f ms\n"
+                       "Average render call (including present hold): %.2f ms\n",
                        (float)stats.networkDroppedFrames / stats.totalFrames * 100,
                        (float)stats.pacerDroppedFrames / stats.decodedFrames * 100,
+                       stats.pacerVrrOverfillDroppedFrames,
+                       stats.pacerVrrBacklogDroppedFrames,
+                       stats.pacerVrrStrictDroppedFrames,
+                       stats.pacerPacingQueueDroppedFrames,
+                       stats.pacerRenderQueueDroppedFrames,
+                       stats.pacerCapacityDroppedFrames,
+                       stats.pacerStartupDroppedFrames,
                        rttString,
                        (double)(stats.totalDecodeTimeUs / 1000.0) / stats.decodedFrames,
                        (double)(stats.totalPacerTimeUs / 1000.0) / stats.renderedFrames,
@@ -1036,6 +1092,28 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         }
 
         offset += ret;
+
+        if (m_FrontendRenderer != nullptr &&
+                m_FrontendRenderer->getPresentationMode() ==
+                    IFFmpegRenderer::PresentationMode::VrrCadence) {
+            ret = snprintf(&output[offset],
+                           length - offset,
+                           "  VRR queue preparation/protection: %.2f/%.2f ms\n"
+                           "  VRR render work/present hold: %.2f/%.2f ms\n",
+                           (double)(stats.totalPacerPreparationTimeUs / 1000.0) /
+                               stats.renderedFrames,
+                           (double)(stats.totalPacerProtectionTimeUs / 1000.0) /
+                               stats.renderedFrames,
+                           (double)(stats.totalRenderWorkTimeUs / 1000.0) /
+                               stats.renderedFrames,
+                           (double)(stats.totalPresentAlignmentWaitUs / 1000.0) /
+                               stats.renderedFrames);
+            if (ret < 0 || ret >= length - offset) {
+                SDL_assert(false);
+                return;
+            }
+            offset += ret;
+        }
     }
 
     if (stats.frameIntervalSamples != 0) {
@@ -1080,7 +1158,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
 {
     if (stats.renderedFps > 0 || stats.renderedFrames != 0) {
-        char videoStatsStr[1024];
+        char videoStatsStr[1280];
         stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr));
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1116,8 +1194,8 @@ void FFmpegVideoDecoder::logFrameCadenceDiagnostics(VIDEO_STATS& stats)
     }
 
     // Drop attribution (2026-07-08 multi-stream diagnostic): the two drop
-    // counters distinguish the two client-side failure modes, both of which
-    // the overlay blames on the network. PACER drops (pacerDroppedFrames) =
+    // counters distinguish the two client-side failure modes. PACER drops
+    // (pacerDroppedFrames) =
     // present/render backpressure: the pacer sheds decoded frames it can't
     // present in time. NETWORK drops (networkDroppedFrames) = gaps in the
     // HOST frame numbers reaching submitDecodeUnit, which the CLIENT
@@ -1129,7 +1207,7 @@ void FFmpegVideoDecoder::logFrameCadenceDiagnostics(VIDEO_STATS& stats)
     // it's present-side. Either way the root cause is upstream render/present
     // slowness (see the "D3D11 render phases" gpu-wait line).
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Frame cadence: rendered %.2f FPS, interval avg/min/max/stddev %.2f/%.2f/%.2f/%.2f ms, signal %s, samples %u, pacer drops %.2f%%, network drops %.2f%% (%u recv / %u expected), queue %.2f ms, render %.2f ms",
+                "Frame cadence: rendered %.2f FPS, interval avg/min/max/stddev %.2f/%.2f/%.2f/%.2f ms, signal %s, samples %u, pacer drops %.2f%% [VRR ovf/backlog/strict %u/%u/%u, queue pacing/render/capacity %u/%u/%u, startup %u], network drops %.2f%% (%u recv / %u expected), queue %.2f ms [prep/protect %.2f/%.2f], render %.2f ms [work/hold %.2f/%.2f]",
                 stats.renderedFps,
                 avgIntervalUs / 1000.0,
                 (double)stats.minFrameIntervalUs / 1000.0,
@@ -1138,11 +1216,22 @@ void FFmpegVideoDecoder::logFrameCadenceDiagnostics(VIDEO_STATS& stats)
                 cadenceSignal,
                 stats.frameIntervalSamples,
                 stats.decodedFrames != 0 ? (float)stats.pacerDroppedFrames / stats.decodedFrames * 100 : 0,
+                stats.pacerVrrOverfillDroppedFrames,
+                stats.pacerVrrBacklogDroppedFrames,
+                stats.pacerVrrStrictDroppedFrames,
+                stats.pacerPacingQueueDroppedFrames,
+                stats.pacerRenderQueueDroppedFrames,
+                stats.pacerCapacityDroppedFrames,
+                stats.pacerStartupDroppedFrames,
                 stats.totalFrames != 0 ? (float)stats.networkDroppedFrames / stats.totalFrames * 100 : 0,
                 stats.receivedFrames,
                 stats.totalFrames,
                 stats.renderedFrames != 0 ? (double)(stats.totalPacerTimeUs / 1000.0) / stats.renderedFrames : 0,
-                stats.renderedFrames != 0 ? (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames : 0);
+                stats.renderedFrames != 0 ? (double)(stats.totalPacerPreparationTimeUs / 1000.0) / stats.renderedFrames : 0,
+                stats.renderedFrames != 0 ? (double)(stats.totalPacerProtectionTimeUs / 1000.0) / stats.renderedFrames : 0,
+                stats.renderedFrames != 0 ? (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames : 0,
+                stats.renderedFrames != 0 ? (double)(stats.totalRenderWorkTimeUs / 1000.0) / stats.renderedFrames : 0,
+                stats.renderedFrames != 0 ? (double)(stats.totalPresentAlignmentWaitUs / 1000.0) / stats.renderedFrames : 0);
 }
 
 IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig* hwDecodeCfg, int pass)
@@ -1971,15 +2060,16 @@ int FFmpegVideoDecoder::decoderThreadProcThunk(void *context)
 
 void FFmpegVideoDecoder::decoderThreadProc()
 {
-    // The VRR cadence pacer runs at TIME_CRITICAL priority so its present timing
-    // is precise, but that's undermined if this thread's own OS scheduling is
-    // jittery - any delay here shows up as frame-arrival jitter the cadence
-    // clock then has to chase.
+    // The priority escalation belongs only to the cadence pacer. Retaining
+    // the normal decoder-thread scheduling for FixedVsync and Immediate
+    // presentation keeps disabled-VRR streams on the pre-VRR behavior.
+    if (m_UsesVrrCadencePacing) {
 #if SDL_VERSION_ATLEAST(2, 0, 9)
-    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL);
+        SDL_SetThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL);
 #else
-    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+        SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
 #endif
+    }
 
     while (!SDL_AtomicGet(&m_DecoderThreadShouldQuit)) {
         if (m_FramesIn == m_FramesOut) {
@@ -2185,9 +2275,9 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     uint64_t now = LiGetMicroseconds();
     if (now > m_ActiveWndVideoStats.measurementStartUs + 1000000) {
         VIDEO_STATS lastTwoWndStats = {};
-        bool logCadenceDiagnostics =
-                m_LastFrameDiagnosticLogUs == 0 ||
-                now > m_LastFrameDiagnosticLogUs + FRAME_CADENCE_DIAGNOSTIC_LOG_INTERVAL_US;
+        bool logCadenceDiagnostics = m_UsesVrrCadencePacing &&
+                (m_LastFrameDiagnosticLogUs == 0 ||
+                 now > m_LastFrameDiagnosticLogUs + FRAME_CADENCE_DIAGNOSTIC_LOG_INTERVAL_US);
 
         // Update overlay stats if it's enabled
         if (Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug) ||
@@ -2296,4 +2386,3 @@ void FFmpegVideoDecoder::renderFrameOnMainThread()
 {
     m_Pacer->renderOnMainThread();
 }
-

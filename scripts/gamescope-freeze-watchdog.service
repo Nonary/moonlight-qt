@@ -1,0 +1,14 @@
+[Unit]
+Description=Gamescope freeze watchdog (capture kernel state, restart session)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/home/deck/sources/moonlight-qt/scripts/gamescope-freeze-watchdog.sh
+Restart=on-failure
+RestartSec=10
+# Stays responsive while a runaway compositor/client loads the CPU.
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target

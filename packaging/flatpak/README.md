@@ -8,9 +8,9 @@ glibc. The manifest is derived from the official Flathub packaging
 
 - The `moonlight` module builds this fork instead of upstream `v6.1.0`
   (the Qt 6.9 UI patches from Flathub are already merged here).
-- `--env=PREFER_VULKAN=1`: the VRR cadence pacing lives in the Vulkan
-  (libplacebo) renderer, so the Flatpak selects it by default. Launch with
-  `PREFER_VULKAN=0` to get the stock renderer order.
+- The Linux vrr8 port is applied as a patch over the published vrr8 tag.
+  When VRR is enabled, Moonlight selects the Vulkan (libplacebo) renderer
+  automatically. With VRR disabled, the normal renderer order is unchanged.
 - `CONFIG+=disable-libdrm` removed: the fork reads the true display refresh
   rate from DRM scanout state (gamescope's XWayland advertises a fake 60 Hz
   mode), which needs `HAVE_DRM`.

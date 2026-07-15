@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Chase <chase@local>
+Date: Thu, 9 Jul 2026 23:07:59 -0500
+Subject: [PATCH] Port vrr8 pacing to Linux
+
+
+diff --git a/AGENTS.md b/AGENTS.md
+index aa51528a..7b7edf9f 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,9 +1,8 @@
+-# Repository agent instructions
++# Agent Notes
+ 
+-## Windows VRR builds and deployment
+-
+-- Any time an agent successfully builds the Windows Moonlight application in this workspace—whether the build is incremental, a verification build, or a release build—the agent must immediately deploy the binaries produced by that exact build to `C:\Users\Chase\Desktop\VRR`.
+-- A build task is not complete until this deployment has succeeded. At minimum, replace `Moonlight.exe`. Also replace any runtime `.dll` rebuilt as part of the same build when its contents changed (for example, `AntiHooking.dll`).
+-- Never replace or delete portable data, settings, logs, dumps, cache, box art, or other user-generated files in the Desktop VRR folder. Do not mirror or clean the destination directory.
+-- After copying, verify that each deployed binary has the same SHA-256 hash as its build output and report the deployed path and timestamp.
+-- If a destination binary is locked by a running Moonlight process, do not terminate the process without permission. Report that Moonlight must be closed, then finish the copy and verification once it is available.
++- This Moonlight dev checkout is built inside the `moonlight-dev` Distrobox, not with the host toolchain. The host may not have `g++`, `make`, or other build tools in `PATH`.
++- The dev binary launched by the desktop shortcuts is `/home/deck/sources/moonlight-qt/build/app/moonlight`.
++- The Desktop launcher `Moonlight Dev (Logged)` runs `/home/deck/.local/bin/moonlight-dev-log`, which logs to `~/moonlight-logs/latest.log` and then calls `/home/deck/.local/bin/moonlight-dev`.
++- The `moonlight-dev` wrapper enters the `moonlight-dev` Distrobox and runs the built binary with the container's Qt/FFmpeg stack. It chooses Wayland/X11 variables based on the current session without forcing a renderer or session type.
++- For build or compile validation, enter the Distrobox first, for example: `distrobox enter --name moonlight-dev -- <build command>`.
++- For real Steam Deck presentation testing, use Steam/Game Mode. Desktop launches are useful for logs and quick checks, but nested gamescope from Plasma Desktop is only a fallback and KWin still owns the physical display.
+diff --git a/app/streaming/video/ffmpeg-renderers/pacer/pacer.cpp b/app/streaming/video/ffmpeg-renderers/pacer/pacer.cpp
+index 57e1e9b5..e76164a5 100644
+--- a/app/streaming/video/ffmpeg-renderers/pacer/pacer.cpp
++++ b/app/streaming/video/ffmpeg-renderers/pacer/pacer.cpp
+@@ -807,6 +807,7 @@ int Pacer::cadenceThread(void* context)
+         }
+ 
+         bool latchSupported =
++            me->m_VsyncRenderer->canVsyncLatchVrrPresents() &&
+             qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_LATCH") == 0;
+         bool preferenceLatchAvailable = !me->m_VrrTearingPreferred &&
+             latchSupported;
+@@ -2139,14 +2140,13 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
+ bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrrTearing, int vrrCushionUs)
+ {
+     m_MaxVideoFps = maxVideoFps;
+-    // A tearing preference only means something when the renderer can
+-    // actually present with tearing. On renderers whose presents all latch
+-    // at a vblank anyway (plvk's FIFO VrrCadence path), honoring it would
+-    // strip the pacer's vsync-latch fallback and flip-spacing slack - all
+-    // of tearing-preferred pacing's cost with none of its latency benefit
+-    // (observed 2026-07-05: 100fps content flipping at the panel ceiling
+-    // on every catch-up because vrrtearing=true removed the +750us floor).
+-    m_VrrTearingPreferred = enableVrrTearing &&
++    // Treat low-latency VRR as preferred when requested, or when the
++    // renderer's selected VRR cadence present mode cannot honor per-frame
++    // vsync-latch requests. On renderers whose presents all latch at vblank
++    // anyway (plvk FIFO), honoring a tearing preference would strip the
++    // pacer's latch fallback and flip-spacing slack for no latency benefit.
++    m_VrrTearingPreferred = (enableVrrTearing ||
++        !m_VsyncRenderer->canVsyncLatchVrrPresents()) &&
+         !m_VsyncRenderer->arePresentsVsyncLatched();
+     if (vrrCushionUs > 0) {
+         m_VrrCushionUs = vrrCushionUs;
+diff --git a/app/streaming/video/ffmpeg-renderers/plvk.cpp b/app/streaming/video/ffmpeg-renderers/plvk.cpp
+index bd7458bf..87096c9c 100644
+--- a/app/streaming/video/ffmpeg-renderers/plvk.cpp
++++ b/app/streaming/video/ffmpeg-renderers/plvk.cpp
+@@ -682,25 +682,27 @@ void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
+         m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+     }
+     else if (m_PresentationMode == PresentationMode::VrrCadence) {
+-        // Vsync-latched presents, paced by the cadence clock. There is no
+-        // scan-position source on this platform, so a tearing (immediate)
+-        // flip can never be phase-aligned - under direct scanout it lands
+-        // mid-scan and visibly tears (observed at 116fps-on-120Hz, KWin
+-        // direct scanout, 2026-07-05). FIFO latches every flip at a vblank
+-        // instead: with VRR active the vblank happens when our paced present
+-        // arrives (the cadence still drives the panel), and on a fixed-rate
+-        // raster this degrades to the classic vsync-latch regime the pacer
+-        // already runs near the panel's ceiling. The pacer holds each frame
+-        // to its target before queuing and never queues a second one, so the
+-        // FIFO queue cannot re-pace the flips it latches.
++        // Linux VRR cadence needs the compositor/display stack to observe our
++        // actual present cadence. FIFO is tear-free, but under a compositor it
++        // can still latch/sample on the compositor's repaint clock unless the
++        // surface is direct-scanned. That shows up as "almost VRR" motion:
++        // blur from the host cadence plus residual shake from repeated or
++        // uneven compositor presents. Prefer Immediate when available so the
++        // swapchain is never intentionally vblank-latched before it reaches
++        // the compositor/display path.
+         //
+-        // MOONLIGHT_VRR_NO_LATCH=1 opts back into immediate flips to A/B the
+-        // few ms of latency this trades away (tears under direct scanout).
+-        if (qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_LATCH") && haveImmediate) {
++        // MOONLIGHT_VRR_FORCE_LATCH=1 restores the previous FIFO behavior for
++        // A/B testing. If Immediate is unavailable, FIFO remains the fallback
++        // and the pacer treats presents as vblank-latched.
++        if (haveImmediate &&
++                qEnvironmentVariableIntValue("MOONLIGHT_VRR_FORCE_LATCH") == 0) {
+             m_VkPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+         }
+         else {
+             m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
++            if (params->enableVrrTearing && !haveImmediate) {
++                fallbackReason = "low-latency VRR requested but immediate present mode is not supported";
++            }
+         }
+     }
+     else if (haveImmediate) {
+@@ -1356,11 +1358,11 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
+         uint64_t afterFinishUs = LiGetMicroseconds();
+         noteCadenceStage(StageGpuFinish, afterFinishUs - beforeFinishUs);
+ 
+-        // The returned vsync-latch flag needs no mechanical action here:
+-        // Vulkan's present mode is fixed per-swapchain and composited
+-        // presentation never tears, so latched and tearing presents issue
+-        // identically - the presenter just tracks the regime for the pacer
+-        // and the overlay's sub-state line.
++        // Vulkan present mode is fixed per-swapchain, so the returned
++        // vsync-latch flag cannot change this individual present. The
++        // presenter still applies target holds and tracks the overlay
++        // sub-state; the pacer only requests latch states when the selected
++        // swapchain mode can actually honor them.
+         m_VrrPresenter.prepareToPresent();
+         noteCadenceStage(StageTargetHold, LiGetMicroseconds() - afterFinishUs);
+     }
+@@ -1557,6 +1559,11 @@ const char* PlVkRenderer::getPresentationModeFallbackReason()
+     // inert.
+     if (m_PresentationMode == PresentationMode::VrrCadence &&
+             m_PresentationModeFallbackReason == nullptr) {
++        if (m_VkPresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
++            return m_VrrPresenter.lastPresentBuffered() ?
++                "true VRR pacing (immediate, near-ceiling buffer)" :
++                "true VRR pacing (immediate)";
++        }
+         if (m_VrrPresenter.lastPresentLatched()) {
+             return "vsync-latched: content at the panel's VRR ceiling";
+         }
+@@ -1595,13 +1602,19 @@ bool PlVkRenderer::isVrrRasterLockUncertain()
+ 
+ bool PlVkRenderer::arePresentsVsyncLatched()
+ {
+-    // VrrCadence maps to FIFO on this platform (see resolvePresentationMode):
+-    // every flip latches at a vblank, and only MOONLIGHT_VRR_NO_LATCH=1 opts
+-    // into tearing-capable immediate presents.
+     return m_PresentationMode == PresentationMode::VrrCadence &&
+            m_VkPresentMode == VK_PRESENT_MODE_FIFO_KHR;
+ }
+ 
++bool PlVkRenderer::canVsyncLatchVrrPresents()
++{
++    // Vulkan present mode is fixed for the swapchain. FIFO can latch every
++    // present, while Immediate cannot honor the pacer's per-frame latch
++    // request without recreating the swapchain.
++    return m_PresentationMode != PresentationMode::VrrCadence ||
++           m_VkPresentMode == VK_PRESENT_MODE_FIFO_KHR;
++}
++
+ int PlVkRenderer::getDecoderColorspace()
+ {
+     // We rely on libplacebo for color conversion, pick colorspace with the same primaries as sRGB
+diff --git a/app/streaming/video/ffmpeg-renderers/plvk.h b/app/streaming/video/ffmpeg-renderers/plvk.h
+index 92deb8c6..75a90272 100644
+--- a/app/streaming/video/ffmpeg-renderers/plvk.h
++++ b/app/streaming/video/ffmpeg-renderers/plvk.h
+@@ -58,6 +58,7 @@ public:
+     virtual uint32_t popMidScanTearCount() override;
+     virtual bool isVrrRasterLockUncertain() override;
+     virtual bool arePresentsVsyncLatched() override;
++    virtual bool canVsyncLatchVrrPresents() override;
+     virtual int getDecoderColorspace() override;
+     virtual int getDecoderColorRange() override;
+     virtual int getDecoderCapabilities() override;
+diff --git a/app/streaming/video/ffmpeg-renderers/renderer.h b/app/streaming/video/ffmpeg-renderers/renderer.h
+index cb56bd41..342eae41 100644
+--- a/app/streaming/video/ffmpeg-renderers/renderer.h
++++ b/app/streaming/video/ffmpeg-renderers/renderer.h
+@@ -347,6 +347,15 @@ public:
+         return false;
+     }
+ 
++    virtual bool canVsyncLatchVrrPresents() {
++        // True if the renderer can honor VrrCadence's per-present request to
++        // latch at vblank instead of presenting immediately. D3D11 can switch
++        // this per present by dropping DXGI_PRESENT_ALLOW_TEARING. Vulkan WSI
++        // cannot switch without recreating the swapchain, so a VrrCadence
++        // swapchain in Immediate mode must report false here.
++        return true;
++    }
++
+     static const char* getPresentationModeName(PresentationMode mode) {
+         switch (mode) {
+         case PresentationMode::Immediate:
+diff --git a/app/streaming/video/ffmpeg.cpp b/app/streaming/video/ffmpeg.cpp
+index 0227d4ea..a9b6b600 100644
+--- a/app/streaming/video/ffmpeg.cpp
++++ b/app/streaming/video/ffmpeg.cpp
+@@ -366,13 +366,50 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
+     Q_UNUSED(glIsSlow);
+     Q_UNUSED(vulkanIsSlow);
+ 
++#ifdef HAVE_LIBPLACEBO_VULKAN
++    const bool preferVulkanForVrr =
++#if defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN)
++        params->enableVrr;
++#else
++        false;
++#endif
++    const bool preferVulkanFrontend =
++        preferVulkanForVrr || qgetenv("PREFER_VULKAN") == "1";
++    const char* preferVulkanReason =
++        preferVulkanForVrr ? "VRR" : "PREFER_VULKAN";
++    bool preferredVulkanAttempted = false;
++    auto tryPreferredVulkanFrontend = [this, params, &preferredVulkanAttempted](const char* reason) {
++        preferredVulkanAttempted = true;
++        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                    "Trying Vulkan frontend renderer (%s)", reason);
++        m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
++        if (initializeRendererInternal(m_FrontendRenderer, params)) {
++            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                        "Using Vulkan frontend renderer");
++            return true;
++        }
++        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
++                    "Requested Vulkan renderer failed to initialize; falling back to the default renderer");
++        delete m_FrontendRenderer;
++        m_FrontendRenderer = nullptr;
++        return false;
++    };
++#endif
++
+     // For cases where we're already using Vulkan Video decoding, always use the Vulkan renderer too.
+     // The alternate frontend logic is primarily for cases where a different renderer like EGL or DRM
+     // may provide additional performance or HDR capabilities. Neither of these are true for Vulkan.
+     if (useAlternateFrontend && m_BackendRenderer->getRendererType() != IFFmpegRenderer::RendererType::Vulkan) {
++#ifdef HAVE_LIBPLACEBO_VULKAN
++        if (preferVulkanFrontend &&
++                tryPreferredVulkanFrontend(preferVulkanReason)) {
++            return true;
++        }
++#endif
++
+         if (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) {
+ #ifdef HAVE_LIBPLACEBO_VULKAN
+-            if (!vulkanIsSlow) {
++            if (!preferredVulkanAttempted && !vulkanIsSlow) {
+                 // The Vulkan renderer can also handle HDR with a supported compositor. We prefer
+                 // rendering HDR with Vulkan if possible since it's more fully featured than DRM.
+                 m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
+@@ -400,7 +437,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
+ #endif
+ 
+ #ifdef HAVE_LIBPLACEBO_VULKAN
+-            if (vulkanIsSlow) {
++            if (!preferredVulkanAttempted && vulkanIsSlow) {
+                 // Try Vulkan even if it's slow because we have no other renderer
+                 // that can display HDR properly on Linux.
+                 m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
+@@ -412,20 +449,6 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
+             }
+ #endif
+         }
+-        else
+-        {
+-#ifdef HAVE_LIBPLACEBO_VULKAN
+-            if (qgetenv("PREFER_VULKAN") == "1") {
+-                m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
+-                if (initializeRendererInternal(m_FrontendRenderer, params)) {
+-                    return true;
+-                }
+-                delete m_FrontendRenderer;
+-                m_FrontendRenderer = nullptr;
+-            }
+-#endif
+-        }
+-
+ #ifdef HAVE_EGL
+         // Try EGLRenderer if GL is not slow on this platform
+         if (!glIsSlow && m_BackendRenderer->canExportEGL()) {
+@@ -443,7 +466,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
+     }
+ 
+ #ifdef HAVE_LIBPLACEBO_VULKAN
+-    // PREFER_VULKAN=1: try the Vulkan frontend before the backend's
++    // VRR and PREFER_VULKAN=1: try the Vulkan frontend before the backend's
+     // direct-rendering shortcut below. This must live HERE, not only in the
+     // alternate-frontend block above - that block never runs on Windows
+     // (the renderer-selection loop only does the alternate pass on Unix),
+@@ -451,19 +474,10 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
+     // explicitly requested attempt must not fail silently, so both
+     // outcomes are logged.
+     if (m_BackendRenderer->getRendererType() != IFFmpegRenderer::RendererType::Vulkan &&
+-            qgetenv("PREFER_VULKAN") == "1") {
+-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+-                    "Trying Vulkan frontend renderer (PREFER_VULKAN)");
+-        m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
+-        if (initializeRendererInternal(m_FrontendRenderer, params)) {
+-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+-                        "Using Vulkan frontend renderer");
++            preferVulkanFrontend) {
++        if (tryPreferredVulkanFrontend(preferVulkanReason)) {
+             return true;
+         }
+-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+-                    "Requested Vulkan renderer failed to initialize; falling back to the default renderer");
+-        delete m_FrontendRenderer;
+-        m_FrontendRenderer = nullptr;
+     }
+ #endif
+ 
+diff --git a/app/version.txt b/app/version.txt
+index 358e78e6..904eaa39 100644
+--- a/app/version.txt
++++ b/app/version.txt
+@@ -1 +1 @@
+-6.1.0
+\ No newline at end of file
++6.1.0-vrr8-linux
+-- 
+2.50.1
+

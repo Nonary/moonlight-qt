@@ -293,10 +293,25 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.window = window;
     params.enableVsync = enableVsync;
     params.enableFramePacing = enableFramePacing;
-    params.enableVrr = StreamingPreferences::get()->enableVrr;
-    params.enableVrrTearing = StreamingPreferences::get()->vrrTearing && params.enableVrr;
-    params.vrrCushionUs = StreamingPreferences::get()->vrrCushionUs;
-    params.enableOsScheduledVrr = StreamingPreferences::get()->osScheduledVrr && params.enableVrr;
+
+    // VRR pacing is an opt-in extension of the V-sync presentation path. In
+    // particular, don't let a saved VRR preference change renderer selection
+    // or presentation behavior for a stream where V-sync is disabled (either
+    // by the user or because the stream exceeds the display refresh rate).
+    const StreamingPreferences* preferences = StreamingPreferences::get();
+    params.enableVrr = enableVsync && preferences->enableVrr;
+    params.vrrCushionUs = preferences->vrrCushionUs;
+    Session* activeSession = !testOnly ? s_ActiveSession : nullptr;
+    NvComputer* activeComputer = activeSession != nullptr ?
+        activeSession->m_Computer : nullptr;
+    params.vrrCacheHostKey = activeComputer != nullptr ?
+        activeComputer->uuid : QString();
+    // Reuse the route class already selected for the active stream. Calling
+    // getActiveAddressReachability() here would open a blocking socket while
+    // creating or recreating the decoder.
+    params.vrrCacheRouteClass = activeSession != nullptr ?
+        activeSession->m_StreamConfig.streamingRemotely : STREAM_CFG_AUTO;
+    params.enableOsScheduledVrr = preferences->osScheduledVrr && params.enableVrr;
     params.testOnly = testOnly;
     params.vds = vds;
 
@@ -553,7 +568,9 @@ bool Session::populateDecoderProperties(SDL_Window* window)
 
 Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *preferences)
     : m_Preferences(preferences ? preferences : StreamingPreferences::get()),
-      m_IsFullScreen(m_Preferences->windowMode != StreamingPreferences::WM_WINDOWED || m_Preferences->enableVrr || !WMUtils::isRunningDesktopEnvironment()),
+      m_IsFullScreen(m_Preferences->windowMode != StreamingPreferences::WM_WINDOWED ||
+                     (m_Preferences->enableVsync && m_Preferences->enableVrr) ||
+                     !WMUtils::isRunningDesktopEnvironment()),
       m_Computer(computer),
       m_App(app),
       m_Window(nullptr),
@@ -565,6 +582,7 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_InputHandler(nullptr),
       m_MouseEmulationRefCount(0),
       m_FlushingWindowEventsRef(0),
+      m_InterruptRequested(false),
       m_ShouldExit(false),
       m_AsyncConnectionSuccess(false),
       m_PortTestResults(0),
@@ -593,7 +611,9 @@ bool Session::initialize(QQuickWindow* qtWindow)
         // (notched or notchless), override the fullscreen mode to ensure it works as expected.
         // - SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES=0 will place the video underneath the notch
         // - SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES=1 will place the video below the notch
-        bool shouldUseFullScreenSpaces = m_Preferences->windowMode != StreamingPreferences::WM_FULLSCREEN || m_Preferences->enableVrr;
+        bool shouldUseFullScreenSpaces =
+            m_Preferences->windowMode != StreamingPreferences::WM_FULLSCREEN ||
+            (m_Preferences->enableVsync && m_Preferences->enableVrr);
         SDL_DisplayMode desktopMode;
         SDL_Rect safeArea;
         for (int displayIndex = 0; StreamUtils::getNativeDesktopMode(displayIndex, &desktopMode, &safeArea); displayIndex++) {
@@ -881,7 +901,8 @@ bool Session::initialize(QQuickWindow* qtWindow)
     }
 
     StreamingPreferences::WindowMode windowMode = m_Preferences->windowMode;
-    if (m_Preferences->enableVrr && windowMode != StreamingPreferences::WM_FULLSCREEN_DESKTOP) {
+    const bool vrrEnabled = m_Preferences->enableVsync && m_Preferences->enableVrr;
+    if (vrrEnabled && windowMode != StreamingPreferences::WM_FULLSCREEN_DESKTOP) {
         // VRR pacing needs flip presentation on the desktop compositor's
         // native mode; exclusive fullscreen can trigger a modeset and
         // windowed mode can't get direct scanout, so both break adaptive
@@ -897,7 +918,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
         // Normally we'd default to fullscreen desktop when starting in windowed
         // mode, but in the case of a slow GPU, we want to use real fullscreen
         // to allow the display to assist with the video scaling work.
-        if (WMUtils::isGpuSlow() && !m_Preferences->enableVrr) {
+        if (WMUtils::isGpuSlow() && !vrrEnabled) {
             m_FullScreenFlag = SDL_WINDOW_FULLSCREEN;
             break;
         }
@@ -1765,6 +1786,12 @@ void Session::start()
 
 void Session::interrupt()
 {
+    // SDL_PushEvent() normally wakes the SDL loop, but signal delivery can
+    // race with the event backend on X11/Game Mode. Keep the request in
+    // session state too, so a missed event can delay shutdown by at most one
+    // event-loop timeout rather than leaving the stream running indefinitely.
+    m_InterruptRequested.store(true, std::memory_order_release);
+
     // Stop any connection in progress
     LiInterruptConnection();
 
@@ -1772,7 +1799,11 @@ void Session::interrupt()
     SDL_Event event;
     event.type = SDL_QUIT;
     event.quit.timestamp = SDL_GetTicks();
-    SDL_PushEvent(&event);
+    if (SDL_PushEvent(&event) != 1) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Failed to wake the SDL loop for shutdown: %s",
+                    SDL_GetError());
+    }
 }
 
 void Session::exec()
@@ -1962,6 +1993,12 @@ void Session::exec()
     // because we want to suspend all Qt processing until the stream is over.
     SDL_Event event;
     for (;;) {
+        if (m_InterruptRequested.load(std::memory_order_acquire)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Interrupt requested; leaving SDL loop");
+            goto DispatchDeferredCleanup;
+        }
+
 #if SDL_VERSION_ATLEAST(2, 0, 18) && !defined(STEAM_LINK)
         // SDL 2.0.18 has a proper wait event implementation that uses platform
         // support to block on events rather than polling on Windows, macOS, X11,

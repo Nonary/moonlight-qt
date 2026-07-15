@@ -1,0 +1,255 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Chase <chase@local>
+Subject: [PATCH] Retire low-latency VRR checkbox
+
+The cadence pacer selects its recovery behavior from renderer capability, so
+the old allow-tearing checkbox no longer represents a meaningful independent
+choice. Keep Flatpak behavior aligned with the development build.
+
+diff --git a/app/gui/SettingsView.qml b/app/gui/SettingsView.qml
+index bc1ae123..cd664eef 100644
+--- a/app/gui/SettingsView.qml
++++ b/app/gui/SettingsView.qml
+@@ -994,23 +994,6 @@ Flickable {
+                                 ToolTip.text: qsTr("Paces each frame to your display's variable refresh rate (G-Sync, FreeSync) for smooth, tear-free streaming at lower latency than fixed V-Sync.\nEnabling VRR selects the recommended VRR frame rate for your display and forces borderless windowed mode while streaming.\nVRR pacing is latency-sensitive, so while streaming it asks Windows to run at full CPU/GPU performance and keeps your system and display from sleeping. This uses more power than standard V-Sync, so expect reduced battery life on a laptop.")
+                             }
+ 
+-                            CheckBox {
+-                                id: vrrTearingCheck
+-                                width: parent.width
+-                                hoverEnabled: true
+-                                text: qsTr("Low-latency VRR (allow tearing)")
+-                                font.pointSize: 12
+-                                enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+-                                checked: StreamingPreferences.vrrTearing
+-                                onCheckedChanged: {
+-                                    StreamingPreferences.vrrTearing = checked
+-                                }
+-                                ToolTip.delay: 1000
+-                                ToolTip.timeout: 5000
+-                                ToolTip.visible: hovered
+-                                ToolTip.text: qsTr("Prefers immediate presentation when tear-free VRR pacing cannot keep up. Isolated on-time misses are still rescued tear-free, and a measured tear storm briefly falls back to fixed vsync before automatically retrying true VRR. This keeps recovery latency low without allowing sustained visible tearing near the display's VRR limit.")
+-                            }
+-
+                             Label {
+                                 width: parent.width
+                                 id: vrrCushionTitle
+diff --git a/app/settings/streamingpreferences.cpp b/app/settings/streamingpreferences.cpp
+index 1dd08683..a1e9f4c7 100644
+--- a/app/settings/streamingpreferences.cpp
++++ b/app/settings/streamingpreferences.cpp
+@@ -35,7 +35,6 @@
+ #define SER_STARTWINDOWED "startwindowed"
+ #define SER_FRAMEPACING "framepacing"
+ #define SER_ENABLEVRR "enablevrr"
+-#define SER_VRRTEARING "vrrtearing"
+ #define SER_VRRCUSHION "vrrcushion"
+ #define SER_OSSCHEDULEDVRR "osscheduledvrr"
+ #define SER_CONNWARNINGS "connwarnings"
+@@ -142,7 +141,6 @@ void StreamingPreferences::reload()
+     absoluteTouchMode = settings.value(SER_ABSTOUCHMODE, true).toBool();
+     framePacing = settings.value(SER_FRAMEPACING, false).toBool();
+     enableVrr = settings.value(SER_ENABLEVRR, false).toBool();
+-    vrrTearing = settings.value(SER_VRRTEARING, false).toBool();
+     vrrCushionUs = settings.value(SER_VRRCUSHION, 4500).toInt();
+     osScheduledVrr = settings.value(SER_OSSCHEDULEDVRR, false).toBool();
+     connectionWarnings = settings.value(SER_CONNWARNINGS, true).toBool();
+@@ -344,7 +342,7 @@ void StreamingPreferences::save()
+     settings.setValue(SER_ABSTOUCHMODE, absoluteTouchMode);
+     settings.setValue(SER_FRAMEPACING, framePacing);
+     settings.setValue(SER_ENABLEVRR, enableVrr);
+-    settings.setValue(SER_VRRTEARING, vrrTearing);
++    settings.remove(QStringLiteral("vrrtearing"));
+     settings.setValue(SER_VRRCUSHION, vrrCushionUs);
+     settings.setValue(SER_OSSCHEDULEDVRR, osScheduledVrr);
+     settings.setValue(SER_CONNWARNINGS, connectionWarnings);
+diff --git a/app/settings/streamingpreferences.h b/app/settings/streamingpreferences.h
+index eae9cc7b..93acba09 100644
+--- a/app/settings/streamingpreferences.h
++++ b/app/settings/streamingpreferences.h
+@@ -124,7 +124,6 @@ public:
+     Q_PROPERTY(bool absoluteTouchMode MEMBER absoluteTouchMode NOTIFY absoluteTouchModeChanged)
+     Q_PROPERTY(bool framePacing MEMBER framePacing NOTIFY framePacingChanged)
+     Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
+-    Q_PROPERTY(bool vrrTearing MEMBER vrrTearing NOTIFY vrrTearingChanged)
+     Q_PROPERTY(int vrrCushionUs MEMBER vrrCushionUs NOTIFY vrrCushionUsChanged)
+     Q_PROPERTY(bool osScheduledVrr MEMBER osScheduledVrr NOTIFY osScheduledVrrChanged)
+     Q_PROPERTY(bool connectionWarnings MEMBER connectionWarnings NOTIFY connectionWarningsChanged)
+@@ -169,7 +168,6 @@ public:
+     bool absoluteTouchMode;
+     bool framePacing;
+     bool enableVrr;
+-    bool vrrTearing;
+     int vrrCushionUs;
+     bool osScheduledVrr;
+     bool connectionWarnings;
+@@ -219,7 +217,6 @@ signals:
+     void windowModeChanged();
+     void framePacingChanged();
+     void enableVrrChanged();
+-    void vrrTearingChanged();
+     void vrrCushionUsChanged();
+     void osScheduledVrrChanged();
+     void connectionWarningsChanged();
+diff --git a/app/streaming/session.cpp b/app/streaming/session.cpp
+index abecacbc..339ac0a3 100644
+--- a/app/streaming/session.cpp
++++ b/app/streaming/session.cpp
+@@ -294,7 +294,6 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
+     params.enableVsync = enableVsync;
+     params.enableFramePacing = enableFramePacing;
+     params.enableVrr = StreamingPreferences::get()->enableVrr;
+-    params.enableVrrTearing = StreamingPreferences::get()->vrrTearing && params.enableVrr;
+     params.vrrCushionUs = StreamingPreferences::get()->vrrCushionUs;
+     params.enableOsScheduledVrr = StreamingPreferences::get()->osScheduledVrr && params.enableVrr;
+     params.testOnly = testOnly;
+diff --git a/app/streaming/video/decoder.h b/app/streaming/video/decoder.h
+index 527e0454..05a84b2f 100644
+--- a/app/streaming/video/decoder.h
++++ b/app/streaming/video/decoder.h
+@@ -49,7 +49,6 @@ typedef struct _DECODER_PARAMETERS {
+     bool enableVsync;
+     bool enableFramePacing;
+     bool enableVrr;
+-    bool enableVrrTearing;
+     int vrrCushionUs;
+     bool enableOsScheduledVrr;
+     bool testOnly;
+diff --git a/app/streaming/video/ffmpeg-renderers/pacer/pacer.cpp b/app/streaming/video/ffmpeg-renderers/pacer/pacer.cpp
+index e76164a5..514cdb67 100644
+--- a/app/streaming/video/ffmpeg-renderers/pacer/pacer.cpp
++++ b/app/streaming/video/ffmpeg-renderers/pacer/pacer.cpp
+@@ -185,7 +185,7 @@ Pacer::Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats) :
+     m_VsyncRenderer(renderer),
+     m_MaxVideoFps(0),
+     m_DisplayFps(0),
+-    m_VrrTearingPreferred(false),
++    m_VrrLatchUnavailable(false),
+     m_VrrCushionUs(4500),
+     m_VideoStats(videoStats),
+     m_RendererAttributes(0),
+@@ -809,7 +809,7 @@ int Pacer::cadenceThread(void* context)
+         bool latchSupported =
+             me->m_VsyncRenderer->canVsyncLatchVrrPresents() &&
+             qEnvironmentVariableIntValue("MOONLIGHT_VRR_NO_LATCH") == 0;
+-        bool preferenceLatchAvailable = !me->m_VrrTearingPreferred &&
++        bool preferenceLatchAvailable = !me->m_VrrLatchUnavailable &&
+             latchSupported;
+ 
+         // Cadence-cold grace: the clock's sample window restarts on any real
+@@ -1103,7 +1103,7 @@ int Pacer::cadenceThread(void* context)
+                 // the whole game.
+                 flipSpacingFloorUs += bufferGuardUs;
+             }
+-            else if (!me->m_VrrTearingPreferred) {
++            else if (!me->m_VrrLatchUnavailable) {
+                 flipSpacingFloorUs += flipCeilingSlackUs;
+             }
+         }
+@@ -1494,7 +1494,7 @@ int Pacer::cadenceThread(void* context)
+             alignBudgetUs = qMin(qMin(cadenceSlackUs, threadSlackUs),
+                                  rushBudgetCapUs);
+             if (!classicRecovery &&
+-                    (nearBuffered || !me->m_VrrTearingPreferred) &&
++                    (nearBuffered || !me->m_VrrLatchUnavailable) &&
+                     alignBudgetUs < boundedRushAlignFloorUs) {
+                 // In-band the floor applies even for tearing-preferred
+                 // users: one blind rush flip can cost the raster lock, and
+@@ -1906,25 +1906,6 @@ int Pacer::cadenceThread(void* context)
+                                     1000000.0 / measuredSourceIntervalUs : 0.0,
+                                 fallbackSecs);
+                 }
+-                else if (latchSupported && me->m_VrrTearingPreferred) {
+-                    // "Allow tearing" remains immediate in healthy true VRR,
+-                    // but it must not permit a measured tear storm to persist.
+-                    // Eight seconds is long enough to make the bad interval
+-                    // visually quiet without turning this preference into a
+-                    // permanent fixed-vsync mode; expiry automatically probes
+-                    // true VRR again. No queue reserve is added.
+-                    const uint32_t fallbackSecs = 8;
+-                    bandTearFallbackUntilUs = nowUs +
+-                        (uint64_t)fallbackSecs * 1000000ULL;
+-                    bandTearFallbackIntervalUs = measuredSourceIntervalUs;
+-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+-                                "VRR low-latency tear rescue: %u of %u in-band presents tore visibly at %.1f fps measured; temporarily vsync-latching for %us",
+-                                bandTearWindowTears,
+-                                bandTearWindowPresents,
+-                                measuredSourceIntervalUs > 0 ?
+-                                    1000000.0 / measuredSourceIntervalUs : 0.0,
+-                                fallbackSecs);
+-                }
+                 bandTearWindowPresents = 0;
+                 bandTearWindowTears = 0;
+             }
+@@ -2137,16 +2118,14 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
+     enqueueFrameForRenderingAndUnlock(m_PacingQueue.dequeue());
+ }
+ 
+-bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrrTearing, int vrrCushionUs)
++bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, int vrrCushionUs)
+ {
+     m_MaxVideoFps = maxVideoFps;
+-    // Treat low-latency VRR as preferred when requested, or when the
+-    // renderer's selected VRR cadence present mode cannot honor per-frame
+-    // vsync-latch requests. On renderers whose presents all latch at vblank
+-    // anyway (plvk FIFO), honoring a tearing preference would strip the
+-    // pacer's latch fallback and flip-spacing slack for no latency benefit.
+-    m_VrrTearingPreferred = (enableVrrTearing ||
+-        !m_VsyncRenderer->canVsyncLatchVrrPresents()) &&
++    // Presentation capability—not a user preference—selects the recovery
++    // path. A renderer without a per-present vblank latch retains its
++    // cadence-following behavior; otherwise the standard tear-free fallback
++    // remains available for every session.
++    m_VrrLatchUnavailable = !m_VsyncRenderer->canVsyncLatchVrrPresents() &&
+         !m_VsyncRenderer->arePresentsVsyncLatched();
+     if (vrrCushionUs > 0) {
+         m_VrrCushionUs = vrrCushionUs;
+diff --git a/app/streaming/video/ffmpeg-renderers/pacer/pacer.h b/app/streaming/video/ffmpeg-renderers/pacer/pacer.h
+index b54c964d..bbee8f04 100644
+--- a/app/streaming/video/ffmpeg-renderers/pacer/pacer.h
++++ b/app/streaming/video/ffmpeg-renderers/pacer/pacer.h
+@@ -42,7 +42,7 @@ public:
+ 
+     void submitFrame(AVFrame* frame);
+ 
+-    bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrrTearing, int vrrCushionUs);
++    bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, int vrrCushionUs);
+ 
+     void signalVsync();
+ 
+@@ -107,7 +107,7 @@ private:
+     IFFmpegRenderer* m_VsyncRenderer;
+     int m_MaxVideoFps;
+     int m_DisplayFps;
+-    bool m_VrrTearingPreferred;
++    bool m_VrrLatchUnavailable;
+     int m_VrrCushionUs;
+     PVIDEO_STATS m_VideoStats;
+     // Control state must not depend on the one-second VIDEO_STATS window,
+diff --git a/app/streaming/video/ffmpeg-renderers/plvk.cpp b/app/streaming/video/ffmpeg-renderers/plvk.cpp
+index 87096c9c..3f0bb1e3 100644
+--- a/app/streaming/video/ffmpeg-renderers/plvk.cpp
++++ b/app/streaming/video/ffmpeg-renderers/plvk.cpp
+@@ -700,9 +700,6 @@ void PlVkRenderer::resolvePresentationMode(PDECODER_PARAMETERS params)
+         }
+         else {
+             m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+-            if (params->enableVrrTearing && !haveImmediate) {
+-                fallbackReason = "low-latency VRR requested but immediate present mode is not supported";
+-            }
+         }
+     }
+     else if (haveImmediate) {
+diff --git a/app/streaming/video/ffmpeg.cpp b/app/streaming/video/ffmpeg.cpp
+index a9b6b600..94e14e0d 100644
+--- a/app/streaming/video/ffmpeg.cpp
++++ b/app/streaming/video/ffmpeg.cpp
+@@ -549,7 +549,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
+ 
+         m_Pacer = new Pacer(m_FrontendRenderer, &m_ActiveWndVideoStats);
+         if (!m_Pacer->initialize(params->window, params->frameRate, enablePacing,
+-                                 params->enableVrrTearing, params->vrrCushionUs)) {
++                                 params->vrrCushionUs)) {
+             return false;
+         }
+     }

@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep the Moonlight development Distrobox available outside Steam game scopes
+After=graphical-session.target
+ConditionPathExists=/usr/bin/podman
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The container may already be running (for example because Sunshine started
+# it).  In that case this is deliberately a no-op.
+ExecStart=/usr/bin/bash -lc '/usr/bin/podman inspect --format "{{.State.Running}}" moonlight-dev 2>/dev/null | /usr/bin/grep -qx true || /usr/bin/podman start moonlight-dev'
+
+[Install]
+WantedBy=default.target
