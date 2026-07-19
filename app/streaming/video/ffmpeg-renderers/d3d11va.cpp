@@ -10,6 +10,7 @@
 #include "streaming/session.h"
 
 #include <SDL_syswm.h>
+#include <Limelight.h>
 
 #include <dwmapi.h>
 
@@ -55,18 +56,48 @@ static const std::array<const char*, D3D11VARenderer::PixelShaders::_COUNT> k_Vi
     "d3d11_y410_pixel.fxc",
 };
 
+namespace {
+
+bool isBorderlessFullscreenWindow(SDL_Window* window)
+{
+    if (window == nullptr) {
+        return false;
+    }
+
+    return (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP) ==
+        SDL_WINDOW_FULLSCREEN_DESKTOP;
+}
+
+}
+
 D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
     : IFFmpegRenderer(RendererType::D3D11VA),
       m_DecoderSelectionPass(decoderSelectionPass),
       m_DevicesWithFL11Support(0),
       m_DevicesWithCodecSupport(0),
+      m_AdapterIndex(-1),
+      m_RenderAdapterIndex(-1),
       m_LastColorTrc(AVCOL_TRC_UNSPECIFIED),
       m_AllowTearing(false),
+      m_VrrTearingSupported(false),
+      m_VrrBorderlessFlipModel(false),
+      m_VrrSameGpuOutput(false),
+      m_VrrSwapChainAllowsTearing(false),
+      m_VrrSuspended(false),
+      m_VrrFallbackReason(VrrFallbackReason::InitializationFailed),
+      m_VrrFramePrepared(false),
+      m_VrrContextLocked(false),
+      m_VrrPreparedFrame(nullptr),
+      m_VrrPresentReadyFenceValue(0),
+      m_VrrPresentReadyFenceEvent(nullptr),
+      m_VrrPresentReadyAvailable(false),
+      m_VrrGpuReadyTimingValid(false),
+      m_VrrGpuReadyWaitStartUs(0),
+      m_VrrGpuReadyTimeUs(0),
       m_OverlayLock(0),
       m_HwDeviceContext(nullptr)
 {
     m_ContextLock = SDL_CreateMutex();
-
     DwmEnableMMCSS(TRUE);
 }
 
@@ -74,6 +105,10 @@ D3D11VARenderer::~D3D11VARenderer()
 {
     DwmEnableMMCSS(FALSE);
 
+    // The VRR worker may be cancelled after preparation but before Present.
+    // Release the retained D3D context lock before destroying it or any
+    // back-buffer objects.
+    cancelFrame();
     SDL_DestroyMutex(m_ContextLock);
 
     m_VideoVertexBuffer.Reset();
@@ -110,6 +145,12 @@ D3D11VARenderer::~D3D11VARenderer()
     m_DecodeR2DFence.Reset();
     m_RenderD2RFence.Reset();
     m_RenderR2DFence.Reset();
+
+    m_VrrPresentReadyFence.Reset();
+    if (m_VrrPresentReadyFenceEvent != nullptr) {
+        CloseHandle(m_VrrPresentReadyFenceEvent);
+        m_VrrPresentReadyFenceEvent = nullptr;
+    }
 
     m_RenderTargetView.Reset();
     m_SwapChain.Reset();
@@ -432,6 +473,7 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
         m_DevicesWithCodecSupport++;
     }
 
+    m_RenderAdapterIndex = adapterIndex;
     success = true;
 
 Exit:
@@ -492,7 +534,6 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
                      SDL_GetError());
         return false;
     }
-
     hr = CreateDXGIFactory2(
         m_DebugLayer ? DXGI_CREATE_FACTORY_DEBUG : 0,
         __uuidof(IDXGIFactory5),
@@ -570,39 +611,15 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
         swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     }
 
-    // Use DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING with flip mode for non-vsync case, if possible.
-    // NOTE: This is only possible in windowed or borderless windowed mode.
-    if (!params->enableVsync) {
-        BOOL allowTearing = FALSE;
-        hr = m_Factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-                                            &allowTearing,
-                                            sizeof(allowTearing));
-        if (SUCCEEDED(hr)) {
-            if (allowTearing) {
-                // Use flip discard with allow tearing mode if possible.
-                swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
-                m_AllowTearing = true;
-            }
-            else {
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "OS/GPU doesn't support DXGI_FEATURE_PRESENT_ALLOW_TEARING");
-            }
-        }
-        else {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "IDXGIFactory::CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING) failed: %x",
-                         hr);
-            // Non-fatal
-        }
+    initializeVrrPresentationState(params->window, &swapChainDesc);
 
-        // DXVA2 may let us take over for FSE V-sync off cases. However, if we don't have DXGI_FEATURE_PRESENT_ALLOW_TEARING
-        // then we should not attempt to do this unless there's no other option (HDR, DXVA2 failed in pass 1, etc).
-        if (!m_AllowTearing && m_DecoderSelectionPass == 0 && !(params->videoFormat & VIDEO_FORMAT_MASK_10BIT) &&
-                (SDL_GetWindowFlags(params->window) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Defaulting to DXVA2 for FSE without DXGI_FEATURE_PRESENT_ALLOW_TEARING support");
-            return false;
-        }
+    // DXVA2 may let us take over for FSE V-sync off cases. However, if we don't have DXGI_FEATURE_PRESENT_ALLOW_TEARING
+    // then we should not attempt to do this unless there's no other option (HDR, DXVA2 failed in pass 1, etc).
+    if (!m_AllowTearing && !params->enableVsync && m_DecoderSelectionPass == 0 && !(params->videoFormat & VIDEO_FORMAT_MASK_10BIT) &&
+            (SDL_GetWindowFlags(params->window) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Defaulting to DXVA2 for FSE without DXGI_FEATURE_PRESENT_ALLOW_TEARING support");
+        return false;
     }
 
     SDL_SysWMinfo info;
@@ -644,6 +661,12 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
                      "IDXGIFactory::MakeWindowAssociation() failed: %x",
                      hr);
         return false;
+    }
+
+    if (m_DecoderParams.enableVrr && m_VrrFallbackReason == VrrFallbackReason::None) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR backend enabled: refresh=%d Hz",
+                    m_DecoderParams.vrrDisplayRefreshHz);
     }
 
     {
@@ -747,65 +770,10 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         lockContext(this);
     }
 
-    // Clear the back buffer
-    const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    m_RenderDeviceContext->ClearRenderTargetView(m_RenderTargetView.Get(), clearColor);
-
-    // Bind the back buffer. This needs to be done each time,
-    // because the render target view will be unbound by Present().
-    m_RenderDeviceContext->OMSetRenderTargets(1, m_RenderTargetView.GetAddressOf(), nullptr);
-
-    // Render our video frame with the aspect-ratio adjusted viewport
-    renderVideo(frame);
-
-    // Render overlays on top of the video stream
-    for (int i = 0; i < Overlay::OverlayMax; i++) {
-        renderOverlay((Overlay::OverlayType)i);
-    }
-
-    UINT flags;
-
-    if (m_AllowTearing) {
-        SDL_assert(!m_DecoderParams.enableVsync);
-
-        // If tearing is allowed, use DXGI_PRESENT_ALLOW_TEARING with syncInterval 0.
-        // It is not valid to use any other syncInterval values in tearing mode.
-        flags = DXGI_PRESENT_ALLOW_TEARING;
-    }
-    else {
-        // Otherwise, we'll submit as fast as possible and DWM will discard excess
-        // frames for us. If frame pacing is also enabled or we're in full-screen,
-        // our Vsync source will keep us in sync with VBlank.
-        flags = 0;
-    }
-
-    HRESULT hr;
-
-    if (frame->color_trc != m_LastColorTrc) {
-        if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
-            // Switch to Rec 2020 PQ (SMPTE ST 2084) colorspace for HDR10 rendering
-            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-            if (FAILED(hr)) {
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                             "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) failed: %x",
-                             hr);
-            }
-        }
-        else {
-            // Restore default sRGB colorspace
-            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-            if (FAILED(hr)) {
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                             "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) failed: %x",
-                             hr);
-            }
-        }
-
-        m_LastColorTrc = frame->color_trc;
-    }
-
-    // Present according to the decoder parameters
-    hr = m_SwapChain->Present(0, flags);
+    // Keep the existing fixed/unpaced behavior intact while sharing the same
+    // preparation and final Present helpers used by the opt-in VRR backend.
+    bool prepared = prepareFrameForPresent(frame);
+    HRESULT hr = prepared ? presentPreparedFrame(legacyPresentFlags()) : E_FAIL;
 
     if (m_DecodeDevice == m_RenderDevice) {
         // Release the context lock
@@ -813,14 +781,18 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     }
 
     if (FAILED(hr)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "IDXGISwapChain::Present() failed: %x",
-                     hr);
+        if (prepared) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "IDXGISwapChain::Present() failed: %x",
+                         hr);
+        }
+        else {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "D3D11 frame preparation failed");
+        }
 
         // The card may have been removed or crashed. Reset the decoder.
-        SDL_Event event;
-        event.type = SDL_RENDER_DEVICE_RESET;
-        SDL_PushEvent(&event);
+        queueRenderDeviceReset();
         return;
     }
 }
@@ -1007,11 +979,17 @@ void D3D11VARenderer::renderVideo(AVFrame* frame)
         SDL_assert(m_DecodeD2RFence);
         SDL_assert(m_RenderD2RFence);
 
-        lockContext(this);
+        bool acquiredContextLock = false;
+        if (!m_VrrContextLocked) {
+            lockContext(this);
+            acquiredContextLock = true;
+        }
         if (SUCCEEDED(m_DecodeDeviceContext->Signal(m_DecodeD2RFence.Get(), m_D2RFenceValue))) {
             m_RenderDeviceContext->Wait(m_RenderD2RFence.Get(), m_D2RFenceValue++);
         }
-        unlockContext(this);
+        if (acquiredContextLock) {
+            unlockContext(this);
+        }
     }
 
     UINT srvIndex;
@@ -1067,10 +1045,16 @@ void D3D11VARenderer::renderVideo(AVFrame* frame)
         // This means the fence should generally not cause a pipeline bubble for the decoder
         // unless rendering is taking much longer than expected.
         if (SUCCEEDED(m_RenderDeviceContext->Signal(m_RenderR2DFence.Get(), m_R2DFenceValue))) {
-            lockContext(this);
+            bool acquiredContextLock = false;
+            if (!m_VrrContextLocked) {
+                lockContext(this);
+                acquiredContextLock = true;
+            }
             SDL_assert(m_R2DFenceValue > 0);
             m_DecodeDeviceContext->Wait(m_DecodeR2DFence.Get(), m_R2DFenceValue - 1);
-            unlockContext(this);
+            if (acquiredContextLock) {
+                unlockContext(this);
+            }
             m_R2DFenceValue++;
         }
     }
@@ -1233,6 +1217,13 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         if (!m_Factory->IsCurrent()) {
             return false;
         }
+
+        // A same-GPU display move keeps this renderer alive. Serialize the
+        // refreshed swapchain eligibility with the context retained by the
+        // VRR worker from preparation through Present.
+        lockContext(this);
+        refreshVrrDisplayState();
+        unlockContext(this);
 
         // We've handled this state change
         stateInfo->stateChangeFlags &= ~WINDOW_STATE_CHANGE_DISPLAY;
@@ -1523,6 +1514,611 @@ void D3D11VARenderer::unlockContext(void *lock_ctx)
     auto me = (D3D11VARenderer*)lock_ctx;
 
     SDL_UnlockMutex(me->m_ContextLock);
+}
+
+void D3D11VARenderer::initializeVrrPresentationState(SDL_Window* window,
+                                                       DXGI_SWAP_CHAIN_DESC1* swapChainDesc)
+{
+    m_AllowTearing = false;
+    m_VrrTearingSupported = false;
+    m_VrrBorderlessFlipModel = false;
+    m_VrrSameGpuOutput = false;
+    m_VrrSwapChainAllowsTearing = false;
+    m_VrrSuspended = false;
+    m_VrrFallbackReason = VrrFallbackReason::None;
+    m_VrrPresentReadyAvailable = false;
+
+    // Preserve the legacy non-VSync path while also creating an
+    // allow-tearing flip swapchain for an explicitly requested VRR session.
+    // The latter is required even though the session's effective V-Sync is
+    // true: the VRR worker always uses immediate presentation and owns the
+    // complete mathematical pacing policy.
+    if (!m_DecoderParams.enableVsync || m_DecoderParams.enableVrr) {
+        BOOL allowTearing = FALSE;
+        HRESULT hr = m_Factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                    &allowTearing,
+                                                    sizeof(allowTearing));
+        if (SUCCEEDED(hr) && allowTearing) {
+            m_VrrTearingSupported = true;
+            swapChainDesc->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+            m_VrrSwapChainAllowsTearing = true;
+
+            // Do not alter legacy V-Sync semantics.  Only the existing
+            // non-VSync path uses this flag from renderFrame().
+            if (!m_DecoderParams.enableVsync) {
+                m_AllowTearing = true;
+            }
+        }
+        else if (!m_DecoderParams.enableVsync) {
+            if (SUCCEEDED(hr)) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "OS/GPU doesn't support DXGI_FEATURE_PRESENT_ALLOW_TEARING");
+            }
+            else {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "IDXGIFactory::CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING) failed: %x",
+                             hr);
+            }
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "D3D11 VRR unavailable: DXGI_FEATURE_PRESENT_ALLOW_TEARING is unavailable (%x)",
+                        hr);
+        }
+    }
+
+    if (!m_DecoderParams.enableVrr) {
+        return;
+    }
+
+    m_VrrPresentReadyAvailable = initializeVrrPresentReadyFence();
+    if (!m_VrrPresentReadyAvailable) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR unavailable: GPU present-ready fencing is unavailable");
+    }
+
+    m_VrrBorderlessFlipModel = isBorderlessFullscreenWindow(window) &&
+        (swapChainDesc->SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ||
+         swapChainDesc->SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
+    m_VrrSameGpuOutput = m_RenderAdapterIndex >= 0 &&
+        m_RenderAdapterIndex == m_AdapterIndex;
+    m_VrrFallbackReason = evaluateVrrEligibility(false);
+    switch (m_VrrFallbackReason) {
+    case VrrFallbackReason::None:
+        break;
+    case VrrFallbackReason::IneffectiveVsync:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR unavailable: effective V-sync is disabled");
+        break;
+    case VrrFallbackReason::UnsupportedRenderer:
+        if (!m_VrrBorderlessFlipModel) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "D3D11 VRR unavailable: a borderless flip-model swapchain is required");
+        }
+        else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "D3D11 VRR unavailable: render adapter %d does not own output adapter %d",
+                        m_RenderAdapterIndex,
+                        m_AdapterIndex);
+        }
+        break;
+    case VrrFallbackReason::InvalidRefresh:
+        // Session already performs the strict query exactly once and preserves
+        // the result for every renderer recreation. Do not silently substitute
+        // a new display value or the legacy 60 Hz fallback here.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR unavailable: the active display has no valid refresh rate");
+        break;
+    case VrrFallbackReason::MainThreadRenderer:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR unavailable: the renderer cannot stay on the pacing worker thread");
+        break;
+    case VrrFallbackReason::AdaptivePresentationUnavailable:
+        if (!m_VrrPresentReadyAvailable) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "D3D11 VRR unavailable: GPU present-ready fencing is unavailable");
+        }
+        else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "D3D11 VRR unavailable: DXGI tearing support is unavailable");
+        }
+        break;
+    case VrrFallbackReason::InitializationFailed:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR unavailable: the flip-model swapchain lacks DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING");
+        break;
+    default:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR unavailable: %s",
+                    vrrFallbackReasonName(m_VrrFallbackReason));
+        break;
+    }
+}
+
+void D3D11VARenderer::refreshVrrDisplayState()
+{
+    if (!m_DecoderParams.enableVrr) {
+        return;
+    }
+
+    DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
+    bool gotSwapChainDesc = m_SwapChain != nullptr && SUCCEEDED(m_SwapChain->GetDesc1(&swapChainDesc));
+    m_VrrBorderlessFlipModel = gotSwapChainDesc &&
+        isBorderlessFullscreenWindow(m_DecoderParams.window) &&
+        (swapChainDesc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ||
+         swapChainDesc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
+    m_VrrSwapChainAllowsTearing = gotSwapChainDesc &&
+        (swapChainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+    m_VrrSameGpuOutput = m_RenderAdapterIndex >= 0 &&
+        m_RenderAdapterIndex == m_AdapterIndex;
+
+    VrrFallbackReason previousReason = m_VrrFallbackReason;
+    // Keep the established display-update precedence: an output mismatch is
+    // reported before a stale refresh snapshot, whereas initial setup logs the
+    // stricter refresh qualification first.
+    m_VrrFallbackReason = evaluateVrrEligibility(true);
+
+    if (m_VrrFallbackReason != previousReason) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR display update: %s",
+                    vrrFallbackReasonName(m_VrrFallbackReason));
+    }
+}
+
+VrrFallbackReason D3D11VARenderer::evaluateVrrEligibility(
+    bool prioritizeOutputCompatibility)
+{
+    if (!m_DecoderParams.enableVsync) {
+        return VrrFallbackReason::IneffectiveVsync;
+    }
+    if (!m_VrrBorderlessFlipModel ||
+        (prioritizeOutputCompatibility && !m_VrrSameGpuOutput)) {
+        return VrrFallbackReason::UnsupportedRenderer;
+    }
+    if (m_DecoderParams.vrrDisplayRefreshHz <= 0) {
+        return VrrFallbackReason::InvalidRefresh;
+    }
+    if (!m_VrrSameGpuOutput) {
+        return VrrFallbackReason::UnsupportedRenderer;
+    }
+    if (!isRenderThreadSupported()) {
+        return VrrFallbackReason::MainThreadRenderer;
+    }
+    if (!m_VrrPresentReadyAvailable) {
+        return VrrFallbackReason::AdaptivePresentationUnavailable;
+    }
+    if (!m_VrrTearingSupported) {
+        return VrrFallbackReason::AdaptivePresentationUnavailable;
+    }
+    if (!m_VrrSwapChainAllowsTearing) {
+        return VrrFallbackReason::InitializationFailed;
+    }
+
+    return VrrFallbackReason::None;
+}
+
+void D3D11VARenderer::releasePreparedVrrFrame()
+{
+    // Present() unbinds the render target itself.  A cancellation does not,
+    // so explicitly remove the context's reference to the back buffer before
+    // a resize/device reset can tear it down.
+    if ((m_VrrFramePrepared || m_VrrContextLocked) &&
+            m_RenderDeviceContext != nullptr) {
+        m_RenderDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+    }
+
+    m_VrrFramePrepared = false;
+    m_VrrPreparedFrame = nullptr;
+    m_VrrGpuReadyTimingValid = false;
+    m_VrrGpuReadyWaitStartUs = 0;
+    m_VrrGpuReadyTimeUs = 0;
+
+    if (m_VrrContextLocked) {
+        unlockContext(this);
+        m_VrrContextLocked = false;
+    }
+}
+
+void D3D11VARenderer::queueRenderDeviceReset()
+{
+    SDL_Event event = {};
+    event.type = SDL_RENDER_DEVICE_RESET;
+    SDL_PushEvent(&event);
+}
+
+bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame)
+{
+    if (frame == nullptr || m_RenderDeviceContext == nullptr ||
+            m_RenderTargetView == nullptr || m_SwapChain == nullptr) {
+        return false;
+    }
+
+    // Clear the back buffer.
+    const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    m_RenderDeviceContext->ClearRenderTargetView(m_RenderTargetView.Get(), clearColor);
+
+    // Bind the back buffer. This needs to be done each time because Present()
+    // unbinds the render target view.
+    m_RenderDeviceContext->OMSetRenderTargets(1, m_RenderTargetView.GetAddressOf(), nullptr);
+
+    // Render the video and overlays.  This is the complete preparation phase
+    // shared by the legacy and VRR paths; only the final Present is split out.
+    renderVideo(frame);
+    for (int i = 0; i < Overlay::OverlayMax; i++) {
+        renderOverlay((Overlay::OverlayType)i);
+    }
+
+    if (frame->color_trc != m_LastColorTrc) {
+        HRESULT hr;
+        if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
+            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+            if (FAILED(hr)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) failed: %x",
+                             hr);
+            }
+        }
+        else {
+            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+            if (FAILED(hr)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) failed: %x",
+                             hr);
+            }
+        }
+
+        m_LastColorTrc = frame->color_trc;
+    }
+
+    return true;
+}
+
+bool D3D11VARenderer::initializeVrrPresentReadyFence()
+{
+    m_VrrPresentReadyFence.Reset();
+    if (m_VrrPresentReadyFenceEvent != nullptr) {
+        CloseHandle(m_VrrPresentReadyFenceEvent);
+        m_VrrPresentReadyFenceEvent = nullptr;
+    }
+    m_VrrPresentReadyFenceValue = 0;
+
+    HRESULT hr = m_RenderDevice->CreateFence(
+        0, D3D11_FENCE_FLAG_NONE,
+        IID_PPV_ARGS(&m_VrrPresentReadyFence));
+    if (SUCCEEDED(hr)) {
+        m_VrrPresentReadyFenceEvent = CreateEventW(
+            nullptr, FALSE, FALSE, nullptr);
+    }
+
+    if (FAILED(hr) || m_VrrPresentReadyFenceEvent == nullptr) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR could not create the present-ready fence: %x",
+                    hr);
+        m_VrrPresentReadyFence.Reset();
+        if (m_VrrPresentReadyFenceEvent != nullptr) {
+            CloseHandle(m_VrrPresentReadyFenceEvent);
+            m_VrrPresentReadyFenceEvent = nullptr;
+        }
+        return false;
+    }
+
+    return true;
+}
+
+bool D3D11VARenderer::waitForVrrPresentReady()
+{
+    m_VrrGpuReadyTimingValid = false;
+    m_VrrGpuReadyWaitStartUs = 0;
+    m_VrrGpuReadyTimeUs = 0;
+    if (!m_VrrPresentReadyAvailable ||
+            m_VrrPresentReadyFence == nullptr ||
+            m_VrrPresentReadyFenceEvent == nullptr) {
+        return false;
+    }
+
+    // A tearing Present does not become scanout-visible until all GPU work
+    // targeting its back buffer is complete. vrr8's PresentMon diagnosis
+    // measured roughly 2.4 ms between the CPU call and display when this
+    // fence was absent, which made timing the CPU call itself insufficient.
+    // Finish the frame first so the worker's later target hold operates on an
+    // actual flip-ready boundary.
+    const UINT64 fenceValue = ++m_VrrPresentReadyFenceValue;
+    HRESULT hr = m_RenderDeviceContext->Signal(
+        m_VrrPresentReadyFence.Get(), fenceValue);
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR present-ready Signal() failed: %x", hr);
+        m_VrrPresentReadyAvailable = false;
+        return false;
+    }
+
+    m_RenderDeviceContext->Flush();
+    hr = m_VrrPresentReadyFence->SetEventOnCompletion(
+        fenceValue, m_VrrPresentReadyFenceEvent);
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR present-ready SetEventOnCompletion() failed: %x",
+                     hr);
+        m_VrrPresentReadyAvailable = false;
+        return false;
+    }
+
+    // A shared decode/render device uses this mutex in FFmpeg's device
+    // callbacks. Never wait for the GPU while retaining it: doing so stalls
+    // decode behind the render fence and recreates vrr8's first failed GPU
+    // synchronization experiment.
+    const bool releaseSharedContext =
+        m_DecodeDevice == m_RenderDevice && m_VrrContextLocked;
+    if (releaseSharedContext) {
+        unlockContext(this);
+        m_VrrContextLocked = false;
+    }
+
+    m_VrrGpuReadyWaitStartUs = LiGetMicroseconds();
+    const DWORD waitResult = WaitForSingleObject(
+        m_VrrPresentReadyFenceEvent, 50);
+    m_VrrGpuReadyTimeUs = LiGetMicroseconds();
+
+    if (releaseSharedContext) {
+        lockContext(this);
+        m_VrrContextLocked = true;
+    }
+
+    if (waitResult != WAIT_OBJECT_0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR present-ready fence wait failed or timed out: %lu",
+                     static_cast<unsigned long>(waitResult));
+        m_VrrPresentReadyAvailable = false;
+        return false;
+    }
+
+    m_VrrGpuReadyTimingValid = true;
+    return true;
+}
+
+HRESULT D3D11VARenderer::presentPreparedFrame(UINT flags)
+{
+    if (m_SwapChain == nullptr) {
+        return E_FAIL;
+    }
+
+    return m_SwapChain->Present(0, flags);
+}
+
+UINT D3D11VARenderer::legacyPresentFlags() const
+{
+    if (m_AllowTearing) {
+        SDL_assert(!m_DecoderParams.enableVsync);
+        return DXGI_PRESENT_ALLOW_TEARING;
+    }
+
+    return 0;
+}
+
+IVrrFramePresenter* D3D11VARenderer::getVrrFramePresenter()
+{
+    return this;
+}
+
+VrrFallbackReason D3D11VARenderer::checkSupport() const
+{
+    if (m_VrrFallbackReason != VrrFallbackReason::None) {
+        return m_VrrFallbackReason;
+    }
+
+    return m_DecoderParams.enableVrr && m_SwapChain != nullptr &&
+        m_VrrSwapChainAllowsTearing ? VrrFallbackReason::None :
+        VrrFallbackReason::InitializationFailed;
+}
+
+VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
+{
+    VrrPrepareResult result;
+    if (m_VrrSuspended || frame == nullptr) {
+        return result;
+    }
+
+    // The contract guarantees one worker, but make an accidental second
+    // preparation recoverable instead of leaking a retained context lock.
+    if (m_VrrFramePrepared) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR discarded an unpresented prepared frame");
+        result.feedback = cancelFrame();
+        return result;
+    }
+
+    // Hold the FFmpeg/D3D context lock from rendering preparation through
+    // final Present.  renderVideo() recognizes this retained lock for the
+    // separate-device fence calls, so it never recursively locks the SDL
+    // mutex while this frame is in flight.
+    lockContext(this);
+    m_VrrContextLocked = true;
+
+    // Display-state changes share this lock with preparation through Present.
+    // Check eligibility only after taking it so a UI callback cannot replace
+    // swapchain state concurrently.
+    if (checkSupport() != VrrFallbackReason::None) {
+        releasePreparedVrrFrame();
+        return result;
+    }
+
+    if (!prepareFrameForPresent(frame)) {
+        releasePreparedVrrFrame();
+        return result;
+    }
+
+    if (!waitForVrrPresentReady()) {
+        m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+        releasePreparedVrrFrame();
+        queueRenderDeviceReset();
+        return result;
+    }
+
+    // The shared-device fence wait temporarily releases the renderer lock.
+    // Revalidate state after reacquiring it before publishing this frame as
+    // prepared for the worker's target wait.
+    if (m_VrrSuspended || checkSupport() != VrrFallbackReason::None) {
+        releasePreparedVrrFrame();
+        return result;
+    }
+
+    HRESULT deviceReason = m_RenderDevice->GetDeviceRemovedReason();
+    if (FAILED(deviceReason)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR preparation detected device loss: %x",
+                     deviceReason);
+        releasePreparedVrrFrame();
+        queueRenderDeviceReset();
+        return result;
+    }
+
+    m_VrrPreparedFrame = frame;
+    m_VrrFramePrepared = true;
+    result.prepared = true;
+    return result;
+}
+
+VrrPresentFeedback D3D11VARenderer::presentAdaptive(
+    const VrrPresentRequest& request)
+{
+    VrrPresentFeedback feedback;
+
+    if (!m_VrrFramePrepared || m_VrrPreparedFrame == nullptr ||
+            m_VrrSuspended) {
+        return cancelFrame();
+    }
+
+    feedback.gpuReadyTimingValid = m_VrrGpuReadyTimingValid;
+    feedback.gpuReadyWaitStartUs = m_VrrGpuReadyWaitStartUs;
+    feedback.gpuReadyTimeUs = m_VrrGpuReadyTimeUs;
+
+    const auto translateSyncQpcTime = [](LARGE_INTEGER syncQpcTime,
+                                         uint64_t& translatedTimeUs) {
+        if (syncQpcTime.QuadPart <= 0) {
+            return false;
+        }
+        LARGE_INTEGER qpcNow;
+        LARGE_INTEGER qpcFrequency;
+        if (!QueryPerformanceCounter(&qpcNow) ||
+                !QueryPerformanceFrequency(&qpcFrequency) ||
+                qpcFrequency.QuadPart <= 0 ||
+                qpcNow.QuadPart < syncQpcTime.QuadPart) {
+            return false;
+        }
+        const uint64_t nowUs = LiGetMicroseconds();
+        const uint64_t ageTicks = static_cast<uint64_t>(
+            qpcNow.QuadPart - syncQpcTime.QuadPart);
+        const uint64_t ticksPerSecond = static_cast<uint64_t>(
+            qpcFrequency.QuadPart);
+        const uint64_t ageUs =
+            (ageTicks / ticksPerSecond) * 1000000ULL +
+            (ageTicks % ticksPerSecond) * 1000000ULL / ticksPerSecond;
+        translatedTimeUs = nowUs > ageUs ? nowUs - ageUs : 0;
+        return true;
+    };
+    if (request.collectDiagnostics) {
+        UINT presentCountBefore = 0;
+        if (SUCCEEDED(m_SwapChain->GetLastPresentCount(
+                &presentCountBefore))) {
+            feedback.presentCountBeforeValid = true;
+            feedback.presentCountBefore = presentCountBefore;
+        }
+
+        DXGI_FRAME_STATISTICS frameStatsBefore = {};
+        uint64_t frameStatsBeforeTimeUs = 0;
+        if (SUCCEEDED(m_SwapChain->GetFrameStatistics(&frameStatsBefore)) &&
+                translateSyncQpcTime(frameStatsBefore.SyncQPCTime,
+                                     frameStatsBeforeTimeUs)) {
+            feedback.frameStatsBeforeValid = true;
+            feedback.frameStatsBeforePresentCount =
+                frameStatsBefore.PresentCount;
+            feedback.frameStatsBeforeTimeUs = frameStatsBeforeTimeUs;
+            feedback.frameStatsBeforeRefreshSequence =
+                frameStatsBefore.SyncRefreshCount;
+        }
+    }
+
+    // A latched near-refresh present omits ALLOW_TEARING so DXGI synchronizes
+    // the flip to a vertical blank instead of executing it mid-scan. The flag
+    // is a per-present choice on this swapchain; no recreation is involved.
+    const uint64_t submissionTimeUs = LiGetMicroseconds();
+    HRESULT hr = presentPreparedFrame(
+        request.latchedPresentation ? 0 : DXGI_PRESENT_ALLOW_TEARING);
+    const uint64_t nativePresentEndUs = LiGetMicroseconds();
+    if (request.collectDiagnostics) {
+        feedback.nativePresentTimingValid = true;
+        feedback.nativePresentStartUs = submissionTimeUs;
+        feedback.nativePresentEndUs = nativePresentEndUs;
+    }
+
+    // This is deliberately before device-reset notification so every error
+    // path releases the FFmpeg/D3D context lock retained by preparation.
+    releasePreparedVrrFrame();
+
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "IDXGISwapChain::Present() failed on D3D11 VRR path: %x",
+                     hr);
+        queueRenderDeviceReset();
+        feedback.cancelled = true;
+        return feedback;
+    }
+
+    feedback.presented = true;
+    feedback.submissionTimeValid = true;
+    feedback.submissionTimeUs = submissionTimeUs;
+
+    // Observation-only display-latch feedback. DXGI frame statistics describe
+    // the most recent present that actually reached the screen, which may lag
+    // this submission by several frames; the pacer correlates them by present
+    // id. SyncQPCTime is translated onto the shared pacing clock through a
+    // same-instant QPC sample so traces can compare submission and latch
+    // times directly. Failure (e.g. FRAME_STATISTICS_DISJOINT after a mode
+    // change, or a composed swapchain) just leaves the sample invalid.
+    UINT lastPresentCount = 0;
+    if (SUCCEEDED(m_SwapChain->GetLastPresentCount(&lastPresentCount))) {
+        feedback.submissionIdValid = true;
+        feedback.submissionId = lastPresentCount;
+    }
+
+    DXGI_FRAME_STATISTICS frameStats = {};
+    uint64_t latchTimeUs = 0;
+    if (SUCCEEDED(m_SwapChain->GetFrameStatistics(&frameStats)) &&
+            translateSyncQpcTime(frameStats.SyncQPCTime, latchTimeUs)) {
+        feedback.latchSampleValid = true;
+        feedback.latchTimeUs = latchTimeUs;
+        feedback.latchSubmissionId = frameStats.PresentCount;
+        feedback.latchRefreshSequence = frameStats.SyncRefreshCount;
+    }
+
+    return feedback;
+}
+
+VrrPresentFeedback D3D11VARenderer::cancelFrame()
+{
+    releasePreparedVrrFrame();
+    VrrPresentFeedback feedback;
+    feedback.cancelled = true;
+    return feedback;
+}
+
+bool D3D11VARenderer::restoreFixedPresentation(VrrFallbackReason reason)
+{
+    // This is called synchronously only if the pacing worker could not start,
+    // before it has prepared a frame.  ALLOW_TEARING is a swapchain capability,
+    // not a requirement for every Present, so the existing swapchain safely
+    // supports the legacy fixed path with Present(0, 0).  Do not recreate it.
+    cancelFrame();
+    m_VrrSuspended = false;
+    m_DecoderParams.enableVrr = false;
+    m_VrrFallbackReason = reason == VrrFallbackReason::None ?
+        VrrFallbackReason::InitializationFailed : reason;
+    return true;
+}
+
+void D3D11VARenderer::setSuspended(bool suspended)
+{
+    m_VrrSuspended = suspended;
 }
 
 bool D3D11VARenderer::setupRenderingResources()

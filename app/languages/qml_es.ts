@@ -508,158 +508,158 @@
         <translation>Código de error: %1</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="958"/>
+        <location filename="../streaming/session.cpp" line="1059"/>
         <source>The version of GeForce Experience on %1 is not supported by this build of Moonlight. You must update Moonlight to stream from %1.</source>
         <translation>La versión de GeForce Experience en %1 no es compatible con esta versión de Moonlight. Debes actualizar Moonlight para transmitir desde %1.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="963"/>
+        <location filename="../streaming/session.cpp" line="1064"/>
         <source>Your selection to enable remote desktop mouse mode may cause problems in games.</source>
         <translation>La selección de activar el modo de ratón de escritorio remoto puede causar problemas en los juegos.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="967"/>
+        <location filename="../streaming/session.cpp" line="1068"/>
         <source>Your settings selection to force software decoding may cause poor streaming performance.</source>
         <translation>Su selección de ajustes para forzar la decodificación por software puede causar un rendimiento deficiente de la transmisión.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1003"/>
+        <location filename="../streaming/session.cpp" line="1104"/>
         <source>Your host PC doesn&apos;t support encoding HEVC.</source>
         <translation>El host de tu PC no soporta la codificación HEVC.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1021"/>
+        <location filename="../streaming/session.cpp" line="1122"/>
         <source>Using software decoding due to your selection to force HEVC without GPU support. This may cause poor streaming performance.</source>
         <translation>Usando decodificación por software debido a su selección de forzar HEVC sin soporte de GPU. Esto puede causar un bajo rendimiento de streaming.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="973"/>
+        <location filename="../streaming/session.cpp" line="1074"/>
         <source>Your host software or GPU doesn&apos;t support encoding AV1.</source>
         <translation>El software host o la GPU no admiten la codificación AV1.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="991"/>
+        <location filename="../streaming/session.cpp" line="1092"/>
         <source>Using software decoding due to your selection to force AV1 without GPU support. This may cause poor streaming performance.</source>
         <translation>El uso de la decodificación por software debido a tu selección para forzar el AV1 sin soporte para la GPU. Esto puede causar un bajo rendimiento de la transmisión.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1068"/>
+        <location filename="../streaming/session.cpp" line="1169"/>
         <source>Your host PC doesn&apos;t support HDR streaming.</source>
         <translation>El host de tu PC no es compatible con HDR.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1060"/>
+        <location filename="../streaming/session.cpp" line="1161"/>
         <source>HDR is not supported using the H.264 codec.</source>
         <translation>HDR no es compatible con el códec H.264.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1083"/>
+        <location filename="../streaming/session.cpp" line="1184"/>
         <source>This PC&apos;s GPU doesn&apos;t support AV1 Main10 decoding for HDR streaming.</source>
         <translation>La GPU de este PC no es compatible con la decodificación en AV1 Main10 para la transmisión en HDR.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1064"/>
+        <location filename="../streaming/session.cpp" line="1165"/>
         <source>This PC&apos;s GPU doesn&apos;t support 10-bit HEVC or AV1 decoding for HDR streaming.</source>
         <translation>La GPU de este PC no admite la decodificación en HEVC de 10 bits ni AV1 para la retransmisión en HDR.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1116"/>
+        <location filename="../streaming/session.cpp" line="1217"/>
         <source>Your host PC and client PC don&apos;t support the same HDR video codecs.</source>
         <translation>El host de tu PC y tu servidor no admiten los mismos códecs de video en HDR.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1209"/>
+        <location filename="../streaming/session.cpp" line="1310"/>
         <source>Video resolutions over 4K are not supported by the H.264 codec.</source>
         <translation>Las resoluciones de video superiores a 4K no son compatibles con el códec H.264.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1606"/>
+        <location filename="../streaming/session.cpp" line="1713"/>
         <source>Host returned error: %1</source>
         <translation>El host devuelve el error: %1</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1040"/>
+        <location filename="../streaming/session.cpp" line="1141"/>
         <source>Using software decoding due to your selection to force H.264 without GPU support. This may cause poor streaming performance.</source>
         <translation>Usando decodificación de software debido a su selección para forzar H.264 sin soporte de GPU. Esto puede provocar un rendimiento de transmisión deficiente.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1050"/>
+        <location filename="../streaming/session.cpp" line="1151"/>
         <source>Your host PC and client PC don&apos;t support the same video codecs. This may cause poor streaming performance.</source>
         <translation>Su PC anfitrión y el PC cliente no soportan los mismos códecs de vídeo. Esto puede causar un bajo rendimiento de la transmisión.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1053"/>
+        <location filename="../streaming/session.cpp" line="1154"/>
         <source>Your client GPU doesn&apos;t support H.264 decoding. This may cause poor streaming performance.</source>
         <translation>Su GPU cliente no soporta la decodificación H.264. Esto puede causar un bajo rendimiento de la transmisión.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1089"/>
-        <location filename="../streaming/session.cpp" line="1107"/>
+        <location filename="../streaming/session.cpp" line="1190"/>
+        <location filename="../streaming/session.cpp" line="1208"/>
         <source>Using software decoding due to your selection to force HDR without GPU support. This may cause poor streaming performance.</source>
         <translation>La decodificación de software se utiliza debido a su elección de forzar HDR sin compatibilidad con tarjetas gráficas. Esto puede resultar en un rendimiento deficiente de la transmisión.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1101"/>
+        <location filename="../streaming/session.cpp" line="1202"/>
         <source>This PC&apos;s GPU doesn&apos;t support HEVC Main10 decoding for HDR streaming.</source>
         <translation>La GPU de este PC no es compatible con la decodificación HEVC Main10 para la transmisión de HDR.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1123"/>
+        <location filename="../streaming/session.cpp" line="1224"/>
         <source>Your host PC doesn&apos;t support YUV 4:4:4 streaming.</source>
         <translation>El host de tu ordenador no admite la transmisión YUV 4:4:4.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1131"/>
+        <location filename="../streaming/session.cpp" line="1232"/>
         <source>Your host PC doesn&apos;t support YUV 4:4:4 streaming for selected video codec.</source>
         <translation>El PC anfitrión no admite la transmisión YUV 4:4:4 para el códec de vídeo seleccionado.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1146"/>
+        <location filename="../streaming/session.cpp" line="1247"/>
         <source>Using software decoding due to your selection to force YUV 4:4:4 without GPU support. This may cause poor streaming performance.</source>
         <translation>Uso de decodificación por software debido a su selección para forzar YUV 4:4:4 sin soporte GPU. Esto puede causar un bajo rendimiento en el streaming.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1152"/>
+        <location filename="../streaming/session.cpp" line="1253"/>
         <source>This PC&apos;s GPU doesn&apos;t support YUV 4:4:4 decoding for selected video codec.</source>
         <translation>La GPU de este PC no es compatible con la descodificación YUV 4:4:4 para el códec de vídeo seleccionado.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1161"/>
+        <location filename="../streaming/session.cpp" line="1262"/>
         <source>GeForce Experience 3.0 or higher is required for 4K streaming.</source>
         <translation>Se requiere GeForce Experience 3.0 o superior para la transmisión en 4K.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1176"/>
+        <location filename="../streaming/session.cpp" line="1277"/>
         <source>Your selected surround sound setting is not supported by the current audio device.</source>
         <translation>La configuración de sonido envolvente seleccionada no es compatible con el dispositivo de audio actual.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1182"/>
+        <location filename="../streaming/session.cpp" line="1283"/>
         <source>Failed to open audio device. Audio will be unavailable during this session.</source>
         <translation>No se ha podido abrir el dispositivo de audio. El audio no estará disponible durante esta sesión.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1187"/>
+        <location filename="../streaming/session.cpp" line="1288"/>
         <source>An attached gamepad has no mapping and won&apos;t be usable. Visit the Moonlight help to resolve this.</source>
         <translation>Un mando conectado no tiene mapeo y no será utilizable. Visita la ayuda de Moonlight para resolver esto.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1205"/>
+        <location filename="../streaming/session.cpp" line="1306"/>
         <source>Your host PC&apos;s GPU doesn&apos;t support streaming video resolutions over 4K.</source>
         <translation>La GPU de su PC anfitrión no admite la transmisión de resoluciones de vídeo superiores a 4K.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1223"/>
+        <location filename="../streaming/session.cpp" line="1324"/>
         <source>Your selection to force hardware decoding cannot be satisfied due to missing hardware decoding support on this PC&apos;s GPU.</source>
         <translation>Su selección para forzar la decodificación por hardware no puede ser satisfecha debido a la falta de soporte de decodificación por hardware en la GPU de este PC.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="1226"/>
+        <location filename="../streaming/session.cpp" line="1327"/>
         <source>Your codec selection and force hardware decoding setting are not compatible. This PC&apos;s GPU lacks support for decoding your chosen codec.</source>
         <translation>La selección del códec y la configuración de la decodificación forzada por hardware no son compatibles. La GPU de este PC no es compatible con la descodificación del códec elegido.</translation>
     </message>
     <message>
-        <location filename="../streaming/session.cpp" line="2204"/>
+        <location filename="../streaming/session.cpp" line="2366"/>
         <source>Unable to initialize video decoder. Please check your streaming settings and try again.</source>
         <translation>No se ha podido inicializar el decodificador de vídeo. Por favor, compruebe la configuración de la transmisión y vuelva a intentarlo.</translation>
     </message>
@@ -722,48 +722,48 @@
         <translation>Introduzca una resolución personalizada:</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="604"/>
+        <location filename="../gui/SettingsView.qml" line="584"/>
         <source>%1 FPS</source>
         <translation>%1 FPS</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="672"/>
+        <location filename="../gui/SettingsView.qml" line="666"/>
         <source>Video bitrate:</source>
         <translation>Tasa de bits de vídeo:</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="680"/>
+        <location filename="../gui/SettingsView.qml" line="674"/>
         <source>Lower the bitrate on slower connections. Raise the bitrate to increase image quality.</source>
         <translation>Reduzca la tasa de bits en las conexiones más lentas. Aumenta la tasa de bits para aumentar la calidad de la imagen.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="702"/>
+        <location filename="../gui/SettingsView.qml" line="696"/>
         <source>Video bitrate: %1 Mbps</source>
         <translation>Tasa de bits de vídeo: %1 Mbps</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="732"/>
+        <location filename="../gui/SettingsView.qml" line="726"/>
         <source>Display mode</source>
         <translation>Modo de visualización</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="762"/>
+        <location filename="../gui/SettingsView.qml" line="756"/>
         <source>(Recommended)</source>
         <translation>(Recomendado)</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="743"/>
-        <location filename="../gui/SettingsView.qml" line="1218"/>
+        <location filename="../gui/SettingsView.qml" line="737"/>
+        <location filename="../gui/SettingsView.qml" line="1333"/>
         <source>Fullscreen</source>
         <translation>Pantalla completa</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="812"/>
+        <location filename="../gui/SettingsView.qml" line="816"/>
         <source>Fullscreen generally provides the best performance, but borderless windowed may work better with features like macOS Spaces, Alt+Tab, screenshot tools, on-screen overlays, etc.</source>
         <translation>La pantalla completa suele ofrecer el mejor rendimiento, pero la ventana sin bordes puede funcionar mejor con funciones como macOS Spaces, Alt+Tab, herramientas de captura de pantalla, superposiciones en pantalla, etc.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="748"/>
+        <location filename="../gui/SettingsView.qml" line="742"/>
         <source>Borderless windowed</source>
         <translation>Ventana sin bordes</translation>
     </message>
@@ -778,417 +778,445 @@
         <translation>Nativo (excluido Notch)</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="718"/>
+        <location filename="../gui/SettingsView.qml" line="578"/>
+        <source>VRR (%1 FPS)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../gui/SettingsView.qml" line="580"/>
+        <source>Low-latency VRR (%1 FPS)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../gui/SettingsView.qml" line="712"/>
         <source>Use Default (%1 Mbps)</source>
         <translation>Uso predeterminado(%1 Mbps)</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="753"/>
-        <location filename="../gui/SettingsView.qml" line="1210"/>
+        <location filename="../gui/SettingsView.qml" line="747"/>
+        <location filename="../gui/SettingsView.qml" line="1325"/>
         <source>Windowed</source>
         <translation>Ventana</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="819"/>
+        <location filename="../gui/SettingsView.qml" line="814"/>
+        <source>Borderless windowed mode is required for active VRR streaming. Your saved display mode will be restored for non-VRR sessions.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../gui/SettingsView.qml" line="826"/>
         <source>V-Sync</source>
         <translation>V-Sync (Sincronización Vertical)</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="829"/>
+        <location filename="../gui/SettingsView.qml" line="836"/>
         <source>Disabling V-Sync allows sub-frame rendering latency, but it can display visible tearing</source>
         <translation>Desactivar V-Sync permite una latencia de renderizado por debajo de los fotogramas, pero puede mostrar un tearing visible</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="836"/>
+        <location filename="../gui/SettingsView.qml" line="842"/>
         <source>Frame pacing</source>
         <translation>Ritmo de fotogramas</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="846"/>
+        <location filename="../gui/SettingsView.qml" line="852"/>
         <source>Frame pacing reduces micro-stutter by delaying frames that come in too early</source>
         <translation>El ritmo de los fotogramas reduce el microtartamudeo retrasando los fotogramas que llegan demasiado pronto</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="856"/>
+        <location filename="../gui/SettingsView.qml" line="858"/>
+        <source>Enable VRR</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../gui/SettingsView.qml" line="872"/>
+        <source>VRR uses paced adaptive presentation with best-effort tear avoidance. Sessions without enough refresh-rate headroom use fixed V-Sync. Borderless fullscreen is used while VRR is active.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../gui/SettingsView.qml" line="874"/>
+        <source>VRR requires V-Sync. Enable V-Sync to change this setting.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../gui/SettingsView.qml" line="971"/>
         <source>Audio Settings</source>
         <translation>Ajustes de audio</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="891"/>
+        <location filename="../gui/SettingsView.qml" line="1006"/>
         <source>Stereo</source>
         <translation>Estéreo</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="895"/>
+        <location filename="../gui/SettingsView.qml" line="1010"/>
         <source>5.1 surround sound</source>
         <translation>Sonido envolvente 5.1</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="899"/>
+        <location filename="../gui/SettingsView.qml" line="1014"/>
         <source>7.1 surround sound</source>
         <translation>Sonido envolvente 7.1</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="913"/>
+        <location filename="../gui/SettingsView.qml" line="1028"/>
         <source>Mute host PC speakers while streaming</source>
         <translation>Silenciar los altavoces del PC anfitrión durante la transmisión</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="923"/>
+        <location filename="../gui/SettingsView.qml" line="1038"/>
         <source>You must restart any game currently in progress for this setting to take effect</source>
         <translation>Para que este ajuste surta efecto, debes reiniciar cualquier partida que esté en curso</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="929"/>
+        <location filename="../gui/SettingsView.qml" line="1044"/>
         <source>Mute audio stream when Moonlight is not the active window</source>
         <translation>Silenciar el flujo de audio cuando Moonlight no es la ventana activa</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="940"/>
+        <location filename="../gui/SettingsView.qml" line="1055"/>
         <source>Mutes Moonlight&apos;s audio when you Alt+Tab out of the stream or click on a different window.</source>
         <translation>Silencia el audio de Moonlight cuando haces Alt+Tab fuera de la transmisión o haces clic en una ventana diferente.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="989"/>
+        <location filename="../gui/SettingsView.qml" line="1104"/>
         <source>UI Settings</source>
         <translation>Configuración de la interfaz</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="999"/>
+        <location filename="../gui/SettingsView.qml" line="1114"/>
         <source>Language</source>
         <translation>Idioma</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1025"/>
+        <location filename="../gui/SettingsView.qml" line="1140"/>
         <source>Automatic</source>
         <translation>Automático</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1160"/>
+        <location filename="../gui/SettingsView.qml" line="1275"/>
         <source>You must restart Moonlight for this change to take effect</source>
         <translation>Debe reiniciar Moonlight para que este cambio surta efecto</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1177"/>
+        <location filename="../gui/SettingsView.qml" line="1292"/>
         <source>GUI display mode</source>
         <translation>Modo de visualización GUI</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1214"/>
+        <location filename="../gui/SettingsView.qml" line="1329"/>
         <source>Maximized</source>
         <translation>Maximizado</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1242"/>
+        <location filename="../gui/SettingsView.qml" line="1357"/>
         <source>Show configuration warnings</source>
         <translation>Mostrar advertencias de configuración</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1298"/>
+        <location filename="../gui/SettingsView.qml" line="1413"/>
         <source>Input Settings</source>
         <translation>Ajustes de entrada</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1319"/>
+        <location filename="../gui/SettingsView.qml" line="1434"/>
         <source>This enables seamless mouse control without capturing the client&apos;s mouse cursor. It is ideal for remote desktop usage but will not work in most games.</source>
         <translation>Esto permite un control perfecto del ratón sin capturar el cursor del ratón del cliente. Es ideal para el uso del escritorio remoto, pero no funcionará en la mayoría de los juegos.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1321"/>
+        <location filename="../gui/SettingsView.qml" line="1436"/>
         <source>NOTE: Due to a bug in GeForce Experience, this option may not work properly if your host PC has multiple monitors.</source>
         <translation>NOTA: Debido a un error en GeForce Experience, es posible que esta opción no funcione correctamente si su PC host tiene varios monitores.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1621"/>
+        <location filename="../gui/SettingsView.qml" line="1736"/>
         <source>AV1</source>
         <translation>AV1</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1636"/>
+        <location filename="../gui/SettingsView.qml" line="944"/>
         <source>Enable HDR</source>
         <translation>Activar HDR</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1651"/>
+        <location filename="../gui/SettingsView.qml" line="959"/>
         <source>The stream will be HDR-capable, but some games may require an HDR monitor on your host PC to enable HDR mode.</source>
         <translation>La transmisión podrá utilizar HDR, pero algunos juegos pueden requerir un monitor HDR en el PC anfitrión para permitir el modo HDR.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1653"/>
+        <location filename="../gui/SettingsView.qml" line="961"/>
         <source>HDR streaming is not supported on this PC.</source>
         <translation>La transmisión HDR no esta soportada en este PC.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1659"/>
+        <location filename="../gui/SettingsView.qml" line="1751"/>
         <source>Enable YUV 4:4:4</source>
         <translation>Activar YUV 4:4:4</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1740"/>
+        <location filename="../gui/SettingsView.qml" line="1832"/>
         <source>Show performance stats while streaming</source>
         <translation>Mostrar estadísticas de rendimiento en streaming</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1750"/>
+        <location filename="../gui/SettingsView.qml" line="1842"/>
         <source>Display real-time stream performance information while streaming.</source>
         <translation>Muestra información sobre el rendimiento del flujo en tiempo real mientras se transmite.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1751"/>
+        <location filename="../gui/SettingsView.qml" line="1843"/>
         <source>You can toggle it at any time while streaming using Ctrl+Alt+Shift+S or Select+L1+R1+X.</source>
         <translation>Puedes cambiarla en cualquier momento mientras transmites con Ctrl+Alt+Mayús+S o Select+L1+R1+X.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1752"/>
+        <location filename="../gui/SettingsView.qml" line="1844"/>
         <source>The performance overlay is not supported on Steam Link or Raspberry Pi.</source>
         <translation>La superposición de rendimiento no es compatible con Steam Link o Raspberry Pi.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1340"/>
+        <location filename="../gui/SettingsView.qml" line="1455"/>
         <source>NOTE: Certain keyboard shortcuts like Ctrl+Alt+Del on Windows cannot be intercepted by any application, including Moonlight.</source>
         <translation>NOTA: Ciertos atajos de teclado como Ctrl+Alt+Supr en Windows no pueden ser interceptados por ninguna aplicación, incluyendo Moonlight.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1403"/>
+        <location filename="../gui/SettingsView.qml" line="1518"/>
         <source>Use touchscreen as a virtual trackpad</source>
         <translation>Utilice la pantalla táctil como un trackpad virtual</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1420"/>
+        <location filename="../gui/SettingsView.qml" line="1535"/>
         <source>Swap left and right mouse buttons</source>
         <translation>Intercambiar los botones izquierdo y derecho del ratón</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1432"/>
+        <location filename="../gui/SettingsView.qml" line="1547"/>
         <source>Reverse mouse scrolling direction</source>
         <translation>Invertir la dirección de desplazamiento del ratón</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1446"/>
+        <location filename="../gui/SettingsView.qml" line="1561"/>
         <source>Gamepad Settings</source>
         <translation>Configuración del mando</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1456"/>
+        <location filename="../gui/SettingsView.qml" line="1571"/>
         <source>Swap A/B and X/Y gamepad buttons</source>
         <translation>Cambiar los botones del mando A / B y X / Y</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1466"/>
+        <location filename="../gui/SettingsView.qml" line="1581"/>
         <source>This switches gamepads into a Nintendo-style button layout</source>
         <translation>Esto cambia los mandos a un diseño de botones al estilo de Nintendo</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1472"/>
+        <location filename="../gui/SettingsView.qml" line="1587"/>
         <source>Force gamepad #1 always connected</source>
         <translation>Forzar que el mando #1 esté siempre conectado</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1482"/>
+        <location filename="../gui/SettingsView.qml" line="1597"/>
         <source>Forces a single gamepad to always stay connected to the host, even if no gamepads are actually connected to this PC.</source>
         <translation>Obliga a un solo mando a permanecer siempre conectado al host, aunque no haya ningún mando conectado a este PC.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1320"/>
+        <location filename="../gui/SettingsView.qml" line="1435"/>
         <source>You can toggle this while streaming using Ctrl+Alt+Shift+M.</source>
         <translation>Puedes alternar esto mientras transmites usando Ctrl+Alt+Mayús+M.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1490"/>
+        <location filename="../gui/SettingsView.qml" line="1605"/>
         <source>Enable mouse control with gamepads by holding the &apos;Start&apos; button</source>
         <translation>Activa el control del ratón con los mandos manteniendo pulsado el botón &apos;Start&apos;</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1501"/>
+        <location filename="../gui/SettingsView.qml" line="1616"/>
         <source>Process gamepad input when Moonlight is in the background</source>
         <translation>Procesar la entrada del mando cuando Moonlight está en segundo plano</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1512"/>
+        <location filename="../gui/SettingsView.qml" line="1627"/>
         <source>Allows Moonlight to capture gamepad inputs even if it&apos;s not the current window in focus</source>
         <translation>Permite a Moonlight capturar las entradas del mando incluso si no es la ventana actual</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="949"/>
+        <location filename="../gui/SettingsView.qml" line="1064"/>
         <source>Host Settings</source>
         <translation>Configuración de host</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1521"/>
+        <location filename="../gui/SettingsView.qml" line="1636"/>
         <source>Advanced Settings</source>
         <translation>Configuración avanzada</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="866"/>
+        <location filename="../gui/SettingsView.qml" line="981"/>
         <source>Audio configuration</source>
         <translation>Configuración del sonido</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1231"/>
+        <location filename="../gui/SettingsView.qml" line="1346"/>
         <source>Show connection quality warnings</source>
         <translation>Mostrar avisos de calidad de la conexión</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1254"/>
+        <location filename="../gui/SettingsView.qml" line="1369"/>
         <source>Discord Rich Presence integration</source>
         <translation>Integración de Discord Rich Presence</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1264"/>
+        <location filename="../gui/SettingsView.qml" line="1379"/>
         <source>Updates your Discord status to display the name of the game you&apos;re streaming.</source>
         <translation>Actualiza tu estado de Discord para mostrar el nombre del juego que estás transmitiendo.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1483"/>
+        <location filename="../gui/SettingsView.qml" line="1598"/>
         <source>Only enable this option when streaming a game that doesn&apos;t support gamepads being connected after startup.</source>
         <translation>Sólo active esta opción cuando transmita un juego que no admita la conexión de mandos después del inicio.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1309"/>
+        <location filename="../gui/SettingsView.qml" line="1424"/>
         <source>Optimize mouse for remote desktop instead of games</source>
         <translation>Optimizar el ratón para el escritorio remoto en lugar de los juegos</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="512"/>
-        <location filename="../gui/SettingsView.qml" line="622"/>
+        <location filename="../gui/SettingsView.qml" line="514"/>
+        <location filename="../gui/SettingsView.qml" line="582"/>
         <source>Custom (%1 FPS)</source>
         <translation>Personalizado (%1 FPS)</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="527"/>
+        <location filename="../gui/SettingsView.qml" line="529"/>
         <source>Enter a custom frame rate:</source>
         <translation>Introduce una velocidad para los fotogramas personalizada:</translation>
     </message>
     <message>
         <location filename="../gui/SettingsView.qml" line="219"/>
         <location filename="../gui/SettingsView.qml" line="228"/>
-        <location filename="../gui/SettingsView.qml" line="625"/>
+        <location filename="../gui/SettingsView.qml" line="626"/>
         <source>Custom</source>
         <translation>Personalizado</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="643"/>
         <source>30 FPS</source>
-        <translation>30 FPS</translation>
+        <translation type="vanished">30 FPS</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="648"/>
         <source>60 FPS</source>
-        <translation>60 FPS</translation>
+        <translation type="vanished">60 FPS</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1270"/>
+        <location filename="../gui/SettingsView.qml" line="1385"/>
         <source>Keep the display awake while streaming</source>
         <translation>Mantener la pantalla encendida mientras dura la transmisión</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1280"/>
+        <location filename="../gui/SettingsView.qml" line="1395"/>
         <source>Prevents the screensaver from starting or the display from going to sleep while streaming.</source>
         <translation>Prevenir que el protector de pantallas inicie o la pantalla entre en modo dormir durante la transmisión.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1331"/>
+        <location filename="../gui/SettingsView.qml" line="1446"/>
         <source>Capture system keyboard shortcuts</source>
         <translation>Capturar los atajos de teclado del sistema</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1339"/>
+        <location filename="../gui/SettingsView.qml" line="1454"/>
         <source>This enables the capture of system-wide keyboard shortcuts like Alt+Tab that would normally be handled by the client OS while streaming.</source>
         <translation>Esto permite capturar los atajos de teclado de todo el sistema, como Alt+Tab, que normalmente serían manejados por el sistema operativo del cliente durante la transmisión.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1369"/>
+        <location filename="../gui/SettingsView.qml" line="1484"/>
         <source>in fullscreen</source>
         <translation>en pantalla completa</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1373"/>
+        <location filename="../gui/SettingsView.qml" line="1488"/>
         <source>always</source>
         <translation>siempre</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1413"/>
+        <location filename="../gui/SettingsView.qml" line="1528"/>
         <source>When checked, the touchscreen acts like a trackpad. When unchecked, the touchscreen will directly control the mouse pointer.</source>
         <translation>Cuando está marcada, la pantalla táctil actúa como un trackpad. Si no está marcada, la pantalla táctil controlará directamente el puntero del ratón.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="959"/>
+        <location filename="../gui/SettingsView.qml" line="1074"/>
         <source>Optimize game settings for streaming</source>
         <translation>Optimizar la configuración del juego para la transmisión</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="970"/>
+        <location filename="../gui/SettingsView.qml" line="1085"/>
         <source>Quit app on host PC after ending stream</source>
         <translation>Salir de la aplicación en el PC anfitrión después de terminar la transmisión</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="980"/>
+        <location filename="../gui/SettingsView.qml" line="1095"/>
         <source>This will close the app or game you are streaming when you end your stream. You will lose any unsaved progress!</source>
         <translation>Esto cerrará la aplicación o el juego que estás transmitiendo cuando termines tu transmisión. ¡Perderás todo el progreso que no hayas guardado!</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1531"/>
+        <location filename="../gui/SettingsView.qml" line="1646"/>
         <source>Video decoder</source>
         <translation>Descodificador de vídeo</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1556"/>
-        <location filename="../gui/SettingsView.qml" line="1609"/>
+        <location filename="../gui/SettingsView.qml" line="1671"/>
+        <location filename="../gui/SettingsView.qml" line="1724"/>
         <source>Automatic (Recommended)</source>
         <translation>Automático (recomendado)</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1560"/>
+        <location filename="../gui/SettingsView.qml" line="1675"/>
         <source>Force software decoding</source>
         <translation>Forzar la decodificación por software</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1564"/>
+        <location filename="../gui/SettingsView.qml" line="1679"/>
         <source>Force hardware decoding</source>
         <translation>Forzar la decodificación por hardware</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1579"/>
+        <location filename="../gui/SettingsView.qml" line="1694"/>
         <source>Video codec</source>
         <translation>Códec de vídeo</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1613"/>
+        <location filename="../gui/SettingsView.qml" line="1728"/>
         <source>H.264</source>
         <translation>H.264</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1617"/>
+        <location filename="../gui/SettingsView.qml" line="1732"/>
         <source>HEVC (H.265)</source>
         <translation>HEVC (H.265)</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1681"/>
+        <location filename="../gui/SettingsView.qml" line="1773"/>
         <source>Good for streaming desktop and text-heavy games, but not recommended for fast-paced games.</source>
         <translation>Bueno para la transmisión de juegos de escritorio y de texto pesado, pero no se recomienda para juegos de ritmo rápido.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1683"/>
+        <location filename="../gui/SettingsView.qml" line="1775"/>
         <source>YUV 4:4:4 is not supported on this PC.</source>
         <translation>YUV 4:4:4 no es compatible con este PC.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1689"/>
+        <location filename="../gui/SettingsView.qml" line="1781"/>
         <source>Unlock bitrate limit (Experimental)</source>
         <translation>Desbloqueo del límite de bits (Experimental)</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1702"/>
+        <location filename="../gui/SettingsView.qml" line="1794"/>
         <source>This unlocks extremely high video bitrates for use with Sunshine hosts. It should only be used when streaming over an Ethernet LAN connection.</source>
         <translation>Esto desbloquea tasas de bits de vídeo extremadamente altas para su uso con hosts Sunshine. Solo debe utilizarse cuando se transmita a través de una conexión LAN Ethernet.</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1708"/>
+        <location filename="../gui/SettingsView.qml" line="1800"/>
         <source>Automatically find PCs on the local network (Recommended)</source>
         <translation>Encuentre automáticamente los ordenadores de la red local (recomendado)</translation>
     </message>
     <message>
-        <location filename="../gui/SettingsView.qml" line="1729"/>
+        <location filename="../gui/SettingsView.qml" line="1821"/>
         <source>Automatically detect blocked connections (Recommended)</source>
         <translation>Detectar automáticamente las conexiones bloqueadas (recomendado)</translation>
     </message>

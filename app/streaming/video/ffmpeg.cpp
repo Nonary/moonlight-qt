@@ -4,6 +4,7 @@
 #include "streaming/session.h"
 
 #include <h264_stream.h>
+#include <utility>
 
 extern "C" {
 #include <libavutil/mastering_display_metadata.h>
@@ -82,6 +83,10 @@ void FFmpegVideoDecoder::setHdrMode(bool enabled)
 
 bool FFmpegVideoDecoder::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
 {
+    if (m_Pacer != nullptr) {
+        m_Pacer->notifyWindowChanged(info);
+    }
+
     return m_FrontendRenderer->notifyWindowChanged(info);
 }
 
@@ -498,7 +503,10 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     if (testMode != TestMode::TestFrameOnly) {
         m_Pacer = new Pacer(m_FrontendRenderer, &m_ActiveWndVideoStats);
         if (!m_Pacer->initialize(params->window, params->frameRate,
-                                 params->enableFramePacing || (params->enableVsync && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_FORCE_PACING)))) {
+                                 params->enableFramePacing || (params->enableVsync && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_FORCE_PACING)),
+                                 params->enableVsync,
+                                 params->enableVrr,
+                                 params->vrrDisplayRefreshHz)) {
             return false;
         }
     }
@@ -762,6 +770,17 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalFrames += src.totalFrames;
     dst.networkDroppedFrames += src.networkDroppedFrames;
     dst.pacerDroppedFrames += src.pacerDroppedFrames;
+    dst.vrrPacingDroppedFrames += src.vrrPacingDroppedFrames;
+    dst.vrrReadinessMisses += src.vrrReadinessMisses;
+    dst.vrrSpacingCorrections += src.vrrSpacingCorrections;
+    // These are instantaneous VRR state rather than counters. Preserve the
+    // most recent non-legacy sample while ordinary pacing remains byte-for-
+    // byte compatible with its previous statistics.
+    if (src.vrrTimingBudgetUs != 0) {
+        dst.vrrTimingBudgetUs = src.vrrTimingBudgetUs;
+        dst.vrrSchedulerDelayUs = src.vrrSchedulerDelayUs;
+        dst.vrrGuardUs = src.vrrGuardUs;
+    }
     dst.totalReassemblyTimeUs += src.totalReassemblyTimeUs;
     dst.totalDecodeTimeUs += src.totalDecodeTimeUs;
     dst.totalPacerTimeUs += src.totalPacerTimeUs;
@@ -974,12 +993,37 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
         offset += ret;
     }
+
+    if (stats.vrrTimingBudgetUs != 0 || stats.vrrReadinessMisses != 0 ||
+            stats.vrrPacingDroppedFrames != 0 ||
+            stats.vrrSpacingCorrections != 0) {
+        ret = snprintf(&output[offset],
+                       length - offset,
+                       "VRR timing budget: %.2f ms\n"
+                        "VRR scheduler delay (p95): %.2f ms\n"
+                        "VRR display guard: %.2f ms\n"
+                        "VRR readiness misses: %u\n"
+                        "VRR spacing corrections: %u\n"
+                       "VRR pacing drops: %u\n",
+                        static_cast<double>(stats.vrrTimingBudgetUs) / 1000.0,
+                        static_cast<double>(stats.vrrSchedulerDelayUs) / 1000.0,
+                        static_cast<double>(stats.vrrGuardUs) / 1000.0,
+                        stats.vrrReadinessMisses,
+                        stats.vrrSpacingCorrections,
+                       stats.vrrPacingDroppedFrames);
+        if (ret < 0 || ret >= length - offset) {
+            SDL_assert(false);
+            return;
+        }
+
+        offset += ret;
+    }
 }
 
 void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
 {
     if (stats.renderedFps > 0 || stats.renderedFrames != 0) {
-        char videoStatsStr[512];
+        char videoStatsStr[1024];
         stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr));
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1850,6 +1894,29 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     SDL_assert(m_FrameInfoQueue.size() == m_FramesIn - m_FramesOut);
                     m_FramesOut++;
 
+                    // Only active VRR needs decoder-facing pacing metadata.
+                    // Keep legacy handoff and its AVFrame-only path unchanged.
+                    const bool vrrActive = m_Pacer->isVrrActive();
+                    uint64_t decodeCompleteUs = 0;
+                    int frameNumber = -1;
+                    uint32_t rtpTimestamp = 0;
+                    bool timestampValid = false;
+
+                    if (vrrActive) {
+                        // Capture timing while the matching DECODE_UNIT is
+                        // still available. RTP timestamp 0 is valid, so
+                        // validity is represented separately rather than
+                        // inferred from the raw value.
+                        decodeCompleteUs = LiGetMicroseconds();
+                        if (!m_FrameInfoQueue.isEmpty()) {
+                            // Snapshot without moving the legacy dequeue point.
+                            const DECODE_UNIT& du = m_FrameInfoQueue.head();
+                            frameNumber = du.frameNumber;
+                            rtpTimestamp = du.rtpTimestamp;
+                            timestampValid = true;
+                        }
+                    }
+
                     // Attach HDR metadata to the frame if it's not already present. We will defer to
                     // any metadata contained in the bitstream itself since that is guaranteed to be
                     // correctly synchronized to each frame, unlike our async HDR metadata message.
@@ -1916,26 +1983,39 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     // Restore default log level after a successful decode
                     av_log_set_level(AV_LOG_INFO);
 
-                    // Capture a frame timestamp to measuring pacing delay
+                    // Keep the established legacy pacing timestamp at its
+                    // original handoff point. VRR never reads pkt_dts: its
+                    // PacedFrame carries the earlier decoder-complete stamp.
                     frame->pkt_dts = LiGetMicroseconds();
 
                     if (!m_FrameInfoQueue.isEmpty()) {
                         // Data buffers in the DU are not valid here!
                         DECODE_UNIT du = m_FrameInfoQueue.dequeue();
 
-                        // Count time in avcodec_send_packet() and avcodec_receive_frame()
-                        // as time spent decoding. Also count time spent in the decode unit
-                        // queue because that's directly caused by decoder latency.
-                        m_ActiveWndVideoStats.totalDecodeTimeUs += (LiGetMicroseconds() - du.enqueueTimeUs);
+                        // Preserve the legacy measurement point. VRR's
+                        // decode-complete timestamp above is intentionally a
+                        // separate, earlier value used only for scheduling.
+                        m_ActiveWndVideoStats.totalDecodeTimeUs +=
+                            (LiGetMicroseconds() - du.enqueueTimeUs);
 
-                        // Store the presentation time (90 kHz timebase)
+                        // Store the presentation time (90 kHz timebase) for
+                        // existing renderers. VRR uses PacedFrame instead.
                         frame->pts = (int64_t)du.rtpTimestamp;
                     }
 
                     m_ActiveWndVideoStats.decodedFrames++;
 
                     // Queue the frame for rendering (or render now if pacer is disabled)
-                    m_Pacer->submitFrame(frame);
+                    if (vrrActive) {
+                        m_Pacer->submitFrame(PacedFrame(frame,
+                                                        frameNumber,
+                                                        rtpTimestamp,
+                                                        timestampValid,
+                                                        decodeCompleteUs));
+                    }
+                    else {
+                        m_Pacer->submitFrame(frame);
+                    }
                 }
                 else if (err == AVERROR(EAGAIN)) {
                     VIDEO_FRAME_HANDLE handle;

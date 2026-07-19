@@ -154,6 +154,8 @@ private:
 
     bool populateDecoderProperties(SDL_Window* window);
 
+    void snapshotPresentationSettings(SDL_Window* window);
+
     IAudioRenderer* createAudioRenderer(const POPUS_MULTISTREAM_CONFIGURATION opusConfig);
 
     bool initializeAudioRenderer();
@@ -186,8 +188,9 @@ private:
     bool chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                        SDL_Window* window, int videoFormat, int width, int height,
                        int frameRate, bool enableVsync, bool enableFramePacing,
-                       bool testOnly,
-                       IVideoDecoder*& chosenDecoder);
+                       bool enableVrr, int vrrDisplayRefreshHz, bool testOnly,
+                       IVideoDecoder*& chosenDecoder,
+                       bool* effectiveVrr = nullptr);
 
     static
     void clStageStarting(int stage);
@@ -242,7 +245,18 @@ private:
     static
     int drSubmitDecodeUnit(PDECODE_UNIT du);
 
+    struct PresentationSettings {
+        bool requestedVrr = false;
+        bool effectiveVsync = false;
+        bool enableFramePacing = false;
+        bool enableVrr = false;
+        int refreshRate = 0;
+        StreamingPreferences::WindowMode effectiveWindowMode = StreamingPreferences::WM_WINDOWED;
+        StreamingPreferences::VideoDecoderSelection decoderSelection = StreamingPreferences::VDS_AUTO;
+    };
+
     StreamingPreferences* m_Preferences;
+    PresentationSettings m_PresentationSettings;
     bool m_IsFullScreen;
     SupportedVideoFormatList m_SupportedVideoFormats; // Sorted in order of descending priority
     STREAM_CONFIGURATION m_StreamConfig;

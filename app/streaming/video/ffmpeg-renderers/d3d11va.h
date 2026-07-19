@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ivrrframepresenter.h"
 #include "renderer.h"
 
 #include <d3d11_4.h>
@@ -12,7 +13,7 @@ extern "C" {
 #include <wrl/client.h>
 #include <wrl/wrappers/corewrappers.h>
 
-class D3D11VARenderer : public IFFmpegRenderer
+class D3D11VARenderer : public IFFmpegRenderer, public IVrrFramePresenter
 {
 public:
     D3D11VARenderer(int decoderSelectionPass);
@@ -21,6 +22,16 @@ public:
     virtual bool prepareDecoderContext(AVCodecContext* context, AVDictionary**) override;
     virtual bool prepareDecoderContextInGetFormat(AVCodecContext* context, AVPixelFormat pixelFormat) override;
     virtual void renderFrame(AVFrame* frame) override;
+    virtual IVrrFramePresenter* getVrrFramePresenter() override;
+
+    virtual VrrFallbackReason checkSupport() const override;
+    virtual VrrPrepareResult prepareFrame(AVFrame* frame) override;
+    virtual VrrPresentFeedback presentAdaptive(
+        const VrrPresentRequest& request) override;
+    virtual VrrPresentFeedback cancelFrame() override;
+    virtual void setSuspended(bool suspended) override;
+    virtual bool restoreFixedPresentation(VrrFallbackReason reason) override;
+
     virtual void notifyOverlayUpdated(Overlay::OverlayType) override;
     virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo) override;
     virtual int getRendererAttributes() override;
@@ -44,6 +55,18 @@ private:
     bool setupSwapchainDependentResources();
     bool setupVideoTexture(AVHWFramesContext* framesContext); // for !m_BindDecoderOutputTextures
     bool setupTexturePoolViews(AVHWFramesContext* framesContext); // for m_BindDecoderOutputTextures
+    bool prepareFrameForPresent(AVFrame* frame);
+    bool initializeVrrPresentReadyFence();
+    bool waitForVrrPresentReady();
+    HRESULT presentPreparedFrame(UINT flags);
+    UINT legacyPresentFlags() const;
+    void initializeVrrPresentationState(SDL_Window* window,
+                                        DXGI_SWAP_CHAIN_DESC1* swapChainDesc);
+    void refreshVrrDisplayState();
+    VrrFallbackReason evaluateVrrEligibility(
+        bool prioritizeOutputCompatibility);
+    void releasePreparedVrrFrame();
+    void queueRenderDeviceReset();
     void renderOverlay(Overlay::OverlayType type);
     bool createOverlayVertexBuffer(Overlay::OverlayType type, int width, int height, Microsoft::WRL::ComPtr<ID3D11Buffer>& newVertexBuffer);
     void bindColorConversion(bool frameChanged, AVFrame* frame);
@@ -69,7 +92,11 @@ private:
 
     bool m_DebugLayer;
     Microsoft::WRL::ComPtr<IDXGIFactory5> m_Factory;
+    // m_AdapterIndex identifies the output selected by SDL.  The renderer
+    // may fall back to another adapter for decoding, so retain that index
+    // separately for the VRR same-GPU check.
     int m_AdapterIndex;
+    int m_RenderAdapterIndex;
     Microsoft::WRL::ComPtr<ID3D11Device5> m_RenderDevice, m_DecodeDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext4> m_RenderDeviceContext, m_DecodeDeviceContext;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_RenderSharedTextureArray;
@@ -93,6 +120,22 @@ private:
     AVColorTransferCharacteristic m_LastColorTrc;
 
     bool m_AllowTearing;
+    bool m_VrrTearingSupported;
+    bool m_VrrBorderlessFlipModel;
+    bool m_VrrSameGpuOutput;
+    bool m_VrrSwapChainAllowsTearing;
+    bool m_VrrSuspended;
+    VrrFallbackReason m_VrrFallbackReason;
+    bool m_VrrFramePrepared;
+    bool m_VrrContextLocked;
+    AVFrame* m_VrrPreparedFrame;
+    Microsoft::WRL::ComPtr<ID3D11Fence> m_VrrPresentReadyFence;
+    UINT64 m_VrrPresentReadyFenceValue;
+    HANDLE m_VrrPresentReadyFenceEvent;
+    bool m_VrrPresentReadyAvailable;
+    bool m_VrrGpuReadyTimingValid;
+    uint64_t m_VrrGpuReadyWaitStartUs;
+    uint64_t m_VrrGpuReadyTimeUs;
 
     std::array<Microsoft::WRL::ComPtr<ID3D11PixelShader>, PixelShaders::_COUNT> m_VideoPixelShaders;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_VideoVertexBuffer;

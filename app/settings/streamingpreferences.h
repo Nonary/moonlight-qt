@@ -3,6 +3,9 @@
 #include <QObject>
 #include <QRect>
 #include <QQmlEngine>
+#include <QVariantList>
+
+#include <vector>
 
 class StreamingPreferences : public QObject
 {
@@ -110,11 +113,12 @@ public:
 
     Q_PROPERTY(int width MEMBER width NOTIFY displayModeChanged)
     Q_PROPERTY(int height MEMBER height NOTIFY displayModeChanged)
-    Q_PROPERTY(int fps MEMBER fps NOTIFY displayModeChanged)
+    Q_PROPERTY(int fps READ getFps WRITE setFps NOTIFY displayModeChanged)
     Q_PROPERTY(int bitrateKbps MEMBER bitrateKbps NOTIFY bitrateChanged)
     Q_PROPERTY(bool unlockBitrate MEMBER unlockBitrate NOTIFY unlockBitrateChanged)
     Q_PROPERTY(bool autoAdjustBitrate MEMBER autoAdjustBitrate NOTIFY autoAdjustBitrateChanged)
     Q_PROPERTY(bool enableVsync MEMBER enableVsync NOTIFY enableVsyncChanged)
+    Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
     Q_PROPERTY(bool gameOptimizations MEMBER gameOptimizations NOTIFY gameOptimizationsChanged)
     Q_PROPERTY(bool playAudioOnHost MEMBER playAudioOnHost NOTIFY playAudioOnHostChanged)
     Q_PROPERTY(bool multiController MEMBER multiController NOTIFY multiControllerChanged)
@@ -148,6 +152,13 @@ public:
 
     Q_INVOKABLE bool retranslate();
 
+    int getFps() const;
+    void setFps(int value);
+
+    // Rate choices are advisory; toggling VRR never rewrites the saved FPS
+    // preference.
+    Q_INVOKABLE QVariantList getFpsChoices(const QVariantList& refreshRates) const;
+
     // Directly accessible members for preferences
     int width;
     int height;
@@ -156,6 +167,7 @@ public:
     bool unlockBitrate;
     bool autoAdjustBitrate;
     bool enableVsync;
+    bool enableVrr;
     bool gameOptimizations;
     bool playAudioOnHost;
     bool multiController;
@@ -194,6 +206,7 @@ signals:
     void unlockBitrateChanged();
     void autoAdjustBitrateChanged();
     void enableVsyncChanged();
+    void enableVrrChanged();
     void gameOptimizationsChanged();
     void playAudioOnHostChanged();
     void multiControllerChanged();
@@ -229,6 +242,8 @@ private:
     explicit StreamingPreferences(QQmlEngine *qmlEngine);
 
     QString getSuffixFromLanguage(Language lang);
+
+    static std::vector<int> toRefreshRates(const QVariantList& refreshRates);
 
     QQmlEngine* m_QmlEngine;
 };

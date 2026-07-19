@@ -15,6 +15,13 @@ typedef struct _VIDEO_STATS {
     uint32_t totalFrames;
     uint32_t networkDroppedFrames;
     uint32_t pacerDroppedFrames;
+    // VRR-only telemetry. These remain zero on the legacy pacing paths.
+    uint32_t vrrPacingDroppedFrames;
+    uint32_t vrrReadinessMisses;
+    uint32_t vrrSpacingCorrections;
+    uint64_t vrrTimingBudgetUs;
+    uint64_t vrrSchedulerDelayUs;
+    uint64_t vrrGuardUs;
     uint16_t minHostProcessingLatency;         // low-res from RTP
     uint16_t maxHostProcessingLatency;         // low-res from RTP
     uint32_t totalHostProcessingLatency;       // low-res from RTP
@@ -43,11 +50,20 @@ typedef struct _DECODER_PARAMETERS {
     int frameRate;
     bool enableVsync;
     bool enableFramePacing;
+    // VRR is an opt-in, session-snapshotted third pacing mode.
+    bool enableVrr;
+    // Strictly obtained during Session initialization. A value of zero means
+    // the session was not qualified for VRR; Pacer must not substitute a
+    // legacy 60 Hz fallback when this path is requested.
+    int vrrDisplayRefreshHz;
     bool testOnly;
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;
 
 #define WINDOW_STATE_CHANGE_SIZE 0x01
 #define WINDOW_STATE_CHANGE_DISPLAY 0x02
+#define WINDOW_STATE_CHANGE_MINIMIZED 0x04
+#define WINDOW_STATE_CHANGE_RESTORED 0x08
+#define WINDOW_STATE_CHANGE_SUSPENDED 0x10
 
 typedef struct _WINDOW_STATE_CHANGE_INFO {
     SDL_Window* window;
