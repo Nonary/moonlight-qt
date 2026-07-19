@@ -24,6 +24,7 @@ public:
     virtual void renderFrame(AVFrame* frame) override;
     virtual IVrrFramePresenter* getVrrFramePresenter() override;
 
+    virtual bool canLatchAdaptivePresent() const override { return true; }
     virtual VrrFallbackReason checkSupport() const override;
     virtual VrrPrepareResult prepareFrame(AVFrame* frame) override;
     virtual VrrPresentFeedback presentAdaptive(
@@ -154,4 +155,3 @@ private:
 
     AVBufferRef* m_HwDeviceContext;
 };
-

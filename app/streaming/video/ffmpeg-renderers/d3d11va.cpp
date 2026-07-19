@@ -663,7 +663,7 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
-    if (m_DecoderParams.enableVrr && m_VrrFallbackReason == VrrFallbackReason::None) {
+    if (m_DecoderParams.enableVrr && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "D3D11 VRR backend enabled: refresh=%d Hz",
                     m_DecoderParams.vrrDisplayRefreshHz);
@@ -1525,7 +1525,7 @@ void D3D11VARenderer::initializeVrrPresentationState(SDL_Window* window,
     m_VrrSameGpuOutput = false;
     m_VrrSwapChainAllowsTearing = false;
     m_VrrSuspended = false;
-    m_VrrFallbackReason = VrrFallbackReason::None;
+    m_VrrFallbackReason = VrrFallbackReason::NoFallback;
     m_VrrPresentReadyAvailable = false;
 
     // Preserve the legacy non-VSync path while also creating an
@@ -1584,7 +1584,7 @@ void D3D11VARenderer::initializeVrrPresentationState(SDL_Window* window,
         m_RenderAdapterIndex == m_AdapterIndex;
     m_VrrFallbackReason = evaluateVrrEligibility(false);
     switch (m_VrrFallbackReason) {
-    case VrrFallbackReason::None:
+    case VrrFallbackReason::NoFallback:
         break;
     case VrrFallbackReason::IneffectiveVsync:
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1694,7 +1694,7 @@ VrrFallbackReason D3D11VARenderer::evaluateVrrEligibility(
         return VrrFallbackReason::InitializationFailed;
     }
 
-    return VrrFallbackReason::None;
+    return VrrFallbackReason::NoFallback;
 }
 
 void D3D11VARenderer::releasePreparedVrrFrame()
@@ -1902,12 +1902,12 @@ IVrrFramePresenter* D3D11VARenderer::getVrrFramePresenter()
 
 VrrFallbackReason D3D11VARenderer::checkSupport() const
 {
-    if (m_VrrFallbackReason != VrrFallbackReason::None) {
+    if (m_VrrFallbackReason != VrrFallbackReason::NoFallback) {
         return m_VrrFallbackReason;
     }
 
     return m_DecoderParams.enableVrr && m_SwapChain != nullptr &&
-        m_VrrSwapChainAllowsTearing ? VrrFallbackReason::None :
+        m_VrrSwapChainAllowsTearing ? VrrFallbackReason::NoFallback :
         VrrFallbackReason::InitializationFailed;
 }
 
@@ -1937,7 +1937,7 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
     // Display-state changes share this lock with preparation through Present.
     // Check eligibility only after taking it so a UI callback cannot replace
     // swapchain state concurrently.
-    if (checkSupport() != VrrFallbackReason::None) {
+    if (checkSupport() != VrrFallbackReason::NoFallback) {
         releasePreparedVrrFrame();
         return result;
     }
@@ -1957,7 +1957,7 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
     // The shared-device fence wait temporarily releases the renderer lock.
     // Revalidate state after reacquiring it before publishing this frame as
     // prepared for the worker's target wait.
-    if (m_VrrSuspended || checkSupport() != VrrFallbackReason::None) {
+    if (m_VrrSuspended || checkSupport() != VrrFallbackReason::NoFallback) {
         releasePreparedVrrFrame();
         return result;
     }
@@ -2111,7 +2111,7 @@ bool D3D11VARenderer::restoreFixedPresentation(VrrFallbackReason reason)
     cancelFrame();
     m_VrrSuspended = false;
     m_DecoderParams.enableVrr = false;
-    m_VrrFallbackReason = reason == VrrFallbackReason::None ?
+    m_VrrFallbackReason = reason == VrrFallbackReason::NoFallback ?
         VrrFallbackReason::InitializationFailed : reason;
     return true;
 }

@@ -568,7 +568,7 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     }
 
     if (m_VrrRequested) {
-        if (m_VrrFallbackReason == VrrFallbackReason::None) {
+        if (m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Vulkan VRR backend selected immutable %s swapchain presentation",
                         vrrSelectedPresentModeName());
@@ -785,7 +785,7 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
         if (isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device,
                                                    VK_PRESENT_MODE_MAILBOX_KHR)) {
             m_VkPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-            m_VrrFallbackReason = VrrFallbackReason::None;
+            m_VrrFallbackReason = VrrFallbackReason::NoFallback;
             return;
         }
     }
@@ -796,7 +796,7 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
         if (isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device,
                                                    VK_PRESENT_MODE_IMMEDIATE_KHR)) {
             m_VkPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-            m_VrrFallbackReason = VrrFallbackReason::None;
+            m_VrrFallbackReason = VrrFallbackReason::NoFallback;
             return;
         }
     }
@@ -1211,12 +1211,12 @@ VrrFallbackReason PlVkRenderer::checkSupport() const
 {
     const bool adaptiveMode = m_VkPresentMode == VK_PRESENT_MODE_MAILBOX_KHR ||
                               m_VkPresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR;
-    if (m_VrrFallbackReason != VrrFallbackReason::None) {
+    if (m_VrrFallbackReason != VrrFallbackReason::NoFallback) {
         return m_VrrFallbackReason;
     }
 
     return m_VrrRequested && m_Vulkan != nullptr && m_Swapchain != nullptr &&
-        m_Renderer != nullptr && adaptiveMode ? VrrFallbackReason::None :
+        m_Renderer != nullptr && adaptiveMode ? VrrFallbackReason::NoFallback :
         VrrFallbackReason::InitializationFailed;
 }
 
@@ -1228,7 +1228,7 @@ const char* PlVkRenderer::vrrSelectedPresentModeName() const
 VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame)
 {
     VrrPrepareResult result;
-    if (frame == nullptr || checkSupport() != VrrFallbackReason::None ||
+    if (frame == nullptr || checkSupport() != VrrFallbackReason::NoFallback ||
             m_VrrSuspended) {
         return result;
     }
@@ -1375,7 +1375,7 @@ bool PlVkRenderer::restoreFixedPresentation(VrrFallbackReason reason)
     m_VrrRequested = false;
     m_VrrSuspended = false;
     m_VrrWindowChangePending.store(false);
-    m_VrrFallbackReason = reason == VrrFallbackReason::None ?
+    m_VrrFallbackReason = reason == VrrFallbackReason::NoFallback ?
         VrrFallbackReason::InitializationFailed : reason;
     m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
 

@@ -94,27 +94,28 @@ void testQueueCapacityAndDrops()
         expect(backend.waitForPrepareCount(1),
                "first worker frame must enter the preparation gate");
 
-        // The active frame and one replaceable successor are the entire VRR
-        // queue. Newer decoded frames coalesce pending work to bound latency.
+        // The active frame and three successors absorb a short decoder burst.
+        // A fourth successor evicts only the oldest queued frame.
         worker.submit(frame(2, second));
         worker.submit(frame(3, third));
         worker.submit(frame(4, fourth));
         worker.submit(frame(50, freshest));
-        expect(stats.vrrPacingDroppedFrames >= 3 &&
-                   stats.pacerDroppedFrames >= 3,
-               "queued successors must coalesce instead of accumulating latency");
+        expect(stats.vrrPacingDroppedFrames == 1 &&
+                   stats.pacerDroppedFrames == 1,
+               "a short successor burst must be buffered with only capacity overflow coalesced");
 
         const uint64_t releaseUs = LiGetMicroseconds();
         backend.releasePreparation();
         expect(backend.waitForPresentCount(1),
                "releasing preparation must present the active frame");
-        expect(backend.waitForPresentCount(2),
-               "overflow recovery must present the freshest retained frame");
+        expect(backend.waitForPresentCount(4),
+               "overflow recovery must drain every retained successor");
 
         const std::vector<int> presentedFrames = backend.presentedFrames();
-        expect(presentedFrames.size() >= 2 && presentedFrames[0] == 1 &&
-                   presentedFrames[1] == 50,
-               "queue overflow must retain only the newest successor");
+        expect(presentedFrames.size() >= 4 && presentedFrames[0] == 1 &&
+                   presentedFrames[1] == 3 && presentedFrames[2] == 4 &&
+                   presentedFrames[3] == 50,
+               "queue overflow must retain the three freshest successors in cadence order");
         const std::vector<uint64_t> calls = backend.presentCallTimesUs();
         expect(calls.size() >= 2 && calls[1] >= releaseUs &&
                    calls[1] - releaseUs < 100000,
@@ -416,9 +417,11 @@ void testImmutablePresentationContract()
     VIDEO_STATS stats {};
     TrackedFrameLifetime first;
     TrackedFrameLifetime second;
+    VrrSessionConfig immutableConfig = enabledConfig();
+    immutableConfig.streamRateHz = 116;
 
     {
-        VrrPacingWorker worker(&backend, enabledConfig(), &stats);
+        VrrPacingWorker worker(&backend, immutableConfig, &stats);
         expect(worker.start(), "worker must start for presentation contract testing");
         worker.submit(frame(1, first));
         expect(backend.waitForPresentCount(1), "first contract frame must present");
@@ -430,6 +433,10 @@ void testImmutablePresentationContract()
     expect(presentedFrames.size() == 2 && presentedFrames[0] == 1 &&
                presentedFrames[1] == 2,
            "the minimal presenter contract must preserve frame order");
+    const std::vector<VrrPresentRequest> requests = backend.presentRequests();
+    expect(requests.size() == 2 && !requests[0].latchedPresentation &&
+               !requests[1].latchedPresentation,
+           "an immutable presenter must never receive a per-present latch request");
 }
 
 void testDeepTraceRequestsNativeObservationsWithoutChangingMode()

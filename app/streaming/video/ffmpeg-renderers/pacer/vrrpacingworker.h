@@ -122,8 +122,8 @@ private:
     SDL_Thread* m_WorkerThread = nullptr;
     std::atomic_bool m_Stopping { false };
     std::atomic_bool m_Suspended { false };
-    // Any eviction starts a fresh sender-timeline epoch. The one-entry queue
-    // always retains only the freshest decoded successor.
+    // Capacity eviction marks a local discontinuity while retaining source
+    // timestamps so the cadence model can advance across omitted frames.
     std::atomic_bool m_QueueDiscontinuity { false };
     std::atomic_uint32_t m_PendingWindowStateFlags { 0 };
     bool m_PresenterSuspended = false;

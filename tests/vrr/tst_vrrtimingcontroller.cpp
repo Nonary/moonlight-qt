@@ -179,6 +179,53 @@ void testNearRefreshRequestsLatchedPresentation()
     decision = withHeadroom.schedule(frame(1, 0, true, 100000), 100000);
     expect(!decision.latchedPresentation,
            "a cadence with real adaptive headroom must keep immediate flips");
+
+    VrrTimingController immutableMailbox(config(116, 120), false);
+    decision = immutableMailbox.schedule(
+        frame(1, 0, true, 100000), 100000);
+    expect(!decision.latchedPresentation,
+           "an immutable cadence-following backend must not be classified as fixed-vsync latched");
+}
+
+void testHeadroomAwareReadinessReserve()
+{
+    constexpr uint64_t epochUs = 1000000;
+    VrrTimingController wideHeadroom(config(60, 120), false);
+    VrrTimingController nearCeiling(config(116, 120), false);
+
+    const auto train = [](VrrTimingController& controller, int rateHz) {
+        constexpr uint64_t startUs = epochUs;
+        VrrTimingDecision decision = controller.schedule(
+            frame(0, 0, true, startUs), startUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        for (int i = 1; i <= 96; ++i) {
+            const uint32_t timestamp = static_cast<uint32_t>(
+                static_cast<uint64_t>(i) * 90000ULL /
+                static_cast<uint64_t>(rateHz));
+            const uint64_t sourceUs = decodedTimeForRtp(startUs, timestamp);
+            const uint64_t tailUs = i % 4 == 0 ? 3000 : 0;
+            decision = controller.schedule(
+                frame(i, timestamp, true, sourceUs + tailUs),
+                sourceUs + tailUs);
+            controller.noteSubmission(true, false, decision.targetUs);
+        }
+    };
+
+    train(wideHeadroom, 60);
+    train(nearCeiling, 116);
+
+    if (wideHeadroom.timingBudgetUs() + 500 >=
+            nearCeiling.timingBudgetUs()) {
+        std::fprintf(stderr,
+                     "headroom budgets: wide=%llu us near=%llu us\n",
+                     static_cast<unsigned long long>(wideHeadroom.timingBudgetUs()),
+                     static_cast<unsigned long long>(nearCeiling.timingBudgetUs()));
+    }
+    expect(wideHeadroom.timingBudgetUs() + 500 <
+               nearCeiling.timingBudgetUs(),
+           "cadence headroom must absorb arrival spread without carrying the near-ceiling reserve at lower rates");
+    expect(nearCeiling.timingBudgetUs() >= 3000,
+           "near-ceiling cadence-following presentation must retain a real burst cushion");
 }
 
 void testCadenceGapAndRateChange()
@@ -503,6 +550,13 @@ void testQuantizedCadenceProjectsSmoothTargets()
         previousTargetUs = decision.targetUs;
     }
 
+    if (largeErrors * 20 > measuredSpacings) {
+        std::fprintf(stderr,
+                     "quantized target errors: %u/%u, readiness=%lld us, budget=%llu us\n",
+                     largeErrors, measuredSpacings,
+                     static_cast<long long>(controller.readinessBudgetUs()),
+                     static_cast<unsigned long long>(controller.timingBudgetUs()));
+    }
     expect(largeErrors * 20 <= measuredSpacings,
            "a learned quantized cadence must project at least 95 percent of targets within 500 us");
 }
@@ -628,6 +682,7 @@ int main()
     testLongRunNearRefreshRtpCadence();
     testSpacingGuardFeedback();
     testNearRefreshRequestsLatchedPresentation();
+    testHeadroomAwareReadinessReserve();
     testCadenceGapAndRateChange();
     testFutureSourceProjectionReseedsPhase();
     testDecodeTailAdaptation();

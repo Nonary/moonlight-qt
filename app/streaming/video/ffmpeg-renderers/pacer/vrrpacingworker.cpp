@@ -12,7 +12,11 @@
 
 namespace {
 
-constexpr size_t kMaximumQueuedFrames = 1;
+// Keep enough decoded successors to absorb the short gap-then-burst delivery
+// pattern seen near the panel ceiling. Capacity remains bounded and evicts the
+// oldest queued successor under sustained pressure, so it cannot accumulate
+// an unbounded latency backlog.
+constexpr size_t kMaximumQueuedFrames = 3;
 // ~64 seconds of rows at 120 FPS. When the writer thread cannot keep up the
 // pacing thread drops rows rather than ever waiting on diagnostics.
 constexpr size_t kMaximumTraceQueueRows = 8192;
@@ -90,7 +94,8 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
                                  PVIDEO_STATS videoStats) :
     m_Presenter(presenter),
     m_VideoStats(videoStats),
-    m_TimingController(std::make_unique<VrrTimingController>(config))
+    m_TimingController(std::make_unique<VrrTimingController>(
+        config, presenter != nullptr && presenter->canLatchAdaptivePresent()))
 {
     const char* deepTraceEnv = SDL_getenv("MOONLIGHT_VRR_DEEP_TRACE");
     m_DeepTraceEnabled = deepTraceEnv != nullptr && deepTraceEnv[0] == '1';
@@ -125,7 +130,7 @@ VrrPacingWorker::~VrrPacingWorker()
 bool VrrPacingWorker::start()
 {
     if (m_Presenter == nullptr ||
-        m_Presenter->checkSupport() != VrrFallbackReason::None) {
+        m_Presenter->checkSupport() != VrrFallbackReason::NoFallback) {
         return false;
     }
 

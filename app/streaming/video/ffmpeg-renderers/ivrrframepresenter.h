@@ -8,7 +8,7 @@ struct AVFrame;
 // cross this boundary: the presenter only prepares, adaptively presents, or
 // abandons a decoded image.
 enum class VrrFallbackReason : uint8_t {
-    None,
+    NoFallback,
     IneffectiveVsync,
     InvalidRefresh,
     UnsupportedRenderer,
@@ -22,7 +22,7 @@ enum class VrrFallbackReason : uint8_t {
 inline const char* vrrFallbackReasonName(VrrFallbackReason reason)
 {
     switch (reason) {
-    case VrrFallbackReason::None:
+    case VrrFallbackReason::NoFallback:
         return "none";
     case VrrFallbackReason::IneffectiveVsync:
         return "ineffective V-sync";
@@ -111,7 +111,15 @@ class IVrrFramePresenter {
 public:
     virtual ~IVrrFramePresenter() = default;
 
-    // Startup eligibility only. None means the presenter supports a worker-
+    // Some adaptive backends can select a fixed-vsync latch for an individual
+    // present. Vulkan WSI modes are immutable for the swapchain lifetime, so
+    // cadence-following Mailbox/Immediate implementations leave this false.
+    virtual bool canLatchAdaptivePresent() const
+    {
+        return false;
+    }
+
+    // Startup eligibility only. NoFallback means the presenter supports a worker-
     // thread split prepare/present path using its adaptive presentation mode.
     virtual VrrFallbackReason checkSupport() const = 0;
 

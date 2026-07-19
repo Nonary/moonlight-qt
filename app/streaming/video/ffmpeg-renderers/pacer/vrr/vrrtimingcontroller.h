@@ -38,7 +38,8 @@ struct VrrTimingDecision {
 
 class VrrTimingController {
 public:
-    explicit VrrTimingController(const VrrSessionConfig& config);
+    explicit VrrTimingController(const VrrSessionConfig& config,
+                                 bool canLatchPresentation = true);
 
     void reset();
 
@@ -118,6 +119,8 @@ private:
     bool acceptSourcePeriodQ16(uint64_t periodUsQ16);
     void anchorSourceTime(uint64_t sourceTimeUs);
     void updateLearnedBudgets();
+    void updateReadinessModel();
+    void applyReadinessBudget(bool acquireReserve);
 
     uint64_t renderLeadFloorUs() const;
     uint64_t renderLeadCeilingUs() const;
@@ -148,9 +151,14 @@ private:
     uint64_t m_SourcePeriodUs = 0;
     uint64_t m_SourcePeriodUsQ16 = 0;
     int64_t m_ReadinessBudgetUs = 0;
+    int64_t m_ReadinessPhaseUs = 0;
+    uint64_t m_ReadinessDemandUs = 0;
+    uint64_t m_AppliedReadinessReserveUs = 0;
+    bool m_ReadinessModelValid = false;
     uint64_t m_RenderLeadUs = 0;
     uint64_t m_RenderWakeLeadUs = 0;
     uint64_t m_TargetWakeLeadUs = 0;
+    bool m_CanLatchPresentation = true;
     bool m_LatchedPresentation = false;
 
     bool m_HaveTimeline = false;

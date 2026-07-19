@@ -286,7 +286,7 @@ public:
 private:
     mutable std::mutex m_Mutex;
     std::condition_variable m_Condition;
-    VrrFallbackReason m_Support = VrrFallbackReason::None;
+    VrrFallbackReason m_Support = VrrFallbackReason::NoFallback;
     bool m_PreparationSucceeds = true;
     bool m_CancellationMaySubmit = false;
     bool m_CancelSubmits = false;

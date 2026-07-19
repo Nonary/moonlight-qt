@@ -287,7 +287,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
     // rejection continues through the original fixed path below.
     if (enableVrr) {
         VrrSessionConfig config;
-        VrrFallbackReason fallbackReason = VrrFallbackReason::None;
+        VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         config.streamRateHz = maxVideoFps;
         config.displayRefreshHz = vrrDisplayRefreshHz;
 
@@ -303,7 +303,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
             IVrrFramePresenter* presenter =
                 m_VsyncRenderer->getVrrFramePresenter();
             if (presenter != nullptr &&
-                    presenter->checkSupport() == VrrFallbackReason::None &&
+                    presenter->checkSupport() == VrrFallbackReason::NoFallback &&
                     !presenter->restoreFixedPresentation(fallbackReason)) {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "VRR pacing lacks adaptive-refresh headroom and the presenter cannot restore fixed presentation");
@@ -318,7 +318,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
             }
             else {
                 fallbackReason = presenter->checkSupport();
-                if (fallbackReason == VrrFallbackReason::None) {
+                if (fallbackReason == VrrFallbackReason::NoFallback) {
                     m_VrrWorker = std::make_unique<VrrPacingWorker>(
                         presenter, config, m_VideoStats);
                     if (m_VrrWorker->start()) {
