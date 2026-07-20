@@ -127,6 +127,7 @@ private:
     uint64_t readinessCeilingUs() const;
     uint64_t guardCeilingUs() const;
     static uint64_t periodForRate(int rateHz, uint64_t fallbackUs);
+    static uint64_t periodForRateQ16(int rateHz, uint64_t fallbackQ16);
     static uint64_t saturatingAdd(uint64_t left, uint64_t right);
     static uint64_t addSigned(uint64_t value, int64_t adjustment);
     static int64_t signedDifference(uint64_t left, uint64_t right);
@@ -144,6 +145,7 @@ private:
 
     VrrSessionConfig m_Config;
     uint64_t m_ConfiguredStreamPeriodUs = 0;
+    uint64_t m_ConfiguredStreamPeriodQ16 = 0;
     uint64_t m_DisplayPeriodUs = 0;
     uint64_t m_BaseGuardUs = 0;
     uint64_t m_GuardUs = 0;

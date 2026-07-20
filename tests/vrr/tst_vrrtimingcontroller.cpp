@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace {
 
@@ -42,13 +43,22 @@ uint32_t quantizedRtpTimestamp(int frameNumber, int sourceRateHz,
         (static_cast<uint64_t>(frameNumber) * captureRateHz +
          static_cast<uint64_t>(sourceRateHz) / 2) /
         static_cast<uint64_t>(sourceRateHz);
-    return static_cast<uint32_t>(captureFrame *
-        (90000 / static_cast<uint64_t>(captureRateHz)));
+    return static_cast<uint32_t>(
+        (captureFrame * 90000ULL +
+         static_cast<uint64_t>(captureRateHz) / 2) /
+        static_cast<uint64_t>(captureRateHz));
 }
 
 uint64_t decodedTimeForRtp(uint64_t epochUs, uint32_t timestamp)
 {
     return epochUs + static_cast<uint64_t>(timestamp) * 1000000ULL / 90000ULL;
+}
+
+uint64_t idealDecodedTime(uint64_t epochUs, int frameNumber, int rateHz)
+{
+    return epochUs + (static_cast<uint64_t>(frameNumber) * 1000000ULL +
+                      static_cast<uint64_t>(rateHz) / 2) /
+        static_cast<uint64_t>(rateHz);
 }
 
 void testRtpWrapResetAndFallback()
@@ -145,6 +155,133 @@ void testLongRunNearRefreshRtpCadence()
            "90 kHz timestamp quantization must not accumulate source-clock drift");
 }
 
+void testQuantizedCadenceDoesNotOscillate()
+{
+    constexpr uint64_t epochUs = 1000000;
+    struct CadenceCase {
+        int streamRateHz;
+        int captureRateHz;
+        int displayRefreshHz;
+    };
+    const CadenceCase cases[] = {
+        {59, 60, 60},
+        {116, 120, 120},
+        {138, 144, 144},
+        {480, 480, 960},
+    };
+
+    for (const CadenceCase& cadence : cases) {
+        VrrTimingController controller(config(cadence.streamRateHz,
+                                              cadence.displayRefreshHz));
+        VrrTimingDecision decision = controller.schedule(
+            frame(0, 0, true, epochUs), epochUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+
+        const uint64_t expectedPeriodUs =
+            (1000000ULL + static_cast<uint64_t>(cadence.streamRateHz) / 2) /
+            static_cast<uint64_t>(cadence.streamRateHz);
+        uint64_t minimumPeriodUs = std::numeric_limits<uint64_t>::max();
+        uint64_t maximumPeriodUs = 0;
+        int64_t minimumReadyOffsetUs = std::numeric_limits<int64_t>::max();
+        int64_t maximumReadyOffsetUs = std::numeric_limits<int64_t>::min();
+        uint64_t maximumTimingBudgetUs = 0;
+        bool sawRebase = false;
+        const int warmupFrames = cadence.streamRateHz * 4;
+        const int frameCount = cadence.streamRateHz * 12;
+
+        for (int i = 1; i <= frameCount; ++i) {
+            const uint32_t timestamp = quantizedRtpTimestamp(
+                i, cadence.streamRateHz, cadence.captureRateHz);
+            const uint64_t decodedUs = idealDecodedTime(
+                epochUs, i, cadence.streamRateHz);
+            decision = controller.schedule(
+                frame(i, timestamp, true, decodedUs), decodedUs);
+            controller.noteSubmission(true, false, decision.targetUs);
+            sawRebase = sawRebase || decision.rebased;
+
+            if (i > warmupFrames) {
+                minimumPeriodUs = std::min(minimumPeriodUs,
+                                            decision.sourcePeriodUs);
+                maximumPeriodUs = std::max(maximumPeriodUs,
+                                            decision.sourcePeriodUs);
+                minimumReadyOffsetUs = std::min(minimumReadyOffsetUs,
+                                                decision.readyOffsetUs);
+                maximumReadyOffsetUs = std::max(maximumReadyOffsetUs,
+                                                decision.readyOffsetUs);
+                maximumTimingBudgetUs = std::max(
+                    maximumTimingBudgetUs, controller.timingBudgetUs());
+            }
+        }
+
+        const uint64_t readyOffsetSpanUs =
+            maximumReadyOffsetUs > minimumReadyOffsetUs ?
+                static_cast<uint64_t>(maximumReadyOffsetUs -
+                                      minimumReadyOffsetUs) : 0;
+        if (minimumPeriodUs != expectedPeriodUs ||
+                maximumPeriodUs != expectedPeriodUs ||
+                readyOffsetSpanUs > 2 ||
+                maximumTimingBudgetUs > 2000) {
+            std::fprintf(stderr,
+                         "quantized cadence %d/%d: period=%llu..%llu "
+                         "expected=%llu phase-span=%llu budget=%llu\n",
+                         cadence.streamRateHz, cadence.captureRateHz,
+                         static_cast<unsigned long long>(minimumPeriodUs),
+                         static_cast<unsigned long long>(maximumPeriodUs),
+                         static_cast<unsigned long long>(expectedPeriodUs),
+                         static_cast<unsigned long long>(readyOffsetSpanUs),
+                         static_cast<unsigned long long>(maximumTimingBudgetUs));
+        }
+        expect(!sawRebase,
+               "steady host-quantized cadence must not rebase");
+        expect(minimumPeriodUs == expectedPeriodUs &&
+                   maximumPeriodUs == expectedPeriodUs,
+               "host-quantized cadence must retain one exact learned period");
+        expect(readyOffsetSpanUs <= 2,
+               "host-quantized cadence must not create millisecond source phase motion");
+        expect(maximumTimingBudgetUs <= 2000,
+               "host-quantized cadence must not create a multi-millisecond readiness reserve");
+    }
+}
+
+void testNegotiatedRateCeiling()
+{
+    constexpr uint64_t epochUs = 1000000;
+
+    VrrTimingController candidateController(config(60, 120));
+    candidateController.schedule(frame(0, 0, true, epochUs), epochUs);
+    candidateController.schedule(
+        frame(1, 1500, true, idealDecodedTime(epochUs, 1, 60)),
+        idealDecodedTime(epochUs, 1, 60));
+    VrrTimingDecision provisional = candidateController.schedule(
+        frame(2, 1875, true, idealDecodedTime(epochUs, 2, 240)),
+        idealDecodedTime(epochUs, 2, 240));
+    VrrTimingDecision boundedCandidate = candidateController.schedule(
+        frame(3, 2250, true, idealDecodedTime(epochUs, 3, 240)),
+        idealDecodedTime(epochUs, 3, 240));
+    const uint64_t sixtyFpsPeriodUs = (1000000ULL + 30) / 60;
+    expect(provisional.phaseDiscontinuity &&
+               !boundedCandidate.sourceRateChanged &&
+               candidateController.sourcePeriodUs() == sixtyFpsPeriodUs,
+           "a faster provisional candidate must remain at the negotiated rate");
+
+    VrrTimingController fittedController(config(116, 120));
+    fittedController.schedule(frame(0, 0, true, epochUs), epochUs);
+    uint64_t minimumPeriodUs = std::numeric_limits<uint64_t>::max();
+    for (int i = 1; i <= 128; ++i) {
+        const uint32_t timestamp = static_cast<uint32_t>(i * 750);
+        const uint64_t decodedUs = idealDecodedTime(epochUs, i, 120);
+        const VrrTimingDecision decision = fittedController.schedule(
+            frame(i, timestamp, true, decodedUs), decodedUs);
+        if (i >= 16) {
+            minimumPeriodUs = std::min(minimumPeriodUs,
+                                        decision.sourcePeriodUs);
+        }
+    }
+    const uint64_t negotiatedPeriodUs = (1000000ULL + 58) / 116;
+    expect(minimumPeriodUs == negotiatedPeriodUs,
+           "a fitted cadence must never imply a rate above the negotiated stream FPS");
+}
+
 void testSpacingGuardFeedback()
 {
     VrrTimingController controller(config(60, 120));
@@ -230,7 +367,7 @@ void testHeadroomAwareReadinessReserve()
 
 void testCadenceGapAndRateChange()
 {
-    VrrTimingController controller(config());
+    VrrTimingController controller(config(120, 120));
     uint32_t timestamp = 0;
     uint64_t decodedUs = 100000;
     controller.schedule(frame(0, timestamp, true, decodedUs), decodedUs);
@@ -680,6 +817,8 @@ int main()
     testRtpWrapResetAndFallback();
     testTimingFormulaeAndReserveCap();
     testLongRunNearRefreshRtpCadence();
+    testQuantizedCadenceDoesNotOscillate();
+    testNegotiatedRateCeiling();
     testSpacingGuardFeedback();
     testNearRefreshRequestsLatchedPresentation();
     testHeadroomAwareReadinessReserve();

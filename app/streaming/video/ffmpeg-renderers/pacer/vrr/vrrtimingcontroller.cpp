@@ -1,7 +1,6 @@
 #include "vrrtimingcontroller.h"
 
 #include <algorithm>
-#include <cmath>
 #include <limits>
 #include <vector>
 
@@ -37,7 +36,9 @@ constexpr unsigned int kGuardDecayFrames = 120;
 constexpr size_t kLearningSampleCount = 32;
 constexpr size_t kMinimumReadinessSamples = 16;
 constexpr size_t kMinimumCadenceSamples = 6;
-constexpr size_t kMaximumCadenceSamples = 128;
+// A tight cadence window spans one source second. The supported stream range
+// reaches 480 FPS, so retain one anchor plus every frame in that window.
+constexpr size_t kMaximumCadenceSamples = 512;
 constexpr size_t kRateCandidateSampleCount = 3;
 constexpr uint64_t kLooseCadenceWindowUs = 500000ULL;
 constexpr uint64_t kTightCadenceWindowUs = 1000000ULL;
@@ -69,8 +70,10 @@ VrrTimingController::VrrTimingController(const VrrSessionConfig& config,
 void VrrTimingController::reset()
 {
     m_DisplayPeriodUs = periodForRate(m_Config.displayRefreshHz, 16667);
-    m_ConfiguredStreamPeriodUs = periodForRate(
-        m_Config.streamRateHz, m_DisplayPeriodUs);
+    m_ConfiguredStreamPeriodQ16 = periodForRateQ16(
+        m_Config.streamRateHz, m_DisplayPeriodUs * kQ16One);
+    m_ConfiguredStreamPeriodUs = std::max<uint64_t>(
+        1, roundedQ16(m_ConfiguredStreamPeriodQ16));
     m_BaseGuardUs = clampUnsigned(m_DisplayPeriodUs / 64,
                                   kMinimumGuardUs,
                                   kMaximumBaseGuardUs);
@@ -96,8 +99,9 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     const uint64_t previousTargetWakeLeadUs = m_TargetWakeLeadUs;
     const uint64_t previousGuardUs = m_GuardUs;
 
-    m_SourcePeriodUs = m_ConfiguredStreamPeriodUs;
-    m_SourcePeriodUsQ16 = m_SourcePeriodUs * kQ16One;
+    m_SourcePeriodUsQ16 = m_ConfiguredStreamPeriodQ16;
+    m_SourcePeriodUs = std::max<uint64_t>(
+        1, roundedQ16(m_SourcePeriodUsQ16));
     m_LatchedPresentation = m_CanLatchPresentation && m_SourcePeriodUs <
         saturatingAdd(m_DisplayPeriodUs, kLatchedPresentationHeadroomUs);
     m_ReadinessBudgetUs = 0;
@@ -464,10 +468,10 @@ void VrrTimingController::observeRtpCadence(
             const uint64_t candidatePeriodQ16 = fittedSourcePeriodQ16(
                 m_RateCandidateSamples);
             if (candidatePeriodQ16 != 0) {
-                acceptSourcePeriodQ16(candidatePeriodQ16);
+                observation.sourceRateChanged = acceptSourcePeriodQ16(
+                    candidatePeriodQ16);
                 m_CadenceSamples = m_RateCandidateSamples;
                 m_RateCandidateSamples.clear();
-                observation.sourceRateChanged = true;
                 observation.eligible = true;
             }
         }
@@ -521,47 +525,40 @@ uint64_t VrrTimingController::fittedSourcePeriodQ16(
         return 0;
     }
 
-    // Fit cumulative RTP movement against frame progression. Centering the
-    // coordinates at the first point keeps the sums small and makes skipped
-    // frame numbers naturally contribute their full source-frame distance.
-    const long double firstFrame = static_cast<long double>(
-        samples.front().frameOrdinal);
-    const long double firstTicks = static_cast<long double>(
-        samples.front().rtpTicks);
-    long double sumX = 0.0L;
-    long double sumY = 0.0L;
-    for (const CadenceSample& sample : samples) {
-        sumX += static_cast<long double>(sample.frameOrdinal) - firstFrame;
-        sumY += static_cast<long double>(sample.rtpTicks) - firstTicks;
-    }
-
-    const long double count = static_cast<long double>(samples.size());
-    const long double meanX = sumX / count;
-    const long double meanY = sumY / count;
-    long double covariance = 0.0L;
-    long double variance = 0.0L;
-    for (const CadenceSample& sample : samples) {
-        const long double x =
-            static_cast<long double>(sample.frameOrdinal) - firstFrame - meanX;
-        const long double y =
-            static_cast<long double>(sample.rtpTicks) - firstTicks - meanY;
-        covariance += x * y;
-        variance += x * x;
-    }
-    if (variance <= 0.0L || covariance <= 0.0L) {
+    const CadenceSample& first = samples.front();
+    const CadenceSample& last = samples.back();
+    if (last.frameOrdinal <= first.frameOrdinal ||
+        last.rtpTicks <= first.rtpTicks) {
         return 0;
     }
 
-    const long double periodUs = covariance / variance *
-        static_cast<long double>(kMicrosecondsPerSecond) /
-        static_cast<long double>(kRtpClockRate);
-    const long double periodQ16 = periodUs *
-        static_cast<long double>(kQ16One);
-    if (periodQ16 < 1.0L || periodQ16 >= static_cast<long double>(
-            std::numeric_limits<uint64_t>::max())) {
+    // RTP timestamps from a host-refresh-quantized source form a staircase.
+    // OLS weighs the placement of each staircase step, so its slope breathes
+    // as a long atom crosses the window.  The endpoint span measures only
+    // the net source movement and still accounts for skipped local frames.
+    const uint64_t spanFrames = last.frameOrdinal - first.frameOrdinal;
+    const uint64_t spanTicks = last.rtpTicks - first.rtpTicks;
+    constexpr uint64_t kPeriodQ16Scale =
+        kMicrosecondsPerSecond * kQ16One;
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+
+    // The cadence window is at most one previous window plus one valid
+    // one-second RTP interval, so these products are comfortably 64-bit in
+    // normal operation. Keep explicit guards for malformed frame numbers.
+    if (spanTicks > maximum / kPeriodQ16Scale ||
+        spanFrames > maximum / kRtpClockRate) {
         return 0;
     }
-    return static_cast<uint64_t>(std::llround(periodQ16));
+
+    const uint64_t numerator = spanTicks * kPeriodQ16Scale;
+    const uint64_t denominator = spanFrames * kRtpClockRate;
+    const uint64_t quotient = numerator / denominator;
+    const uint64_t remainder = numerator % denominator;
+    const uint64_t halfway = denominator / 2 + denominator % 2;
+    if (remainder >= halfway && quotient < maximum) {
+        return quotient + 1;
+    }
+    return quotient;
 }
 
 uint64_t VrrTimingController::cadenceWindowUs() const
@@ -607,6 +604,10 @@ bool VrrTimingController::acceptSourcePeriodQ16(uint64_t periodUsQ16)
         return false;
     }
 
+    // The negotiated stream rate is an upper bound on source FPS. Preserve
+    // it at Q16 precision so fractional rates do not acquire an artificial
+    // drift from the rounded microsecond period.
+    periodUsQ16 = std::max(periodUsQ16, m_ConfiguredStreamPeriodQ16);
     const uint64_t previousPeriodUs = m_SourcePeriodUs;
     m_SourcePeriodUsQ16 = periodUsQ16;
     m_SourcePeriodUs = std::max<uint64_t>(1, roundedQ16(periodUsQ16));
@@ -916,6 +917,19 @@ uint64_t VrrTimingController::periodForRate(int rateHz, uint64_t fallbackUs)
     const uint64_t rate = static_cast<uint64_t>(rateHz);
     return std::max<uint64_t>(1,
         (kMicrosecondsPerSecond + rate / 2) / rate);
+}
+
+uint64_t VrrTimingController::periodForRateQ16(int rateHz,
+                                               uint64_t fallbackQ16)
+{
+    if (rateHz <= 0) {
+        return fallbackQ16;
+    }
+    const uint64_t rate = static_cast<uint64_t>(rateHz);
+    constexpr uint64_t kPeriodQ16Scale =
+        kMicrosecondsPerSecond * kQ16One;
+    return std::max<uint64_t>(1,
+        (kPeriodQ16Scale + rate / 2) / rate);
 }
 
 uint64_t VrrTimingController::saturatingAdd(uint64_t left, uint64_t right)
