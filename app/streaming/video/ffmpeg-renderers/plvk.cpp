@@ -91,6 +91,18 @@ bool isGamescopePresentation(const char* videoDriver)
            hasEnvironmentValue("GAMESCOPE_XWAYLAND_DISPLAY");
 }
 
+bool isGamescopeWsiPresentation(const char* videoDriver)
+{
+    // The Gamescope WSI layer presents through its own Mailbox driver
+    // swapchain even when the application-facing mode is FIFO. vrr8 relied on
+    // that behavior: Moonlight paced the FIFO requests while Gamescope owned
+    // the physical adaptive scanout. Restrict the exception to an explicitly
+    // enabled WSI layer so ordinary X11 FIFO cannot be mistaken for VRR.
+    const char* enabled = SDL_getenv("ENABLE_GAMESCOPE_WSI");
+    return isGamescopePresentation(videoDriver) && enabled != nullptr &&
+           SDL_strcmp(enabled, "1") == 0;
+}
+
 bool isWaylandPresentation(const char* videoDriver)
 {
     return videoDriver != nullptr && SDL_strcmp(videoDriver, "wayland") == 0 &&
@@ -778,6 +790,7 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
     }
 
     const char* videoDriver = SDL_GetCurrentVideoDriver();
+    const bool gamescopeWsi = isGamescopeWsiPresentation(videoDriver);
     if (isWaylandPresentation(videoDriver)) {
         // Wayland uses Mailbox when the surface reports it. Do not use
         // Immediate as a substitute: the selection is intentionally fixed at
@@ -797,6 +810,19 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
                                                    VK_PRESENT_MODE_IMMEDIATE_KHR)) {
             m_VkPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
             m_VrrFallbackReason = VrrFallbackReason::NoFallback;
+            return;
+        }
+
+        // Gamescope WSI intentionally does not expose Immediate on current
+        // SteamOS. The known-good vrr8 Linux path kept cadence pacing active
+        // with an application-facing FIFO swapchain here; the WSI layer maps
+        // it onto Gamescope's non-blocking driver swapchain. Falling back to
+        // Moonlight's fixed-vsync worker instead pins the OSD near 120 Hz.
+        if (gamescopeWsi) {
+            m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+            m_VrrFallbackReason = VrrFallbackReason::NoFallback;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Gamescope WSI uses FIFO application presentation; retaining adaptive VRR pacing");
             return;
         }
     }
@@ -1209,8 +1235,11 @@ IVrrFramePresenter* PlVkRenderer::getVrrFramePresenter()
 
 VrrFallbackReason PlVkRenderer::checkSupport() const
 {
+    const char* videoDriver = SDL_GetCurrentVideoDriver();
     const bool adaptiveMode = m_VkPresentMode == VK_PRESENT_MODE_MAILBOX_KHR ||
-                              m_VkPresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR;
+                              m_VkPresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ||
+                              (m_VkPresentMode == VK_PRESENT_MODE_FIFO_KHR &&
+                               isGamescopeWsiPresentation(videoDriver));
     if (m_VrrFallbackReason != VrrFallbackReason::NoFallback) {
         return m_VrrFallbackReason;
     }
