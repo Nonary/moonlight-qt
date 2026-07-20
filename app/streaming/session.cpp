@@ -1609,12 +1609,6 @@ void Session::updateOptimalWindowDisplayMode()
 
 void Session::toggleFullscreen()
 {
-    if (m_PresentationSettings.enableVrr) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Ignoring fullscreen toggle while VRR is active");
-        return;
-    }
-
     bool fullScreen = !(SDL_GetWindowFlags(m_Window) & m_FullScreenFlag);
 
 #if defined(Q_OS_WIN32) || defined(Q_OS_DARWIN)
