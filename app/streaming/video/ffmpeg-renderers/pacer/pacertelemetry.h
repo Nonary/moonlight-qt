@@ -26,7 +26,6 @@ struct PacerTelemetrySnapshot {
     uint64_t vrrEligibleFrames = 0;
     uint64_t vrrPrepareLateFrames = 0;
     uint64_t vrrTargetWaitEntryLateFrames = 0;
-    uint64_t vrrSubmitLateFrames = 0;
     uint64_t vrrPresentFailedFrames = 0;
     uint64_t vrrPresentCancelledFrames = 0;
     uint64_t vrrSpacingCorrections = 0;
@@ -34,6 +33,10 @@ struct PacerTelemetrySnapshot {
     uint64_t vrrPrepareLatenessP50Us = 0;
     uint64_t vrrPrepareLatenessP95Us = 0;
     uint64_t vrrPrepareLatenessP99Us = 0;
+    int64_t vrrSubmitErrorP50Us = 0;
+    int64_t vrrSubmitErrorP95Us = 0;
+    int64_t vrrSubmitErrorP99Us = 0;
+    int64_t vrrSubmitErrorMaxUs = 0;
 
     // These are a decision-time sample, not an aggregate or a proxy for the
     // target used by a different frame.
@@ -54,10 +57,10 @@ struct VrrTelemetrySample {
     uint64_t pacerTimeUs = 0;
     uint64_t renderTimeUs = 0;
     uint64_t preparationLatenessUs = 0;
+    int64_t submitErrorUs = 0;
 
     bool prepareLate = false;
     bool targetWaitEntryLate = false;
-    bool submitLate = false;
     bool spacingCorrected = false;
     bool presented = false;
     bool cancelled = false;
@@ -78,6 +81,7 @@ public:
         QMutexLocker lock(&m_Lock);
         PacerTelemetrySnapshot snapshot = m_Snapshot;
         populatePrepareLatenessPercentilesLocked(snapshot);
+        populateSubmitErrorPercentilesLocked(snapshot);
         return snapshot;
     }
 
@@ -137,8 +141,10 @@ public:
         if (sample.targetWaitEntryLate) {
             ++m_Snapshot.vrrTargetWaitEntryLateFrames;
         }
-        if (sample.submitLate) {
-            ++m_Snapshot.vrrSubmitLateFrames;
+        // Submission error is meaningful only for output that was actually
+        // presented. Cancelled submissions are reported separately.
+        if (sample.presented && !sample.cancelled) {
+            addSubmitErrorLocked(sample.submitErrorUs);
         }
         if (sample.spacingCorrected) {
             ++m_Snapshot.vrrSpacingCorrections;
@@ -162,6 +168,7 @@ public:
 
 private:
     static constexpr size_t kPrepareLatenessSampleCount = 128;
+    static constexpr size_t kSubmitErrorSampleCount = 128;
 
     static size_t percentileIndex(size_t count, size_t percentile)
     {
@@ -213,9 +220,42 @@ private:
             percentileIndex(m_PrepareLatenessSampleSize, 99)];
     }
 
+    void addSubmitErrorLocked(int64_t errorUs)
+    {
+        m_SubmitErrorSamples[m_NextSubmitErrorSample] = errorUs;
+        m_NextSubmitErrorSample =
+            (m_NextSubmitErrorSample + 1) % kSubmitErrorSampleCount;
+        m_SubmitErrorSampleSize = std::min(
+            m_SubmitErrorSampleSize + 1, kSubmitErrorSampleCount);
+    }
+
+    void populateSubmitErrorPercentilesLocked(
+        PacerTelemetrySnapshot& snapshot) const
+    {
+        if (m_SubmitErrorSampleSize == 0) {
+            return;
+        }
+
+        std::array<int64_t, kSubmitErrorSampleCount> sortedSamples =
+            m_SubmitErrorSamples;
+        std::sort(sortedSamples.begin(),
+                  sortedSamples.begin() + m_SubmitErrorSampleSize);
+        snapshot.vrrSubmitErrorP50Us = sortedSamples[
+            percentileIndex(m_SubmitErrorSampleSize, 50)];
+        snapshot.vrrSubmitErrorP95Us = sortedSamples[
+            percentileIndex(m_SubmitErrorSampleSize, 95)];
+        snapshot.vrrSubmitErrorP99Us = sortedSamples[
+            percentileIndex(m_SubmitErrorSampleSize, 99)];
+        snapshot.vrrSubmitErrorMaxUs = sortedSamples[
+            m_SubmitErrorSampleSize - 1];
+    }
+
     mutable QMutex m_Lock;
     PacerTelemetrySnapshot m_Snapshot;
     std::array<uint64_t, kPrepareLatenessSampleCount> m_PrepareLatenessSamples {};
     size_t m_NextPrepareLatenessSample = 0;
     size_t m_PrepareLatenessSampleSize = 0;
+    std::array<int64_t, kSubmitErrorSampleCount> m_SubmitErrorSamples {};
+    size_t m_NextSubmitErrorSample = 0;
+    size_t m_SubmitErrorSampleSize = 0;
 };

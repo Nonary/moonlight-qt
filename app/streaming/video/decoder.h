@@ -22,13 +22,16 @@ typedef struct _VIDEO_STATS {
     uint64_t vrrEligibleFrames;
     uint64_t vrrPrepareLateFrames;
     uint64_t vrrTargetWaitEntryLateFrames;
-    uint64_t vrrSubmitLateFrames;
     uint64_t vrrPresentFailedFrames;
     uint64_t vrrPresentCancelledFrames;
     uint64_t vrrSpacingCorrections;
     uint64_t vrrPrepareLatenessP50Us;
     uint64_t vrrPrepareLatenessP95Us;
     uint64_t vrrPrepareLatenessP99Us;
+    int64_t vrrSubmitErrorP50Us;
+    int64_t vrrSubmitErrorP95Us;
+    int64_t vrrSubmitErrorP99Us;
+    int64_t vrrSubmitErrorMaxUs;
     uint64_t vrrStateSequence;
     uint64_t vrrStateSampleTimeUs;
     int64_t vrrReadinessBudgetUs;

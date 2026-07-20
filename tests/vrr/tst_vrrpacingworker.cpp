@@ -169,7 +169,7 @@ void testTelemetrySnapshotsRemainCumulative()
     PacerTelemetry telemetry;
     telemetry.beginVrrSession(1);
 
-    constexpr uint64_t frameCount = 256;
+    constexpr uint64_t frameCount = 512;
     std::atomic_bool producerDone { false };
     std::thread producer([&telemetry, &producerDone, frameCount] {
         for (uint64_t i = 1; i <= frameCount; ++i) {
@@ -180,6 +180,7 @@ void testTelemetrySnapshotsRemainCumulative()
             sample.renderTimeUs = i * 2;
             sample.prepareLate = (i % 2) == 0;
             sample.preparationLatenessUs = i;
+            sample.submitErrorUs = static_cast<int64_t>(i) - 450;
             sample.spacingCorrected = (i % 8) == 0;
             sample.presented = true;
             sample.readinessBudgetUs = static_cast<int64_t>(i);
@@ -210,7 +211,6 @@ void testTelemetrySnapshotsRemainCumulative()
     delayedSubmission.publicationTimeUs = frameCount + 2;
     delayedSubmission.decisionTimeUs = frameCount + 1;
     delayedSubmission.targetWaitEntryLate = true;
-    delayedSubmission.submitLate = true;
     telemetry.recordVrrFrame(delayedSubmission);
 
     const PacerTelemetrySnapshot finalSnapshot = telemetryStats(telemetry);
@@ -221,12 +221,17 @@ void testTelemetrySnapshotsRemainCumulative()
                finalSnapshot.vrrEligibleFrames == frameCount + 1,
            "cumulative telemetry must retain every published frame");
     expect(finalSnapshot.vrrPrepareLateFrames == frameCount / 2 &&
-               finalSnapshot.vrrPrepareLatenessP95Us != 0 &&
+               finalSnapshot.vrrPrepareLatenessP50Us == 384 &&
+               finalSnapshot.vrrPrepareLatenessP95Us == 500 &&
+               finalSnapshot.vrrPrepareLatenessP99Us == 510 &&
                finalSnapshot.vrrTargetWaitEntryLateFrames == 1 &&
-               finalSnapshot.vrrSubmitLateFrames == 1 &&
+               finalSnapshot.vrrSubmitErrorP50Us == -2 &&
+               finalSnapshot.vrrSubmitErrorP95Us == 56 &&
+               finalSnapshot.vrrSubmitErrorP99Us == 61 &&
+               finalSnapshot.vrrSubmitErrorMaxUs == 62 &&
                finalSnapshot.vrrPresentFailedFrames == 1 &&
                finalSnapshot.vrrStateSequence == finalSnapshot.sequence,
-           "telemetry must keep timing causes and output outcomes separate");
+           "telemetry must keep bounded timing distributions and output outcomes separate");
 }
 
 void testSuspendDiscardAndFreshFrame()
@@ -386,6 +391,33 @@ void testBlockingPresentUsesWorkerCallBoundary()
         expect(calls.size() >= 2 && returns.size() >= 1 &&
                    calls[1] < returns[0] + displayPeriodUs,
                "a blocking presenter must not add a second display period");
+    }
+}
+
+void testSubmissionErrorCapturesPresentOverhead()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.setPreSubmissionDelayUs(1000);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime first;
+
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "worker must start for submission-error testing");
+        worker.submit(frame(1, first));
+        expect(backend.waitForPresentCount(1),
+               "submission-error fixture must present its frame");
+        expect(waitFor([&telemetry] {
+                   return telemetryStats(telemetry).vrrEligibleFrames >= 1;
+               }),
+               "submission-error telemetry must publish with the presentation");
+
+        const PacerTelemetrySnapshot stats = telemetryStats(telemetry);
+        expect(stats.vrrSubmitErrorP50Us > 0 &&
+                   stats.vrrSubmitErrorMaxUs > 0 &&
+                   stats.vrrPresentFailedFrames == 0,
+               "post-target present overhead must be reported as submission error, not output failure");
     }
 }
 
@@ -594,6 +626,7 @@ int main()
     testCancelledPresentationCountsAsDroppedOutput();
     testPresentCallSpacingSetsDisplayFloor();
     testBlockingPresentUsesWorkerCallBoundary();
+    testSubmissionErrorCapturesPresentOverhead();
     testFailedPreparationCancellationHonorsDisplayFloor();
     testSuspendedPreparedCancellationHonorsDisplayFloor();
     testImmutablePresentationContract();

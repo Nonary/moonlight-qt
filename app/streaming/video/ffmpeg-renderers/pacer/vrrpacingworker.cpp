@@ -510,7 +510,7 @@ int VrrPacingWorker::run()
             sample.targetWaitEntryLate = !sample.prepareLate &&
                 telemetry.preparationEndUs < decision.targetUs &&
                 targetWait.deadlineAlreadyElapsed;
-            sample.submitLate = telemetry.submissionBoundaryUs > decision.targetUs;
+            sample.submitErrorUs = telemetry.submitErrorUs;
             sample.spacingCorrected = telemetry.spacingCorrected;
             sample.presented = feedback.presented;
             sample.cancelled = feedback.cancelled;

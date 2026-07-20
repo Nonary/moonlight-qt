@@ -789,7 +789,6 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.vrrEligibleFrames += src.vrrEligibleFrames;
     dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
     dst.vrrTargetWaitEntryLateFrames += src.vrrTargetWaitEntryLateFrames;
-    dst.vrrSubmitLateFrames += src.vrrSubmitLateFrames;
     dst.vrrPresentFailedFrames += src.vrrPresentFailedFrames;
     dst.vrrPresentCancelledFrames += src.vrrPresentCancelledFrames;
     dst.vrrSpacingCorrections += src.vrrSpacingCorrections;
@@ -815,6 +814,10 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
         dst.vrrPrepareLatenessP50Us = src.vrrPrepareLatenessP50Us;
         dst.vrrPrepareLatenessP95Us = src.vrrPrepareLatenessP95Us;
         dst.vrrPrepareLatenessP99Us = src.vrrPrepareLatenessP99Us;
+        dst.vrrSubmitErrorP50Us = src.vrrSubmitErrorP50Us;
+        dst.vrrSubmitErrorP95Us = src.vrrSubmitErrorP95Us;
+        dst.vrrSubmitErrorP99Us = src.vrrSubmitErrorP99Us;
+        dst.vrrSubmitErrorMaxUs = src.vrrSubmitErrorMaxUs;
     }
     dst.totalReassemblyTimeUs += src.totalReassemblyTimeUs;
     dst.totalDecodeTimeUs += src.totalDecodeTimeUs;
@@ -900,9 +903,6 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
     m_ActiveWndVideoStats.vrrTargetWaitEntryLateFrames +=
         delta(snapshot.vrrTargetWaitEntryLateFrames,
               m_LastPacerTelemetry.vrrTargetWaitEntryLateFrames);
-    m_ActiveWndVideoStats.vrrSubmitLateFrames +=
-        delta(snapshot.vrrSubmitLateFrames,
-              m_LastPacerTelemetry.vrrSubmitLateFrames);
     m_ActiveWndVideoStats.vrrPresentFailedFrames +=
         delta(snapshot.vrrPresentFailedFrames,
               m_LastPacerTelemetry.vrrPresentFailedFrames);
@@ -933,6 +933,14 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
             snapshot.vrrPrepareLatenessP95Us;
         m_ActiveWndVideoStats.vrrPrepareLatenessP99Us =
             snapshot.vrrPrepareLatenessP99Us;
+        m_ActiveWndVideoStats.vrrSubmitErrorP50Us =
+            snapshot.vrrSubmitErrorP50Us;
+        m_ActiveWndVideoStats.vrrSubmitErrorP95Us =
+            snapshot.vrrSubmitErrorP95Us;
+        m_ActiveWndVideoStats.vrrSubmitErrorP99Us =
+            snapshot.vrrSubmitErrorP99Us;
+        m_ActiveWndVideoStats.vrrSubmitErrorMaxUs =
+            snapshot.vrrSubmitErrorMaxUs;
     }
 
     m_LastPacerTelemetry = snapshot;
@@ -1145,8 +1153,9 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
         ret = snprintf(&output[offset],
                        length - offset,
-                       "VRR eligible: %llu; prepare late %.2f%% (%llu, recent p50/p95/p99 %.2f/%.2f/%.2f ms)\n"
-                       "VRR wait-entry/submit late: %.2f%%/%.2f%%; failed/cancelled: %llu/%llu; drops/spacing: %llu/%llu\n"
+                       "VRR eligible: %llu; prepare late %.2f%% (%llu, late-prep magnitude p50/p95/p99 (up to 128 retained late frames): %.2f/%.2f/%.2f ms)\n"
+                       "VRR wait-entry late: %.2f%%; submit error p50/p95/p99/max (up to 128 retained successful presentations): %+.2f/%+.2f/%+.2f/%+.2f ms\n"
+                       "VRR failed/cancelled: %llu/%llu; drops/spacing: %llu/%llu\n"
                        "VRR decision readiness/timing reserve/guard: %.2f/%.2f/%.2f ms (sample %s)\n"
                        "VRR render lead/wake lead (render/target)/source: %.2f/%.2f/%.2f/%.2f ms\n",
                        static_cast<unsigned long long>(stats.vrrEligibleFrames),
@@ -1156,7 +1165,10 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                        static_cast<double>(stats.vrrPrepareLatenessP95Us) / 1000.0,
                        static_cast<double>(stats.vrrPrepareLatenessP99Us) / 1000.0,
                        percentOfEligible(stats.vrrTargetWaitEntryLateFrames),
-                       percentOfEligible(stats.vrrSubmitLateFrames),
+                       static_cast<double>(stats.vrrSubmitErrorP50Us) / 1000.0,
+                       static_cast<double>(stats.vrrSubmitErrorP95Us) / 1000.0,
+                       static_cast<double>(stats.vrrSubmitErrorP99Us) / 1000.0,
+                       static_cast<double>(stats.vrrSubmitErrorMaxUs) / 1000.0,
                        static_cast<unsigned long long>(stats.vrrPresentFailedFrames),
                        static_cast<unsigned long long>(stats.vrrPresentCancelledFrames),
                        static_cast<unsigned long long>(stats.vrrPacingDroppedFrames),
