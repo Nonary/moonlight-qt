@@ -15,13 +15,29 @@ typedef struct _VIDEO_STATS {
     uint32_t totalFrames;
     uint32_t networkDroppedFrames;
     uint32_t pacerDroppedFrames;
-    // VRR-only telemetry. These remain zero on the legacy pacing paths.
-    uint32_t vrrPacingDroppedFrames;
-    uint32_t vrrReadinessMisses;
-    uint32_t vrrSpacingCorrections;
+    // Pacer telemetry is merged into decoder-owned windows from coherent
+    // cumulative snapshots. These remain zero on non-VRR pacing paths.
+    bool vrrTelemetryActive;
+    uint64_t vrrPacingDroppedFrames;
+    uint64_t vrrEligibleFrames;
+    uint64_t vrrPrepareLateFrames;
+    uint64_t vrrTargetWaitEntryLateFrames;
+    uint64_t vrrSubmitLateFrames;
+    uint64_t vrrPresentFailedFrames;
+    uint64_t vrrPresentCancelledFrames;
+    uint64_t vrrSpacingCorrections;
+    uint64_t vrrPrepareLatenessP50Us;
+    uint64_t vrrPrepareLatenessP95Us;
+    uint64_t vrrPrepareLatenessP99Us;
+    uint64_t vrrStateSequence;
+    uint64_t vrrStateSampleTimeUs;
+    int64_t vrrReadinessBudgetUs;
     uint64_t vrrTimingBudgetUs;
-    uint64_t vrrSchedulerDelayUs;
+    uint64_t vrrRenderLeadUs;
+    uint64_t vrrRenderWakeLeadUs;
+    uint64_t vrrTargetWakeLeadUs;
     uint64_t vrrGuardUs;
+    uint64_t vrrSourcePeriodUs;
     uint16_t minHostProcessingLatency;         // low-res from RTP
     uint16_t maxHostProcessingLatency;         // low-res from RTP
     uint32_t totalHostProcessingLatency;       // low-res from RTP

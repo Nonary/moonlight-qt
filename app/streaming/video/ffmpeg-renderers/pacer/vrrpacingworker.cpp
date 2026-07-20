@@ -91,9 +91,9 @@ bool isUncPath(const char* path)
 
 VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
                                  const VrrSessionConfig& config,
-                                 PVIDEO_STATS videoStats) :
+                                 PacerTelemetry* telemetry) :
     m_Presenter(presenter),
-    m_VideoStats(videoStats),
+    m_Telemetry(telemetry),
     m_TimingController(std::make_unique<VrrTimingController>(
         config, presenter != nullptr && presenter->canLatchAdaptivePresent()))
 {
@@ -140,6 +140,10 @@ bool VrrPacingWorker::start()
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "Failed to create VRR pacing worker: %s", SDL_GetError());
         return false;
+    }
+
+    if (m_Telemetry != nullptr) {
+        m_Telemetry->beginVrrSession(LiGetMicroseconds());
     }
 
     return true;
@@ -273,8 +277,9 @@ int VrrPacingWorker::run()
         // its learned cadence.
         (void) queueDiscontinuity;
 
-        uint64_t nowUs = LiGetMicroseconds();
-        VrrTimingDecision decision = m_TimingController->schedule(frame, nowUs);
+        const uint64_t decisionTimeUs = LiGetMicroseconds();
+        VrrTimingDecision decision = m_TimingController->schedule(
+            frame, decisionTimeUs);
         FrameTelemetry telemetry;
         const VrrTargetWaitResult renderWait =
             m_TargetWaiter->waitUntil(decision.renderStartUs);
@@ -296,6 +301,11 @@ int VrrPacingWorker::run()
             recordSubmission(decision, feedback, telemetry.presentStartUs,
                              telemetry.presentEndUs,
                              telemetry);
+            if (m_Telemetry != nullptr) {
+                m_Telemetry->recordVrrOutcome(feedback.presented,
+                                              feedback.cancelled,
+                                              telemetry.presentEndUs);
+            }
             writeTrace(frame, decision, feedback, telemetry,
                        queuedFrameCount(), true);
             noteDrop();
@@ -305,7 +315,7 @@ int VrrPacingWorker::run()
         // A frame can become stale while the worker waits for its render
         // start. Leave the surface unprepared and let the next iteration start
         // fresh rather than rendering an avoidably old image.
-        nowUs = LiGetMicroseconds();
+        uint64_t nowUs = LiGetMicroseconds();
         const uint64_t staleHorizonAfterWaitUs = staleToleranceUs(decision);
         if (staleHorizonAfterWaitUs != 0 &&
             nowUs > decision.targetUs + staleHorizonAfterWaitUs &&
@@ -359,6 +369,11 @@ int VrrPacingWorker::run()
             recordSubmission(decision, feedback, submissionOperationStartUs,
                              submissionOperationEndUs,
                              telemetry);
+            if (m_Telemetry != nullptr) {
+                m_Telemetry->recordVrrOutcome(feedback.presented,
+                                              feedback.cancelled,
+                                              submissionOperationEndUs);
+            }
             writeTrace(frame, decision, feedback, telemetry,
                        queuedFrameCount(), true);
             noteDrop();
@@ -390,6 +405,11 @@ int VrrPacingWorker::run()
             recordSubmission(decision, feedback, telemetry.presentStartUs,
                              telemetry.presentEndUs,
                              telemetry);
+            if (m_Telemetry != nullptr) {
+                m_Telemetry->recordVrrOutcome(feedback.presented,
+                                              feedback.cancelled,
+                                              telemetry.presentEndUs);
+            }
             writeTrace(frame, decision, feedback, telemetry,
                        queuedFrameCount(), true);
             noteDrop();
@@ -475,27 +495,33 @@ int VrrPacingWorker::run()
         recordSubmission(decision, feedback, telemetry.presentStartUs,
                          telemetry.presentEndUs,
                          telemetry);
-        if (m_VideoStats != nullptr) {
-            m_VideoStats->totalPacerTimeUs +=
+        if (m_Telemetry != nullptr) {
+            VrrTelemetrySample sample;
+            sample.publicationTimeUs = telemetry.presentEndUs;
+            sample.decisionTimeUs = decisionTimeUs;
+            sample.pacerTimeUs =
                 telemetry.preparationStartUs >= frame.decodeCompleteUs() ?
                     telemetry.preparationStartUs - frame.decodeCompleteUs() : 0;
-            m_VideoStats->totalRenderTimeUs +=
-                telemetry.preparationDurationUs + telemetry.presentDurationUs;
-            if (targetWait.deadlineAlreadyElapsed ||
-                telemetry.preparationEndUs > decision.targetUs) {
-                ++m_VideoStats->vrrReadinessMisses;
-            }
-            if (telemetry.spacingCorrected) {
-                ++m_VideoStats->vrrSpacingCorrections;
-            }
-            m_VideoStats->vrrTimingBudgetUs =
-                m_TimingController->timingBudgetUs();
-            m_VideoStats->vrrSchedulerDelayUs =
-                m_TimingController->wakeLeadUs();
-            m_VideoStats->vrrGuardUs = m_TimingController->guardUs();
-            if (feedback.presented && !feedback.cancelled) {
-                ++m_VideoStats->renderedFrames;
-            }
+            sample.renderTimeUs = telemetry.preparationDurationUs +
+                telemetry.presentDurationUs;
+            sample.prepareLate = telemetry.preparationEndUs > decision.targetUs;
+            sample.preparationLatenessUs = sample.prepareLate ?
+                telemetry.preparationEndUs - decision.targetUs : 0;
+            sample.targetWaitEntryLate = !sample.prepareLate &&
+                telemetry.preparationEndUs < decision.targetUs &&
+                targetWait.deadlineAlreadyElapsed;
+            sample.submitLate = telemetry.submissionBoundaryUs > decision.targetUs;
+            sample.spacingCorrected = telemetry.spacingCorrected;
+            sample.presented = feedback.presented;
+            sample.cancelled = feedback.cancelled;
+            sample.readinessBudgetUs = decision.readinessBudgetUs;
+            sample.timingBudgetUs = decision.timingBudgetUs;
+            sample.renderLeadUs = decision.renderLeadUs;
+            sample.renderWakeLeadUs = decision.renderWakeLeadUs;
+            sample.targetWakeLeadUs = decision.targetWakeLeadUs;
+            sample.guardUs = decision.guardUs;
+            sample.sourcePeriodUs = decision.sourcePeriodUs;
+            m_Telemetry->recordVrrFrame(sample);
         }
 
         const bool outputDropped = !feedback.presented || feedback.cancelled;
@@ -696,9 +722,8 @@ void VrrPacingWorker::deferFrame(PacedFrame&& frame)
 
 void VrrPacingWorker::noteDrop()
 {
-    if (m_VideoStats != nullptr) {
-        ++m_VideoStats->pacerDroppedFrames;
-        ++m_VideoStats->vrrPacingDroppedFrames;
+    if (m_Telemetry != nullptr) {
+        m_Telemetry->recordVrrDrop(LiGetMicroseconds());
     }
 }
 

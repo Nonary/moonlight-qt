@@ -2,6 +2,7 @@
 
 #include "../../decoder.h"
 #include "../renderer.h"
+#include "pacertelemetry.h"
 #include "vrr/vrrtypes.h"
 
 #include <QQueue>
@@ -36,9 +37,15 @@ public:
 class Pacer
 {
 public:
-    Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats);
+    Pacer(IFFmpegRenderer* renderer);
 
     ~Pacer();
+
+    // Stop all producer threads before a final telemetry snapshot is merged
+    // by the decoder. It is safe to call this more than once.
+    void shutdown();
+
+    PacerTelemetrySnapshot telemetrySnapshot() const;
 
     // Only the active VRR worker consumes the decoder-facing pacing metadata.
     void submitFrame(PacedFrame&& frame);
@@ -82,12 +89,13 @@ private:
     SDL_Thread* m_VsyncThread;
     AVFrame* m_DeferredFreeFrame;
     bool m_Stopping;
+    bool m_Shutdown;
 
     IVsyncSource* m_VsyncSource;
     IFFmpegRenderer* m_VsyncRenderer;
     int m_MaxVideoFps;
     int m_DisplayFps;
-    PVIDEO_STATS m_VideoStats;
     int m_RendererAttributes;
+    PacerTelemetry m_Telemetry;
     std::unique_ptr<VrrPacingWorker> m_VrrWorker;
 };

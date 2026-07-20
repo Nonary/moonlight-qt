@@ -2,6 +2,7 @@
 
 #include "../../decoder.h"
 #include "../ivrrframepresenter.h"
+#include "pacertelemetry.h"
 #include "vrr/vrrtypes.h"
 #include "vrr/vrrtimingcontroller.h"
 
@@ -23,7 +24,7 @@ class VrrPacingWorker {
 public:
     VrrPacingWorker(IVrrFramePresenter* presenter,
                     const VrrSessionConfig& config,
-                    PVIDEO_STATS videoStats);
+                    PacerTelemetry* telemetry);
     ~VrrPacingWorker();
 
     VrrPacingWorker(const VrrPacingWorker&) = delete;
@@ -110,7 +111,7 @@ private:
     void writeTraceRow(const TraceRow& row);
 
     IVrrFramePresenter* m_Presenter;
-    PVIDEO_STATS m_VideoStats;
+    PacerTelemetry* m_Telemetry;
 
     std::unique_ptr<VrrTimingController> m_TimingController;
     std::unique_ptr<VrrTargetWaiter> m_TargetWaiter;

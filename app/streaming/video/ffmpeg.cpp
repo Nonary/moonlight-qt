@@ -246,6 +246,7 @@ FFmpegVideoDecoder::FFmpegVideoDecoder(bool testOnly)
     SDL_zero(m_ActiveWndVideoStats);
     SDL_zero(m_LastWndVideoStats);
     SDL_zero(m_GlobalVideoStats);
+    m_LastPacerTelemetry = {};
 
     SDL_AtomicSet(&m_DecoderThreadShouldQuit, 0);
 }
@@ -283,8 +284,22 @@ void FFmpegVideoDecoder::reset()
     m_FramesIn = m_FramesOut = 0;
     m_FrameInfoQueue.clear();
 
-    delete m_Pacer;
-    m_Pacer = nullptr;
+    if (m_Pacer != nullptr) {
+        // Pacer owns all producer threads. Stop them first so this final
+        // cumulative snapshot includes work that finished after the last
+        // one-second decoder window.
+        m_Pacer->shutdown();
+        syncPacerTelemetry();
+
+        delete m_Pacer;
+        m_Pacer = nullptr;
+        m_LastPacerTelemetry = {};
+    }
+
+    // Windows normally roll over from submitDecodeUnit(). Session shutdown
+    // may occur at any point within a window, so merge its remaining decoder-
+    // owned values before the final global log is produced.
+    finalizeActiveVideoStats();
 
     // This must be called after deleting Pacer because it
     // may be holding AVFrames to free in its destructor.
@@ -501,7 +516,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
 
     // Don't bother initializing Pacer if we're not actually going to render
     if (testMode != TestMode::TestFrameOnly) {
-        m_Pacer = new Pacer(m_FrontendRenderer, &m_ActiveWndVideoStats);
+        m_Pacer = new Pacer(m_FrontendRenderer);
         if (!m_Pacer->initialize(params->window, params->frameRate,
                                  params->enableFramePacing || (params->enableVsync && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_FORCE_PACING)),
                                  params->enableVsync,
@@ -771,15 +786,35 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.networkDroppedFrames += src.networkDroppedFrames;
     dst.pacerDroppedFrames += src.pacerDroppedFrames;
     dst.vrrPacingDroppedFrames += src.vrrPacingDroppedFrames;
-    dst.vrrReadinessMisses += src.vrrReadinessMisses;
+    dst.vrrEligibleFrames += src.vrrEligibleFrames;
+    dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
+    dst.vrrTargetWaitEntryLateFrames += src.vrrTargetWaitEntryLateFrames;
+    dst.vrrSubmitLateFrames += src.vrrSubmitLateFrames;
+    dst.vrrPresentFailedFrames += src.vrrPresentFailedFrames;
+    dst.vrrPresentCancelledFrames += src.vrrPresentCancelledFrames;
     dst.vrrSpacingCorrections += src.vrrSpacingCorrections;
-    // These are instantaneous VRR state rather than counters. Preserve the
-    // most recent non-legacy sample while ordinary pacing remains byte-for-
-    // byte compatible with its previous statistics.
-    if (src.vrrTimingBudgetUs != 0) {
+    dst.vrrTelemetryActive = dst.vrrTelemetryActive || src.vrrTelemetryActive;
+    // These are decision-time VRR state rather than counters. Preserve the
+    // newest complete sample; a Pacer-local sequence can restart when a
+    // decoder is reinitialized, so timestamp is the primary ordering key.
+    // Zeros are valid state values during startup/rebase.
+    const bool sourceHasNewerVrrState = src.vrrStateSequence != 0 &&
+        (src.vrrStateSampleTimeUs > dst.vrrStateSampleTimeUs ||
+         (src.vrrStateSampleTimeUs == dst.vrrStateSampleTimeUs &&
+          src.vrrStateSequence > dst.vrrStateSequence));
+    if (sourceHasNewerVrrState) {
+        dst.vrrStateSequence = src.vrrStateSequence;
+        dst.vrrStateSampleTimeUs = src.vrrStateSampleTimeUs;
+        dst.vrrReadinessBudgetUs = src.vrrReadinessBudgetUs;
         dst.vrrTimingBudgetUs = src.vrrTimingBudgetUs;
-        dst.vrrSchedulerDelayUs = src.vrrSchedulerDelayUs;
+        dst.vrrRenderLeadUs = src.vrrRenderLeadUs;
+        dst.vrrRenderWakeLeadUs = src.vrrRenderWakeLeadUs;
+        dst.vrrTargetWakeLeadUs = src.vrrTargetWakeLeadUs;
         dst.vrrGuardUs = src.vrrGuardUs;
+        dst.vrrSourcePeriodUs = src.vrrSourcePeriodUs;
+        dst.vrrPrepareLatenessP50Us = src.vrrPrepareLatenessP50Us;
+        dst.vrrPrepareLatenessP95Us = src.vrrPrepareLatenessP95Us;
+        dst.vrrPrepareLatenessP99Us = src.vrrPrepareLatenessP99Us;
     }
     dst.totalReassemblyTimeUs += src.totalReassemblyTimeUs;
     dst.totalDecodeTimeUs += src.totalDecodeTimeUs;
@@ -819,6 +854,98 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.receivedFps     = (double)dst.receivedFrames / timeDiffSecs;
     dst.decodedFps      = (double)dst.decodedFrames / timeDiffSecs;
     dst.renderedFps     = (double)dst.renderedFrames / timeDiffSecs;
+}
+
+void FFmpegVideoDecoder::syncPacerTelemetry()
+{
+    if (m_Pacer == nullptr) {
+        return;
+    }
+
+    const PacerTelemetrySnapshot snapshot = m_Pacer->telemetrySnapshot();
+    if (snapshot.sequence == m_LastPacerTelemetry.sequence) {
+        return;
+    }
+
+    const auto delta = [](uint64_t current, uint64_t previous) {
+        // A Pacer instance publishes cumulative counters for its whole
+        // lifetime. Treat an unexpected decrease as a fresh baseline rather
+        // than allowing unsigned underflow to manufacture a huge window.
+        return current >= previous ? current - previous : current;
+    };
+
+    m_ActiveWndVideoStats.renderedFrames += static_cast<uint32_t>(
+        delta(snapshot.renderedFrames, m_LastPacerTelemetry.renderedFrames));
+    m_ActiveWndVideoStats.pacerDroppedFrames += static_cast<uint32_t>(
+        delta(snapshot.pacerDroppedFrames,
+              m_LastPacerTelemetry.pacerDroppedFrames));
+    m_ActiveWndVideoStats.totalPacerTimeUs +=
+        delta(snapshot.totalPacerTimeUs,
+              m_LastPacerTelemetry.totalPacerTimeUs);
+    m_ActiveWndVideoStats.totalRenderTimeUs +=
+        delta(snapshot.totalRenderTimeUs,
+              m_LastPacerTelemetry.totalRenderTimeUs);
+
+    m_ActiveWndVideoStats.vrrTelemetryActive =
+        m_ActiveWndVideoStats.vrrTelemetryActive || snapshot.vrrActive;
+    m_ActiveWndVideoStats.vrrPacingDroppedFrames +=
+        delta(snapshot.vrrPacingDroppedFrames,
+              m_LastPacerTelemetry.vrrPacingDroppedFrames);
+    m_ActiveWndVideoStats.vrrEligibleFrames +=
+        delta(snapshot.vrrEligibleFrames,
+              m_LastPacerTelemetry.vrrEligibleFrames);
+    m_ActiveWndVideoStats.vrrPrepareLateFrames +=
+        delta(snapshot.vrrPrepareLateFrames,
+              m_LastPacerTelemetry.vrrPrepareLateFrames);
+    m_ActiveWndVideoStats.vrrTargetWaitEntryLateFrames +=
+        delta(snapshot.vrrTargetWaitEntryLateFrames,
+              m_LastPacerTelemetry.vrrTargetWaitEntryLateFrames);
+    m_ActiveWndVideoStats.vrrSubmitLateFrames +=
+        delta(snapshot.vrrSubmitLateFrames,
+              m_LastPacerTelemetry.vrrSubmitLateFrames);
+    m_ActiveWndVideoStats.vrrPresentFailedFrames +=
+        delta(snapshot.vrrPresentFailedFrames,
+              m_LastPacerTelemetry.vrrPresentFailedFrames);
+    m_ActiveWndVideoStats.vrrPresentCancelledFrames +=
+        delta(snapshot.vrrPresentCancelledFrames,
+              m_LastPacerTelemetry.vrrPresentCancelledFrames);
+    m_ActiveWndVideoStats.vrrSpacingCorrections +=
+        delta(snapshot.vrrSpacingCorrections,
+              m_LastPacerTelemetry.vrrSpacingCorrections);
+
+    if (snapshot.vrrStateSequence > m_LastPacerTelemetry.vrrStateSequence) {
+        m_ActiveWndVideoStats.vrrStateSequence = snapshot.vrrStateSequence;
+        m_ActiveWndVideoStats.vrrStateSampleTimeUs =
+            snapshot.vrrStateSampleTimeUs;
+        m_ActiveWndVideoStats.vrrReadinessBudgetUs =
+            snapshot.vrrReadinessBudgetUs;
+        m_ActiveWndVideoStats.vrrTimingBudgetUs = snapshot.vrrTimingBudgetUs;
+        m_ActiveWndVideoStats.vrrRenderLeadUs = snapshot.vrrRenderLeadUs;
+        m_ActiveWndVideoStats.vrrRenderWakeLeadUs =
+            snapshot.vrrRenderWakeLeadUs;
+        m_ActiveWndVideoStats.vrrTargetWakeLeadUs =
+            snapshot.vrrTargetWakeLeadUs;
+        m_ActiveWndVideoStats.vrrGuardUs = snapshot.vrrGuardUs;
+        m_ActiveWndVideoStats.vrrSourcePeriodUs = snapshot.vrrSourcePeriodUs;
+        m_ActiveWndVideoStats.vrrPrepareLatenessP50Us =
+            snapshot.vrrPrepareLatenessP50Us;
+        m_ActiveWndVideoStats.vrrPrepareLatenessP95Us =
+            snapshot.vrrPrepareLatenessP95Us;
+        m_ActiveWndVideoStats.vrrPrepareLatenessP99Us =
+            snapshot.vrrPrepareLatenessP99Us;
+    }
+
+    m_LastPacerTelemetry = snapshot;
+}
+
+void FFmpegVideoDecoder::finalizeActiveVideoStats()
+{
+    if (m_ActiveWndVideoStats.measurementStartUs == 0) {
+        return;
+    }
+
+    addVideoStats(m_ActiveWndVideoStats, m_GlobalVideoStats);
+    SDL_zero(m_ActiveWndVideoStats);
 }
 
 void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, int length)
@@ -994,23 +1121,54 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         offset += ret;
     }
 
-    if (stats.vrrTimingBudgetUs != 0 || stats.vrrReadinessMisses != 0 ||
+    if (stats.vrrTelemetryActive || stats.vrrEligibleFrames != 0 ||
             stats.vrrPacingDroppedFrames != 0 ||
-            stats.vrrSpacingCorrections != 0) {
+            stats.vrrPresentFailedFrames != 0 ||
+            stats.vrrPresentCancelledFrames != 0) {
+        const auto percentOfEligible = [&stats](uint64_t count) {
+            return stats.vrrEligibleFrames == 0 ? 0.0 :
+                static_cast<double>(count) * 100.0 /
+                static_cast<double>(stats.vrrEligibleFrames);
+        };
+        char sampleAge[64];
+        if (stats.vrrStateSequence == 0) {
+            snprintf(sampleAge, sizeof(sampleAge), "N/A");
+        }
+        else {
+            const uint64_t nowUs = LiGetMicroseconds();
+            const uint64_t ageUs = nowUs >= stats.vrrStateSampleTimeUs ?
+                nowUs - stats.vrrStateSampleTimeUs : 0;
+            snprintf(sampleAge, sizeof(sampleAge), "%.2f ms, seq %llu",
+                     static_cast<double>(ageUs) / 1000.0,
+                     static_cast<unsigned long long>(stats.vrrStateSequence));
+        }
+
         ret = snprintf(&output[offset],
                        length - offset,
-                       "VRR timing budget: %.2f ms\n"
-                        "VRR scheduler delay (p95): %.2f ms\n"
-                        "VRR display guard: %.2f ms\n"
-                        "VRR readiness misses: %u\n"
-                        "VRR spacing corrections: %u\n"
-                       "VRR pacing drops: %u\n",
-                        static_cast<double>(stats.vrrTimingBudgetUs) / 1000.0,
-                        static_cast<double>(stats.vrrSchedulerDelayUs) / 1000.0,
-                        static_cast<double>(stats.vrrGuardUs) / 1000.0,
-                        stats.vrrReadinessMisses,
-                        stats.vrrSpacingCorrections,
-                       stats.vrrPacingDroppedFrames);
+                       "VRR eligible: %llu; prepare late %.2f%% (%llu, recent p50/p95/p99 %.2f/%.2f/%.2f ms)\n"
+                       "VRR wait-entry/submit late: %.2f%%/%.2f%%; failed/cancelled: %llu/%llu; drops/spacing: %llu/%llu\n"
+                       "VRR decision readiness/timing reserve/guard: %.2f/%.2f/%.2f ms (sample %s)\n"
+                       "VRR render lead/wake lead (render/target)/source: %.2f/%.2f/%.2f/%.2f ms\n",
+                       static_cast<unsigned long long>(stats.vrrEligibleFrames),
+                       percentOfEligible(stats.vrrPrepareLateFrames),
+                       static_cast<unsigned long long>(stats.vrrPrepareLateFrames),
+                       static_cast<double>(stats.vrrPrepareLatenessP50Us) / 1000.0,
+                       static_cast<double>(stats.vrrPrepareLatenessP95Us) / 1000.0,
+                       static_cast<double>(stats.vrrPrepareLatenessP99Us) / 1000.0,
+                       percentOfEligible(stats.vrrTargetWaitEntryLateFrames),
+                       percentOfEligible(stats.vrrSubmitLateFrames),
+                       static_cast<unsigned long long>(stats.vrrPresentFailedFrames),
+                       static_cast<unsigned long long>(stats.vrrPresentCancelledFrames),
+                       static_cast<unsigned long long>(stats.vrrPacingDroppedFrames),
+                       static_cast<unsigned long long>(stats.vrrSpacingCorrections),
+                       static_cast<double>(stats.vrrReadinessBudgetUs) / 1000.0,
+                       static_cast<double>(stats.vrrTimingBudgetUs) / 1000.0,
+                       static_cast<double>(stats.vrrGuardUs) / 1000.0,
+                       sampleAge,
+                       static_cast<double>(stats.vrrRenderLeadUs) / 1000.0,
+                       static_cast<double>(stats.vrrRenderWakeLeadUs) / 1000.0,
+                       static_cast<double>(stats.vrrTargetWakeLeadUs) / 1000.0,
+                       static_cast<double>(stats.vrrSourcePeriodUs) / 1000.0);
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);
             return;
@@ -1022,8 +1180,9 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
 void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
 {
-    if (stats.renderedFps > 0 || stats.renderedFrames != 0) {
-        char videoStatsStr[1024];
+    if (stats.renderedFps > 0 || stats.renderedFrames != 0 ||
+            stats.vrrTelemetryActive) {
+        char videoStatsStr[2048];
         stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr));
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -2096,6 +2255,10 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
 
     // Flip stats windows roughly every second
     if (LiGetMicroseconds() > m_ActiveWndVideoStats.measurementStartUs + 1000000) {
+        // Pacer producers publish cumulative snapshots. Merge the delta before
+        // this decoder-owned window is read, accumulated, and reset.
+        syncPacerTelemetry();
+
         // Update overlay stats if it's enabled
         if (Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug)) {
             VIDEO_STATS lastTwoWndStats = {};
@@ -2196,4 +2359,3 @@ void FFmpegVideoDecoder::renderFrameOnMainThread()
 {
     m_Pacer->renderOnMainThread();
 }
-

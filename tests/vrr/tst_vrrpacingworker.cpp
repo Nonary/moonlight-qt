@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QTemporaryDir>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -52,6 +53,11 @@ VrrSessionConfig enabledConfig()
     return config;
 }
 
+PacerTelemetrySnapshot telemetryStats(const PacerTelemetry& telemetry)
+{
+    return telemetry.snapshot();
+}
+
 PacedFrame frame(int number, TrackedFrameLifetime& lifetime)
 {
     return makeTrackedPacedFrame(number,
@@ -63,11 +69,11 @@ PacedFrame frame(int number, TrackedFrameLifetime& lifetime)
 void testCapabilityRejection()
 {
     FakeVrrFramePresenter backend;
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
 
     backend.setSupport(
         VrrFallbackReason::AdaptivePresentationUnavailable);
-    VrrPacingWorker unsupportedWorker(&backend, enabledConfig(), &stats);
+    VrrPacingWorker unsupportedWorker(&backend, enabledConfig(), &telemetry);
     expect(!unsupportedWorker.start(),
            "worker must reject an unsupported VRR presentation backend");
     expect(backend.checkSupport() ==
@@ -80,7 +86,7 @@ void testQueueCapacityAndDrops()
     resetFakeClock();
     FakeVrrFramePresenter backend;
     backend.blockPreparation();
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
     TrackedFrameLifetime first;
     TrackedFrameLifetime second;
     TrackedFrameLifetime third;
@@ -88,7 +94,7 @@ void testQueueCapacityAndDrops()
     TrackedFrameLifetime freshest;
 
     {
-        VrrPacingWorker worker(&backend, enabledConfig(), &stats);
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
         expect(worker.start(), "worker must start for a capable backend");
         worker.submit(frame(1, first));
         expect(backend.waitForPrepareCount(1),
@@ -100,6 +106,7 @@ void testQueueCapacityAndDrops()
         worker.submit(frame(3, third));
         worker.submit(frame(4, fourth));
         worker.submit(frame(50, freshest));
+        const PacerTelemetrySnapshot stats = telemetryStats(telemetry);
         expect(stats.vrrPacingDroppedFrames == 1 &&
                    stats.pacerDroppedFrames == 1,
                "a short successor burst must be buffered with only capacity overflow coalesced");
@@ -131,11 +138,11 @@ void testLatePreparedFramePresentsImmediately()
     resetFakeClock();
     FakeVrrFramePresenter backend;
     backend.blockPreparation();
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
     TrackedFrameLifetime lifetime;
 
     {
-        VrrPacingWorker worker(&backend, enabledConfig(), &stats);
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
         expect(worker.start(), "worker must start for late-presentation recovery");
         worker.submit(frame(1, lifetime));
         expect(backend.waitForPrepareCount(1),
@@ -145,11 +152,81 @@ void testLatePreparedFramePresentsImmediately()
         backend.releasePreparation();
         expect(backend.waitForPresentCount(1),
                "a late prepared frame must present instead of being cancelled");
+        expect(waitFor([&telemetry] {
+                   return telemetryStats(telemetry).vrrEligibleFrames >= 1;
+               }),
+               "late preparation telemetry must publish with the presentation");
+        const PacerTelemetrySnapshot stats = telemetryStats(telemetry);
         expect(stats.vrrPacingDroppedFrames == 0,
                "a late observation must not manufacture a pacing drop");
-        expect(stats.vrrReadinessMisses >= 1,
-               "late preparation must remain visible in readiness telemetry");
+        expect(stats.vrrPrepareLateFrames >= 1,
+               "late preparation must remain visible in timing telemetry");
     }
+}
+
+void testTelemetrySnapshotsRemainCumulative()
+{
+    PacerTelemetry telemetry;
+    telemetry.beginVrrSession(1);
+
+    constexpr uint64_t frameCount = 256;
+    std::atomic_bool producerDone { false };
+    std::thread producer([&telemetry, &producerDone, frameCount] {
+        for (uint64_t i = 1; i <= frameCount; ++i) {
+            VrrTelemetrySample sample;
+            sample.publicationTimeUs = i + 1;
+            sample.decisionTimeUs = i;
+            sample.pacerTimeUs = i;
+            sample.renderTimeUs = i * 2;
+            sample.prepareLate = (i % 2) == 0;
+            sample.preparationLatenessUs = i;
+            sample.spacingCorrected = (i % 8) == 0;
+            sample.presented = true;
+            sample.readinessBudgetUs = static_cast<int64_t>(i);
+            sample.timingBudgetUs = i * 3;
+            sample.renderLeadUs = i * 4;
+            sample.renderWakeLeadUs = i * 5;
+            sample.targetWakeLeadUs = i * 6;
+            sample.guardUs = i * 7;
+            sample.sourcePeriodUs = i * 8;
+            telemetry.recordVrrFrame(sample);
+        }
+        producerDone.store(true);
+    });
+
+    uint64_t previousSequence = 0;
+    uint64_t previousRenderedFrames = 0;
+    bool monotonic = true;
+    while (!producerDone.load()) {
+        const PacerTelemetrySnapshot snapshot = telemetryStats(telemetry);
+        monotonic = monotonic && snapshot.sequence >= previousSequence &&
+            snapshot.renderedFrames >= previousRenderedFrames;
+        previousSequence = snapshot.sequence;
+        previousRenderedFrames = snapshot.renderedFrames;
+    }
+    producer.join();
+
+    VrrTelemetrySample delayedSubmission;
+    delayedSubmission.publicationTimeUs = frameCount + 2;
+    delayedSubmission.decisionTimeUs = frameCount + 1;
+    delayedSubmission.targetWaitEntryLate = true;
+    delayedSubmission.submitLate = true;
+    telemetry.recordVrrFrame(delayedSubmission);
+
+    const PacerTelemetrySnapshot finalSnapshot = telemetryStats(telemetry);
+    expect(monotonic,
+           "telemetry snapshots must not regress while another thread publishes");
+    expect(finalSnapshot.vrrActive &&
+               finalSnapshot.renderedFrames == frameCount &&
+               finalSnapshot.vrrEligibleFrames == frameCount + 1,
+           "cumulative telemetry must retain every published frame");
+    expect(finalSnapshot.vrrPrepareLateFrames == frameCount / 2 &&
+               finalSnapshot.vrrPrepareLatenessP95Us != 0 &&
+               finalSnapshot.vrrTargetWaitEntryLateFrames == 1 &&
+               finalSnapshot.vrrSubmitLateFrames == 1 &&
+               finalSnapshot.vrrPresentFailedFrames == 1 &&
+               finalSnapshot.vrrStateSequence == finalSnapshot.sequence,
+           "telemetry must keep timing causes and output outcomes separate");
 }
 
 void testSuspendDiscardAndFreshFrame()
@@ -157,14 +234,14 @@ void testSuspendDiscardAndFreshFrame()
     resetFakeClock();
     FakeVrrFramePresenter backend;
     backend.blockPreparation();
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
     TrackedFrameLifetime first;
     TrackedFrameLifetime queuedOne;
     TrackedFrameLifetime queuedTwo;
     TrackedFrameLifetime fresh;
 
     {
-        VrrPacingWorker worker(&backend, enabledConfig(), &stats);
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
         expect(worker.start(), "worker must start before exercising suspension");
         worker.submit(frame(1, first));
         expect(backend.waitForPrepareCount(1),
@@ -175,7 +252,7 @@ void testSuspendDiscardAndFreshFrame()
         WINDOW_STATE_CHANGE_INFO minimized {};
         minimized.stateChangeFlags = WINDOW_STATE_CHANGE_MINIMIZED;
         worker.notifyWindowChanged(&minimized);
-        expect(stats.vrrPacingDroppedFrames >= 2,
+        expect(telemetryStats(telemetry).vrrPacingDroppedFrames >= 2,
                "minimize must synchronously discard queued VRR frames");
 
         backend.releasePreparation();
@@ -203,12 +280,12 @@ void testDeferredSurfaceLifetime()
 {
     resetFakeClock();
     FakeVrrFramePresenter backend;
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
     TrackedFrameLifetime first;
     TrackedFrameLifetime second;
 
     {
-        VrrPacingWorker worker(&backend, enabledConfig(), &stats);
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
         expect(worker.start(), "worker must start for deferred lifetime testing");
         worker.submit(frame(1, first));
         expect(backend.waitForPresentCount(1), "first frame must present");
@@ -232,21 +309,25 @@ void testCancelledPresentationCountsAsDroppedOutput()
     resetFakeClock();
     FakeVrrFramePresenter backend;
     backend.setPresentCancelled(true);
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
     TrackedFrameLifetime cancelled;
 
     {
-        VrrPacingWorker worker(&backend, enabledConfig(), &stats);
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
         expect(worker.start(), "worker must start for cancellation classification");
         worker.submit(frame(1, cancelled));
         expect(backend.waitForPresentCount(1),
                "cancelled presentation fixture must still submit its frame");
-        expect(waitFor([&stats] {
+        expect(waitFor([&telemetry] {
+                   const PacerTelemetrySnapshot stats = telemetryStats(telemetry);
                    return stats.pacerDroppedFrames == 1 &&
-                       stats.vrrPacingDroppedFrames == 1;
+                       stats.vrrPacingDroppedFrames == 1 &&
+                       stats.vrrPresentCancelledFrames == 1;
                }),
                "a cancelled presentation must increment both pacing drop counters");
-        expect(stats.renderedFrames == 0,
+        const PacerTelemetrySnapshot stats = telemetryStats(telemetry);
+        expect(stats.renderedFrames == 0 && stats.vrrEligibleFrames == 1 &&
+                   stats.vrrPresentFailedFrames == 0,
                "a cancelled presentation must not count as rendered output");
     }
 }
@@ -255,14 +336,14 @@ void testPresentCallSpacingSetsDisplayFloor()
 {
     resetFakeClock();
     FakeVrrFramePresenter backend;
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
     TrackedFrameLifetime first;
     TrackedFrameLifetime second;
     VrrSessionConfig atRefresh = enabledConfig();
     atRefresh.streamRateHz = 120;
 
     {
-        VrrPacingWorker worker(&backend, atRefresh, &stats);
+        VrrPacingWorker worker(&backend, atRefresh, &telemetry);
         expect(worker.start(), "worker must start for presentation spacing");
         worker.submit(makeTrackedPacedFrame(1, 0, LiGetMicroseconds(), first));
         expect(backend.waitForPresentCount(1), "first spacing frame must present");
@@ -280,14 +361,14 @@ void testBlockingPresentUsesWorkerCallBoundary()
     resetFakeClock();
     FakeVrrFramePresenter backend;
     backend.setPresentDelayUs(20000);
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
     TrackedFrameLifetime first;
     TrackedFrameLifetime second;
     VrrSessionConfig config = enabledConfig();
     config.displayRefreshHz = 60;
 
     {
-        VrrPacingWorker worker(&backend, config, &stats);
+        VrrPacingWorker worker(&backend, config, &telemetry);
         expect(worker.start(), "worker must start for blocking presentation testing");
         worker.submit(frame(1, first));
         expect(backend.waitForPresentCount(1), "blocking first present must return");
@@ -312,14 +393,14 @@ void testFailedPreparationCancellationHonorsDisplayFloor()
 {
     resetFakeClock();
     FakeVrrFramePresenter backend;
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
     TrackedFrameLifetime first;
     TrackedFrameLifetime failed;
     VrrSessionConfig config = enabledConfig();
     config.displayRefreshHz = 20;
 
     {
-        VrrPacingWorker worker(&backend, config, &stats);
+        VrrPacingWorker worker(&backend, config, &telemetry);
         expect(worker.start(), "worker must start for cancellation timing");
 
         backend.blockPreparation();
@@ -349,14 +430,14 @@ void testSuspendedPreparedCancellationHonorsDisplayFloor()
 {
     resetFakeClock();
     FakeVrrFramePresenter backend;
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
     TrackedFrameLifetime first;
     TrackedFrameLifetime suspended;
     VrrSessionConfig config = enabledConfig();
     config.displayRefreshHz = 20;
 
     {
-        VrrPacingWorker worker(&backend, config, &stats);
+        VrrPacingWorker worker(&backend, config, &telemetry);
         expect(worker.start(), "worker must start for suspended cancellation timing");
 
         backend.blockPreparation();
@@ -414,14 +495,14 @@ void testImmutablePresentationContract()
 
     resetFakeClock();
     FakeVrrFramePresenter backend;
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
     TrackedFrameLifetime first;
     TrackedFrameLifetime second;
     VrrSessionConfig immutableConfig = enabledConfig();
     immutableConfig.streamRateHz = 116;
 
     {
-        VrrPacingWorker worker(&backend, immutableConfig, &stats);
+        VrrPacingWorker worker(&backend, immutableConfig, &telemetry);
         expect(worker.start(), "worker must start for presentation contract testing");
         worker.submit(frame(1, first));
         expect(backend.waitForPresentCount(1), "first contract frame must present");
@@ -450,11 +531,11 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     SDL_setenv("MOONLIGHT_VRR_TRACE", tracePathBytes.constData(), 1);
     SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "1", 1);
     FakeVrrFramePresenter backend;
-    VIDEO_STATS stats {};
+    PacerTelemetry telemetry;
     TrackedFrameLifetime first;
 
     {
-        VrrPacingWorker worker(&backend, enabledConfig(), &stats);
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
         expect(worker.start(), "worker must start for deep diagnostics testing");
         worker.submit(frame(1, first));
         expect(backend.waitForPresentCount(1),
@@ -507,6 +588,7 @@ int main()
     testCapabilityRejection();
     testQueueCapacityAndDrops();
     testLatePreparedFramePresentsImmediately();
+    testTelemetrySnapshotsRemainCumulative();
     testSuspendDiscardAndFreshFrame();
     testDeferredSurfaceLifetime();
     testCancelledPresentationCountsAsDroppedOutput();
