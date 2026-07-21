@@ -33,7 +33,12 @@ constexpr uint64_t kMaximumBaseGuardUs = 250ULL;
 constexpr uint64_t kMaximumAdaptiveGuardUs = 1000ULL;
 constexpr uint64_t kGuardStepUs = 50ULL;
 constexpr unsigned int kGuardDecayFrames = 120;
-constexpr size_t kLearningSampleCount = 32;
+// Wake-up jitter changes much faster than decode readiness or GPU preparation.
+// With nearest-rank p95, 19 is the longest short history that still retains
+// every recent late wake; at 20 samples the single worst wake is discarded.
+constexpr size_t kSchedulerLearningSampleCount = 19;
+constexpr size_t kReadinessLearningSampleCount = 32;
+constexpr size_t kPreparationLearningSampleCount = 32;
 constexpr size_t kMinimumReadinessSamples = 16;
 constexpr size_t kMinimumCadenceSamples = 6;
 // A tight cadence window spans one source second. The supported stream range
@@ -644,10 +649,10 @@ void VrrTimingController::noteSchedulerDelays(uint64_t renderDelayUs,
                                               bool targetDelayValid)
 {
     appendBounded(m_RenderSchedulerDelays, renderDelayUs,
-                  kLearningSampleCount);
+                  kSchedulerLearningSampleCount);
     if (targetDelayValid) {
         appendBounded(m_TargetSchedulerDelays, targetDelayUs,
-                      kLearningSampleCount);
+                      kSchedulerLearningSampleCount);
     }
     updateLearnedBudgets();
 }
@@ -686,12 +691,12 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         if (!cancelled) {
             if (m_Pending.cadenceEligible) {
                 appendBounded(m_ReadyOffsets, m_Pending.readyOffsetUs,
-                              kLearningSampleCount);
+                              kReadinessLearningSampleCount);
             }
             if (m_Pending.hasPreparationDuration) {
                 appendBounded(m_PreparationDurations,
                               m_Pending.preparationDurationUs,
-                              kLearningSampleCount);
+                              kPreparationLearningSampleCount);
             }
             updateReadinessModel();
             updateLearnedBudgets();
@@ -730,11 +735,14 @@ void VrrTimingController::updateReadinessModel()
     }
 
     // Learn exogenous decode-arrival variation, not absolute source phase or
-    // queue age created by this controller. This is the compact equivalent of
-    // VRR8's raw arrival-phase model: p10 is the local phase baseline and the
-    // robust p10-p90 spread is the reserve demand.
+    // queue age created by this controller. P10 is the local phase baseline.
+    // Near the display ceiling, preserve the p90 arrival tail because there is
+    // too little cadence slack to absorb a late frame. Slower sources can use
+    // p80 and avoid making the slowest fifth standing latency for every frame.
     const int64_t lowUs = percentile(m_ReadyOffsets, 10);
-    const int64_t highUs = percentile(m_ReadyOffsets, 90);
+    const unsigned int highPercentile = headroomUs() > m_DisplayPeriodUs ?
+        80U : 90U;
+    const int64_t highUs = percentile(m_ReadyOffsets, highPercentile);
     const uint64_t spreadUs = highUs > lowUs ?
         static_cast<uint64_t>(highUs - lowUs) : 0;
     const uint64_t candidateDemandUs = clampUnsigned(

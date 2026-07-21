@@ -45,6 +45,47 @@ bool waitFor(const std::function<bool()>& predicate,
     return true;
 }
 
+QByteArray readExpandedTrace(const QString& tracePath)
+{
+    QFile traceFile(tracePath);
+    if (!traceFile.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    const QByteArray encoded = traceFile.readAll();
+    constexpr int magicLength = 7;
+    if (!encoded.startsWith("MLVRR1\n")) {
+        return encoded;
+    }
+
+    QByteArray expanded;
+    int offset = magicLength;
+    while (offset < encoded.size()) {
+        if (encoded.size() - offset < 4) {
+            return {};
+        }
+        const unsigned char* length =
+            reinterpret_cast<const unsigned char*>(encoded.constData() + offset);
+        const uint32_t compressedBytes =
+            static_cast<uint32_t>(length[0]) |
+            (static_cast<uint32_t>(length[1]) << 8) |
+            (static_cast<uint32_t>(length[2]) << 16) |
+            (static_cast<uint32_t>(length[3]) << 24);
+        offset += 4;
+        if (compressedBytes > static_cast<uint32_t>(encoded.size() - offset)) {
+            return {};
+        }
+        const QByteArray chunk = qUncompress(
+            reinterpret_cast<const uchar*>(encoded.constData() + offset),
+            static_cast<int>(compressedBytes));
+        if (chunk.isEmpty()) {
+            return {};
+        }
+        expanded.append(chunk);
+        offset += static_cast<int>(compressedBytes);
+    }
+    return expanded;
+}
+
 VrrSessionConfig enabledConfig()
 {
     VrrSessionConfig config;
@@ -552,13 +593,108 @@ void testImmutablePresentationContract()
            "an immutable presenter must never receive a per-present latch request");
 }
 
+void testTraceCapturesEveryDeliveredFrame()
+{
+    resetFakeClock();
+    QTemporaryDir traceDirectory;
+    expect(traceDirectory.isValid(),
+           "replay trace test must create a temporary directory");
+    const QString tracePath = traceDirectory.filePath("vrr-replay.csv");
+    const QByteArray tracePathBytes = QFile::encodeName(tracePath);
+    SDL_setenv("MOONLIGHT_VRR_TRACE", tracePathBytes.constData(), 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
+
+    FakeVrrFramePresenter backend;
+    backend.blockPreparation();
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetimes[6];
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "worker must start for replay tracing");
+        worker.submit(frame(1, lifetimes[0]));
+        expect(backend.waitForPrepareCount(1),
+               "replay trace must hold one active frame");
+        for (int frameNumber = 2; frameNumber <= 5; ++frameNumber) {
+            worker.submit(frame(frameNumber, lifetimes[frameNumber - 1]));
+        }
+        backend.releasePreparation();
+        expect(backend.waitForPresentCount(4),
+               "replay trace test must drain retained frames");
+
+        WINDOW_STATE_CHANGE_INFO minimized {};
+        minimized.stateChangeFlags = WINDOW_STATE_CHANGE_MINIMIZED;
+        worker.notifyWindowChanged(&minimized);
+        worker.submit(frame(6, lifetimes[5]));
+    }
+
+    const QList<QByteArray> lines = readExpandedTrace(tracePath).split('\n');
+    const QList<QByteArray> columns = lines.value(0).split(',');
+    const int frameColumn = columns.indexOf("frame");
+    const int rtpColumn = columns.indexOf("rtp_timestamp");
+    const int arrivalColumn = columns.indexOf("pacer_arrival_us");
+    const int decisionValidColumn = columns.indexOf("decision_valid");
+    const int dispositionColumn = columns.indexOf("disposition");
+    expect(frameColumn >= 0 && rtpColumn >= 0 && arrivalColumn >= 0 &&
+               decisionValidColumn >= 0 && dispositionColumn >= 0,
+           "replay schema must expose raw arrivals and terminal disposition");
+
+    bool observedFrames[6] = {};
+    bool observedCapacityDrop = false;
+    bool observedRejectedArrival = false;
+    int rowCount = 0;
+    for (int i = 1; i < lines.size(); ++i) {
+        if (lines[i].isEmpty()) {
+            continue;
+        }
+        const QList<QByteArray> fields = lines[i].split(',');
+        expect(fields.size() == columns.size(),
+               "every replay row must match the declared schema");
+        if (fields.size() != columns.size()) {
+            continue;
+        }
+        ++rowCount;
+        const int frameNumber = fields[frameColumn].toInt();
+        if (frameNumber >= 1 && frameNumber <= 5) {
+            observedFrames[frameNumber] = true;
+        }
+        expect(fields[rtpColumn].toULongLong() ==
+                   static_cast<uint64_t>((frameNumber - 1) * 1500),
+               "replay trace must preserve each raw RTP timestamp");
+        expect(fields[arrivalColumn].toULongLong() != 0,
+               "replay trace must capture the pacer arrival instant");
+        if (frameNumber == 2 &&
+            fields[dispositionColumn] == "queue_capacity") {
+            observedCapacityDrop = true;
+            expect(fields[decisionValidColumn] == "0",
+                   "pre-schedule eviction must not invent a timing decision");
+        }
+        if (frameNumber == 6 &&
+            fields[dispositionColumn] == "arrival_rejected") {
+            observedRejectedArrival = true;
+            expect(fields[decisionValidColumn] == "0",
+                   "suspended arrival must not invent a timing decision");
+        }
+    }
+    expect(rowCount == 6,
+           "trace must contain exactly one terminal row per delivered frame");
+    expect(observedFrames[1] && observedFrames[2] && observedFrames[3] &&
+               observedFrames[4] && observedFrames[5],
+           "trace must not omit evicted or presented deliveries");
+    expect(observedCapacityDrop,
+           "trace must identify the frame evicted by queue capacity");
+    expect(observedRejectedArrival,
+           "trace must retain frames rejected before queue admission");
+
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+}
+
 void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
 {
     resetFakeClock();
     QTemporaryDir traceDirectory;
     expect(traceDirectory.isValid(),
            "deep diagnostics test must create a temporary directory");
-    const QString tracePath = traceDirectory.filePath("vrr-deep-trace.csv");
+    const QString tracePath = traceDirectory.filePath("vrr-deep-trace.vrrtrace");
     const QByteArray tracePathBytes = QFile::encodeName(tracePath);
     SDL_setenv("MOONLIGHT_VRR_TRACE", tracePathBytes.constData(), 1);
     SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "1", 1);
@@ -580,19 +716,32 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     expect(requests.size() == 1 && !requests[0].latchedPresentation,
            "deep trace must not change the controller presentation mode");
 
-    QFile traceFile(tracePath);
-    expect(traceFile.open(QIODevice::ReadOnly | QIODevice::Text),
-           "deep diagnostics must produce a readable trace");
-    const QByteArray header = traceFile.readLine();
-    const QByteArray row = traceFile.readLine();
+    const QByteArray expandedTrace = readExpandedTrace(tracePath);
+    const QList<QByteArray> lines = expandedTrace.split('\n');
+    const QByteArray header = lines.value(0);
+    const QByteArray row = lines.value(1);
     expect(header.contains("native_present_call_us") &&
-               header.contains("gpu_ready_wait_us"),
-           "deep trace must identify native and renderer-readiness timing");
+               header.contains("gpu_ready_wait_us") &&
+               header.contains("tear_classification") &&
+               header.contains("spacing_guard_feedback_us") &&
+               header.contains("latch_present_refresh_seq"),
+           "deep trace must identify native, tear, guard, and renderer-readiness timing");
+    expect(row.startsWith("4,"),
+           "new captures must use exact-replay trace schema 4");
     expect(!row.isEmpty() && header.count(',') == row.count(','),
            "deep trace rows must match the CSV schema");
+    QFile traceFile(tracePath);
+    expect(traceFile.size() > 7 && traceFile.size() < expandedTrace.size(),
+           "recommended traces must be chunk-compressed on disk");
     expect(traceFile.size() < 16384,
            "one deep trace row must remain compact");
-    traceFile.close();
+
+    const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_TRACE");
+    if (exportPath != nullptr && exportPath[0] != '\0') {
+        QFile::remove(QString::fromLocal8Bit(exportPath));
+        expect(QFile::copy(tracePath, QString::fromLocal8Bit(exportPath)),
+               "deep trace test must export its replay fixture when requested");
+    }
 
     SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
     SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
@@ -630,6 +779,7 @@ int main()
     testFailedPreparationCancellationHonorsDisplayFloor();
     testSuspendedPreparedCancellationHonorsDisplayFloor();
     testImmutablePresentationContract();
+    testTraceCapturesEveryDeliveredFrame();
     testDeepTraceRequestsNativeObservationsWithoutChangingMode();
 
     SDL_Quit();

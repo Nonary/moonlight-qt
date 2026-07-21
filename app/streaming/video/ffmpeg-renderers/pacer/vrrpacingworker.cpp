@@ -6,6 +6,8 @@
 #include <Limelight.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <limits>
 #include <thread>
 #include <utility>
@@ -20,9 +22,33 @@ constexpr size_t kMaximumQueuedFrames = 3;
 // ~64 seconds of rows at 120 FPS. When the writer thread cannot keep up the
 // pacing thread drops rows rather than ever waiting on diagnostics.
 constexpr size_t kMaximumTraceQueueRows = 8192;
-// A forgotten diagnostic session must not write indefinitely. This includes
-// the normal and deep-trace columns and is enforced only by the writer thread.
-constexpr uint64_t kMaximumTraceBytes = 128ULL * 1024ULL * 1024ULL;
+// Each compressed chunk covers only a few seconds, limiting crash loss while
+// still turning repeated timestamps and controller state into very small,
+// infrequent physical writes.
+constexpr int kTraceChunkBytes = 256 * 1024;
+// Always preserve at least an hour, including the maximum supported 480 FPS
+// stream cadence. The physical cap takes effect only after that duration, so
+// an unusually incompressible trace remains complete rather than silently
+// trading away replay fidelity. Chunk compression keeps normal captures far
+// below this limit.
+constexpr uint64_t kMinimumTraceDurationUs = 60ULL * 60ULL * 1000000ULL;
+constexpr uint64_t kMaximumTraceBytes = 512ULL * 1024ULL * 1024ULL;
+constexpr char kTraceMagic[] = "MLVRR1\n";
+constexpr char kTraceHeader[] =
+    "trace_schema,arrival_sequence,frame,rtp_timestamp,rtp_valid,decode_complete_us,pacer_arrival_us,"
+    "arrival_queue_depth_before,arrival_queue_depth_after,queue_accepted,dequeue_us,queue_discontinuity,decision_valid,decision_us,"
+    "display_refresh_hz,stream_rate_hz,display_period_us,can_latch_present,sender_interval_us,source_rate_hz,source_period_us,"
+    "source_time_us,ready_offset_us,readiness_budget_us,timing_budget_us,render_lead_us,"
+    "render_wake_lead_us,target_wake_lead_us,guard_us,headroom_us,render_start_us,render_wait_final_us,render_wait_overshoot_us,"
+    "render_scheduler_delay_us,render_scheduler_delay_valid,render_deadline_already_elapsed,"
+    "prepare_start_us,prepare_end_us,prepare_us,target_us,target_wait_final_us,target_wait_overshoot_us,target_scheduler_delay_us,target_scheduler_delay_valid,target_deadline_already_elapsed,"
+    "present_start_us,submission_boundary_us,presenter_submission_time_used,present_end_us,present_call_us,submit_error_us,submission_spacing_us,"
+    "spacing_margin_us,spacing_deficit_us,spacing_guard_feedback_us,spacing_corrected,had_prior_submission,tear_classification,tear_risk,completion_queue_depth,disposition,dropped,presented,cancelled,"
+    "submission_id_valid,submission_id,latch_valid,latch_submission_id,latch_time_us,latch_present_refresh_seq,latch_sync_refresh_seq,latched_present,"
+    "used_rtp_timestamp,cadence_eligible,source_rate_changed,phase_discontinuity,rebased,deep_trace,"
+    "native_present_timing_valid,native_present_start_us,native_present_end_us,native_present_call_us,"
+    "present_count_before_valid,present_count_before,frame_stats_before_valid,frame_stats_before_present_count,frame_stats_before_time_us,frame_stats_before_present_refresh_seq,frame_stats_before_sync_refresh_seq,"
+    "gpu_ready_timing_valid,gpu_ready_wait_start_us,gpu_ready_time_us,gpu_ready_wait_us\n";
 constexpr uint32_t kVrrWindowStateMask =
     WINDOW_STATE_CHANGE_MINIMIZED |
     WINDOW_STATE_CHANGE_RESTORED |
@@ -87,6 +113,27 @@ bool isUncPath(const char* path)
 }
 #endif
 
+bool pathEndsWithIgnoreCase(const char* path, const char* suffix)
+{
+    if (path == nullptr || suffix == nullptr) {
+        return false;
+    }
+    const size_t pathLength = std::strlen(path);
+    const size_t suffixLength = std::strlen(suffix);
+    if (suffixLength > pathLength) {
+        return false;
+    }
+    for (size_t i = 0; i < suffixLength; ++i) {
+        const unsigned char left = static_cast<unsigned char>(
+            path[pathLength - suffixLength + i]);
+        const unsigned char right = static_cast<unsigned char>(suffix[i]);
+        if (std::tolower(left) != std::tolower(right)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
@@ -94,8 +141,11 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
                                  PacerTelemetry* telemetry) :
     m_Presenter(presenter),
     m_Telemetry(telemetry),
+    m_Config(config),
+    m_CanLatchPresentation(presenter != nullptr &&
+                           presenter->canLatchAdaptivePresent()),
     m_TimingController(std::make_unique<VrrTimingController>(
-        config, presenter != nullptr && presenter->canLatchAdaptivePresent()))
+        config, m_CanLatchPresentation))
 {
     const char* deepTraceEnv = SDL_getenv("MOONLIGHT_VRR_DEEP_TRACE");
     m_DeepTraceEnabled = deepTraceEnv != nullptr && deepTraceEnv[0] == '1';
@@ -123,7 +173,7 @@ VrrPacingWorker::~VrrPacingWorker()
         m_WorkerThread = nullptr;
     }
 
-    discardQueuedFrames(false);
+    discardQueuedFrames(false, TraceDisposition::ShutdownDiscard);
     closeTrace();
 }
 
@@ -134,11 +184,16 @@ bool VrrPacingWorker::start()
         return false;
     }
 
+    // Enable capture before the producer can submit its first frame. Opening
+    // from run() left a small startup race that made session replay incomplete.
+    openTraceIfRequested();
+
     m_WorkerThread = SDL_CreateThread(VrrPacingWorker::threadProc,
                                       "PacerVRR", this);
     if (m_WorkerThread == nullptr) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "Failed to create VRR pacing worker: %s", SDL_GetError());
+        closeTrace();
         return false;
     }
 
@@ -155,34 +210,47 @@ void VrrPacingWorker::submit(PacedFrame&& frame)
         return;
     }
 
-    if (m_Stopping.load() || m_Suspended.load()) {
-        noteDrop();
-        return;
+    QueuedFrame incoming;
+    incoming.frame = std::move(frame);
+    incoming.trace.enabled = m_TraceAcceptingRows.load();
+    if (incoming.trace.enabled) {
+        incoming.trace.arrivalUs = LiGetMicroseconds();
+        incoming.trace.arrivalSequence =
+            m_TraceArrivalSequence.fetch_add(1) + 1;
     }
 
-    PacedFrame droppedFrame;
+    QueuedFrame droppedFrame;
+    TraceDisposition droppedDisposition = TraceDisposition::ArrivalRejected;
     bool queuedFrame = false;
     {
         QMutexLocker lock(&m_FrameQueueLock);
+        incoming.trace.queueDepthBefore = m_FrameQueue.size();
         // Close the race where suspension can begin after the optimistic
         // check above but before this producer acquires the queue lock.
         if (m_Stopping.load() || m_Suspended.load()) {
-            droppedFrame = std::move(frame);
+            incoming.trace.queueDepthAfter = m_FrameQueue.size();
+            droppedFrame = std::move(incoming);
         }
         else {
             if (m_FrameQueue.size() >= kMaximumQueuedFrames) {
                 droppedFrame = std::move(m_FrameQueue.front());
                 m_FrameQueue.pop_front();
+                droppedDisposition = TraceDisposition::QueueCapacity;
                 // Without a rebase, a multi-frame RTP jump to the freshest
                 // successor can be mistaken for time still left to wait.
                 m_QueueDiscontinuity.store(true);
             }
-            m_FrameQueue.emplace_back(std::move(frame));
+            incoming.trace.queueAccepted = true;
+            m_FrameQueue.emplace_back(std::move(incoming));
+            m_FrameQueue.back().trace.queueDepthAfter = m_FrameQueue.size();
             queuedFrame = true;
         }
     }
 
     if (droppedFrame) {
+        writeTrace(droppedFrame, VrrTimingDecision {},
+                   VrrPresentFeedback {}, FrameTelemetry {},
+                   queuedFrameCount(), droppedDisposition, false);
         noteDrop();
     }
     if (queuedFrame) {
@@ -203,7 +271,7 @@ void VrrPacingWorker::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
 
     if (flags & (WINDOW_STATE_CHANGE_MINIMIZED | WINDOW_STATE_CHANGE_SUSPENDED)) {
         m_Suspended.store(true);
-        discardQueuedFrames(true);
+        discardQueuedFrames(true, TraceDisposition::SuspensionDiscard);
     }
     if (flags & WINDOW_STATE_CHANGE_RESTORED) {
         m_Suspended.store(false);
@@ -230,26 +298,35 @@ int VrrPacingWorker::run()
                     SDL_GetError());
     }
 
-    openTraceIfRequested();
-
     while (!isStopping()) {
         consumeWindowStateNotifications();
 
-        PacedFrame frame;
+        QueuedFrame queuedFrame;
         bool queueDiscontinuity = false;
-        if (!dequeueFrame(frame, queueDiscontinuity)) {
+        if (!dequeueFrame(queuedFrame, queueDiscontinuity)) {
             break;
         }
+        queuedFrame.trace.dequeueUs = LiGetMicroseconds();
+        queuedFrame.trace.queueDiscontinuity = queueDiscontinuity;
+        PacedFrame& frame = queuedFrame.frame;
 
         consumeWindowStateNotifications();
         if (isStopping()) {
             if (frame) {
+                writeTrace(queuedFrame, VrrTimingDecision {},
+                           VrrPresentFeedback {}, FrameTelemetry {},
+                           queuedFrameCount(),
+                           TraceDisposition::ShutdownDiscard, false);
                 noteDrop();
             }
             continue;
         }
         if (presentationSuspended()) {
             if (frame) {
+                writeTrace(queuedFrame, VrrTimingDecision {},
+                           VrrPresentFeedback {}, FrameTelemetry {},
+                           queuedFrameCount(),
+                           TraceDisposition::SuspensionDiscard, false);
                 noteDrop();
             }
             // dequeueFrame() wakes without a frame so suspension can be
@@ -281,8 +358,14 @@ int VrrPacingWorker::run()
         VrrTimingDecision decision = m_TimingController->schedule(
             frame, decisionTimeUs);
         FrameTelemetry telemetry;
+        telemetry.decisionTimeUs = decisionTimeUs;
         const VrrTargetWaitResult renderWait =
             m_TargetWaiter->waitUntil(decision.renderStartUs);
+        telemetry.renderWaitFinalUs = renderWait.finalNowUs;
+        telemetry.renderSchedulerDelayUs = renderWait.schedulerDelayUs;
+        telemetry.renderSchedulerDelayValid = renderWait.schedulerDelayValid;
+        telemetry.renderDeadlineAlreadyElapsed =
+            renderWait.deadlineAlreadyElapsed;
         // A deadline that was already in the past is not an OS wake delay.
         // This matters when a decoded frame arrives after its projected render
         // start: readiness/render telemetry owns that lateness instead.
@@ -306,8 +389,8 @@ int VrrPacingWorker::run()
                                               feedback.cancelled,
                                               telemetry.presentEndUs);
             }
-            writeTrace(frame, decision, feedback, telemetry,
-                       queuedFrameCount(), true);
+            writeTrace(queuedFrame, decision, feedback, telemetry,
+                       queuedFrameCount(), TraceDisposition::Interrupted);
             noteDrop();
             continue;
         }
@@ -320,8 +403,8 @@ int VrrPacingWorker::run()
         if (staleHorizonAfterWaitUs != 0 &&
             nowUs > decision.targetUs + staleHorizonAfterWaitUs &&
             hasQueuedFrame()) {
-            writeTrace(frame, decision, VrrPresentFeedback {}, telemetry,
-                       queuedFrameCount(), true);
+            writeTrace(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
+                       queuedFrameCount(), TraceDisposition::Stale);
             noteDrop();
             m_TimingController->rebase();
             continue;
@@ -374,8 +457,10 @@ int VrrPacingWorker::run()
                                               feedback.cancelled,
                                               submissionOperationEndUs);
             }
-            writeTrace(frame, decision, feedback, telemetry,
-                       queuedFrameCount(), true);
+            writeTrace(queuedFrame, decision, feedback, telemetry,
+                       queuedFrameCount(),
+                       preparation.prepared ? TraceDisposition::Interrupted :
+                                              TraceDisposition::PreparationFailed);
             noteDrop();
             deferFrame(std::move(frame));
             continue;
@@ -384,12 +469,15 @@ int VrrPacingWorker::run()
         const VrrTargetWaitResult targetWait =
             m_TargetWaiter->waitUntil(decision.targetUs,
                                       decision.targetWakeLeadUs);
+        telemetry.targetWaitFinalUs = targetWait.finalNowUs;
         telemetry.targetWaitOvershootUs = targetWait.deadlineAlreadyElapsed ?
             0 : positiveDifference(targetWait.finalNowUs,
                                    decision.targetUs);
         telemetry.targetSchedulerDelayUs = targetWait.schedulerDelayUs;
         telemetry.targetSchedulerDelayValid =
             targetWait.schedulerDelayValid;
+        telemetry.targetDeadlineAlreadyElapsed =
+            targetWait.deadlineAlreadyElapsed;
         consumeWindowStateNotifications();
         if (presentationSuspended() || isStopping()) {
             if (preparation.cancellationMaySubmit) {
@@ -410,8 +498,8 @@ int VrrPacingWorker::run()
                                               feedback.cancelled,
                                               telemetry.presentEndUs);
             }
-            writeTrace(frame, decision, feedback, telemetry,
-                       queuedFrameCount(), true);
+            writeTrace(queuedFrame, decision, feedback, telemetry,
+                       queuedFrameCount(), TraceDisposition::Interrupted);
             noteDrop();
             deferFrame(std::move(frame));
             continue;
@@ -459,6 +547,7 @@ int VrrPacingWorker::run()
                     -(telemetry.spacingMarginUs + 1)) + 1;
                 telemetry.spacingDeficitUs = std::max(
                     telemetry.spacingDeficitUs, deficitUs);
+                telemetry.spacingGuardFeedbackUs = deficitUs;
                 telemetry.spacingCorrected = true;
                 m_TimingController->noteSpacingDeficit(deficitUs);
                 const uint64_t correctedFloorUs =
@@ -528,8 +617,10 @@ int VrrPacingWorker::run()
         if (outputDropped) {
             noteDrop();
         }
-        writeTrace(frame, decision, feedback, telemetry,
-                   queuedFrameCount(), outputDropped);
+        writeTrace(queuedFrame, decision, feedback, telemetry,
+                   queuedFrameCount(), outputDropped ?
+                       TraceDisposition::OutputDropped :
+                       TraceDisposition::Presented);
         deferFrame(std::move(frame));
     }
 
@@ -538,7 +629,7 @@ int VrrPacingWorker::run()
     return 0;
 }
 
-bool VrrPacingWorker::dequeueFrame(PacedFrame& frame,
+bool VrrPacingWorker::dequeueFrame(QueuedFrame& frame,
                                    bool& queueDiscontinuity)
 {
     QMutexLocker lock(&m_FrameQueueLock);
@@ -571,17 +662,20 @@ size_t VrrPacingWorker::queuedFrameCount()
     return m_FrameQueue.size();
 }
 
-void VrrPacingWorker::discardQueuedFrames(bool countDrops)
+void VrrPacingWorker::discardQueuedFrames(
+    bool countDrops, TraceDisposition disposition)
 {
-    std::deque<PacedFrame> discardedFrames;
+    std::deque<QueuedFrame> discardedFrames;
     {
         QMutexLocker lock(&m_FrameQueueLock);
         discardedFrames.swap(m_FrameQueue);
         m_QueueDiscontinuity.store(false);
     }
 
-    if (countDrops) {
-        for (size_t i = 0; i < discardedFrames.size(); ++i) {
+    for (const QueuedFrame& frame : discardedFrames) {
+        writeTrace(frame, VrrTimingDecision {}, VrrPresentFeedback {},
+                   FrameTelemetry {}, 0, disposition, false);
+        if (countDrops) {
             noteDrop();
         }
     }
@@ -652,6 +746,10 @@ void VrrPacingWorker::waitForSubmissionFloor(
 
     const VrrTargetWaitResult wait = m_TargetWaiter->waitUntil(
         submissionFloorUs, decision.targetWakeLeadUs);
+    telemetry.targetWaitFinalUs = std::max(telemetry.targetWaitFinalUs,
+                                            wait.finalNowUs);
+    telemetry.targetDeadlineAlreadyElapsed =
+        telemetry.targetDeadlineAlreadyElapsed || wait.deadlineAlreadyElapsed;
     if (wait.schedulerDelayValid) {
         telemetry.targetSchedulerDelayUs = std::max(
             telemetry.targetSchedulerDelayUs, wait.schedulerDelayUs);
@@ -688,13 +786,17 @@ void VrrPacingWorker::recordSubmission(
     telemetry.latchSampleValid = feedback.latchSampleValid;
     telemetry.latchSubmissionId = feedback.latchSubmissionId;
     telemetry.latchTimeUs = feedback.latchTimeUs;
+    telemetry.latchPresentRefreshSequence =
+        feedback.latchPresentRefreshSequence;
     telemetry.latchRefreshSequence = feedback.latchRefreshSequence;
+    telemetry.hadPriorSubmission =
+        m_TimingController->hasLastSubmission();
 
     if (feedback.presented) {
         telemetry.submitErrorUs = signedDifference(
             telemetry.submissionBoundaryUs, decision.targetUs);
 
-        if (m_TimingController->hasLastSubmission()) {
+        if (telemetry.hadPriorSubmission) {
             const uint64_t priorSubmissionUs =
                 m_TimingController->lastSubmissionUs();
             telemetry.presentSpacingUs =
@@ -727,25 +829,32 @@ void VrrPacingWorker::noteDrop()
     }
 }
 
-void VrrPacingWorker::writeTrace(const PacedFrame& frame,
+void VrrPacingWorker::writeTrace(const QueuedFrame& queuedFrame,
                                  const VrrTimingDecision& decision,
                                  const VrrPresentFeedback& feedback,
                                  const FrameTelemetry& telemetry,
                                  size_t queueDepth,
-                                 bool dropped)
+                                 TraceDisposition disposition,
+                                 bool decisionValid)
 {
-    if (!m_TraceAcceptingRows.load()) {
+    if (!queuedFrame.trace.enabled || !m_TraceAcceptingRows.load()) {
         return;
     }
 
+    const PacedFrame& frame = queuedFrame.frame;
     TraceRow row;
     row.frameNumber = frame.frameNumber();
+    row.rtpTimestamp = frame.rtpTimestamp();
+    row.timestampValid = frame.timestampValid();
     row.decodeCompleteUs = frame.decodeCompleteUs();
+    row.input = queuedFrame.trace;
     row.decision = decision;
     row.feedback = feedback;
     row.telemetry = telemetry;
-    row.queueDepth = queueDepth;
-    row.dropped = dropped;
+    row.completionQueueDepth = queueDepth;
+    row.disposition = disposition;
+    row.decisionValid = decisionValid;
+    row.dropped = disposition != TraceDisposition::Presented;
 
     {
         QMutexLocker lock(&m_TraceLock);
@@ -776,6 +885,9 @@ int VrrPacingWorker::traceRun()
         }
 
         if (batch.empty() && m_TraceStopping.load()) {
+            if (m_TraceFormat == TraceFormat::ChunkedCompressed) {
+                flushTraceChunk();
+            }
             return 0;
         }
         for (const TraceRow& row : batch) {
@@ -790,104 +902,254 @@ int VrrPacingWorker::traceRun()
 
 void VrrPacingWorker::writeTraceRow(const TraceRow& row)
 {
+    m_TraceLatestArrivalUs = std::max(m_TraceLatestArrivalUs,
+                                      row.input.arrivalUs);
     const VrrTimingDecision& decision = row.decision;
     const VrrPresentFeedback& feedback = row.feedback;
     const FrameTelemetry& telemetry = row.telemetry;
-    const size_t queueDepth = row.queueDepth;
-    const bool dropped = row.dropped;
-
-    const double sourceRateHz = decision.sourcePeriodUs == 0 ? 0.0 :
-        1000000.0 / static_cast<double>(decision.sourcePeriodUs);
-    const int baseBytes = std::fprintf(m_TraceFile,
-                 "%d,%llu,%llu,%.3f,%llu,%llu,%lld,%lld,%llu,%llu,%llu,"
-                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
-                 "%d,%llu,%llu,%d,%llu,%llu,%lld,%llu,%lld,%llu,%d,%zu,%d,%d,%d,"
-                 "%d,%llu,%d,%llu,%llu,%llu,%d,%d",
-                 row.frameNumber,
-                 static_cast<unsigned long long>(decision.sourceIntervalUs),
-                 static_cast<unsigned long long>(row.decodeCompleteUs),
-                 sourceRateHz,
-                 static_cast<unsigned long long>(decision.sourcePeriodUs),
-                 static_cast<unsigned long long>(decision.sourceTimeUs),
-                 static_cast<long long>(decision.readyOffsetUs),
-                 static_cast<long long>(decision.readinessBudgetUs),
-                 static_cast<unsigned long long>(decision.timingBudgetUs),
-                 static_cast<unsigned long long>(decision.renderLeadUs),
-                 static_cast<unsigned long long>(decision.renderWakeLeadUs),
-                 static_cast<unsigned long long>(decision.targetWakeLeadUs),
-                 static_cast<unsigned long long>(decision.guardUs),
-                 static_cast<unsigned long long>(decision.headroomUs),
-                 static_cast<unsigned long long>(decision.renderStartUs),
-                 static_cast<unsigned long long>(telemetry.renderWaitOvershootUs),
-                 static_cast<unsigned long long>(telemetry.preparationStartUs),
-                 static_cast<unsigned long long>(telemetry.preparationEndUs),
-                 static_cast<unsigned long long>(telemetry.preparationDurationUs),
-                 static_cast<unsigned long long>(decision.targetUs),
-                 static_cast<unsigned long long>(telemetry.targetWaitOvershootUs),
-                 static_cast<unsigned long long>(telemetry.targetSchedulerDelayUs),
-                 telemetry.targetSchedulerDelayValid ? 1 : 0,
-                 static_cast<unsigned long long>(telemetry.presentStartUs),
-                 static_cast<unsigned long long>(telemetry.submissionBoundaryUs),
-                 telemetry.usedPresenterSubmissionTime ? 1 : 0,
-                 static_cast<unsigned long long>(telemetry.presentEndUs),
-                 static_cast<unsigned long long>(telemetry.presentDurationUs),
-                 static_cast<long long>(telemetry.submitErrorUs),
-                 static_cast<unsigned long long>(telemetry.presentSpacingUs),
-                 static_cast<long long>(telemetry.spacingMarginUs),
-                 static_cast<unsigned long long>(telemetry.spacingDeficitUs),
-                 telemetry.spacingCorrected ? 1 : 0,
-                 queueDepth,
-                 dropped ? 1 : 0,
-                 feedback.presented ? 1 : 0,
-                 feedback.cancelled ? 1 : 0,
-                 telemetry.submissionIdValid ? 1 : 0,
-                 static_cast<unsigned long long>(telemetry.submissionId),
-                 telemetry.latchSampleValid ? 1 : 0,
-                 static_cast<unsigned long long>(telemetry.latchSubmissionId),
-                 static_cast<unsigned long long>(telemetry.latchTimeUs),
-                 static_cast<unsigned long long>(telemetry.latchRefreshSequence),
-                 decision.latchedPresentation ? 1 : 0,
-                 decision.phaseDiscontinuity ? 1 : 0);
-
     const uint64_t nativePresentDurationUs =
         feedback.nativePresentTimingValid &&
         feedback.nativePresentEndUs >= feedback.nativePresentStartUs ?
             feedback.nativePresentEndUs - feedback.nativePresentStartUs : 0;
-    const int diagnosticBytes = std::fprintf(
-        m_TraceFile,
-        ",%d,%d,%llu,%llu,%llu,%d,%llu,%d,%llu,%llu,%llu,"
-        "%d,%llu,%llu,%llu\n",
-        m_DeepTraceEnabled ? 1 : 0,
-        feedback.nativePresentTimingValid ? 1 : 0,
-        static_cast<unsigned long long>(feedback.nativePresentStartUs),
-        static_cast<unsigned long long>(feedback.nativePresentEndUs),
-        static_cast<unsigned long long>(nativePresentDurationUs),
-        feedback.presentCountBeforeValid ? 1 : 0,
-        static_cast<unsigned long long>(feedback.presentCountBefore),
-        feedback.frameStatsBeforeValid ? 1 : 0,
-        static_cast<unsigned long long>(feedback.frameStatsBeforePresentCount),
-        static_cast<unsigned long long>(feedback.frameStatsBeforeTimeUs),
-        static_cast<unsigned long long>(feedback.frameStatsBeforeRefreshSequence),
-        feedback.gpuReadyTimingValid ? 1 : 0,
-        static_cast<unsigned long long>(feedback.gpuReadyWaitStartUs),
-        static_cast<unsigned long long>(feedback.gpuReadyTimeUs),
-        static_cast<unsigned long long>(
-            feedback.gpuReadyTimingValid &&
-            feedback.gpuReadyTimeUs >= feedback.gpuReadyWaitStartUs ?
-                feedback.gpuReadyTimeUs - feedback.gpuReadyWaitStartUs : 0));
+    const uint64_t gpuReadyWaitUs = feedback.gpuReadyTimingValid &&
+        feedback.gpuReadyTimeUs >= feedback.gpuReadyWaitStartUs ?
+            feedback.gpuReadyTimeUs - feedback.gpuReadyWaitStartUs : 0;
+    const uint64_t displayPeriodUs = m_Config.displayRefreshHz > 0 ?
+        (1000000ULL + static_cast<uint64_t>(m_Config.displayRefreshHz) / 2) /
+            static_cast<uint64_t>(m_Config.displayRefreshHz) : 0;
 
-    if (baseBytes > 0) {
-        m_TraceBytesWritten += static_cast<uint64_t>(baseBytes);
+    QByteArray line;
+    line.reserve(2048);
+    auto separator = [&line]() {
+        if (!line.isEmpty()) {
+            line.append(',');
+        }
+    };
+    auto addUnsigned = [&line, &separator](uint64_t value) {
+        separator();
+        line.append(QByteArray::number(value));
+    };
+    auto addSigned = [&line, &separator](int64_t value) {
+        separator();
+        line.append(QByteArray::number(value));
+    };
+    auto addBool = [&addUnsigned](bool value) {
+        addUnsigned(value ? 1 : 0);
+    };
+    auto addText = [&line, &separator](const char* value) {
+        separator();
+        line.append(value);
+    };
+
+    addUnsigned(4);
+    addUnsigned(row.input.arrivalSequence);
+    addSigned(row.frameNumber);
+    addUnsigned(row.rtpTimestamp);
+    addBool(row.timestampValid);
+    addUnsigned(row.decodeCompleteUs);
+    addUnsigned(row.input.arrivalUs);
+    addUnsigned(row.input.queueDepthBefore);
+    addUnsigned(row.input.queueDepthAfter);
+    addBool(row.input.queueAccepted);
+    addUnsigned(row.input.dequeueUs);
+    addBool(row.input.queueDiscontinuity);
+    addBool(row.decisionValid);
+    addUnsigned(telemetry.decisionTimeUs);
+    addSigned(m_Config.displayRefreshHz);
+    addSigned(m_Config.streamRateHz);
+    addUnsigned(displayPeriodUs);
+    addBool(m_CanLatchPresentation);
+    addUnsigned(decision.sourceIntervalUs);
+    separator();
+    line.append(QByteArray::number(
+        decision.sourcePeriodUs == 0 ? 0.0 :
+            1000000.0 / static_cast<double>(decision.sourcePeriodUs), 'f', 3));
+    addUnsigned(decision.sourcePeriodUs);
+    addUnsigned(decision.sourceTimeUs);
+    addSigned(decision.readyOffsetUs);
+    addSigned(decision.readinessBudgetUs);
+    addUnsigned(decision.timingBudgetUs);
+    addUnsigned(decision.renderLeadUs);
+    addUnsigned(decision.renderWakeLeadUs);
+    addUnsigned(decision.targetWakeLeadUs);
+    addUnsigned(decision.guardUs);
+    addUnsigned(decision.headroomUs);
+    addUnsigned(decision.renderStartUs);
+    addUnsigned(telemetry.renderWaitFinalUs);
+    addUnsigned(telemetry.renderWaitOvershootUs);
+    addUnsigned(telemetry.renderSchedulerDelayUs);
+    addBool(telemetry.renderSchedulerDelayValid);
+    addBool(telemetry.renderDeadlineAlreadyElapsed);
+    addUnsigned(telemetry.preparationStartUs);
+    addUnsigned(telemetry.preparationEndUs);
+    addUnsigned(telemetry.preparationDurationUs);
+    addUnsigned(decision.targetUs);
+    addUnsigned(telemetry.targetWaitFinalUs);
+    addUnsigned(telemetry.targetWaitOvershootUs);
+    addUnsigned(telemetry.targetSchedulerDelayUs);
+    addBool(telemetry.targetSchedulerDelayValid);
+    addBool(telemetry.targetDeadlineAlreadyElapsed);
+    addUnsigned(telemetry.presentStartUs);
+    addUnsigned(telemetry.submissionBoundaryUs);
+    addBool(telemetry.usedPresenterSubmissionTime);
+    addUnsigned(telemetry.presentEndUs);
+    addUnsigned(telemetry.presentDurationUs);
+    addSigned(telemetry.submitErrorUs);
+    addUnsigned(telemetry.presentSpacingUs);
+    addSigned(telemetry.spacingMarginUs);
+    addUnsigned(telemetry.spacingDeficitUs);
+    addUnsigned(telemetry.spacingGuardFeedbackUs);
+    addBool(telemetry.spacingCorrected);
+    addBool(telemetry.hadPriorSubmission);
+    addText(tearClassification(row));
+    addBool(feedback.presented && !decision.latchedPresentation &&
+            telemetry.hadPriorSubmission && telemetry.spacingMarginUs < 0);
+    addUnsigned(row.completionQueueDepth);
+    addText(traceDispositionName(row.disposition));
+    addBool(row.dropped);
+    addBool(feedback.presented);
+    addBool(feedback.cancelled);
+    addBool(telemetry.submissionIdValid);
+    addUnsigned(telemetry.submissionId);
+    addBool(telemetry.latchSampleValid);
+    addUnsigned(telemetry.latchSubmissionId);
+    addUnsigned(telemetry.latchTimeUs);
+    addUnsigned(telemetry.latchPresentRefreshSequence);
+    addUnsigned(telemetry.latchRefreshSequence);
+    addBool(decision.latchedPresentation);
+    addBool(decision.usedRtpTimestamp);
+    addBool(decision.cadenceEligible);
+    addBool(decision.sourceRateChanged);
+    addBool(decision.phaseDiscontinuity);
+    addBool(decision.rebased);
+    addBool(m_DeepTraceEnabled);
+    addBool(feedback.nativePresentTimingValid);
+    addUnsigned(feedback.nativePresentStartUs);
+    addUnsigned(feedback.nativePresentEndUs);
+    addUnsigned(nativePresentDurationUs);
+    addBool(feedback.presentCountBeforeValid);
+    addUnsigned(feedback.presentCountBefore);
+    addBool(feedback.frameStatsBeforeValid);
+    addUnsigned(feedback.frameStatsBeforePresentCount);
+    addUnsigned(feedback.frameStatsBeforeTimeUs);
+    addUnsigned(feedback.frameStatsBeforePresentRefreshSequence);
+    addUnsigned(feedback.frameStatsBeforeRefreshSequence);
+    addBool(feedback.gpuReadyTimingValid);
+    addUnsigned(feedback.gpuReadyWaitStartUs);
+    addUnsigned(feedback.gpuReadyTimeUs);
+    addUnsigned(gpuReadyWaitUs);
+    line.append('\n');
+
+    if (m_TraceFormat == TraceFormat::ChunkedCompressed) {
+        m_TraceChunk.append(line);
+        if (m_TraceChunk.size() >= kTraceChunkBytes) {
+            flushTraceChunk();
+        }
+        return;
     }
-    if (diagnosticBytes > 0) {
-        m_TraceBytesWritten += static_cast<uint64_t>(diagnosticBytes);
+
+    const size_t bytesWritten = std::fwrite(
+        line.constData(), 1, static_cast<size_t>(line.size()), m_TraceFile);
+    m_TraceBytesWritten += bytesWritten;
+    if (bytesWritten != static_cast<size_t>(line.size())) {
+        m_TraceAcceptingRows.store(false);
     }
-    if (m_TraceBytesWritten >= kMaximumTraceBytes) {
+    else if (m_TraceBytesWritten >= kMaximumTraceBytes &&
+             minimumTraceDurationCaptured()) {
         m_TraceSizeCapped = true;
         m_TraceAcceptingRows.store(false);
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "VRR trace reached the 128 MiB safety cap; stopping diagnostics");
     }
+}
+
+void VrrPacingWorker::flushTraceChunk()
+{
+    if (m_TraceChunk.isEmpty() || m_TraceFile == nullptr) {
+        return;
+    }
+
+    const QByteArray compressed = qCompress(m_TraceChunk, 6);
+    const uint32_t compressedBytes = static_cast<uint32_t>(compressed.size());
+    const uint64_t recordBytes = sizeof(compressedBytes) + compressedBytes;
+
+    const unsigned char lengthBytes[4] = {
+        static_cast<unsigned char>(compressedBytes & 0xff),
+        static_cast<unsigned char>((compressedBytes >> 8) & 0xff),
+        static_cast<unsigned char>((compressedBytes >> 16) & 0xff),
+        static_cast<unsigned char>((compressedBytes >> 24) & 0xff),
+    };
+    const size_t lengthWritten = std::fwrite(
+        lengthBytes, 1, sizeof(lengthBytes), m_TraceFile);
+    const size_t payloadWritten = std::fwrite(
+        compressed.constData(), 1, static_cast<size_t>(compressed.size()),
+        m_TraceFile);
+    if (lengthWritten != sizeof(lengthBytes) ||
+        payloadWritten != static_cast<size_t>(compressed.size())) {
+        m_TraceAcceptingRows.store(false);
+    }
+    else {
+        m_TraceBytesWritten += recordBytes;
+        // A completed chunk is independently recoverable after a crash. This
+        // is a low-frequency write performed only by the background thread.
+        std::fflush(m_TraceFile);
+        if (m_TraceBytesWritten >= kMaximumTraceBytes &&
+            minimumTraceDurationCaptured()) {
+            m_TraceSizeCapped = true;
+            m_TraceAcceptingRows.store(false);
+        }
+    }
+    m_TraceChunk.clear();
+}
+
+bool VrrPacingWorker::minimumTraceDurationCaptured() const
+{
+    return m_TraceLatestArrivalUs >= m_TraceStartUs &&
+        m_TraceLatestArrivalUs - m_TraceStartUs >= kMinimumTraceDurationUs;
+}
+
+const char* VrrPacingWorker::traceDispositionName(
+    TraceDisposition disposition)
+{
+    switch (disposition) {
+    case TraceDisposition::Presented:
+        return "presented";
+    case TraceDisposition::OutputDropped:
+        return "output_dropped";
+    case TraceDisposition::QueueCapacity:
+        return "queue_capacity";
+    case TraceDisposition::ArrivalRejected:
+        return "arrival_rejected";
+    case TraceDisposition::SuspensionDiscard:
+        return "suspension_discard";
+    case TraceDisposition::ShutdownDiscard:
+        return "shutdown_discard";
+    case TraceDisposition::Interrupted:
+        return "interrupted";
+    case TraceDisposition::Stale:
+        return "stale";
+    case TraceDisposition::PreparationFailed:
+        return "preparation_failed";
+    }
+    return "unknown";
+}
+
+const char* VrrPacingWorker::tearClassification(const TraceRow& row) const
+{
+    if (!row.feedback.presented) {
+        return "not_presented";
+    }
+    if (row.decision.latchedPresentation && m_CanLatchPresentation) {
+        return "confirmed_safe_latched";
+    }
+    if (!row.telemetry.hadPriorSubmission) {
+        return "first_submission_unknown";
+    }
+    if (row.telemetry.spacingMarginUs < 0) {
+        return "adaptive_interval_violation";
+    }
+    // This proves that the client respected the panel-period floor. It is not
+    // a literal hardware tear observation: a nonfunctional VRR path or an
+    // unreported scanout transition can still require external validation.
+    return "adaptive_interval_safe";
 }
 
 void VrrPacingWorker::openTraceIfRequested()
@@ -909,11 +1171,11 @@ void VrrPacingWorker::openTraceIfRequested()
 
     // Use the checked CRT variant on Windows so enabling diagnostics does not
     // introduce a deprecation warning in the normal application build.
-    if (fopen_s(&m_TraceFile, tracePath, "w") != 0) {
+    if (fopen_s(&m_TraceFile, tracePath, "wb") != 0) {
         m_TraceFile = nullptr;
     }
 #else
-    m_TraceFile = std::fopen(tracePath, "w");
+    m_TraceFile = std::fopen(tracePath, "wb");
 #endif
     if (m_TraceFile == nullptr) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -921,16 +1183,48 @@ void VrrPacingWorker::openTraceIfRequested()
         return;
     }
 
+    // A .csv suffix explicitly requests the directly readable compatibility
+    // format. The recommended .vrrtrace format compresses independent chunks
+    // and typically reduces a full session by an order of magnitude.
+    m_TraceFormat = pathEndsWithIgnoreCase(tracePath, ".csv") ?
+        TraceFormat::Csv : TraceFormat::ChunkedCompressed;
+
     // Amortize local diagnostic writes instead of flushing on every frame.
-    // fclose() commits the buffered tail.
+    // fclose() commits the CSV tail; compressed chunks flush independently.
     std::setvbuf(m_TraceFile, nullptr, _IOFBF, 1024 * 1024);
+
+    m_TraceBytesWritten = 0;
+    m_TraceChunk.clear();
+    if (m_TraceFormat == TraceFormat::ChunkedCompressed) {
+        const size_t magicBytes = sizeof(kTraceMagic) - 1;
+        if (std::fwrite(kTraceMagic, 1, magicBytes, m_TraceFile) != magicBytes) {
+            std::fclose(m_TraceFile);
+            m_TraceFile = nullptr;
+            return;
+        }
+        m_TraceBytesWritten = magicBytes;
+        m_TraceChunk.append(kTraceHeader);
+    }
+    else {
+        const size_t headerBytes = sizeof(kTraceHeader) - 1;
+        if (std::fwrite(kTraceHeader, 1, headerBytes, m_TraceFile) !=
+                headerBytes) {
+            std::fclose(m_TraceFile);
+            m_TraceFile = nullptr;
+            return;
+        }
+        m_TraceBytesWritten = headerBytes;
+    }
 
     // All formatting and I/O happen on this thread; the pacing worker only
     // enqueues row copies. Without it, a buffered flush would periodically
     // stall the TIME_CRITICAL thread and perturb the timing being measured.
     m_TraceStopping.store(false);
-    m_TraceBytesWritten = 0;
     m_TraceSizeCapped = false;
+    m_TraceDroppedRows = 0;
+    m_TraceArrivalSequence.store(0);
+    m_TraceStartUs = LiGetMicroseconds();
+    m_TraceLatestArrivalUs = m_TraceStartUs;
     m_TraceThread = SDL_CreateThread(VrrPacingWorker::traceThreadProc,
                                      "VrrTrace", this);
     if (m_TraceThread == nullptr) {
@@ -939,23 +1233,8 @@ void VrrPacingWorker::openTraceIfRequested()
                     SDL_GetError());
         std::fclose(m_TraceFile);
         m_TraceFile = nullptr;
+        m_TraceChunk.clear();
         return;
-    }
-
-    const int headerBytes = std::fprintf(m_TraceFile,
-                  "frame,sender_interval_us,decode_complete_us,source_rate_hz,source_period_us,"
-                  "source_time_us,ready_offset_us,readiness_budget_us,timing_budget_us,render_lead_us,"
-                  "render_wake_lead_us,target_wake_lead_us,guard_us,headroom_us,render_start_us,render_wait_overshoot_us,"
-                  "prepare_start_us,prepare_end_us,prepare_us,target_us,target_wait_overshoot_us,target_scheduler_delay_us,target_scheduler_delay_valid,"
-                  "present_start_us,submission_boundary_us,presenter_submission_time_used,present_end_us,present_call_us,submit_error_us,submission_spacing_us,"
-                  "spacing_margin_us,spacing_deficit_us,spacing_corrected,queue_depth,dropped,presented,cancelled,"
-                  "submission_id_valid,submission_id,latch_valid,latch_submission_id,latch_time_us,latch_refresh_seq,latched_present,phase_discontinuity,"
-                  "deep_trace,"
-                  "native_present_timing_valid,native_present_start_us,native_present_end_us,native_present_call_us,"
-                  "present_count_before_valid,present_count_before,frame_stats_before_valid,frame_stats_before_present_count,frame_stats_before_time_us,frame_stats_before_refresh_seq,"
-                  "gpu_ready_timing_valid,gpu_ready_wait_start_us,gpu_ready_time_us,gpu_ready_wait_us\n");
-    if (headerBytes > 0) {
-        m_TraceBytesWritten = static_cast<uint64_t>(headerBytes);
     }
     m_TraceAcceptingRows.store(true);
 }
@@ -982,7 +1261,7 @@ void VrrPacingWorker::closeTrace()
 
     if (m_TraceSizeCapped) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "VRR trace was capped at 128 MiB to limit diagnostic disk writes");
+                    "VRR trace was capped at 512 MiB after preserving at least one hour");
         m_TraceSizeCapped = false;
     }
 
@@ -990,4 +1269,5 @@ void VrrPacingWorker::closeTrace()
         std::fclose(m_TraceFile);
         m_TraceFile = nullptr;
     }
+    m_TraceChunk.clear();
 }

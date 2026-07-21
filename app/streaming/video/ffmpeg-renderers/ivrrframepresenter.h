@@ -66,6 +66,10 @@ struct VrrPresentFeedback {
     bool latchSampleValid = false;
     uint64_t latchSubmissionId = 0;
     uint64_t latchTimeUs = 0;
+    // DXGI PresentRefreshCount (when available) identifies the v-blank at
+    // which this image reached the monitor. It is distinct from the periodic
+    // SyncRefreshCount/QPC clock sample below.
+    uint64_t latchPresentRefreshSequence = 0;
     uint64_t latchRefreshSequence = 0;
 
     // Opt-in, observation-only diagnostics captured immediately around the
@@ -78,6 +82,7 @@ struct VrrPresentFeedback {
     bool frameStatsBeforeValid = false;
     uint64_t frameStatsBeforePresentCount = 0;
     uint64_t frameStatsBeforeTimeUs = 0;
+    uint64_t frameStatsBeforePresentRefreshSequence = 0;
     uint64_t frameStatsBeforeRefreshSequence = 0;
     // Optional renderer-readiness timing. A backend that queues GPU work in
     // prepareFrame() reports when that work became complete, proving the

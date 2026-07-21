@@ -2033,6 +2033,8 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
             feedback.frameStatsBeforePresentCount =
                 frameStatsBefore.PresentCount;
             feedback.frameStatsBeforeTimeUs = frameStatsBeforeTimeUs;
+            feedback.frameStatsBeforePresentRefreshSequence =
+                frameStatsBefore.PresentRefreshCount;
             feedback.frameStatsBeforeRefreshSequence =
                 frameStatsBefore.SyncRefreshCount;
         }
@@ -2088,6 +2090,8 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         feedback.latchSampleValid = true;
         feedback.latchTimeUs = latchTimeUs;
         feedback.latchSubmissionId = frameStats.PresentCount;
+        feedback.latchPresentRefreshSequence =
+            frameStats.PresentRefreshCount;
         feedback.latchRefreshSequence = frameStats.SyncRefreshCount;
     }
 
