@@ -324,6 +324,31 @@ void testNearRefreshRequestsLatchedPresentation()
            "an immutable cadence-following backend must not be classified as fixed-vsync latched");
 }
 
+void testLatchedPresentationRecoversAfterGuardDecay()
+{
+    // At 100 FPS on a 120 Hz panel, the base guard leaves just over the
+    // immediate-presentation threshold. A single spacing correction should
+    // select latching while it is needed, but must not make that cadence stay
+    // latched after the guard has returned to its normal value.
+    VrrTimingController controller(config(100, 120));
+    VrrTimingDecision decision = controller.schedule(
+        frame(1, 0, true, 100000), 100000);
+    expect(!decision.latchedPresentation,
+           "100 FPS must begin in immediate mode with its base guard");
+
+    controller.noteSpacingDeficit(50);
+    decision = controller.schedule(frame(2, 900, true, 110000), 110000);
+    expect(decision.latchedPresentation,
+           "a transient guard increase must select the safe latched path");
+
+    for (int i = 0; i < 120; ++i) {
+        controller.noteSpacingDeficit(0);
+    }
+    decision = controller.schedule(frame(3, 1800, true, 120000), 120000);
+    expect(!decision.latchedPresentation,
+           "a fully recovered guard must restore immediate 100 FPS pacing");
+}
+
 void testHeadroomAwareReadinessReserve()
 {
     constexpr uint64_t epochUs = 1000000;
@@ -821,6 +846,7 @@ int main()
     testNegotiatedRateCeiling();
     testSpacingGuardFeedback();
     testNearRefreshRequestsLatchedPresentation();
+    testLatchedPresentationRecoversAfterGuardDecay();
     testHeadroomAwareReadinessReserve();
     testCadenceGapAndRateChange();
     testFutureSourceProjectionReseedsPhase();

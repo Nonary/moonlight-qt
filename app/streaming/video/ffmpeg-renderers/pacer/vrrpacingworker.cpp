@@ -359,6 +359,27 @@ int VrrPacingWorker::run()
             frame, decisionTimeUs);
         FrameTelemetry telemetry;
         telemetry.decisionTimeUs = decisionTimeUs;
+
+        // schedule() deliberately clamps an overdue target to the current
+        // one-slot deadline. That is right for the newest frame, but it makes
+        // the later target-relative stale check unable to see time already
+        // spent waiting in this worker's queue. If a fresher successor exists,
+        // skip a frame that is already more than one source interval old before
+        // rendering it; its RTP/frame delta remains in the controller, so the
+        // successor preserves cadence without re-anchoring the whole model.
+        const uint64_t scheduleNowUs = LiGetMicroseconds();
+        const uint64_t scheduleAgeUs = scheduleNowUs >=
+                frame.decodeCompleteUs() ?
+            scheduleNowUs - frame.decodeCompleteUs() : 0;
+        if (decision.sourcePeriodUs != 0 &&
+            scheduleAgeUs > decision.sourcePeriodUs && hasQueuedFrame()) {
+            writeTrace(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
+                       queuedFrameCount(), TraceDisposition::Stale);
+            noteDrop();
+            m_TimingController->noteSubmission(false, false, 0);
+            continue;
+        }
+
         const VrrTargetWaitResult renderWait =
             m_TargetWaiter->waitUntil(decision.renderStartUs);
         telemetry.renderWaitFinalUs = renderWait.finalNowUs;
