@@ -1,17 +1,23 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
+#include "vrrreplayconfig.h"
 
 #include <QCommandLineParser>
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QMap>
+#include <QProcess>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -153,6 +159,15 @@ struct Columns {
     int latchPresentRefreshSequence = -1;
     int nativePresentCallUs = -1;
     int gpuReadyWaitUs = -1;
+    int controllerCallUs = -1;
+    int staleAgeUs = -1;
+    int renderWaitEntryUs = -1;
+    int renderWaitFinalUs = -1;
+    int targetWaitEntryUs = -1;
+    int targetWaitFinalUs = -1;
+    int correctionWaitStartUs = -1;
+    int correctionWaitEndUs = -1;
+    QMap<QString, int> capturedParameterColumns;
 
     bool resolve(const QList<QByteArray>& header, QString& error)
     {
@@ -216,6 +231,21 @@ struct Columns {
         latchPresentRefreshSequence = find("latch_present_refresh_seq");
         nativePresentCallUs = find("native_present_call_us");
         gpuReadyWaitUs = find("gpu_ready_wait_us");
+        controllerCallUs = find("controller_call_us");
+        staleAgeUs = find("stale_age_us");
+        renderWaitEntryUs = find("render_wait_entry_us");
+        renderWaitFinalUs = find("render_wait_final_us");
+        targetWaitEntryUs = find("target_wait_entry_us");
+        targetWaitFinalUs = find("target_wait_final_us");
+        correctionWaitStartUs = find("correction_wait_start_us");
+        correctionWaitEndUs = find("correction_wait_end_us");
+        for (const QString& path : vrrReplayParameterNames()) {
+            if (!path.startsWith("controller.")) continue;
+            const QString key = path.mid(QString("controller.").size());
+            const int column = header.indexOf(
+                ("param_" + key).toLatin1());
+            if (column >= 0) capturedParameterColumns.insert(path, column);
+        }
 
         const int required[] = {
             traceSchema, arrivalSequence, frame, rtpTimestamp, rtpValid,
@@ -282,6 +312,12 @@ struct Metrics {
     uint64_t exactSimulatedSubmissions = 0;
     uint64_t exactTearClassifications = 0;
     uint64_t invalidExecutionResiduals = 0;
+    uint64_t workerArrivals = 0;
+    uint64_t workerAccepted = 0;
+    uint64_t workerCapacityEvictions = 0;
+    uint64_t workerNewlyAdmittedWithoutCost = 0;
+    uint64_t workerMeasuredCostFrames = 0;
+    uint64_t workerEstimatorFallbacks = 0;
     QMap<QByteArray, uint64_t> dispositions;
     QMap<QByteArray, uint64_t> tearClassifications;
     QMap<QByteArray, uint64_t> simulatedTearClassifications;
@@ -298,6 +334,13 @@ struct Metrics {
     Distribution observedPresentCall;
     Distribution observedNativePresentCall;
     Distribution observedGpuReadyWait;
+    Distribution observedControllerCall;
+    Distribution observedStaleAge;
+    Distribution observedRenderWait;
+    Distribution observedTargetWait;
+    Distribution observedCorrectionWait;
+    Distribution workerEstimatedPreparation;
+    Distribution workerEstimatedPresentCall;
     Distribution simulatedDecodeToSubmission;
     Distribution simulatedArrivalToSubmission;
     Distribution simulatedDecisionToSubmission;
@@ -451,7 +494,8 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
                           const QString& tracePath, qint64 traceBytes,
                           int capturedDisplayHz, int capturedStreamFps,
                           int simulatedDisplayHz, int simulatedStreamFps,
-                          bool simulatedCanLatch)
+                          bool simulatedCanLatch,
+                          const VrrReplayScenario& scenario)
 {
     const uint64_t captureDurationUs =
         metrics.lastArrivalUs >= metrics.firstArrivalUs ?
@@ -504,6 +548,16 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.observedNativePresentCall);
     observedCosts["gpu_ready_wait"] = distributionObject(
         metrics.observedGpuReadyWait);
+    observedCosts["controller_call"] = distributionObject(
+        metrics.observedControllerCall);
+    observedCosts["stale_age_at_check"] = distributionObject(
+        metrics.observedStaleAge);
+    observedCosts["render_wait"] = distributionObject(
+        metrics.observedRenderWait);
+    observedCosts["target_wait"] = distributionObject(
+        metrics.observedTargetWait);
+    observedCosts["spacing_correction_wait"] = distributionObject(
+        metrics.observedCorrectionWait);
 
     QJsonObject observedTears;
     observedTears["classifications"] = countObject(
@@ -550,8 +604,46 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     simulation["display_hz"] = simulatedDisplayHz;
     simulation["stream_fps"] = simulatedStreamFps;
     simulation["can_latch_present"] = simulatedCanLatch;
-    simulation["fixed_recorded_admission_and_lifecycle"] = true;
-    simulation["drops"] = static_cast<qint64>(metrics.originalDrops);
+    simulation["scenario"] = scenario.name;
+    simulation["mode"] = scenario.mode;
+    QJsonObject resolvedParameters;
+    resolvedParameters["controller"] = vrrTimingParametersToJson(
+        scenario.controller);
+    resolvedParameters["worker"] = vrrWorkerParametersToJson(scenario.worker);
+    simulation["resolved_parameters"] = resolvedParameters;
+    simulation["parameter_fingerprint"] = QString::fromLatin1(
+        QCryptographicHash::hash(
+            QJsonDocument(resolvedParameters).toJson(QJsonDocument::Compact),
+            QCryptographicHash::Sha256).toHex());
+    simulation["fixed_recorded_admission_and_lifecycle"] =
+        scenario.mode == "fixed";
+    if (scenario.mode == "worker") {
+        QJsonObject worker;
+        worker["model"] = "experimental-recorded-arrival-admission-v1";
+        worker["arrivals"] = static_cast<qint64>(metrics.workerArrivals);
+        worker["accepted"] = static_cast<qint64>(metrics.workerAccepted);
+        worker["capacity_evictions"] = static_cast<qint64>(
+            metrics.workerCapacityEvictions);
+        worker["newly_admitted_frames_requiring_estimated_cost"] =
+            static_cast<qint64>(metrics.workerNewlyAdmittedWithoutCost);
+        worker["measured_cost_frames"] = static_cast<qint64>(
+            metrics.workerMeasuredCostFrames);
+        worker["estimator_fallbacks"] = static_cast<qint64>(
+            metrics.workerEstimatorFallbacks);
+        worker["cost_estimator"] = "rolling-median-previous-executed-frames";
+        worker["rolling_cost_window"] = static_cast<qint64>(
+            scenario.worker.rollingCostWindow);
+        QJsonObject estimatedCosts;
+        estimatedCosts["preparation"] = distributionObject(
+            metrics.workerEstimatedPreparation);
+        estimatedCosts["present_call"] = distributionObject(
+            metrics.workerEstimatedPresentCall);
+        worker["estimated_execution_cost_us"] = estimatedCosts;
+        worker["scanout_prediction"] = false;
+        simulation["worker"] = worker;
+    }
+    simulation["drops"] = static_cast<qint64>(scenario.mode == "worker" ?
+        metrics.workerCapacityEvictions : metrics.originalDrops);
     simulation["latency_us"] = simulatedLatency;
     simulation["absolute_submit_error_us"] = distributionObject(
         metrics.simulatedAbsoluteSubmitError);
@@ -700,6 +792,47 @@ bool writeTimelineRow(QFile& file, uint64_t arrivalSequence, int frame,
     return file.write(line) == line.size();
 }
 
+QJsonValue jsonPathValue(const QJsonObject& root, const QString& path)
+{
+    QJsonValue value(root);
+    for (const QString& component : path.split('.', Qt::SkipEmptyParts)) {
+        if (!value.isObject()) return {};
+        value = value.toObject().value(component);
+    }
+    return value;
+}
+
+bool evaluateAssertions(const VrrReplayScenario& scenario,
+                        QJsonObject& summary)
+{
+    QJsonArray results;
+    bool passed = true;
+    for (const VrrReplayAssertion& assertion : scenario.assertions) {
+        const QJsonValue metricValue = jsonPathValue(summary, assertion.metric);
+        const double actual = metricValue.toDouble(
+            std::numeric_limits<double>::quiet_NaN());
+        bool result = std::isfinite(actual);
+        if (result && assertion.operation == "<") result = actual < assertion.value;
+        else if (result && assertion.operation == "<=") result = actual <= assertion.value;
+        else if (result && assertion.operation == "==") result = actual == assertion.value;
+        else if (result && assertion.operation == ">=") result = actual >= assertion.value;
+        else if (result && assertion.operation == ">") result = actual > assertion.value;
+        QJsonObject item;
+        item["metric"] = assertion.metric;
+        item["operator"] = assertion.operation;
+        item["expected"] = assertion.value;
+        item["actual"] = std::isfinite(actual) ? QJsonValue(actual) : QJsonValue();
+        item["passed"] = result;
+        results.append(item);
+        passed = passed && result;
+    }
+    QJsonObject assertionSummary;
+    assertionSummary["passed"] = passed;
+    assertionSummary["results"] = results;
+    summary["assertions"] = assertionSummary;
+    return passed;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -727,6 +860,18 @@ int main(int argc, char* argv[])
     QCommandLineOption exactOption(
         "require-exact-baseline",
         "Fail unless an unmodified configuration exactly reproduces targets, submissions, and tear classes");
+    QCommandLineOption configOption(
+        "config", "Load versioned replay scenarios and parameters", "json");
+    QCommandLineOption scenarioOption(
+        "scenario", "Run only the named scenario (repeatable)", "name");
+    QCommandLineOption setOption(
+        "set", "Override a resolved parameter as section.name=value", "override");
+    QCommandLineOption modeOption(
+        "mode", "Override scenario mode: fixed or worker", "mode");
+    QCommandLineOption listParametersOption(
+        "list-parameters", "List every replay parameter and exit");
+    QCommandLineOption dumpDefaultsOption(
+        "dump-default-config", "Print a complete default JSON configuration and exit");
     parser.addOption(displayOption);
     parser.addOption(streamOption);
     parser.addOption(latchOption);
@@ -734,14 +879,35 @@ int main(int argc, char* argv[])
     parser.addOption(outputOption);
     parser.addOption(timelineOption);
     parser.addOption(exactOption);
+    parser.addOption(configOption);
+    parser.addOption(scenarioOption);
+    parser.addOption(setOption);
+    parser.addOption(modeOption);
+    parser.addOption(listParametersOption);
+    parser.addOption(dumpDefaultsOption);
     parser.process(application);
+
+    if (parser.isSet(listParametersOption)) {
+        for (const QString& name : vrrReplayParameterNames()) {
+            std::printf("%s\n", qPrintable(name));
+        }
+        return 0;
+    }
+    if (parser.isSet(dumpDefaultsOption)) {
+        const QByteArray defaults = QJsonDocument(
+            vrrDefaultReplayConfigurationJson()).toJson(QJsonDocument::Indented);
+        std::fwrite(defaults.constData(), 1,
+                    static_cast<size_t>(defaults.size()), stdout);
+        return 0;
+    }
 
     if (parser.positionalArguments().size() != 1) {
         parser.showHelp(2);
     }
     if (parser.isSet(exactOption) &&
             (parser.isSet(displayOption) || parser.isSet(streamOption) ||
-             parser.isSet(latchOption))) {
+             parser.isSet(latchOption) || parser.isSet(setOption) ||
+             parser.isSet(modeOption) || parser.isSet(configOption))) {
         std::fprintf(stderr,
                      "--require-exact-baseline cannot be used with candidate overrides\n");
         return 2;
@@ -749,6 +915,116 @@ int main(int argc, char* argv[])
 
     const QString tracePath = parser.positionalArguments().front();
     QString error;
+
+    VrrReplayConfiguration replayConfiguration;
+    if (parser.isSet(configOption)) {
+        QFile configFile(parser.value(configOption));
+        if (!configFile.open(QIODevice::ReadOnly) ||
+                !loadVrrReplayConfiguration(configFile.readAll(),
+                                            replayConfiguration, error)) {
+            std::fprintf(stderr, "Unable to load replay config: %s\n",
+                         qPrintable(error.isEmpty() ?
+                             configFile.errorString() : error));
+            return 2;
+        }
+    }
+    else {
+        if (!loadVrrReplayConfiguration(
+                QJsonDocument(vrrDefaultReplayConfigurationJson()).toJson(),
+                replayConfiguration, error)) {
+            std::fprintf(stderr, "Invalid built-in replay defaults: %s\n",
+                         qPrintable(error));
+            return 2;
+        }
+    }
+
+    const QStringList requestedScenarios = parser.values(scenarioOption);
+    if (!requestedScenarios.isEmpty()) {
+        QList<VrrReplayScenario> filtered;
+        for (const QString& requested : requestedScenarios) {
+            const auto found = std::find_if(
+                replayConfiguration.scenarios.cbegin(),
+                replayConfiguration.scenarios.cend(),
+                [&requested](const VrrReplayScenario& item) {
+                    return item.name == requested;
+                });
+            if (found == replayConfiguration.scenarios.cend()) {
+                std::fprintf(stderr, "Unknown replay scenario: %s\n",
+                             qPrintable(requested));
+                return 2;
+            }
+            filtered.append(*found);
+        }
+        replayConfiguration.scenarios = filtered;
+    }
+
+    if (replayConfiguration.scenarios.size() > 1) {
+        if (parser.isSet(timelineOption)) {
+            std::fprintf(stderr,
+                         "--timeline requires selecting a single scenario\n");
+            return 2;
+        }
+        QJsonArray scenarioResults;
+        bool allPassed = true;
+        for (const VrrReplayScenario& scenario :
+             replayConfiguration.scenarios) {
+            QStringList arguments { tracePath, "--config",
+                                    parser.value(configOption), "--scenario",
+                                    scenario.name };
+            for (const QString& overrideValue : parser.values(setOption))
+                arguments << "--set" << overrideValue;
+            if (parser.isSet(modeOption)) arguments << "--mode" << parser.value(modeOption);
+            if (parser.isSet(displayOption)) arguments << "--display-hz" << parser.value(displayOption);
+            if (parser.isSet(streamOption)) arguments << "--stream-fps" << parser.value(streamOption);
+            if (parser.isSet(latchOption)) arguments << "--no-latch";
+            if (parser.isSet(compareOption)) arguments << "--compare" << parser.value(compareOption);
+            QProcess child;
+            child.start(QCoreApplication::applicationFilePath(), arguments);
+            child.waitForFinished(-1);
+            QJsonParseError childError;
+            const QJsonDocument childDocument = QJsonDocument::fromJson(
+                child.readAllStandardOutput(), &childError);
+            if (!childDocument.isObject()) {
+                std::fprintf(stderr, "Scenario %s failed: %s%s\n",
+                             qPrintable(scenario.name),
+                             qPrintable(childError.errorString()),
+                             child.readAllStandardError().constData());
+                return child.exitCode() == 0 ? 1 : child.exitCode();
+            }
+            QJsonObject result = childDocument.object();
+            result["scenario"] = scenario.name;
+            result["exit_code"] = child.exitCode();
+            allPassed = allPassed && child.exitCode() == 0;
+            scenarioResults.append(result);
+        }
+        QJsonObject batch;
+        batch["config_schema"] = 1;
+        batch["trace"] = QFileInfo(tracePath).fileName();
+        batch["scenarios"] = scenarioResults;
+        batch["passed"] = allPassed;
+        const QByteArray output = QJsonDocument(batch).toJson(
+            QJsonDocument::Indented);
+        if (parser.isSet(outputOption)) {
+            QFile outputFile(parser.value(outputOption));
+            if (!outputFile.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+                    outputFile.write(output) != output.size()) return 1;
+        }
+        else std::fwrite(output.constData(), 1,
+                         static_cast<size_t>(output.size()), stdout);
+        return allPassed ? 0 : 4;
+    }
+
+    VrrReplayScenario scenario = replayConfiguration.scenarios.front();
+    if (parser.isSet(modeOption)) scenario.mode = parser.value(modeOption);
+    if (scenario.mode != "fixed" && scenario.mode != "worker") {
+        std::fprintf(stderr, "--mode must be fixed or worker\n"); return 2;
+    }
+    for (const QString& overrideValue : parser.values(setOption)) {
+        if (!applyVrrReplayOverride(overrideValue, scenario, error)) {
+            std::fprintf(stderr, "Invalid replay override: %s\n",
+                         qPrintable(error)); return 2;
+        }
+    }
     TraceReader reader(tracePath);
     if (!reader.open(error)) {
         std::fprintf(stderr, "Unable to open trace: %s\n",
@@ -782,6 +1058,7 @@ int main(int argc, char* argv[])
     Metrics metrics;
     VrrSessionConfig capturedConfig;
     VrrSessionConfig simulatedConfig;
+    VrrTimingParameters capturedParameters;
     std::unique_ptr<VrrTimingController> referenceController;
     std::unique_ptr<VrrTimingController> simulatedController;
     bool capturedCanLatch = false;
@@ -791,6 +1068,8 @@ int main(int argc, char* argv[])
     bool haveLatch = false;
     uint64_t priorLatchSubmission = 0;
     uint64_t priorPresentRefresh = 0;
+    std::deque<uint64_t> recentPreparationCosts;
+    std::deque<uint64_t> recentPresentCosts;
 
     QElapsedTimer timer;
     timer.start();
@@ -804,7 +1083,7 @@ int main(int argc, char* argv[])
         }
         const uint64_t traceSchema = unsignedField(fields,
                                                     columns.traceSchema);
-        if (traceSchema != 3 && traceSchema != 4) {
+        if (traceSchema != 3 && traceSchema != 4 && traceSchema != 5) {
             std::fprintf(stderr, "Unsupported trace schema on row %llu\n",
                          static_cast<unsigned long long>(metrics.delivered + 2));
             return 1;
@@ -813,6 +1092,11 @@ int main(int argc, char* argv[])
             std::fprintf(stderr,
                          "Schema 4 trace is missing spacing_guard_feedback_us\n");
             return 1;
+        }
+        if (scenario.mode == "worker" && traceSchema < 5) {
+            std::fprintf(stderr,
+                         "Worker simulation requires a schema 5 trace\n");
+            return 2;
         }
         if (metrics.traceSchema == 0) {
             metrics.traceSchema = traceSchema;
@@ -840,6 +1124,39 @@ int main(int argc, char* argv[])
 
         const QByteArray disposition = fields[columns.disposition];
         const QByteArray recordedTear = fields[columns.tearClassification];
+        if (scenario.mode == "worker") {
+            ++metrics.workerArrivals;
+            const bool accepted = unsignedField(
+                fields, columns.queueAccepted) != 0;
+            const uint64_t queueDepthBefore = unsignedField(
+                fields, columns.queueDepthBefore);
+            if (accepted) {
+                ++metrics.workerAccepted;
+                if (queueDepthBefore >= scenario.worker.queueCapacity) {
+                    ++metrics.workerCapacityEvictions;
+                }
+            }
+            if (disposition == "queue_capacity" && accepted &&
+                    queueDepthBefore < scenario.worker.queueCapacity) {
+                ++metrics.workerNewlyAdmittedWithoutCost;
+                const auto estimate = [&metrics](
+                    const std::deque<uint64_t>& history,
+                    Distribution& distribution) {
+                    if (history.empty()) {
+                        ++metrics.workerEstimatorFallbacks;
+                        distribution.add(0);
+                        return;
+                    }
+                    distribution.add(percentile(
+                        std::vector<uint64_t>(history.cbegin(), history.cend()),
+                        50));
+                };
+                estimate(recentPreparationCosts,
+                         metrics.workerEstimatedPreparation);
+                estimate(recentPresentCosts,
+                         metrics.workerEstimatedPresentCall);
+            }
+        }
         ++metrics.dispositions[disposition];
         ++metrics.tearClassifications[recordedTear];
         if (unsignedField(fields, columns.dropped) != 0) {
@@ -864,6 +1181,33 @@ int main(int argc, char* argv[])
             capturedConfig.streamRateHz = static_cast<int>(signedField(
                 fields, columns.streamRateHz));
             capturedCanLatch = unsignedField(fields, columns.canLatch) != 0;
+            if (traceSchema >= 5) {
+                VrrReplayScenario capturedScenario;
+                int expectedParameters = 0;
+                for (const QString& path : vrrReplayParameterNames()) {
+                    if (!path.startsWith("controller.")) continue;
+                    ++expectedParameters;
+                    const auto column = columns.capturedParameterColumns.find(
+                        path);
+                    if (column == columns.capturedParameterColumns.end() ||
+                            !applyVrrReplayOverride(
+                                path + "=" + QString::number(unsignedField(
+                                    fields, column.value())),
+                                capturedScenario, error)) {
+                        std::fprintf(stderr,
+                                     "Schema 5 trace has invalid captured parameters: %s\n",
+                                     qPrintable(error));
+                        return 1;
+                    }
+                }
+                if (columns.capturedParameterColumns.size() !=
+                        expectedParameters) {
+                    std::fprintf(stderr,
+                                 "Schema 5 trace is missing captured controller parameters\n");
+                    return 1;
+                }
+                capturedParameters = capturedScenario.controller;
+            }
             simulatedConfig = capturedConfig;
             if (parser.isSet(displayOption)) {
                 simulatedConfig.displayRefreshHz =
@@ -875,9 +1219,9 @@ int main(int argc, char* argv[])
             }
             simulatedCanLatch = capturedCanLatch && !parser.isSet(latchOption);
             referenceController = std::make_unique<VrrTimingController>(
-                capturedConfig, capturedCanLatch);
+                capturedConfig, capturedCanLatch, capturedParameters);
             simulatedController = std::make_unique<VrrTimingController>(
-                simulatedConfig, simulatedCanLatch);
+                simulatedConfig, simulatedCanLatch, scenario.controller);
         }
 
         if (unsignedField(fields, columns.latchValid) != 0) {
@@ -930,6 +1274,38 @@ int main(int argc, char* argv[])
             fields, columns.nativePresentCallUs));
         metrics.observedGpuReadyWait.add(unsignedField(fields,
                                                        columns.gpuReadyWaitUs));
+        if (scenario.mode == "worker") {
+            ++metrics.workerMeasuredCostFrames;
+            const auto remember = [&scenario](std::deque<uint64_t>& history,
+                                              uint64_t value) {
+                history.push_back(value);
+                while (history.size() > scenario.worker.rollingCostWindow)
+                    history.pop_front();
+            };
+            remember(recentPreparationCosts,
+                     unsignedField(fields, columns.preparationUs));
+            remember(recentPresentCosts,
+                     unsignedField(fields, columns.presentCallUs));
+        }
+        if (columns.controllerCallUs >= 0)
+            metrics.observedControllerCall.add(unsignedField(
+                fields, columns.controllerCallUs));
+        if (columns.staleAgeUs >= 0)
+            metrics.observedStaleAge.add(unsignedField(
+                fields, columns.staleAgeUs));
+        if (columns.renderWaitEntryUs >= 0 && columns.renderWaitFinalUs >= 0)
+            metrics.observedRenderWait.addElapsed(
+                unsignedField(fields, columns.renderWaitFinalUs),
+                unsignedField(fields, columns.renderWaitEntryUs));
+        if (columns.targetWaitEntryUs >= 0 && columns.targetWaitFinalUs >= 0)
+            metrics.observedTargetWait.addElapsed(
+                unsignedField(fields, columns.targetWaitFinalUs),
+                unsignedField(fields, columns.targetWaitEntryUs));
+        if (columns.correctionWaitStartUs >= 0 &&
+                columns.correctionWaitEndUs >= 0)
+            metrics.observedCorrectionWait.addElapsed(
+                unsignedField(fields, columns.correctionWaitEndUs),
+                unsignedField(fields, columns.correctionWaitStartUs));
         PacedFrame frame(nullptr,
                          static_cast<int>(signedField(fields, columns.frame)),
                          static_cast<uint32_t>(unsignedField(
@@ -1144,7 +1520,7 @@ int main(int argc, char* argv[])
         metrics, timer.elapsed(), tracePath, QFileInfo(tracePath).size(),
         capturedConfig.displayRefreshHz, capturedConfig.streamRateHz,
         simulatedConfig.displayRefreshHz, simulatedConfig.streamRateHz,
-        simulatedCanLatch);
+        simulatedCanLatch, scenario);
     if (parser.isSet(compareOption)) {
         QFile baselineFile(parser.value(compareOption));
         if (!baselineFile.open(QIODevice::ReadOnly)) {
@@ -1187,6 +1563,7 @@ int main(int argc, char* argv[])
         summary["comparison"] = deltas;
     }
 
+    const bool assertionsPassed = evaluateAssertions(scenario, summary);
     const bool baselineExact = summary.value("fidelity").toObject().value(
         "baseline_exact").toBool();
     const QByteArray output = QJsonDocument(summary).toJson(
@@ -1210,5 +1587,5 @@ int main(int argc, char* argv[])
                      "Exact baseline validation failed; inspect the fidelity object\n");
         return 3;
     }
-    return 0;
+    return assertionsPassed ? 0 : 4;
 }

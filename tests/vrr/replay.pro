@@ -7,7 +7,10 @@ CONFIG -= app_bundle
 
 SOURCES += \
     $$PWD/vrrreplay.cpp \
+    $$PWD/vrrreplayconfig.cpp \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.cpp
+
+HEADERS += $$PWD/vrrreplayconfig.h
 
 win32 {
     contains(QT_ARCH, x86_64) {

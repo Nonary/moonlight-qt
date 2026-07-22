@@ -1,0 +1,42 @@
+{
+  "config_schema": 1,
+  "parameters": {
+    "controller": {},
+    "worker": {
+      "queue_capacity": 3,
+      "rolling_cost_window": 32,
+      "stale_source_periods": 1
+    }
+  },
+  "scenarios": [
+    {
+      "name": "defaults",
+      "mode": "fixed",
+      "assertions": [
+        {
+          "metric": "simulation.tear.modelled_interval_violations",
+          "operator": "<=",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "larger-guard-step",
+      "mode": "fixed",
+      "parameters": {
+        "controller": {
+          "guard_step_us": 100
+        }
+      }
+    },
+    {
+      "name": "wide-worker-queue",
+      "mode": "worker",
+      "parameters": {
+        "worker": {
+          "queue_capacity": 6
+        }
+      }
+    }
+  ]
+}

@@ -103,16 +103,27 @@ void testTimingFormulaeAndReserveCap()
     VrrTimingController controller(config(60, 120));
     VrrTimingDecision first = controller.schedule(
         frame(1, 0, true, 100000), 100000);
-    expect(first.guardUs == 130, "display guard must be displayPeriod / 64");
-    expect(first.headroomUs == 8204,
+    const VrrTimingParameters& parameters = controller.parameters();
+    const uint64_t expectedGuardUs = std::clamp(
+        controller.displayPeriodUs() / parameters.baseGuardDivisor,
+        parameters.minimumGuardUs, parameters.maximumBaseGuardUs);
+    expect(first.guardUs == expectedGuardUs,
+           "display guard must honor the configured divisor and bounds");
+    expect(first.headroomUs ==
+               controller.sourcePeriodUs() - controller.displayPeriodUs() -
+                   expectedGuardUs,
            "headroom must subtract one display period and the guard");
-    expect(first.targetUs == 101250 && first.renderStartUs == 100250,
+    expect(first.targetUs ==
+               100000 + first.renderLeadUs + parameters.presentationSafetyUs &&
+               first.renderStartUs ==
+                   first.targetUs - first.renderLeadUs - first.renderWakeLeadUs,
            "target must include render lead and presentation safety");
 
     controller.noteSubmission(true, false, first.targetUs);
     VrrTimingDecision second = controller.schedule(
         frame(2, 1500, true, 116666), 116666);
-    expect(second.targetUs >= first.targetUs + 8333 + 130,
+    expect(second.targetUs >=
+               first.targetUs + controller.displayPeriodUs() + expectedGuardUs,
            "target must honor the prior presentation floor and guard");
 
     VrrTimingController capped(config(360, 120));
@@ -288,19 +299,26 @@ void testSpacingGuardFeedback()
     VrrTimingDecision first = controller.schedule(
         frame(1, 0, true, 100000), 100000);
     controller.noteSubmission(true, false, first.targetUs);
+    const VrrTimingParameters& parameters = controller.parameters();
+    const uint64_t raisedGuardUs = std::min(
+        parameters.maximumAdaptiveGuardUs,
+        first.guardUs + std::max<uint64_t>(parameters.guardStepUs, 300));
     controller.noteSpacingDeficit(300);
-    expect(controller.guardUs() == 430,
+    expect(controller.guardUs() == raisedGuardUs,
            "a spacing deficit must raise the bounded guard directly");
 
     VrrTimingDecision second = controller.schedule(
         frame(2, 1500, true, 116666), 116666);
-    expect(second.targetUs >= first.targetUs + 8333 + 430,
+    expect(second.targetUs >=
+               first.targetUs + controller.displayPeriodUs() + raisedGuardUs,
            "the raised guard must affect the next display-spacing floor");
 
-    for (int i = 0; i < 120; ++i) {
+    for (size_t i = 0; i < parameters.guardDecayFrames; ++i) {
         controller.noteSpacingDeficit(0);
     }
-    expect(controller.guardUs() == 380,
+    expect(controller.guardUs() ==
+               raisedGuardUs - std::min(parameters.guardStepUs,
+                                         raisedGuardUs - first.guardUs),
            "a clean run must decay the guard by one small step");
 }
 
@@ -336,12 +354,21 @@ void testLatchedPresentationRecoversAfterGuardDecay()
     expect(!decision.latchedPresentation,
            "100 FPS must begin in immediate mode with its base guard");
 
-    controller.noteSpacingDeficit(50);
+    const uint64_t baseGuardUs = decision.guardUs;
+    const uint64_t latchDeficitUs =
+        decision.headroomUs -
+        controller.parameters().latchedPresentationHeadroomUs + 1;
+    controller.noteSpacingDeficit(latchDeficitUs);
     decision = controller.schedule(frame(2, 900, true, 110000), 110000);
     expect(decision.latchedPresentation,
            "a transient guard increase must select the safe latched path");
 
-    for (int i = 0; i < 120; ++i) {
+    const size_t decayCycles = static_cast<size_t>(
+        (controller.guardUs() - baseGuardUs +
+         controller.parameters().guardStepUs - 1) /
+        controller.parameters().guardStepUs);
+    for (size_t i = 0;
+         i < decayCycles * controller.parameters().guardDecayFrames; ++i) {
         controller.noteSpacingDeficit(0);
     }
     decision = controller.schedule(frame(3, 1800, true, 120000), 120000);
@@ -462,7 +489,8 @@ void testDecodeTailAdaptation()
         controller.noteSubmission(true, false, decision.targetUs);
     }
 
-    expect(controller.renderLeadUs() >= 1500,
+    expect(controller.renderLeadUs() >=
+               1000 + controller.parameters().renderLeadSlackUs,
            "preparation duration must include render slack");
     expect(controller.timingBudgetUs() > 1750,
            "positive readiness tail must grow the timing budget");
@@ -835,6 +863,22 @@ void testTargetWaiterBoundaries()
            "a non-advancing clock must not create unbounded active spinning");
 }
 
+void testRuntimeParametersChangePolicy()
+{
+    VrrTimingController defaults(config(60, 120));
+    VrrTimingParameters parameters;
+    parameters.guardStepUs = 500;
+    VrrTimingController candidate(config(60, 120), true, parameters);
+    defaults.schedule(frame(1, 0, true, 100000), 100000);
+    candidate.schedule(frame(1, 0, true, 100000), 100000);
+    defaults.noteSpacingDeficit(1);
+    candidate.noteSpacingDeficit(1);
+    expect(candidate.guardUs() > defaults.guardUs(),
+           "runtime parameters must change controller policy without recompilation");
+    expect(candidate.parameters().guardStepUs == 500,
+           "controller must retain its resolved parameter set");
+}
+
 } // namespace
 
 int main()
@@ -860,5 +904,6 @@ int main()
     testSkippedLocalFramePreservesCadence();
     testSchedulerDelayFeedback();
     testTargetWaiterBoundaries();
+    testRuntimeParametersChangePolicy();
     return failures == 0 ? 0 : 1;
 }

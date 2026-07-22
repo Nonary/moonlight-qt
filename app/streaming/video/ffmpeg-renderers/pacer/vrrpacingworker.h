@@ -75,6 +75,10 @@ private:
 
     struct FrameTelemetry {
         uint64_t decisionTimeUs = 0;
+        uint64_t decisionEndUs = 0;
+        uint64_t staleCheckUs = 0;
+        uint64_t staleAgeUs = 0;
+        uint64_t renderWaitEntryUs = 0;
         uint64_t renderWaitFinalUs = 0;
         uint64_t renderWaitOvershootUs = 0;
         uint64_t renderSchedulerDelayUs = 0;
@@ -83,6 +87,7 @@ private:
         uint64_t preparationStartUs = 0;
         uint64_t preparationEndUs = 0;
         uint64_t preparationDurationUs = 0;
+        uint64_t targetWaitEntryUs = 0;
         uint64_t targetWaitOvershootUs = 0;
         uint64_t targetWaitFinalUs = 0;
         uint64_t targetSchedulerDelayUs = 0;
@@ -95,6 +100,10 @@ private:
         int64_t spacingMarginUs = 0;
         uint64_t spacingDeficitUs = 0;
         uint64_t spacingGuardFeedbackUs = 0;
+        uint64_t spacingCheckUs = 0;
+        uint64_t presentationFloorUs = 0;
+        uint64_t correctionWaitStartUs = 0;
+        uint64_t correctionWaitEndUs = 0;
         uint64_t submissionId = 0;
         uint64_t latchSubmissionId = 0;
         uint64_t latchTimeUs = 0;
@@ -119,12 +128,14 @@ private:
         uint64_t decodeCompleteUs = 0;
         FrameTraceContext input;
         VrrTimingDecision decision;
+        VrrTimingDiagnostics diagnostics;
         VrrPresentFeedback feedback;
         FrameTelemetry telemetry;
         size_t completionQueueDepth = 0;
         TraceDisposition disposition = TraceDisposition::OutputDropped;
         bool decisionValid = false;
         bool dropped = false;
+        uint64_t terminalTimeUs = 0;
     };
 
     enum class TraceFormat : uint8_t {

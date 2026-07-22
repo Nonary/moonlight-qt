@@ -10,49 +10,6 @@ constexpr uint64_t kMicrosecondsPerSecond = 1000000ULL;
 constexpr uint64_t kRtpClockRate = 90000ULL;
 constexpr uint64_t kQ16One = 1ULL << 16;
 constexpr uint64_t kQ16Half = kQ16One >> 1;
-constexpr uint64_t kMaximumForwardMovementUs = kMicrosecondsPerSecond;
-constexpr uint64_t kRenderLeadFloorUs = 1000ULL;
-constexpr uint64_t kRenderLeadCeilingUs = 6500ULL;
-constexpr uint64_t kRenderLeadSlackUs = 500ULL;
-constexpr uint64_t kPresentationSafetyUs = 250ULL;
-constexpr uint64_t kReadinessCeilingUs = 10000ULL;
-constexpr uint64_t kMinimumReadinessReserveUs = 500ULL;
-constexpr uint64_t kColdStartReadinessDemandUs = 1500ULL;
-constexpr uint64_t kArrivalSpreadGuardUs = 250ULL;
-constexpr uint64_t kReadinessAcquireStepUs = 100ULL;
-constexpr uint64_t kMaximumWakeLeadUs = 2000ULL;
-constexpr uint64_t kMaximumTargetWakeLeadUs = 500ULL;
-constexpr uint64_t kMinimumGuardUs = 100ULL;
-// Below this learned headroom, immediate flips cannot absorb ordinary
-// scheduler and flip-queue jitter, so the controller requests latched
-// presentation instead. At such near-refresh cadences latching costs only a
-// few repeated frames per second, while an early flip is a visible tear.
-constexpr uint64_t kLatchedPresentationHeadroomUs = 1500ULL;
-constexpr uint64_t kLatchedPresentationExitHeadroomUs = 2000ULL;
-constexpr uint64_t kMaximumBaseGuardUs = 250ULL;
-constexpr uint64_t kMaximumAdaptiveGuardUs = 1000ULL;
-constexpr uint64_t kGuardStepUs = 50ULL;
-constexpr unsigned int kGuardDecayFrames = 120;
-// Wake-up jitter changes much faster than decode readiness or GPU preparation.
-// With nearest-rank p95, 19 is the longest short history that still retains
-// every recent late wake; at 20 samples the single worst wake is discarded.
-constexpr size_t kSchedulerLearningSampleCount = 19;
-constexpr size_t kReadinessLearningSampleCount = 32;
-constexpr size_t kPreparationLearningSampleCount = 32;
-constexpr size_t kMinimumReadinessSamples = 16;
-constexpr size_t kMinimumCadenceSamples = 6;
-// A tight cadence window spans one source second. The supported stream range
-// reaches 480 FPS, so retain one anchor plus every frame in that window.
-constexpr size_t kMaximumCadenceSamples = 512;
-constexpr size_t kRateCandidateSampleCount = 3;
-constexpr uint64_t kLooseCadenceWindowUs = 500000ULL;
-constexpr uint64_t kTightCadenceWindowUs = 1000000ULL;
-// Raw timestamp atoms may legitimately dither by nearly 2:1. Only a much
-// larger one-frame departure starts the provisional fast-recovery path.
-constexpr uint64_t kMajorCadenceRatioNumerator = 7ULL;
-constexpr uint64_t kMajorCadenceRatioDenominator = 2ULL;
-constexpr uint64_t kCandidateCadenceRatio = 2ULL;
-constexpr unsigned int kMaterialRateChangePercent = 12;
 
 uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)
 {
@@ -66,7 +23,15 @@ uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)
 
 VrrTimingController::VrrTimingController(const VrrSessionConfig& config,
                                          bool canLatchPresentation) :
+    VrrTimingController(config, canLatchPresentation, VrrTimingParameters {})
+{
+}
+
+VrrTimingController::VrrTimingController(const VrrSessionConfig& config,
+                                         bool canLatchPresentation,
+                                         const VrrTimingParameters& parameters) :
     m_Config(config),
+    m_Parameters(parameters),
     m_CanLatchPresentation(canLatchPresentation)
 {
     reset();
@@ -79,9 +44,10 @@ void VrrTimingController::reset()
         m_Config.streamRateHz, m_DisplayPeriodUs * kQ16One);
     m_ConfiguredStreamPeriodUs = std::max<uint64_t>(
         1, roundedQ16(m_ConfiguredStreamPeriodQ16));
-    m_BaseGuardUs = clampUnsigned(m_DisplayPeriodUs / 64,
-                                  kMinimumGuardUs,
-                                  kMaximumBaseGuardUs);
+    m_BaseGuardUs = clampUnsigned(
+        m_DisplayPeriodUs / m_Parameters.baseGuardDivisor,
+        m_Parameters.minimumGuardUs,
+        m_Parameters.maximumBaseGuardUs);
 
     m_HaveLastSubmission = false;
     m_LastSubmissionUs = 0;
@@ -108,12 +74,14 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_SourcePeriodUs = std::max<uint64_t>(
         1, roundedQ16(m_SourcePeriodUsQ16));
     m_LatchedPresentation = m_CanLatchPresentation && m_SourcePeriodUs <
-        saturatingAdd(m_DisplayPeriodUs, kLatchedPresentationHeadroomUs);
+        saturatingAdd(m_DisplayPeriodUs,
+                      m_Parameters.latchedPresentationHeadroomUs);
     m_ReadinessBudgetUs = 0;
     m_ReadinessPhaseUs = 0;
     m_ReadinessDemandUs = retainLearnedBudgets ?
-        previousReadinessDemandUs : kColdStartReadinessDemandUs;
-    m_AppliedReadinessReserveUs = kColdStartReadinessDemandUs;
+        previousReadinessDemandUs : m_Parameters.coldStartReadinessDemandUs;
+    m_AppliedReadinessReserveUs =
+        m_Parameters.coldStartReadinessDemandUs;
     m_ReadinessModelValid = retainLearnedBudgets &&
         previousReadinessModelValid;
     m_HaveTimeline = false;
@@ -143,15 +111,15 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
                                        renderLeadFloorUs(),
                                        renderLeadCeilingUs());
         m_RenderWakeLeadUs = std::min(previousRenderWakeLeadUs,
-                                      kMaximumWakeLeadUs);
+                                      m_Parameters.maximumRenderWakeLeadUs);
         m_TargetWakeLeadUs = std::min(previousTargetWakeLeadUs,
-                                      kMaximumTargetWakeLeadUs);
+                                      m_Parameters.maximumTargetWakeLeadUs);
         m_GuardUs = clampUnsigned(previousGuardUs,
                                   m_BaseGuardUs,
                                   guardCeilingUs());
     }
     else {
-        m_RenderLeadUs = clampUnsigned(kRenderLeadFloorUs,
+        m_RenderLeadUs = clampUnsigned(m_Parameters.renderLeadFloorUs,
                                        renderLeadFloorUs(),
                                        renderLeadCeilingUs());
         m_RenderWakeLeadUs = 0;
@@ -253,7 +221,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             m_PhaseErrorFrames = 0;
         }
 
-        if (!cadence.phaseDiscontinuity && m_PhaseErrorFrames >= 3) {
+        if (!cadence.phaseDiscontinuity &&
+                m_PhaseErrorFrames >= m_Parameters.phaseErrorFrames) {
             // A bounded readiness reserve cannot repay a sustained source
             // phase error. Re-anchor locally while retaining the cumulative
             // cadence fit, rather than repeatedly rebasing the whole model.
@@ -284,12 +253,12 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
 
     uint64_t targetUs = saturatingAdd(
         addSigned(m_SourceTimeUs, m_ReadinessBudgetUs),
-        saturatingAdd(m_RenderLeadUs, kPresentationSafetyUs));
+        saturatingAdd(m_RenderLeadUs, m_Parameters.presentationSafetyUs));
     targetUs = std::max(
         targetUs,
         saturatingAdd(nowUs,
                       saturatingAdd(m_RenderLeadUs,
-                                    kPresentationSafetyUs)));
+                                    m_Parameters.presentationSafetyUs)));
 
     // This is a live, one-slot path. An unconfirmed RTP/frame jump may
     // describe already-skipped content, never hundreds of milliseconds that
@@ -300,7 +269,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         saturatingAdd(std::max(m_ConfiguredStreamPeriodUs,
                                m_SourcePeriodUs),
                       saturatingAdd(m_RenderLeadUs,
-                                    kPresentationSafetyUs)));
+                                    m_Parameters.presentationSafetyUs)));
     if (targetUs > maximumDirectTargetUs) {
         // Do not clear cadence history when a faster source makes the old
         // playout phase point into the future. Reseed phase from this already
@@ -315,7 +284,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         m_PhaseErrorFrames = 0;
         targetUs = saturatingAdd(
             std::max(frame.decodeCompleteUs(), nowUs),
-            saturatingAdd(m_RenderLeadUs, kPresentationSafetyUs));
+            saturatingAdd(m_RenderLeadUs,
+                          m_Parameters.presentationSafetyUs));
     }
 
     targetUs = std::max(targetUs, earliestSubmissionUs());
@@ -350,13 +320,16 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         // stream stay latched indefinitely. Keep hysteresis while protection
         // is still elevated, then restore immediate presentation at the
         // normal eligibility boundary.
-        if (learnedHeadroomUs >= kLatchedPresentationExitHeadroomUs ||
+        if (learnedHeadroomUs >=
+                m_Parameters.latchedPresentationExitHeadroomUs ||
             (m_GuardUs == m_BaseGuardUs &&
-             learnedHeadroomUs >= kLatchedPresentationHeadroomUs)) {
+             learnedHeadroomUs >=
+                m_Parameters.latchedPresentationHeadroomUs)) {
             m_LatchedPresentation = false;
         }
     }
-    else if (learnedHeadroomUs < kLatchedPresentationHeadroomUs) {
+    else if (learnedHeadroomUs <
+             m_Parameters.latchedPresentationHeadroomUs) {
         m_LatchedPresentation = true;
     }
     decision.latchedPresentation = m_LatchedPresentation;
@@ -402,7 +375,7 @@ VrrTimingController::observeCadence(const PacedFrame& frame)
             static_cast<uint64_t>(wrappedDelta) * kMicrosecondsPerSecond +
             carriedRemainder;
         const uint64_t intervalUs = intervalNumerator / kRtpClockRate;
-        if (intervalUs > kMaximumForwardMovementUs) {
+        if (intervalUs > m_Parameters.maximumForwardMovementUs) {
             observation.needsRebase = true;
             return observation;
         }
@@ -466,8 +439,14 @@ void VrrTimingController::observeRtpCadence(
         const uint64_t observedPeriodUs = std::max<uint64_t>(
             1, observation.intervalUs / observation.frameDelta);
         const bool returnedToStableCadence =
-            observedPeriodUs <= m_SourcePeriodUs * kCandidateCadenceRatio &&
-            m_SourcePeriodUs <= observedPeriodUs * kCandidateCadenceRatio;
+            observedPeriodUs *
+                    m_Parameters.candidateCadenceRatioDenominator <=
+                m_SourcePeriodUs *
+                    m_Parameters.candidateCadenceRatioNumerator &&
+            m_SourcePeriodUs *
+                    m_Parameters.candidateCadenceRatioDenominator <=
+                observedPeriodUs *
+                    m_Parameters.candidateCadenceRatioNumerator;
         if (returnedToStableCadence) {
             m_RateCandidateSamples.clear();
             m_CadenceSamples.clear();
@@ -478,7 +457,8 @@ void VrrTimingController::observeRtpCadence(
 
         appendCadenceSample(m_RateCandidateSamples, current);
         observation.phaseDiscontinuity = true;
-        if (m_RateCandidateSamples.size() >= kRateCandidateSampleCount) {
+        if (m_RateCandidateSamples.size() >=
+                m_Parameters.rateCandidateSamples) {
             const uint64_t candidatePeriodQ16 = fittedSourcePeriodQ16(
                 m_RateCandidateSamples);
             if (candidatePeriodQ16 != 0) {
@@ -501,7 +481,7 @@ void VrrTimingController::observeRtpCadence(
 
     appendCadenceSample(m_CadenceSamples, current);
     observation.eligible = true;
-    if (m_CadenceSamples.size() >= kMinimumCadenceSamples) {
+    if (m_CadenceSamples.size() >= m_Parameters.minimumCadenceSamples) {
         const uint64_t fittedPeriodQ16 = fittedSourcePeriodQ16(
             m_CadenceSamples);
         if (fittedPeriodQ16 != 0 &&
@@ -516,11 +496,11 @@ void VrrTimingController::appendCadenceSample(
     std::deque<CadenceSample>& samples, const CadenceSample& sample)
 {
     samples.push_back(sample);
-    while (samples.size() > kMaximumCadenceSamples) {
+    while (samples.size() > m_Parameters.maximumCadenceSamples) {
         samples.pop_front();
     }
 
-    while (samples.size() > kMinimumCadenceSamples) {
+    while (samples.size() > m_Parameters.minimumCadenceSamples) {
         const uint64_t spanTicks = samples.back().rtpTicks -
             samples.front().rtpTicks;
         const uint64_t spanUs = spanTicks * kMicrosecondsPerSecond /
@@ -581,19 +561,23 @@ uint64_t VrrTimingController::cadenceWindowUs() const
                                                    m_GuardUs);
     const uint64_t headroomUs = m_SourcePeriodUs > displayFloorUs ?
         m_SourcePeriodUs - displayFloorUs : 0;
-    const uint64_t looseHeadroomUs = saturatingAdd(m_DisplayPeriodUs,
-                                                    m_DisplayPeriodUs);
+    const uint64_t looseHeadroomUs =
+        m_Parameters.looseHeadroomDisplayPeriods >
+                std::numeric_limits<uint64_t>::max() / m_DisplayPeriodUs ?
+            std::numeric_limits<uint64_t>::max() :
+            m_DisplayPeriodUs *
+                m_Parameters.looseHeadroomDisplayPeriods;
     if (headroomUs >= looseHeadroomUs) {
-        return kLooseCadenceWindowUs;
+        return m_Parameters.looseCadenceWindowUs;
     }
     if (headroomUs <= m_DisplayPeriodUs) {
-        return kTightCadenceWindowUs;
+        return m_Parameters.tightCadenceWindowUs;
     }
 
     const uint64_t tightnessNumerator = looseHeadroomUs - headroomUs;
-    const uint64_t windowRangeUs = kTightCadenceWindowUs -
-        kLooseCadenceWindowUs;
-    return kLooseCadenceWindowUs +
+    const uint64_t windowRangeUs = m_Parameters.tightCadenceWindowUs -
+        m_Parameters.looseCadenceWindowUs;
+    return m_Parameters.looseCadenceWindowUs +
         windowRangeUs * tightnessNumerator /
             std::max<uint64_t>(1, looseHeadroomUs - m_DisplayPeriodUs);
 }
@@ -606,10 +590,12 @@ bool VrrTimingController::isMajorCadenceDeparture(
     }
     const uint64_t observedPeriodUs = std::max<uint64_t>(
         1, intervalUs / frameDelta);
-    return observedPeriodUs * kMajorCadenceRatioDenominator >
-               m_SourcePeriodUs * kMajorCadenceRatioNumerator ||
-        m_SourcePeriodUs * kMajorCadenceRatioDenominator >
-               observedPeriodUs * kMajorCadenceRatioNumerator;
+    return observedPeriodUs * m_Parameters.majorCadenceRatioDenominator >
+               m_SourcePeriodUs *
+                   m_Parameters.majorCadenceRatioNumerator ||
+        m_SourcePeriodUs * m_Parameters.majorCadenceRatioDenominator >
+               observedPeriodUs *
+                   m_Parameters.majorCadenceRatioNumerator;
 }
 
 bool VrrTimingController::acceptSourcePeriodQ16(uint64_t periodUsQ16)
@@ -632,7 +618,7 @@ bool VrrTimingController::acceptSourcePeriodQ16(uint64_t periodUsQ16)
                               m_BaseGuardUs,
                               guardCeilingUs());
     return !withinPercent(m_SourcePeriodUs, previousPeriodUs,
-                          kMaterialRateChangePercent);
+                          m_Parameters.materialRateChangePercent);
 }
 
 void VrrTimingController::anchorSourceTime(uint64_t sourceTimeUs)
@@ -658,10 +644,10 @@ void VrrTimingController::noteSchedulerDelays(uint64_t renderDelayUs,
                                               bool targetDelayValid)
 {
     appendBounded(m_RenderSchedulerDelays, renderDelayUs,
-                  kSchedulerLearningSampleCount);
+                  m_Parameters.schedulerLearningSamples);
     if (targetDelayValid) {
         appendBounded(m_TargetSchedulerDelays, targetDelayUs,
-                      kSchedulerLearningSampleCount);
+                      m_Parameters.schedulerLearningSamples);
     }
     updateLearnedBudgets();
 }
@@ -670,15 +656,16 @@ void VrrTimingController::noteSpacingDeficit(uint64_t deficitUs)
 {
     if (deficitUs != 0) {
         m_CleanSpacingFrames = 0;
-        const uint64_t increaseUs = std::max(kGuardStepUs, deficitUs);
+        const uint64_t increaseUs = std::max(m_Parameters.guardStepUs,
+                                             deficitUs);
         m_GuardUs = std::min(guardCeilingUs(),
                              saturatingAdd(m_GuardUs, increaseUs));
         return;
     }
 
     if (m_GuardUs > m_BaseGuardUs &&
-        ++m_CleanSpacingFrames >= kGuardDecayFrames) {
-        m_GuardUs -= std::min(kGuardStepUs,
+        ++m_CleanSpacingFrames >= m_Parameters.guardDecayFrames) {
+        m_GuardUs -= std::min(m_Parameters.guardStepUs,
                               m_GuardUs - m_BaseGuardUs);
         m_CleanSpacingFrames = 0;
     }
@@ -700,12 +687,12 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         if (!cancelled) {
             if (m_Pending.cadenceEligible) {
                 appendBounded(m_ReadyOffsets, m_Pending.readyOffsetUs,
-                              kReadinessLearningSampleCount);
+                              m_Parameters.readinessLearningSamples);
             }
             if (m_Pending.hasPreparationDuration) {
                 appendBounded(m_PreparationDurations,
                               m_Pending.preparationDurationUs,
-                              kPreparationLearningSampleCount);
+                              m_Parameters.preparationLearningSamples);
             }
             updateReadinessModel();
             updateLearnedBudgets();
@@ -719,27 +706,31 @@ void VrrTimingController::updateLearnedBudgets()
 {
     if (!m_PreparationDurations.empty()) {
         m_RenderLeadUs = clampUnsigned(
-            saturatingAdd(percentile(m_PreparationDurations, 90),
-                          kRenderLeadSlackUs),
+            saturatingAdd(percentile(
+                              m_PreparationDurations,
+                              m_Parameters.preparationPercentile),
+                          m_Parameters.renderLeadSlackUs),
             renderLeadFloorUs(), renderLeadCeilingUs());
     }
 
     if (!m_RenderSchedulerDelays.empty()) {
         m_RenderWakeLeadUs = std::min(
-            kMaximumWakeLeadUs,
-            percentile(m_RenderSchedulerDelays, 95));
+            m_Parameters.maximumRenderWakeLeadUs,
+            percentile(m_RenderSchedulerDelays,
+                       m_Parameters.schedulerPercentile));
     }
 
     if (!m_TargetSchedulerDelays.empty()) {
         m_TargetWakeLeadUs = std::min(
-            kMaximumTargetWakeLeadUs,
-            percentile(m_TargetSchedulerDelays, 95));
+            m_Parameters.maximumTargetWakeLeadUs,
+            percentile(m_TargetSchedulerDelays,
+                       m_Parameters.schedulerPercentile));
     }
 }
 
 void VrrTimingController::updateReadinessModel()
 {
-    if (m_ReadyOffsets.size() < kMinimumReadinessSamples) {
+    if (m_ReadyOffsets.size() < m_Parameters.minimumReadinessSamples) {
         return;
     }
 
@@ -748,15 +739,17 @@ void VrrTimingController::updateReadinessModel()
     // Near the display ceiling, preserve the p90 arrival tail because there is
     // too little cadence slack to absorb a late frame. Slower sources can use
     // p80 and avoid making the slowest fifth standing latency for every frame.
-    const int64_t lowUs = percentile(m_ReadyOffsets, 10);
+    const int64_t lowUs = percentile(
+        m_ReadyOffsets, m_Parameters.readinessLowPercentile);
     const unsigned int highPercentile = headroomUs() > m_DisplayPeriodUs ?
-        80U : 90U;
+        m_Parameters.readinessLoosePercentile :
+        m_Parameters.readinessTightPercentile;
     const int64_t highUs = percentile(m_ReadyOffsets, highPercentile);
     const uint64_t spreadUs = highUs > lowUs ?
         static_cast<uint64_t>(highUs - lowUs) : 0;
     const uint64_t candidateDemandUs = clampUnsigned(
-        saturatingAdd(spreadUs, kArrivalSpreadGuardUs),
-        kMinimumReadinessReserveUs, readinessCeilingUs());
+        saturatingAdd(spreadUs, m_Parameters.arrivalSpreadGuardUs),
+        m_Parameters.minimumReadinessReserveUs, readinessCeilingUs());
 
     if (!m_ReadinessModelValid) {
         m_ReadinessDemandUs = candidateDemandUs;
@@ -765,12 +758,16 @@ void VrrTimingController::updateReadinessModel()
     else if (candidateDemandUs > m_ReadinessDemandUs) {
         // Attack faster than release, but never let one observation window
         // impose its entire tail on subsequent frames.
+        const uint64_t difference = candidateDemandUs - m_ReadinessDemandUs;
         m_ReadinessDemandUs += std::max<uint64_t>(
-            1, (candidateDemandUs - m_ReadinessDemandUs) / 4);
+            1, difference * m_Parameters.readinessAttackNumerator /
+                m_Parameters.readinessAttackDenominator);
     }
     else if (candidateDemandUs < m_ReadinessDemandUs) {
+        const uint64_t difference = m_ReadinessDemandUs - candidateDemandUs;
         m_ReadinessDemandUs -= std::max<uint64_t>(
-            1, (m_ReadinessDemandUs - candidateDemandUs) / 8);
+            1, difference * m_Parameters.readinessReleaseNumerator /
+                m_Parameters.readinessReleaseDenominator);
     }
 
     m_ReadinessPhaseUs = lowUs;
@@ -791,13 +788,14 @@ void VrrTimingController::applyReadinessBudget(bool acquireReserve)
     // complete learned cushion.
     const uint64_t cadenceHeadroomUs = headroomUs();
     const uint64_t usableHeadroomUs =
-        m_SourcePeriodUs >= saturatingAdd(m_DisplayPeriodUs,
-                                           m_DisplayPeriodUs) ?
-            cadenceHeadroomUs * 3 / 4 : 0;
+        m_SourcePeriodUs >= m_DisplayPeriodUs *
+                m_Parameters.looseHeadroomDisplayPeriods ?
+            cadenceHeadroomUs * m_Parameters.usableHeadroomNumerator /
+                m_Parameters.usableHeadroomDenominator : 0;
     const uint64_t effectiveDemandUs = m_ReadinessModelValid ?
-        m_ReadinessDemandUs : kColdStartReadinessDemandUs;
+        m_ReadinessDemandUs : m_Parameters.coldStartReadinessDemandUs;
     m_AppliedReadinessReserveUs = std::max(
-        kMinimumReadinessReserveUs,
+        m_Parameters.minimumReadinessReserveUs,
         effectiveDemandUs > usableHeadroomUs ?
             effectiveDemandUs - usableHeadroomUs : 0);
 
@@ -818,12 +816,12 @@ void VrrTimingController::applyReadinessBudget(bool acquireReserve)
     else if (clampedDesiredUs > m_ReadinessBudgetUs) {
         m_ReadinessBudgetUs += std::min<int64_t>(
             clampedDesiredUs - m_ReadinessBudgetUs,
-            static_cast<int64_t>(kReadinessAcquireStepUs));
+            static_cast<int64_t>(m_Parameters.readinessAcquireStepUs));
     }
     else if (clampedDesiredUs < m_ReadinessBudgetUs) {
         m_ReadinessBudgetUs -= std::min<int64_t>(
             m_ReadinessBudgetUs - clampedDesiredUs,
-            static_cast<int64_t>(kReadinessAcquireStepUs));
+            static_cast<int64_t>(m_Parameters.readinessAcquireStepUs));
     }
 }
 
@@ -831,7 +829,7 @@ uint64_t VrrTimingController::timingBudgetUs() const
 {
     return saturatingAdd(
         m_AppliedReadinessReserveUs,
-        saturatingAdd(m_RenderLeadUs, kPresentationSafetyUs));
+        saturatingAdd(m_RenderLeadUs, m_Parameters.presentationSafetyUs));
 }
 
 int64_t VrrTimingController::readinessBudgetUs() const
@@ -900,21 +898,44 @@ bool VrrTimingController::hasLastSubmission() const
     return m_HaveLastSubmission;
 }
 
+const VrrTimingParameters& VrrTimingController::parameters() const
+{
+    return m_Parameters;
+}
+
+VrrTimingDiagnostics VrrTimingController::diagnostics() const
+{
+    VrrTimingDiagnostics value;
+    value.readinessPhaseUs = m_ReadinessPhaseUs;
+    value.readinessDemandUs = m_ReadinessDemandUs;
+    value.appliedReadinessReserveUs = m_AppliedReadinessReserveUs;
+    value.cadenceSamples = m_CadenceSamples.size();
+    value.rateCandidateSamples = m_RateCandidateSamples.size();
+    value.readinessSamples = m_ReadyOffsets.size();
+    value.preparationSamples = m_PreparationDurations.size();
+    value.renderSchedulerSamples = m_RenderSchedulerDelays.size();
+    value.targetSchedulerSamples = m_TargetSchedulerDelays.size();
+    value.cleanSpacingFrames = m_CleanSpacingFrames;
+    value.phaseErrorFrames = m_PhaseErrorFrames;
+    value.readinessModelValid = m_ReadinessModelValid;
+    return value;
+}
+
 uint64_t VrrTimingController::renderLeadFloorUs() const
 {
-    return std::min(kRenderLeadFloorUs, m_SourcePeriodUs);
+    return std::min(m_Parameters.renderLeadFloorUs, m_SourcePeriodUs);
 }
 
 uint64_t VrrTimingController::renderLeadCeilingUs() const
 {
-    const uint64_t ceilingUs = std::min(kRenderLeadCeilingUs,
+    const uint64_t ceilingUs = std::min(m_Parameters.renderLeadCeilingUs,
                                         m_SourcePeriodUs);
     return std::max(renderLeadFloorUs(), ceilingUs);
 }
 
 uint64_t VrrTimingController::readinessCeilingUs() const
 {
-    return std::min(kReadinessCeilingUs, m_SourcePeriodUs);
+    return std::min(m_Parameters.readinessCeilingUs, m_SourcePeriodUs);
 }
 
 uint64_t VrrTimingController::guardCeilingUs() const
@@ -923,7 +944,7 @@ uint64_t VrrTimingController::guardCeilingUs() const
         m_SourcePeriodUs - m_DisplayPeriodUs : 0;
     return std::max(
         m_BaseGuardUs,
-        std::min(kMaximumAdaptiveGuardUs, sourceSlackUs));
+        std::min(m_Parameters.maximumAdaptiveGuardUs, sourceSlackUs));
 }
 
 uint64_t VrrTimingController::periodForRate(int rateHz, uint64_t fallbackUs)

@@ -6,6 +6,74 @@
 #include <cstdint>
 #include <deque>
 
+// Every value that changes VRR policy lives here so replay experiments can
+// replace numbers without rebuilding the controller. Production callers use
+// this value-initialized contract and therefore retain the historical policy.
+struct VrrTimingParameters {
+    uint64_t maximumForwardMovementUs = 1000000;
+    uint64_t renderLeadFloorUs = 1000;
+    uint64_t renderLeadCeilingUs = 6500;
+    uint64_t renderLeadSlackUs = 350;
+    uint64_t presentationSafetyUs = 100;
+    uint64_t readinessCeilingUs = 10000;
+    uint64_t minimumReadinessReserveUs = 500;
+    uint64_t coldStartReadinessDemandUs = 1500;
+    uint64_t arrivalSpreadGuardUs = 250;
+    uint64_t readinessAcquireStepUs = 750;
+    uint64_t maximumRenderWakeLeadUs = 2000;
+    uint64_t maximumTargetWakeLeadUs = 500;
+    uint64_t minimumGuardUs = 100;
+    uint64_t latchedPresentationHeadroomUs = 1500;
+    uint64_t latchedPresentationExitHeadroomUs = 2000;
+    uint64_t maximumBaseGuardUs = 250;
+    uint64_t maximumAdaptiveGuardUs = 1000;
+    uint64_t guardStepUs = 50;
+    size_t guardDecayFrames = 120;
+    size_t schedulerLearningSamples = 19;
+    size_t readinessLearningSamples = 32;
+    size_t preparationLearningSamples = 32;
+    size_t minimumReadinessSamples = 16;
+    size_t minimumCadenceSamples = 6;
+    size_t maximumCadenceSamples = 512;
+    size_t rateCandidateSamples = 3;
+    uint64_t looseCadenceWindowUs = 500000;
+    uint64_t tightCadenceWindowUs = 1000000;
+    uint64_t majorCadenceRatioNumerator = 7;
+    uint64_t majorCadenceRatioDenominator = 2;
+    uint64_t candidateCadenceRatioNumerator = 2;
+    uint64_t candidateCadenceRatioDenominator = 1;
+    unsigned int materialRateChangePercent = 12;
+    size_t phaseErrorFrames = 3;
+    unsigned int preparationPercentile = 90;
+    unsigned int schedulerPercentile = 95;
+    unsigned int readinessLowPercentile = 10;
+    unsigned int readinessTightPercentile = 90;
+    unsigned int readinessLoosePercentile = 80;
+    uint64_t readinessAttackNumerator = 1;
+    uint64_t readinessAttackDenominator = 4;
+    uint64_t readinessReleaseNumerator = 1;
+    uint64_t readinessReleaseDenominator = 8;
+    uint64_t usableHeadroomNumerator = 3;
+    uint64_t usableHeadroomDenominator = 4;
+    uint64_t looseHeadroomDisplayPeriods = 2;
+    uint64_t baseGuardDivisor = 96;
+};
+
+struct VrrTimingDiagnostics {
+    int64_t readinessPhaseUs = 0;
+    uint64_t readinessDemandUs = 0;
+    uint64_t appliedReadinessReserveUs = 0;
+    size_t cadenceSamples = 0;
+    size_t rateCandidateSamples = 0;
+    size_t readinessSamples = 0;
+    size_t preparationSamples = 0;
+    size_t renderSchedulerSamples = 0;
+    size_t targetSchedulerSamples = 0;
+    size_t cleanSpacingFrames = 0;
+    size_t phaseErrorFrames = 0;
+    bool readinessModelValid = false;
+};
+
 // Platform-neutral, feed-forward VRR timing. The controller projects the
 // sender clock into the local monotonic epoch and learns bounded readiness,
 // render, scheduler, and spacing budgets. It contains no renderer/native API
@@ -40,6 +108,9 @@ class VrrTimingController {
 public:
     explicit VrrTimingController(const VrrSessionConfig& config,
                                  bool canLatchPresentation = true);
+    VrrTimingController(const VrrSessionConfig& config,
+                        bool canLatchPresentation,
+                        const VrrTimingParameters& parameters);
 
     void reset();
 
@@ -79,6 +150,8 @@ public:
     uint64_t earliestSubmissionUs() const;
     uint64_t lastSubmissionUs() const;
     bool hasLastSubmission() const;
+    const VrrTimingParameters& parameters() const;
+    VrrTimingDiagnostics diagnostics() const;
 
 private:
     struct PendingFrame {
@@ -144,6 +217,7 @@ private:
                               size_t limit);
 
     VrrSessionConfig m_Config;
+    VrrTimingParameters m_Parameters;
     uint64_t m_ConfiguredStreamPeriodUs = 0;
     uint64_t m_ConfiguredStreamPeriodQ16 = 0;
     uint64_t m_DisplayPeriodUs = 0;

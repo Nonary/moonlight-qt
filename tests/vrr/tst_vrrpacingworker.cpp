@@ -764,8 +764,8 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
                header.contains("spacing_guard_feedback_us") &&
                header.contains("latch_present_refresh_seq"),
            "deep trace must identify native, tear, guard, and renderer-readiness timing");
-    expect(row.startsWith("4,"),
-           "new captures must use exact-replay trace schema 4");
+    expect(row.startsWith("5,"),
+           "new captures must use parameterized trace schema 5");
     expect(!row.isEmpty() && header.count(',') == row.count(','),
            "deep trace rows must match the CSV schema");
     QFile traceFile(tracePath);

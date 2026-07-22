@@ -48,7 +48,10 @@ constexpr char kTraceHeader[] =
     "used_rtp_timestamp,cadence_eligible,source_rate_changed,phase_discontinuity,rebased,deep_trace,"
     "native_present_timing_valid,native_present_start_us,native_present_end_us,native_present_call_us,"
     "present_count_before_valid,present_count_before,frame_stats_before_valid,frame_stats_before_present_count,frame_stats_before_time_us,frame_stats_before_present_refresh_seq,frame_stats_before_sync_refresh_seq,"
-    "gpu_ready_timing_valid,gpu_ready_wait_start_us,gpu_ready_time_us,gpu_ready_wait_us\n";
+    "gpu_ready_timing_valid,gpu_ready_wait_start_us,gpu_ready_time_us,gpu_ready_wait_us,"
+    "decision_end_us,controller_call_us,stale_check_us,stale_age_us,render_wait_entry_us,target_wait_entry_us,spacing_check_us,presentation_floor_us,correction_wait_start_us,correction_wait_end_us,terminal_time_us,"
+    "readiness_phase_us,readiness_demand_us,applied_readiness_reserve_us,cadence_sample_count,rate_candidate_sample_count,readiness_sample_count,preparation_sample_count,render_scheduler_sample_count,target_scheduler_sample_count,clean_spacing_frames,phase_error_frames,readiness_model_valid,"
+    "param_maximum_forward_movement_us,param_render_lead_floor_us,param_render_lead_ceiling_us,param_render_lead_slack_us,param_presentation_safety_us,param_readiness_ceiling_us,param_minimum_readiness_reserve_us,param_cold_start_readiness_demand_us,param_arrival_spread_guard_us,param_readiness_acquire_step_us,param_maximum_render_wake_lead_us,param_maximum_target_wake_lead_us,param_minimum_guard_us,param_latch_enter_headroom_us,param_latch_exit_headroom_us,param_maximum_base_guard_us,param_maximum_adaptive_guard_us,param_guard_step_us,param_guard_decay_frames,param_scheduler_learning_samples,param_readiness_learning_samples,param_preparation_learning_samples,param_minimum_readiness_samples,param_minimum_cadence_samples,param_maximum_cadence_samples,param_rate_candidate_samples,param_loose_cadence_window_us,param_tight_cadence_window_us,param_major_cadence_ratio_numerator,param_major_cadence_ratio_denominator,param_candidate_cadence_ratio_numerator,param_candidate_cadence_ratio_denominator,param_material_rate_change_percent,param_phase_error_frames,param_preparation_percentile,param_scheduler_percentile,param_readiness_low_percentile,param_readiness_tight_percentile,param_readiness_loose_percentile,param_readiness_attack_numerator,param_readiness_attack_denominator,param_readiness_release_numerator,param_readiness_release_denominator,param_usable_headroom_numerator,param_usable_headroom_denominator,param_loose_headroom_display_periods,param_base_guard_divisor\n";
 constexpr uint32_t kVrrWindowStateMask =
     WINDOW_STATE_CHANGE_MINIMIZED |
     WINDOW_STATE_CHANGE_RESTORED |
@@ -359,6 +362,7 @@ int VrrPacingWorker::run()
             frame, decisionTimeUs);
         FrameTelemetry telemetry;
         telemetry.decisionTimeUs = decisionTimeUs;
+        telemetry.decisionEndUs = LiGetMicroseconds();
 
         // schedule() deliberately clamps an overdue target to the current
         // one-slot deadline. That is right for the newest frame, but it makes
@@ -368,9 +372,11 @@ int VrrPacingWorker::run()
         // rendering it; its RTP/frame delta remains in the controller, so the
         // successor preserves cadence without re-anchoring the whole model.
         const uint64_t scheduleNowUs = LiGetMicroseconds();
+        telemetry.staleCheckUs = scheduleNowUs;
         const uint64_t scheduleAgeUs = scheduleNowUs >=
                 frame.decodeCompleteUs() ?
             scheduleNowUs - frame.decodeCompleteUs() : 0;
+        telemetry.staleAgeUs = scheduleAgeUs;
         if (decision.sourcePeriodUs != 0 &&
             scheduleAgeUs > decision.sourcePeriodUs && hasQueuedFrame()) {
             writeTrace(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
@@ -380,6 +386,7 @@ int VrrPacingWorker::run()
             continue;
         }
 
+        telemetry.renderWaitEntryUs = LiGetMicroseconds();
         const VrrTargetWaitResult renderWait =
             m_TargetWaiter->waitUntil(decision.renderStartUs);
         telemetry.renderWaitFinalUs = renderWait.finalNowUs;
@@ -487,6 +494,7 @@ int VrrPacingWorker::run()
             continue;
         }
 
+        telemetry.targetWaitEntryUs = LiGetMicroseconds();
         const VrrTargetWaitResult targetWait =
             m_TargetWaiter->waitUntil(decision.targetUs,
                                       decision.targetWakeLeadUs);
@@ -530,6 +538,7 @@ int VrrPacingWorker::run()
         // waiter deliberately has a bounded active phase, so a pathological
         // clock must not turn an early return into an early submission.
         uint64_t beforePresentUs = LiGetMicroseconds();
+        telemetry.spacingCheckUs = beforePresentUs;
         uint64_t earliestSubmissionUs =
             m_TimingController->earliestSubmissionUs();
         m_TimingController->noteSpacingDeficit(0);
@@ -542,6 +551,7 @@ int VrrPacingWorker::run()
 
         const uint64_t presentationFloorUs = std::max(decision.targetUs,
                                                        earliestSubmissionUs);
+        telemetry.presentationFloorUs = presentationFloorUs;
         while (beforePresentUs < presentationFloorUs) {
             m_TargetWaiter->waitUntil(presentationFloorUs);
             beforePresentUs = LiGetMicroseconds();
@@ -573,11 +583,13 @@ int VrrPacingWorker::run()
                 m_TimingController->noteSpacingDeficit(deficitUs);
                 const uint64_t correctedFloorUs =
                     m_TimingController->earliestSubmissionUs();
+                telemetry.correctionWaitStartUs = LiGetMicroseconds();
                 telemetry.presentStartUs = LiGetMicroseconds();
                 while (telemetry.presentStartUs < correctedFloorUs) {
                     m_TargetWaiter->waitUntil(correctedFloorUs);
                     telemetry.presentStartUs = LiGetMicroseconds();
                 }
+                telemetry.correctionWaitEndUs = telemetry.presentStartUs;
                 telemetry.presentSpacingUs =
                     telemetry.presentStartUs >= priorSubmissionUs ?
                         telemetry.presentStartUs - priorSubmissionUs : 0;
@@ -870,12 +882,14 @@ void VrrPacingWorker::writeTrace(const QueuedFrame& queuedFrame,
     row.decodeCompleteUs = frame.decodeCompleteUs();
     row.input = queuedFrame.trace;
     row.decision = decision;
+    row.diagnostics = m_TimingController->diagnostics();
     row.feedback = feedback;
     row.telemetry = telemetry;
     row.completionQueueDepth = queueDepth;
     row.disposition = disposition;
     row.decisionValid = decisionValid;
     row.dropped = disposition != TraceDisposition::Presented;
+    row.terminalTimeUs = LiGetMicroseconds();
 
     {
         QMutexLocker lock(&m_TraceLock);
@@ -926,6 +940,8 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     m_TraceLatestArrivalUs = std::max(m_TraceLatestArrivalUs,
                                       row.input.arrivalUs);
     const VrrTimingDecision& decision = row.decision;
+    const VrrTimingDiagnostics& diagnostics = row.diagnostics;
+    const VrrTimingParameters& parameters = m_TimingController->parameters();
     const VrrPresentFeedback& feedback = row.feedback;
     const FrameTelemetry& telemetry = row.telemetry;
     const uint64_t nativePresentDurationUs =
@@ -962,7 +978,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
         line.append(value);
     };
 
-    addUnsigned(4);
+    addUnsigned(5);
     addUnsigned(row.input.arrivalSequence);
     addSigned(row.frameNumber);
     addUnsigned(row.rtpTimestamp);
@@ -1059,6 +1075,77 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(feedback.gpuReadyWaitStartUs);
     addUnsigned(feedback.gpuReadyTimeUs);
     addUnsigned(gpuReadyWaitUs);
+    addUnsigned(telemetry.decisionEndUs);
+    addUnsigned(telemetry.decisionEndUs >= telemetry.decisionTimeUs ?
+        telemetry.decisionEndUs - telemetry.decisionTimeUs : 0);
+    addUnsigned(telemetry.staleCheckUs);
+    addUnsigned(telemetry.staleAgeUs);
+    addUnsigned(telemetry.renderWaitEntryUs);
+    addUnsigned(telemetry.targetWaitEntryUs);
+    addUnsigned(telemetry.spacingCheckUs);
+    addUnsigned(telemetry.presentationFloorUs);
+    addUnsigned(telemetry.correctionWaitStartUs);
+    addUnsigned(telemetry.correctionWaitEndUs);
+    addUnsigned(row.terminalTimeUs);
+    addSigned(diagnostics.readinessPhaseUs);
+    addUnsigned(diagnostics.readinessDemandUs);
+    addUnsigned(diagnostics.appliedReadinessReserveUs);
+    addUnsigned(diagnostics.cadenceSamples);
+    addUnsigned(diagnostics.rateCandidateSamples);
+    addUnsigned(diagnostics.readinessSamples);
+    addUnsigned(diagnostics.preparationSamples);
+    addUnsigned(diagnostics.renderSchedulerSamples);
+    addUnsigned(diagnostics.targetSchedulerSamples);
+    addUnsigned(diagnostics.cleanSpacingFrames);
+    addUnsigned(diagnostics.phaseErrorFrames);
+    addBool(diagnostics.readinessModelValid);
+    addUnsigned(parameters.maximumForwardMovementUs);
+    addUnsigned(parameters.renderLeadFloorUs);
+    addUnsigned(parameters.renderLeadCeilingUs);
+    addUnsigned(parameters.renderLeadSlackUs);
+    addUnsigned(parameters.presentationSafetyUs);
+    addUnsigned(parameters.readinessCeilingUs);
+    addUnsigned(parameters.minimumReadinessReserveUs);
+    addUnsigned(parameters.coldStartReadinessDemandUs);
+    addUnsigned(parameters.arrivalSpreadGuardUs);
+    addUnsigned(parameters.readinessAcquireStepUs);
+    addUnsigned(parameters.maximumRenderWakeLeadUs);
+    addUnsigned(parameters.maximumTargetWakeLeadUs);
+    addUnsigned(parameters.minimumGuardUs);
+    addUnsigned(parameters.latchedPresentationHeadroomUs);
+    addUnsigned(parameters.latchedPresentationExitHeadroomUs);
+    addUnsigned(parameters.maximumBaseGuardUs);
+    addUnsigned(parameters.maximumAdaptiveGuardUs);
+    addUnsigned(parameters.guardStepUs);
+    addUnsigned(parameters.guardDecayFrames);
+    addUnsigned(parameters.schedulerLearningSamples);
+    addUnsigned(parameters.readinessLearningSamples);
+    addUnsigned(parameters.preparationLearningSamples);
+    addUnsigned(parameters.minimumReadinessSamples);
+    addUnsigned(parameters.minimumCadenceSamples);
+    addUnsigned(parameters.maximumCadenceSamples);
+    addUnsigned(parameters.rateCandidateSamples);
+    addUnsigned(parameters.looseCadenceWindowUs);
+    addUnsigned(parameters.tightCadenceWindowUs);
+    addUnsigned(parameters.majorCadenceRatioNumerator);
+    addUnsigned(parameters.majorCadenceRatioDenominator);
+    addUnsigned(parameters.candidateCadenceRatioNumerator);
+    addUnsigned(parameters.candidateCadenceRatioDenominator);
+    addUnsigned(parameters.materialRateChangePercent);
+    addUnsigned(parameters.phaseErrorFrames);
+    addUnsigned(parameters.preparationPercentile);
+    addUnsigned(parameters.schedulerPercentile);
+    addUnsigned(parameters.readinessLowPercentile);
+    addUnsigned(parameters.readinessTightPercentile);
+    addUnsigned(parameters.readinessLoosePercentile);
+    addUnsigned(parameters.readinessAttackNumerator);
+    addUnsigned(parameters.readinessAttackDenominator);
+    addUnsigned(parameters.readinessReleaseNumerator);
+    addUnsigned(parameters.readinessReleaseDenominator);
+    addUnsigned(parameters.usableHeadroomNumerator);
+    addUnsigned(parameters.usableHeadroomDenominator);
+    addUnsigned(parameters.looseHeadroomDisplayPeriods);
+    addUnsigned(parameters.baseGuardDivisor);
     line.append('\n');
 
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {

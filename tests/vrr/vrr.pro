@@ -7,9 +7,11 @@ timingcontroller.file = $$PWD/timingcontroller.pro
 ratepolicy.file = $$PWD/ratepolicy.pro
 pacingworker.file = $$PWD/pacingworker.pro
 replay.file = $$PWD/replay.pro
+replayconfig.file = $$PWD/replayconfig.pro
 
 SUBDIRS += \
     timingcontroller \
     ratepolicy \
     pacingworker \
-    replay
+    replay \
+    replayconfig

@@ -9,6 +9,7 @@ nmake
 .\vrr\release\tst_vrrtimingcontroller.exe
 .\vrr\release\tst_vrrratepolicy.exe
 .\vrr\release\tst_vrrpacingworker.exe
+.\vrr\release\tst_vrrreplayconfig.exe
 ```
 
 On Linux, use the selected Qt `qmake` in the same way and run `make`. The
@@ -67,7 +68,14 @@ than lose replay inputs. On Windows, direct UNC paths are rejected to keep
 network I/O out of diagnostics; capture locally and copy the completed file
 afterward.
 
-Schema 4 includes two deliberately separate tear signals and an explicit
+Schema 5 retains the schema-4 tear signals and adds the complete resolved
+controller parameter set, controller call duration and learned-model state,
+stale-check age, render/target wait boundaries, both spacing-floor checks,
+correction-wait boundaries, and terminal time. These inexpensive monotonic
+observations are present in ordinary replay-grade traces. Native queries remain
+opt-in because they can perturb the renderer.
+
+Schema 4 introduced two deliberately separate tear signals and an explicit
 `spacing_guard_feedback_us` value. The latter distinguishes a harmless wait at
 the first spacing check from the rare second-boundary violation that actually
 changes the controller's adaptive guard. `vrrreplay` remains backward
@@ -149,9 +157,41 @@ timing-policy A/B results deterministic and permits an exact unchanged-policy
 baseline. A controller change that also changes decoder backpressure, queue
 admission, present-mode cost, or host/network latency still needs a live
 validation run because a frame dropped before preparation has no counterfactual
-renderer cost in the trace. Schema 4 records all client-side feedback needed to
-reconstruct controller state; the trace still cannot provide host capture,
+renderer cost in the trace. Schema 5 records the controller parameters and
+additional client-side timing needed to attribute controller and worker time;
+the trace still cannot provide host capture,
 encode, or network latency timestamps that the client never observed.
+
+## Parameterized scenarios
+
+Every behavior-affecting timing-controller number can be changed for replay
+without rebuilding. List names or write a complete starting configuration:
+
+```powershell
+.\vrr\release\vrrreplay.exe --list-parameters
+.\vrr\release\vrrreplay.exe --dump-default-config > replay-config.json
+```
+
+For a quick experiment, use one or more overrides. Resolved parameters and a
+stable fingerprint are included in the JSON result:
+
+```powershell
+.\vrr\release\vrrreplay.exe capture.vrrtrace `
+    --set controller.guard_step_us=100 `
+    --set controller.scheduler_learning_samples=32
+```
+
+Use `replay-scenarios.example.json` as the batch format. Top-level parameters
+are inherited by each named scenario, scenario parameters override them, and
+CLI `--set` values have final precedence. Assertions use dotted result paths
+and `<`, `<=`, `==`, `>=`, or `>`; a failed assertion exits with code 4.
+
+`mode: fixed` preserves recorded admission and lifecycle for rigorous A/B
+controller comparisons. `mode: worker` requires schema 5 and adds an explicitly
+experimental queue-capacity/admission model. Frames that were dropped in the
+capture but would be admitted by a candidate are reported as requiring an
+estimated renderer cost; DXGI scanout and optical tears are never predicted.
+Schemas 3 and 4 remain readable in fixed mode for historical baseline checks.
 
 To include these targets in a top-level developer build, the integration
 project should add `tests` to its `SUBDIRS` only inside
