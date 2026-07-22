@@ -492,8 +492,9 @@ void testDecodeTailAdaptation()
     expect(controller.renderLeadUs() >=
                1000 + controller.parameters().renderLeadSlackUs,
            "preparation duration must include render slack");
-    expect(controller.timingBudgetUs() > 1750,
-           "positive readiness tail must grow the timing budget");
+    expect(controller.diagnostics().readinessDemandUs >
+               controller.parameters().minimumReadinessReserveUs,
+           "positive readiness tail must grow learned readiness demand");
 }
 
 void testRateChangeReseedsReadinessBudget()
