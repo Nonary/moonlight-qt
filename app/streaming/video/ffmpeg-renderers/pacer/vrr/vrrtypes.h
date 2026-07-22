@@ -6,7 +6,7 @@
 // crossed the decoder/pacer boundary.
 
 #include <cstdint>
-#include <utility>
+#include <memory>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -37,38 +37,17 @@ public:
     {
     }
 
-    ~PacedFrame()
-    {
-        reset();
-    }
-
-    PacedFrame(const PacedFrame&) = delete;
-    PacedFrame& operator=(const PacedFrame&) = delete;
-
-    PacedFrame(PacedFrame&& other) noexcept
-    {
-        moveFrom(std::move(other));
-    }
-
-    PacedFrame& operator=(PacedFrame&& other) noexcept
-    {
-        if (this != &other) {
-            reset();
-            moveFrom(std::move(other));
-        }
-        return *this;
-    }
+    PacedFrame(PacedFrame&&) noexcept = default;
+    PacedFrame& operator=(PacedFrame&&) noexcept = default;
 
     AVFrame* frame() const
     {
-        return m_Frame;
+        return m_Frame.get();
     }
 
     AVFrame* release()
     {
-        AVFrame* frame = m_Frame;
-        m_Frame = nullptr;
-        return frame;
+        return m_Frame.release();
     }
 
     explicit operator bool() const
@@ -96,25 +75,15 @@ public:
         return m_DecodeCompleteUs;
     }
 
-    void reset()
-    {
-        if (m_Frame != nullptr) {
-            av_frame_free(&m_Frame);
-        }
-    }
-
 private:
-    void moveFrom(PacedFrame&& other)
-    {
-        m_Frame = other.m_Frame;
-        m_FrameNumber = other.m_FrameNumber;
-        m_RtpTimestamp = other.m_RtpTimestamp;
-        m_TimestampValid = other.m_TimestampValid;
-        m_DecodeCompleteUs = other.m_DecodeCompleteUs;
-        other.m_Frame = nullptr;
-    }
+    struct FrameDeleter {
+        void operator()(AVFrame* frame) const
+        {
+            av_frame_free(&frame);
+        }
+    };
 
-    AVFrame* m_Frame = nullptr;
+    std::unique_ptr<AVFrame, FrameDeleter> m_Frame;
     int m_FrameNumber = -1;
     uint32_t m_RtpTimestamp = 0;
     bool m_TimestampValid = false;

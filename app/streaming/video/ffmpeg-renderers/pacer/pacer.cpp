@@ -267,7 +267,7 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
 
         // Drop the lock while we call av_frame_free()
         m_FrameQueueLock.unlock();
-        m_Telemetry.recordLegacyDrop(LiGetMicroseconds());
+        m_Telemetry.recordLegacyDrop();
         av_frame_free(&frame);
         m_FrameQueueLock.lock();
     }
@@ -457,8 +457,7 @@ void Pacer::renderFrame(AVFrame* frame)
 
     m_Telemetry.recordLegacyFrame(
         beforeRender - static_cast<uint64_t>(frame->pkt_dts),
-        afterRender - beforeRender,
-        afterRender);
+        afterRender - beforeRender);
 
     // Wait until after next frame to free this one to ensure the GPU
     // doesn't stall or read garbage if the backing buffer gets returned
@@ -501,7 +500,7 @@ void Pacer::renderFrame(AVFrame* frame)
 
         // Drop the lock while we call av_frame_free()
         m_FrameQueueLock.unlock();
-        m_Telemetry.recordLegacyDrop(LiGetMicroseconds());
+        m_Telemetry.recordLegacyDrop();
         av_frame_free(&frame);
         m_FrameQueueLock.lock();
     }

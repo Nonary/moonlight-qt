@@ -5,8 +5,6 @@
 #include <QQmlEngine>
 #include <QVariantList>
 
-#include <vector>
-
 class StreamingPreferences : public QObject
 {
     Q_OBJECT
@@ -113,7 +111,7 @@ public:
 
     Q_PROPERTY(int width MEMBER width NOTIFY displayModeChanged)
     Q_PROPERTY(int height MEMBER height NOTIFY displayModeChanged)
-    Q_PROPERTY(int fps READ getFps WRITE setFps NOTIFY displayModeChanged)
+    Q_PROPERTY(int fps MEMBER fps NOTIFY displayModeChanged)
     Q_PROPERTY(int bitrateKbps MEMBER bitrateKbps NOTIFY bitrateChanged)
     Q_PROPERTY(bool unlockBitrate MEMBER unlockBitrate NOTIFY unlockBitrateChanged)
     Q_PROPERTY(bool autoAdjustBitrate MEMBER autoAdjustBitrate NOTIFY autoAdjustBitrateChanged)
@@ -151,9 +149,6 @@ public:
     Q_PROPERTY(Language language MEMBER language NOTIFY languageChanged);
 
     Q_INVOKABLE bool retranslate();
-
-    int getFps() const;
-    void setFps(int value);
 
     // Rate choices are advisory; toggling VRR never rewrites the saved FPS
     // preference.
@@ -242,8 +237,6 @@ private:
     explicit StreamingPreferences(QQmlEngine *qmlEngine);
 
     QString getSuffixFromLanguage(Language lang);
-
-    static std::vector<int> toRefreshRates(const QVariantList& refreshRates);
 
     QQmlEngine* m_QmlEngine;
 };

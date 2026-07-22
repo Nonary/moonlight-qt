@@ -87,7 +87,6 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_VrrFallbackReason(VrrFallbackReason::InitializationFailed),
       m_VrrFramePrepared(false),
       m_VrrContextLocked(false),
-      m_VrrPreparedFrame(nullptr),
       m_VrrPresentReadyFenceValue(0),
       m_VrrPresentReadyFenceEvent(nullptr),
       m_VrrPresentReadyAvailable(false),
@@ -1708,7 +1707,6 @@ void D3D11VARenderer::releasePreparedVrrFrame()
     }
 
     m_VrrFramePrepared = false;
-    m_VrrPreparedFrame = nullptr;
     m_VrrGpuReadyTimingValid = false;
     m_VrrGpuReadyWaitStartUs = 0;
     m_VrrGpuReadyTimeUs = 0;
@@ -1972,7 +1970,6 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
         return result;
     }
 
-    m_VrrPreparedFrame = frame;
     m_VrrFramePrepared = true;
     result.prepared = true;
     return result;
@@ -1983,8 +1980,7 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
 {
     VrrPresentFeedback feedback;
 
-    if (!m_VrrFramePrepared || m_VrrPreparedFrame == nullptr ||
-            m_VrrSuspended) {
+    if (!m_VrrFramePrepared || m_VrrSuspended) {
         return cancelFrame();
     }
 

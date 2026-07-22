@@ -187,10 +187,9 @@ CLI `--set` values have final precedence. Assertions use dotted result paths
 and `<`, `<=`, `==`, `>=`, or `>`; a failed assertion exits with code 4.
 
 `mode: fixed` preserves recorded admission and lifecycle for rigorous A/B
-controller comparisons. `mode: worker` requires schema 5 and adds an explicitly
-experimental queue-capacity/admission model. Frames that were dropped in the
-capture but would be admitted by a candidate are reported as requiring an
-estimated renderer cost; DXGI scanout and optical tears are never predicted.
+controller comparisons. `mode: worker` requires schema 5 and audits recorded
+arrival/queue depth against a candidate capacity. It does not synthesize an
+alternate renderer lifecycle; DXGI scanout and optical tears are never predicted.
 Schemas 3 and 4 remain readable in fixed mode for historical baseline checks.
 
 To include these targets in a top-level developer build, the integration

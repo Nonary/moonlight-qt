@@ -279,14 +279,10 @@ void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlag
 bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             SDL_Window* window, int videoFormat, int width, int height,
                             int frameRate, bool enableVsync, bool enableFramePacing,
-                            bool enableVrr, int vrrDisplayRefreshHz,
                             bool testOnly, IVideoDecoder*& chosenDecoder,
-                            bool* effectiveVrr)
+                            bool enableVrr, int vrrDisplayRefreshHz,
+                            [[maybe_unused]] bool* effectiveVrr)
 {
-    if (effectiveVrr != nullptr) {
-        *effectiveVrr = enableVrr;
-    }
-
     DECODER_PARAMETERS params = {};
 
     // We should never have vsync enabled for test-mode.
@@ -427,7 +423,7 @@ void Session::getDecoderInfo(SDL_Window* window,
     // Try an HEVC Main10 decoder first to see if we have HDR support
     if (chooseDecoder(StreamingPreferences::VDS_FORCE_HARDWARE,
                       window, VIDEO_FORMAT_H265_MAIN10, 1920, 1080, 60,
-                      false, false, false, 0, true, decoder)) {
+                      false, false, true, decoder)) {
         isHardwareAccelerated = decoder->isHardwareAccelerated();
         isFullScreenOnly = decoder->isAlwaysFullScreen();
         isHdrSupported = decoder->isHdrSupported();
@@ -440,7 +436,7 @@ void Session::getDecoderInfo(SDL_Window* window,
     // Try an AV1 Main10 decoder next to see if we have HDR support
     if (chooseDecoder(StreamingPreferences::VDS_FORCE_HARDWARE,
                       window, VIDEO_FORMAT_AV1_MAIN10, 1920, 1080, 60,
-                      false, false, false, 0, true, decoder)) {
+                      false, false, true, decoder)) {
         // If we've got a working AV1 Main 10-bit decoder, we'll enable the HDR checkbox
         // but we will still continue probing to get other attributes for HEVC or H.264
         // decoders. See the AV1 comment at the top of the function for more info.
@@ -452,10 +448,10 @@ void Session::getDecoderInfo(SDL_Window* window,
         // that supports HDR rendering with software decoded frames.
         if (chooseDecoder(StreamingPreferences::VDS_FORCE_SOFTWARE,
                           window, VIDEO_FORMAT_H265_MAIN10, 1920, 1080, 60,
-                          false, false, false, 0, true, decoder) ||
+                          false, false, true, decoder) ||
             chooseDecoder(StreamingPreferences::VDS_FORCE_SOFTWARE,
                           window, VIDEO_FORMAT_AV1_MAIN10, 1920, 1080, 60,
-                          false, false, false, 0, true, decoder)) {
+                          false, false, true, decoder)) {
             isHdrSupported = decoder->isHdrSupported();
             delete decoder;
         }
@@ -469,7 +465,7 @@ void Session::getDecoderInfo(SDL_Window* window,
     // Try a regular hardware accelerated HEVC decoder now
     if (chooseDecoder(StreamingPreferences::VDS_FORCE_HARDWARE,
                       window, VIDEO_FORMAT_H265, 1920, 1080, 60,
-                      false, false, false, 0, true, decoder)) {
+                      false, false, true, decoder)) {
         isHardwareAccelerated = decoder->isHardwareAccelerated();
         isFullScreenOnly = decoder->isAlwaysFullScreen();
         maxResolution = decoder->getDecoderMaxResolution();
@@ -482,7 +478,7 @@ void Session::getDecoderInfo(SDL_Window* window,
 #if 0 // See AV1 comment at the top of this function
     if (chooseDecoder(StreamingPreferences::VDS_FORCE_HARDWARE,
                       window, VIDEO_FORMAT_AV1_MAIN8, 1920, 1080, 60,
-                      false, false, false, 0, true, decoder)) {
+                      false, false, true, decoder)) {
         isHardwareAccelerated = decoder->isHardwareAccelerated();
         isFullScreenOnly = decoder->isAlwaysFullScreen();
         maxResolution = decoder->getDecoderMaxResolution();
@@ -496,7 +492,7 @@ void Session::getDecoderInfo(SDL_Window* window,
     // This will fall back to software decoding, so it should always work.
     if (chooseDecoder(StreamingPreferences::VDS_AUTO,
                       window, VIDEO_FORMAT_H264, 1920, 1080, 60,
-                      false, false, false, 0, true, decoder)) {
+                      false, false, true, decoder)) {
         isHardwareAccelerated = decoder->isHardwareAccelerated();
         isFullScreenOnly = decoder->isAlwaysFullScreen();
         maxResolution = decoder->getDecoderMaxResolution();
@@ -517,7 +513,7 @@ Session::getDecoderAvailability(SDL_Window* window,
     IVideoDecoder* decoder;
 
     if (!chooseDecoder(vds, window, videoFormat, width, height, frameRate,
-                       false, false, false, 0, true, decoder)) {
+                       false, false, true, decoder)) {
         return DecoderAvailability::None;
     }
 
@@ -538,7 +534,7 @@ bool Session::populateDecoderProperties(SDL_Window* window)
                        m_StreamConfig.width,
                        m_StreamConfig.height,
                        m_StreamConfig.fps,
-                       false, false, false, 0, true, decoder)) {
+                       false, false, true, decoder)) {
         return false;
     }
 
@@ -612,7 +608,7 @@ Session::~Session()
 
 void Session::snapshotPresentationSettings(SDL_Window* window)
 {
-    m_PresentationSettings.requestedVrr = m_Preferences->enableVrr;
+    const bool requestedVrr = m_Preferences->enableVrr;
     m_PresentationSettings.decoderSelection = m_Preferences->videoDecoderSelection;
     m_PresentationSettings.effectiveWindowMode = m_Preferences->windowMode;
 
@@ -622,8 +618,11 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
 
     // Retain the legacy V-sync behavior when display information is incomplete,
     // but do not use its 60 Hz fallback to qualify VRR.
-    const int vsyncRefreshRate = hasStrictRefreshRate ? strictRefreshRate :
-                                                       StreamUtils::getDisplayRefreshRate(window);
+    const int vsyncRefreshRate = hasStrictRefreshRate ? strictRefreshRate : 60;
+    if (!hasStrictRefreshRate) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Refresh rate unavailable; assuming 60 Hz for legacy pacing");
+    }
     m_PresentationSettings.effectiveVsync = m_Preferences->enableVsync;
     if (m_PresentationSettings.effectiveVsync && vsyncRefreshRate + 5 < m_StreamConfig.fps) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -635,7 +634,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
                                                m_Preferences->framePacing;
     m_PresentationSettings.enableVrr = false;
 
-    if (m_PresentationSettings.requestedVrr) {
+    if (requestedVrr) {
         const bool hasAdaptiveHeadroom = hasStrictRefreshRate &&
             VrrRatePolicy::hasAdaptiveHeadroom(m_StreamConfig.fps,
                                                strictRefreshRate);
@@ -666,7 +665,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
     // A rejected VRR request still uses the seamless fixed-V-sync fallback.
     // Keep that fallback paced even when the separate frame-pacing preference
     // is off, matching renderer-level VRR rejection later in initialization.
-    if (m_PresentationSettings.requestedVrr &&
+    if (requestedVrr &&
             !m_PresentationSettings.enableVrr &&
             m_PresentationSettings.effectiveVsync) {
         m_PresentationSettings.enableFramePacing = true;
@@ -680,7 +679,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Presentation snapshot: V-sync %s, VRR requested %s, VRR enabled %s, refresh %d Hz, window mode %d",
                 m_PresentationSettings.effectiveVsync ? "enabled" : "disabled",
-                m_PresentationSettings.requestedVrr ? "yes" : "no",
+                requestedVrr ? "yes" : "no",
                 m_PresentationSettings.enableVrr ? "yes" : "no",
                 m_PresentationSettings.refreshRate,
                 static_cast<int>(m_PresentationSettings.effectiveWindowMode));
@@ -2370,10 +2369,10 @@ void Session::exec()
                                m_ActiveVideoHeight, m_ActiveVideoFrameRate,
                                m_PresentationSettings.effectiveVsync,
                                m_PresentationSettings.enableFramePacing,
-                               m_PresentationSettings.enableVrr,
-                               m_PresentationSettings.refreshRate,
                                false,
                                s_ActiveSession->m_VideoDecoder,
+                               m_PresentationSettings.enableVrr,
+                               m_PresentationSettings.refreshRate,
                                &m_PresentationSettings.enableVrr)) {
                 SDL_UnlockMutex(m_DecoderLock);
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,

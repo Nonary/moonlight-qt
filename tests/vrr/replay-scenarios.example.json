@@ -3,9 +3,7 @@
   "parameters": {
     "controller": {},
     "worker": {
-      "queue_capacity": 3,
-      "rolling_cost_window": 32,
-      "stale_source_periods": 1
+      "queue_capacity": 3
     }
   },
   "scenarios": [

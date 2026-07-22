@@ -6,8 +6,7 @@
 // one small policy object. It has no dependency on SDL, QSettings, or a
 // renderer, so the arithmetic can be tested independently.
 enum class VrrFpsChoiceKind {
-    Baseline,
-    Native,
+    Fixed,
     Vrr,
     LowLatencyVrr,
     Custom,
@@ -26,8 +25,6 @@ public:
 
     // floor((refresh * 5 / 6) / 5) * 5
     static int lowLatencyRateForRefresh(int refreshHz);
-
-    static bool isNativeRefreshRate(int fps, const std::vector<int>& refreshRates);
 
     // Adaptive presentation needs enough time between stream frames for one
     // display period and the pacer's baseline safety guard. This is a

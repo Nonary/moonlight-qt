@@ -47,9 +47,9 @@ void VrrRatePolicyTest::vrrChoicesOmitNativeRefresh()
 
     QCOMPARE(static_cast<int>(choices.size()), 5);
     QCOMPARE(choices[0].fps, 30);
-    QCOMPARE(static_cast<int>(choices[0].kind), static_cast<int>(VrrFpsChoiceKind::Baseline));
+    QCOMPARE(static_cast<int>(choices[0].kind), static_cast<int>(VrrFpsChoiceKind::Fixed));
     QCOMPARE(choices[1].fps, 60);
-    QCOMPARE(static_cast<int>(choices[1].kind), static_cast<int>(VrrFpsChoiceKind::Baseline));
+    QCOMPARE(static_cast<int>(choices[1].kind), static_cast<int>(VrrFpsChoiceKind::Fixed));
     QCOMPARE(choices[2].fps, 90);
     QCOMPARE(static_cast<int>(choices[2].kind), static_cast<int>(VrrFpsChoiceKind::Custom));
     QCOMPARE(choices[3].fps, 100);
@@ -72,9 +72,9 @@ void VrrRatePolicyTest::disabledChoicesKeepNativeRefresh()
     QCOMPARE(choices[2].fps, 90);
     QCOMPARE(static_cast<int>(choices[2].kind), static_cast<int>(VrrFpsChoiceKind::Custom));
     QCOMPARE(choices[3].fps, 120);
-    QCOMPARE(static_cast<int>(choices[3].kind), static_cast<int>(VrrFpsChoiceKind::Native));
+    QCOMPARE(static_cast<int>(choices[3].kind), static_cast<int>(VrrFpsChoiceKind::Fixed));
     QCOMPARE(choices[4].fps, 144);
-    QCOMPARE(static_cast<int>(choices[4].kind), static_cast<int>(VrrFpsChoiceKind::Native));
+    QCOMPARE(static_cast<int>(choices[4].kind), static_cast<int>(VrrFpsChoiceKind::Fixed));
 }
 
 QTEST_APPLESS_MAIN(VrrRatePolicyTest)

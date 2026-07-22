@@ -406,7 +406,7 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
 
     // Resolve --fps option
     if (parser.isSet("fps")) {
-        preferences->setFps(parser.getIntOption("fps"));
+        preferences->fps = parser.getIntOption("fps");
         if (!inRange(preferences->fps, 10, 480)) {
             fprintf(stderr, "Warning: FPS is out of the supported range (10 - 480 FPS). Performance may suffer!\n");
         }

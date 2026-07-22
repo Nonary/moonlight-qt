@@ -129,7 +129,6 @@ private:
     VrrFallbackReason m_VrrFallbackReason;
     bool m_VrrFramePrepared;
     bool m_VrrContextLocked;
-    AVFrame* m_VrrPreparedFrame;
     Microsoft::WRL::ComPtr<ID3D11Fence> m_VrrPresentReadyFence;
     UINT64 m_VrrPresentReadyFenceValue;
     HANDLE m_VrrPresentReadyFenceEvent;

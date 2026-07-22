@@ -9,8 +9,6 @@
 
 struct VrrReplayWorkerParameters {
     size_t queueCapacity = 3;
-    size_t rollingCostWindow = 32;
-    uint64_t staleSourcePeriods = 1;
 };
 
 struct VrrReplayAssertion {

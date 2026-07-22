@@ -188,8 +188,8 @@ private:
     bool chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                        SDL_Window* window, int videoFormat, int width, int height,
                        int frameRate, bool enableVsync, bool enableFramePacing,
-                       bool enableVrr, int vrrDisplayRefreshHz, bool testOnly,
-                       IVideoDecoder*& chosenDecoder,
+                       bool testOnly, IVideoDecoder*& chosenDecoder,
+                       bool enableVrr = false, int vrrDisplayRefreshHz = 0,
                        bool* effectiveVrr = nullptr);
 
     static
@@ -246,7 +246,6 @@ private:
     int drSubmitDecodeUnit(PDECODE_UNIT du);
 
     struct PresentationSettings {
-        bool requestedVrr = false;
         bool effectiveVsync = false;
         bool enableFramePacing = false;
         bool enableVrr = false;

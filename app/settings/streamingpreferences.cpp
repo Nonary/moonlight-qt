@@ -24,8 +24,6 @@
 #define SER_FULLSCREEN "fullscreen"
 #define SER_VSYNC "vsync"
 #define SER_ENABLEVRR "enablevrr"
-#define SER_LEGACY_VRRSMOOTHNESS "vrrsmoothness"
-#define SER_LEGACY_VRRSCALINGAGGRESSIVENESS "vrrscalingaggressiveness"
 #define SER_GAMEOPTS "gameopts"
 #define SER_HOSTAUDIO "hostaudio"
 #define SER_MULTICONT "multicontroller"
@@ -336,8 +334,6 @@ void StreamingPreferences::save()
     settings.setValue(SER_AUTOADJUSTBITRATE, autoAdjustBitrate);
     settings.setValue(SER_VSYNC, enableVsync);
     settings.setValue(SER_ENABLEVRR, enableVrr);
-    settings.remove(SER_LEGACY_VRRSMOOTHNESS);
-    settings.remove(SER_LEGACY_VRRSCALINGAGGRESSIVENESS);
     settings.setValue(SER_GAMEOPTS, gameOptimizations);
     settings.setValue(SER_HOSTAUDIO, playAudioOnHost);
     settings.setValue(SER_MULTICONT, multiController);
@@ -371,40 +367,20 @@ void StreamingPreferences::save()
     settings.setValue(SER_KEEPAWAKE, keepAwake);
 }
 
-int StreamingPreferences::getFps() const
+QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRates) const
 {
-    return fps;
-}
-
-void StreamingPreferences::setFps(int value)
-{
-    if (fps != value) {
-        fps = value;
-        emit displayModeChanged();
-    }
-}
-
-std::vector<int> StreamingPreferences::toRefreshRates(const QVariantList& refreshRates)
-{
-    std::vector<int> result;
-    result.reserve(refreshRates.size());
-
+    std::vector<int> rates;
+    rates.reserve(refreshRates.size());
     for (const QVariant& value : refreshRates) {
         bool ok = false;
         const int refreshHz = value.toInt(&ok);
         if (ok && refreshHz > 0) {
-            result.push_back(refreshHz);
+            rates.push_back(refreshHz);
         }
     }
 
-    return result;
-}
-
-QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRates) const
-{
-    const std::vector<VrrFpsChoice> choices = VrrRatePolicy::buildChoices(toRefreshRates(refreshRates),
-                                                                            fps,
-                                                                            enableVsync && enableVrr);
+    const std::vector<VrrFpsChoice> choices = VrrRatePolicy::buildChoices(
+        rates, fps, enableVsync && enableVrr);
     QVariantList result;
     for (const VrrFpsChoice& choice : choices) {
         QVariantMap item;
@@ -412,11 +388,8 @@ QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRate
         item.insert("is_custom", choice.kind == VrrFpsChoiceKind::Custom);
 
         switch (choice.kind) {
-        case VrrFpsChoiceKind::Baseline:
-            item.insert("kind", "baseline");
-            break;
-        case VrrFpsChoiceKind::Native:
-            item.insert("kind", "native");
+        case VrrFpsChoiceKind::Fixed:
+            item.insert("kind", "fixed");
             break;
         case VrrFpsChoiceKind::Vrr:
             item.insert("kind", "vrr");

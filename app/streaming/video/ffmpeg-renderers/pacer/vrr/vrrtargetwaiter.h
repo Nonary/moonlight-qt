@@ -26,7 +26,6 @@ struct VrrTargetWaitResult {
 
 class VrrTargetWaiter {
 public:
-    static constexpr uint64_t kCoarseWakeMarginUs = 500;
     static constexpr uint64_t kMaximumActiveWaitUs = 500;
     // Cap the active region so learned scheduler correction cannot turn a
     // near-refresh stream into a multi-millisecond TIME_CRITICAL yield loop.

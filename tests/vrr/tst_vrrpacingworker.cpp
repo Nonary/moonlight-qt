@@ -117,9 +117,6 @@ void testCapabilityRejection()
     VrrPacingWorker unsupportedWorker(&backend, enabledConfig(), &telemetry);
     expect(!unsupportedWorker.start(),
            "worker must reject an unsupported VRR presentation backend");
-    expect(backend.checkSupport() ==
-               VrrFallbackReason::AdaptivePresentationUnavailable,
-           "presenter must retain a concrete rejection reason");
 }
 
 void testQueueCapacityAndDrops()
@@ -246,14 +243,13 @@ void testQueuedStaleFrameYieldsToFreshSuccessor()
 void testTelemetrySnapshotsRemainCumulative()
 {
     PacerTelemetry telemetry;
-    telemetry.beginVrrSession(1);
+    telemetry.beginVrrSession();
 
     constexpr uint64_t frameCount = 512;
     std::atomic_bool producerDone { false };
     std::thread producer([&telemetry, &producerDone, frameCount] {
         for (uint64_t i = 1; i <= frameCount; ++i) {
             VrrTelemetrySample sample;
-            sample.publicationTimeUs = i + 1;
             sample.decisionTimeUs = i;
             sample.pacerTimeUs = i;
             sample.renderTimeUs = i * 2;
@@ -287,7 +283,6 @@ void testTelemetrySnapshotsRemainCumulative()
     producer.join();
 
     VrrTelemetrySample delayedSubmission;
-    delayedSubmission.publicationTimeUs = frameCount + 2;
     delayedSubmission.decisionTimeUs = frameCount + 1;
     delayedSubmission.targetWaitEntryLate = true;
     telemetry.recordVrrFrame(delayedSubmission);
@@ -583,27 +578,6 @@ void testSuspendedPreparedCancellationHonorsDisplayFloor()
 
 void testImmutablePresentationContract()
 {
-    expect(expectedDxgiVrrPresentFlags() == kFakeDxgiPresentAllowTearing,
-           "D3D11 adaptive presentation must not depend on phase telemetry availability");
-    expect(expectedLinuxPresentationMode(FakeLinuxPresentationBackend::Wayland, true) ==
-               FakeLinuxPresentationMode::Mailbox,
-           "Wayland selects Mailbox when available");
-    expect(expectedLinuxPresentationMode(FakeLinuxPresentationBackend::X11, true) ==
-               FakeLinuxPresentationMode::Immediate,
-           "X11 selects Immediate when available");
-    expect(expectedLinuxPresentationMode(FakeLinuxPresentationBackend::Gamescope, true) ==
-               FakeLinuxPresentationMode::Immediate,
-           "Gamescope selects Immediate when available");
-    expect(expectedLinuxPresentationMode(FakeLinuxPresentationBackend::KmsDrm, true) ==
-               FakeLinuxPresentationMode::Immediate,
-           "KMSDRM selects Immediate when available");
-    expect(expectedLinuxPresentationMode(FakeLinuxPresentationBackend::Other, true) ==
-               FakeLinuxPresentationMode::Fifo,
-           "unknown Linux backends fall back to FIFO");
-    expect(expectedLinuxPresentationMode(FakeLinuxPresentationBackend::Wayland, false) ==
-               FakeLinuxPresentationMode::Fifo,
-           "unsupported adaptive modes fall back to FIFO");
-
     resetFakeClock();
     FakeVrrFramePresenter backend;
     PacerTelemetry telemetry;

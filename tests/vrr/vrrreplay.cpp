@@ -17,7 +17,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <deque>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -110,7 +109,6 @@ struct Columns {
     int decodeCompleteUs = -1;
     int pacerArrivalUs = -1;
     int queueDepthBefore = -1;
-    int queueDepthAfter = -1;
     int queueAccepted = -1;
     int dequeueUs = -1;
     int decisionValid = -1;
@@ -132,28 +130,20 @@ struct Columns {
     int preparationEndUs = -1;
     int preparationUs = -1;
     int renderWaitOvershootUs = -1;
-    int renderSchedulerDelayUs = -1;
-    int renderSchedulerDelayValid = -1;
-    int targetWaitOvershootUs = -1;
     int targetSchedulerDelayUs = -1;
     int targetSchedulerDelayValid = -1;
     int recordedTargetUs = -1;
-    int presentStartUs = -1;
     int submissionBoundaryUs = -1;
-    int presentEndUs = -1;
     int presentCallUs = -1;
     int submitErrorUs = -1;
     int submissionSpacingUs = -1;
-    int spacingDeficitUs = -1;
     int spacingGuardFeedbackUs = -1;
     int presented = -1;
     int cancelled = -1;
     int disposition = -1;
     int dropped = -1;
-    int rebased = -1;
     int tearClassification = -1;
     int tearRisk = -1;
-    int latchedPresent = -1;
     int latchValid = -1;
     int latchSubmissionId = -1;
     int latchPresentRefreshSequence = -1;
@@ -182,7 +172,6 @@ struct Columns {
         decodeCompleteUs = find("decode_complete_us");
         pacerArrivalUs = find("pacer_arrival_us");
         queueDepthBefore = find("arrival_queue_depth_before");
-        queueDepthAfter = find("arrival_queue_depth_after");
         queueAccepted = find("queue_accepted");
         dequeueUs = find("dequeue_us");
         decisionValid = find("decision_valid");
@@ -204,28 +193,20 @@ struct Columns {
         preparationEndUs = find("prepare_end_us");
         preparationUs = find("prepare_us");
         renderWaitOvershootUs = find("render_wait_overshoot_us");
-        renderSchedulerDelayUs = find("render_scheduler_delay_us");
-        renderSchedulerDelayValid = find("render_scheduler_delay_valid");
-        targetWaitOvershootUs = find("target_wait_overshoot_us");
         targetSchedulerDelayUs = find("target_scheduler_delay_us");
         targetSchedulerDelayValid = find("target_scheduler_delay_valid");
         recordedTargetUs = find("target_us");
-        presentStartUs = find("present_start_us");
         submissionBoundaryUs = find("submission_boundary_us");
-        presentEndUs = find("present_end_us");
         presentCallUs = find("present_call_us");
         submitErrorUs = find("submit_error_us");
         submissionSpacingUs = find("submission_spacing_us");
-        spacingDeficitUs = find("spacing_deficit_us");
         spacingGuardFeedbackUs = find("spacing_guard_feedback_us");
         presented = find("presented");
         cancelled = find("cancelled");
         disposition = find("disposition");
         dropped = find("dropped");
-        rebased = find("rebased");
         tearClassification = find("tear_classification");
         tearRisk = find("tear_risk");
-        latchedPresent = find("latched_present");
         latchValid = find("latch_valid");
         latchSubmissionId = find("latch_submission_id");
         latchPresentRefreshSequence = find("latch_present_refresh_seq");
@@ -250,24 +231,22 @@ struct Columns {
         const int required[] = {
             traceSchema, arrivalSequence, frame, rtpTimestamp, rtpValid,
             decodeCompleteUs, pacerArrivalUs, queueDepthBefore,
-            queueDepthAfter, queueAccepted, dequeueUs, decisionValid,
+            queueAccepted, dequeueUs, decisionValid,
             decisionUs, displayRefreshHz, streamRateHz, canLatch,
             sourceTimeUs, sourcePeriodUs, readinessBudgetUs, timingBudgetUs,
             renderLeadUs, renderWakeLeadUs, targetWakeLeadUs, guardUs,
             headroomUs, renderStartUs, preparationStartUs,
             preparationEndUs, preparationUs, renderWaitOvershootUs,
-            renderSchedulerDelayUs, renderSchedulerDelayValid,
-            targetWaitOvershootUs, targetSchedulerDelayUs,
-            targetSchedulerDelayValid, recordedTargetUs, presentStartUs,
-            submissionBoundaryUs, presentEndUs, presentCallUs, submitErrorUs,
-            submissionSpacingUs, spacingDeficitUs, presented, cancelled,
-            disposition, dropped, rebased, tearClassification, tearRisk,
-            latchedPresent, latchValid, latchSubmissionId,
+            targetSchedulerDelayUs, targetSchedulerDelayValid,
+            recordedTargetUs, submissionBoundaryUs, presentCallUs,
+            submitErrorUs, submissionSpacingUs, presented, cancelled,
+            disposition, dropped, tearClassification, tearRisk,
+            latchValid, latchSubmissionId,
             latchPresentRefreshSequence, nativePresentCallUs, gpuReadyWaitUs,
         };
         if (std::any_of(std::begin(required), std::end(required),
                         [](int column) { return column < 0; })) {
-            error = "trace schema is missing exact-simulation fields (schema 3 or 4 required)";
+            error = "trace schema is missing exact-simulation fields (schema 3, 4, or 5 required)";
             return false;
         }
         m_Maximum = *std::max_element(std::begin(required),
@@ -315,9 +294,6 @@ struct Metrics {
     uint64_t workerArrivals = 0;
     uint64_t workerAccepted = 0;
     uint64_t workerCapacityEvictions = 0;
-    uint64_t workerNewlyAdmittedWithoutCost = 0;
-    uint64_t workerMeasuredCostFrames = 0;
-    uint64_t workerEstimatorFallbacks = 0;
     QMap<QByteArray, uint64_t> dispositions;
     QMap<QByteArray, uint64_t> tearClassifications;
     QMap<QByteArray, uint64_t> simulatedTearClassifications;
@@ -339,8 +315,6 @@ struct Metrics {
     Distribution observedRenderWait;
     Distribution observedTargetWait;
     Distribution observedCorrectionWait;
-    Distribution workerEstimatedPreparation;
-    Distribution workerEstimatedPresentCall;
     Distribution simulatedDecodeToSubmission;
     Distribution simulatedArrivalToSubmission;
     Distribution simulatedDecisionToSubmission;
@@ -619,26 +593,11 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         scenario.mode == "fixed";
     if (scenario.mode == "worker") {
         QJsonObject worker;
-        worker["model"] = "experimental-recorded-arrival-admission-v1";
+        worker["model"] = "recorded-arrival-capacity-audit-v1";
         worker["arrivals"] = static_cast<qint64>(metrics.workerArrivals);
         worker["accepted"] = static_cast<qint64>(metrics.workerAccepted);
         worker["capacity_evictions"] = static_cast<qint64>(
             metrics.workerCapacityEvictions);
-        worker["newly_admitted_frames_requiring_estimated_cost"] =
-            static_cast<qint64>(metrics.workerNewlyAdmittedWithoutCost);
-        worker["measured_cost_frames"] = static_cast<qint64>(
-            metrics.workerMeasuredCostFrames);
-        worker["estimator_fallbacks"] = static_cast<qint64>(
-            metrics.workerEstimatorFallbacks);
-        worker["cost_estimator"] = "rolling-median-previous-executed-frames";
-        worker["rolling_cost_window"] = static_cast<qint64>(
-            scenario.worker.rollingCostWindow);
-        QJsonObject estimatedCosts;
-        estimatedCosts["preparation"] = distributionObject(
-            metrics.workerEstimatedPreparation);
-        estimatedCosts["present_call"] = distributionObject(
-            metrics.workerEstimatedPresentCall);
-        worker["estimated_execution_cost_us"] = estimatedCosts;
         worker["scanout_prediction"] = false;
         simulation["worker"] = worker;
     }
@@ -929,13 +888,7 @@ int main(int argc, char* argv[])
         }
     }
     else {
-        if (!loadVrrReplayConfiguration(
-                QJsonDocument(vrrDefaultReplayConfigurationJson()).toJson(),
-                replayConfiguration, error)) {
-            std::fprintf(stderr, "Invalid built-in replay defaults: %s\n",
-                         qPrintable(error));
-            return 2;
-        }
+        replayConfiguration.scenarios.append(VrrReplayScenario {});
     }
 
     const QStringList requestedScenarios = parser.values(scenarioOption);
@@ -1068,8 +1021,6 @@ int main(int argc, char* argv[])
     bool haveLatch = false;
     uint64_t priorLatchSubmission = 0;
     uint64_t priorPresentRefresh = 0;
-    std::deque<uint64_t> recentPreparationCosts;
-    std::deque<uint64_t> recentPresentCosts;
 
     QElapsedTimer timer;
     timer.start();
@@ -1135,26 +1086,6 @@ int main(int argc, char* argv[])
                 if (queueDepthBefore >= scenario.worker.queueCapacity) {
                     ++metrics.workerCapacityEvictions;
                 }
-            }
-            if (disposition == "queue_capacity" && accepted &&
-                    queueDepthBefore < scenario.worker.queueCapacity) {
-                ++metrics.workerNewlyAdmittedWithoutCost;
-                const auto estimate = [&metrics](
-                    const std::deque<uint64_t>& history,
-                    Distribution& distribution) {
-                    if (history.empty()) {
-                        ++metrics.workerEstimatorFallbacks;
-                        distribution.add(0);
-                        return;
-                    }
-                    distribution.add(percentile(
-                        std::vector<uint64_t>(history.cbegin(), history.cend()),
-                        50));
-                };
-                estimate(recentPreparationCosts,
-                         metrics.workerEstimatedPreparation);
-                estimate(recentPresentCosts,
-                         metrics.workerEstimatedPresentCall);
             }
         }
         ++metrics.dispositions[disposition];
@@ -1274,19 +1205,6 @@ int main(int argc, char* argv[])
             fields, columns.nativePresentCallUs));
         metrics.observedGpuReadyWait.add(unsignedField(fields,
                                                        columns.gpuReadyWaitUs));
-        if (scenario.mode == "worker") {
-            ++metrics.workerMeasuredCostFrames;
-            const auto remember = [&scenario](std::deque<uint64_t>& history,
-                                              uint64_t value) {
-                history.push_back(value);
-                while (history.size() > scenario.worker.rollingCostWindow)
-                    history.pop_front();
-            };
-            remember(recentPreparationCosts,
-                     unsignedField(fields, columns.preparationUs));
-            remember(recentPresentCosts,
-                     unsignedField(fields, columns.presentCallUs));
-        }
         if (columns.controllerCallUs >= 0)
             metrics.observedControllerCall.add(unsignedField(
                 fields, columns.controllerCallUs));

@@ -19,6 +19,29 @@ uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)
     return std::max(low, std::min(value, high));
 }
 
+template<typename T>
+T percentile(const std::deque<T>& values, unsigned int requestedPercentile)
+{
+    if (values.empty()) {
+        return 0;
+    }
+    std::vector<T> ordered(values.begin(), values.end());
+    std::sort(ordered.begin(), ordered.end());
+    const unsigned int percentileValue = std::min(100U, requestedPercentile);
+    const size_t rank = std::max<size_t>(
+        1, (ordered.size() * percentileValue + 99) / 100);
+    return ordered[rank - 1];
+}
+
+template<typename T>
+void appendBounded(std::deque<T>& values, T value, size_t limit)
+{
+    while (values.size() >= limit) {
+        values.pop_front();
+    }
+    values.push_back(value);
+}
+
 } // namespace
 
 VrrTimingController::VrrTimingController(const VrrSessionConfig& config,
@@ -308,7 +331,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.renderLeadUs = m_RenderLeadUs;
     decision.renderWakeLeadUs = m_RenderWakeLeadUs;
     decision.targetWakeLeadUs = m_TargetWakeLeadUs;
-    const uint64_t learnedHeadroomUs = headroomUs();
+    const uint64_t learnedHeadroomUs = decision.headroomUs;
     if (!m_CanLatchPresentation) {
         m_LatchedPresentation = false;
     }
@@ -863,19 +886,9 @@ uint64_t VrrTimingController::renderLeadUs() const
     return m_RenderLeadUs;
 }
 
-uint64_t VrrTimingController::renderWakeLeadUs() const
-{
-    return m_RenderWakeLeadUs;
-}
-
 uint64_t VrrTimingController::targetWakeLeadUs() const
 {
     return m_TargetWakeLeadUs;
-}
-
-uint64_t VrrTimingController::wakeLeadUs() const
-{
-    return std::max(m_RenderWakeLeadUs, m_TargetWakeLeadUs);
 }
 
 uint64_t VrrTimingController::earliestSubmissionUs() const
@@ -1009,34 +1022,6 @@ uint64_t VrrTimingController::roundedQ16(uint64_t valueQ16)
     return saturatingAdd(valueQ16, kQ16Half) / kQ16One;
 }
 
-uint64_t VrrTimingController::percentile(
-    const std::deque<uint64_t>& values, unsigned int requestedPercentile)
-{
-    if (values.empty()) {
-        return 0;
-    }
-    std::vector<uint64_t> ordered(values.begin(), values.end());
-    std::sort(ordered.begin(), ordered.end());
-    const unsigned int percentileValue = std::min(100U, requestedPercentile);
-    const size_t rank = std::max<size_t>(
-        1, (ordered.size() * percentileValue + 99) / 100);
-    return ordered[rank - 1];
-}
-
-int64_t VrrTimingController::percentile(
-    const std::deque<int64_t>& values, unsigned int requestedPercentile)
-{
-    if (values.empty()) {
-        return 0;
-    }
-    std::vector<int64_t> ordered(values.begin(), values.end());
-    std::sort(ordered.begin(), ordered.end());
-    const unsigned int percentileValue = std::min(100U, requestedPercentile);
-    const size_t rank = std::max<size_t>(
-        1, (ordered.size() * percentileValue + 99) / 100);
-    return ordered[rank - 1];
-}
-
 bool VrrTimingController::withinPercent(uint64_t value, uint64_t reference,
                                         unsigned int percent)
 {
@@ -1047,22 +1032,4 @@ bool VrrTimingController::withinPercent(uint64_t value, uint64_t reference,
                                                      reference - value;
     return static_cast<long double>(difference) * 100.0L <=
         static_cast<long double>(reference) * percent;
-}
-
-void VrrTimingController::appendBounded(std::deque<uint64_t>& values,
-                                        uint64_t value, size_t limit)
-{
-    while (values.size() >= limit) {
-        values.pop_front();
-    }
-    values.push_back(value);
-}
-
-void VrrTimingController::appendBounded(std::deque<int64_t>& values,
-                                        int64_t value, size_t limit)
-{
-    while (values.size() >= limit) {
-        values.pop_front();
-    }
-    values.push_back(value);
 }

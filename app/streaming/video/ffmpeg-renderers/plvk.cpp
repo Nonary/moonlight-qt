@@ -583,13 +583,13 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
         if (m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Vulkan VRR backend selected immutable %s swapchain presentation",
-                        vrrSelectedPresentModeName());
+                        vulkanPresentModeName(m_VkPresentMode));
         }
         else {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Vulkan VRR backend unavailable: %s; using immutable %s fallback",
                         vrrFallbackReasonName(m_VrrFallbackReason),
-                        vrrSelectedPresentModeName());
+                        vulkanPresentModeName(m_VkPresentMode));
         }
     }
 
@@ -738,7 +738,6 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
     m_VrrSuspended = false;
     m_VrrWindowChangePending.store(false);
     m_VrrFramePrepared = false;
-    m_VrrPreparedFrame = nullptr;
     m_VrrPreparingFrame = false;
     m_VrrRenderSucceeded = false;
     m_VrrRenderTimingActive = false;
@@ -1249,11 +1248,6 @@ VrrFallbackReason PlVkRenderer::checkSupport() const
         VrrFallbackReason::InitializationFailed;
 }
 
-const char* PlVkRenderer::vrrSelectedPresentModeName() const
-{
-    return vulkanPresentModeName(m_VkPresentMode);
-}
-
 VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame)
 {
     VrrPrepareResult result;
@@ -1286,7 +1280,6 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame)
     m_VrrPreparingFrame = true;
     m_VrrRenderSucceeded = false;
     m_VrrRenderTimingActive = false;
-    m_VrrPreparedFrame = nullptr;
     renderFrame(frame);
 
     // pl_render_image() records work for the acquired image. Flush it now so
@@ -1308,7 +1301,6 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame)
         return result;
     }
 
-    m_VrrPreparedFrame = frame;
     m_VrrFramePrepared = true;
     result.prepared = true;
     result.cancellationMaySubmit = true;
@@ -1320,7 +1312,7 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest&)
     // Vulkan presentation mode is selected when the swapchain is created, so
     // the per-present latch preference cannot be honored here and is ignored.
     if (!m_VrrFramePrepared || !m_HasPendingSwapchainFrame ||
-        m_VrrPreparedFrame == nullptr || m_VrrSuspended ||
+        m_VrrSuspended ||
         m_VrrWindowChangePending.load()) {
         return cancelFrame();
     }
@@ -1333,7 +1325,6 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest&)
     }
 
     m_VrrFramePrepared = false;
-    m_VrrPreparedFrame = nullptr;
     const uint64_t submissionTimeUs = LiGetMicroseconds();
     const bool submitted = submitPendingSwapchainFrame();
 
@@ -1358,7 +1349,6 @@ bool PlVkRenderer::cancelVrrFrame()
     m_VrrPreparingFrame = false;
     m_VrrFramePrepared = false;
     m_VrrRenderSucceeded = false;
-    m_VrrPreparedFrame = nullptr;
 
     const bool submitted = submitPendingSwapchainFrame();
     if (!submitted && hadPendingFrame) {
@@ -1416,7 +1406,7 @@ bool PlVkRenderer::restoreFixedPresentation(VrrFallbackReason reason)
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Vulkan VRR worker startup fallback selected immutable %s swapchain presentation",
-                vrrSelectedPresentModeName());
+                vulkanPresentModeName(m_VkPresentMode));
     return true;
 }
 

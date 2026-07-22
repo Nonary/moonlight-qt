@@ -25,67 +25,18 @@ bool readUnsigned(const QJsonValue& json, const QString& name, T& value,
     return true;
 }
 
-#define VRR_PARAMETER_FIELDS(X) \
-    X(maximum_forward_movement_us, maximumForwardMovementUs) \
-    X(render_lead_floor_us, renderLeadFloorUs) \
-    X(render_lead_ceiling_us, renderLeadCeilingUs) \
-    X(render_lead_slack_us, renderLeadSlackUs) \
-    X(presentation_safety_us, presentationSafetyUs) \
-    X(readiness_ceiling_us, readinessCeilingUs) \
-    X(minimum_readiness_reserve_us, minimumReadinessReserveUs) \
-    X(cold_start_readiness_demand_us, coldStartReadinessDemandUs) \
-    X(arrival_spread_guard_us, arrivalSpreadGuardUs) \
-    X(readiness_acquire_step_us, readinessAcquireStepUs) \
-    X(maximum_render_wake_lead_us, maximumRenderWakeLeadUs) \
-    X(maximum_target_wake_lead_us, maximumTargetWakeLeadUs) \
-    X(minimum_guard_us, minimumGuardUs) \
-    X(latch_enter_headroom_us, latchedPresentationHeadroomUs) \
-    X(latch_exit_headroom_us, latchedPresentationExitHeadroomUs) \
-    X(maximum_base_guard_us, maximumBaseGuardUs) \
-    X(maximum_adaptive_guard_us, maximumAdaptiveGuardUs) \
-    X(guard_step_us, guardStepUs) \
-    X(guard_decay_frames, guardDecayFrames) \
-    X(scheduler_learning_samples, schedulerLearningSamples) \
-    X(readiness_learning_samples, readinessLearningSamples) \
-    X(preparation_learning_samples, preparationLearningSamples) \
-    X(minimum_readiness_samples, minimumReadinessSamples) \
-    X(minimum_cadence_samples, minimumCadenceSamples) \
-    X(maximum_cadence_samples, maximumCadenceSamples) \
-    X(rate_candidate_samples, rateCandidateSamples) \
-    X(loose_cadence_window_us, looseCadenceWindowUs) \
-    X(tight_cadence_window_us, tightCadenceWindowUs) \
-    X(major_cadence_ratio_numerator, majorCadenceRatioNumerator) \
-    X(major_cadence_ratio_denominator, majorCadenceRatioDenominator) \
-    X(candidate_cadence_ratio_numerator, candidateCadenceRatioNumerator) \
-    X(candidate_cadence_ratio_denominator, candidateCadenceRatioDenominator) \
-    X(material_rate_change_percent, materialRateChangePercent) \
-    X(phase_error_frames, phaseErrorFrames) \
-    X(preparation_percentile, preparationPercentile) \
-    X(scheduler_percentile, schedulerPercentile) \
-    X(readiness_low_percentile, readinessLowPercentile) \
-    X(readiness_tight_percentile, readinessTightPercentile) \
-    X(readiness_loose_percentile, readinessLoosePercentile) \
-    X(readiness_attack_numerator, readinessAttackNumerator) \
-    X(readiness_attack_denominator, readinessAttackDenominator) \
-    X(readiness_release_numerator, readinessReleaseNumerator) \
-    X(readiness_release_denominator, readinessReleaseDenominator) \
-    X(usable_headroom_numerator, usableHeadroomNumerator) \
-    X(usable_headroom_denominator, usableHeadroomDenominator) \
-    X(loose_headroom_display_periods, looseHeadroomDisplayPeriods) \
-    X(base_guard_divisor, baseGuardDivisor)
-
 bool applyControllerObject(const QJsonObject& object,
                            VrrTimingParameters& value, QString& error)
 {
     QSet<QString> known;
-#define APPLY_FIELD(jsonName, memberName) \
+#define APPLY_FIELD(type, jsonName, memberName, defaultValue) \
     known.insert(QStringLiteral(#jsonName)); \
     if (object.contains(QStringLiteral(#jsonName)) && \
             !readUnsigned(object.value(QStringLiteral(#jsonName)), \
                           QStringLiteral("controller.") + \
-                              QStringLiteral(#jsonName), \
+                          QStringLiteral(#jsonName), \
                           value.memberName, error)) return false;
-    VRR_PARAMETER_FIELDS(APPLY_FIELD)
+    VRR_TIMING_PARAMETER_FIELDS(APPLY_FIELD)
 #undef APPLY_FIELD
     for (auto it = object.constBegin(); it != object.constEnd(); ++it) {
         if (!known.contains(it.key())) {
@@ -99,8 +50,7 @@ bool applyControllerObject(const QJsonObject& object,
 bool applyWorkerObject(const QJsonObject& object,
                        VrrReplayWorkerParameters& value, QString& error)
 {
-    const QSet<QString> known { "queue_capacity", "rolling_cost_window",
-                                "stale_source_periods" };
+    const QSet<QString> known { "queue_capacity" };
     for (auto it = object.constBegin(); it != object.constEnd(); ++it) {
         if (!known.contains(it.key())) {
             error = "unknown worker parameter: " + it.key();
@@ -109,15 +59,8 @@ bool applyWorkerObject(const QJsonObject& object,
     }
     return (!object.contains("queue_capacity") ||
             readUnsigned(object.value("queue_capacity"),
-                         "worker.queue_capacity", value.queueCapacity, error)) &&
-        (!object.contains("rolling_cost_window") ||
-         readUnsigned(object.value("rolling_cost_window"),
-                      "worker.rolling_cost_window", value.rollingCostWindow,
-                      error)) &&
-        (!object.contains("stale_source_periods") ||
-         readUnsigned(object.value("stale_source_periods"),
-                      "worker.stale_source_periods", value.staleSourcePeriods,
-                      error)) && validateVrrWorkerParameters(value, error);
+                         "worker.queue_capacity", value.queueCapacity,
+                         error)) && validateVrrWorkerParameters(value, error);
 }
 
 bool applyParametersObject(const QJsonObject& object,
@@ -146,9 +89,9 @@ bool applyParametersObject(const QJsonObject& object,
 QJsonObject vrrTimingParametersToJson(const VrrTimingParameters& value)
 {
     QJsonObject object;
-#define WRITE_FIELD(jsonName, memberName) \
+#define WRITE_FIELD(type, jsonName, memberName, defaultValue) \
     object[QStringLiteral(#jsonName)] = static_cast<double>(value.memberName);
-    VRR_PARAMETER_FIELDS(WRITE_FIELD)
+    VRR_TIMING_PARAMETER_FIELDS(WRITE_FIELD)
 #undef WRITE_FIELD
     return object;
 }
@@ -157,9 +100,6 @@ QJsonObject vrrWorkerParametersToJson(const VrrReplayWorkerParameters& value)
 {
     QJsonObject object;
     object["queue_capacity"] = static_cast<double>(value.queueCapacity);
-    object["rolling_cost_window"] = static_cast<double>(value.rollingCostWindow);
-    object["stale_source_periods"] =
-        static_cast<double>(value.staleSourcePeriods);
     return object;
 }
 
@@ -181,11 +121,11 @@ QJsonObject vrrDefaultReplayConfigurationJson()
 QStringList vrrReplayParameterNames()
 {
     QStringList names;
-#define ADD_NAME(jsonName, memberName) names.append("controller." #jsonName);
-    VRR_PARAMETER_FIELDS(ADD_NAME)
+#define ADD_NAME(type, jsonName, memberName, defaultValue) \
+    names.append("controller." #jsonName);
+    VRR_TIMING_PARAMETER_FIELDS(ADD_NAME)
 #undef ADD_NAME
-    names << "worker.queue_capacity" << "worker.rolling_cost_window"
-          << "worker.stale_source_periods";
+    names << "worker.queue_capacity";
     return names;
 }
 
@@ -237,8 +177,7 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
 bool validateVrrWorkerParameters(const VrrReplayWorkerParameters& value,
                                  QString& error)
 {
-    if (value.queueCapacity == 0 || value.rollingCostWindow == 0 ||
-            value.staleSourcePeriods == 0) {
+    if (value.queueCapacity == 0) {
         error = "worker parameters must be non-zero";
         return false;
     }

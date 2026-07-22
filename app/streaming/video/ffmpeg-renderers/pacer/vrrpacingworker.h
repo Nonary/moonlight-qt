@@ -58,7 +58,6 @@ private:
         uint64_t dequeueUs = 0;
         size_t queueDepthBefore = 0;
         size_t queueDepthAfter = 0;
-        bool enabled = false;
         bool queueAccepted = false;
         bool queueDiscontinuity = false;
     };
@@ -104,18 +103,11 @@ private:
         uint64_t presentationFloorUs = 0;
         uint64_t correctionWaitStartUs = 0;
         uint64_t correctionWaitEndUs = 0;
-        uint64_t submissionId = 0;
-        uint64_t latchSubmissionId = 0;
-        uint64_t latchTimeUs = 0;
-        uint64_t latchPresentRefreshSequence = 0;
-        uint64_t latchRefreshSequence = 0;
         bool targetSchedulerDelayValid = false;
         bool targetDeadlineAlreadyElapsed = false;
         bool hadPriorSubmission = false;
         bool usedPresenterSubmissionTime = false;
         bool spacingCorrected = false;
-        bool submissionIdValid = false;
-        bool latchSampleValid = false;
     };
 
     // Diagnostics must not perturb the measurement. The pacing thread only
@@ -134,7 +126,6 @@ private:
         size_t completionQueueDepth = 0;
         TraceDisposition disposition = TraceDisposition::OutputDropped;
         bool decisionValid = false;
-        bool dropped = false;
         uint64_t terminalTimeUs = 0;
     };
 
@@ -149,13 +140,11 @@ private:
     int run();
     bool dequeueFrame(QueuedFrame& frame, bool& queueDiscontinuity);
     bool hasQueuedFrame();
-    size_t queuedFrameCount();
     void discardQueuedFrames(bool countDrops,
                              TraceDisposition disposition);
     void consumeWindowStateNotifications();
     bool presentationSuspended() const;
     bool isStopping() const;
-    uint64_t staleToleranceUs(const VrrTimingDecision& decision) const;
     void waitForSubmissionFloor(const VrrTimingDecision& decision,
                                 FrameTelemetry& telemetry);
     void recordSubmission(const VrrTimingDecision& decision,
@@ -169,7 +158,6 @@ private:
                     const VrrTimingDecision& decision,
                     const VrrPresentFeedback& feedback,
                     const FrameTelemetry& telemetry,
-                    size_t queueDepth,
                     TraceDisposition disposition,
                     bool decisionValid = true);
     void openTraceIfRequested();
