@@ -18,7 +18,7 @@
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
     X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
     X(uint64_t, cold_start_readiness_demand_us, coldStartReadinessDemandUs, 1500) \
-    X(uint64_t, arrival_spread_guard_us, arrivalSpreadGuardUs, 250) \
+    X(uint64_t, arrival_spread_guard_us, arrivalSpreadGuardUs, 900) \
     X(uint64_t, readiness_acquire_step_us, readinessAcquireStepUs, 1000) \
     X(uint64_t, maximum_render_wake_lead_us, maximumRenderWakeLeadUs, 2000) \
     X(uint64_t, maximum_target_wake_lead_us, maximumTargetWakeLeadUs, 500) \
@@ -36,7 +36,7 @@
     X(size_t, minimum_cadence_samples, minimumCadenceSamples, 6) \
     X(size_t, maximum_cadence_samples, maximumCadenceSamples, 512) \
     X(size_t, rate_candidate_samples, rateCandidateSamples, 3) \
-    X(uint64_t, loose_cadence_window_us, looseCadenceWindowUs, 500000) \
+    X(uint64_t, loose_cadence_window_us, looseCadenceWindowUs, 350000) \
     X(uint64_t, tight_cadence_window_us, tightCadenceWindowUs, 1000000) \
     X(uint64_t, major_cadence_ratio_numerator, majorCadenceRatioNumerator, 7) \
     X(uint64_t, major_cadence_ratio_denominator, majorCadenceRatioDenominator, 2) \
@@ -52,7 +52,7 @@
     X(uint64_t, readiness_attack_numerator, readinessAttackNumerator, 1) \
     X(uint64_t, readiness_attack_denominator, readinessAttackDenominator, 1) \
     X(uint64_t, readiness_release_numerator, readinessReleaseNumerator, 1) \
-    X(uint64_t, readiness_release_denominator, readinessReleaseDenominator, 8) \
+    X(uint64_t, readiness_release_denominator, readinessReleaseDenominator, 32) \
     X(uint64_t, usable_headroom_numerator, usableHeadroomNumerator, 3) \
     X(uint64_t, usable_headroom_denominator, usableHeadroomDenominator, 4) \
     X(uint64_t, loose_headroom_display_periods, looseHeadroomDisplayPeriods, 2) \
