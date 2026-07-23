@@ -3,7 +3,10 @@
 #include "utils.h"
 #include "streaming/session.h"
 
+#ifdef HAVE_H264BITSTREAM
 #include <h264_stream.h>
+#endif
+
 #include <utility>
 
 extern "C" {
@@ -738,8 +741,13 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     if (testMode != TestMode::TestFrameOnly) {
         if ((params->videoFormat & VIDEO_FORMAT_MASK_H264) &&
                 !(m_BackendRenderer->getDecoderCapabilities() & CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC)) {
+#ifdef HAVE_H264BITSTREAM
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Using H.264 SPS fixup");
+#else
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "H.264 SPS fixup cannot be performed without h264bitstream. H.264 may have excessive decoding latency!");
+#endif
             m_NeedsSpsFixup = true;
         }
         else {
@@ -1203,7 +1211,7 @@ void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
     }
 }
 
-IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig* hwDecodeCfg, int pass)
+IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig* hwDecodeCfg, PDECODER_PARAMETERS params, int pass)
 {
     if (!(hwDecodeCfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
         return nullptr;
@@ -1222,11 +1230,17 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
         case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
             // Prefer the libplacebo (on MoltenVK) renderer unless explicitly opted out
 #ifdef HAVE_LIBPLACEBO_VULKAN
-            if (qgetenv("PREFER_VULKAN") != "0") {
+            if (params->renderer == StreamingPreferences::RS_AUTO || params->renderer == StreamingPreferences::RS_VULKAN) {
                 return new PlVkRenderer(hwDecodeCfg->device_type);
             }
 #endif
-            return VTMetalRendererFactory::createRenderer(true);
+            if (params->renderer == StreamingPreferences::RS_AVSBDL) {
+                return VTRendererFactory::createRenderer();
+            }
+            else {
+                // This covers both Metal explicitly selected and probe-only (since Metal is cheap to instantiate)
+                return VTMetalRendererFactory::createRenderer(true);
+            }
 #endif
 #ifdef HAVE_LIBVA
         case AV_HWDEVICE_TYPE_VAAPI:
@@ -1549,7 +1563,7 @@ bool FFmpegVideoDecoder::tryInitializeRendererForUnknownDecoder(const AVCodec* d
                 // Initialize the hardware codec and submit a test frame if the renderer needs it
                 IFFmpegRenderer::InitFailureReason failureReason;
                 if (tryInitializeRenderer(decoder, AV_PIX_FMT_NONE, params, config, &failureReason,
-                                          [config, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, pass); })) {
+                                          [config, params, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, params, pass); })) {
                     return true;
                 }
                 else if (failureReason == IFFmpegRenderer::InitFailureReason::NoHardwareSupport) {
@@ -1749,7 +1763,7 @@ bool FFmpegVideoDecoder::tryInitializeHwAccelDecoder(PDECODER_PARAMETERS params,
             // Initialize the hardware codec and submit a test frame if the renderer needs it
             IFFmpegRenderer::InitFailureReason failureReason;
             if (tryInitializeRenderer(decoder, AV_PIX_FMT_NONE, params, config, &failureReason,
-                                      [config, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, pass); })) {
+                                      [config, params, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, params, pass); })) {
                 return true;
             }
             else if (failureReason == IFFmpegRenderer::InitFailureReason::NoHardwareSupport) {
@@ -1967,6 +1981,7 @@ bool FFmpegVideoDecoder::initialize(PDECODER_PARAMETERS params)
 
 void FFmpegVideoDecoder::writeBuffer(PLENTRY entry, int& offset)
 {
+#ifdef HAVE_H264BITSTREAM
     if (m_NeedsSpsFixup && entry->bufferType == BUFFER_TYPE_SPS) {
         h264_stream_t* stream = h264_new();
         int nalStart, nalEnd;
@@ -2012,7 +2027,9 @@ void FFmpegVideoDecoder::writeBuffer(PLENTRY entry, int& offset)
 
         h264_free(stream);
     }
-    else {
+    else
+#endif
+    {
         // Write the buffer as-is
         memcpy(&m_DecodeBuffer.data()[offset],
                entry->data,

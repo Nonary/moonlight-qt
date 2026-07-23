@@ -186,6 +186,7 @@ private:
 
     static
     bool chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
+                       StreamingPreferences::RendererSelection renderer,
                        SDL_Window* window, int videoFormat, int width, int height,
                        int frameRate, bool enableVsync, bool enableFramePacing,
                        bool enableVrr, int vrrDisplayRefreshHz, bool testOnly,
@@ -253,6 +254,7 @@ private:
         int refreshRate = 0;
         StreamingPreferences::WindowMode effectiveWindowMode = StreamingPreferences::WM_WINDOWED;
         StreamingPreferences::VideoDecoderSelection decoderSelection = StreamingPreferences::VDS_AUTO;
+        StreamingPreferences::RendererSelection rendererSelection = StreamingPreferences::RS_AUTO;
     };
 
     StreamingPreferences* m_Preferences;
