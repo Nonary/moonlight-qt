@@ -136,6 +136,13 @@ private:
     bool m_VrrGpuReadyTimingValid;
     uint64_t m_VrrGpuReadyWaitStartUs;
     uint64_t m_VrrGpuReadyTimeUs;
+    bool m_VrrPriorPresentCountValid;
+    uint64_t m_VrrPriorPresentCount;
+    bool m_VrrPriorFrameStatsValid;
+    uint64_t m_VrrPriorFrameStatsPresentCount;
+    uint64_t m_VrrPriorFrameStatsTimeUs;
+    uint64_t m_VrrPriorFrameStatsPresentRefreshSequence;
+    uint64_t m_VrrPriorFrameStatsRefreshSequence;
 
     std::array<Microsoft::WRL::ComPtr<ID3D11PixelShader>, PixelShaders::_COUNT> m_VideoPixelShaders;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_VideoVertexBuffer;

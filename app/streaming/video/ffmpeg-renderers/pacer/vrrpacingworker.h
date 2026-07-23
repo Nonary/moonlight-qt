@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <deque>
 #include <memory>
+#include <vector>
 
 #include <QByteArray>
 #include <QMutex>
@@ -111,8 +112,8 @@ private:
     };
 
     // Diagnostics must not perturb the measurement. The pacing thread only
-    // copies a row into a bounded queue; a separate writer thread owns all
-    // formatting and file I/O, so a stdio flush can never stall a present.
+    // copies a row into a preallocated bounded queue through a non-blocking
+    // handoff; a separate writer thread owns all formatting and file I/O.
     struct TraceRow {
         int frameNumber = 0;
         uint32_t rtpTimestamp = 0;
@@ -180,6 +181,7 @@ private:
     QMutex m_FrameQueueLock;
     QWaitCondition m_FrameQueueNotEmpty;
     std::deque<QueuedFrame> m_FrameQueue;
+    std::atomic_size_t m_FrameQueueDepth { 0 };
     PacedFrame m_DeferredFrame;
     SDL_Thread* m_WorkerThread = nullptr;
     std::atomic_bool m_Stopping { false };
@@ -195,11 +197,11 @@ private:
     SDL_Thread* m_TraceThread = nullptr;
     QMutex m_TraceLock;
     QWaitCondition m_TraceQueueNotEmpty;
-    std::deque<TraceRow> m_TraceQueue;
+    std::vector<TraceRow> m_TraceQueue;
     std::atomic_bool m_TraceStopping { false };
     std::atomic_bool m_TraceAcceptingRows { false };
     std::atomic_uint64_t m_TraceArrivalSequence { 0 };
-    size_t m_TraceDroppedRows = 0;
+    std::atomic_size_t m_TraceDroppedRows { 0 };
     uint64_t m_TraceBytesWritten = 0;
     uint64_t m_TraceStartUs = 0;
     uint64_t m_TraceLatestArrivalUs = 0;

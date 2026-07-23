@@ -72,8 +72,10 @@ struct VrrPresentFeedback {
     uint64_t latchPresentRefreshSequence = 0;
     uint64_t latchRefreshSequence = 0;
 
-    // Opt-in, observation-only diagnostics captured immediately around the
-    // native Present call. These fields must never affect presentation policy.
+    // Opt-in, observation-only diagnostics around the native Present call.
+    // The before fields may reuse the backend's most recent post-Present
+    // observation to avoid adding synchronous native queries to the hot path.
+    // These fields must never affect presentation policy.
     bool nativePresentTimingValid = false;
     uint64_t nativePresentStartUs = 0;
     uint64_t nativePresentEndUs = 0;

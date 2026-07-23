@@ -93,6 +93,13 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_VrrGpuReadyTimingValid(false),
       m_VrrGpuReadyWaitStartUs(0),
       m_VrrGpuReadyTimeUs(0),
+      m_VrrPriorPresentCountValid(false),
+      m_VrrPriorPresentCount(0),
+      m_VrrPriorFrameStatsValid(false),
+      m_VrrPriorFrameStatsPresentCount(0),
+      m_VrrPriorFrameStatsTimeUs(0),
+      m_VrrPriorFrameStatsPresentRefreshSequence(0),
+      m_VrrPriorFrameStatsRefreshSequence(0),
       m_OverlayLock(0),
       m_HwDeviceContext(nullptr)
 {
@@ -1526,6 +1533,13 @@ void D3D11VARenderer::initializeVrrPresentationState(SDL_Window* window,
     m_VrrSuspended = false;
     m_VrrFallbackReason = VrrFallbackReason::NoFallback;
     m_VrrPresentReadyAvailable = false;
+    m_VrrPriorPresentCountValid = false;
+    m_VrrPriorPresentCount = 0;
+    m_VrrPriorFrameStatsValid = false;
+    m_VrrPriorFrameStatsPresentCount = 0;
+    m_VrrPriorFrameStatsTimeUs = 0;
+    m_VrrPriorFrameStatsPresentRefreshSequence = 0;
+    m_VrrPriorFrameStatsRefreshSequence = 0;
 
     // Preserve the legacy non-VSync path while also creating an
     // allow-tearing flip swapchain for an explicitly requested VRR session.
@@ -2013,26 +2027,22 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         return true;
     };
     if (request.collectDiagnostics) {
-        UINT presentCountBefore = 0;
-        if (SUCCEEDED(m_SwapChain->GetLastPresentCount(
-                &presentCountBefore))) {
+        // Reuse the observation made after the previous Present. This is the
+        // most recent state available before this call, and avoids adding two
+        // extra synchronous DXGI queries to every deeply traced frame.
+        if (m_VrrPriorPresentCountValid) {
             feedback.presentCountBeforeValid = true;
-            feedback.presentCountBefore = presentCountBefore;
+            feedback.presentCountBefore = m_VrrPriorPresentCount;
         }
-
-        DXGI_FRAME_STATISTICS frameStatsBefore = {};
-        uint64_t frameStatsBeforeTimeUs = 0;
-        if (SUCCEEDED(m_SwapChain->GetFrameStatistics(&frameStatsBefore)) &&
-                translateSyncQpcTime(frameStatsBefore.SyncQPCTime,
-                                     frameStatsBeforeTimeUs)) {
+        if (m_VrrPriorFrameStatsValid) {
             feedback.frameStatsBeforeValid = true;
             feedback.frameStatsBeforePresentCount =
-                frameStatsBefore.PresentCount;
-            feedback.frameStatsBeforeTimeUs = frameStatsBeforeTimeUs;
+                m_VrrPriorFrameStatsPresentCount;
+            feedback.frameStatsBeforeTimeUs = m_VrrPriorFrameStatsTimeUs;
             feedback.frameStatsBeforePresentRefreshSequence =
-                frameStatsBefore.PresentRefreshCount;
+                m_VrrPriorFrameStatsPresentRefreshSequence;
             feedback.frameStatsBeforeRefreshSequence =
-                frameStatsBefore.SyncRefreshCount;
+                m_VrrPriorFrameStatsRefreshSequence;
         }
     }
 
@@ -2077,6 +2087,11 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
     if (SUCCEEDED(m_SwapChain->GetLastPresentCount(&lastPresentCount))) {
         feedback.submissionIdValid = true;
         feedback.submissionId = lastPresentCount;
+        m_VrrPriorPresentCountValid = true;
+        m_VrrPriorPresentCount = lastPresentCount;
+    }
+    else {
+        m_VrrPriorPresentCountValid = false;
     }
 
     DXGI_FRAME_STATISTICS frameStats = {};
@@ -2089,6 +2104,15 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         feedback.latchPresentRefreshSequence =
             frameStats.PresentRefreshCount;
         feedback.latchRefreshSequence = frameStats.SyncRefreshCount;
+        m_VrrPriorFrameStatsValid = true;
+        m_VrrPriorFrameStatsPresentCount = frameStats.PresentCount;
+        m_VrrPriorFrameStatsTimeUs = latchTimeUs;
+        m_VrrPriorFrameStatsPresentRefreshSequence =
+            frameStats.PresentRefreshCount;
+        m_VrrPriorFrameStatsRefreshSequence = frameStats.SyncRefreshCount;
+    }
+    else {
+        m_VrrPriorFrameStatsValid = false;
     }
 
     return feedback;
@@ -2119,6 +2143,12 @@ bool D3D11VARenderer::restoreFixedPresentation(VrrFallbackReason reason)
 void D3D11VARenderer::setSuspended(bool suspended)
 {
     m_VrrSuspended = suspended;
+    if (suspended) {
+        // Do not carry a pre-suspension scanout observation into the first
+        // diagnostic sample after a window/mode transition.
+        m_VrrPriorPresentCountValid = false;
+        m_VrrPriorFrameStatsValid = false;
+    }
 }
 
 bool D3D11VARenderer::setupRenderingResources()

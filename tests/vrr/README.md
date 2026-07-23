@@ -97,13 +97,19 @@ the VRR contract, not proof that the driver, display setting, and panel all did.
 External high-speed capture remains the authority for validating a suspected
 hardware/driver failure.
 
-Set `MOONLIGHT_VRR_DEEP_TRACE=1` only for native flip diagnosis. It adds
-native-call timing, DXGI present/frame-statistics values, and `gpu_ready_*`
-timing that proves queued rendering completed before the target boundary. The
-extra queries and fields are observation-only and do not alter pacing decisions.
-Trace formatting remains on the background writer thread, and every trace is
-capped after the guaranteed one-hour window so an accidentally long session
-cannot write indefinitely.
+Set `MOONLIGHT_VRR_DEEP_TRACE=1` for native flip diagnosis. It adds native-call
+timing, DXGI present/frame-statistics values, and `gpu_ready_*` timing that
+proves queued rendering completed before the target boundary. D3D11 reuses the
+previous post-Present observation for the diagnostic before-state, so deep mode
+does not add synchronous DXGI queries around `Present()`; the essential
+post-Present submission/latch queries are collected in both modes.
+
+Trace formatting remains on the background writer thread. The pacing thread
+uses preallocated handoff buffers and never waits for the writer: it drops and
+counts a diagnostic row if the handoff is busy or full. Replay detects the
+resulting arrival-sequence gap rather than accepting capture-induced timing
+skew. Every trace is capped after the guaranteed one-hour window so an
+accidentally long session cannot write indefinitely.
 
 ## Accelerated replay
 
@@ -132,6 +138,32 @@ Use `--timeline replay.csv` when per-frame recorded/simulated values and deltas
 are needed. It is optional because a long session creates a large CSV; the
 default JSON contains complete distributions and outcome counts with minimal
 additional disk I/O.
+
+Replay also derives gap-aware cadence residual and jerk from the elapsed
+projected source clock between frames that were actually presented. JSON
+summaries split these values into rounded learned-rate bands, including a
+combined 40--116 FPS optimization cohort and a retained 60--100 FPS diagnostic
+slice. Edge bands cover 40--49, 50--59, 101--109, and 110--116 FPS so failures
+near the adaptive range boundaries remain visible. Reports also include one-,
+ten-, and sixty-second jerk anomaly windows. The optional timeline includes the
+corresponding source, submission, queue, spacing, and DXGI latch context. All
+of this work is offline: it adds no capture-thread observations or I/O.
+Supplemental rate-band quantiles use a deterministic 32,768-value reservoir,
+giving the added rate-band metrics a fixed memory bound even on multi-hour
+captures. Counts, mean, standard deviation, minimum, and maximum remain exact,
+and the JSON marks quantiles as approximate when the reservoir is active.
+
+Core replay distributions use a fixed timing histogram instead of retaining
+one value per frame. Quantiles remain exact at one-microsecond resolution
+through 100 ms; the uncommon tail uses conservative 100-microsecond buckets
+through one second and one-millisecond buckets through sixty seconds. This
+keeps normal replay memory independent of capture duration without reducing
+the precision of the latency and cadence ranges used for optimization.
+
+The summary's `capture.telemetry_coverage` object distinguishes unavailable
+native diagnostics from valid zero-duration measurements. Deep-trace native
+Present and GPU-readiness distributions contain only samples whose matching
+validity bit was recorded.
 
 After changing and rebuilding the timing controller, replay the identical
 capture and ask for direct lower-is-better deltas:

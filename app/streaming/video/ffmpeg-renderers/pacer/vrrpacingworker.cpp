@@ -228,6 +228,7 @@ void VrrPacingWorker::submit(PacedFrame&& frame)
             m_FrameQueue.back().trace.queueDepthAfter = m_FrameQueue.size();
             queuedFrame = true;
         }
+        m_FrameQueueDepth.store(m_FrameQueue.size(), std::memory_order_relaxed);
     }
 
     if (droppedFrame) {
@@ -653,6 +654,7 @@ bool VrrPacingWorker::dequeueFrame(QueuedFrame& frame,
     queueDiscontinuity = m_QueueDiscontinuity.exchange(false);
     frame = std::move(m_FrameQueue.front());
     m_FrameQueue.pop_front();
+    m_FrameQueueDepth.store(m_FrameQueue.size(), std::memory_order_relaxed);
     return true;
 }
 
@@ -669,6 +671,7 @@ void VrrPacingWorker::discardQueuedFrames(
     {
         QMutexLocker lock(&m_FrameQueueLock);
         discardedFrames.swap(m_FrameQueue);
+        m_FrameQueueDepth.store(0, std::memory_order_relaxed);
         m_QueueDiscontinuity.store(false);
     }
 
@@ -827,10 +830,18 @@ void VrrPacingWorker::writeTrace(const QueuedFrame& queuedFrame,
         return;
     }
 
-    size_t queueDepth;
-    {
-        QMutexLocker lock(&m_FrameQueueLock);
-        queueDepth = m_FrameQueue.size();
+    // A trace can lose a row, but it must never make the time-critical pacing
+    // thread wait for the background writer. The replay reports sequence gaps
+    // explicitly, so dropping under contention is preferable to skewing the
+    // timing being measured.
+    if (!m_TraceLock.tryLock()) {
+        m_TraceDroppedRows.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (m_TraceQueue.size() >= kMaximumTraceQueueRows) {
+        m_TraceDroppedRows.fetch_add(1, std::memory_order_relaxed);
+        m_TraceLock.unlock();
+        return;
     }
 
     const PacedFrame& frame = queuedFrame.frame;
@@ -844,19 +855,14 @@ void VrrPacingWorker::writeTrace(const QueuedFrame& queuedFrame,
     row.diagnostics = m_TimingController->diagnostics();
     row.feedback = feedback;
     row.telemetry = telemetry;
-    row.completionQueueDepth = queueDepth;
+    row.completionQueueDepth =
+        m_FrameQueueDepth.load(std::memory_order_relaxed);
     row.disposition = disposition;
     row.decisionValid = decisionValid;
     row.terminalTimeUs = LiGetMicroseconds();
 
-    {
-        QMutexLocker lock(&m_TraceLock);
-        if (m_TraceQueue.size() >= kMaximumTraceQueueRows) {
-            ++m_TraceDroppedRows;
-            return;
-        }
-        m_TraceQueue.emplace_back(std::move(row));
-    }
+    m_TraceQueue.emplace_back(std::move(row));
+    m_TraceLock.unlock();
     m_TraceQueueNotEmpty.wakeOne();
 }
 
@@ -867,7 +873,8 @@ int VrrPacingWorker::traceThreadProc(void* context)
 
 int VrrPacingWorker::traceRun()
 {
-    std::deque<TraceRow> batch;
+    std::vector<TraceRow> batch;
+    batch.reserve(kMaximumTraceQueueRows);
     while (true) {
         {
             QMutexLocker lock(&m_TraceLock);
@@ -1218,6 +1225,8 @@ void VrrPacingWorker::openTraceIfRequested()
 
     m_TraceBytesWritten = 0;
     m_TraceChunk.clear();
+    m_TraceQueue.clear();
+    m_TraceQueue.reserve(kMaximumTraceQueueRows);
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {
         const size_t magicBytes = sizeof(kTraceMagic) - 1;
         if (std::fwrite(kTraceMagic, 1, magicBytes, m_TraceFile) != magicBytes) {
@@ -1244,7 +1253,7 @@ void VrrPacingWorker::openTraceIfRequested()
     // stall the TIME_CRITICAL thread and perturb the timing being measured.
     m_TraceStopping.store(false);
     m_TraceSizeCapped = false;
-    m_TraceDroppedRows = 0;
+    m_TraceDroppedRows.store(0, std::memory_order_relaxed);
     m_TraceArrivalSequence.store(0);
     m_TraceStartUs = LiGetMicroseconds();
     m_TraceLatestArrivalUs = m_TraceStartUs;
@@ -1275,11 +1284,12 @@ void VrrPacingWorker::closeTrace()
     }
     m_TraceAcceptingRows.store(false);
 
-    if (m_TraceDroppedRows != 0) {
+    const size_t droppedRows =
+        m_TraceDroppedRows.exchange(0, std::memory_order_relaxed);
+    if (droppedRows != 0) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "VRR trace dropped %zu rows to protect pacing",
-                    m_TraceDroppedRows);
-        m_TraceDroppedRows = 0;
+                    droppedRows);
     }
 
     if (m_TraceSizeCapped) {
