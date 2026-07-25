@@ -114,6 +114,14 @@ public:
         std::lock_guard<std::mutex> lock(m_Mutex);
         VrrPresentFeedback feedback;
         feedback.cancelled = true;
+        const bool nativeSubmitAttempted =
+            m_CancellationMaySubmit && m_PreparedFrame != nullptr;
+        if (nativeSubmitAttempted) {
+            feedback.nativeBackendValid = true;
+            feedback.nativeBackend = VrrNativePresentationBackend::Vulkan;
+            feedback.nativePresentResultValid = true;
+            feedback.nativePresentResult = m_CancelSubmits ? 0 : -1;
+        }
         if (m_CancelSubmits && m_PreparedFrame != nullptr) {
             const int frameNumber = static_cast<int>(
                 reinterpret_cast<intptr_t>(m_PreparedFrame->opaque));

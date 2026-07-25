@@ -3,6 +3,7 @@
 #include "../../decoder.h"
 #include "../ivrrframepresenter.h"
 #include "pacertelemetry.h"
+#include "vrr/vrrtargetwaiter.h"
 #include "vrr/vrrtypes.h"
 #include "vrr/vrrtimingcontroller.h"
 
@@ -13,10 +14,10 @@
 #include <vector>
 
 #include <QByteArray>
+#include <QCryptographicHash>
 #include <QMutex>
 #include <QWaitCondition>
 
-class VrrTargetWaiter;
 class VrrTimingController;
 
 // The complete greenfield VRR execution path lives in this one worker.  It
@@ -76,11 +77,15 @@ private:
     struct FrameTelemetry {
         uint64_t decisionTimeUs = 0;
         uint64_t decisionEndUs = 0;
+        bool externalRebaseApplied = false;
+        uint32_t externalRebaseFlags = 0;
+        uint32_t midframeWindowStateFlags = 0;
         uint64_t staleCheckUs = 0;
         uint64_t staleAgeUs = 0;
         uint64_t renderWaitEntryUs = 0;
         uint64_t renderWaitFinalUs = 0;
         uint64_t renderWaitOvershootUs = 0;
+        VrrTargetWaitResult renderWait;
         uint64_t renderSchedulerDelayUs = 0;
         bool renderSchedulerDelayValid = false;
         bool renderDeadlineAlreadyElapsed = false;
@@ -91,6 +96,7 @@ private:
         uint64_t targetWaitOvershootUs = 0;
         uint64_t targetWaitFinalUs = 0;
         uint64_t targetSchedulerDelayUs = 0;
+        VrrTargetWaitResult targetWait;
         uint64_t presentStartUs = 0;
         uint64_t submissionBoundaryUs = 0;
         uint64_t presentEndUs = 0;
@@ -102,6 +108,8 @@ private:
         uint64_t spacingGuardFeedbackUs = 0;
         uint64_t spacingCheckUs = 0;
         uint64_t presentationFloorUs = 0;
+        uint64_t spacingRecheckUs = 0;
+        uint64_t spacingCorrectedFloorUs = 0;
         uint64_t correctionWaitStartUs = 0;
         uint64_t correctionWaitEndUs = 0;
         bool targetSchedulerDelayValid = false;
@@ -143,7 +151,7 @@ private:
     bool hasQueuedFrame();
     void discardQueuedFrames(bool countDrops,
                              TraceDisposition disposition);
-    void consumeWindowStateNotifications();
+    uint32_t consumeWindowStateNotifications();
     bool presentationSuspended() const;
     bool isStopping() const;
     void waitForSubmissionFloor(const VrrTimingDecision& decision,
@@ -165,7 +173,7 @@ private:
     void closeTrace();
     int traceRun();
     void writeTraceRow(const TraceRow& row);
-    void flushTraceChunk();
+    void flushTraceChunk(bool enforceSizeCap = true);
     bool minimumTraceDurationCaptured() const;
     static const char* traceDispositionName(TraceDisposition disposition);
     const char* tearClassification(const TraceRow& row) const;
@@ -192,6 +200,7 @@ private:
     std::atomic_uint32_t m_PendingWindowStateFlags { 0 };
     bool m_PresenterSuspended = false;
     bool m_RebaseOnNextFrame = false;
+    uint32_t m_RebaseOnNextFrameFlags = 0;
     bool m_DeepTraceEnabled = false;
     std::FILE* m_TraceFile = nullptr;
     SDL_Thread* m_TraceThread = nullptr;
@@ -202,10 +211,15 @@ private:
     std::atomic_bool m_TraceAcceptingRows { false };
     std::atomic_uint64_t m_TraceArrivalSequence { 0 };
     std::atomic_size_t m_TraceDroppedRows { 0 };
+    std::atomic_uint64_t m_TraceRowsEnqueued { 0 };
     uint64_t m_TraceBytesWritten = 0;
     uint64_t m_TraceStartUs = 0;
     uint64_t m_TraceLatestArrivalUs = 0;
     bool m_TraceSizeCapped = false;
+    bool m_TraceWriteFailed = false;
     TraceFormat m_TraceFormat = TraceFormat::Csv;
     QByteArray m_TraceChunk;
+    QCryptographicHash m_TraceDecodedHash {
+        QCryptographicHash::Sha256
+    };
 };

@@ -3,9 +3,11 @@
 
 #include <SDL.h>
 
+#include <QCryptographicHash>
 #include <QFile>
 #include <QTemporaryDir>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -619,7 +621,7 @@ void testTraceCapturesEveryDeliveredFrame()
     FakeVrrFramePresenter backend;
     backend.blockPreparation();
     PacerTelemetry telemetry;
-    TrackedFrameLifetime lifetimes[6];
+    TrackedFrameLifetime lifetimes[10];
     {
         VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
         expect(worker.start(), "worker must start for replay tracing");
@@ -637,25 +639,262 @@ void testTraceCapturesEveryDeliveredFrame()
         minimized.stateChangeFlags = WINDOW_STATE_CHANGE_MINIMIZED;
         worker.notifyWindowChanged(&minimized);
         worker.submit(frame(6, lifetimes[5]));
+
+        WINDOW_STATE_CHANGE_INFO restored {};
+        restored.stateChangeFlags = WINDOW_STATE_CHANGE_RESTORED;
+        worker.notifyWindowChanged(&restored);
+        worker.submit(frame(7, lifetimes[6]));
+        expect(backend.waitForPresentCount(5),
+               "restored trace frame must present after an explicit rebase");
+
+        WINDOW_STATE_CHANGE_INFO resized {};
+        resized.stateChangeFlags = WINDOW_STATE_CHANGE_SIZE;
+        resized.width = 1920;
+        resized.height = 1080;
+        worker.notifyWindowChanged(&resized);
+        worker.submit(frame(8, lifetimes[7]));
+        expect(backend.waitForPresentCount(6),
+               "first frame after a geometry refresh must use a new trace epoch");
+
+        backend.blockPreparation();
+        worker.submit(frame(9, lifetimes[8]));
+        expect(backend.waitForPrepareCount(7),
+               "display-epoch race test must hold an in-flight frame");
+        WINDOW_STATE_CHANGE_INFO displayChanged {};
+        displayChanged.stateChangeFlags = WINDOW_STATE_CHANGE_DISPLAY;
+        displayChanged.displayIndex = 0;
+        worker.notifyWindowChanged(&displayChanged);
+        backend.releasePreparation();
+        expect(backend.waitForCancelCount(1),
+               "an in-flight frame must be cancelled after display state changes");
+        expect(backend.presentCount() == 6,
+               "a decision from the prior display epoch must not be presented");
+
+        worker.submit(frame(10, lifetimes[9]));
+        expect(backend.waitForPresentCount(7),
+               "the post-interrupt frame must start the refreshed display epoch");
     }
 
-    const QList<QByteArray> lines = readExpandedTrace(tracePath).split('\n');
+    const QByteArray expandedTrace = readExpandedTrace(tracePath);
+    const QList<QByteArray> lines = expandedTrace.split('\n');
     const QList<QByteArray> columns = lines.value(0).split(',');
     const int frameColumn = columns.indexOf("frame");
     const int rtpColumn = columns.indexOf("rtp_timestamp");
     const int arrivalColumn = columns.indexOf("pacer_arrival_us");
     const int decisionValidColumn = columns.indexOf("decision_valid");
     const int dispositionColumn = columns.indexOf("disposition");
+    const int externalRebaseColumn =
+        columns.indexOf("external_rebase_applied");
+    const int externalRebaseFlagsColumn =
+        columns.indexOf("external_rebase_flags");
+    const int midframeWindowStateFlagsColumn =
+        columns.indexOf("midframe_window_state_flags");
+    const QList<QByteArray> controllerDiagnosticNames {
+        "readiness_phase_us",
+        "readiness_demand_us",
+        "applied_readiness_reserve_us",
+        "cadence_sample_count",
+        "rate_candidate_sample_count",
+        "readiness_sample_count",
+        "preparation_sample_count",
+        "render_scheduler_sample_count",
+        "target_scheduler_sample_count",
+        "clean_spacing_frames",
+        "phase_error_frames",
+        "readiness_model_valid",
+        "render_wait_initial_us",
+        "render_wait_active_budget_us",
+        "render_wait_coarse_sleep_count",
+        "render_wait_coarse_requested_total_us",
+        "render_wait_coarse_requested_wake_us",
+        "render_wait_coarse_return_us",
+        "render_wait_coarse_clock_stalled",
+        "render_wait_active_entered",
+        "render_wait_active_start_us",
+        "render_wait_active_limit_us",
+        "render_wait_active_yield_count",
+        "render_wait_active_clock_stalled",
+        "render_wait_active_yield_limit_reached",
+        "target_wait_initial_us",
+        "target_wait_active_budget_us",
+        "target_wait_coarse_sleep_count",
+        "target_wait_coarse_requested_total_us",
+        "target_wait_coarse_requested_wake_us",
+        "target_wait_coarse_return_us",
+        "target_wait_coarse_clock_stalled",
+        "target_wait_active_entered",
+        "target_wait_active_start_us",
+        "target_wait_active_limit_us",
+        "target_wait_active_yield_count",
+        "target_wait_active_clock_stalled",
+        "target_wait_active_yield_limit_reached",
+    };
+    QList<int> controllerDiagnosticColumns;
+    for (const QByteArray& name : controllerDiagnosticNames) {
+        controllerDiagnosticColumns.append(columns.indexOf(name));
+    }
+    const QList<QByteArray> nativeEvidenceNames {
+        "native_backend_valid",
+        "native_backend",
+        "native_present_result_valid",
+        "native_present_result",
+        "native_present_parameters_valid",
+        "native_present_sync_interval",
+        "native_present_flags",
+        "native_vrr_state_valid",
+        "native_tearing_supported",
+        "native_borderless_flip_model",
+        "native_same_gpu_output",
+        "native_render_adapter_luid_valid",
+        "native_render_adapter_luid",
+        "native_swap_chain_allows_tearing",
+        "native_tearing_feature_query_result_valid",
+        "native_tearing_feature_query_result",
+        "native_tearing_feature_allows_tearing",
+        "native_swap_chain_desc_query_result_valid",
+        "native_swap_chain_desc_query_result",
+        "native_swap_chain_flags",
+        "native_swap_chain_swap_effect",
+        "native_fullscreen_state_query_result_valid",
+        "native_fullscreen_state_query_result",
+        "native_fullscreen_exclusive",
+        "native_window_flags",
+        "native_present_ready_available",
+        "native_foreground_window",
+        "native_vrr_fallback_reason",
+        "native_desktop_monitor_count",
+        "native_vblank_virtualization_probe_complete",
+        "native_vblank_virtualization_call_available",
+        "native_vblank_virtualization_result_valid",
+        "native_vblank_virtualization_result",
+        "native_vblank_virtualization_disabled",
+        "native_display_config_query_result_valid",
+        "native_display_config_query_result",
+        "native_display_path_valid",
+        "native_display_path_flags",
+        "native_display_target_available",
+        "native_display_source_adapter_luid",
+        "native_display_source_id",
+        "native_display_target_adapter_luid",
+        "native_display_target_id",
+        "native_display_output_technology",
+        "native_display_rotation",
+        "native_display_scaling",
+        "native_display_path_refresh_numerator",
+        "native_display_path_refresh_denominator",
+        "native_display_signal_valid",
+        "native_display_signal_pixel_rate_hz",
+        "native_display_signal_hsync_numerator",
+        "native_display_signal_hsync_denominator",
+        "native_display_signal_vsync_numerator",
+        "native_display_signal_vsync_denominator",
+        "native_display_signal_active_width",
+        "native_display_signal_active_height",
+        "native_display_signal_total_width",
+        "native_display_signal_total_height",
+        "native_display_signal_additional_info_raw",
+        "native_display_signal_scanline_ordering",
+        "gpu_ready_attempted",
+        "gpu_ready_signal_result_valid",
+        "gpu_ready_signal_result",
+        "gpu_ready_set_event_result_valid",
+        "gpu_ready_set_event_result",
+        "gpu_ready_wait_result_valid",
+        "gpu_ready_wait_result",
+        "gpu_ready_signal_start_us",
+        "gpu_ready_signal_end_us",
+        "gpu_ready_flush_start_us",
+        "gpu_ready_flush_end_us",
+        "gpu_ready_set_event_start_us",
+        "gpu_ready_set_event_end_us",
+        "native_raster_sampling_requested",
+        "native_raster_open_result_valid",
+        "native_raster_open_result",
+        "native_raster_source_valid",
+        "native_raster_vidpn_source_id",
+        "native_raster_before_query_result_valid",
+        "native_raster_before_query_result",
+        "native_raster_before_query_start_us",
+        "native_raster_before_query_end_us",
+        "native_raster_before_in_vertical_blank",
+        "native_raster_before_scanline",
+        "native_raster_after_query_result_valid",
+        "native_raster_after_query_result",
+        "native_raster_after_query_start_us",
+        "native_raster_after_query_end_us",
+        "native_raster_after_in_vertical_blank",
+        "native_raster_after_scanline",
+        "submission_id_query_result_valid",
+        "submission_id_query_result",
+        "submission_id_query_start_us",
+        "submission_id_query_end_us",
+        "frame_stats_query_result_valid",
+        "frame_stats_query_result",
+        "frame_stats_query_start_us",
+        "frame_stats_query_end_us",
+        "latch_raw_sync_qpc_valid",
+        "latch_raw_sync_qpc_ticks",
+        "latch_raw_sync_qpc_frequency_hz",
+        "latch_qpc_correlation_valid",
+        "latch_qpc_correlation_reference_ticks",
+        "latch_qpc_correlation_reference_time_us",
+        "latch_qpc_correlation_span_ticks",
+    };
+    QList<int> nativeEvidenceColumns;
+    for (const QByteArray& name : nativeEvidenceNames) {
+        nativeEvidenceColumns.append(columns.indexOf(name));
+    }
     expect(frameColumn >= 0 && rtpColumn >= 0 && arrivalColumn >= 0 &&
-               decisionValidColumn >= 0 && dispositionColumn >= 0,
+               decisionValidColumn >= 0 && dispositionColumn >= 0 &&
+               externalRebaseColumn >= 0 &&
+               externalRebaseFlagsColumn >= 0 &&
+               midframeWindowStateFlagsColumn >= 0 &&
+               std::all_of(
+                   controllerDiagnosticColumns.cbegin(),
+                   controllerDiagnosticColumns.cend(),
+                   [](int column) { return column >= 0; }) &&
+               std::all_of(
+                   nativeEvidenceColumns.cbegin(),
+                   nativeEvidenceColumns.cend(),
+                   [](int column) { return column >= 0; }),
            "replay schema must expose raw arrivals and terminal disposition");
 
-    bool observedFrames[6] = {};
+    bool observedFrames[11] = {};
     bool observedCapacityDrop = false;
     bool observedRejectedArrival = false;
+    bool observedRestoreRebase = false;
+    bool observedGeometryRebase = false;
+    bool observedMidframeDisplayInterrupt = false;
+    bool observedPostInterruptDisplayRebase = false;
+    bool observedCleanFooter = false;
+    QByteArray observedFooterHash;
     int rowCount = 0;
     for (int i = 1; i < lines.size(); ++i) {
         if (lines[i].isEmpty()) {
+            continue;
+        }
+        if (lines[i].startsWith("#vrr_trace_footer,")) {
+            const QByteArray hashMarker("decoded_sha256=");
+            const int hashOffset = lines[i].indexOf(hashMarker);
+            const QByteArray footerHash = hashOffset >= 0 ?
+                lines[i].mid(hashOffset + hashMarker.size()) :
+                QByteArray();
+            observedFooterHash = footerHash;
+            observedCleanFooter =
+                lines[i].contains("format_version=2") &&
+                lines[i].contains("clean_shutdown=1") &&
+                lines[i].contains("arrival_sequence_allocated=10") &&
+                lines[i].contains("rows_enqueued=10") &&
+                lines[i].contains("rows_dropped=0") &&
+                lines[i].contains("size_capped=0") &&
+                lines[i].contains("write_failed=0") &&
+                footerHash.size() == 64 &&
+                std::all_of(
+                    footerHash.cbegin(), footerHash.cend(),
+                    [](char value) {
+                        return (value >= '0' && value <= '9') ||
+                            (value >= 'a' && value <= 'f');
+                    });
             continue;
         }
         const QList<QByteArray> fields = lines[i].split(',');
@@ -666,7 +905,7 @@ void testTraceCapturesEveryDeliveredFrame()
         }
         ++rowCount;
         const int frameNumber = fields[frameColumn].toInt();
-        if (frameNumber >= 1 && frameNumber <= 5) {
+        if (frameNumber >= 1 && frameNumber <= 10) {
             observedFrames[frameNumber] = true;
         }
         expect(fields[rtpColumn].toULongLong() ==
@@ -674,6 +913,16 @@ void testTraceCapturesEveryDeliveredFrame()
                "replay trace must preserve each raw RTP timestamp");
         expect(fields[arrivalColumn].toULongLong() != 0,
                "replay trace must capture the pacer arrival instant");
+        if (fields[decisionValidColumn] == "0") {
+            for (int diagnosticColumn : controllerDiagnosticColumns) {
+                expect(fields[diagnosticColumn] == "0",
+                       "producer-side terminal rows must not inspect worker-owned controller state");
+            }
+            for (int evidenceColumn : nativeEvidenceColumns) {
+                expect(fields[evidenceColumn] == "0",
+                       "nondecision rows must not invent native outcome or QPC evidence");
+            }
+        }
         if (frameNumber == 2 &&
             fields[dispositionColumn] == "queue_capacity") {
             observedCapacityDrop = true;
@@ -684,18 +933,141 @@ void testTraceCapturesEveryDeliveredFrame()
             fields[dispositionColumn] == "arrival_rejected") {
             observedRejectedArrival = true;
             expect(fields[decisionValidColumn] == "0",
-                   "suspended arrival must not invent a timing decision");
+                    "suspended arrival must not invent a timing decision");
+        }
+        if (frameNumber == 7 &&
+                fields[dispositionColumn] == "presented") {
+            observedRestoreRebase =
+                fields[decisionValidColumn] == "1" &&
+                fields[externalRebaseColumn] == "1" &&
+                fields[externalRebaseFlagsColumn] ==
+                    QByteArray::number(
+                        WINDOW_STATE_CHANGE_MINIMIZED |
+                        WINDOW_STATE_CHANGE_RESTORED) &&
+                fields[midframeWindowStateFlagsColumn] == "0";
+        }
+        if (frameNumber == 8 &&
+                fields[dispositionColumn] == "presented") {
+            observedGeometryRebase =
+                fields[decisionValidColumn] == "1" &&
+                fields[externalRebaseColumn] == "1" &&
+                fields[externalRebaseFlagsColumn] ==
+                    QByteArray::number(
+                        WINDOW_STATE_CHANGE_SIZE) &&
+                fields[midframeWindowStateFlagsColumn] == "0";
+        }
+        if (frameNumber == 9 &&
+                fields[dispositionColumn] == "interrupted") {
+            observedMidframeDisplayInterrupt =
+                fields[decisionValidColumn] == "1" &&
+                fields[externalRebaseColumn] == "0" &&
+                fields[externalRebaseFlagsColumn] == "0" &&
+                fields[midframeWindowStateFlagsColumn] ==
+                    QByteArray::number(
+                        WINDOW_STATE_CHANGE_DISPLAY);
+        }
+        if (frameNumber == 10 &&
+                fields[dispositionColumn] == "presented") {
+            observedPostInterruptDisplayRebase =
+                fields[decisionValidColumn] == "1" &&
+                fields[externalRebaseColumn] == "1" &&
+                fields[externalRebaseFlagsColumn] ==
+                    QByteArray::number(
+                        WINDOW_STATE_CHANGE_DISPLAY) &&
+                fields[midframeWindowStateFlagsColumn] == "0";
         }
     }
-    expect(rowCount == 6,
+    expect(rowCount == 10,
            "trace must contain exactly one terminal row per delivered frame");
     expect(observedFrames[1] && observedFrames[2] && observedFrames[3] &&
-               observedFrames[4] && observedFrames[5],
+               observedFrames[4] && observedFrames[5] && observedFrames[6] &&
+               observedFrames[7] && observedFrames[8] &&
+               observedFrames[9] && observedFrames[10],
            "trace must not omit evicted or presented deliveries");
     expect(observedCapacityDrop,
            "trace must identify the frame evicted by queue capacity");
     expect(observedRejectedArrival,
            "trace must retain frames rejected before queue admission");
+    expect(observedRestoreRebase,
+           "trace must distinguish an explicit window-state rebase from an internal controller reset");
+    expect(observedGeometryRebase,
+           "trace must begin a new epoch after renderer geometry/display state refresh");
+    expect(observedMidframeDisplayInterrupt,
+           "trace must identify a display change that interrupts an in-flight frame");
+    expect(observedPostInterruptDisplayRebase,
+           "the first frame after a mid-frame display change must carry its exact rebase cause");
+    expect(observedCleanFooter,
+           "trace must end with exact clean-close row accounting");
+    const int footerOffset = expandedTrace.indexOf("#vrr_trace_footer,");
+    const QByteArray expectedFooterHash = footerOffset >= 0 ?
+        QCryptographicHash::hash(
+            expandedTrace.left(footerOffset),
+            QCryptographicHash::Sha256).toHex() :
+        QByteArray();
+    expect(!expectedFooterHash.isEmpty() &&
+               observedFooterHash == expectedFooterHash,
+           "trace footer must authenticate the decoded header and rows");
+
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+}
+
+void testFailedCancellationNativeEvidenceIsTraced()
+{
+    resetFakeClock();
+    QTemporaryDir traceDirectory;
+    expect(traceDirectory.isValid(),
+           "failed cancellation trace test must create a temporary directory");
+    const QString tracePath =
+        traceDirectory.filePath("vrr-cancellation-failure.csv");
+    const QByteArray tracePathBytes = QFile::encodeName(tracePath);
+    SDL_setenv("MOONLIGHT_VRR_TRACE", tracePathBytes.constData(), 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
+
+    FakeVrrFramePresenter backend;
+    backend.setPreparationSucceeds(false);
+    backend.setCancellationMaySubmit(true);
+    backend.setCancelSubmits(false);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime failed;
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(),
+               "worker must start for failed cancellation tracing");
+        worker.submit(frame(1, failed));
+        expect(backend.waitForCancelCount(1),
+               "failed preparation must attempt native cancellation");
+    }
+
+    const QByteArray expandedTrace = readExpandedTrace(tracePath);
+    const QList<QByteArray> lines = expandedTrace.split('\n');
+    const QList<QByteArray> columns = lines.value(0).split(',');
+    const QList<QByteArray> fields = lines.value(1).split(',');
+    const int dispositionColumn = columns.indexOf("disposition");
+    const int backendValidColumn = columns.indexOf("native_backend_valid");
+    const int backendColumn = columns.indexOf("native_backend");
+    const int resultValidColumn =
+        columns.indexOf("native_present_result_valid");
+    const int resultColumn = columns.indexOf("native_present_result");
+    expect(fields.size() == columns.size() &&
+               dispositionColumn >= 0 &&
+               backendValidColumn >= 0 &&
+               backendColumn >= 0 &&
+               resultValidColumn >= 0 &&
+               resultColumn >= 0,
+           "failed cancellation trace must retain a complete row");
+    if (fields.size() == columns.size() &&
+            dispositionColumn >= 0 &&
+            backendValidColumn >= 0 &&
+            backendColumn >= 0 &&
+            resultValidColumn >= 0 &&
+            resultColumn >= 0) {
+        expect(fields[dispositionColumn] == "preparation_failed" &&
+                   fields[backendValidColumn] == "1" &&
+                   fields[backendColumn] == "2" &&
+                   fields[resultValidColumn] == "1" &&
+                   fields[resultColumn] == "-1",
+               "failed native cancellation must not be collapsed into generic cancellation");
+    }
 
     SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
 }
@@ -732,16 +1104,84 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     const QList<QByteArray> lines = expandedTrace.split('\n');
     const QByteArray header = lines.value(0);
     const QByteArray row = lines.value(1);
+    const QList<QByteArray> columns = header.split(',');
+    const QList<QByteArray> fields = row.split(',');
     expect(header.contains("native_present_call_us") &&
+               header.contains("presenter_submission_time_valid") &&
+               header.contains("presenter_submission_time_us") &&
+               header.contains("presenter_submission_time_used") &&
+               header.contains("gpu_ready_attempted") &&
+               header.contains("gpu_ready_signal_result_valid") &&
+               header.contains("gpu_ready_signal_result") &&
+               header.contains("gpu_ready_set_event_result_valid") &&
+               header.contains("gpu_ready_set_event_result") &&
+               header.contains("gpu_ready_wait_result_valid") &&
+               header.contains("gpu_ready_wait_result") &&
+               header.contains("gpu_ready_signal_start_us") &&
+               header.contains("gpu_ready_signal_end_us") &&
+               header.contains("gpu_ready_flush_start_us") &&
+               header.contains("gpu_ready_flush_end_us") &&
+               header.contains("gpu_ready_set_event_start_us") &&
+               header.contains("gpu_ready_set_event_end_us") &&
+               header.contains("gpu_ready_poll_start_us") &&
+               header.contains("gpu_ready_poll_end_us") &&
+               header.contains("gpu_ready_fence_value") &&
+               header.contains("gpu_ready_poll_completed_value") &&
+               header.contains("gpu_ready_completed_before_wait") &&
+               header.contains("gpu_ready_completion_lower_bound_us") &&
+               header.contains("gpu_ready_completion_upper_bound_us") &&
+               header.contains("gpu_ready_completion_uncertainty_us") &&
                header.contains("gpu_ready_wait_us") &&
+               header.contains(
+                   "native_display_signal_additional_info_raw") &&
                header.contains("tear_classification") &&
+               header.contains("spacing_deficit_us") &&
                header.contains("spacing_guard_feedback_us") &&
+               header.contains("spacing_corrected") &&
+               header.contains("spacing_recheck_us") &&
+               header.contains("spacing_corrected_floor_us") &&
+               header.contains("submission_id_query_start_us") &&
+               header.contains("submission_id_query_end_us") &&
+               header.contains("frame_stats_query_start_us") &&
+               header.contains("frame_stats_query_end_us") &&
+               header.contains("completion_queue_depth") &&
                header.contains("latch_present_refresh_seq"),
-           "deep trace must identify native, tear, guard, and renderer-readiness timing");
+           "deep trace must identify presenter, native, tear, spacing, queue, and renderer-readiness timing");
     expect(row.startsWith("5,"),
            "new captures must use parameterized trace schema 5");
     expect(!row.isEmpty() && header.count(',') == row.count(','),
            "deep trace rows must match the CSV schema");
+    const int submissionBoundaryColumn =
+        columns.indexOf("submission_boundary_us");
+    const int presenterSubmissionValidColumn =
+        columns.indexOf("presenter_submission_time_valid");
+    const int presenterSubmissionTimeColumn =
+        columns.indexOf("presenter_submission_time_us");
+    const int presenterSubmissionUsedColumn =
+        columns.indexOf("presenter_submission_time_used");
+    expect(fields.size() == columns.size() &&
+               submissionBoundaryColumn >= 0 &&
+               presenterSubmissionValidColumn >= 0 &&
+               presenterSubmissionTimeColumn >= 0 &&
+               presenterSubmissionUsedColumn >= 0,
+           "deep trace must retain a complete presenter submission-timing row");
+    if (fields.size() == columns.size() &&
+            submissionBoundaryColumn >= 0 &&
+            presenterSubmissionValidColumn >= 0 &&
+            presenterSubmissionTimeColumn >= 0 &&
+            presenterSubmissionUsedColumn >= 0) {
+        expect(fields[presenterSubmissionValidColumn] == "1" &&
+                   fields[presenterSubmissionUsedColumn] == "1" &&
+                   fields[presenterSubmissionTimeColumn] ==
+                       fields[submissionBoundaryColumn],
+               "worker submission boundary must preserve the presenter's exact native-call timestamp");
+    }
+    expect(expandedTrace.contains(
+               "#vrr_trace_footer,format_version=2,clean_shutdown=1,"
+               "arrival_sequence_allocated=1,rows_enqueued=1,"
+               "rows_dropped=0,size_capped=0,write_failed=0,"
+               "decoded_sha256="),
+           "compressed traces must retain the clean-close accounting footer");
     QFile traceFile(tracePath);
     expect(traceFile.size() > 7 && traceFile.size() < expandedTrace.size(),
            "recommended traces must be chunk-compressed on disk");
@@ -793,6 +1233,7 @@ int main()
     testSuspendedPreparedCancellationHonorsDisplayFloor();
     testImmutablePresentationContract();
     testTraceCapturesEveryDeliveredFrame();
+    testFailedCancellationNativeEvidenceIsTraced();
     testDeepTraceRequestsNativeObservationsWithoutChangingMode();
 
     SDL_Quit();

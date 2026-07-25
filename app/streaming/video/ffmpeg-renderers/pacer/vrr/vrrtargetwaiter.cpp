@@ -50,16 +50,17 @@ VrrTargetWaitResult VrrTargetWaiter::waitUntil(
 {
     VrrTargetWaitResult result;
     uint64_t nowUs = m_Hooks.nowUs();
+    result.initialNowUs = nowUs;
+    const uint64_t boundedWakeLeadUs = std::min(
+        additionalWakeLeadUs, kMaximumAdditionalWakeLeadUs);
+    const uint64_t activeWaitUs = saturatingAdd(kMaximumActiveWaitUs,
+                                                 boundedWakeLeadUs);
+    result.activeWaitUs = activeWaitUs;
     if (nowUs >= deadlineUs) {
         result.deadlineAlreadyElapsed = true;
         result.finalNowUs = nowUs;
         return result;
     }
-
-    const uint64_t boundedWakeLeadUs = std::min(
-        additionalWakeLeadUs, kMaximumAdditionalWakeLeadUs);
-    const uint64_t activeWaitUs = saturatingAdd(kMaximumActiveWaitUs,
-                                                 boundedWakeLeadUs);
 
     unsigned int stagnantCoarseSleeps = 0;
     while (nowUs < deadlineUs) {
@@ -74,9 +75,14 @@ VrrTargetWaitResult VrrTargetWaiter::waitUntil(
         const uint64_t coarseSleepUs =
             remainingUs > activeWaitUs ? remainingUs - activeWaitUs : 1;
         const uint64_t requestedWakeUs = saturatingAdd(nowUs, coarseSleepUs);
+        ++result.coarseSleepCount;
+        result.coarseSleepRequestedUs = saturatingAdd(
+            result.coarseSleepRequestedUs, coarseSleepUs);
+        result.coarseSleepRequestedWakeUs = requestedWakeUs;
         m_Hooks.sleepForUs(coarseSleepUs);
 
         const uint64_t afterSleepUs = m_Hooks.nowUs();
+        result.coarseSleepReturnUs = afterSleepUs;
         result.schedulerDelayValid = true;
         if (afterSleepUs > requestedWakeUs) {
             const uint64_t coarseOvershootUs =
@@ -93,6 +99,7 @@ VrrTargetWaitResult VrrTargetWaiter::waitUntil(
             // an unbounded interval.
             if (++stagnantCoarseSleeps >= 2) {
                 nowUs = afterSleepUs;
+                result.coarseSleepClockStalled = true;
                 break;
             }
         }
@@ -106,16 +113,25 @@ VrrTargetWaitResult VrrTargetWaiter::waitUntil(
         const uint64_t activeStartUs = nowUs;
         const uint64_t activeLimitUs = saturatingAdd(
             activeStartUs, activeWaitUs);
+        result.activeWaitEntered = true;
+        result.activeWaitStartUs = activeStartUs;
+        result.activeWaitLimitUs = activeLimitUs;
         unsigned int stagnantYields = 0;
         unsigned int yieldCount = 0;
 
-        while (nowUs < deadlineUs && nowUs < activeLimitUs &&
-               yieldCount < 4096) {
+        // The monotonic active-time limit is the real safety bound. A fixed
+        // yield-count limit is CPU- and scheduler-dependent: on a fast
+        // machine it can expire hundreds of microseconds early even though
+        // the clock is advancing normally. The stagnant-clock detector below
+        // remains the bounded escape for broken hooks or a stopped clock.
+        while (nowUs < deadlineUs && nowUs < activeLimitUs) {
             m_Hooks.yield();
             ++yieldCount;
+            result.activeWaitYieldCount = yieldCount;
             const uint64_t afterYieldUs = m_Hooks.nowUs();
             if (afterYieldUs <= nowUs) {
                 if (++stagnantYields >= 64) {
+                    result.activeWaitClockStalled = true;
                     break;
                 }
             }
@@ -124,6 +140,7 @@ VrrTargetWaitResult VrrTargetWaiter::waitUntil(
                 nowUs = afterYieldUs;
             }
         }
+        result.activeWaitYieldLimitReached = false;
 
         result.finalNowUs = nowUs;
         return result;

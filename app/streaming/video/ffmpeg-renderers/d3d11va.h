@@ -4,6 +4,7 @@
 #include "renderer.h"
 
 #include <d3d11_4.h>
+#include <d3dkmthk.h>
 #include <dxgi1_6.h>
 
 extern "C" {
@@ -64,6 +65,10 @@ private:
     void initializeVrrPresentationState(SDL_Window* window,
                                         DXGI_SWAP_CHAIN_DESC1* swapChainDesc);
     void refreshVrrDisplayState();
+    void refreshVrrDisplayTiming();
+    void closeVrrRasterSource();
+    VrrNativeRasterSample sampleVrrRaster() const;
+    void populateVrrGpuReadyFeedback(VrrPresentFeedback& feedback) const;
     VrrFallbackReason evaluateVrrEligibility(
         bool prioritizeOutputCompatibility);
     void releasePreparedVrrFrame();
@@ -91,6 +96,35 @@ private:
         Monitored,
     };
 
+    struct VrrDisplayTimingSnapshot {
+        bool queryResultValid = false;
+        uint32_t queryResult = 0;
+        bool pathValid = false;
+        uint32_t pathFlags = 0;
+        bool targetAvailable = false;
+        uint64_t sourceAdapterLuid = 0;
+        uint32_t sourceId = 0;
+        uint64_t targetAdapterLuid = 0;
+        uint32_t targetId = 0;
+        uint32_t outputTechnology = 0;
+        uint32_t rotation = 0;
+        uint32_t scaling = 0;
+        uint32_t pathRefreshNumerator = 0;
+        uint32_t pathRefreshDenominator = 0;
+        bool signalValid = false;
+        uint64_t signalPixelRateHz = 0;
+        uint32_t signalHSyncNumerator = 0;
+        uint32_t signalHSyncDenominator = 0;
+        uint32_t signalVSyncNumerator = 0;
+        uint32_t signalVSyncDenominator = 0;
+        uint32_t signalActiveWidth = 0;
+        uint32_t signalActiveHeight = 0;
+        uint32_t signalTotalWidth = 0;
+        uint32_t signalTotalHeight = 0;
+        uint32_t signalAdditionalInfoRaw = 0;
+        uint32_t signalScanLineOrdering = 0;
+    };
+
     bool m_DebugLayer;
     Microsoft::WRL::ComPtr<IDXGIFactory5> m_Factory;
     // m_AdapterIndex identifies the output selected by SDL.  The renderer
@@ -98,6 +132,8 @@ private:
     // separately for the VRR same-GPU check.
     int m_AdapterIndex;
     int m_RenderAdapterIndex;
+    bool m_VrrRenderAdapterLuidValid;
+    uint64_t m_VrrRenderAdapterLuid;
     Microsoft::WRL::ComPtr<ID3D11Device5> m_RenderDevice, m_DecodeDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext4> m_RenderDeviceContext, m_DecodeDeviceContext;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_RenderSharedTextureArray;
@@ -125,6 +161,26 @@ private:
     bool m_VrrBorderlessFlipModel;
     bool m_VrrSameGpuOutput;
     bool m_VrrSwapChainAllowsTearing;
+    bool m_VrrTearingFeatureQueryResultValid;
+    int64_t m_VrrTearingFeatureQueryResult;
+    bool m_VrrTearingFeatureAllowsTearing;
+    bool m_VrrSwapChainDescQueryResultValid;
+    int64_t m_VrrSwapChainDescQueryResult;
+    uint32_t m_VrrSwapChainFlags;
+    uint32_t m_VrrSwapChainSwapEffect;
+    bool m_VrrFullscreenStateQueryResultValid;
+    int64_t m_VrrFullscreenStateQueryResult;
+    bool m_VrrFullscreenExclusive;
+    uint32_t m_VrrWindowFlags;
+    UINT m_VrrDesktopMonitorCount;
+    HWND m_VrrWindowHandle;
+    VrrDisplayTimingSnapshot m_VrrDisplayTiming;
+    bool m_VrrRasterSamplingRequested;
+    bool m_VrrRasterOpenResultValid;
+    int64_t m_VrrRasterOpenResult;
+    bool m_VrrRasterSourceValid;
+    D3DKMT_HANDLE m_VrrRasterAdapter;
+    D3DDDI_VIDEO_PRESENT_SOURCE_ID m_VrrRasterVidPnSourceId;
     bool m_VrrSuspended;
     VrrFallbackReason m_VrrFallbackReason;
     bool m_VrrFramePrepared;
@@ -133,7 +189,25 @@ private:
     UINT64 m_VrrPresentReadyFenceValue;
     HANDLE m_VrrPresentReadyFenceEvent;
     bool m_VrrPresentReadyAvailable;
+    bool m_VrrGpuReadyAttempted;
+    bool m_VrrGpuReadySignalResultValid;
+    int64_t m_VrrGpuReadySignalResult;
+    bool m_VrrGpuReadySetEventResultValid;
+    int64_t m_VrrGpuReadySetEventResult;
+    bool m_VrrGpuReadyWaitResultValid;
+    uint32_t m_VrrGpuReadyWaitResult;
     bool m_VrrGpuReadyTimingValid;
+    uint64_t m_VrrGpuReadySignalStartUs;
+    uint64_t m_VrrGpuReadySignalEndUs;
+    uint64_t m_VrrGpuReadyFlushStartUs;
+    uint64_t m_VrrGpuReadyFlushEndUs;
+    uint64_t m_VrrGpuReadySetEventStartUs;
+    uint64_t m_VrrGpuReadySetEventEndUs;
+    uint64_t m_VrrGpuReadyPollStartUs;
+    uint64_t m_VrrGpuReadyPollEndUs;
+    uint64_t m_VrrGpuReadyFenceValue;
+    uint64_t m_VrrGpuReadyPollCompletedValue;
+    bool m_VrrGpuReadyCompletedBeforeWait;
     uint64_t m_VrrGpuReadyWaitStartUs;
     uint64_t m_VrrGpuReadyTimeUs;
     bool m_VrrPriorPresentCountValid;

@@ -83,11 +83,37 @@ void FFmpegVideoDecoder::setHdrMode(bool enabled)
 
 bool FFmpegVideoDecoder::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
 {
-    if (m_Pacer != nullptr) {
-        m_Pacer->notifyWindowChanged(info);
+    if (info == nullptr) {
+        return m_FrontendRenderer->notifyWindowChanged(info);
     }
 
-    return m_FrontendRenderer->notifyWindowChanged(info);
+    constexpr uint32_t deferredPacerFlags =
+        WINDOW_STATE_CHANGE_SIZE |
+        WINDOW_STATE_CHANGE_DISPLAY;
+    const WINDOW_STATE_CHANGE_INFO originalInfo = *info;
+
+    // Suspension must reach the worker immediately so it cannot submit
+    // another frame after a minimize/background notification. Geometry and
+    // display changes are different: the renderer first completes its
+    // synchronous refresh (D3D11) or queues the refresh that its next prepare
+    // must complete (Vulkan). Only then does the pacing worker mark the next
+    // frame as the first row of the new display epoch.
+    if (m_Pacer != nullptr &&
+            (originalInfo.stateChangeFlags & ~deferredPacerFlags) != 0) {
+        WINDOW_STATE_CHANGE_INFO pacingInfo = originalInfo;
+        pacingInfo.stateChangeFlags &= ~deferredPacerFlags;
+        m_Pacer->notifyWindowChanged(&pacingInfo);
+    }
+
+    const bool handled =
+        m_FrontendRenderer->notifyWindowChanged(info);
+    if (m_Pacer != nullptr && handled &&
+            (originalInfo.stateChangeFlags & deferredPacerFlags) != 0) {
+        WINDOW_STATE_CHANGE_INFO pacingInfo = originalInfo;
+        pacingInfo.stateChangeFlags &= deferredPacerFlags;
+        m_Pacer->notifyWindowChanged(&pacingInfo);
+    }
+    return handled;
 }
 
 int FFmpegVideoDecoder::getDecoderCapabilities()

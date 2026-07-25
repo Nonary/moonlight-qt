@@ -98,7 +98,7 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         1, roundedQ16(m_SourcePeriodUsQ16));
     m_LatchedPresentation = m_CanLatchPresentation && m_SourcePeriodUs <
         saturatingAdd(m_DisplayPeriodUs,
-                      m_Parameters.latchedPresentationHeadroomUs);
+                      latchedPresentationHeadroomUs());
     m_ReadinessBudgetUs = 0;
     m_ReadinessPhaseUs = 0;
     m_ReadinessDemandUs = retainLearnedBudgets ?
@@ -344,15 +344,15 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         // is still elevated, then restore immediate presentation at the
         // normal eligibility boundary.
         if (learnedHeadroomUs >=
-                m_Parameters.latchedPresentationExitHeadroomUs ||
+                latchedPresentationExitHeadroomUs() ||
             (m_GuardUs == m_BaseGuardUs &&
              learnedHeadroomUs >=
-                m_Parameters.latchedPresentationHeadroomUs)) {
+                latchedPresentationHeadroomUs())) {
             m_LatchedPresentation = false;
         }
     }
     else if (learnedHeadroomUs <
-             m_Parameters.latchedPresentationHeadroomUs) {
+             latchedPresentationHeadroomUs()) {
         m_LatchedPresentation = true;
     }
     decision.latchedPresentation = m_LatchedPresentation;
@@ -864,6 +864,37 @@ uint64_t VrrTimingController::headroomUs() const
 {
     const uint64_t floorUs = saturatingAdd(m_DisplayPeriodUs, m_GuardUs);
     return m_SourcePeriodUs > floorUs ? m_SourcePeriodUs - floorUs : 0;
+}
+
+uint64_t VrrTimingController::scaledDisplayPeriodUs(
+    uint64_t numerator, uint64_t denominator) const
+{
+    if (numerator == 0 || denominator == 0) {
+        return 0;
+    }
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    if (m_DisplayPeriodUs > maximum / numerator) {
+        return maximum;
+    }
+    return m_DisplayPeriodUs * numerator / denominator;
+}
+
+uint64_t VrrTimingController::latchedPresentationHeadroomUs() const
+{
+    return std::max(
+        m_Parameters.latchedPresentationHeadroomUs,
+        scaledDisplayPeriodUs(
+            m_Parameters.latchedPresentationHeadroomPeriodNumerator,
+            m_Parameters.latchedPresentationHeadroomPeriodDenominator));
+}
+
+uint64_t VrrTimingController::latchedPresentationExitHeadroomUs() const
+{
+    return std::max(
+        m_Parameters.latchedPresentationExitHeadroomUs,
+        scaledDisplayPeriodUs(
+            m_Parameters.latchedPresentationExitHeadroomPeriodNumerator,
+            m_Parameters.latchedPresentationExitHeadroomPeriodDenominator));
 }
 
 uint64_t VrrTimingController::sourcePeriodUs() const

@@ -1329,6 +1329,11 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest&)
     const bool submitted = submitPendingSwapchainFrame();
 
     VrrPresentFeedback feedback;
+    feedback.nativeBackendValid = true;
+    feedback.nativeBackend = VrrNativePresentationBackend::Vulkan;
+    feedback.nativePresentResultValid = true;
+    // libplacebo exposes a boolean submit result here rather than VkResult.
+    feedback.nativePresentResult = submitted ? 0 : -1;
     if (!submitted) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "pl_swapchain_submit_frame() failed on Vulkan VRR path");
@@ -1365,8 +1370,15 @@ VrrPresentFeedback PlVkRenderer::cancelFrame()
 {
     VrrPresentFeedback feedback;
     feedback.cancelled = true;
+    const bool nativeSubmitAttempted = m_HasPendingSwapchainFrame;
     const uint64_t submissionTimeUs = LiGetMicroseconds();
     feedback.presented = cancelVrrFrame();
+    if (nativeSubmitAttempted) {
+        feedback.nativeBackendValid = true;
+        feedback.nativeBackend = VrrNativePresentationBackend::Vulkan;
+        feedback.nativePresentResultValid = true;
+        feedback.nativePresentResult = feedback.presented ? 0 : -1;
+    }
     if (feedback.presented) {
         feedback.submissionTimeValid = true;
         feedback.submissionTimeUs = submissionTimeUs;

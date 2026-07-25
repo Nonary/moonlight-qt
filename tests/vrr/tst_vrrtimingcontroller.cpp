@@ -330,10 +330,10 @@ void testNearRefreshRequestsLatchedPresentation()
     expect(decision.latchedPresentation,
            "a near-refresh cadence must request latched presentation");
 
-    VrrTimingController withHeadroom(config(96, 120));
+    VrrTimingController withHeadroom(config(20, 120));
     decision = withHeadroom.schedule(frame(1, 0, true, 100000), 100000);
     expect(!decision.latchedPresentation,
-           "a cadence with real adaptive headroom must keep immediate flips");
+           "a cadence beyond the display-scaled protection window must keep immediate flips");
 
     VrrTimingController immutableMailbox(config(116, 120), false);
     decision = immutableMailbox.schedule(
@@ -344,36 +344,76 @@ void testNearRefreshRequestsLatchedPresentation()
 
 void testLatchedPresentationRecoversAfterGuardDecay()
 {
-    // At 100 FPS on a 120 Hz panel, the base guard leaves just over the
-    // immediate-presentation threshold. A single spacing correction should
-    // select latching while it is needed, but must not make that cadence stay
-    // latched after the guard has returned to its normal value.
-    VrrTimingController controller(config(100, 120));
+    // Just below one quarter of a 144 Hz display rate, the base guard leaves a
+    // small margin beyond the three-display-period protection window. A spacing
+    // correction should select latching while needed, but must not make that
+    // cadence stay latched after the guard returns to normal.
+    VrrTimingController controller(config(35, 144));
     VrrTimingDecision decision = controller.schedule(
         frame(1, 0, true, 100000), 100000);
     expect(!decision.latchedPresentation,
-           "100 FPS must begin in immediate mode with its base guard");
+           "a cadence beyond the scaled entry window must begin in immediate mode");
 
     const uint64_t baseGuardUs = decision.guardUs;
+    const VrrTimingParameters& parameters = controller.parameters();
+    const uint64_t scaledLatchHeadroomUs =
+        controller.displayPeriodUs() *
+            parameters.latchedPresentationHeadroomPeriodNumerator /
+            parameters.latchedPresentationHeadroomPeriodDenominator;
+    const uint64_t latchHeadroomUs = std::max(
+        parameters.latchedPresentationHeadroomUs,
+        scaledLatchHeadroomUs);
     const uint64_t latchDeficitUs =
-        decision.headroomUs -
-        controller.parameters().latchedPresentationHeadroomUs + 1;
+        decision.headroomUs - latchHeadroomUs + 1;
     controller.noteSpacingDeficit(latchDeficitUs);
-    decision = controller.schedule(frame(2, 900, true, 110000), 110000);
+    decision = controller.schedule(
+        frame(2, 2571, true, 128571), 128571);
     expect(decision.latchedPresentation,
            "a transient guard increase must select the safe latched path");
 
     const size_t decayCycles = static_cast<size_t>(
         (controller.guardUs() - baseGuardUs +
-         controller.parameters().guardStepUs - 1) /
-        controller.parameters().guardStepUs);
+         parameters.guardStepUs - 1) /
+        parameters.guardStepUs);
     for (size_t i = 0;
-         i < decayCycles * controller.parameters().guardDecayFrames; ++i) {
+         i < decayCycles * parameters.guardDecayFrames; ++i) {
         controller.noteSpacingDeficit(0);
     }
-    decision = controller.schedule(frame(3, 1800, true, 120000), 120000);
+    decision = controller.schedule(
+        frame(3, 5143, true, 157144), 157144);
     expect(!decision.latchedPresentation,
-           "a fully recovered guard must restore immediate 100 FPS pacing");
+           "a fully recovered guard must restore immediate presentation outside the scaled window");
+}
+
+void testDisplayScaledLatchedPresentationBoundary()
+{
+    const struct {
+        int displayHz;
+        int protectedRateHz;
+        int adaptiveRateHz;
+    } cases[] = {
+        {60, 15, 14},
+        {120, 30, 29},
+        {144, 36, 35},
+        {165, 42, 41},
+    };
+    for (const auto& value : cases) {
+        VrrTimingController protectedController(
+            config(value.protectedRateHz, value.displayHz));
+        const VrrTimingDecision protectedDecision =
+            protectedController.schedule(
+                frame(1, 0, true, 100000), 100000);
+        expect(protectedDecision.latchedPresentation,
+               "three-period latch protection must scale with display refresh");
+
+        VrrTimingController adaptiveController(
+            config(value.adaptiveRateHz, value.displayHz));
+        const VrrTimingDecision adaptiveDecision =
+            adaptiveController.schedule(
+                frame(1, 0, true, 100000), 100000);
+        expect(!adaptiveDecision.latchedPresentation,
+               "cadence beyond the three-period window must stay adaptive at every display rate");
+    }
 }
 
 void testHeadroomAwareReadinessReserve()
@@ -818,12 +858,26 @@ void testTargetWaiterBoundaries()
     VrrTargetWaitResult result = waiter.waitUntil(1000);
     expect(requestedCoarseSleepUs == 500 && result.finalNowUs >= 1000,
            "waiter must sleep to the active-wait boundary");
+    expect(result.initialNowUs == 0 && result.activeWaitUs == 500 &&
+               result.coarseSleepCount == 1 &&
+               result.coarseSleepRequestedUs == 500 &&
+               result.coarseSleepRequestedWakeUs == 500 &&
+               result.coarseSleepReturnUs == 500 &&
+               result.activeWaitEntered &&
+               result.activeWaitStartUs == 500 &&
+               result.activeWaitLimitUs == 1000 &&
+               result.activeWaitYieldCount == 20,
+           "waiter must expose the exact coarse and active lifecycle");
 
     nowUs = 0;
     requestedCoarseSleepUs = 0;
     result = waiter.waitUntil(1000, 400);
     expect(requestedCoarseSleepUs == 100 && result.finalNowUs >= 1000,
            "learned scheduler delay must wake the final wait earlier");
+    expect(result.activeWaitUs == 900 &&
+               result.coarseSleepRequestedWakeUs == 100 &&
+               result.coarseSleepReturnUs == 100,
+           "waiter lifecycle must include the bounded learned wake lead");
 
     uint64_t delayedNowUs = 0;
     VrrTargetWaiterHooks delayedHooks;
@@ -835,19 +889,29 @@ void testTargetWaiterBoundaries()
     VrrTargetWaiter delayedWaiter(delayedHooks);
     result = delayedWaiter.waitUntil(5000);
     expect(result.schedulerDelayValid && result.schedulerDelayUs == 400 &&
-               result.finalNowUs == 5400,
+               result.finalNowUs == 5400 &&
+               result.coarseSleepRequestedWakeUs == 4500 &&
+               result.coarseSleepReturnUs == 5400 &&
+               !result.activeWaitEntered,
            "coarse wake feedback must measure overshoot beyond the active margin");
 
     delayedNowUs = 0;
     result = delayedWaiter.waitUntil(5000, 400);
     expect(result.schedulerDelayValid && result.schedulerDelayUs == 400 &&
-               result.finalNowUs == 5000,
+               result.finalNowUs == 5000 &&
+               result.coarseSleepRequestedWakeUs == 4100 &&
+               result.coarseSleepReturnUs == 5000 &&
+               !result.activeWaitEntered,
            "learned wake delay must correct final-target overshoot");
 
     nowUs = 100;
     result = waiter.waitUntil(100);
     expect(result.deadlineAlreadyElapsed && result.finalNowUs == 100,
            "an elapsed deadline must return without waiting");
+    expect(result.initialNowUs == 100 && result.activeWaitUs == 500 &&
+               result.coarseSleepCount == 0 &&
+               !result.activeWaitEntered,
+           "elapsed waiter lifecycle must remain explicit and empty");
 
     unsigned int stalledSleepCalls = 0;
     unsigned int stalledYieldCalls = 0;
@@ -860,8 +924,33 @@ void testTargetWaiterBoundaries()
     VrrTargetWaiter stalled(stalledHooks);
     result = stalled.waitUntil(1000);
     expect(result.finalNowUs == 0 && stalledSleepCalls == 2 &&
-               stalledYieldCalls == 64,
+               stalledYieldCalls == 64 &&
+               result.coarseSleepClockStalled &&
+               result.activeWaitClockStalled &&
+               result.coarseSleepCount == 2 &&
+               result.activeWaitYieldCount == 64,
            "a non-advancing clock must not create unbounded active spinning");
+
+    uint64_t slowNowUs = 0;
+    uint64_t slowYieldCalls = 0;
+    VrrTargetWaiterHooks slowHooks;
+    slowHooks.nowUs = [&slowNowUs]() { return slowNowUs; };
+    slowHooks.sleepForUs = [&slowNowUs](uint64_t durationUs) {
+        slowNowUs += durationUs;
+    };
+    slowHooks.yield = [&slowNowUs, &slowYieldCalls]() {
+        ++slowYieldCalls;
+        if (slowYieldCalls % 16 == 0) {
+            ++slowNowUs;
+        }
+    };
+    VrrTargetWaiter slowWaiter(slowHooks);
+    result = slowWaiter.waitUntil(1000);
+    expect(result.finalNowUs == 1000 &&
+               result.activeWaitYieldCount == 8000 &&
+               !result.activeWaitClockStalled &&
+               !result.activeWaitYieldLimitReached,
+           "an advancing clock must reach the deadline even when a fast CPU yields more than 4096 times");
 }
 
 void testRuntimeParametersChangePolicy()
@@ -892,6 +981,7 @@ int main()
     testSpacingGuardFeedback();
     testNearRefreshRequestsLatchedPresentation();
     testLatchedPresentationRecoversAfterGuardDecay();
+    testDisplayScaledLatchedPresentationBoundary();
     testHeadroomAwareReadinessReserve();
     testCadenceGapAndRateChange();
     testFutureSourceProjectionReseedsPhase();

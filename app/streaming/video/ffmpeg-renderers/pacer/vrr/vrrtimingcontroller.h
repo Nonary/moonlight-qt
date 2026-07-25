@@ -25,6 +25,10 @@
     X(uint64_t, minimum_guard_us, minimumGuardUs, 100) \
     X(uint64_t, latch_enter_headroom_us, latchedPresentationHeadroomUs, 1500) \
     X(uint64_t, latch_exit_headroom_us, latchedPresentationExitHeadroomUs, 2000) \
+    X(uint64_t, latch_enter_headroom_period_numerator, latchedPresentationHeadroomPeriodNumerator, 3) \
+    X(uint64_t, latch_enter_headroom_period_denominator, latchedPresentationHeadroomPeriodDenominator, 1) \
+    X(uint64_t, latch_exit_headroom_period_numerator, latchedPresentationExitHeadroomPeriodNumerator, 13) \
+    X(uint64_t, latch_exit_headroom_period_denominator, latchedPresentationExitHeadroomPeriodDenominator, 4) \
     X(uint64_t, maximum_base_guard_us, maximumBaseGuardUs, 250) \
     X(uint64_t, maximum_adaptive_guard_us, maximumAdaptiveGuardUs, 1000) \
     X(uint64_t, guard_step_us, guardStepUs, 50) \
@@ -205,6 +209,10 @@ private:
     uint64_t renderLeadCeilingUs() const;
     uint64_t readinessCeilingUs() const;
     uint64_t guardCeilingUs() const;
+    uint64_t latchedPresentationHeadroomUs() const;
+    uint64_t latchedPresentationExitHeadroomUs() const;
+    uint64_t scaledDisplayPeriodUs(uint64_t numerator,
+                                   uint64_t denominator) const;
     static uint64_t periodForRate(int rateHz, uint64_t fallbackUs);
     static uint64_t periodForRateQ16(int rateHz, uint64_t fallbackQ16);
     static uint64_t saturatingAdd(uint64_t left, uint64_t right);
