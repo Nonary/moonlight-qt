@@ -15,7 +15,20 @@ struct VrrTargetWaiterHooks {
 };
 
 struct VrrTargetWaitResult {
+    uint64_t initialNowUs = 0;
     uint64_t finalNowUs = 0;
+    uint64_t activeWaitUs = 0;
+    uint64_t coarseSleepCount = 0;
+    uint64_t coarseSleepRequestedUs = 0;
+    uint64_t coarseSleepRequestedWakeUs = 0;
+    uint64_t coarseSleepReturnUs = 0;
+    bool coarseSleepClockStalled = false;
+    bool activeWaitEntered = false;
+    uint64_t activeWaitStartUs = 0;
+    uint64_t activeWaitLimitUs = 0;
+    uint64_t activeWaitYieldCount = 0;
+    bool activeWaitClockStalled = false;
+    bool activeWaitYieldLimitReached = false;
     // Additional early wake needed beyond the fixed active margin, measured
     // at the coarse sleep boundary. Unlike final overshoot, this observation
     // remains meaningful after an early-wake correction succeeds.
@@ -26,7 +39,6 @@ struct VrrTargetWaitResult {
 
 class VrrTargetWaiter {
 public:
-    static constexpr uint64_t kCoarseWakeMarginUs = 500;
     static constexpr uint64_t kMaximumActiveWaitUs = 500;
     // Cap the active region so learned scheduler correction cannot turn a
     // near-refresh stream into a multi-millisecond TIME_CRITICAL yield loop.

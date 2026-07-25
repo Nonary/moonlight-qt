@@ -34,9 +34,6 @@ public:
         VrrPrepareResult result;
         std::unique_lock<std::mutex> lock(m_Mutex);
         m_PreparedFrame = frame;
-        const int frameNumber = frame == nullptr ? -1 :
-            static_cast<int>(reinterpret_cast<intptr_t>(frame->opaque));
-        m_PreparedFrames.push_back(frameNumber);
         ++m_PrepareCount;
         m_Condition.notify_all();
 
@@ -117,6 +114,14 @@ public:
         std::lock_guard<std::mutex> lock(m_Mutex);
         VrrPresentFeedback feedback;
         feedback.cancelled = true;
+        const bool nativeSubmitAttempted =
+            m_CancellationMaySubmit && m_PreparedFrame != nullptr;
+        if (nativeSubmitAttempted) {
+            feedback.nativeBackendValid = true;
+            feedback.nativeBackend = VrrNativePresentationBackend::Vulkan;
+            feedback.nativePresentResultValid = true;
+            feedback.nativePresentResult = m_CancelSubmits ? 0 : -1;
+        }
         if (m_CancelSubmits && m_PreparedFrame != nullptr) {
             const int frameNumber = static_cast<int>(
                 reinterpret_cast<intptr_t>(m_PreparedFrame->opaque));
@@ -229,12 +234,6 @@ public:
         });
     }
 
-    size_t prepareCount() const
-    {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        return m_PrepareCount;
-    }
-
     size_t presentCount() const
     {
         std::lock_guard<std::mutex> lock(m_Mutex);
@@ -301,7 +300,6 @@ private:
     size_t m_SuspendedCount = 0;
     size_t m_ResumedCount = 0;
     AVFrame* m_PreparedFrame = nullptr;
-    std::vector<int> m_PreparedFrames;
     std::vector<int> m_PresentedFrames;
     std::vector<VrrPresentRequest> m_PresentRequests;
     std::vector<uint64_t> m_PresentCallTimesUs;
@@ -345,50 +343,4 @@ inline PacedFrame makeTrackedPacedFrame(int frameNumber,
     frame->opaque = reinterpret_cast<void*>(static_cast<intptr_t>(frameNumber));
 
     return PacedFrame(frame, frameNumber, rtpTimestamp, true, decodeCompleteUs);
-}
-
-// Portable contract probes. These are deliberately not substitutes for the
-// native D3D11/libplacebo integration tests; they state the immutable request
-// mapping used by test fakes when those APIs are unavailable on the host.
-constexpr unsigned int kFakeDxgiPresentAllowTearing = 0x00000200U;
-
-inline unsigned int expectedDxgiVrrPresentFlags()
-{
-    return kFakeDxgiPresentAllowTearing;
-}
-
-enum class FakeLinuxPresentationBackend {
-    Wayland,
-    X11,
-    Gamescope,
-    KmsDrm,
-    Other,
-};
-
-enum class FakeLinuxPresentationMode {
-    Mailbox,
-    Immediate,
-    Fifo,
-};
-
-inline FakeLinuxPresentationMode expectedLinuxPresentationMode(
-    FakeLinuxPresentationBackend backend,
-    bool requestedModeIsSupported)
-{
-    if (!requestedModeIsSupported) {
-        return FakeLinuxPresentationMode::Fifo;
-    }
-
-    switch (backend) {
-    case FakeLinuxPresentationBackend::Wayland:
-        return FakeLinuxPresentationMode::Mailbox;
-    case FakeLinuxPresentationBackend::X11:
-    case FakeLinuxPresentationBackend::Gamescope:
-    case FakeLinuxPresentationBackend::KmsDrm:
-        return FakeLinuxPresentationMode::Immediate;
-    case FakeLinuxPresentationBackend::Other:
-        return FakeLinuxPresentationMode::Fifo;
-    }
-
-    return FakeLinuxPresentationMode::Fifo;
 }

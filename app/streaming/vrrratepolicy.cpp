@@ -49,13 +49,7 @@ int VrrRatePolicy::lowLatencyRateForRefresh(int refreshHz)
         return 0;
     }
 
-    const long long fiveSixths = static_cast<long long>(refreshHz) * 5LL / 6LL;
-    return static_cast<int>((fiveSixths / 5LL) * 5LL);
-}
-
-bool VrrRatePolicy::isNativeRefreshRate(int fps, const std::vector<int>& refreshRates)
-{
-    return std::find(refreshRates.cbegin(), refreshRates.cend(), fps) != refreshRates.cend();
+    return (refreshHz / 6) * 5;
 }
 
 bool VrrRatePolicy::hasAdaptiveHeadroom(int streamRateHz, int displayRefreshHz)
@@ -86,8 +80,8 @@ std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& re
 
     // These are always useful streaming rates, including on a 60 Hz display
     // where 60 is also the exact native rate.
-    addChoice(choices, 30, VrrFpsChoiceKind::Baseline);
-    addChoice(choices, 60, VrrFpsChoiceKind::Baseline);
+    addChoice(choices, 30, VrrFpsChoiceKind::Fixed);
+    addChoice(choices, 60, VrrFpsChoiceKind::Fixed);
 
     for (const int refreshHz : refreshRates) {
         if (!isUsableRefreshRate(refreshHz)) {
@@ -99,14 +93,16 @@ std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& re
             addChoice(choices, lowLatencyRateForRefresh(refreshHz), VrrFpsChoiceKind::LowLatencyVrr);
         }
         else {
-            addChoice(choices, refreshHz, VrrFpsChoiceKind::Native);
+            addChoice(choices, refreshHz, VrrFpsChoiceKind::Fixed);
         }
     }
 
     // A manually saved custom choice must remain visible.  Native FPS values
     // are deliberately not reintroduced while VRR is enabled, because that
     // would undermine the exact-native omission rule.
-    if (savedFps > 0 && (!vrrEnabled || !isNativeRefreshRate(savedFps, refreshRates))) {
+    if (savedFps > 0 &&
+            (!vrrEnabled ||
+             std::find(refreshRates.cbegin(), refreshRates.cend(), savedFps) == refreshRates.cend())) {
         addChoice(choices, savedFps, VrrFpsChoiceKind::Custom);
     }
 

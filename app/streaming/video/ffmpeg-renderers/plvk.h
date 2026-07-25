@@ -65,14 +65,6 @@ public:
     virtual bool isPixelFormatSupported(int videoFormat, enum AVPixelFormat pixelFormat) override;
     virtual AVPixelFormat getPreferredPixelFormat(int videoFormat) override;
 
-    // The Vulkan present mode is immutable for the life of a swapchain.  This
-    // exposes the mode selected during initialization for diagnostics without
-    // implying that the compositor or display enabled physical adaptive sync.
-    VkPresentModeKHR vrrSelectedPresentMode() const {
-        return m_VkPresentMode;
-    }
-    const char* vrrSelectedPresentModeName() const;
-
 private:
     static void lockQueue(AVHWDeviceContext *dev_ctx, uint32_t queue_family, uint32_t index);
     static void unlockQueue(AVHWDeviceContext *dev_ctx, uint32_t queue_family, uint32_t index);
@@ -156,7 +148,6 @@ private:
     bool m_VrrFramePrepared = false;
     bool m_VrrRenderSucceeded = false;
     bool m_VrrRenderTimingActive = false;
-    AVFrame* m_VrrPreparedFrame = nullptr;
 
     // Overlay state
     SDL_SpinLock m_OverlayLock = 0;

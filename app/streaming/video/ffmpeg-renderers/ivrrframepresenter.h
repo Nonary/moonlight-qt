@@ -19,6 +19,25 @@ enum class VrrFallbackReason : uint8_t {
     InitializationFailed,
 };
 
+enum class VrrNativePresentationBackend : uint8_t {
+    Unknown,
+    Dxgi,
+    Vulkan,
+};
+
+// Observation-only D3DKMT raster sample bracketed on the Moonlight clock.
+// queryResult is the exact signed NTSTATUS. A zero result makes the blanking
+// and scan-line payload valid; no field implies that a Present took effect at
+// this raster position.
+struct VrrNativeRasterSample {
+    bool queryResultValid = false;
+    int64_t queryResult = 0;
+    uint64_t queryStartUs = 0;
+    uint64_t queryEndUs = 0;
+    bool inVerticalBlank = false;
+    uint32_t scanLine = 0;
+};
+
 inline const char* vrrFallbackReasonName(VrrFallbackReason reason)
 {
     switch (reason) {
@@ -53,23 +72,150 @@ struct VrrPresentFeedback {
     bool cancelled = false;
     bool submissionTimeValid = false;
     uint64_t submissionTimeUs = 0;
+    // Backend and signed native result for the actual presentation call.
+    // Both validity flags are set whenever that call was attempted, including
+    // cancellation and failure paths. Vulkan's libplacebo wrapper exposes
+    // only a boolean result, represented as 0 for success and -1 for failure.
+    bool nativeBackendValid = false;
+    VrrNativePresentationBackend nativeBackend =
+        VrrNativePresentationBackend::Unknown;
+    bool nativePresentResultValid = false;
+    int64_t nativePresentResult = 0;
+    // Exact native Present parameters and the renderer eligibility snapshot
+    // used for that call. They distinguish an intended immediate/tearing
+    // transition from a synchronized one without inferring flags later.
+    bool nativePresentParametersValid = false;
+    uint32_t nativePresentSyncInterval = 0;
+    uint32_t nativePresentFlags = 0;
+    bool nativeVrrStateValid = false;
+    bool nativeTearingSupported = false;
+    bool nativeBorderlessFlipModel = false;
+    bool nativeSameGpuOutput = false;
+    // Preserve the actual render-device adapter identity so replay can
+    // independently compare it with the DisplayConfig source adapter instead
+    // of trusting the renderer's index-derived same-GPU boolean.
+    bool nativeRenderAdapterLuidValid = false;
+    uint64_t nativeRenderAdapterLuid = 0;
+    bool nativeSwapChainAllowsTearing = false;
+    // Raw DXGI/window capability evidence used to derive the booleans above.
+    // These cached setup/display-transition queries avoid adding COM calls to
+    // each Present while still making the eligibility decision auditable.
+    bool nativeTearingFeatureQueryResultValid = false;
+    int64_t nativeTearingFeatureQueryResult = 0;
+    bool nativeTearingFeatureAllowsTearing = false;
+    bool nativeSwapChainDescQueryResultValid = false;
+    int64_t nativeSwapChainDescQueryResult = 0;
+    uint32_t nativeSwapChainFlags = 0;
+    uint32_t nativeSwapChainSwapEffect = 0;
+    bool nativeFullscreenStateQueryResultValid = false;
+    int64_t nativeFullscreenStateQueryResult = 0;
+    bool nativeFullscreenExclusive = false;
+    uint32_t nativeWindowFlags = 0;
+    bool nativePresentReadyAvailable = false;
+    bool nativeForegroundWindow = false;
+    VrrFallbackReason nativeVrrFallbackReason =
+        VrrFallbackReason::NoFallback;
+    uint32_t nativeDesktopMonitorCount = 0;
+    // DXGIDisableVBlankVirtualization() is probed and, when available, called
+    // once at process startup before Qt can create a swapchain. Preserve the
+    // exact signed HRESULT so replay can prove that native vblank timing was
+    // requested successfully instead of inferring it from display rates.
+    bool nativeVblankVirtualizationProbeComplete = false;
+    bool nativeVblankVirtualizationCallAvailable = false;
+    bool nativeVblankVirtualizationResultValid = false;
+    int64_t nativeVblankVirtualizationResult = 0;
+    bool nativeVblankVirtualizationDisabled = false;
+    // Cached Windows CCD evidence for the display path containing the
+    // Moonlight HWND. The path refresh can be a virtual/desktop rate while
+    // signalVSync is the physical mode rate; retaining both exposes Dynamic
+    // Refresh Rate instead of rounding either value to an integer Hz.
+    bool nativeDisplayConfigQueryResultValid = false;
+    uint32_t nativeDisplayConfigQueryResult = 0;
+    bool nativeDisplayPathValid = false;
+    uint32_t nativeDisplayPathFlags = 0;
+    bool nativeDisplayTargetAvailable = false;
+    uint64_t nativeDisplaySourceAdapterLuid = 0;
+    uint32_t nativeDisplaySourceId = 0;
+    uint64_t nativeDisplayTargetAdapterLuid = 0;
+    uint32_t nativeDisplayTargetId = 0;
+    uint32_t nativeDisplayOutputTechnology = 0;
+    uint32_t nativeDisplayRotation = 0;
+    uint32_t nativeDisplayScaling = 0;
+    uint32_t nativeDisplayPathRefreshNumerator = 0;
+    uint32_t nativeDisplayPathRefreshDenominator = 0;
+    bool nativeDisplaySignalValid = false;
+    uint64_t nativeDisplaySignalPixelRateHz = 0;
+    uint32_t nativeDisplaySignalHSyncNumerator = 0;
+    uint32_t nativeDisplaySignalHSyncDenominator = 0;
+    uint32_t nativeDisplaySignalVSyncNumerator = 0;
+    uint32_t nativeDisplaySignalVSyncDenominator = 0;
+    uint32_t nativeDisplaySignalActiveWidth = 0;
+    uint32_t nativeDisplaySignalActiveHeight = 0;
+    uint32_t nativeDisplaySignalTotalWidth = 0;
+    uint32_t nativeDisplaySignalTotalHeight = 0;
+    uint32_t nativeDisplaySignalAdditionalInfoRaw = 0;
+    uint32_t nativeDisplaySignalScanLineOrdering = 0;
+    // MOONLIGHT_VRR_ALIGN enables two observation-only scan-position queries
+    // bracketing the native Present. This deliberately does not spin, wait,
+    // or alter presentation policy. The setup result and VidPn source ID bind
+    // the samples to the same Windows display path captured above.
+    bool nativeRasterSamplingRequested = false;
+    bool nativeRasterOpenResultValid = false;
+    int64_t nativeRasterOpenResult = 0;
+    bool nativeRasterSourceValid = false;
+    uint32_t nativeRasterVidPnSourceId = 0;
+    VrrNativeRasterSample nativeRasterBeforePresent;
+    VrrNativeRasterSample nativeRasterAfterPresent;
 
-    // Optional display-latch observation. A backend that can query when
-    // submitted frames actually reached the display (e.g. DXGI frame
-    // statistics, Wayland presentation-time, Metal presented handlers)
-    // reports the most recent known latch here, translated onto the shared
-    // pacing clock. The latch may describe an earlier submission than this
-    // one; submissionId/latchSubmissionId associate the two. This is
-    // observation only: it must never gate, delay, or fail a submission.
+    // Optional presentation observation. The sample may describe an earlier
+    // submission than this one; submissionId/latchSubmissionId associate the
+    // two. Backends with a real presentation timestamp may put it in
+    // latchTimeUs. DXGI does not expose that timestamp: its latchTimeUs is
+    // SyncQPCTime, paired with latchRefreshSequence (SyncRefreshCount), and
+    // must not be interpreted as the time of latchPresentRefreshSequence
+    // (PresentRefreshCount). This is observation only: it must never gate,
+    // delay, or fail a submission.
     bool submissionIdValid = false;
     uint64_t submissionId = 0;
+    // Signed result from the native submission-ID query, independent of
+    // whether the query returned a usable ID.
+    bool submissionIdQueryResultValid = false;
+    int64_t submissionIdQueryResult = 0;
+    // Deep diagnostics bracket the two post-Present DXGI observations
+    // independently. Their combined cost otherwise looks like renderer or
+    // worker occupancy and cannot be reproduced honestly during replay.
+    uint64_t submissionIdQueryStartUs = 0;
+    uint64_t submissionIdQueryEndUs = 0;
     bool latchSampleValid = false;
     uint64_t latchSubmissionId = 0;
     uint64_t latchTimeUs = 0;
+    // DXGI PresentRefreshCount (when available) identifies the v-blank at
+    // which this image reached the monitor. It is distinct from the periodic
+    // SyncRefreshCount/QPC clock sample below.
+    uint64_t latchPresentRefreshSequence = 0;
     uint64_t latchRefreshSequence = 0;
+    // Signed result from the native frame-statistics query. Raw QPC evidence
+    // is retained separately so cross-clock translation can be audited.
+    bool frameStatsQueryResultValid = false;
+    int64_t frameStatsQueryResult = 0;
+    uint64_t frameStatsQueryStartUs = 0;
+    uint64_t frameStatsQueryEndUs = 0;
+    bool latchRawSyncQpcValid = false;
+    uint64_t latchRawSyncQpcTicks = 0;
+    uint64_t latchRawSyncQpcFrequency = 0;
+    // Stable process-wide QPC-to-Limelight clock correlation used for the
+    // translation above. The bracket span records how far QPC advanced around
+    // the reference LiGetMicroseconds() sample, making its alignment
+    // uncertainty auditable rather than implicit.
+    bool latchQpcCorrelationValid = false;
+    uint64_t latchQpcCorrelationReferenceTicks = 0;
+    uint64_t latchQpcCorrelationReferenceTimeUs = 0;
+    uint64_t latchQpcCorrelationSpanTicks = 0;
 
-    // Opt-in, observation-only diagnostics captured immediately around the
-    // native Present call. These fields must never affect presentation policy.
+    // Opt-in, observation-only diagnostics around the native Present call.
+    // The before fields may reuse the backend's most recent post-Present
+    // observation to avoid adding synchronous native queries to the hot path.
+    // These fields must never affect presentation policy.
     bool nativePresentTimingValid = false;
     uint64_t nativePresentStartUs = 0;
     uint64_t nativePresentEndUs = 0;
@@ -78,12 +224,36 @@ struct VrrPresentFeedback {
     bool frameStatsBeforeValid = false;
     uint64_t frameStatsBeforePresentCount = 0;
     uint64_t frameStatsBeforeTimeUs = 0;
+    uint64_t frameStatsBeforePresentRefreshSequence = 0;
     uint64_t frameStatsBeforeRefreshSequence = 0;
     // Optional renderer-readiness timing. A backend that queues GPU work in
-    // prepareFrame() reports when that work became complete, proving the
-    // later target wait operated on a displayable buffer rather than merely
-    // on an accepted CPU Present call.
+    // prepareFrame() reports the CPU wait around its completion fence. The
+    // wait return is only an upper bound on the actual GPU completion instant.
+    // The signal/poll bracket below lets replay derive a conservative lower
+    // bound too, rather than pretending the CPU wake timestamp is exact. The
+    // exact target/completed fence values make the completed-before-wait
+    // interpretation independently auditable. Exact native operation results
+    // remain available on failed preparation rows too, so a fence setup
+    // failure cannot collapse into an unexplained generic cancellation.
+    bool gpuReadyAttempted = false;
+    bool gpuReadySignalResultValid = false;
+    int64_t gpuReadySignalResult = 0;
+    bool gpuReadySetEventResultValid = false;
+    int64_t gpuReadySetEventResult = 0;
+    bool gpuReadyWaitResultValid = false;
+    uint32_t gpuReadyWaitResult = 0;
     bool gpuReadyTimingValid = false;
+    uint64_t gpuReadySignalStartUs = 0;
+    uint64_t gpuReadySignalEndUs = 0;
+    uint64_t gpuReadyFlushStartUs = 0;
+    uint64_t gpuReadyFlushEndUs = 0;
+    uint64_t gpuReadySetEventStartUs = 0;
+    uint64_t gpuReadySetEventEndUs = 0;
+    uint64_t gpuReadyPollStartUs = 0;
+    uint64_t gpuReadyPollEndUs = 0;
+    uint64_t gpuReadyFenceValue = 0;
+    uint64_t gpuReadyPollCompletedValue = 0;
+    bool gpuReadyCompletedBeforeWait = false;
     uint64_t gpuReadyWaitStartUs = 0;
     uint64_t gpuReadyTimeUs = 0;
 };

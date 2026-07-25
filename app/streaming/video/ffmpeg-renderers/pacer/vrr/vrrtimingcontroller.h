@@ -6,6 +6,86 @@
 #include <cstdint>
 #include <deque>
 
+// This list is also the replay/trace parameter schema. Keeping the JSON name,
+// C++ member, type, and production default together prevents those copies from
+// drifting while avoiding hand-written serialization for every field.
+#define VRR_TIMING_PARAMETER_FIELDS(X) \
+    X(uint64_t, maximum_forward_movement_us, maximumForwardMovementUs, 1000000) \
+    X(uint64_t, render_lead_floor_us, renderLeadFloorUs, 1000) \
+    X(uint64_t, render_lead_ceiling_us, renderLeadCeilingUs, 6500) \
+    X(uint64_t, render_lead_slack_us, renderLeadSlackUs, 0) \
+    X(uint64_t, presentation_safety_us, presentationSafetyUs, 0) \
+    X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
+    X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
+    X(uint64_t, cold_start_readiness_demand_us, coldStartReadinessDemandUs, 1500) \
+    X(uint64_t, arrival_spread_guard_us, arrivalSpreadGuardUs, 900) \
+    X(uint64_t, readiness_acquire_step_us, readinessAcquireStepUs, 1000) \
+    X(uint64_t, maximum_render_wake_lead_us, maximumRenderWakeLeadUs, 2000) \
+    X(uint64_t, maximum_target_wake_lead_us, maximumTargetWakeLeadUs, 500) \
+    X(uint64_t, minimum_guard_us, minimumGuardUs, 100) \
+    X(uint64_t, latch_enter_headroom_us, latchedPresentationHeadroomUs, 1500) \
+    X(uint64_t, latch_exit_headroom_us, latchedPresentationExitHeadroomUs, 2000) \
+    X(uint64_t, latch_enter_headroom_period_numerator, latchedPresentationHeadroomPeriodNumerator, 3) \
+    X(uint64_t, latch_enter_headroom_period_denominator, latchedPresentationHeadroomPeriodDenominator, 1) \
+    X(uint64_t, latch_exit_headroom_period_numerator, latchedPresentationExitHeadroomPeriodNumerator, 13) \
+    X(uint64_t, latch_exit_headroom_period_denominator, latchedPresentationExitHeadroomPeriodDenominator, 4) \
+    X(uint64_t, maximum_base_guard_us, maximumBaseGuardUs, 250) \
+    X(uint64_t, maximum_adaptive_guard_us, maximumAdaptiveGuardUs, 1000) \
+    X(uint64_t, guard_step_us, guardStepUs, 50) \
+    X(size_t, guard_decay_frames, guardDecayFrames, 120) \
+    X(size_t, scheduler_learning_samples, schedulerLearningSamples, 19) \
+    X(size_t, readiness_learning_samples, readinessLearningSamples, 16) \
+    X(size_t, preparation_learning_samples, preparationLearningSamples, 96) \
+    X(size_t, minimum_readiness_samples, minimumReadinessSamples, 16) \
+    X(size_t, minimum_cadence_samples, minimumCadenceSamples, 6) \
+    X(size_t, maximum_cadence_samples, maximumCadenceSamples, 512) \
+    X(size_t, rate_candidate_samples, rateCandidateSamples, 3) \
+    X(uint64_t, loose_cadence_window_us, looseCadenceWindowUs, 350000) \
+    X(uint64_t, tight_cadence_window_us, tightCadenceWindowUs, 1000000) \
+    X(uint64_t, major_cadence_ratio_numerator, majorCadenceRatioNumerator, 7) \
+    X(uint64_t, major_cadence_ratio_denominator, majorCadenceRatioDenominator, 2) \
+    X(uint64_t, candidate_cadence_ratio_numerator, candidateCadenceRatioNumerator, 2) \
+    X(uint64_t, candidate_cadence_ratio_denominator, candidateCadenceRatioDenominator, 1) \
+    X(unsigned int, material_rate_change_percent, materialRateChangePercent, 12) \
+    X(size_t, phase_error_frames, phaseErrorFrames, 3) \
+    X(unsigned int, preparation_percentile, preparationPercentile, 99) \
+    X(unsigned int, scheduler_percentile, schedulerPercentile, 95) \
+    X(unsigned int, readiness_low_percentile, readinessLowPercentile, 0) \
+    X(unsigned int, readiness_tight_percentile, readinessTightPercentile, 100) \
+    X(unsigned int, readiness_loose_percentile, readinessLoosePercentile, 80) \
+    X(uint64_t, readiness_attack_numerator, readinessAttackNumerator, 1) \
+    X(uint64_t, readiness_attack_denominator, readinessAttackDenominator, 1) \
+    X(uint64_t, readiness_release_numerator, readinessReleaseNumerator, 1) \
+    X(uint64_t, readiness_release_denominator, readinessReleaseDenominator, 32) \
+    X(uint64_t, usable_headroom_numerator, usableHeadroomNumerator, 3) \
+    X(uint64_t, usable_headroom_denominator, usableHeadroomDenominator, 4) \
+    X(uint64_t, loose_headroom_display_periods, looseHeadroomDisplayPeriods, 2) \
+    X(uint64_t, base_guard_divisor, baseGuardDivisor, 96)
+
+// Every value that changes VRR policy remains replaceable by replay without
+// rebuilding the controller. Production callers use these defaults.
+struct VrrTimingParameters {
+#define VRR_DECLARE_TIMING_PARAMETER(type, jsonName, memberName, defaultValue) \
+    type memberName = defaultValue;
+    VRR_TIMING_PARAMETER_FIELDS(VRR_DECLARE_TIMING_PARAMETER)
+#undef VRR_DECLARE_TIMING_PARAMETER
+};
+
+struct VrrTimingDiagnostics {
+    int64_t readinessPhaseUs = 0;
+    uint64_t readinessDemandUs = 0;
+    uint64_t appliedReadinessReserveUs = 0;
+    size_t cadenceSamples = 0;
+    size_t rateCandidateSamples = 0;
+    size_t readinessSamples = 0;
+    size_t preparationSamples = 0;
+    size_t renderSchedulerSamples = 0;
+    size_t targetSchedulerSamples = 0;
+    size_t cleanSpacingFrames = 0;
+    size_t phaseErrorFrames = 0;
+    bool readinessModelValid = false;
+};
+
 // Platform-neutral, feed-forward VRR timing. The controller projects the
 // sender clock into the local monotonic epoch and learns bounded readiness,
 // render, scheduler, and spacing budgets. It contains no renderer/native API
@@ -40,6 +120,9 @@ class VrrTimingController {
 public:
     explicit VrrTimingController(const VrrSessionConfig& config,
                                  bool canLatchPresentation = true);
+    VrrTimingController(const VrrSessionConfig& config,
+                        bool canLatchPresentation,
+                        const VrrTimingParameters& parameters);
 
     void reset();
 
@@ -73,12 +156,12 @@ public:
     uint64_t displayPeriodUs() const;
     uint64_t guardUs() const;
     uint64_t renderLeadUs() const;
-    uint64_t renderWakeLeadUs() const;
     uint64_t targetWakeLeadUs() const;
-    uint64_t wakeLeadUs() const;
     uint64_t earliestSubmissionUs() const;
     uint64_t lastSubmissionUs() const;
     bool hasLastSubmission() const;
+    const VrrTimingParameters& parameters() const;
+    VrrTimingDiagnostics diagnostics() const;
 
 private:
     struct PendingFrame {
@@ -126,24 +209,21 @@ private:
     uint64_t renderLeadCeilingUs() const;
     uint64_t readinessCeilingUs() const;
     uint64_t guardCeilingUs() const;
+    uint64_t latchedPresentationHeadroomUs() const;
+    uint64_t latchedPresentationExitHeadroomUs() const;
+    uint64_t scaledDisplayPeriodUs(uint64_t numerator,
+                                   uint64_t denominator) const;
     static uint64_t periodForRate(int rateHz, uint64_t fallbackUs);
     static uint64_t periodForRateQ16(int rateHz, uint64_t fallbackQ16);
     static uint64_t saturatingAdd(uint64_t left, uint64_t right);
     static uint64_t addSigned(uint64_t value, int64_t adjustment);
     static int64_t signedDifference(uint64_t left, uint64_t right);
     static uint64_t roundedQ16(uint64_t valueQ16);
-    static uint64_t percentile(const std::deque<uint64_t>& values,
-                               unsigned int percentile);
-    static int64_t percentile(const std::deque<int64_t>& values,
-                              unsigned int percentile);
     static bool withinPercent(uint64_t value, uint64_t reference,
                               unsigned int percent);
-    static void appendBounded(std::deque<uint64_t>& values, uint64_t value,
-                              size_t limit);
-    static void appendBounded(std::deque<int64_t>& values, int64_t value,
-                              size_t limit);
 
     VrrSessionConfig m_Config;
+    VrrTimingParameters m_Parameters;
     uint64_t m_ConfiguredStreamPeriodUs = 0;
     uint64_t m_ConfiguredStreamPeriodQ16 = 0;
     uint64_t m_DisplayPeriodUs = 0;

@@ -5,6 +5,7 @@
 #include "dxutil.h"
 #include "path.h"
 #include "utils.h"
+#include "windowsvblankvirtualization.h"
 
 #include "streaming/streamutils.h"
 #include "streaming/session.h"
@@ -13,6 +14,9 @@
 #include <Limelight.h>
 
 #include <dwmapi.h>
+
+#include <cwchar>
+#include <limits>
 
 using Microsoft::WRL::ComPtr;
 
@@ -68,6 +72,112 @@ bool isBorderlessFullscreenWindow(SDL_Window* window)
         SDL_WINDOW_FULLSCREEN_DESKTOP;
 }
 
+uint64_t packLuid(const LUID& luid)
+{
+    return static_cast<uint64_t>(luid.LowPart) |
+        (static_cast<uint64_t>(
+             static_cast<uint32_t>(luid.HighPart)) << 32);
+}
+
+struct VrrQpcClockCorrelation {
+    LONGLONG referenceQpc = 0;
+    LONGLONG qpcFrequency = 0;
+    uint64_t referenceTimeUs = 0;
+    uint64_t bracketSpanTicks = 0;
+    bool valid = false;
+};
+
+const VrrQpcClockCorrelation& vrrQpcClockCorrelation()
+{
+    static const VrrQpcClockCorrelation correlation = []() {
+        VrrQpcClockCorrelation value;
+        // Ensure the Limelight clock origin is established before bracketing
+        // the QPC sample used for the stable cross-clock correlation.
+        (void)LiGetMicroseconds();
+        LARGE_INTEGER frequency;
+        LARGE_INTEGER before;
+        LARGE_INTEGER after;
+        if (!QueryPerformanceFrequency(&frequency) ||
+                frequency.QuadPart <= 0) {
+            return value;
+        }
+        // Retain the native frequency even if the cross-clock correlation
+        // cannot be completed. A successful DXGI statistics query can then
+        // still emit independently auditable raw SyncQPCTime evidence.
+        value.qpcFrequency = frequency.QuadPart;
+        if (!QueryPerformanceCounter(&before)) {
+            return value;
+        }
+        value.referenceTimeUs = LiGetMicroseconds();
+        if (!QueryPerformanceCounter(&after) ||
+                after.QuadPart < before.QuadPart) {
+            return value;
+        }
+        value.bracketSpanTicks = static_cast<uint64_t>(
+            after.QuadPart - before.QuadPart);
+        value.referenceQpc = before.QuadPart +
+            (after.QuadPart - before.QuadPart) / 2;
+        value.valid = true;
+        return value;
+    }();
+    return correlation;
+}
+
+bool translateVrrSyncQpcTime(LARGE_INTEGER syncQpcTime,
+                             uint64_t& translatedTimeUs,
+                             uint64_t& qpcFrequency)
+{
+    translatedTimeUs = 0;
+    qpcFrequency = 0;
+    const VrrQpcClockCorrelation& correlation =
+        vrrQpcClockCorrelation();
+    if (correlation.qpcFrequency > 0) {
+        qpcFrequency = static_cast<uint64_t>(correlation.qpcFrequency);
+    }
+    if (!correlation.valid) {
+        return false;
+    }
+    if (syncQpcTime.QuadPart <= 0) {
+        return false;
+    }
+
+    const uint64_t deltaTicks = syncQpcTime.QuadPart >=
+            correlation.referenceQpc ?
+        static_cast<uint64_t>(
+            syncQpcTime.QuadPart - correlation.referenceQpc) :
+        static_cast<uint64_t>(
+            correlation.referenceQpc - syncQpcTime.QuadPart);
+    const uint64_t frequency = static_cast<uint64_t>(
+        correlation.qpcFrequency);
+    const uint64_t wholeSeconds = deltaTicks / frequency;
+    const uint64_t remainderTicks = deltaTicks % frequency;
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    if (wholeSeconds > maximum / 1000000ULL ||
+            remainderTicks > maximum / 1000000ULL) {
+        return false;
+    }
+    const uint64_t wholeUs = wholeSeconds * 1000000ULL;
+    const uint64_t remainderUs =
+        remainderTicks * 1000000ULL / frequency;
+    if (remainderUs > maximum - wholeUs) {
+        return false;
+    }
+    const uint64_t deltaUs = wholeUs + remainderUs;
+    if (syncQpcTime.QuadPart < correlation.referenceQpc) {
+        if (deltaUs > correlation.referenceTimeUs) {
+            return false;
+        }
+        translatedTimeUs = correlation.referenceTimeUs - deltaUs;
+    }
+    else {
+        if (deltaUs > maximum - correlation.referenceTimeUs) {
+            return false;
+        }
+        translatedTimeUs = correlation.referenceTimeUs + deltaUs;
+    }
+    return true;
+}
+
 }
 
 D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
@@ -77,23 +187,69 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_DevicesWithCodecSupport(0),
       m_AdapterIndex(-1),
       m_RenderAdapterIndex(-1),
+      m_VrrRenderAdapterLuidValid(false),
+      m_VrrRenderAdapterLuid(0),
       m_LastColorTrc(AVCOL_TRC_UNSPECIFIED),
       m_AllowTearing(false),
       m_VrrTearingSupported(false),
       m_VrrBorderlessFlipModel(false),
       m_VrrSameGpuOutput(false),
       m_VrrSwapChainAllowsTearing(false),
+      m_VrrTearingFeatureQueryResultValid(false),
+      m_VrrTearingFeatureQueryResult(0),
+      m_VrrTearingFeatureAllowsTearing(false),
+      m_VrrSwapChainDescQueryResultValid(false),
+      m_VrrSwapChainDescQueryResult(0),
+      m_VrrSwapChainFlags(0),
+      m_VrrSwapChainSwapEffect(0),
+      m_VrrFullscreenStateQueryResultValid(false),
+      m_VrrFullscreenStateQueryResult(0),
+      m_VrrFullscreenExclusive(false),
+      m_VrrWindowFlags(0),
+      m_VrrDesktopMonitorCount(0),
+      m_VrrWindowHandle(nullptr),
+      m_VrrDisplayTiming(),
+      m_VrrRasterSamplingRequested(false),
+      m_VrrRasterOpenResultValid(false),
+      m_VrrRasterOpenResult(0),
+      m_VrrRasterSourceValid(false),
+      m_VrrRasterAdapter(0),
+      m_VrrRasterVidPnSourceId(0),
       m_VrrSuspended(false),
       m_VrrFallbackReason(VrrFallbackReason::InitializationFailed),
       m_VrrFramePrepared(false),
       m_VrrContextLocked(false),
-      m_VrrPreparedFrame(nullptr),
       m_VrrPresentReadyFenceValue(0),
       m_VrrPresentReadyFenceEvent(nullptr),
       m_VrrPresentReadyAvailable(false),
+      m_VrrGpuReadyAttempted(false),
+      m_VrrGpuReadySignalResultValid(false),
+      m_VrrGpuReadySignalResult(0),
+      m_VrrGpuReadySetEventResultValid(false),
+      m_VrrGpuReadySetEventResult(0),
+      m_VrrGpuReadyWaitResultValid(false),
+      m_VrrGpuReadyWaitResult(0),
       m_VrrGpuReadyTimingValid(false),
+      m_VrrGpuReadySignalStartUs(0),
+      m_VrrGpuReadySignalEndUs(0),
+      m_VrrGpuReadyFlushStartUs(0),
+      m_VrrGpuReadyFlushEndUs(0),
+      m_VrrGpuReadySetEventStartUs(0),
+      m_VrrGpuReadySetEventEndUs(0),
+      m_VrrGpuReadyPollStartUs(0),
+      m_VrrGpuReadyPollEndUs(0),
+      m_VrrGpuReadyFenceValue(0),
+      m_VrrGpuReadyPollCompletedValue(0),
+      m_VrrGpuReadyCompletedBeforeWait(false),
       m_VrrGpuReadyWaitStartUs(0),
       m_VrrGpuReadyTimeUs(0),
+      m_VrrPriorPresentCountValid(false),
+      m_VrrPriorPresentCount(0),
+      m_VrrPriorFrameStatsValid(false),
+      m_VrrPriorFrameStatsPresentCount(0),
+      m_VrrPriorFrameStatsTimeUs(0),
+      m_VrrPriorFrameStatsPresentRefreshSequence(0),
+      m_VrrPriorFrameStatsRefreshSequence(0),
       m_OverlayLock(0),
       m_HwDeviceContext(nullptr)
 {
@@ -109,6 +265,7 @@ D3D11VARenderer::~D3D11VARenderer()
     // Release the retained D3D context lock before destroying it or any
     // back-buffer objects.
     cancelFrame();
+    closeVrrRasterSource();
     SDL_DestroyMutex(m_ContextLock);
 
     m_VideoVertexBuffer.Reset();
@@ -474,6 +631,8 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
     }
 
     m_RenderAdapterIndex = adapterIndex;
+    m_VrrRenderAdapterLuidValid = true;
+    m_VrrRenderAdapterLuid = packLuid(adapterDesc.AdapterLuid);
     success = true;
 
 Exit:
@@ -662,6 +821,11 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
                      hr);
         return false;
     }
+
+    // Query the created swapchain rather than trusting the requested
+    // descriptor. Driver/runtime normalization and fullscreen state are part
+    // of the capability evidence and must be settled before VRR starts.
+    refreshVrrDisplayState();
 
     if (m_DecoderParams.enableVrr && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1276,6 +1440,13 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
             return false;
         }
 
+        // A same-monitor mode switch can arrive only as SIZE_CHANGED while
+        // retaining the same rounded refresh rate. Refresh the physical
+        // DisplayConfig signal and D3DKMT source after ResizeBuffers so a
+        // trace cannot silently carry the old active/total geometry into the
+        // new mode.
+        refreshVrrDisplayState();
+
         unlockContext(this);
 
         // We've handled this state change
@@ -1524,9 +1695,53 @@ void D3D11VARenderer::initializeVrrPresentationState(SDL_Window* window,
     m_VrrBorderlessFlipModel = false;
     m_VrrSameGpuOutput = false;
     m_VrrSwapChainAllowsTearing = false;
+    m_VrrTearingFeatureQueryResultValid = false;
+    m_VrrTearingFeatureQueryResult = 0;
+    m_VrrTearingFeatureAllowsTearing = false;
+    m_VrrSwapChainDescQueryResultValid = false;
+    m_VrrSwapChainDescQueryResult = 0;
+    m_VrrSwapChainFlags = 0;
+    m_VrrSwapChainSwapEffect = 0;
+    m_VrrFullscreenStateQueryResultValid = false;
+    m_VrrFullscreenStateQueryResult = 0;
+    m_VrrFullscreenExclusive = false;
+    m_VrrWindowFlags = window != nullptr ?
+        SDL_GetWindowFlags(window) : 0;
+    m_VrrDesktopMonitorCount = static_cast<UINT>(
+        std::max(0, GetSystemMetrics(SM_CMONITORS)));
+    m_VrrWindowHandle = nullptr;
+    m_VrrDisplayTiming = {};
+    closeVrrRasterSource();
+    const char* rasterSamplingEnv = SDL_getenv("MOONLIGHT_VRR_ALIGN");
+    m_VrrRasterSamplingRequested =
+        rasterSamplingEnv != nullptr &&
+        rasterSamplingEnv[0] == '1' &&
+        rasterSamplingEnv[1] == '\0';
+    SDL_SysWMinfo windowInfo;
+    SDL_VERSION(&windowInfo.version);
+    if (window != nullptr &&
+            SDL_GetWindowWMInfo(window, &windowInfo) &&
+            windowInfo.subsystem == SDL_SYSWM_WINDOWS) {
+        m_VrrWindowHandle = windowInfo.info.win.window;
+    }
     m_VrrSuspended = false;
     m_VrrFallbackReason = VrrFallbackReason::NoFallback;
     m_VrrPresentReadyAvailable = false;
+    m_VrrPriorPresentCountValid = false;
+    m_VrrPriorPresentCount = 0;
+    m_VrrPriorFrameStatsValid = false;
+    m_VrrPriorFrameStatsPresentCount = 0;
+    m_VrrPriorFrameStatsTimeUs = 0;
+    m_VrrPriorFrameStatsPresentRefreshSequence = 0;
+    m_VrrPriorFrameStatsRefreshSequence = 0;
+
+    if (m_DecoderParams.enableVrr) {
+        // Prime the process-wide correlation and display snapshot during
+        // renderer setup so the first deeply traced Present does not pay
+        // one-time initialization cost on the pacing thread.
+        (void)vrrQpcClockCorrelation();
+        refreshVrrDisplayTiming();
+    }
 
     // Preserve the legacy non-VSync path while also creating an
     // allow-tearing flip swapchain for an explicitly requested VRR session.
@@ -1538,6 +1753,9 @@ void D3D11VARenderer::initializeVrrPresentationState(SDL_Window* window,
         HRESULT hr = m_Factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
                                                     &allowTearing,
                                                     sizeof(allowTearing));
+        m_VrrTearingFeatureQueryResultValid = true;
+        m_VrrTearingFeatureQueryResult = static_cast<int64_t>(hr);
+        m_VrrTearingFeatureAllowsTearing = allowTearing != FALSE;
         if (SUCCEEDED(hr) && allowTearing) {
             m_VrrTearingSupported = true;
             swapChainDesc->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
@@ -1642,15 +1860,48 @@ void D3D11VARenderer::refreshVrrDisplayState()
     }
 
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
-    bool gotSwapChainDesc = m_SwapChain != nullptr && SUCCEEDED(m_SwapChain->GetDesc1(&swapChainDesc));
+    HRESULT swapChainDescResult = E_POINTER;
+    if (m_SwapChain != nullptr) {
+        swapChainDescResult = m_SwapChain->GetDesc1(&swapChainDesc);
+    }
+    m_VrrSwapChainDescQueryResultValid = m_SwapChain != nullptr;
+    m_VrrSwapChainDescQueryResult =
+        static_cast<int64_t>(swapChainDescResult);
+    const bool gotSwapChainDesc = swapChainDescResult == S_OK;
+    m_VrrSwapChainFlags =
+        gotSwapChainDesc ? swapChainDesc.Flags : 0;
+    m_VrrSwapChainSwapEffect =
+        gotSwapChainDesc ?
+            static_cast<uint32_t>(swapChainDesc.SwapEffect) : 0;
+
+    BOOL fullscreenExclusive = FALSE;
+    HRESULT fullscreenStateResult = E_POINTER;
+    if (m_SwapChain != nullptr) {
+        fullscreenStateResult = m_SwapChain->GetFullscreenState(
+            &fullscreenExclusive, nullptr);
+    }
+    m_VrrFullscreenStateQueryResultValid = m_SwapChain != nullptr;
+    m_VrrFullscreenStateQueryResult =
+        static_cast<int64_t>(fullscreenStateResult);
+    m_VrrFullscreenExclusive =
+        fullscreenStateResult == S_OK &&
+        fullscreenExclusive != FALSE;
+    m_VrrWindowFlags = m_DecoderParams.window != nullptr ?
+        SDL_GetWindowFlags(m_DecoderParams.window) : 0;
     m_VrrBorderlessFlipModel = gotSwapChainDesc &&
-        isBorderlessFullscreenWindow(m_DecoderParams.window) &&
+        fullscreenStateResult == S_OK &&
+        !m_VrrFullscreenExclusive &&
+        (m_VrrWindowFlags & SDL_WINDOW_FULLSCREEN_DESKTOP) ==
+            SDL_WINDOW_FULLSCREEN_DESKTOP &&
         (swapChainDesc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ||
          swapChainDesc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
     m_VrrSwapChainAllowsTearing = gotSwapChainDesc &&
         (swapChainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
     m_VrrSameGpuOutput = m_RenderAdapterIndex >= 0 &&
         m_RenderAdapterIndex == m_AdapterIndex;
+    m_VrrDesktopMonitorCount = static_cast<UINT>(
+        std::max(0, GetSystemMetrics(SM_CMONITORS)));
+    refreshVrrDisplayTiming();
 
     VrrFallbackReason previousReason = m_VrrFallbackReason;
     // Keep the established display-update precedence: an output mismatch is
@@ -1708,8 +1959,25 @@ void D3D11VARenderer::releasePreparedVrrFrame()
     }
 
     m_VrrFramePrepared = false;
-    m_VrrPreparedFrame = nullptr;
+    m_VrrGpuReadyAttempted = false;
+    m_VrrGpuReadySignalResultValid = false;
+    m_VrrGpuReadySignalResult = 0;
+    m_VrrGpuReadySetEventResultValid = false;
+    m_VrrGpuReadySetEventResult = 0;
+    m_VrrGpuReadyWaitResultValid = false;
+    m_VrrGpuReadyWaitResult = 0;
     m_VrrGpuReadyTimingValid = false;
+    m_VrrGpuReadySignalStartUs = 0;
+    m_VrrGpuReadySignalEndUs = 0;
+    m_VrrGpuReadyFlushStartUs = 0;
+    m_VrrGpuReadyFlushEndUs = 0;
+    m_VrrGpuReadySetEventStartUs = 0;
+    m_VrrGpuReadySetEventEndUs = 0;
+    m_VrrGpuReadyPollStartUs = 0;
+    m_VrrGpuReadyPollEndUs = 0;
+    m_VrrGpuReadyFenceValue = 0;
+    m_VrrGpuReadyPollCompletedValue = 0;
+    m_VrrGpuReadyCompletedBeforeWait = false;
     m_VrrGpuReadyWaitStartUs = 0;
     m_VrrGpuReadyTimeUs = 0;
 
@@ -1717,6 +1985,39 @@ void D3D11VARenderer::releasePreparedVrrFrame()
         unlockContext(this);
         m_VrrContextLocked = false;
     }
+}
+
+void D3D11VARenderer::populateVrrGpuReadyFeedback(
+    VrrPresentFeedback& feedback) const
+{
+    feedback.gpuReadyAttempted = m_VrrGpuReadyAttempted;
+    feedback.gpuReadySignalResultValid =
+        m_VrrGpuReadySignalResultValid;
+    feedback.gpuReadySignalResult = m_VrrGpuReadySignalResult;
+    feedback.gpuReadySetEventResultValid =
+        m_VrrGpuReadySetEventResultValid;
+    feedback.gpuReadySetEventResult = m_VrrGpuReadySetEventResult;
+    feedback.gpuReadyWaitResultValid =
+        m_VrrGpuReadyWaitResultValid;
+    feedback.gpuReadyWaitResult = m_VrrGpuReadyWaitResult;
+    feedback.gpuReadyTimingValid = m_VrrGpuReadyTimingValid;
+    feedback.gpuReadySignalStartUs = m_VrrGpuReadySignalStartUs;
+    feedback.gpuReadySignalEndUs = m_VrrGpuReadySignalEndUs;
+    feedback.gpuReadyFlushStartUs = m_VrrGpuReadyFlushStartUs;
+    feedback.gpuReadyFlushEndUs = m_VrrGpuReadyFlushEndUs;
+    feedback.gpuReadySetEventStartUs =
+        m_VrrGpuReadySetEventStartUs;
+    feedback.gpuReadySetEventEndUs =
+        m_VrrGpuReadySetEventEndUs;
+    feedback.gpuReadyPollStartUs = m_VrrGpuReadyPollStartUs;
+    feedback.gpuReadyPollEndUs = m_VrrGpuReadyPollEndUs;
+    feedback.gpuReadyFenceValue = m_VrrGpuReadyFenceValue;
+    feedback.gpuReadyPollCompletedValue =
+        m_VrrGpuReadyPollCompletedValue;
+    feedback.gpuReadyCompletedBeforeWait =
+        m_VrrGpuReadyCompletedBeforeWait;
+    feedback.gpuReadyWaitStartUs = m_VrrGpuReadyWaitStartUs;
+    feedback.gpuReadyTimeUs = m_VrrGpuReadyTimeUs;
 }
 
 void D3D11VARenderer::queueRenderDeviceReset()
@@ -1807,7 +2108,25 @@ bool D3D11VARenderer::initializeVrrPresentReadyFence()
 
 bool D3D11VARenderer::waitForVrrPresentReady()
 {
+    m_VrrGpuReadyAttempted = false;
+    m_VrrGpuReadySignalResultValid = false;
+    m_VrrGpuReadySignalResult = 0;
+    m_VrrGpuReadySetEventResultValid = false;
+    m_VrrGpuReadySetEventResult = 0;
+    m_VrrGpuReadyWaitResultValid = false;
+    m_VrrGpuReadyWaitResult = 0;
     m_VrrGpuReadyTimingValid = false;
+    m_VrrGpuReadySignalStartUs = 0;
+    m_VrrGpuReadySignalEndUs = 0;
+    m_VrrGpuReadyFlushStartUs = 0;
+    m_VrrGpuReadyFlushEndUs = 0;
+    m_VrrGpuReadySetEventStartUs = 0;
+    m_VrrGpuReadySetEventEndUs = 0;
+    m_VrrGpuReadyPollStartUs = 0;
+    m_VrrGpuReadyPollEndUs = 0;
+    m_VrrGpuReadyFenceValue = 0;
+    m_VrrGpuReadyPollCompletedValue = 0;
+    m_VrrGpuReadyCompletedBeforeWait = false;
     m_VrrGpuReadyWaitStartUs = 0;
     m_VrrGpuReadyTimeUs = 0;
     if (!m_VrrPresentReadyAvailable ||
@@ -1823,8 +2142,14 @@ bool D3D11VARenderer::waitForVrrPresentReady()
     // Finish the frame first so the worker's later target hold operates on an
     // actual flip-ready boundary.
     const UINT64 fenceValue = ++m_VrrPresentReadyFenceValue;
+    m_VrrGpuReadyAttempted = true;
+    m_VrrGpuReadyFenceValue = fenceValue;
+    m_VrrGpuReadySignalStartUs = LiGetMicroseconds();
     HRESULT hr = m_RenderDeviceContext->Signal(
         m_VrrPresentReadyFence.Get(), fenceValue);
+    m_VrrGpuReadySignalEndUs = LiGetMicroseconds();
+    m_VrrGpuReadySignalResultValid = true;
+    m_VrrGpuReadySignalResult = static_cast<int64_t>(hr);
     if (FAILED(hr)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "D3D11 VRR present-ready Signal() failed: %x", hr);
@@ -1832,9 +2157,15 @@ bool D3D11VARenderer::waitForVrrPresentReady()
         return false;
     }
 
+    m_VrrGpuReadyFlushStartUs = LiGetMicroseconds();
     m_RenderDeviceContext->Flush();
+    m_VrrGpuReadyFlushEndUs = LiGetMicroseconds();
+    m_VrrGpuReadySetEventStartUs = LiGetMicroseconds();
     hr = m_VrrPresentReadyFence->SetEventOnCompletion(
         fenceValue, m_VrrPresentReadyFenceEvent);
+    m_VrrGpuReadySetEventEndUs = LiGetMicroseconds();
+    m_VrrGpuReadySetEventResultValid = true;
+    m_VrrGpuReadySetEventResult = static_cast<int64_t>(hr);
     if (FAILED(hr)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "D3D11 VRR present-ready SetEventOnCompletion() failed: %x",
@@ -1854,9 +2185,23 @@ bool D3D11VARenderer::waitForVrrPresentReady()
         m_VrrContextLocked = false;
     }
 
+    // GetCompletedValue() is a nonblocking observation. If the target value
+    // is still incomplete, its call start is a conservative lower bound for
+    // the eventual completion. If it is already complete, Signal() call start
+    // remains the only defensible lower bound and the poll end is the upper
+    // bound. In both cases the later event wait preserves the existing
+    // synchronization behavior.
+    m_VrrGpuReadyPollStartUs = LiGetMicroseconds();
+    const UINT64 completedValue =
+        m_VrrPresentReadyFence->GetCompletedValue();
+    m_VrrGpuReadyPollCompletedValue = completedValue;
+    m_VrrGpuReadyPollEndUs = LiGetMicroseconds();
+    m_VrrGpuReadyCompletedBeforeWait = completedValue >= fenceValue;
     m_VrrGpuReadyWaitStartUs = LiGetMicroseconds();
     const DWORD waitResult = WaitForSingleObject(
         m_VrrPresentReadyFenceEvent, 50);
+    m_VrrGpuReadyWaitResultValid = true;
+    m_VrrGpuReadyWaitResult = waitResult;
     m_VrrGpuReadyTimeUs = LiGetMicroseconds();
 
     if (releaseSharedContext) {
@@ -1949,6 +2294,8 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
 
     if (!waitForVrrPresentReady()) {
         m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+        populateVrrGpuReadyFeedback(result.feedback);
+        result.feedback.cancelled = true;
         releasePreparedVrrFrame();
         queueRenderDeviceReset();
         return result;
@@ -1958,6 +2305,8 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
     // Revalidate state after reacquiring it before publishing this frame as
     // prepared for the worker's target wait.
     if (m_VrrSuspended || checkSupport() != VrrFallbackReason::NoFallback) {
+        populateVrrGpuReadyFeedback(result.feedback);
+        result.feedback.cancelled = true;
         releasePreparedVrrFrame();
         return result;
     }
@@ -1967,12 +2316,13 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "D3D11 VRR preparation detected device loss: %x",
                      deviceReason);
+        populateVrrGpuReadyFeedback(result.feedback);
+        result.feedback.cancelled = true;
         releasePreparedVrrFrame();
         queueRenderDeviceReset();
         return result;
     }
 
-    m_VrrPreparedFrame = frame;
     m_VrrFramePrepared = true;
     result.prepared = true;
     return result;
@@ -1983,83 +2333,195 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
 {
     VrrPresentFeedback feedback;
 
-    if (!m_VrrFramePrepared || m_VrrPreparedFrame == nullptr ||
-            m_VrrSuspended) {
+    if (!m_VrrFramePrepared || m_VrrSuspended) {
         return cancelFrame();
     }
 
-    feedback.gpuReadyTimingValid = m_VrrGpuReadyTimingValid;
-    feedback.gpuReadyWaitStartUs = m_VrrGpuReadyWaitStartUs;
-    feedback.gpuReadyTimeUs = m_VrrGpuReadyTimeUs;
+    populateVrrGpuReadyFeedback(feedback);
 
-    const auto translateSyncQpcTime = [](LARGE_INTEGER syncQpcTime,
-                                         uint64_t& translatedTimeUs) {
-        if (syncQpcTime.QuadPart <= 0) {
-            return false;
-        }
-        LARGE_INTEGER qpcNow;
-        LARGE_INTEGER qpcFrequency;
-        if (!QueryPerformanceCounter(&qpcNow) ||
-                !QueryPerformanceFrequency(&qpcFrequency) ||
-                qpcFrequency.QuadPart <= 0 ||
-                qpcNow.QuadPart < syncQpcTime.QuadPart) {
-            return false;
-        }
-        const uint64_t nowUs = LiGetMicroseconds();
-        const uint64_t ageTicks = static_cast<uint64_t>(
-            qpcNow.QuadPart - syncQpcTime.QuadPart);
-        const uint64_t ticksPerSecond = static_cast<uint64_t>(
-            qpcFrequency.QuadPart);
-        const uint64_t ageUs =
-            (ageTicks / ticksPerSecond) * 1000000ULL +
-            (ageTicks % ticksPerSecond) * 1000000ULL / ticksPerSecond;
-        translatedTimeUs = nowUs > ageUs ? nowUs - ageUs : 0;
-        return true;
-    };
     if (request.collectDiagnostics) {
-        UINT presentCountBefore = 0;
-        if (SUCCEEDED(m_SwapChain->GetLastPresentCount(
-                &presentCountBefore))) {
+        // Reuse the observation made after the previous Present. This is the
+        // most recent state available before this call, and avoids adding two
+        // extra synchronous DXGI queries to every deeply traced frame.
+        if (m_VrrPriorPresentCountValid) {
             feedback.presentCountBeforeValid = true;
-            feedback.presentCountBefore = presentCountBefore;
+            feedback.presentCountBefore = m_VrrPriorPresentCount;
         }
-
-        DXGI_FRAME_STATISTICS frameStatsBefore = {};
-        uint64_t frameStatsBeforeTimeUs = 0;
-        if (SUCCEEDED(m_SwapChain->GetFrameStatistics(&frameStatsBefore)) &&
-                translateSyncQpcTime(frameStatsBefore.SyncQPCTime,
-                                     frameStatsBeforeTimeUs)) {
+        if (m_VrrPriorFrameStatsValid) {
             feedback.frameStatsBeforeValid = true;
             feedback.frameStatsBeforePresentCount =
-                frameStatsBefore.PresentCount;
-            feedback.frameStatsBeforeTimeUs = frameStatsBeforeTimeUs;
+                m_VrrPriorFrameStatsPresentCount;
+            feedback.frameStatsBeforeTimeUs = m_VrrPriorFrameStatsTimeUs;
+            feedback.frameStatsBeforePresentRefreshSequence =
+                m_VrrPriorFrameStatsPresentRefreshSequence;
             feedback.frameStatsBeforeRefreshSequence =
-                frameStatsBefore.SyncRefreshCount;
+                m_VrrPriorFrameStatsRefreshSequence;
         }
     }
 
-    // A latched near-refresh present omits ALLOW_TEARING so DXGI synchronizes
-    // the flip to a vertical blank instead of executing it mid-scan. The flag
-    // is a per-present choice on this swapchain; no recreation is involved.
+    // A latched near-refresh request omits ALLOW_TEARING, selecting DXGI's
+    // non-tearing path. Sync interval 0 still has flip-queue semantics and
+    // does not prove which v-blank displays the image; frame statistics below
+    // remain the authority for that observation. The flag is a per-present
+    // choice on this swapchain, so no recreation is involved.
+    constexpr UINT presentSyncInterval = 0;
+    const UINT presentFlags = request.latchedPresentation ?
+        0 : DXGI_PRESENT_ALLOW_TEARING;
+    feedback.nativeBackendValid = true;
+    feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
+    feedback.nativePresentParametersValid = true;
+    feedback.nativePresentSyncInterval = presentSyncInterval;
+    feedback.nativePresentFlags = presentFlags;
+    feedback.nativeVrrStateValid = true;
+    feedback.nativeTearingSupported = m_VrrTearingSupported;
+    feedback.nativeBorderlessFlipModel = m_VrrBorderlessFlipModel;
+    feedback.nativeSameGpuOutput = m_VrrSameGpuOutput;
+    feedback.nativeRenderAdapterLuidValid =
+        m_VrrRenderAdapterLuidValid;
+    feedback.nativeRenderAdapterLuid =
+        m_VrrRenderAdapterLuid;
+    feedback.nativeSwapChainAllowsTearing =
+        m_VrrSwapChainAllowsTearing;
+    feedback.nativeTearingFeatureQueryResultValid =
+        m_VrrTearingFeatureQueryResultValid;
+    feedback.nativeTearingFeatureQueryResult =
+        m_VrrTearingFeatureQueryResult;
+    feedback.nativeTearingFeatureAllowsTearing =
+        m_VrrTearingFeatureAllowsTearing;
+    feedback.nativeSwapChainDescQueryResultValid =
+        m_VrrSwapChainDescQueryResultValid;
+    feedback.nativeSwapChainDescQueryResult =
+        m_VrrSwapChainDescQueryResult;
+    feedback.nativeSwapChainFlags = m_VrrSwapChainFlags;
+    feedback.nativeSwapChainSwapEffect =
+        m_VrrSwapChainSwapEffect;
+    feedback.nativeFullscreenStateQueryResultValid =
+        m_VrrFullscreenStateQueryResultValid;
+    feedback.nativeFullscreenStateQueryResult =
+        m_VrrFullscreenStateQueryResult;
+    feedback.nativeFullscreenExclusive =
+        m_VrrFullscreenExclusive;
+    feedback.nativeWindowFlags = m_VrrWindowFlags;
+    feedback.nativePresentReadyAvailable =
+        m_VrrPresentReadyAvailable;
+    feedback.nativeForegroundWindow =
+        m_VrrWindowHandle != nullptr &&
+        GetForegroundWindow() == m_VrrWindowHandle;
+    feedback.nativeVrrFallbackReason = m_VrrFallbackReason;
+    feedback.nativeDesktopMonitorCount = m_VrrDesktopMonitorCount;
+    const WindowsVblankVirtualization::Snapshot
+        vblankVirtualization =
+            WindowsVblankVirtualization::snapshot();
+    feedback.nativeVblankVirtualizationProbeComplete =
+        vblankVirtualization.probeComplete;
+    feedback.nativeVblankVirtualizationCallAvailable =
+        vblankVirtualization.callAvailable;
+    feedback.nativeVblankVirtualizationResultValid =
+        vblankVirtualization.resultValid;
+    feedback.nativeVblankVirtualizationResult =
+        vblankVirtualization.result;
+    feedback.nativeVblankVirtualizationDisabled =
+        vblankVirtualization.disabled;
+    feedback.nativeDisplayConfigQueryResultValid =
+        m_VrrDisplayTiming.queryResultValid;
+    feedback.nativeDisplayConfigQueryResult =
+        m_VrrDisplayTiming.queryResult;
+    feedback.nativeDisplayPathValid = m_VrrDisplayTiming.pathValid;
+    feedback.nativeDisplayPathFlags = m_VrrDisplayTiming.pathFlags;
+    feedback.nativeDisplayTargetAvailable =
+        m_VrrDisplayTiming.targetAvailable;
+    feedback.nativeDisplaySourceAdapterLuid =
+        m_VrrDisplayTiming.sourceAdapterLuid;
+    feedback.nativeDisplaySourceId =
+        m_VrrDisplayTiming.sourceId;
+    feedback.nativeDisplayTargetAdapterLuid =
+        m_VrrDisplayTiming.targetAdapterLuid;
+    feedback.nativeDisplayTargetId =
+        m_VrrDisplayTiming.targetId;
+    feedback.nativeDisplayOutputTechnology =
+        m_VrrDisplayTiming.outputTechnology;
+    feedback.nativeDisplayRotation =
+        m_VrrDisplayTiming.rotation;
+    feedback.nativeDisplayScaling =
+        m_VrrDisplayTiming.scaling;
+    feedback.nativeDisplayPathRefreshNumerator =
+        m_VrrDisplayTiming.pathRefreshNumerator;
+    feedback.nativeDisplayPathRefreshDenominator =
+        m_VrrDisplayTiming.pathRefreshDenominator;
+    feedback.nativeDisplaySignalValid =
+        m_VrrDisplayTiming.signalValid;
+    feedback.nativeDisplaySignalPixelRateHz =
+        m_VrrDisplayTiming.signalPixelRateHz;
+    feedback.nativeDisplaySignalHSyncNumerator =
+        m_VrrDisplayTiming.signalHSyncNumerator;
+    feedback.nativeDisplaySignalHSyncDenominator =
+        m_VrrDisplayTiming.signalHSyncDenominator;
+    feedback.nativeDisplaySignalVSyncNumerator =
+        m_VrrDisplayTiming.signalVSyncNumerator;
+    feedback.nativeDisplaySignalVSyncDenominator =
+        m_VrrDisplayTiming.signalVSyncDenominator;
+    feedback.nativeDisplaySignalActiveWidth =
+        m_VrrDisplayTiming.signalActiveWidth;
+    feedback.nativeDisplaySignalActiveHeight =
+        m_VrrDisplayTiming.signalActiveHeight;
+    feedback.nativeDisplaySignalTotalWidth =
+        m_VrrDisplayTiming.signalTotalWidth;
+    feedback.nativeDisplaySignalTotalHeight =
+        m_VrrDisplayTiming.signalTotalHeight;
+    feedback.nativeDisplaySignalAdditionalInfoRaw =
+        m_VrrDisplayTiming.signalAdditionalInfoRaw;
+    feedback.nativeDisplaySignalScanLineOrdering =
+        m_VrrDisplayTiming.signalScanLineOrdering;
+    feedback.nativeRasterSamplingRequested =
+        m_VrrRasterSamplingRequested;
+    feedback.nativeRasterOpenResultValid =
+        m_VrrRasterOpenResultValid;
+    feedback.nativeRasterOpenResult = m_VrrRasterOpenResult;
+    feedback.nativeRasterSourceValid = m_VrrRasterSourceValid;
+    feedback.nativeRasterVidPnSourceId =
+        m_VrrRasterVidPnSourceId;
+    if (request.collectDiagnostics &&
+            m_VrrRasterSamplingRequested &&
+            m_VrrRasterSourceValid) {
+        feedback.nativeRasterBeforePresent = sampleVrrRaster();
+    }
     const uint64_t submissionTimeUs = LiGetMicroseconds();
-    HRESULT hr = presentPreparedFrame(
-        request.latchedPresentation ? 0 : DXGI_PRESENT_ALLOW_TEARING);
+    HRESULT hr = presentPreparedFrame(presentFlags);
     const uint64_t nativePresentEndUs = LiGetMicroseconds();
+    if (request.collectDiagnostics &&
+            m_VrrRasterSamplingRequested &&
+            m_VrrRasterSourceValid) {
+        feedback.nativeRasterAfterPresent = sampleVrrRaster();
+    }
+    feedback.nativePresentResultValid = true;
+    feedback.nativePresentResult = static_cast<int64_t>(hr);
     if (request.collectDiagnostics) {
         feedback.nativePresentTimingValid = true;
         feedback.nativePresentStartUs = submissionTimeUs;
         feedback.nativePresentEndUs = nativePresentEndUs;
     }
 
-    // This is deliberately before device-reset notification so every error
-    // path releases the FFmpeg/D3D context lock retained by preparation.
-    releasePreparedVrrFrame();
-
     if (FAILED(hr)) {
+        // Release before notifying the UI about device loss, but not before
+        // all successful-Present observations below. Keeping the retained
+        // renderer lock across the ID/statistics queries prevents a window or
+        // mode reset from replacing the swapchain between Present() and the
+        // evidence that is supposed to describe that same call.
+        releasePreparedVrrFrame();
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "IDXGISwapChain::Present() failed on D3D11 VRR path: %x",
                      hr);
         queueRenderDeviceReset();
+        feedback.cancelled = true;
+        return feedback;
+    }
+    if (hr != S_OK) {
+        // In particular, DXGI_STATUS_OCCLUDED is a successful HRESULT but
+        // does not mean that the image reached a monitor.
+        releasePreparedVrrFrame();
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                     "IDXGISwapChain::Present() returned non-display status on D3D11 VRR path: %x",
+                     hr);
         feedback.cancelled = true;
         return feedback;
     }
@@ -2068,36 +2530,108 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
     feedback.submissionTimeValid = true;
     feedback.submissionTimeUs = submissionTimeUs;
 
-    // Observation-only display-latch feedback. DXGI frame statistics describe
-    // the most recent present that actually reached the screen, which may lag
-    // this submission by several frames; the pacer correlates them by present
-    // id. SyncQPCTime is translated onto the shared pacing clock through a
-    // same-instant QPC sample so traces can compare submission and latch
-    // times directly. Failure (e.g. FRAME_STATISTICS_DISJOINT after a mode
-    // change, or a composed swapchain) just leaves the sample invalid.
+    // Observation-only presentation feedback. DXGI frame statistics describe
+    // the most recent present that reached the screen, which may lag this
+    // submission by several frames. PresentRefreshCount identifies its
+    // refresh, but DXGI does not provide that refresh's timestamp.
+    // SyncQPCTime is instead paired with SyncRefreshCount and is translated
+    // onto the shared pacing clock as a raster-clock anchor. Never treat it as
+    // the time of PresentRefreshCount. Failure (for example,
+    // FRAME_STATISTICS_DISJOINT after a mode change or a composed swapchain)
+    // leaves the sample invalid.
     UINT lastPresentCount = 0;
-    if (SUCCEEDED(m_SwapChain->GetLastPresentCount(&lastPresentCount))) {
+    if (request.collectDiagnostics) {
+        feedback.submissionIdQueryStartUs = LiGetMicroseconds();
+    }
+    const HRESULT presentCountResult =
+        m_SwapChain->GetLastPresentCount(&lastPresentCount);
+    if (request.collectDiagnostics) {
+        feedback.submissionIdQueryEndUs = LiGetMicroseconds();
+    }
+    feedback.submissionIdQueryResultValid = true;
+    feedback.submissionIdQueryResult =
+        static_cast<int64_t>(presentCountResult);
+    if (presentCountResult == S_OK) {
         feedback.submissionIdValid = true;
         feedback.submissionId = lastPresentCount;
+        m_VrrPriorPresentCountValid = true;
+        m_VrrPriorPresentCount = lastPresentCount;
+    }
+    else {
+        m_VrrPriorPresentCountValid = false;
     }
 
     DXGI_FRAME_STATISTICS frameStats = {};
-    uint64_t latchTimeUs = 0;
-    if (SUCCEEDED(m_SwapChain->GetFrameStatistics(&frameStats)) &&
-            translateSyncQpcTime(frameStats.SyncQPCTime, latchTimeUs)) {
+    uint64_t syncSampleTimeUs = 0;
+    uint64_t syncQpcFrequency = 0;
+    if (request.collectDiagnostics) {
+        feedback.frameStatsQueryStartUs = LiGetMicroseconds();
+    }
+    const HRESULT frameStatsResult =
+        m_SwapChain->GetFrameStatistics(&frameStats);
+    if (request.collectDiagnostics) {
+        feedback.frameStatsQueryEndUs = LiGetMicroseconds();
+    }
+    feedback.frameStatsQueryResultValid = true;
+    feedback.frameStatsQueryResult =
+        static_cast<int64_t>(frameStatsResult);
+    const bool syncQpcTranslated =
+        frameStatsResult == S_OK &&
+        translateVrrSyncQpcTime(
+            frameStats.SyncQPCTime, syncSampleTimeUs,
+            syncQpcFrequency);
+    if (frameStatsResult == S_OK &&
+            frameStats.SyncQPCTime.QuadPart > 0 &&
+            syncQpcFrequency != 0) {
+        feedback.latchRawSyncQpcValid = true;
+        feedback.latchRawSyncQpcTicks = static_cast<uint64_t>(
+            frameStats.SyncQPCTime.QuadPart);
+        feedback.latchRawSyncQpcFrequency = syncQpcFrequency;
+        const VrrQpcClockCorrelation& correlation =
+            vrrQpcClockCorrelation();
+        if (correlation.valid &&
+                correlation.referenceQpc > 0) {
+            feedback.latchQpcCorrelationValid = true;
+            feedback.latchQpcCorrelationReferenceTicks =
+                static_cast<uint64_t>(correlation.referenceQpc);
+            feedback.latchQpcCorrelationReferenceTimeUs =
+                correlation.referenceTimeUs;
+            feedback.latchQpcCorrelationSpanTicks =
+                correlation.bracketSpanTicks;
+        }
+    }
+    if (syncQpcTranslated) {
         feedback.latchSampleValid = true;
-        feedback.latchTimeUs = latchTimeUs;
+        // Retain the schema-5 field name for compatibility. Its DXGI
+        // semantics are the SyncRefreshCount clock sample documented above.
+        feedback.latchTimeUs = syncSampleTimeUs;
         feedback.latchSubmissionId = frameStats.PresentCount;
+        feedback.latchPresentRefreshSequence =
+            frameStats.PresentRefreshCount;
         feedback.latchRefreshSequence = frameStats.SyncRefreshCount;
+        m_VrrPriorFrameStatsValid = true;
+        m_VrrPriorFrameStatsPresentCount = frameStats.PresentCount;
+        m_VrrPriorFrameStatsTimeUs = syncSampleTimeUs;
+        m_VrrPriorFrameStatsPresentRefreshSequence =
+            frameStats.PresentRefreshCount;
+        m_VrrPriorFrameStatsRefreshSequence = frameStats.SyncRefreshCount;
+    }
+    else {
+        m_VrrPriorFrameStatsValid = false;
     }
 
+    // Present(), both raster samples, and the DXGI ID/statistics queries are
+    // now one state-consistent observation. Release only after their evidence
+    // has been copied into feedback.
+    releasePreparedVrrFrame();
     return feedback;
 }
 
 VrrPresentFeedback D3D11VARenderer::cancelFrame()
 {
-    releasePreparedVrrFrame();
     VrrPresentFeedback feedback;
+    populateVrrGpuReadyFeedback(feedback);
+    releasePreparedVrrFrame();
     feedback.cancelled = true;
     return feedback;
 }
@@ -2119,6 +2653,226 @@ bool D3D11VARenderer::restoreFixedPresentation(VrrFallbackReason reason)
 void D3D11VARenderer::setSuspended(bool suspended)
 {
     m_VrrSuspended = suspended;
+    if (suspended) {
+        // Do not carry a pre-suspension scanout observation into the first
+        // diagnostic sample after a window/mode transition.
+        m_VrrPriorPresentCountValid = false;
+        m_VrrPriorFrameStatsValid = false;
+    }
+}
+
+void D3D11VARenderer::refreshVrrDisplayTiming()
+{
+    m_VrrDisplayTiming = {};
+    closeVrrRasterSource();
+    m_VrrDisplayTiming.queryResultValid = true;
+    if (m_VrrWindowHandle == nullptr) {
+        m_VrrDisplayTiming.queryResult = ERROR_INVALID_WINDOW_HANDLE;
+        return;
+    }
+
+    MONITORINFOEXW monitorInfo = {};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    const HMONITOR monitor = MonitorFromWindow(
+        m_VrrWindowHandle, MONITOR_DEFAULTTONEAREST);
+    if (monitor == nullptr ||
+            !GetMonitorInfoW(monitor, &monitorInfo)) {
+        m_VrrDisplayTiming.queryResult = GetLastError();
+        return;
+    }
+
+    if (m_VrrRasterSamplingRequested) {
+        D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME openAdapter = {};
+        wcsncpy_s(openAdapter.DeviceName, monitorInfo.szDevice, _TRUNCATE);
+        const NTSTATUS openResult =
+            D3DKMTOpenAdapterFromGdiDisplayName(&openAdapter);
+        m_VrrRasterOpenResultValid = true;
+        m_VrrRasterOpenResult = static_cast<int64_t>(openResult);
+        if (openResult == 0) {
+            m_VrrRasterSourceValid = true;
+            m_VrrRasterAdapter = openAdapter.hAdapter;
+            m_VrrRasterVidPnSourceId = openAdapter.VidPnSourceId;
+        }
+    }
+
+    // Windows 11 can expose a virtual desktop refresh independently from the
+    // physical signal refresh. Prefer that view, then fall back for older
+    // systems that reject the newer query flag.
+    constexpr UINT32 queryFlagSets[] = {
+        QDC_ONLY_ACTIVE_PATHS |
+            QDC_VIRTUAL_MODE_AWARE |
+            QDC_VIRTUAL_REFRESH_RATE_AWARE,
+        QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE,
+        QDC_ONLY_ACTIVE_PATHS,
+    };
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    LONG queryResult = ERROR_INVALID_PARAMETER;
+    for (UINT32 flags : queryFlagSets) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            UINT32 pathCount = 0;
+            UINT32 modeCount = 0;
+            queryResult = GetDisplayConfigBufferSizes(
+                flags, &pathCount, &modeCount);
+            if (queryResult != ERROR_SUCCESS) {
+                break;
+            }
+            paths.assign(pathCount, DISPLAYCONFIG_PATH_INFO {});
+            modes.assign(modeCount, DISPLAYCONFIG_MODE_INFO {});
+            queryResult = QueryDisplayConfig(
+                flags, &pathCount,
+                paths.empty() ? nullptr : paths.data(),
+                &modeCount,
+                modes.empty() ? nullptr : modes.data(),
+                nullptr);
+            if (queryResult == ERROR_SUCCESS) {
+                paths.resize(pathCount);
+                modes.resize(modeCount);
+                break;
+            }
+            if (queryResult != ERROR_INSUFFICIENT_BUFFER) {
+                break;
+            }
+        }
+        if (queryResult == ERROR_SUCCESS ||
+                queryResult != ERROR_INVALID_PARAMETER) {
+            break;
+        }
+    }
+    m_VrrDisplayTiming.queryResult =
+        static_cast<uint32_t>(queryResult);
+    if (queryResult != ERROR_SUCCESS) {
+        return;
+    }
+
+    VrrDisplayTimingSnapshot matchedTiming;
+    uint32_t matchedPaths = 0;
+    for (const DISPLAYCONFIG_PATH_INFO& path : paths) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME sourceName = {};
+        sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        sourceName.header.size = sizeof(sourceName);
+        sourceName.header.adapterId = path.sourceInfo.adapterId;
+        sourceName.header.id = path.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&sourceName.header) !=
+                ERROR_SUCCESS ||
+                _wcsicmp(sourceName.viewGdiDeviceName,
+                         monitorInfo.szDevice) != 0) {
+            continue;
+        }
+
+        ++matchedPaths;
+        matchedTiming.queryResultValid = true;
+        matchedTiming.queryResult = ERROR_SUCCESS;
+        matchedTiming.pathValid = true;
+        matchedTiming.pathFlags = path.flags;
+        matchedTiming.targetAvailable =
+            path.targetInfo.targetAvailable != FALSE;
+        matchedTiming.sourceAdapterLuid =
+            packLuid(path.sourceInfo.adapterId);
+        matchedTiming.sourceId = path.sourceInfo.id;
+        matchedTiming.targetAdapterLuid =
+            packLuid(path.targetInfo.adapterId);
+        matchedTiming.targetId = path.targetInfo.id;
+        matchedTiming.outputTechnology =
+            static_cast<uint32_t>(
+                path.targetInfo.outputTechnology);
+        matchedTiming.rotation =
+            static_cast<uint32_t>(path.targetInfo.rotation);
+        matchedTiming.scaling =
+            static_cast<uint32_t>(path.targetInfo.scaling);
+        matchedTiming.pathRefreshNumerator =
+            path.targetInfo.refreshRate.Numerator;
+        matchedTiming.pathRefreshDenominator =
+            path.targetInfo.refreshRate.Denominator;
+
+        const bool virtualMode =
+            (path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) != 0;
+        const UINT32 targetModeIndex = virtualMode ?
+            path.targetInfo.targetModeInfoIdx :
+            path.targetInfo.modeInfoIdx;
+        const UINT32 invalidTargetModeIndex = virtualMode ?
+            DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID :
+            DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        if (targetModeIndex == invalidTargetModeIndex ||
+                targetModeIndex >= modes.size()) {
+            continue;
+        }
+        const DISPLAYCONFIG_MODE_INFO& mode = modes[targetModeIndex];
+        if (mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_TARGET ||
+                mode.id != path.targetInfo.id ||
+                mode.adapterId.HighPart !=
+                    path.targetInfo.adapterId.HighPart ||
+                mode.adapterId.LowPart !=
+                    path.targetInfo.adapterId.LowPart) {
+            continue;
+        }
+
+        const DISPLAYCONFIG_VIDEO_SIGNAL_INFO& signal =
+            mode.targetMode.targetVideoSignalInfo;
+        matchedTiming.signalValid = true;
+        matchedTiming.signalPixelRateHz = signal.pixelRate;
+        matchedTiming.signalHSyncNumerator =
+            signal.hSyncFreq.Numerator;
+        matchedTiming.signalHSyncDenominator =
+            signal.hSyncFreq.Denominator;
+        matchedTiming.signalVSyncNumerator =
+            signal.vSyncFreq.Numerator;
+        matchedTiming.signalVSyncDenominator =
+            signal.vSyncFreq.Denominator;
+        matchedTiming.signalActiveWidth = signal.activeSize.cx;
+        matchedTiming.signalActiveHeight = signal.activeSize.cy;
+        matchedTiming.signalTotalWidth = signal.totalSize.cx;
+        matchedTiming.signalTotalHeight = signal.totalSize.cy;
+        // Preserve the complete union word. Bits 0..15 are videoStandard,
+        // bits 16..21 are the Miracast VSync divider, and the remainder is
+        // reserved. Keeping the raw value avoids hiding future driver data.
+        matchedTiming.signalAdditionalInfoRaw = signal.videoStandard;
+        matchedTiming.signalScanLineOrdering =
+            static_cast<uint32_t>(signal.scanLineOrdering);
+    }
+
+    // A cloned source can map the same GDI name to more than one target.
+    // Refuse to guess which physical signal owns the window.
+    if (matchedPaths == 1) {
+        m_VrrDisplayTiming = matchedTiming;
+    }
+}
+
+void D3D11VARenderer::closeVrrRasterSource()
+{
+    if (m_VrrRasterSourceValid) {
+        D3DKMT_CLOSEADAPTER closeAdapter = {};
+        closeAdapter.hAdapter = m_VrrRasterAdapter;
+        D3DKMTCloseAdapter(&closeAdapter);
+    }
+    m_VrrRasterOpenResultValid = false;
+    m_VrrRasterOpenResult = 0;
+    m_VrrRasterSourceValid = false;
+    m_VrrRasterAdapter = 0;
+    m_VrrRasterVidPnSourceId = 0;
+}
+
+VrrNativeRasterSample D3D11VARenderer::sampleVrrRaster() const
+{
+    VrrNativeRasterSample sample;
+    if (!m_VrrRasterSamplingRequested ||
+            !m_VrrRasterSourceValid) {
+        return sample;
+    }
+
+    D3DKMT_GETSCANLINE query = {};
+    query.hAdapter = m_VrrRasterAdapter;
+    query.VidPnSourceId = m_VrrRasterVidPnSourceId;
+    sample.queryStartUs = LiGetMicroseconds();
+    const NTSTATUS queryResult = D3DKMTGetScanLine(&query);
+    sample.queryEndUs = LiGetMicroseconds();
+    sample.queryResultValid = true;
+    sample.queryResult = static_cast<int64_t>(queryResult);
+    if (queryResult == 0) {
+        sample.inVerticalBlank = query.InVerticalBlank != FALSE;
+        sample.scanLine = query.ScanLine;
+    }
+    return sample;
 }
 
 bool D3D11VARenderer::setupRenderingResources()

@@ -14,7 +14,6 @@
 // state always describe one coherent publication.
 struct PacerTelemetrySnapshot {
     uint64_t sequence = 0;
-    uint64_t sampleTimeUs = 0;
 
     uint64_t renderedFrames = 0;
     uint64_t pacerDroppedFrames = 0;
@@ -52,7 +51,6 @@ struct PacerTelemetrySnapshot {
 };
 
 struct VrrTelemetrySample {
-    uint64_t publicationTimeUs = 0;
     uint64_t decisionTimeUs = 0;
     uint64_t pacerTimeUs = 0;
     uint64_t renderTimeUs = 0;
@@ -85,46 +83,43 @@ public:
         return snapshot;
     }
 
-    void beginVrrSession(uint64_t sampleTimeUs)
+    void beginVrrSession()
     {
         QMutexLocker lock(&m_Lock);
         m_Snapshot.vrrActive = true;
-        touchLocked(sampleTimeUs);
+        touchLocked();
     }
 
-    void recordLegacyDrop(uint64_t sampleTimeUs)
+    void recordLegacyDrop()
     {
         QMutexLocker lock(&m_Lock);
         ++m_Snapshot.pacerDroppedFrames;
-        touchLocked(sampleTimeUs);
+        touchLocked();
     }
 
     void recordLegacyFrame(uint64_t pacerTimeUs,
-                           uint64_t renderTimeUs,
-                           uint64_t sampleTimeUs)
+                           uint64_t renderTimeUs)
     {
         QMutexLocker lock(&m_Lock);
         m_Snapshot.totalPacerTimeUs += pacerTimeUs;
         m_Snapshot.totalRenderTimeUs += renderTimeUs;
         ++m_Snapshot.renderedFrames;
-        touchLocked(sampleTimeUs);
+        touchLocked();
     }
 
-    void recordVrrDrop(uint64_t sampleTimeUs)
+    void recordVrrDrop()
     {
         QMutexLocker lock(&m_Lock);
         ++m_Snapshot.pacerDroppedFrames;
         ++m_Snapshot.vrrPacingDroppedFrames;
-        touchLocked(sampleTimeUs);
+        touchLocked();
     }
 
-    void recordVrrOutcome(bool presented,
-                          bool cancelled,
-                          uint64_t sampleTimeUs)
+    void recordVrrOutcome(bool presented, bool cancelled)
     {
         QMutexLocker lock(&m_Lock);
         recordVrrOutcomeLocked(presented, cancelled);
-        touchLocked(sampleTimeUs);
+        touchLocked();
     }
 
     void recordVrrFrame(const VrrTelemetrySample& sample)
@@ -154,7 +149,7 @@ public:
             ++m_Snapshot.renderedFrames;
         }
 
-        touchLocked(sample.publicationTimeUs);
+        touchLocked();
         m_Snapshot.vrrStateSequence = m_Snapshot.sequence;
         m_Snapshot.vrrStateSampleTimeUs = sample.decisionTimeUs;
         m_Snapshot.vrrReadinessBudgetUs = sample.readinessBudgetUs;
@@ -176,10 +171,9 @@ private:
         return ((count * percentile + 99) / 100) - 1;
     }
 
-    void touchLocked(uint64_t sampleTimeUs)
+    void touchLocked()
     {
         ++m_Snapshot.sequence;
-        m_Snapshot.sampleTimeUs = sampleTimeUs;
     }
 
     void recordVrrOutcomeLocked(bool presented, bool cancelled)

@@ -850,16 +850,13 @@ Flickable {
                     }
 
                     CheckBox {
-                        id: vrrCheck
                         hoverEnabled: true
                         text: qsTr("Enable VRR")
                         font.pointSize: 12
                         enabled: StreamingPreferences.enableVsync
                         checked: StreamingPreferences.enableVrr
                         onCheckedChanged: {
-                            if (checked !== StreamingPreferences.enableVrr) {
-                                StreamingPreferences.enableVrr = checked
-                            }
+                            StreamingPreferences.enableVrr = checked
                         }
 
                         ToolTip.delay: 1000

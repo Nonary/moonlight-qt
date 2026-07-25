@@ -243,7 +243,8 @@ HEADERS += \
     settings/mappingmanager.h \
     gui/sdlgamepadkeynavigation.h \
     streaming/video/overlaymanager.h \
-    backend/systemproperties.h
+    backend/systemproperties.h \
+    windowsvblankvirtualization.h
 
 # Platform-specific renderers and decoders
 ffmpeg {
