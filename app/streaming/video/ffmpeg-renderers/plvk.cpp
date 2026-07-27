@@ -59,22 +59,6 @@ public:
 
 namespace {
 
-const char* vulkanPresentModeName(VkPresentModeKHR mode)
-{
-    switch (mode) {
-    case VK_PRESENT_MODE_IMMEDIATE_KHR:
-        return "Immediate";
-    case VK_PRESENT_MODE_MAILBOX_KHR:
-        return "Mailbox";
-    case VK_PRESENT_MODE_FIFO_KHR:
-        return "FIFO";
-    case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
-        return "FIFO Relaxed";
-    default:
-        return "Unknown";
-    }
-}
-
 bool hasEnvironmentValue(const char* name)
 {
     const char* value = SDL_getenv(name);
@@ -85,8 +69,7 @@ bool isGamescopePresentation(const char* videoDriver)
 {
     // Gamescope commonly exposes an X11 or Wayland SDL backend, so the SDL
     // driver alone cannot distinguish it from a desktop compositor. These
-    // environment values are Gamescope's platform identity, not user-facing
-    // VRR knobs or experimental overrides.
+    // environment values are Gamescope's platform identity.
     return (videoDriver != nullptr && SDL_strcmp(videoDriver, "gamescope") == 0) ||
            hasEnvironmentValue("GAMESCOPE_WAYLAND_DISPLAY") ||
            hasEnvironmentValue("GAMESCOPE_XWAYLAND_DISPLAY");
@@ -95,10 +78,9 @@ bool isGamescopePresentation(const char* videoDriver)
 bool isGamescopeWsiPresentation(const char* videoDriver)
 {
     // The Gamescope WSI layer presents through its own Mailbox driver
-    // swapchain even when the application-facing mode is FIFO. vrr8 relied on
-    // that behavior: Moonlight paced the FIFO requests while Gamescope owned
-    // the physical adaptive scanout. Restrict the exception to an explicitly
-    // enabled WSI layer so ordinary X11 FIFO cannot be mistaken for VRR.
+    // swapchain even when the application-facing mode is FIFO. Restrict the
+    // exception to an explicitly enabled WSI layer so ordinary X11 FIFO
+    // cannot be mistaken for adaptive presentation.
     const char* enabled = SDL_getenv("ENABLE_GAMESCOPE_WSI");
     return isGamescopePresentation(videoDriver) && enabled != nullptr &&
            SDL_strcmp(enabled, "1") == 0;
@@ -580,20 +562,6 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
-    if (m_VrrRequested) {
-        if (m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Vulkan VRR backend selected immutable %s swapchain presentation",
-                        vulkanPresentModeName(m_VkPresentMode));
-        }
-        else {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Vulkan VRR backend unavailable: %s; using immutable %s fallback",
-                        vrrFallbackReasonName(m_VrrFallbackReason),
-                        vulkanPresentModeName(m_VkPresentMode));
-        }
-    }
-
     m_Renderer = pl_renderer_create(m_Log, m_Vulkan->gpu);
     if (m_Renderer == nullptr) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -741,16 +709,8 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
     m_VrrFramePrepared = false;
     m_VrrPreparingFrame = false;
     m_VrrRenderSucceeded = false;
-    m_VrrRenderTimingActive = false;
 
     if (!m_VrrRequested) {
-#ifdef Q_OS_WIN32
-        // Keep this explicit for direct backend queries on Windows while
-        // leaving the normal, non-VRR Vulkan selection untouched.
-        m_VrrFallbackReason = VrrFallbackReason::WindowsVulkan;
-#else
-        m_VrrFallbackReason = VrrFallbackReason::UnsupportedRenderer;
-#endif
         selectLegacyPresentMode(params);
         return;
     }
@@ -768,9 +728,9 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
         return;
     }
 
-    // The session owns this strict qualification snapshot. Do not query the
-    // display again here: the adapter must make the same decision as session
-    // setup for its entire lifetime.
+    // The session owns this qualification snapshot. Do not query the display
+    // again here: the renderer must make the same decision as session setup
+    // for its entire lifetime.
     if (params->vrrDisplayRefreshHz <= 0) {
         m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
         m_VrrFallbackReason = VrrFallbackReason::InvalidRefresh;
@@ -814,10 +774,9 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
         }
 
         // Gamescope WSI intentionally does not expose Immediate on current
-        // SteamOS. The known-good vrr8 Linux path kept cadence pacing active
-        // with an application-facing FIFO swapchain here; the WSI layer maps
-        // it onto Gamescope's non-blocking driver swapchain. Falling back to
-        // Moonlight's fixed-vsync worker instead pins the OSD near 120 Hz.
+        // SteamOS. Its FIFO swapchain is still non-blocking because the WSI
+        // layer maps it onto Gamescope's own Mailbox driver swapchain, so
+        // adaptive pacing remains correct here.
         if (gamescopeWsi) {
             m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
             m_VrrFallbackReason = VrrFallbackReason::NoFallback;
@@ -1104,22 +1063,9 @@ void PlVkRenderer::queueRenderDeviceReset()
     SDL_PushEvent(&event);
 }
 
-void PlVkRenderer::finishVrrRenderTiming()
-{
-    if (!m_VrrRenderTimingActive) {
-        return;
-    }
-
-#ifndef PLVK_USE_EARLY_RENDER_TO_WAIT
-    endRenderTiming();
-#endif
-    m_VrrRenderTimingActive = false;
-}
-
 bool PlVkRenderer::submitPendingSwapchainFrame()
 {
     if (!m_HasPendingSwapchainFrame) {
-        finishVrrRenderTiming();
         return true;
     }
 
@@ -1129,43 +1075,11 @@ bool PlVkRenderer::submitPendingSwapchainFrame()
     const bool submitted = m_Swapchain != nullptr &&
                            pl_swapchain_submit_frame(m_Swapchain);
     SDL_zero(m_SwapchainFrame);
-    finishVrrRenderTiming();
     return submitted;
 }
 
-bool PlVkRenderer::acquireVrrSwapchainFrame()
+bool PlVkRenderer::acquirePendingSwapchainFrame()
 {
-    if (m_Vulkan == nullptr || m_Vulkan->gpu == nullptr ||
-        m_Swapchain == nullptr || m_Window == nullptr) {
-        return false;
-    }
-
-    if (pl_gpu_is_failed(m_Vulkan->gpu)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "GPU is in failed state during Vulkan VRR preparation. Recreating renderer.");
-        queueRenderDeviceReset();
-        return false;
-    }
-
-    // This should only happen after cancellation interrupted the worker. Do
-    // not resize or start another image until the old one was submitted.
-    if (m_HasPendingSwapchainFrame) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "Vulkan VRR replacing an unpresented swapchain frame");
-        cancelVrrFrame();
-    }
-
-    return acquirePendingSwapchainFrame(
-        "pl_render_image() failed during Vulkan VRR render wait");
-}
-
-bool PlVkRenderer::acquirePendingSwapchainFrame(
-    const char* earlyRenderFailureMessage)
-{
-#ifndef PLVK_USE_EARLY_RENDER_TO_WAIT
-    (void) earlyRenderFailureMessage;
-#endif
-
 #ifndef Q_OS_WIN32
     // With libplacebo's Vulkan backend, swap_buffers() waits for queued
     // presents. Both the legacy and VRR paths need that before acquiring an
@@ -1197,8 +1111,8 @@ bool PlVkRenderer::acquirePendingSwapchainFrame(
 
     beginRenderTiming();
     if (!pl_render_image(m_Renderer, nullptr, &targetFrame, &pl_render_fast_params)) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "%s",
-                    earlyRenderFailureMessage);
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "pl_render_image() failed during render wait");
     }
     endRenderTiming();
 #endif
@@ -1216,7 +1130,7 @@ void PlVkRenderer::waitToRender()
         return;
     }
 
-    acquirePendingSwapchainFrame("pl_render_image() failed during render wait");
+    acquirePendingSwapchainFrame();
 }
 
 void PlVkRenderer::cleanupRenderContext()
@@ -1235,17 +1149,15 @@ IVrrFramePresenter* PlVkRenderer::getVrrFramePresenter()
 
 VrrFallbackReason PlVkRenderer::checkSupport() const
 {
-    const char* videoDriver = SDL_GetCurrentVideoDriver();
-    const bool adaptiveMode = m_VkPresentMode == VK_PRESENT_MODE_MAILBOX_KHR ||
-                              m_VkPresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ||
-                              (m_VkPresentMode == VK_PRESENT_MODE_FIFO_KHR &&
-                               isGamescopeWsiPresentation(videoDriver));
+    // selectPresentationMode() only reports NoFallback after it committed the
+    // swapchain to an adaptive presentation mode, so there is nothing further
+    // to re-derive from the present mode or the video driver here.
     if (m_VrrFallbackReason != VrrFallbackReason::NoFallback) {
         return m_VrrFallbackReason;
     }
 
     return m_VrrRequested && m_Vulkan != nullptr && m_Swapchain != nullptr &&
-        m_Renderer != nullptr && adaptiveMode ? VrrFallbackReason::NoFallback :
+        m_Renderer != nullptr ? VrrFallbackReason::NoFallback :
         VrrFallbackReason::InitializationFailed;
 }
 
@@ -1267,9 +1179,22 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame)
 
     // A size/display callback arrives on the main thread. Clear the current
     // generation before acquisition; a concurrent new callback remains set
-    // and makes presentFrame() safely abandon this image.
+    // and makes presentAdaptive() safely abandon this image.
     m_VrrWindowChangePending.exchange(false);
-    if (!acquireVrrSwapchainFrame()) {
+
+    if (m_Vulkan == nullptr || m_Vulkan->gpu == nullptr ||
+        m_Swapchain == nullptr || m_Window == nullptr) {
+        return result;
+    }
+
+    if (pl_gpu_is_failed(m_Vulkan->gpu)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "GPU is in failed state during Vulkan VRR preparation. Recreating renderer.");
+        queueRenderDeviceReset();
+        return result;
+    }
+
+    if (!acquirePendingSwapchainFrame()) {
         return result;
     }
 
@@ -1280,12 +1205,11 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame)
 
     m_VrrPreparingFrame = true;
     m_VrrRenderSucceeded = false;
-    m_VrrRenderTimingActive = false;
     renderFrame(frame);
 
     // pl_render_image() records work for the acquired image. Flush it now so
     // GPU rendering can overlap the worker's target wait, but retain the
-    // swapchain frame: only presentFrame() is allowed to submit its
+    // swapchain frame: only presentAdaptive() is allowed to submit its
     // display transition/present.
     if (m_VrrRenderSucceeded && m_Vulkan != nullptr && m_Vulkan->gpu != nullptr) {
         pl_gpu_flush(m_Vulkan->gpu);
@@ -1330,11 +1254,6 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest&)
     const bool submitted = submitPendingSwapchainFrame();
 
     VrrPresentFeedback feedback;
-    feedback.nativeBackendValid = true;
-    feedback.nativeBackend = VrrNativePresentationBackend::Vulkan;
-    feedback.nativePresentResultValid = true;
-    // libplacebo exposes a boolean submit result here rather than VkResult.
-    feedback.nativePresentResult = submitted ? 0 : -1;
     if (!submitted) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "pl_swapchain_submit_frame() failed on Vulkan VRR path");
@@ -1371,15 +1290,11 @@ VrrPresentFeedback PlVkRenderer::cancelFrame()
 {
     VrrPresentFeedback feedback;
     feedback.cancelled = true;
-    const bool nativeSubmitAttempted = m_HasPendingSwapchainFrame;
     const uint64_t submissionTimeUs = LiGetMicroseconds();
+    // A Vulkan swapchain image can only be abandoned by submitting it, so an
+    // abandoned frame really does occupy a display slot. Report it as
+    // presented so the worker advances its display-spacing floor.
     feedback.presented = cancelVrrFrame();
-    if (nativeSubmitAttempted) {
-        feedback.nativeBackendValid = true;
-        feedback.nativeBackend = VrrNativePresentationBackend::Vulkan;
-        feedback.nativePresentResultValid = true;
-        feedback.nativePresentResult = feedback.presented ? 0 : -1;
-    }
     if (feedback.presented) {
         feedback.submissionTimeValid = true;
         feedback.submissionTimeUs = submissionTimeUs;
@@ -1417,9 +1332,6 @@ bool PlVkRenderer::restoreFixedPresentation(VrrFallbackReason reason)
         return false;
     }
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Vulkan VRR worker startup fallback selected immutable %s swapchain presentation",
-                vulkanPresentModeName(m_VkPresentMode));
     return true;
 }
 
@@ -1538,12 +1450,11 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
 
 #ifndef PLVK_USE_EARLY_RENDER_TO_WAIT
     // For PLVK_USE_EARLY_RENDER_TO_WAIT, we already timed our early render in waitToRender()
+    // NB: The VRR path exits below without calling endRenderTiming(). That is
+    // harmless because PLVK_USE_DYNAMIC_SWAPCHAIN_DEPTH (which is what
+    // endRenderTiming() feeds) is only defined alongside
+    // PLVK_USE_EARLY_RENDER_TO_WAIT on Darwin, where VRR is never selected.
     beginRenderTiming();
-    if (m_VrrPreparingFrame) {
-        // VRR leaves this timing span open until its final submit, matching
-        // the legacy render-to-present measurement without submitting here.
-        m_VrrRenderTimingActive = true;
-    }
 #endif
 
     // Render the video image and overlays into the swapchain buffer
@@ -1559,7 +1470,7 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
     }
 
     if (m_VrrPreparingFrame) {
-        // The VRR worker owns the target wait. It calls presentFrame()
+        // The VRR worker owns the target wait. It calls presentAdaptive()
         // later, so retain the acquired image instead of submitting here.
         // Mapping and overlay lifetime can still end now because libplacebo
         // retains the GPU work it recorded for the swapchain frame.

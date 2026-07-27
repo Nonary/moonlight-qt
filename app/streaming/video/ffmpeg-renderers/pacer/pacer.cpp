@@ -34,32 +34,22 @@ static_assert(PACER_MAX_OUTSTANDING_FRAMES == MAX_QUEUED_FRAMES + 2,
 // V-sync happens.
 #define TIMER_SLACK_MS 3
 
-Pacer::Pacer(IFFmpegRenderer* renderer) :
+Pacer::Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats) :
     m_RenderThread(nullptr),
     m_VsyncThread(nullptr),
     m_DeferredFreeFrame(nullptr),
     m_Stopping(false),
-    m_Shutdown(false),
     m_VsyncSource(nullptr),
     m_VsyncRenderer(renderer),
     m_MaxVideoFps(0),
-    m_DisplayFps(0)
+    m_DisplayFps(0),
+    m_VideoStats(videoStats)
 {
 
 }
 
 Pacer::~Pacer()
 {
-    shutdown();
-}
-
-void Pacer::shutdown()
-{
-    if (m_Shutdown) {
-        return;
-    }
-    m_Shutdown = true;
-
     if (m_VrrWorker != nullptr) {
         // The VRR worker owns the renderer context and releases it from its
         // own thread after cancelling any prepared frame.
@@ -101,11 +91,6 @@ void Pacer::shutdown()
         av_frame_free(&frame);
     }
     av_frame_free(&m_DeferredFreeFrame);
-}
-
-PacerTelemetrySnapshot Pacer::telemetrySnapshot() const
-{
-    return m_Telemetry.snapshot();
 }
 
 void Pacer::renderOnMainThread()
@@ -267,7 +252,7 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
 
         // Drop the lock while we call av_frame_free()
         m_FrameQueueLock.unlock();
-        m_Telemetry.recordLegacyDrop();
+        m_VideoStats->pacerDroppedFrames++;
         av_frame_free(&frame);
         m_FrameQueueLock.lock();
     }
@@ -335,7 +320,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                 fallbackReason = presenter->checkSupport();
                 if (fallbackReason == VrrFallbackReason::NoFallback) {
                     m_VrrWorker = std::make_unique<VrrPacingWorker>(
-                        presenter, config, &m_Telemetry);
+                        presenter, config, m_VideoStats);
                     if (m_VrrWorker->start()) {
                         m_DisplayFps = config.displayRefreshHz;
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -455,9 +440,9 @@ void Pacer::renderFrame(AVFrame* frame)
     m_VsyncRenderer->renderFrame(frame);
     uint64_t afterRender = LiGetMicroseconds();
 
-    m_Telemetry.recordLegacyFrame(
-        beforeRender - static_cast<uint64_t>(frame->pkt_dts),
-        afterRender - beforeRender);
+    m_VideoStats->totalPacerTimeUs += beforeRender - static_cast<uint64_t>(frame->pkt_dts);
+    m_VideoStats->totalRenderTimeUs += afterRender - beforeRender;
+    m_VideoStats->renderedFrames++;
 
     // Wait until after next frame to free this one to ensure the GPU
     // doesn't stall or read garbage if the backing buffer gets returned
@@ -500,7 +485,7 @@ void Pacer::renderFrame(AVFrame* frame)
 
         // Drop the lock while we call av_frame_free()
         m_FrameQueueLock.unlock();
-        m_Telemetry.recordLegacyDrop();
+        m_VideoStats->pacerDroppedFrames++;
         av_frame_free(&frame);
         m_FrameQueueLock.lock();
     }

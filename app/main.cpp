@@ -54,7 +54,6 @@
 #include "streaming/session.h"
 #include "settings/streamingpreferences.h"
 #include "gui/sdlgamepadkeynavigation.h"
-#include "windowsvblankvirtualization.h"
 
 #if defined(Q_OS_WIN32)
 #define IS_UNSPECIFIED_HANDLE(x) ((x) == INVALID_HANDLE_VALUE || (x) == NULL)
@@ -605,12 +604,7 @@ int main(int argc, char *argv[])
         (decltype(DXGIDisableVBlankVirtualization)*)GetProcAddress(GetModuleHandleW(L"dxgi.dll"),
                                                                    "DXGIDisableVBlankVirtualization");
     if (fnDXGIDisableVBlankVirtualization) {
-        const HRESULT result = fnDXGIDisableVBlankVirtualization();
-        WindowsVblankVirtualization::recordResult(
-            static_cast<int64_t>(result));
-    }
-    else {
-        WindowsVblankVirtualization::recordUnavailable();
+        fnDXGIDisableVBlankVirtualization();
     }
 #endif
 

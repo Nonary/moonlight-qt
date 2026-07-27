@@ -292,7 +292,7 @@ if defined CI_VERSION (
     if !ERRORLEVEL! NEQ 0 goto Error
 )
 
-powershell -NoProfile -Command "Compress-Archive -Path '%DEPLOY_FOLDER%\*' -DestinationPath '%INSTALLER_FOLDER%\MoonlightPortable-%ARCH%-%VERSION%.zip' -CompressionLevel Optimal -Force"
+7z a %INSTALLER_FOLDER%\MoonlightPortable-%ARCH%-%VERSION%.zip %DEPLOY_FOLDER%\*
 if !ERRORLEVEL! NEQ 0 goto Error
 
 echo Build successful for Moonlight v%VERSION% %ARCH% binaries!

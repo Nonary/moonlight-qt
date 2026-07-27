@@ -439,9 +439,7 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     // Resolve --vsync and --no-vsync options
     preferences->enableVsync = parser.getToggleOptionValue("vsync", preferences->enableVsync);
 
-    // This is intentionally an in-memory override, like the other stream
-    // command-line settings.  It must not persist a CLI choice back to the
-    // normal settings UI.
+    // Resolve --vrr and --no-vrr options
     preferences->enableVrr = parser.getToggleOptionValue("vrr", preferences->enableVrr);
 
     // Resolve --audio-config option

@@ -74,10 +74,8 @@ private:
     void endRenderTiming();
     void selectPresentationMode(PDECODER_PARAMETERS params);
     void selectLegacyPresentMode(PDECODER_PARAMETERS params);
-    bool acquirePendingSwapchainFrame(const char* earlyRenderFailureMessage);
-    bool acquireVrrSwapchainFrame();
+    bool acquirePendingSwapchainFrame();
     bool submitPendingSwapchainFrame();
-    void finishVrrRenderTiming();
     bool cancelVrrFrame();
     void queueRenderDeviceReset();
 
@@ -147,7 +145,6 @@ private:
     bool m_VrrPreparingFrame = false;
     bool m_VrrFramePrepared = false;
     bool m_VrrRenderSucceeded = false;
-    bool m_VrrRenderTimingActive = false;
 
     // Overlay state
     SDL_SpinLock m_OverlayLock = 0;

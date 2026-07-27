@@ -243,8 +243,7 @@ HEADERS += \
     settings/mappingmanager.h \
     gui/sdlgamepadkeynavigation.h \
     streaming/video/overlaymanager.h \
-    backend/systemproperties.h \
-    windowsvblankvirtualization.h
+    backend/systemproperties.h
 
 # Platform-specific renderers and decoders
 ffmpeg {
@@ -268,7 +267,6 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/sdlvid.h \
         streaming/video/ffmpeg-renderers/swframemapper.h \
         streaming/video/ffmpeg-renderers/pacer/pacer.h \
-        streaming/video/ffmpeg-renderers/pacer/pacertelemetry.h \
         streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h \
         streaming/video/ffmpeg-renderers/ivrrframepresenter.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \

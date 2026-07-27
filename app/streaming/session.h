@@ -246,14 +246,12 @@ private:
     static
     int drSubmitDecodeUnit(PDECODE_UNIT du);
 
+    // VRR qualification is decided once at session start. The refresh rate is
+    // baked into the renderer's immutable presentation mode, so it must not be
+    // re-derived from a mutable settings object mid-stream.
     struct PresentationSettings {
-        bool effectiveVsync = false;
-        bool enableFramePacing = false;
         bool enableVrr = false;
         int refreshRate = 0;
-        StreamingPreferences::WindowMode effectiveWindowMode = StreamingPreferences::WM_WINDOWED;
-        StreamingPreferences::VideoDecoderSelection decoderSelection = StreamingPreferences::VDS_AUTO;
-        StreamingPreferences::RendererSelection rendererSelection = StreamingPreferences::RS_AUTO;
     };
 
     StreamingPreferences* m_Preferences;

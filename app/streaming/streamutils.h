@@ -26,9 +26,9 @@ public:
     static
     int getDisplayRefreshRate(SDL_Window* window);
 
-    // Unlike getDisplayRefreshRate(), this does not guess 60 Hz.  It is used
-    // to decide whether a session may enter the opt-in VRR path, where an
-    // invented refresh rate would produce an invalid pacing configuration.
+    // Unlike getDisplayRefreshRate(), this does not guess 60 Hz. VRR session
+    // qualification must reject an unknown refresh rate rather than pace
+    // against an invented one.
     static
     bool tryGetDisplayRefreshRate(SDL_Window* window, int& outHz);
 

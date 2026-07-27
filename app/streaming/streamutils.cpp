@@ -163,10 +163,8 @@ int StreamUtils::getDisplayRefreshRate(SDL_Window* window)
         return refreshHz;
     }
 
-    // Preserve the historical behavior for existing fixed-pacing callers.
-    // VRR qualification must use tryGetDisplayRefreshRate() instead.
     SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                "Refresh rate unavailable; assuming 60 Hz for legacy pacing");
+                "Refresh rate unknown; assuming 60 Hz");
     return 60;
 }
 
@@ -174,18 +172,14 @@ bool StreamUtils::tryGetDisplayRefreshRate(SDL_Window* window, int& outHz)
 {
     outHz = 0;
 
-    if (window == nullptr) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "Failed to get display refresh rate: window is null");
-        return false;
-    }
-
     int displayIndex = SDL_GetWindowDisplayIndex(window);
     if (displayIndex < 0) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "Failed to get current display: %s",
                      SDL_GetError());
-        return false;
+
+        // Assume display 0 if it fails
+        displayIndex = 0;
     }
 
     SDL_DisplayMode mode;
@@ -208,11 +202,9 @@ bool StreamUtils::tryGetDisplayRefreshRate(SDL_Window* window, int& outHz)
         }
     }
 
-    // SDL uses zero for an undefined refresh rate.  A strict caller must be
-    // able to reject that state instead of silently qualifying VRR at 60 Hz.
+    // SDL uses zero for an undefined refresh rate. A strict caller must be able
+    // to reject that state instead of silently qualifying VRR at 60 Hz.
     if (mode.refresh_rate <= 0) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "Refresh rate unknown");
         return false;
     }
 

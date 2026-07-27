@@ -444,16 +444,18 @@ Flickable {
                         property int lastIndexValue
 
                         function updateBitrateForSelection() {
+                            // Only modify the bitrate if the values actually changed
                             var selectedFps = parseInt(model.get(fpsComboBox.currentIndex).video_fps)
-                            var fpsChanged = StreamingPreferences.fps !== selectedFps
-                            StreamingPreferences.fps = selectedFps
+                            if (StreamingPreferences.fps !== selectedFps) {
+                                StreamingPreferences.fps = selectedFps
 
-                            if (fpsChanged && StreamingPreferences.autoAdjustBitrate) {
-                                StreamingPreferences.bitrateKbps = StreamingPreferences.getDefaultBitrate(StreamingPreferences.width,
-                                                                                                          StreamingPreferences.height,
-                                                                                                          StreamingPreferences.fps,
-                                                                                                          StreamingPreferences.enableYUV444);
-                                slider.value = StreamingPreferences.bitrateKbps
+                                if (StreamingPreferences.autoAdjustBitrate) {
+                                    StreamingPreferences.bitrateKbps = StreamingPreferences.getDefaultBitrate(StreamingPreferences.width,
+                                                                                                              StreamingPreferences.height,
+                                                                                                              StreamingPreferences.fps,
+                                                                                                              StreamingPreferences.enableYUV444);
+                                    slider.value = StreamingPreferences.bitrateKbps
+                                }
                             }
 
                             lastIndexValue = currentIndex
@@ -609,10 +611,8 @@ Flickable {
                                 }
                             }
 
-                            // VrrRatePolicy preserves every saved custom value.  An
-                            // exact native refresh is intentionally absent in VRR
-                            // mode, so leave the first valid choice selected if a
-                            // stale external setting reaches this UI.
+                            // VRR mode omits exact native refresh rates, so a saved
+                            // native value may have no entry to select.
                             if (!found) {
                                 currentIndex = model.count > 0 ? 0 : -1
                             }
@@ -770,11 +770,8 @@ Flickable {
                         model = createModel()
                         currentIndex = 0
 
-                        // VRR sessions use borderless presentation, but the
-                        // saved window-mode preference is never overwritten.
-                        var savedWm = vrrForced ?
-                                          StreamingPreferences.WM_FULLSCREEN_DESKTOP :
-                                          StreamingPreferences.windowMode
+                        // Set the current value based on the saved preferences
+                        var savedWm = StreamingPreferences.windowMode
                         for (var i = 0; i < model.count; i++) {
                              var thisWm = model.get(i).val;
                              if (savedWm === thisWm) {
@@ -783,9 +780,7 @@ Flickable {
                              }
                         }
 
-                        if (!vrrForced) {
-                            activated(currentIndex)
-                        }
+                        activated(currentIndex)
                     }
 
                     Component.onCompleted: {
@@ -794,10 +789,11 @@ Flickable {
                     }
 
                     id: windowModeComboBox
-                    property bool vrrForced: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
-                    onVrrForcedChanged: reinitialize()
                     visible: SystemProperties.hasDesktopEnvironment
-                    enabled: !SystemProperties.rendererAlwaysFullScreen && !vrrForced
+                    // An active VRR session always uses borderless fullscreen,
+                    // so the saved preference cannot take effect while it is on.
+                    enabled: !SystemProperties.rendererAlwaysFullScreen &&
+                             !(StreamingPreferences.enableVsync && StreamingPreferences.enableVrr)
                     hoverEnabled: true
                     textRole: "text"
                     onActivated: {
@@ -807,10 +803,7 @@ Flickable {
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
                     ToolTip.visible: hovered
-                    ToolTip.text: vrrForced ?
-                                      qsTr("Borderless windowed mode is required for active VRR streaming. Your saved display mode will be restored for non-VRR sessions.")
-                                    :
-                                      qsTr("Fullscreen generally provides the best performance, but borderless windowed may work better with features like macOS Spaces, Alt+Tab, screenshot tools, on-screen overlays, etc.")
+                    ToolTip.text: qsTr("Fullscreen generally provides the best performance, but borderless windowed may work better with features like macOS Spaces, Alt+Tab, screenshot tools, on-screen overlays, etc.")
                 }
 
                 Row {
@@ -862,10 +855,8 @@ Flickable {
                         ToolTip.delay: 1000
                         ToolTip.timeout: 5000
                         ToolTip.visible: hovered
-                        ToolTip.text: enabled ?
-                                          qsTr("VRR uses paced adaptive presentation with best-effort tear avoidance. Sessions without enough refresh-rate headroom use fixed V-Sync. Borderless fullscreen is used while VRR is active.")
-                                        :
-                                          qsTr("VRR requires V-Sync. Enable V-Sync to change this setting.")
+                        ToolTip.text: enabled ? qsTr("VRR uses paced adaptive presentation with best-effort tear avoidance. Sessions without enough refresh-rate headroom use fixed V-Sync. Borderless fullscreen is used while VRR is active.")
+                                              : qsTr("VRR requires V-Sync. Enable V-Sync to change this setting.")
                     }
                 }
 

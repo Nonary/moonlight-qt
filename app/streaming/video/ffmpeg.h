@@ -56,10 +56,6 @@ private:
 
     void addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst);
 
-    void syncPacerTelemetry();
-
-    void finalizeActiveVideoStats();
-
     bool createFrontendRenderer(PDECODER_PARAMETERS params, bool useAlternateFrontend);
 
     static
@@ -121,7 +117,6 @@ private:
     VIDEO_STATS m_ActiveWndVideoStats;
     VIDEO_STATS m_LastWndVideoStats;
     VIDEO_STATS m_GlobalVideoStats;
-    PacerTelemetrySnapshot m_LastPacerTelemetry;
     std::set<IFFmpegRenderer::RendererType> m_FailedRenderers;
 
     int m_FramesIn;

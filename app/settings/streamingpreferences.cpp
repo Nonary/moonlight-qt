@@ -12,6 +12,8 @@
 
 #include <QtDebug>
 
+#include <algorithm>
+#include <map>
 #include <vector>
 
 #define SER_STREAMSETTINGS "streamsettings"
@@ -373,39 +375,56 @@ void StreamingPreferences::save()
 
 QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRates) const
 {
+    const bool vrrEnabled = enableVsync && enableVrr;
+
     std::vector<int> rates;
     rates.reserve(refreshRates.size());
     for (const QVariant& value : refreshRates) {
         bool ok = false;
         const int refreshHz = value.toInt(&ok);
-        if (ok && refreshHz > 0) {
+        if (ok && refreshHz > 1) {
             rates.push_back(refreshHz);
         }
     }
 
-    const std::vector<VrrFpsChoice> choices = VrrRatePolicy::buildChoices(
-        rates, fps, enableVsync && enableVrr);
-    QVariantList result;
-    for (const VrrFpsChoice& choice : choices) {
-        QVariantMap item;
-        item.insert("video_fps", QString::number(choice.fps));
-        item.insert("is_custom", choice.kind == VrrFpsChoiceKind::Custom);
-
-        switch (choice.kind) {
-        case VrrFpsChoiceKind::Fixed:
-            item.insert("kind", "fixed");
-            break;
-        case VrrFpsChoiceKind::Vrr:
-            item.insert("kind", "vrr");
-            break;
-        case VrrFpsChoiceKind::LowLatencyVrr:
-            item.insert("kind", "low-latency-vrr");
-            break;
-        case VrrFpsChoiceKind::Custom:
-            item.insert("kind", "custom");
-            break;
+    // Sorted by rate, and the first semantic role for a duplicate rate wins so
+    // a baseline choice is never relabeled by a coincident calculated rate.
+    std::map<int, QString> choices;
+    auto addChoice = [&choices](int rate, const char* kind) {
+        if (rate > 0) {
+            choices.emplace(rate, QLatin1String(kind));
         }
+    };
 
+    // Always useful streaming rates, including on a 60 Hz display.
+    addChoice(30, "fixed");
+    addChoice(60, "fixed");
+
+    for (const int refreshHz : rates) {
+        if (vrrEnabled) {
+            // Exact native rates are deliberately omitted while VRR is on:
+            // they leave no adaptive-refresh headroom.
+            addChoice(VrrRatePolicy::vrrRateForRefresh(refreshHz), "vrr");
+            addChoice(VrrRatePolicy::lowLatencyRateForRefresh(refreshHz), "low-latency-vrr");
+        }
+        else {
+            addChoice(refreshHz, "fixed");
+        }
+    }
+
+    // A manually saved value must remain selectable, but a native rate is not
+    // reintroduced that way while VRR is enabled.
+    if (fps > 0 && (!vrrEnabled ||
+                    std::find(rates.cbegin(), rates.cend(), fps) == rates.cend())) {
+        addChoice(fps, "custom");
+    }
+
+    QVariantList result;
+    for (const auto& choice : choices) {
+        QVariantMap item;
+        item.insert("video_fps", QString::number(choice.first));
+        item.insert("is_custom", choice.second == QLatin1String("custom"));
+        item.insert("kind", choice.second);
         result.append(item);
     }
 
