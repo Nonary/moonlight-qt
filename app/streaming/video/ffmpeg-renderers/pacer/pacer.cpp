@@ -194,10 +194,12 @@ int Pacer::renderThread(void* context)
 
 void Pacer::enqueueFrameForRenderingAndUnlock(AVFrame *frame)
 {
-    dropFrameForEnqueue(m_RenderQueue);
+    AVFrame* droppedFrame = dropFrameForEnqueue();
     m_RenderQueue.enqueue(frame);
 
     m_FrameQueueLock.unlock();
+
+    av_frame_free(&droppedFrame);
 
     if (m_RenderThread != nullptr) {
         m_RenderQueueNotEmpty.wakeOne();
@@ -493,13 +495,21 @@ void Pacer::renderFrame(AVFrame* frame)
     m_FrameQueueLock.unlock();
 }
 
-void Pacer::dropFrameForEnqueue(QQueue<AVFrame*>& queue)
+AVFrame* Pacer::dropFrameForEnqueue()
 {
-    SDL_assert(queue.size() <= MAX_QUEUED_FRAMES);
-    if (queue.size() == MAX_QUEUED_FRAMES) {
-        AVFrame* frame = queue.dequeue();
-        av_frame_free(&frame);
+    const int queuedFrames = m_RenderQueue.size() + m_PacingQueue.size();
+    SDL_assert(queuedFrames <= MAX_QUEUED_FRAMES);
+    if (queuedFrames < MAX_QUEUED_FRAMES) {
+        return nullptr;
     }
+
+    // Frames reach the render queue only after leaving the pacing queue, so
+    // its head is always the oldest globally queued frame. If it is empty,
+    // the pacing head is the oldest remaining frame.
+    AVFrame* frame = !m_RenderQueue.isEmpty() ?
+        m_RenderQueue.dequeue() : m_PacingQueue.dequeue();
+    m_VideoStats->pacerDroppedFrames++;
+    return frame;
 }
 
 void Pacer::submitFrame(AVFrame* frame)
@@ -510,9 +520,10 @@ void Pacer::submitFrame(AVFrame* frame)
     // Queue the frame and possibly wake up the render thread
     m_FrameQueueLock.lock();
     if (m_VsyncSource != nullptr) {
-        dropFrameForEnqueue(m_PacingQueue);
+        AVFrame* droppedFrame = dropFrameForEnqueue();
         m_PacingQueue.enqueue(frame);
         m_FrameQueueLock.unlock();
+        av_frame_free(&droppedFrame);
         m_PacingQueueNotEmpty.wakeOne();
     }
     else {

@@ -50,6 +50,9 @@ typedef struct _DECODER_PARAMETERS {
     // the session was not qualified for VRR; Pacer must not substitute a
     // legacy 60 Hz fallback when this path is requested.
     int vrrDisplayRefreshHz;
+    // On supported HDR displays, alternate every SDR video frame with a
+    // black frame while rendering video at twice SDR reference white.
+    bool enableBlackFrameInsertion;
     bool testOnly;
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;
 

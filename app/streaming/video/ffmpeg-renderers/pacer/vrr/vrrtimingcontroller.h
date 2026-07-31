@@ -7,6 +7,7 @@
 
 struct VrrTimingDecision {
     uint64_t sourcePeriodUs = 0;
+    uint64_t sourceFrameDelta = 1;
     uint64_t renderStartUs = 0;
     uint64_t targetUs = 0;
     uint64_t targetWakeLeadUs = 0;
@@ -45,6 +46,12 @@ public:
     // lifecycle result. The timing controller has no renderer/native types.
     void noteSubmission(bool submitted, bool cancelled,
                         uint64_t submissionUs);
+
+    // Records a display transition that is not associated with a scheduled
+    // source frame, such as the BFI idle-brightness fallback. It participates
+    // in the same physical display-spacing floor without resolving or
+    // learning from a pending frame.
+    void noteAuxiliarySubmission(uint64_t submissionUs);
 
     uint64_t displayPeriodUs() const;
     uint64_t earliestSubmissionUs() const;

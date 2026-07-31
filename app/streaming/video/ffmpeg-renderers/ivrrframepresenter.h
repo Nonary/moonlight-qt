@@ -56,6 +56,24 @@ struct VrrPresentFeedback {
     // call boundary, which may include a blocking return.
     bool submissionTimeValid = false;
     uint64_t submissionTimeUs = 0;
+
+    // Optional native present/latch evidence. DXGI reports the most recent
+    // frame that reached the display, which may be older than this submission;
+    // submissionId and latchSubmissionId allow the worker to associate it with
+    // a black, video, or recovery phase without changing pacing policy.
+    bool submissionIdValid = false;
+    uint64_t submissionId = 0;
+    bool latchSampleValid = false;
+    uint64_t latchSubmissionId = 0;
+    uint64_t latchPresentRefreshSequence = 0;
+    uint64_t latchRefreshSequence = 0;
+    bool latchTimeValid = false;
+    uint64_t latchTimeUs = 0;
+
+    // Records the mode actually passed to the native Present call. This can
+    // differ from the controller request during the opt-in BFI tearing A/B.
+    bool presentModeValid = false;
+    bool tearingAllowed = false;
 };
 
 // Per-present request from the platform-neutral controller. When the learned
@@ -95,6 +113,53 @@ public:
     // May acquire a swapchain image and submit rendering work, but must not
     // intentionally pace or wait for the worker's presentation target.
     virtual VrrPrepareResult prepareFrame(AVFrame* frame) = 0;
+
+    // Effects such as BFI may require a transition shortly before the video
+    // frame. The worker invokes presentPreFrame() this far ahead of the
+    // adaptive video target.
+    virtual uint64_t prePresentLeadTimeUs() const
+    {
+        return 0;
+    }
+
+    virtual VrrPresentFeedback presentPreFrame(
+        const VrrPresentRequest&)
+    {
+        return {};
+    }
+
+    // A confirmed source gap can request a normal-luminance recovery frame
+    // instead of another boosted frame/black pair.
+    virtual void setFrameDropRecovery(bool)
+    {
+    }
+
+    // BFI normally leaves the boosted video image visible while the worker
+    // waits for the next decoded frame. If that frame does not arrive by the
+    // next black-transition deadline, replace the cached boosted image with a
+    // normal-luminance copy so a source/network stall cannot become a bright
+    // flash. This is an auxiliary display transition with no prepared frame.
+    virtual VrrPresentFeedback presentIdleFrameRecovery(
+        const VrrPresentRequest&)
+    {
+        return {};
+    }
+
+    // Grid-locked BFI absorbs source/display clock drift by re-presenting
+    // the cached boosted image as one extra black/video pair, keeping the
+    // panel's black/bright alternation intact. Both calls operate without a
+    // prepared frame and must leave the cached image usable afterwards.
+    virtual VrrPresentFeedback presentPairRepeatBlack(
+        const VrrPresentRequest&)
+    {
+        return {};
+    }
+
+    virtual VrrPresentFeedback presentPairRepeatVideo(
+        const VrrPresentRequest&)
+    {
+        return {};
+    }
 
     // Presents the prepared image using the backend's adaptive presentation
     // path without intentionally waiting.

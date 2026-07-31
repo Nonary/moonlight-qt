@@ -336,6 +336,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
 
     VrrTimingDecision decision;
     decision.sourcePeriodUs = m_SourcePeriodUs;
+    decision.sourceFrameDelta = rebased ? 1 : cadence.frameDelta;
     decision.renderStartUs = targetUs > totalLeadUs ?
         targetUs - totalLeadUs : 0;
     decision.targetUs = targetUs;
@@ -718,6 +719,12 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
     }
 
     m_Pending = PendingFrame {};
+}
+
+void VrrTimingController::noteAuxiliarySubmission(uint64_t submissionUs)
+{
+    m_HaveLastSubmission = true;
+    m_LastSubmissionUs = submissionUs;
 }
 
 void VrrTimingController::updateLearnedBudgets()

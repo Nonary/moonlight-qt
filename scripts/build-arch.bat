@@ -141,7 +141,17 @@ for /f "usebackq delims=" %%i in (`%VSWHERE% -latest -property installationPath`
 if !ERRORLEVEL! NEQ 0 goto Error
 
 rem Find VC redistributable DLLs
+set VC_REDIST_DLL_PATH=
 for /f "usebackq delims=" %%i in (`%VSWHERE% -latest -find VC\Redist\MSVC\*\%ARCH%\Microsoft.VC*.CRT`) do set VC_REDIST_DLL_PATH=%%i
+if not defined VC_REDIST_DLL_PATH (
+    if defined VCToolsRedistDir (
+        set VC_REDIST_DLL_PATH=!VCToolsRedistDir!%ARCH%\Microsoft.VC143.CRT
+    )
+)
+if not exist "!VC_REDIST_DLL_PATH!\*.dll" (
+    echo Unable to find the Visual C++ runtime DLLs
+    goto Error
+)
 
 echo Cleaning output directories
 rmdir /s /q %DEPLOY_FOLDER%

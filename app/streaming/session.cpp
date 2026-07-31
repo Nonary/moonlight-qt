@@ -282,7 +282,8 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             int frameRate, bool enableVsync, bool enableFramePacing,
                             bool testOnly, IVideoDecoder*& chosenDecoder,
                             bool enableVrr, int vrrDisplayRefreshHz,
-                            [[maybe_unused]] bool* effectiveVrr)
+                            [[maybe_unused]] bool* effectiveVrr,
+                            bool enableBlackFrameInsertion)
 {
     DECODER_PARAMETERS params;
 
@@ -300,6 +301,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.enableFramePacing = enableFramePacing;
     params.enableVrr = enableVrr;
     params.vrrDisplayRefreshHz = vrrDisplayRefreshHz;
+    params.enableBlackFrameInsertion = enableBlackFrameInsertion;
     params.testOnly = testOnly;
     params.vds = vds;
     params.renderer = renderer;
@@ -314,6 +316,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     DECODER_PARAMETERS slVideoParams = params;
     slVideoParams.enableVrr = false;
     slVideoParams.vrrDisplayRefreshHz = 0;
+    slVideoParams.enableBlackFrameInsertion = false;
     chosenDecoder = new SLVideoDecoder(testOnly);
     if (chosenDecoder->initialize(&slVideoParams)) {
         // Keep the session snapshot aligned with the decoder that was
@@ -2317,6 +2320,12 @@ void Session::exec()
                 bool enableFramePacing = enableVsync &&
                         (m_Preferences->framePacing ||
                          (m_Preferences->enableVrr && !m_PresentationSettings.enableVrr));
+                // Black frame insertion converts SDR locally to HDR. In VRR
+                // mode, black is inserted immediately before each adaptively
+                // paced video frame.
+                bool enableBlackFrameInsertion = enableVsync &&
+                        m_Preferences->enableBlackFrameInsertion &&
+                        !m_Preferences->enableHdr;
 
                 // Choose a new decoder (hopefully the same one, but possibly
                 // not if a GPU was removed or something).
@@ -2330,7 +2339,8 @@ void Session::exec()
                                    s_ActiveSession->m_VideoDecoder,
                                    m_PresentationSettings.enableVrr,
                                    m_PresentationSettings.refreshRate,
-                                   &m_PresentationSettings.enableVrr)) {
+                                   &m_PresentationSettings.enableVrr,
+                                   enableBlackFrameInsertion)) {
                     SDL_UnlockMutex(m_DecoderLock);
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                                  "Failed to recreate decoder after reset");

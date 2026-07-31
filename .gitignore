@@ -7,3 +7,22 @@ build/
 libs/
 config.tests/*/.qmake.stash
 config.tests/*/Makefile
+
+# In-source qmake build outputs
+/AntiHooking/.qmake.stash
+/AntiHooking/Makefile*
+/AntiHooking/release/
+/app/.qmake.stash
+/app/Makefile*
+/app/Moonlight_resource.rc
+/app/qml_qmlcache.qrc
+/app/release/
+/h264bitstream/.qmake.stash
+/h264bitstream/Makefile*
+/h264bitstream/release/
+/moonlight-common-c/.qmake.stash
+/moonlight-common-c/Makefile*
+/moonlight-common-c/release/
+/qmdnsengine/.qmake.stash
+/qmdnsengine/Makefile*
+/qmdnsengine/release/

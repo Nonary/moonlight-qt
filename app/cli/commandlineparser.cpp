@@ -348,6 +348,7 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     parser.addValueOption("resolution", "custom <width>x<height> resolution");
     parser.addToggleOption("vsync", "V-Sync");
     parser.addToggleOption("vrr", "VRR");
+    parser.addToggleOption("black-frame-insertion", "black frame insertion on supported HDR displays");
     parser.addValueOption("fps", "FPS");
     parser.addValueOption("bitrate", "bitrate in Kbps");
     parser.addValueOption("packet-size", "video packet size");
@@ -441,6 +442,9 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
 
     // Resolve --vrr and --no-vrr options
     preferences->enableVrr = parser.getToggleOptionValue("vrr", preferences->enableVrr);
+
+    // Resolve --black-frame-insertion and --no-black-frame-insertion options
+    preferences->enableBlackFrameInsertion = parser.getToggleOptionValue("black-frame-insertion", preferences->enableBlackFrameInsertion);
 
     // Resolve --audio-config option
     if (parser.isSet("audio-config")) {

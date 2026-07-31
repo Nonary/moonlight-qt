@@ -858,6 +858,24 @@ Flickable {
                         ToolTip.text: enabled ? qsTr("VRR uses paced adaptive presentation with best-effort tear avoidance. Sessions without enough refresh-rate headroom use fixed V-Sync. Borderless fullscreen is used while VRR is active.")
                                               : qsTr("VRR requires V-Sync. Enable V-Sync to change this setting.")
                     }
+
+                    CheckBox {
+                        hoverEnabled: true
+                        text: qsTr("Black frame insertion")
+                        font.pointSize: 12
+                        enabled: StreamingPreferences.enableVsync &&
+                                 !StreamingPreferences.enableHdr
+                        checked: enabled && StreamingPreferences.enableBlackFrameInsertion
+                        onCheckedChanged: {
+                            StreamingPreferences.enableBlackFrameInsertion = checked
+                        }
+
+                        ToolTip.delay: 1000
+                        ToolTip.timeout: 5000
+                        ToolTip.visible: hovered
+                        ToolTip.text: enabled ? qsTr("Uses an HDR display to alternate equal-duration black and boosted SDR video intervals. Fixed V-Sync requires exactly twice the stream frame rate; VRR supports refresh rates at least twice the stream frame rate.")
+                                              : qsTr("Black frame insertion requires V-Sync and is unavailable with HDR streaming.")
+                    }
                 }
 
                 CheckBox {

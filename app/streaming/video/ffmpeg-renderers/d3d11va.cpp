@@ -49,12 +49,51 @@ typedef struct _CSC_CONST_BUF
 } CSC_CONST_BUF, *PCSC_CONST_BUF;
 static_assert(sizeof(CSC_CONST_BUF) % 16 == 0, "Constant buffer sizes must be a multiple of 16");
 
+typedef struct _BFI_CONST_BUF
+{
+    float referenceWhiteNits;
+    float padding[3];
+} BFI_CONST_BUF;
+static_assert(sizeof(BFI_CONST_BUF) % 16 == 0,
+              "Constant buffer sizes must be a multiple of 16");
+
 static const std::array<const char*, D3D11VARenderer::PixelShaders::_COUNT> k_VideoShaderNames =
 {
     "d3d11_yuv420_pixel.fxc",
     "d3d11_ayuv_pixel.fxc",
     "d3d11_y410_pixel.fxc",
+    "d3d11_yuv420_bfi_pixel.fxc",
+    "d3d11_ayuv_bfi_pixel.fxc",
+    "d3d11_y410_bfi_pixel.fxc",
 };
+
+static bool translateQpcToPacingTime(LARGE_INTEGER syncQpcTime,
+                                     uint64_t& translatedTimeUs)
+{
+    if (syncQpcTime.QuadPart <= 0) {
+        return false;
+    }
+
+    LARGE_INTEGER qpcNow;
+    LARGE_INTEGER qpcFrequency;
+    if (!QueryPerformanceCounter(&qpcNow) ||
+            !QueryPerformanceFrequency(&qpcFrequency) ||
+            qpcFrequency.QuadPart <= 0 ||
+            qpcNow.QuadPart < syncQpcTime.QuadPart) {
+        return false;
+    }
+
+    const uint64_t nowUs = LiGetMicroseconds();
+    const uint64_t ageTicks = static_cast<uint64_t>(
+        qpcNow.QuadPart - syncQpcTime.QuadPart);
+    const uint64_t ticksPerSecond = static_cast<uint64_t>(
+        qpcFrequency.QuadPart);
+    const uint64_t ageUs =
+        (ageTicks / ticksPerSecond) * 1000000ULL +
+        (ageTicks % ticksPerSecond) * 1000000ULL / ticksPerSecond;
+    translatedTimeUs = nowUs > ageUs ? nowUs - ageUs : 0;
+    return true;
+}
 
 D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
     : IFFmpegRenderer(RendererType::D3D11VA),
@@ -65,6 +104,11 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_RenderAdapterIndex(-1),
       m_LastColorTrc(AVCOL_TRC_UNSPECIFIED),
       m_AllowTearing(false),
+      m_BlackFrameInsertionActive(false),
+      m_BlackFrameInsertionBlackPresented(false),
+      m_BlackFrameInsertionDropRecovery(false),
+      m_BlackFrameInsertionForceTearing(false),
+      m_BlackFrameInsertionLeadTimeUs(0),
       m_VrrBorderlessFlipModel(false),
       m_VrrSwapChainAllowsTearing(false),
       m_VrrSuspended(false),
@@ -92,6 +136,10 @@ D3D11VARenderer::~D3D11VARenderer()
     SDL_DestroyMutex(m_ContextLock);
 
     m_VideoVertexBuffer.Reset();
+    m_BlackFrameInsertionFullscreenVertexBuffer.Reset();
+    m_BlackFrameInsertionBrightConstants.Reset();
+    m_BlackFrameInsertionRecoveryConstants.Reset();
+    m_BlackFrameInsertionDimPixelShader.Reset();
     for (auto& shader : m_VideoPixelShaders) {
         shader.Reset();
     }
@@ -117,6 +165,7 @@ D3D11VARenderer::~D3D11VARenderer()
     }
 
     m_OverlayPixelShader.Reset();
+    m_BfiOverlayPixelShader.Reset();
 
     m_OverlayBlendState.Reset();
     m_VideoBlendState.Reset();
@@ -132,7 +181,10 @@ D3D11VARenderer::~D3D11VARenderer()
         m_VrrPresentReadyFenceEvent = nullptr;
     }
 
+    m_BlackFrameInsertionVideoTextureSrv.Reset();
+    m_BlackFrameInsertionVideoTexture.Reset();
     m_RenderTargetView.Reset();
+    m_RenderTargetTexture.Reset();
     m_SwapChain.Reset();
 
     m_RenderSharedTextureArray.Reset();
@@ -584,7 +636,7 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     m_DisplayWidth = swapChainDesc.Width;
     m_DisplayHeight = swapChainDesc.Height;
 
-    if (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) {
+    if ((params->videoFormat & VIDEO_FORMAT_MASK_10BIT) || params->enableBlackFrameInsertion) {
         swapChainDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
     }
     else {
@@ -646,6 +698,10 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     // Determine VRR eligibility from the created swapchain rather than the
     // requested descriptor, since the runtime may normalize it.
     refreshVrrDisplayState();
+
+    if (!initializeBlackFrameInsertion()) {
+        return false;
+    }
 
     {
         m_HwDeviceContext = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
@@ -760,7 +816,19 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     }
 
     bool prepared = prepareFrameForPresent(frame);
-    HRESULT hr = prepared ? presentPreparedFrame(flags) : E_FAIL;
+    HRESULT hr = E_FAIL;
+    if (prepared && m_BlackFrameInsertionActive) {
+        // End on the lit frame. A delayed or dropped source frame now holds
+        // the previous video image instead of extending the black interval.
+        hr = presentBlackFrame(1, 0);
+        if (SUCCEEDED(hr)) {
+            hr = restoreBlackFrameInsertionVideo() ?
+                m_SwapChain->Present(1, 0) : E_FAIL;
+        }
+    }
+    else if (prepared) {
+        hr = presentPreparedFrame(flags);
+    }
 
     if (m_DecodeDevice == m_RenderDevice) {
         // Release the context lock
@@ -816,7 +884,9 @@ void D3D11VARenderer::renderOverlay(Overlay::OverlayType type)
     m_RenderDeviceContext->IASetVertexBuffers(0, 1, overlayVertexBuffer.GetAddressOf(), &stride, &offset);
 
     // Bind pixel shader and resources
-    m_RenderDeviceContext->PSSetShader(m_OverlayPixelShader.Get(), nullptr, 0);
+    m_RenderDeviceContext->PSSetShader(
+        m_BlackFrameInsertionActive ? m_BfiOverlayPixelShader.Get() : m_OverlayPixelShader.Get(),
+        nullptr, 0);
     m_RenderDeviceContext->PSSetShaderResources(0, 1, overlayTextureResourceView.GetAddressOf());
 
     // Draw the overlay with alpha blending
@@ -891,10 +961,14 @@ void D3D11VARenderer::bindColorConversion(bool frameChanged, AVFrame* frame)
         switch (m_TextureFormat)
         {
         case DXGI_FORMAT_AYUV:
-            m_RenderDeviceContext->PSSetShader(m_VideoPixelShaders[PixelShaders::GENERIC_AYUV].Get(), nullptr, 0);
+            m_RenderDeviceContext->PSSetShader(m_VideoPixelShaders[
+                m_BlackFrameInsertionActive && frame->color_trc != AVCOL_TRC_SMPTE2084 ?
+                    PixelShaders::BFI_AYUV : PixelShaders::GENERIC_AYUV].Get(), nullptr, 0);
             break;
         case DXGI_FORMAT_Y410:
-            m_RenderDeviceContext->PSSetShader(m_VideoPixelShaders[PixelShaders::GENERIC_Y410].Get(), nullptr, 0);
+            m_RenderDeviceContext->PSSetShader(m_VideoPixelShaders[
+                m_BlackFrameInsertionActive && frame->color_trc != AVCOL_TRC_SMPTE2084 ?
+                    PixelShaders::BFI_Y410 : PixelShaders::GENERIC_Y410].Get(), nullptr, 0);
             break;
         default:
             SDL_assert(false);
@@ -902,7 +976,9 @@ void D3D11VARenderer::bindColorConversion(bool frameChanged, AVFrame* frame)
     }
     else {
         // We'll need to use the generic 4:2:0 shader for this colorspace and color range combo
-        m_RenderDeviceContext->PSSetShader(m_VideoPixelShaders[PixelShaders::GENERIC_YUV_420].Get(), nullptr, 0);
+        m_RenderDeviceContext->PSSetShader(m_VideoPixelShaders[
+            m_BlackFrameInsertionActive && frame->color_trc != AVCOL_TRC_SMPTE2084 ?
+                PixelShaders::BFI_YUV_420 : PixelShaders::GENERIC_YUV_420].Get(), nullptr, 0);
     }
 
     // If nothing has changed since last frame, we're done
@@ -1210,6 +1286,18 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         // worker retains from preparation through Present.
         lockContext(this);
         refreshVrrDisplayState();
+        const bool wasBlackFrameInsertionActive =
+            m_BlackFrameInsertionActive;
+        m_BlackFrameInsertionActive = false;
+        if (!initializeBlackFrameInsertion()) {
+            unlockContext(this);
+            return false;
+        }
+        if (m_BlackFrameInsertionActive !=
+                wasBlackFrameInsertionActive) {
+            unlockContext(this);
+            return false;
+        }
         unlockContext(this);
 
         // We've handled this state change
@@ -1245,7 +1333,10 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         SDL_AtomicUnlock(&m_OverlayLock);
 
         // We must release all references to the back buffer
+        m_BlackFrameInsertionVideoTextureSrv.Reset();
+        m_BlackFrameInsertionVideoTexture.Reset();
         m_RenderTargetView.Reset();
+        m_RenderTargetTexture.Reset();
         m_RenderDeviceContext->Flush();
 
         HRESULT hr = m_SwapChain->ResizeBuffers(0, stateInfo->width, stateInfo->height, DXGI_FORMAT_UNKNOWN, swapchainDesc.Flags);
@@ -1640,6 +1731,7 @@ void D3D11VARenderer::releasePreparedVrrFrame()
     }
 
     m_VrrFramePrepared = false;
+    m_BlackFrameInsertionBlackPresented = false;
 
     if (m_VrrContextLocked) {
         unlockContext(this);
@@ -1669,6 +1761,18 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame)
     // unbinds the render target view.
     m_RenderDeviceContext->OMSetRenderTargets(1, m_RenderTargetView.GetAddressOf(), nullptr);
 
+    if (m_BlackFrameInsertionActive) {
+        ID3D11Buffer* brightnessConstants =
+            m_BlackFrameInsertionDropRecovery ?
+                m_BlackFrameInsertionRecoveryConstants.Get() :
+                m_BlackFrameInsertionBrightConstants.Get();
+        if (brightnessConstants == nullptr) {
+            return false;
+        }
+        m_RenderDeviceContext->PSSetConstantBuffers(
+            1, 1, &brightnessConstants);
+    }
+
     // Render the video and overlays.  This is the complete preparation phase
     // shared by the legacy and VRR paths; only the final Present is split out.
     renderVideo(frame);
@@ -1676,9 +1780,11 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame)
         renderOverlay((Overlay::OverlayType)i);
     }
 
-    if (frame->color_trc != m_LastColorTrc) {
+    const AVColorTransferCharacteristic outputTrc =
+        m_BlackFrameInsertionActive ? AVCOL_TRC_SMPTE2084 : frame->color_trc;
+    if (outputTrc != m_LastColorTrc) {
         HRESULT hr;
-        if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
+        if (outputTrc == AVCOL_TRC_SMPTE2084) {
             hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
             if (FAILED(hr)) {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -1695,7 +1801,17 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame)
             }
         }
 
-        m_LastColorTrc = frame->color_trc;
+        m_LastColorTrc = outputTrc;
+    }
+
+    if (m_BlackFrameInsertionActive) {
+        if (m_RenderTargetTexture == nullptr ||
+                m_BlackFrameInsertionVideoTexture == nullptr) {
+            return false;
+        }
+        m_RenderDeviceContext->CopyResource(
+            m_BlackFrameInsertionVideoTexture.Get(),
+            m_RenderTargetTexture.Get());
     }
 
     return true;
@@ -1798,6 +1914,158 @@ HRESULT D3D11VARenderer::presentPreparedFrame(UINT flags)
     return m_SwapChain->Present(0, flags);
 }
 
+bool D3D11VARenderer::initializeBlackFrameInsertion()
+{
+    m_BlackFrameInsertionLeadTimeUs = 0;
+    m_BlackFrameInsertionDropRecovery = false;
+    m_BlackFrameInsertionForceTearing = false;
+    if (!m_DecoderParams.enableBlackFrameInsertion) {
+        return true;
+    }
+
+    int displayRefreshHz = 0;
+    if (!StreamUtils::tryGetDisplayRefreshRate(
+            m_DecoderParams.window, displayRefreshHz)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Black frame insertion disabled: display refresh rate is unavailable");
+        return true;
+    }
+
+    if (m_DecoderParams.frameRate <= 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Black frame insertion disabled: stream frame rate is invalid");
+        return true;
+    }
+
+    const int requiredRefreshHz = m_DecoderParams.frameRate * 2;
+    const bool refreshRateSupported = m_DecoderParams.enableVrr ?
+        displayRefreshHz >= requiredRefreshHz :
+        displayRefreshHz == requiredRefreshHz;
+    if (!refreshRateSupported) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Black frame insertion disabled: %d FPS stream requires %d Hz%s",
+                    m_DecoderParams.frameRate, requiredRefreshHz,
+                    m_DecoderParams.enableVrr ? " or higher with VRR" : "");
+        return true;
+    }
+
+    UINT colorSpaceSupport = 0;
+    HRESULT hr = m_SwapChain->CheckColorSpaceSupport(
+        DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &colorSpaceSupport);
+    if (FAILED(hr) || !(colorSpaceSupport & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Black frame insertion disabled: the current display does not support HDR10 presentation");
+        return true;
+    }
+
+    m_BlackFrameInsertionActive = true;
+    // Keep black and boosted video on screen for equal durations. Using one
+    // native display period made the duty cycle depend on the panel ceiling
+    // (for example, only 20% black at 60 FPS on a 300 Hz panel), so a normal
+    // 600-nit BFI frame and a 300-nit recovery frame had different average
+    // luminance and visibly pulsed.
+    m_BlackFrameInsertionLeadTimeUs =
+        1000000ULL /
+        (static_cast<uint64_t>(m_DecoderParams.frameRate) * 2ULL);
+    m_BlackFrameInsertionForceTearing =
+        m_DecoderParams.enableVrr &&
+        qEnvironmentVariableIntValue(
+            "MOONLIGHT_BFI_FORCE_TEARING") != 0;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Black frame insertion enabled: SDR reference white is rendered at 600 nits with a 50%% duty cycle (%llu us black interval)%s",
+                static_cast<unsigned long long>(
+                    m_BlackFrameInsertionLeadTimeUs),
+                m_DecoderParams.enableVrr ? " using VRR" : "");
+    if (m_DecoderParams.enableVrr && displayRefreshHz > 4 &&
+            requiredRefreshHz > displayRefreshHz - 4) {
+        // Total presents per second should stop below the nominal refresh,
+        // matching the plain-VRR headroom rule (116 FPS on 120 Hz). Above
+        // it, the pacer's ceiling governor evens the books by occasionally
+        // presenting a frame without its black transition.
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "BFI at %d FPS submits %d presents/sec, above the "
+                    "adaptive headroom ceiling of %d/sec; governed black "
+                    "skips will occur. A %d FPS stream gives every frame "
+                    "a full pair.",
+                    m_DecoderParams.frameRate, requiredRefreshHz,
+                    displayRefreshHz - 4, (displayRefreshHz - 4) / 2);
+    }
+    if (m_BlackFrameInsertionForceTearing) {
+        SDL_LogWarn(
+            SDL_LOG_CATEGORY_APPLICATION,
+            "BFI tearing A/B enabled by MOONLIGHT_BFI_FORCE_TEARING: "
+            "black, video, and recovery Presents will use "
+            "DXGI_PRESENT_ALLOW_TEARING");
+    }
+
+    return true;
+}
+
+bool D3D11VARenderer::restoreBlackFrameInsertionVideo()
+{
+    if (m_RenderDeviceContext == nullptr ||
+            m_RenderTargetTexture == nullptr ||
+            m_BlackFrameInsertionVideoTexture == nullptr) {
+        return false;
+    }
+
+    m_RenderDeviceContext->CopyResource(
+        m_RenderTargetTexture.Get(),
+        m_BlackFrameInsertionVideoTexture.Get());
+    return true;
+}
+
+HRESULT D3D11VARenderer::presentBlackFrame(
+    UINT syncInterval, UINT flags)
+{
+    if (m_RenderDeviceContext == nullptr || m_RenderTargetView == nullptr ||
+            m_SwapChain == nullptr) {
+        return E_FAIL;
+    }
+
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    m_RenderDeviceContext->ClearRenderTargetView(m_RenderTargetView.Get(), black);
+    return m_SwapChain->Present(syncInterval, flags);
+}
+
+UINT D3D11VARenderer::bfiVrrPresentFlags(
+    const VrrPresentRequest&) const
+{
+    // Every BFI present participates in the black/boosted luminance cycle. A
+    // torn present splits the screen between two luminance states at the tear
+    // line, which reads as a large dark band, so BFI ignores the controller's
+    // latched/immediate preference and always presents non-tearing. The
+    // MOONLIGHT_BFI_FORCE_TEARING A/B remains the explicit override.
+    return m_BlackFrameInsertionForceTearing ?
+        DXGI_PRESENT_ALLOW_TEARING : 0;
+}
+
+void D3D11VARenderer::populateVrrPresentFeedback(
+    VrrPresentFeedback& feedback, UINT presentFlags)
+{
+    feedback.presentModeValid = true;
+    feedback.tearingAllowed =
+        (presentFlags & DXGI_PRESENT_ALLOW_TEARING) != 0;
+
+    UINT lastPresentCount = 0;
+    if (SUCCEEDED(m_SwapChain->GetLastPresentCount(
+            &lastPresentCount))) {
+        feedback.submissionIdValid = true;
+        feedback.submissionId = lastPresentCount;
+    }
+
+    DXGI_FRAME_STATISTICS frameStats = {};
+    if (SUCCEEDED(m_SwapChain->GetFrameStatistics(&frameStats))) {
+        feedback.latchSampleValid = true;
+        feedback.latchSubmissionId = frameStats.PresentCount;
+        feedback.latchPresentRefreshSequence =
+            frameStats.PresentRefreshCount;
+        feedback.latchRefreshSequence = frameStats.SyncRefreshCount;
+        feedback.latchTimeValid = translateQpcToPacingTime(
+            frameStats.SyncQPCTime, feedback.latchTimeUs);
+    }
+}
+
 IVrrFramePresenter* D3D11VARenderer::getVrrFramePresenter()
 {
     return this;
@@ -1879,8 +2147,212 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
     }
 
     m_VrrFramePrepared = true;
+    m_BlackFrameInsertionBlackPresented = false;
     result.prepared = true;
     return result;
+}
+
+uint64_t D3D11VARenderer::prePresentLeadTimeUs() const
+{
+    return m_BlackFrameInsertionActive ?
+        m_BlackFrameInsertionLeadTimeUs : 0;
+}
+
+VrrPresentFeedback D3D11VARenderer::presentPreFrame(
+    const VrrPresentRequest& request)
+{
+    VrrPresentFeedback feedback;
+    if (!m_VrrFramePrepared || m_VrrSuspended ||
+            !m_BlackFrameInsertionActive) {
+        feedback.cancelled = true;
+        return feedback;
+    }
+
+    const UINT presentFlags = bfiVrrPresentFlags(request);
+    const uint64_t submissionTimeUs = LiGetMicroseconds();
+    const HRESULT hr = presentBlackFrame(0, presentFlags);
+    if (hr != S_OK || !restoreBlackFrameInsertionVideo()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR BFI black transition failed: %x", hr);
+        releasePreparedVrrFrame();
+        queueRenderDeviceReset();
+        feedback.cancelled = true;
+        return feedback;
+    }
+
+    m_BlackFrameInsertionBlackPresented = true;
+    feedback.presented = true;
+    feedback.submissionTimeValid = true;
+    feedback.submissionTimeUs = submissionTimeUs;
+    populateVrrPresentFeedback(feedback, presentFlags);
+    return feedback;
+}
+
+VrrPresentFeedback D3D11VARenderer::presentIdleFrameRecovery(
+    const VrrPresentRequest& request)
+{
+    VrrPresentFeedback feedback;
+    if (!m_BlackFrameInsertionActive || m_VrrSuspended ||
+            m_VrrFramePrepared || m_VrrContextLocked) {
+        return feedback;
+    }
+
+    // No source frame is prepared while the worker waits, so serialize this
+    // small cached-image pass explicitly against FFmpeg and window changes.
+    lockContext(this);
+    if (!m_BlackFrameInsertionActive || m_VrrSuspended ||
+            m_RenderDeviceContext == nullptr ||
+            m_RenderTargetView == nullptr ||
+            m_BlackFrameInsertionVideoTextureSrv == nullptr ||
+            m_BlackFrameInsertionFullscreenVertexBuffer == nullptr ||
+            m_BlackFrameInsertionDimPixelShader == nullptr ||
+            m_SwapChain == nullptr) {
+        unlockContext(this);
+        return feedback;
+    }
+
+    m_RenderDeviceContext->OMSetRenderTargets(
+        1, m_RenderTargetView.GetAddressOf(), nullptr);
+
+    UINT stride = sizeof(VERTEX);
+    UINT offset = 0;
+    ID3D11Buffer* fullscreenVertexBuffer =
+        m_BlackFrameInsertionFullscreenVertexBuffer.Get();
+    m_RenderDeviceContext->IASetVertexBuffers(
+        0, 1, &fullscreenVertexBuffer, &stride, &offset);
+    m_RenderDeviceContext->PSSetShader(
+        m_BlackFrameInsertionDimPixelShader.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* cachedVideoSrv =
+        m_BlackFrameInsertionVideoTextureSrv.Get();
+    m_RenderDeviceContext->PSSetShaderResources(
+        0, 1, &cachedVideoSrv);
+    m_RenderDeviceContext->OMSetBlendState(
+        m_VideoBlendState.Get(), nullptr, 0xffffffff);
+    m_RenderDeviceContext->DrawIndexed(6, 0, 0);
+
+    // The next decoded frame copies the back buffer into this cache. Unbind it
+    // now so that CopyResource never sees the destination still bound as an
+    // input resource.
+    ID3D11ShaderResourceView* nullSrv = nullptr;
+    m_RenderDeviceContext->PSSetShaderResources(0, 1, &nullSrv);
+
+    const UINT presentFlags = bfiVrrPresentFlags(request);
+    const uint64_t submissionTimeUs = LiGetMicroseconds();
+    const HRESULT hr = presentPreparedFrame(presentFlags);
+    unlockContext(this);
+
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR BFI idle brightness recovery failed: %x",
+                     hr);
+        queueRenderDeviceReset();
+        feedback.cancelled = true;
+        return feedback;
+    }
+    if (hr != S_OK) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR BFI idle brightness recovery returned non-display status: %x",
+                    hr);
+        feedback.cancelled = true;
+        return feedback;
+    }
+
+    feedback.presented = true;
+    feedback.submissionTimeValid = true;
+    feedback.submissionTimeUs = submissionTimeUs;
+    populateVrrPresentFeedback(feedback, presentFlags);
+    return feedback;
+}
+
+VrrPresentFeedback D3D11VARenderer::presentPairRepeatBlack(
+    const VrrPresentRequest& request)
+{
+    VrrPresentFeedback feedback;
+    if (!m_BlackFrameInsertionActive || m_VrrSuspended ||
+            m_VrrFramePrepared || m_VrrContextLocked) {
+        return feedback;
+    }
+
+    // No source frame is prepared; serialize this cached-image pass
+    // explicitly against FFmpeg and window changes.
+    lockContext(this);
+    if (!m_BlackFrameInsertionActive || m_VrrSuspended ||
+            m_RenderDeviceContext == nullptr ||
+            m_RenderTargetView == nullptr ||
+            m_RenderTargetTexture == nullptr ||
+            m_BlackFrameInsertionVideoTexture == nullptr ||
+            m_SwapChain == nullptr) {
+        unlockContext(this);
+        return feedback;
+    }
+
+    const UINT presentFlags = bfiVrrPresentFlags(request);
+    const uint64_t submissionTimeUs = LiGetMicroseconds();
+    const HRESULT hr = presentBlackFrame(0, presentFlags);
+    const bool restored = hr == S_OK && restoreBlackFrameInsertionVideo();
+    unlockContext(this);
+
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR BFI pair-repeat black failed: %x", hr);
+        queueRenderDeviceReset();
+        feedback.cancelled = true;
+        return feedback;
+    }
+    if (hr != S_OK || !restored) {
+        feedback.cancelled = true;
+        return feedback;
+    }
+
+    feedback.presented = true;
+    feedback.submissionTimeValid = true;
+    feedback.submissionTimeUs = submissionTimeUs;
+    populateVrrPresentFeedback(feedback, presentFlags);
+    return feedback;
+}
+
+VrrPresentFeedback D3D11VARenderer::presentPairRepeatVideo(
+    const VrrPresentRequest& request)
+{
+    VrrPresentFeedback feedback;
+    if (!m_BlackFrameInsertionActive || m_VrrSuspended ||
+            m_VrrFramePrepared || m_VrrContextLocked) {
+        return feedback;
+    }
+
+    lockContext(this);
+    if (!m_BlackFrameInsertionActive || m_VrrSuspended ||
+            m_RenderDeviceContext == nullptr ||
+            m_RenderTargetTexture == nullptr ||
+            m_BlackFrameInsertionVideoTexture == nullptr ||
+            m_SwapChain == nullptr ||
+            !restoreBlackFrameInsertionVideo()) {
+        unlockContext(this);
+        return feedback;
+    }
+
+    const UINT presentFlags = bfiVrrPresentFlags(request);
+    const uint64_t submissionTimeUs = LiGetMicroseconds();
+    const HRESULT hr = presentPreparedFrame(presentFlags);
+    unlockContext(this);
+
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR BFI pair-repeat video failed: %x", hr);
+        queueRenderDeviceReset();
+        feedback.cancelled = true;
+        return feedback;
+    }
+    if (hr != S_OK) {
+        feedback.cancelled = true;
+        return feedback;
+    }
+
+    feedback.presented = true;
+    feedback.submissionTimeValid = true;
+    feedback.submissionTimeUs = submissionTimeUs;
+    populateVrrPresentFeedback(feedback, presentFlags);
+    return feedback;
 }
 
 VrrPresentFeedback D3D11VARenderer::presentAdaptive(
@@ -1891,12 +2363,21 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
     if (!m_VrrFramePrepared || m_VrrSuspended) {
         return cancelFrame();
     }
+    if (m_BlackFrameInsertionActive &&
+            !m_BlackFrameInsertionDropRecovery &&
+            !m_BlackFrameInsertionBlackPresented) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR BFI video present had no black transition");
+        return cancelFrame();
+    }
 
     // A latched near-refresh request omits ALLOW_TEARING, selecting DXGI's
     // non-tearing path. The flag is a per-present choice on this swapchain,
     // so no swapchain recreation is involved.
-    const UINT presentFlags = request.latchedPresentation ?
-        0 : DXGI_PRESENT_ALLOW_TEARING;
+    const UINT presentFlags = m_BlackFrameInsertionActive ?
+        bfiVrrPresentFlags(request) :
+        (request.latchedPresentation ?
+            0 : DXGI_PRESENT_ALLOW_TEARING);
 
     // The worker anchors its display-spacing floor at this instant rather
     // than at its own call boundary, so capture it immediately before Present.
@@ -1926,7 +2407,9 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
     feedback.presented = true;
     feedback.submissionTimeValid = true;
     feedback.submissionTimeUs = submissionTimeUs;
-
+    if (m_BlackFrameInsertionActive) {
+        populateVrrPresentFeedback(feedback, presentFlags);
+    }
     releasePreparedVrrFrame();
     return feedback;
 }
@@ -1934,6 +2417,31 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
 VrrPresentFeedback D3D11VARenderer::cancelFrame()
 {
     VrrPresentFeedback feedback;
+
+    // Once the black transition has reached DXGI, abandoning the prepared
+    // frame without another Present can leave black on screen until the next
+    // decoded frame. End an interrupted pair on the cached lit image. A
+    // minimized window is not visible and may only return OCCLUDED, so defer
+    // to normal restore/recreation in that state.
+    if (m_VrrFramePrepared && m_BlackFrameInsertionBlackPresented &&
+            !m_VrrSuspended) {
+        const UINT presentFlags = m_VrrSwapChainAllowsTearing ?
+            DXGI_PRESENT_ALLOW_TEARING : 0;
+        const uint64_t submissionTimeUs = LiGetMicroseconds();
+        const HRESULT hr = presentPreparedFrame(presentFlags);
+        if (hr == S_OK) {
+            feedback.presented = true;
+            feedback.submissionTimeValid = true;
+            feedback.submissionTimeUs = submissionTimeUs;
+            populateVrrPresentFeedback(feedback, presentFlags);
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "D3D11 VRR BFI could not restore video while cancelling a black transition: %x",
+                        hr);
+        }
+    }
+
     releasePreparedVrrFrame();
     feedback.cancelled = true;
     return feedback;
@@ -1948,6 +2456,11 @@ bool D3D11VARenderer::restoreFixedPresentation(VrrFallbackReason reason)
     cancelFrame();
     m_VrrSuspended = false;
     m_DecoderParams.enableVrr = false;
+    m_BlackFrameInsertionDropRecovery = false;
+    m_BlackFrameInsertionActive = false;
+    if (!initializeBlackFrameInsertion()) {
+        return false;
+    }
     m_VrrFallbackReason = reason == VrrFallbackReason::NoFallback ?
         VrrFallbackReason::InitializationFailed : reason;
     return true;
@@ -2003,6 +2516,29 @@ bool D3D11VARenderer::setupRenderingResources()
                          hr);
             return false;
         }
+
+        QByteArray bfiOverlayPixelShaderBytecode = Path::readDataFile("d3d11_overlay_bfi_pixel.fxc");
+        hr = m_RenderDevice->CreatePixelShader(bfiOverlayPixelShaderBytecode.constData(), bfiOverlayPixelShaderBytecode.length(), nullptr, &m_BfiOverlayPixelShader);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "ID3D11Device::CreatePixelShader() failed: %x",
+                         hr);
+            return false;
+        }
+
+        QByteArray bfiDimPixelShaderBytecode =
+            Path::readDataFile("d3d11_bfi_dim_pixel.fxc");
+        hr = m_RenderDevice->CreatePixelShader(
+            bfiDimPixelShaderBytecode.constData(),
+            bfiDimPixelShaderBytecode.length(), nullptr,
+            &m_BlackFrameInsertionDimPixelShader);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Unable to create BFI idle-dimming pixel shader: %x",
+                         hr);
+            return false;
+        }
+
     }
 
     for (int i = 0; i < PixelShaders::_COUNT; i++)
@@ -2072,6 +2608,66 @@ bool D3D11VARenderer::setupRenderingResources()
         }
     }
 
+    // BFI brightness is selected without changing shaders or adding a pass.
+    {
+        const VERTEX fullscreenVertices[] =
+        {
+            {-1.0f, -1.0f, 0.0f, 1.0f},
+            {-1.0f,  1.0f, 0.0f, 0.0f},
+            { 1.0f, -1.0f, 1.0f, 1.0f},
+            { 1.0f,  1.0f, 1.0f, 0.0f},
+        };
+        D3D11_BUFFER_DESC vertexBufferDesc = {};
+        vertexBufferDesc.ByteWidth = sizeof(fullscreenVertices);
+        vertexBufferDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        vertexBufferDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        vertexBufferDesc.StructureByteStride = sizeof(VERTEX);
+        D3D11_SUBRESOURCE_DATA vertexBufferData = {};
+        vertexBufferData.pSysMem = fullscreenVertices;
+        hr = m_RenderDevice->CreateBuffer(
+            &vertexBufferDesc, &vertexBufferData,
+            &m_BlackFrameInsertionFullscreenVertexBuffer);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Unable to create BFI fullscreen vertex buffer: %x",
+                         hr);
+            return false;
+        }
+
+        D3D11_BUFFER_DESC constantBufferDesc = {};
+        constantBufferDesc.ByteWidth = sizeof(BFI_CONST_BUF);
+        constantBufferDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        constantBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+        BFI_CONST_BUF brightConstants = {};
+        brightConstants.referenceWhiteNits = 600.0f;
+        D3D11_SUBRESOURCE_DATA brightData = {};
+        brightData.pSysMem = &brightConstants;
+        hr = m_RenderDevice->CreateBuffer(
+            &constantBufferDesc, &brightData,
+            &m_BlackFrameInsertionBrightConstants);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Unable to create BFI brightness constants: %x",
+                         hr);
+            return false;
+        }
+
+        BFI_CONST_BUF recoveryConstants = {};
+        recoveryConstants.referenceWhiteNits = 300.0f;
+        D3D11_SUBRESOURCE_DATA recoveryData = {};
+        recoveryData.pSysMem = &recoveryConstants;
+        hr = m_RenderDevice->CreateBuffer(
+            &constantBufferDesc, &recoveryData,
+            &m_BlackFrameInsertionRecoveryConstants);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Unable to create BFI recovery constants: %x",
+                         hr);
+            return false;
+        }
+    }
+
     // Create our overlay blend state
     {
         D3D11_BLEND_DESC blendDesc = {};
@@ -2128,8 +2724,8 @@ bool D3D11VARenderer::setupSwapchainDependentResources()
 
     // Create our render target view
     {
-        ComPtr<ID3D11Resource> backBufferResource;
-        hr = m_SwapChain->GetBuffer(0, IID_PPV_ARGS(&backBufferResource));
+        hr = m_SwapChain->GetBuffer(
+            0, IID_PPV_ARGS(&m_RenderTargetTexture));
         if (FAILED(hr)) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                          "IDXGISwapChain::GetBuffer() failed: %x",
@@ -2137,12 +2733,41 @@ bool D3D11VARenderer::setupSwapchainDependentResources()
             return false;
         }
 
-        hr = m_RenderDevice->CreateRenderTargetView(backBufferResource.Get(), nullptr, &m_RenderTargetView);
+        hr = m_RenderDevice->CreateRenderTargetView(
+            m_RenderTargetTexture.Get(), nullptr, &m_RenderTargetView);
         if (FAILED(hr)) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                          "ID3D11Device::CreateRenderTargetView() failed: %x",
                          hr);
             return false;
+        }
+
+        if (m_BlackFrameInsertionActive) {
+            D3D11_TEXTURE2D_DESC textureDesc = {};
+            m_RenderTargetTexture->GetDesc(&textureDesc);
+            textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            textureDesc.CPUAccessFlags = 0;
+            textureDesc.MiscFlags = 0;
+            textureDesc.Usage = D3D11_USAGE_DEFAULT;
+            hr = m_RenderDevice->CreateTexture2D(
+                &textureDesc, nullptr,
+                &m_BlackFrameInsertionVideoTexture);
+            if (FAILED(hr)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "Unable to create BFI video cache texture: %x",
+                             hr);
+                return false;
+            }
+
+            hr = m_RenderDevice->CreateShaderResourceView(
+                m_BlackFrameInsertionVideoTexture.Get(), nullptr,
+                &m_BlackFrameInsertionVideoTextureSrv);
+            if (FAILED(hr)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "Unable to create BFI video cache view: %x",
+                             hr);
+                return false;
+            }
         }
     }
 

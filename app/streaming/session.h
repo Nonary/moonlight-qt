@@ -191,7 +191,8 @@ private:
                        int frameRate, bool enableVsync, bool enableFramePacing,
                        bool testOnly, IVideoDecoder*& chosenDecoder,
                        bool enableVrr = false, int vrrDisplayRefreshHz = 0,
-                       bool* effectiveVrr = nullptr);
+                       bool* effectiveVrr = nullptr,
+                       bool enableBlackFrameInsertion = false);
 
     static
     void clStageStarting(int stage);

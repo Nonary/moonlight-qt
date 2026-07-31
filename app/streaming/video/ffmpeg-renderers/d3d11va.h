@@ -27,6 +27,17 @@ public:
     virtual bool canLatchAdaptivePresent() const override { return true; }
     virtual VrrFallbackReason checkSupport() const override;
     virtual VrrPrepareResult prepareFrame(AVFrame* frame) override;
+    virtual uint64_t prePresentLeadTimeUs() const override;
+    virtual VrrPresentFeedback presentPreFrame(
+        const VrrPresentRequest& request) override;
+    virtual void setFrameDropRecovery(bool enabled) override
+        { m_BlackFrameInsertionDropRecovery = enabled; }
+    virtual VrrPresentFeedback presentIdleFrameRecovery(
+        const VrrPresentRequest& request) override;
+    virtual VrrPresentFeedback presentPairRepeatBlack(
+        const VrrPresentRequest& request) override;
+    virtual VrrPresentFeedback presentPairRepeatVideo(
+        const VrrPresentRequest& request) override;
     virtual VrrPresentFeedback presentAdaptive(
         const VrrPresentRequest& request) override;
     virtual VrrPresentFeedback cancelFrame() override;
@@ -43,6 +54,9 @@ public:
         GENERIC_YUV_420,
         GENERIC_AYUV,
         GENERIC_Y410,
+        BFI_YUV_420,
+        BFI_AYUV,
+        BFI_Y410,
         _COUNT
     };
 
@@ -57,6 +71,12 @@ private:
     bool setupVideoTexture(AVHWFramesContext* framesContext); // for !m_BindDecoderOutputTextures
     bool setupTexturePoolViews(AVHWFramesContext* framesContext); // for m_BindDecoderOutputTextures
     bool prepareFrameForPresent(AVFrame* frame);
+    bool initializeBlackFrameInsertion();
+    bool restoreBlackFrameInsertionVideo();
+    HRESULT presentBlackFrame(UINT syncInterval, UINT flags);
+    UINT bfiVrrPresentFlags(const VrrPresentRequest& request) const;
+    void populateVrrPresentFeedback(VrrPresentFeedback& feedback,
+                                    UINT presentFlags);
     bool initializeVrrPresentReadyFence();
     bool waitForVrrPresentReady();
     HRESULT presentPreparedFrame(UINT flags);
@@ -99,7 +119,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D11DeviceContext4> m_RenderDeviceContext, m_DecodeDeviceContext;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_RenderSharedTextureArray;
     Microsoft::WRL::ComPtr<IDXGISwapChain4> m_SwapChain;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_RenderTargetTexture;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_RenderTargetView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_BlackFrameInsertionVideoTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_BlackFrameInsertionVideoTextureSrv;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_VideoBlendState;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_OverlayBlendState;
 
@@ -118,6 +141,11 @@ private:
     AVColorTransferCharacteristic m_LastColorTrc;
 
     bool m_AllowTearing;
+    bool m_BlackFrameInsertionActive;
+    bool m_BlackFrameInsertionBlackPresented;
+    bool m_BlackFrameInsertionDropRecovery;
+    bool m_BlackFrameInsertionForceTearing;
+    uint64_t m_BlackFrameInsertionLeadTimeUs;
     bool m_VrrBorderlessFlipModel;
     bool m_VrrSwapChainAllowsTearing;
     bool m_VrrSuspended;
@@ -131,6 +159,10 @@ private:
 
     std::array<Microsoft::WRL::ComPtr<ID3D11PixelShader>, PixelShaders::_COUNT> m_VideoPixelShaders;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_VideoVertexBuffer;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_BlackFrameInsertionFullscreenVertexBuffer;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_BlackFrameInsertionBrightConstants;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_BlackFrameInsertionRecoveryConstants;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_BlackFrameInsertionDimPixelShader;
 
     // Only valid if !m_BindDecoderOutputTextures
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_VideoTexture;
@@ -143,6 +175,7 @@ private:
     std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, Overlay::OverlayMax> m_OverlayTextures;
     std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>, Overlay::OverlayMax> m_OverlayTextureResourceViews;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_OverlayPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_BfiOverlayPixelShader;
 
     AVBufferRef* m_HwDeviceContext;
 };

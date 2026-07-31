@@ -13,7 +13,7 @@
 class VrrPacingWorker;
 
 // The maximum number of frames pacer will ever hold is:
-// - 3 frames in the pacing queue
+// - 3 frames total across the pacing and render queues
 // - 1 frame removed from the render queue in the process of rendering
 // - 1 frame for deferred free
 #define PACER_MAX_OUTSTANDING_FRAMES (3 + 1 + 1)
@@ -68,7 +68,9 @@ private:
 
     void renderFrame(AVFrame* frame);
 
-    void dropFrameForEnqueue(QQueue<AVFrame*>& queue);
+    // Called with m_FrameQueueLock held. The returned frame is detached from
+    // the queues and must be freed after releasing the lock.
+    AVFrame* dropFrameForEnqueue();
 
     QQueue<AVFrame*> m_RenderQueue;
     QQueue<AVFrame*> m_PacingQueue;

@@ -37,10 +37,14 @@ public:
     void notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info);
 
 private:
+    struct Diagnostics;
+
     static int threadProc(void* context);
 
     int run();
-    bool dequeueFrame(PacedFrame& frame);
+    bool dequeueFrame(PacedFrame& frame,
+                      uint64_t idleRecoveryDeadlineUs,
+                      bool& idleRecoveryDue);
     bool hasQueuedFrame();
     void discardQueuedFrames(bool countDrops);
     uint32_t consumeWindowStateNotifications();
@@ -50,11 +54,17 @@ private:
     void recordSubmission(const VrrPresentFeedback& feedback,
                           uint64_t operationStartUs,
                           uint64_t operationEndUs);
+    void observeGridSample(const VrrPresentFeedback& feedback);
+    bool gridSlotAtOrAfter(uint64_t timeUs,
+                           uint64_t& slotTimeUs,
+                           uint64_t& slotSeq);
+    void resetGrid();
 
     IVrrFramePresenter* m_Presenter;
     PVIDEO_STATS m_VideoStats;
 
     std::unique_ptr<VrrTimingController> m_TimingController;
+    std::unique_ptr<Diagnostics> m_Diagnostics;
     VrrTargetWaiter m_TargetWaiter;
 
     QMutex m_FrameQueueLock;
@@ -69,4 +79,36 @@ private:
     std::atomic_uint32_t m_PendingWindowStateFlags { 0 };
     bool m_PresenterSuspended = false;
     bool m_RebaseOnNextFrame = false;
+    bool m_BfiBrightFrameHeld = false;
+    bool m_BfiRecoveryActive = false;
+    unsigned int m_BfiRecoveryFrames = 0;
+    uint64_t m_BfiRecoveryStartUs = 0;
+    uint64_t m_LastBfiBrightSubmissionUs = 0;
+
+    // Display-refresh grid model learned from exact DXGI latch feedback.
+    // Grid-locked BFI snaps pair submissions into refresh slots so
+    // source/display clock drift is absorbed as explicit pair repeats
+    // instead of uncontrolled single-refresh black or bright repeats.
+    bool m_BfiGridValid = false;
+    uint64_t m_BfiGridAnchorUs = 0;
+    uint64_t m_BfiGridAnchorSeq = 0;
+    uint64_t m_BfiGridPeriodQ16 = 0;
+    uint64_t m_BfiGridLastSampleUs = 0;
+    bool m_BfiHaveLastVideoSlot = false;
+    uint64_t m_BfiLastVideoSlotSeq = 0;
+
+    // Grid-locked scheduling assumes a fixed refresh grid, which is wrong on
+    // a display whose VRR genuinely follows our presents. Opt-in only.
+    bool m_BfiGridLockEnabled = false;
+
+    // A pair costs two refreshes of the panel's true minimum period. When
+    // that exceeds the source period (stream rate * 2 above the real VRR
+    // ceiling), the overdraft accumulates here and is repaid by presenting
+    // one frame without its black transition at normal luminance.
+    uint64_t m_BfiCeilingDebtQ16 = 0;
+
+    // The same adaptive-refresh headroom rule the plain VRR path uses:
+    // total presents per second stop a few Hz below the nominal refresh
+    // (116/s on a 120 Hz panel), never scale up to the nominal ceiling.
+    uint64_t m_BfiSafePresentPeriodQ16 = 0;
 };
