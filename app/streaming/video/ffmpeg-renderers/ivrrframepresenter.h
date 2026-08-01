@@ -128,17 +128,25 @@ public:
         return {};
     }
 
+    // BFI can begin its black phase on schedule before the next decoded frame
+    // is ready. The backend must preserve its cached lit image so preparation
+    // can either replace it with the new frame or cancellation can restore it.
+    virtual VrrPresentFeedback presentIdlePreFrame(
+        const VrrPresentRequest&)
+    {
+        return {};
+    }
+
     // A confirmed source gap can request a normal-luminance recovery frame
     // instead of another boosted frame/black pair.
     virtual void setFrameDropRecovery(bool)
     {
     }
 
-    // BFI normally leaves the boosted video image visible while the worker
-    // waits for the next decoded frame. If that frame does not arrive by the
-    // next black-transition deadline, replace the cached boosted image with a
-    // normal-luminance copy so a source/network stall cannot become a bright
-    // flash. This is an auxiliary display transition with no prepared frame.
+    // If a decoded frame still has not arrived by the end of an idle-started
+    // black phase, replace it with a normal-luminance cached image so a true
+    // source/network stall cannot leave black on screen. This is an auxiliary
+    // display transition with no prepared frame.
     virtual VrrPresentFeedback presentIdleFrameRecovery(
         const VrrPresentRequest&)
     {

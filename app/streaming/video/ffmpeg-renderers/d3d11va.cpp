@@ -1720,7 +1720,8 @@ VrrFallbackReason D3D11VARenderer::evaluateVrrEligibility()
     return VrrFallbackReason::NoFallback;
 }
 
-void D3D11VARenderer::releasePreparedVrrFrame()
+void D3D11VARenderer::releasePreparedVrrFrame(
+    bool preserveBlackTransition)
 {
     // Present() unbinds the render target itself.  A cancellation does not,
     // so explicitly remove the context's reference to the back buffer before
@@ -1731,7 +1732,9 @@ void D3D11VARenderer::releasePreparedVrrFrame()
     }
 
     m_VrrFramePrepared = false;
-    m_BlackFrameInsertionBlackPresented = false;
+    if (!preserveBlackTransition) {
+        m_BlackFrameInsertionBlackPresented = false;
+    }
 
     if (m_VrrContextLocked) {
         unlockContext(this);
@@ -2109,19 +2112,22 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
     // Check eligibility only after taking it so a UI callback cannot replace
     // swapchain state concurrently.
     if (checkSupport() != VrrFallbackReason::NoFallback) {
-        releasePreparedVrrFrame();
+        releasePreparedVrrFrame(
+            m_BlackFrameInsertionBlackPresented);
         return result;
     }
 
     if (!prepareFrameForPresent(frame)) {
-        releasePreparedVrrFrame();
+        releasePreparedVrrFrame(
+            m_BlackFrameInsertionBlackPresented);
         return result;
     }
 
     if (!waitForVrrPresentReady()) {
         m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
         result.feedback.cancelled = true;
-        releasePreparedVrrFrame();
+        releasePreparedVrrFrame(
+            m_BlackFrameInsertionBlackPresented);
         queueRenderDeviceReset();
         return result;
     }
@@ -2131,7 +2137,8 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
     // prepared for the worker's target wait.
     if (m_VrrSuspended || checkSupport() != VrrFallbackReason::NoFallback) {
         result.feedback.cancelled = true;
-        releasePreparedVrrFrame();
+        releasePreparedVrrFrame(
+            m_BlackFrameInsertionBlackPresented);
         return result;
     }
 
@@ -2141,13 +2148,13 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
                      "D3D11 VRR preparation detected device loss: %x",
                      deviceReason);
         result.feedback.cancelled = true;
-        releasePreparedVrrFrame();
+        releasePreparedVrrFrame(
+            m_BlackFrameInsertionBlackPresented);
         queueRenderDeviceReset();
         return result;
     }
 
     m_VrrFramePrepared = true;
-    m_BlackFrameInsertionBlackPresented = false;
     result.prepared = true;
     return result;
 }
@@ -2181,6 +2188,60 @@ VrrPresentFeedback D3D11VARenderer::presentPreFrame(
     }
 
     m_BlackFrameInsertionBlackPresented = true;
+    feedback.presented = true;
+    feedback.submissionTimeValid = true;
+    feedback.submissionTimeUs = submissionTimeUs;
+    populateVrrPresentFeedback(feedback, presentFlags);
+    return feedback;
+}
+
+VrrPresentFeedback D3D11VARenderer::presentIdlePreFrame(
+    const VrrPresentRequest& request)
+{
+    VrrPresentFeedback feedback;
+    if (!m_BlackFrameInsertionActive || m_VrrSuspended ||
+            m_VrrFramePrepared || m_VrrContextLocked ||
+            m_BlackFrameInsertionBlackPresented) {
+        feedback.cancelled = true;
+        return feedback;
+    }
+
+    // Begin the black phase without waiting for preparation of the next source
+    // frame. Keep the cached lit image in the new back buffer so a later
+    // preparation failure or interruption can restore it immediately.
+    lockContext(this);
+    if (!m_BlackFrameInsertionActive || m_VrrSuspended ||
+            m_RenderDeviceContext == nullptr ||
+            m_RenderTargetView == nullptr ||
+            m_RenderTargetTexture == nullptr ||
+            m_BlackFrameInsertionVideoTexture == nullptr ||
+            m_SwapChain == nullptr) {
+        unlockContext(this);
+        feedback.cancelled = true;
+        return feedback;
+    }
+
+    const UINT presentFlags = bfiVrrPresentFlags(request);
+    const uint64_t submissionTimeUs = LiGetMicroseconds();
+    const HRESULT hr = presentBlackFrame(0, presentFlags);
+    const bool restored = hr == S_OK && restoreBlackFrameInsertionVideo();
+    if (restored) {
+        m_BlackFrameInsertionBlackPresented = true;
+    }
+    unlockContext(this);
+
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR BFI idle black transition failed: %x", hr);
+        queueRenderDeviceReset();
+        feedback.cancelled = true;
+        return feedback;
+    }
+    if (hr != S_OK || !restored) {
+        feedback.cancelled = true;
+        return feedback;
+    }
+
     feedback.presented = true;
     feedback.submissionTimeValid = true;
     feedback.submissionTimeUs = submissionTimeUs;
@@ -2260,6 +2321,9 @@ VrrPresentFeedback D3D11VARenderer::presentIdleFrameRecovery(
     feedback.presented = true;
     feedback.submissionTimeValid = true;
     feedback.submissionTimeUs = submissionTimeUs;
+    // This normal-luminance image completes an idle-started black phase when
+    // no decoded successor arrived before its video deadline.
+    m_BlackFrameInsertionBlackPresented = false;
     populateVrrPresentFeedback(feedback, presentFlags);
     return feedback;
 }
@@ -2423,12 +2487,26 @@ VrrPresentFeedback D3D11VARenderer::cancelFrame()
     // decoded frame. End an interrupted pair on the cached lit image. A
     // minimized window is not visible and may only return OCCLUDED, so defer
     // to normal restore/recreation in that state.
-    if (m_VrrFramePrepared && m_BlackFrameInsertionBlackPresented &&
-            !m_VrrSuspended) {
-        const UINT presentFlags = m_VrrSwapChainAllowsTearing ?
-            DXGI_PRESENT_ALLOW_TEARING : 0;
+    if (m_BlackFrameInsertionBlackPresented && !m_VrrSuspended) {
+        // An idle-started black transition can be pending before preparation
+        // acquires the retained renderer lock. Serialize the cached-image
+        // restore explicitly in that case.
+        if (!m_VrrContextLocked) {
+            lockContext(this);
+            m_VrrContextLocked = true;
+        }
+
+        // A cancellation restore is still one half of a BFI luminance
+        // transition. Keep it on the same non-tearing path as ordinary black,
+        // video, and recovery presents so an interruption cannot introduce a
+        // full-width bright/dark tear band. The explicit tearing A/B remains
+        // available through bfiVrrPresentFlags().
+        const UINT presentFlags =
+            bfiVrrPresentFlags(VrrPresentRequest {});
+        const bool restored = restoreBlackFrameInsertionVideo();
         const uint64_t submissionTimeUs = LiGetMicroseconds();
-        const HRESULT hr = presentPreparedFrame(presentFlags);
+        const HRESULT hr = restored ?
+            presentPreparedFrame(presentFlags) : E_FAIL;
         if (hr == S_OK) {
             feedback.presented = true;
             feedback.submissionTimeValid = true;

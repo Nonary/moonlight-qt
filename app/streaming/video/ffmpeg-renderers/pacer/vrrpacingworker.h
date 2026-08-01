@@ -43,8 +43,8 @@ private:
 
     int run();
     bool dequeueFrame(PacedFrame& frame,
-                      uint64_t idleRecoveryDeadlineUs,
-                      bool& idleRecoveryDue);
+                      uint64_t idleTransitionDeadlineUs,
+                      bool& idleTransitionDue);
     bool hasQueuedFrame();
     void discardQueuedFrames(bool countDrops);
     uint32_t consumeWindowStateNotifications();
@@ -80,10 +80,9 @@ private:
     bool m_PresenterSuspended = false;
     bool m_RebaseOnNextFrame = false;
     bool m_BfiBrightFrameHeld = false;
-    bool m_BfiRecoveryActive = false;
-    unsigned int m_BfiRecoveryFrames = 0;
-    uint64_t m_BfiRecoveryStartUs = 0;
     uint64_t m_LastBfiBrightSubmissionUs = 0;
+    bool m_BfiIdleBlackPending = false;
+    uint64_t m_BfiIdleBlackSubmissionUs = 0;
 
     // Display-refresh grid model learned from exact DXGI latch feedback.
     // Grid-locked BFI snaps pair submissions into refresh slots so

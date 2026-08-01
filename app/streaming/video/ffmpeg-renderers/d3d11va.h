@@ -30,6 +30,8 @@ public:
     virtual uint64_t prePresentLeadTimeUs() const override;
     virtual VrrPresentFeedback presentPreFrame(
         const VrrPresentRequest& request) override;
+    virtual VrrPresentFeedback presentIdlePreFrame(
+        const VrrPresentRequest& request) override;
     virtual void setFrameDropRecovery(bool enabled) override
         { m_BlackFrameInsertionDropRecovery = enabled; }
     virtual VrrPresentFeedback presentIdleFrameRecovery(
@@ -83,7 +85,7 @@ private:
     void initializeVrrPresentationState(DXGI_SWAP_CHAIN_DESC1* swapChainDesc);
     void refreshVrrDisplayState();
     VrrFallbackReason evaluateVrrEligibility();
-    void releasePreparedVrrFrame();
+    void releasePreparedVrrFrame(bool preserveBlackTransition = false);
     void queueRenderDeviceReset();
     void renderOverlay(Overlay::OverlayType type);
     bool createOverlayVertexBuffer(Overlay::OverlayType type, int width, int height, Microsoft::WRL::ComPtr<ID3D11Buffer>& newVertexBuffer);

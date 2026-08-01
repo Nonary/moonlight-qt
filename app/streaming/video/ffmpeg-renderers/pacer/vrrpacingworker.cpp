@@ -17,14 +17,6 @@ namespace {
 // an unbounded latency backlog.
 constexpr size_t kMaximumQueuedFrames = 3;
 
-// After an interrupted BFI pair, keep a run of complete source frames at
-// normal luminance before resuming the black/boosted cadence. Three frames
-// proved short enough that marginal-fps play toggled regimes more than once
-// per second, which itself reads as brightness flicker; 12 frames (200 ms at
-// 60 FPS) bounds the toggle rate while the 50%-duty pair stretch keeps the
-// average luminance of both regimes identical across the transition.
-constexpr unsigned int kBfiRecoveryFrameCount = 12;
-
 constexpr uint64_t kBfiDiagnosticSummaryIntervalUs = 30ULL * 1000 * 1000;
 constexpr uint64_t kBfiDiagnosticWarningCooldownUs = 60ULL * 1000 * 1000;
 
@@ -96,8 +88,8 @@ uint64_t saturatingAdd(uint64_t left, uint64_t right)
 enum class BfiDiagnosticWarning : size_t {
     QueueEviction,
     SourceGapRecovery,
+    IdleBlack,
     IdleRecovery,
-    RecoveryComplete,
     PrePresentFailure,
     PairTiming,
     VideoPresentFailure,
@@ -177,6 +169,9 @@ struct BfiIntervalDiagnostics {
     uint64_t prePresentFailures = 0;
     uint64_t videoPresentFailures = 0;
     uint64_t sourceGaps = 0;
+    uint64_t idleBlackAttempts = 0;
+    uint64_t idleBlackSuccesses = 0;
+    uint64_t idleBlackFailures = 0;
     uint64_t idleRecoveryAttempts = 0;
     uint64_t idleRecoverySuccesses = 0;
     uint64_t idleRecoveryFailures = 0;
@@ -536,8 +531,9 @@ struct VrrPacingWorker::Diagnostics {
         SDL_LogInfo(
             SDL_LOG_CATEGORY_APPLICATION,
             "VRR-BFI %s: window=%llums frames=%llu pairs=%llu/%llu "
-            "recovery={gaps:%llu idle:%llu/%llu fail:%llu frames:%llu "
-            "complete:%llu} drops={queue:%llu discard:%llu stale_queue:%llu "
+            "recovery={gaps:%llu idle_black:%llu/%llu fail:%llu "
+            "idle_dim:%llu/%llu fail:%llu frames:%llu complete:%llu} "
+            "drops={queue:%llu discard:%llu stale_queue:%llu "
             "stale_render:%llu} queue_max=%llu failures={pre:%llu video:%llu "
             "cancel_black:%llu} anomalies={latency:%llu pair:%llu spacing:%llu} "
             "miss={deadline:%llu cadence_hold:%llu} "
@@ -560,6 +556,9 @@ struct VrrPacingWorker::Diagnostics {
             static_cast<unsigned long long>(interval.pairCompleted),
             static_cast<unsigned long long>(interval.pairAttempts),
             static_cast<unsigned long long>(interval.sourceGaps),
+            static_cast<unsigned long long>(interval.idleBlackSuccesses),
+            static_cast<unsigned long long>(interval.idleBlackAttempts),
+            static_cast<unsigned long long>(interval.idleBlackFailures),
             static_cast<unsigned long long>(interval.idleRecoverySuccesses),
             static_cast<unsigned long long>(interval.idleRecoveryAttempts),
             static_cast<unsigned long long>(interval.idleRecoveryFailures),
@@ -859,6 +858,7 @@ int VrrPacingWorker::run()
     // owns the target and display-spacing policy, so the timing controller is
     // always told how the abandoned submission ended.
     auto cancelPresentation = [this]() {
+        const bool idleBlackPending = m_BfiIdleBlackPending;
         const uint64_t startUs = LiGetMicroseconds();
         VrrPresentFeedback feedback = m_Presenter->cancelFrame();
         const uint64_t endUs = LiGetMicroseconds();
@@ -869,6 +869,8 @@ int VrrPacingWorker::run()
         m_Diagnostics->observePresent(
             BfiPresentPhase::CancelRestore, feedback, submissionUs);
         m_BfiHaveLastVideoSlot = false;
+        m_BfiIdleBlackPending = false;
+        m_BfiIdleBlackSubmissionUs = 0;
         if (feedback.presented &&
                 m_Presenter->prePresentLeadTimeUs() != 0) {
             // D3D restores the cached lit image when a pair is cancelled
@@ -876,6 +878,10 @@ int VrrPacingWorker::run()
             // after an ordinary boosted video present.
             m_BfiBrightFrameHeld = true;
             m_LastBfiBrightSubmissionUs = submissionUs;
+        }
+        else if (idleBlackPending) {
+            m_BfiBrightFrameHeld = false;
+            m_LastBfiBrightSubmissionUs = 0;
         }
         m_VideoStats->pacerDroppedFrames++;
     };
@@ -917,35 +923,45 @@ int VrrPacingWorker::run()
                 SDL_LogWarn(
                     SDL_LOG_CATEGORY_APPLICATION,
                     "VRR-BFI anomaly queue-eviction: count=%llu "
-                    "queue_max=%llu bright_held=%d recovery=%d "
+                    "queue_max=%llu bright_held=%d idle_black=%d "
                     "suppressed=%llu",
                     static_cast<unsigned long long>(newQueueEvictions),
                     static_cast<unsigned long long>(
                         m_Diagnostics->currentQueueHighWater()),
                     m_BfiBrightFrameHeld ? 1 : 0,
-                    m_BfiRecoveryActive ? 1 : 0,
+                    m_BfiIdleBlackPending ? 1 : 0,
                     static_cast<unsigned long long>(suppressed));
             }
         }
         m_Diagnostics->maybeLogSummary(loopNowUs);
 
-        uint64_t idleRecoveryDeadlineUs = 0;
-        if (m_BfiBrightFrameHeld &&
-                nominalPrePresentLeadUs != 0 &&
-                m_TimingController->hasLastSubmission()) {
-            // This is when the next pair's black transition would have
-            // replaced the boosted image. Never submit sooner than one
-            // physical display period on higher-refresh panels.
-            idleRecoveryDeadlineUs = saturatingAdd(
-                m_TimingController->lastSubmissionUs(),
+        uint64_t idleTransitionDeadlineUs = 0;
+        if (nominalPrePresentLeadUs != 0) {
+            const uint64_t idlePhaseDurationUs =
                 std::max(nominalPrePresentLeadUs,
-                         m_TimingController->displayPeriodUs()));
+                         m_TimingController->displayPeriodUs());
+            if (m_BfiIdleBlackPending) {
+                // Bound an idle-started black phase. If no source frame has
+                // arrived by its video deadline, fall back to the cached image
+                // at normal luminance rather than leaving black on screen.
+                idleTransitionDeadlineUs = saturatingAdd(
+                    m_BfiIdleBlackSubmissionUs, idlePhaseDurationUs);
+            }
+            else if (m_BfiBrightFrameHeld &&
+                    m_TimingController->hasLastSubmission()) {
+                // Begin the next black phase on schedule even when the decoded
+                // successor is not ready. Preparation can then occupy the
+                // black interval instead of delaying the luminance transition.
+                idleTransitionDeadlineUs = saturatingAdd(
+                    m_TimingController->lastSubmissionUs(),
+                    idlePhaseDurationUs);
+            }
         }
 
         PacedFrame frame;
-        bool idleRecoveryDue = false;
-        if (!dequeueFrame(frame, idleRecoveryDeadlineUs,
-                          idleRecoveryDue)) {
+        bool idleTransitionDue = false;
+        if (!dequeueFrame(frame, idleTransitionDeadlineUs,
+                          idleTransitionDue)) {
             break;
         }
 
@@ -969,71 +985,118 @@ int VrrPacingWorker::run()
             }
             continue;
         }
-        if (idleRecoveryDue) {
-            VrrPresentRequest recoveryRequest;
-            const uint64_t recoveryStartUs = LiGetMicroseconds();
-            const uint64_t recoveryLatenessUs =
-                recoveryStartUs > idleRecoveryDeadlineUs ?
-                    recoveryStartUs - idleRecoveryDeadlineUs : 0;
-            const VrrPresentFeedback recoveryFeedback =
-                m_Presenter->presentIdleFrameRecovery(recoveryRequest);
-            const uint64_t recoveryEndUs = LiGetMicroseconds();
-            const uint64_t recoveryDurationUs =
-                recoveryEndUs >= recoveryStartUs ?
-                    recoveryEndUs - recoveryStartUs : 0;
-            const uint64_t recoverySubmissionUs = submissionBoundaryUs(
-                recoveryFeedback, recoveryStartUs, recoveryEndUs);
+        if (idleTransitionDue) {
+            const bool completingIdleBlack = m_BfiIdleBlackPending;
+            VrrPresentRequest idleRequest;
+            const uint64_t idleStartUs = LiGetMicroseconds();
+            const uint64_t idleLatenessUs =
+                idleStartUs > idleTransitionDeadlineUs ?
+                    idleStartUs - idleTransitionDeadlineUs : 0;
+            const VrrPresentFeedback idleFeedback =
+                completingIdleBlack ?
+                    m_Presenter->presentIdleFrameRecovery(idleRequest) :
+                    m_Presenter->presentIdlePreFrame(idleRequest);
+            const uint64_t idleEndUs = LiGetMicroseconds();
+            const uint64_t idleDurationUs =
+                idleEndUs >= idleStartUs ?
+                    idleEndUs - idleStartUs : 0;
+            const uint64_t idleSubmissionUs = submissionBoundaryUs(
+                idleFeedback, idleStartUs, idleEndUs);
             m_Diagnostics->observePresent(
-                BfiPresentPhase::Recovery,
-                recoveryFeedback,
-                recoverySubmissionUs);
-            observeGridSample(recoveryFeedback);
+                completingIdleBlack ?
+                    BfiPresentPhase::Recovery :
+                    BfiPresentPhase::Black,
+                idleFeedback,
+                idleSubmissionUs);
+            observeGridSample(idleFeedback);
             m_BfiHaveLastVideoSlot = false;
-            const bool recoverySucceeded =
-                recoveryFeedback.presented &&
-                    !recoveryFeedback.cancelled &&
-                    recoverySubmissionUs != 0;
-            m_Diagnostics->interval.idleRecoveryAttempts++;
+            const bool idleSucceeded =
+                idleFeedback.presented &&
+                    !idleFeedback.cancelled &&
+                    idleSubmissionUs != 0;
             m_Diagnostics->interval.idleRecoveryLateness.add(
-                recoveryLatenessUs);
-            m_Diagnostics->interval.presentCall.add(recoveryDurationUs);
-            if (recoverySucceeded) {
-                m_Diagnostics->interval.idleRecoverySuccesses++;
-                m_TimingController->noteAuxiliarySubmission(
-                    recoverySubmissionUs);
-                if (!m_BfiRecoveryActive) {
-                    m_BfiRecoveryStartUs = recoverySubmissionUs;
+                idleLatenessUs);
+            m_Diagnostics->interval.presentCall.add(idleDurationUs);
+
+            if (!completingIdleBlack) {
+                m_Diagnostics->interval.idleBlackAttempts++;
+                if (idleSucceeded) {
+                    m_Diagnostics->interval.idleBlackSuccesses++;
+                    m_Diagnostics->interval.pairAttempts++;
+                    if (m_LastBfiBrightSubmissionUs != 0 &&
+                            idleSubmissionUs >=
+                                m_LastBfiBrightSubmissionUs) {
+                        m_Diagnostics->interval.brightGap.add(
+                            idleSubmissionUs -
+                                m_LastBfiBrightSubmissionUs);
+                    }
+                    m_TimingController->noteAuxiliarySubmission(
+                        idleSubmissionUs);
+                    m_BfiIdleBlackPending = true;
+                    m_BfiIdleBlackSubmissionUs = idleSubmissionUs;
                 }
-                m_BfiRecoveryActive = true;
-                m_BfiRecoveryFrames = 0;
+                else {
+                    m_Diagnostics->interval.idleBlackFailures++;
+                    m_BfiIdleBlackPending = false;
+                    m_BfiIdleBlackSubmissionUs = 0;
+                }
+
+                uint64_t suppressed = 0;
+                if (m_Diagnostics->shouldLog(
+                        BfiDiagnosticWarning::IdleBlack,
+                        idleEndUs, suppressed)) {
+                    SDL_LogInfo(
+                        SDL_LOG_CATEGORY_APPLICATION,
+                        "VRR-BFI idle-black: success=%d presented=%d "
+                        "cancelled=%d deadline_late=%lluus call=%lluus "
+                        "pair_target=%lluus suppressed=%llu",
+                        idleSucceeded ? 1 : 0,
+                        idleFeedback.presented ? 1 : 0,
+                        idleFeedback.cancelled ? 1 : 0,
+                        static_cast<unsigned long long>(idleLatenessUs),
+                        static_cast<unsigned long long>(idleDurationUs),
+                        static_cast<unsigned long long>(
+                            nominalPrePresentLeadUs),
+                        static_cast<unsigned long long>(suppressed));
+                }
             }
             else {
-                m_Diagnostics->interval.idleRecoveryFailures++;
+                m_Diagnostics->interval.idleRecoveryAttempts++;
+                if (idleSucceeded) {
+                    m_Diagnostics->interval.idleRecoverySuccesses++;
+                    m_TimingController->noteAuxiliarySubmission(
+                        idleSubmissionUs);
+                }
+                else {
+                    m_Diagnostics->interval.idleRecoveryFailures++;
+                }
+                m_BfiIdleBlackPending = false;
+                m_BfiIdleBlackSubmissionUs = 0;
+
+                uint64_t suppressed = 0;
+                if (m_Diagnostics->shouldLog(
+                        BfiDiagnosticWarning::IdleRecovery,
+                        idleEndUs, suppressed)) {
+                    SDL_LogWarn(
+                        SDL_LOG_CATEGORY_APPLICATION,
+                        "VRR-BFI recovery idle-dim: success=%d presented=%d "
+                        "cancelled=%d deadline_late=%lluus call=%lluus "
+                        "pair_target=%lluus black_timeout=1 suppressed=%llu",
+                        idleSucceeded ? 1 : 0,
+                        idleFeedback.presented ? 1 : 0,
+                        idleFeedback.cancelled ? 1 : 0,
+                        static_cast<unsigned long long>(idleLatenessUs),
+                        static_cast<unsigned long long>(idleDurationUs),
+                        static_cast<unsigned long long>(
+                            nominalPrePresentLeadUs),
+                        static_cast<unsigned long long>(suppressed));
+                }
             }
 
-            uint64_t suppressed = 0;
-            if (m_Diagnostics->shouldLog(
-                    BfiDiagnosticWarning::IdleRecovery,
-                    recoveryEndUs, suppressed)) {
-                SDL_LogWarn(
-                    SDL_LOG_CATEGORY_APPLICATION,
-                    "VRR-BFI recovery idle-dim: success=%d presented=%d "
-                    "cancelled=%d deadline_late=%lluus call=%lluus "
-                    "pair_target=%lluus suppressed=%llu",
-                    recoverySucceeded ? 1 : 0,
-                    recoveryFeedback.presented ? 1 : 0,
-                    recoveryFeedback.cancelled ? 1 : 0,
-                    static_cast<unsigned long long>(recoveryLatenessUs),
-                    static_cast<unsigned long long>(recoveryDurationUs),
-                    static_cast<unsigned long long>(
-                        nominalPrePresentLeadUs),
-                    static_cast<unsigned long long>(suppressed));
-            }
-
-            // Do not repeatedly retry a failed auxiliary Present against the
-            // same cached frame. The renderer queues a device reset on native
-            // failure, while a successful recovery stays dim until a new
-            // decoded image is available.
+            // No decoded frame is consumed by either idle transition. A
+            // successful idle-black keeps its renderer-side transition state
+            // pending for the next prepared video; the fallback dim completes
+            // that transition and waits for a future source frame.
             m_BfiBrightFrameHeld = false;
             m_LastBfiBrightSubmissionUs = 0;
             continue;
@@ -1055,13 +1118,7 @@ int VrrPacingWorker::run()
             decision.sourceFrameDelta > 1 &&
             nominalPrePresentLeadUs != 0;
         const bool brightHeldAtSourceGap = m_BfiBrightFrameHeld;
-        const bool recoveryWasActive = m_BfiRecoveryActive;
         if (sourceGapDetected) {
-            if (!m_BfiRecoveryActive) {
-                m_BfiRecoveryStartUs = LiGetMicroseconds();
-            }
-            m_BfiRecoveryActive = true;
-            m_BfiRecoveryFrames = 0;
             m_Diagnostics->interval.sourceGaps +=
                 decision.sourceFrameDelta - 1;
         }
@@ -1070,41 +1127,19 @@ int VrrPacingWorker::run()
                 frame.decodeCompleteUs() ?
             scheduleNowUs - frame.decodeCompleteUs() : 0;
 
-        // A frame that can no longer reach its black transition on time is
-        // itself the slowdown signal, not merely a skipped frame number.
-        // Enter normal-luminance recovery and present this fresh frame
-        // without a black transition, instead of the former bailout that
-        // discarded it in favor of a recycled dim image and another
-        // display-spacing wait.
-        //
-        // No predictive missed-black-deadline entry: every prediction tried
-        // charged the preparation budget against the black deadline, but the
-        // pair's floor chain rebuilds its standing pipeline offset within a
-        // few frames of any tightening, so a transiently late black self-
-        // heals with the 50% duty preserved. Predicting from a collapsed
-        // offset (as after a recovery exit) misclassified healthy frames and
-        // recycled the session through recovery indefinitely. Genuine
-        // slowdown signals are owned by the cadence hold (sustained slow
-        // period), source-gap detection (skipped frames), the idle dim
-        // (stall with a boosted image held), and the ceiling governor
-        // (present rate above the panel's adaptive headroom).
-
-        // The black interval is fixed at half the negotiated frame period.
-        // While the learned cadence runs materially slower, a boosted pair
-        // would hold the 600-nit image well past a 50% duty cycle, so stay
-        // on normal-luminance frames until the source returns to nominal
-        // cadence; the recovery counter restarts every held frame.
+        // Slow cadence and source gaps no longer switch the renderer into a
+        // multi-frame normal-luminance regime. The scheduled idle-black path
+        // now owns the duty cycle independently of decode arrival: it starts
+        // black on time, lets preparation occupy that interval, and falls back
+        // to a cached normal-luminance image only if the entire black phase
+        // expires without a successor. Avoiding the old 12-frame regime switch
+        // removes a second source of visible brightness pulsing.
         const uint64_t nominalSourcePeriodUs = nominalPrePresentLeadUs * 2;
         if (nominalPrePresentLeadUs != 0 &&
                 decision.sourcePeriodUs >
                     saturatingAdd(nominalSourcePeriodUs,
                                   nominalSourcePeriodUs /
                                       kBfiSlowCadenceToleranceDivisor)) {
-            if (!m_BfiRecoveryActive) {
-                m_BfiRecoveryStartUs = scheduleNowUs;
-                m_BfiRecoveryActive = true;
-            }
-            m_BfiRecoveryFrames = 0;
             m_Diagnostics->interval.cadenceHoldFrames++;
             uint64_t suppressed = 0;
             if (m_Diagnostics->shouldLog(
@@ -1112,8 +1147,8 @@ int VrrPacingWorker::run()
                     scheduleNowUs, suppressed)) {
                 SDL_LogWarn(
                     SDL_LOG_CATEGORY_APPLICATION,
-                    "VRR-BFI recovery cadence-hold: source_period=%lluus "
-                    "nominal=%lluus boosted_pairs_suspended=1 "
+                    "VRR-BFI cadence-slow: source_period=%lluus "
+                    "nominal=%lluus idle_black_guard=1 "
                     "suppressed=%llu",
                     static_cast<unsigned long long>(
                         decision.sourcePeriodUs),
@@ -1134,7 +1169,7 @@ int VrrPacingWorker::run()
             m_BfiGridValid ? m_BfiGridPeriodQ16 : 0,
             m_BfiSafePresentPeriodQ16);
         bool governorSkip = false;
-        if (nominalPrePresentLeadUs != 0 && !m_BfiRecoveryActive &&
+        if (nominalPrePresentLeadUs != 0 &&
                 presentPeriodFloorQ16 != 0 &&
                 m_BfiCeilingDebtQ16 >= presentPeriodFloorQ16) {
             governorSkip = true;
@@ -1160,11 +1195,20 @@ int VrrPacingWorker::run()
             }
         }
 
+        const bool pendingIdleBlack =
+            m_BfiIdleBlackPending &&
+            m_BfiIdleBlackSubmissionUs != 0 &&
+            nominalPrePresentLeadUs != 0;
+        // An idle-started black has already committed this source frame to a
+        // boosted video half-cycle. Complete that pair before any newly
+        // detected source-gap/cadence recovery takes effect on later frames.
         const bool frameDropRecovery =
-            (m_BfiRecoveryActive || governorSkip) &&
+            !pendingIdleBlack &&
+            governorSkip &&
             nominalPrePresentLeadUs != 0;
         const uint64_t prePresentLeadUs =
-            frameDropRecovery ? 0 : nominalPrePresentLeadUs;
+            frameDropRecovery || pendingIdleBlack ?
+                0 : nominalPrePresentLeadUs;
         if (nominalPrePresentLeadUs != 0) {
             m_Diagnostics->interval.frames++;
             if (decision.latchedPresentation) {
@@ -1179,14 +1223,14 @@ int VrrPacingWorker::run()
                     scheduleNowUs, suppressed)) {
                 SDL_LogWarn(
                     SDL_LOG_CATEGORY_APPLICATION,
-                    "VRR-BFI recovery source-gap: missing=%llu "
-                    "bright_held=%d already_recovering=%d "
+                    "VRR-BFI source-gap: missing=%llu "
+                    "bright_held=%d idle_black_pending=%d "
                     "decode_age=%lluus source_period=%lluus "
                     "queue_max=%llu suppressed=%llu",
                     static_cast<unsigned long long>(
                         decision.sourceFrameDelta - 1),
                     brightHeldAtSourceGap ? 1 : 0,
-                    recoveryWasActive ? 1 : 0,
+                    m_BfiIdleBlackPending ? 1 : 0,
                     static_cast<unsigned long long>(scheduleAgeUs),
                     static_cast<unsigned long long>(
                         decision.sourcePeriodUs),
@@ -1427,11 +1471,12 @@ int VrrPacingWorker::run()
         // merely for the later lit-video target. Starting at the ordinary
         // render deadline made preparation consume the pre-present interval,
         // so black and video both slipped by one half-cycle.
-        const uint64_t renderStartUs = gridLocked ?
-            (plannedBlackSubmitUs > preparationBudgetUs ?
-                plannedBlackSubmitUs - preparationBudgetUs : 0) :
-            (decision.renderStartUs > prePresentLeadUs ?
-                decision.renderStartUs - prePresentLeadUs : 0);
+        const uint64_t renderStartUs = pendingIdleBlack ? 0 :
+            (gridLocked ?
+                (plannedBlackSubmitUs > preparationBudgetUs ?
+                    plannedBlackSubmitUs - preparationBudgetUs : 0) :
+                (decision.renderStartUs > prePresentLeadUs ?
+                    decision.renderStartUs - prePresentLeadUs : 0));
         const VrrTargetWaitResult renderWait =
             m_TargetWaiter.waitUntil(renderStartUs);
         // A deadline that was already in the past is not an OS wake delay.
@@ -1518,8 +1563,8 @@ int VrrPacingWorker::run()
             uint64_t operationStartUs = preparationStartUs;
             uint64_t operationEndUs = preparationEndUs;
             const bool mustCancel = !feedback.presented &&
-                (preparation.prepared || preparation.cancellationMaySubmit ||
-                 !feedback.cancelled);
+                (pendingIdleBlack || preparation.prepared ||
+                 preparation.cancellationMaySubmit || !feedback.cancelled);
             if (mustCancel) {
                 // A presenter may need to submit an acquired image in order
                 // to abandon it. It reports only that neutral fact; the worker
@@ -1532,7 +1577,21 @@ int VrrPacingWorker::run()
                 operationEndUs = LiGetMicroseconds();
             }
             feedback.cancelled = true;
+            const uint64_t cancellationSubmissionUs = submissionBoundaryUs(
+                feedback, operationStartUs, operationEndUs);
             recordSubmission(feedback, operationStartUs, operationEndUs);
+            if (pendingIdleBlack) {
+                reportCancelAfterBlack("prepare");
+                m_Diagnostics->observePresent(
+                    BfiPresentPhase::CancelRestore,
+                    feedback,
+                    cancellationSubmissionUs);
+                m_BfiIdleBlackPending = false;
+                m_BfiIdleBlackSubmissionUs = 0;
+                m_BfiBrightFrameHeld = feedback.presented;
+                m_LastBfiBrightSubmissionUs =
+                    feedback.presented ? cancellationSubmissionUs : 0;
+            }
             m_VideoStats->pacerDroppedFrames++;
             m_DeferredFrame = std::move(frame);
             continue;
@@ -1543,7 +1602,8 @@ int VrrPacingWorker::run()
 
         uint64_t videoTargetUs = gridLocked ?
             plannedVideoSubmitUs : decision.targetUs;
-        uint64_t preSubmissionUs = 0;
+        uint64_t preSubmissionUs = pendingIdleBlack ?
+            m_BfiIdleBlackSubmissionUs : 0;
 
         // A 50% duty cycle belongs to the actual source cadence, not the
         // negotiated rate: with the black interval fixed at the nominal lead,
@@ -1557,6 +1617,12 @@ int VrrPacingWorker::run()
             saturatingAdd(nominalPrePresentLeadUs,
                           nominalPrePresentLeadUs /
                               kBfiSlowCadenceToleranceDivisor));
+        if (pendingIdleBlack &&
+                preSubmissionUs <=
+                    std::numeric_limits<uint64_t>::max() - pairIntervalUs) {
+            videoTargetUs = std::max(
+                videoTargetUs, preSubmissionUs + pairIntervalUs);
+        }
         if (prePresentLeadUs != 0) {
             m_Diagnostics->interval.pairAttempts++;
             const uint64_t requestedPreTargetUs =
@@ -1806,6 +1872,10 @@ int VrrPacingWorker::run()
             feedback,
             videoSubmissionUs);
         observeGridSample(feedback);
+        if (pendingIdleBlack) {
+            m_BfiIdleBlackPending = false;
+            m_BfiIdleBlackSubmissionUs = 0;
+        }
 
         if (feedback.presented && !feedback.cancelled) {
             m_VideoStats->totalPacerTimeUs +=
@@ -1925,32 +1995,6 @@ int VrrPacingWorker::run()
                 m_BfiCeilingDebtQ16 = 0;
             }
 
-            if (frameDropRecovery && m_BfiRecoveryActive &&
-                    ++m_BfiRecoveryFrames >=
-                        kBfiRecoveryFrameCount) {
-                const uint64_t recoveryDurationUs =
-                    m_BfiRecoveryStartUs != 0 &&
-                            presentEndUs >= m_BfiRecoveryStartUs ?
-                        presentEndUs - m_BfiRecoveryStartUs : 0;
-                m_Diagnostics->interval.recoveryCompletions++;
-                m_BfiRecoveryActive = false;
-                m_BfiRecoveryFrames = 0;
-                m_BfiRecoveryStartUs = 0;
-                uint64_t suppressed = 0;
-                if (m_Diagnostics->shouldLog(
-                        BfiDiagnosticWarning::RecoveryComplete,
-                        presentEndUs, suppressed)) {
-                    SDL_LogInfo(
-                        SDL_LOG_CATEGORY_APPLICATION,
-                        "VRR-BFI recovery complete: normal_frames=%u "
-                        "duration=%lluus boosted_pairs_resume=1 "
-                        "suppressed=%llu",
-                        kBfiRecoveryFrameCount,
-                        static_cast<unsigned long long>(
-                            recoveryDurationUs),
-                        static_cast<unsigned long long>(suppressed));
-                }
-            }
             if (frameDropRecovery) {
                 m_Diagnostics->interval.recoveryFrames++;
             }
@@ -1992,26 +2036,26 @@ int VrrPacingWorker::run()
 }
 
 bool VrrPacingWorker::dequeueFrame(PacedFrame& frame,
-                                   uint64_t idleRecoveryDeadlineUs,
-                                   bool& idleRecoveryDue)
+                                   uint64_t idleTransitionDeadlineUs,
+                                   bool& idleTransitionDue)
 {
-    idleRecoveryDue = false;
+    idleTransitionDue = false;
     QMutexLocker lock(&m_FrameQueueLock);
     while (!isStopping() && !m_Suspended.load() &&
             m_PendingWindowStateFlags.load() == 0 &&
             m_FrameQueue.empty()) {
-        if (idleRecoveryDeadlineUs == 0) {
+        if (idleTransitionDeadlineUs == 0) {
             m_FrameQueueNotEmpty.wait(&m_FrameQueueLock);
             continue;
         }
 
         const uint64_t nowUs = LiGetMicroseconds();
-        if (nowUs >= idleRecoveryDeadlineUs) {
-            idleRecoveryDue = true;
+        if (nowUs >= idleTransitionDeadlineUs) {
+            idleTransitionDue = true;
             return true;
         }
 
-        const uint64_t remainingUs = idleRecoveryDeadlineUs - nowUs;
+        const uint64_t remainingUs = idleTransitionDeadlineUs - nowUs;
         const uint64_t remainingMs = (remainingUs + 999) / 1000;
         m_FrameQueueNotEmpty.wait(
             &m_FrameQueueLock,
@@ -2079,10 +2123,9 @@ uint32_t VrrPacingWorker::consumeWindowStateNotifications()
         m_PresenterSuspended = suspended;
     }
     m_BfiBrightFrameHeld = false;
-    m_BfiRecoveryActive = false;
-    m_BfiRecoveryFrames = 0;
-    m_BfiRecoveryStartUs = 0;
     m_LastBfiBrightSubmissionUs = 0;
+    m_BfiIdleBlackPending = false;
+    m_BfiIdleBlackSubmissionUs = 0;
     m_Diagnostics->resetDisplayEpoch();
     resetGrid();
     m_RebaseOnNextFrame = true;
