@@ -13,6 +13,8 @@ extern "C" {
 #include <wrl/client.h>
 #include <wrl/wrappers/corewrappers.h>
 
+#include <deque>
+
 class D3D11VARenderer : public IFFmpegRenderer, public IVrrFramePresenter
 {
 public:
@@ -22,6 +24,7 @@ public:
     virtual bool prepareDecoderContext(AVCodecContext* context, AVDictionary**) override;
     virtual bool prepareDecoderContextInGetFormat(AVCodecContext* context, AVPixelFormat pixelFormat) override;
     virtual void renderFrame(AVFrame* frame) override;
+    virtual bool takeDisplayedFrameTiming(DisplayedFrameTiming& timing) override;
     virtual IVrrFramePresenter* getVrrFramePresenter() override;
 
     virtual bool canLatchAdaptivePresent() const override { return true; }
@@ -59,7 +62,15 @@ private:
     bool prepareFrameForPresent(AVFrame* frame);
     bool initializeVrrPresentReadyFence();
     bool waitForVrrPresentReady();
-    HRESULT presentPreparedFrame(UINT flags);
+    HRESULT presentPreparedFrame(UINT flags, uint64_t frameReadyUs,
+                                 bool variableRefreshTiming = false,
+                                 uint64_t* submissionTimeUs = nullptr);
+    void collectDisplayedFrameTimings();
+    void resetDisplayedFrameTimings();
+    void trackSubmittedFrame(uint64_t frameReadyUs, uint64_t submissionTimeUs,
+                             bool variableRefreshTiming);
+    uint64_t frameStatisticsTimeUs(const DXGI_FRAME_STATISTICS& stats,
+                                   bool variableRefreshTiming) const;
     void initializeVrrPresentationState(DXGI_SWAP_CHAIN_DESC1* swapChainDesc);
     void refreshVrrDisplayState();
     VrrFallbackReason evaluateVrrEligibility();
@@ -128,6 +139,19 @@ private:
     UINT64 m_VrrPresentReadyFenceValue;
     HANDLE m_VrrPresentReadyFenceEvent;
     bool m_VrrPresentReadyAvailable;
+    uint64_t m_VrrPreparedFrameReadyUs;
+    int m_PresentationDisplayRefreshHz;
+
+    struct PendingPresentTiming {
+        UINT presentId;
+        uint64_t frameReadyUs;
+        uint64_t submissionTimeUs;
+        bool variableRefreshTiming;
+    };
+    std::deque<PendingPresentTiming> m_PendingPresentTimings;
+    std::deque<DisplayedFrameTiming> m_DisplayedFrameTimings;
+    UINT m_LastCollectedPresentId;
+    bool m_HaveCollectedPresentId;
 
     std::array<Microsoft::WRL::ComPtr<ID3D11PixelShader>, PixelShaders::_COUNT> m_VideoPixelShaders;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_VideoVertexBuffer;

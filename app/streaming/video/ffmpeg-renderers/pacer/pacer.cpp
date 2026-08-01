@@ -290,6 +290,8 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         config.streamRateHz = maxVideoFps;
         config.displayRefreshHz = vrrDisplayRefreshHz;
+        config.lowLatency = maxVideoFps ==
+            VrrRatePolicy::lowLatencyRateForRefresh(vrrDisplayRefreshHz);
 
         if (!enableVsync) {
             fallbackReason = VrrFallbackReason::IneffectiveVsync;
@@ -324,7 +326,8 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                     if (m_VrrWorker->start()) {
                         m_DisplayFps = config.displayRefreshHz;
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "VRR pacing: target %d Hz with %d FPS stream",
+                                    "VRR pacing: %s target %d Hz with %d FPS stream",
+                                    config.lowLatency ? "low-latency" : "smooth",
                                     m_DisplayFps, m_MaxVideoFps);
                         return true;
                     }
@@ -443,6 +446,7 @@ void Pacer::renderFrame(AVFrame* frame)
     m_VideoStats->totalPacerTimeUs += beforeRender - static_cast<uint64_t>(frame->pkt_dts);
     m_VideoStats->totalRenderTimeUs += afterRender - beforeRender;
     m_VideoStats->renderedFrames++;
+    collectDisplayedFrameTimings();
 
     // Wait until after next frame to free this one to ensure the GPU
     // doesn't stall or read garbage if the backing buffer gets returned
@@ -491,6 +495,20 @@ void Pacer::renderFrame(AVFrame* frame)
     }
 
     m_FrameQueueLock.unlock();
+}
+
+void Pacer::collectDisplayedFrameTimings()
+{
+    DisplayedFrameTiming timing;
+    while (m_VsyncRenderer->takeDisplayedFrameTiming(timing)) {
+        if (timing.displayTimeUs < timing.frameReadyUs) {
+            continue;
+        }
+
+        m_VideoStats->totalClientPresentationTimeUs +=
+            timing.displayTimeUs - timing.frameReadyUs;
+        m_VideoStats->framesWithClientPresentationTime++;
+    }
 }
 
 void Pacer::dropFrameForEnqueue(QQueue<AVFrame*>& queue)

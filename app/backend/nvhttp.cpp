@@ -235,6 +235,10 @@ NvHTTP::startApp(QString verb,
                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+
                                    "&gcmap="+QString::number(gamepadMask)+
                                    "&gcpersist="+QString::number(persistGameControllersOnDisconnect ? 1 : 0)+
+                                   // Request Vibeshine's opt-in extended frame
+                                   // timing header. Other Sunshine hosts ignore
+                                   // unknown launch query parameters.
+                                   ((!isGfe) ? "&clientLatencyTelemetry=1" : "")+
                                    // This reports launch-time VRR qualification. The
                                    // renderer can still reject VRR after the stream starts.
                                    ((clientVrrRequested && !isGfe) ?

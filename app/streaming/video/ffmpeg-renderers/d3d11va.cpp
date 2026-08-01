@@ -56,6 +56,18 @@ static const std::array<const char*, D3D11VARenderer::PixelShaders::_COUNT> k_Vi
     "d3d11_y410_pixel.fxc",
 };
 
+static bool presentIdBefore(UINT left, UINT right)
+{
+    return static_cast<INT32>(left - right) < 0;
+}
+
+static int strictDisplayRefreshRate(SDL_Window* window)
+{
+    int refreshHz = 0;
+    StreamUtils::tryGetDisplayRefreshRate(window, refreshHz);
+    return refreshHz;
+}
+
 D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
     : IFFmpegRenderer(RendererType::D3D11VA),
       m_DecoderSelectionPass(decoderSelectionPass),
@@ -74,6 +86,10 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_VrrPresentReadyFenceValue(0),
       m_VrrPresentReadyFenceEvent(nullptr),
       m_VrrPresentReadyAvailable(false),
+      m_VrrPreparedFrameReadyUs(0),
+      m_PresentationDisplayRefreshHz(0),
+      m_LastCollectedPresentId(0),
+      m_HaveCollectedPresentId(false),
       m_OverlayLock(0),
       m_HwDeviceContext(nullptr)
 {
@@ -475,6 +491,9 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     HRESULT hr;
 
     m_DecoderParams = *params;
+    m_PresentationDisplayRefreshHz = params->vrrDisplayRefreshHz > 0 ?
+        params->vrrDisplayRefreshHz :
+        strictDisplayRefreshRate(params->window);
 
     if (qgetenv("D3D11VA_ENABLED") == "0") {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -760,7 +779,15 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     }
 
     bool prepared = prepareFrameForPresent(frame);
-    HRESULT hr = prepared ? presentPreparedFrame(flags) : E_FAIL;
+    // A tearing Present can replace pixels partway through scanout, so it has
+    // no single scanout-start boundary to report. Keep those sessions on the
+    // explicitly labelled renderer-submission fallback.
+    const uint64_t frameReadyUs =
+        (flags & DXGI_PRESENT_ALLOW_TEARING) == 0 ?
+            static_cast<uint64_t>(frame->pkt_dts) : 0;
+    HRESULT hr = prepared ?
+        presentPreparedFrame(flags, frameReadyUs) :
+        E_FAIL;
 
     if (m_DecodeDevice == m_RenderDevice) {
         // Release the context lock
@@ -1209,6 +1236,9 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         // refreshed swapchain eligibility against the context lock the VRR
         // worker retains from preparation through Present.
         lockContext(this);
+        resetDisplayedFrameTimings();
+        m_PresentationDisplayRefreshHz =
+            strictDisplayRefreshRate(stateInfo->window);
         refreshVrrDisplayState();
         unlockContext(this);
 
@@ -1247,6 +1277,7 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         // We must release all references to the back buffer
         m_RenderTargetView.Reset();
         m_RenderDeviceContext->Flush();
+        resetDisplayedFrameTimings();
 
         HRESULT hr = m_SwapChain->ResizeBuffers(0, stateInfo->width, stateInfo->height, DXGI_FORMAT_UNKNOWN, swapchainDesc.Flags);
         if (FAILED(hr)) {
@@ -1265,6 +1296,8 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
 
         // A same-monitor mode switch can arrive only as SIZE_CHANGED, so
         // re-evaluate VRR eligibility from the resized swapchain.
+        m_PresentationDisplayRefreshHz =
+            strictDisplayRefreshRate(stateInfo->window);
         refreshVrrDisplayState();
 
         unlockContext(this);
@@ -1640,6 +1673,7 @@ void D3D11VARenderer::releasePreparedVrrFrame()
     }
 
     m_VrrFramePrepared = false;
+    m_VrrPreparedFrameReadyUs = 0;
 
     if (m_VrrContextLocked) {
         unlockContext(this);
@@ -1789,13 +1823,197 @@ bool D3D11VARenderer::waitForVrrPresentReady()
     return true;
 }
 
-HRESULT D3D11VARenderer::presentPreparedFrame(UINT flags)
+HRESULT D3D11VARenderer::presentPreparedFrame(UINT flags,
+                                              uint64_t frameReadyUs,
+                                              bool variableRefreshTiming,
+                                              uint64_t* submissionTimeUs)
 {
     if (m_SwapChain == nullptr) {
         return E_FAIL;
     }
 
-    return m_SwapChain->Present(0, flags);
+    // Query feedback for an earlier Present before submitting the next one.
+    // GetFrameStatistics() is non-blocking here; never call DwmFlush() because
+    // doing so would perturb the latency we are trying to measure.
+    collectDisplayedFrameTimings();
+
+    const uint64_t submitUs = LiGetMicroseconds();
+    if (submissionTimeUs != nullptr) {
+        *submissionTimeUs = submitUs;
+    }
+
+    const HRESULT hr = m_SwapChain->Present(0, flags);
+    if (hr == S_OK) {
+        trackSubmittedFrame(frameReadyUs, submitUs, variableRefreshTiming);
+    }
+    return hr;
+}
+
+void D3D11VARenderer::trackSubmittedFrame(uint64_t frameReadyUs,
+                                         uint64_t submissionTimeUs,
+                                         bool variableRefreshTiming)
+{
+    if (frameReadyUs == 0 || frameReadyUs > submissionTimeUs) {
+        return;
+    }
+
+    UINT presentId = 0;
+    if (FAILED(m_SwapChain->GetLastPresentCount(&presentId))) {
+        return;
+    }
+
+    m_PendingPresentTimings.push_back({
+        presentId,
+        frameReadyUs,
+        submissionTimeUs,
+        variableRefreshTiming,
+    });
+
+    // Bound state when a driver does not provide usable frame statistics.
+    while (m_PendingPresentTimings.size() > 32) {
+        m_PendingPresentTimings.pop_front();
+    }
+}
+
+uint64_t D3D11VARenderer::frameStatisticsTimeUs(
+    const DXGI_FRAME_STATISTICS& stats,
+    bool variableRefreshTiming) const
+{
+    if (stats.SyncQPCTime.QuadPart <= 0 ||
+            m_PresentationDisplayRefreshHz <= 0) {
+        return 0;
+    }
+
+    LARGE_INTEGER qpcFrequency;
+    LARGE_INTEGER qpcNow;
+    if (!QueryPerformanceFrequency(&qpcFrequency) ||
+            !QueryPerformanceCounter(&qpcNow) ||
+            qpcFrequency.QuadPart <= 0) {
+        return 0;
+    }
+
+    const INT32 refreshDelta = static_cast<INT32>(
+        stats.PresentRefreshCount - stats.SyncRefreshCount);
+    if (refreshDelta < 0 || refreshDelta > 8) {
+        return 0;
+    }
+
+    // Under VRR, refresh-count deltas do not identify the duration of the
+    // variable blanking intervals between the scheduler's QPC sample and the
+    // displayed frame. Only a direct QPC anchor (zero delta) is exact enough
+    // to call scanout timing; otherwise omit the sample instead of applying a
+    // fixed-refresh period to a variable-refresh interval.
+    if (variableRefreshTiming && refreshDelta != 0) {
+        return 0;
+    }
+
+    // DXGI reports a QPC anchor for SyncRefreshCount and the actual refresh
+    // count that displayed this Present ID. Reconstruct the scanout-start QPC
+    // from the physical refresh period, then add half a scanout to represent
+    // the average pixel position rather than just the top edge of the panel.
+    const long double presentQpc =
+        static_cast<long double>(stats.SyncQPCTime.QuadPart) +
+        static_cast<long double>(refreshDelta) *
+            static_cast<long double>(qpcFrequency.QuadPart) /
+            static_cast<long double>(m_PresentationDisplayRefreshHz);
+    const long double deltaUs =
+        (presentQpc - static_cast<long double>(qpcNow.QuadPart)) *
+        1000000.0L / static_cast<long double>(qpcFrequency.QuadPart);
+
+    const int64_t scanoutStartUs =
+        static_cast<int64_t>(LiGetMicroseconds()) +
+        static_cast<int64_t>(deltaUs);
+    if (scanoutStartUs < 0) {
+        return 0;
+    }
+
+    return static_cast<uint64_t>(scanoutStartUs) +
+        static_cast<uint64_t>(500000 / m_PresentationDisplayRefreshHz);
+}
+
+void D3D11VARenderer::collectDisplayedFrameTimings()
+{
+    if (m_SwapChain == nullptr || m_PendingPresentTimings.empty()) {
+        return;
+    }
+    if (m_PresentationDisplayRefreshHz <= 0) {
+        return;
+    }
+
+    DXGI_FRAME_STATISTICS stats = {};
+    const HRESULT hr = m_SwapChain->GetFrameStatistics(&stats);
+    if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
+        // The first query and display-mode transitions start a new sequence.
+        m_HaveCollectedPresentId = false;
+        return;
+    }
+    if (FAILED(hr) || stats.PresentCount == 0 ||
+            (m_HaveCollectedPresentId &&
+             stats.PresentCount == m_LastCollectedPresentId)) {
+        return;
+    }
+
+    m_LastCollectedPresentId = stats.PresentCount;
+    m_HaveCollectedPresentId = true;
+
+    while (!m_PendingPresentTimings.empty() &&
+            presentIdBefore(m_PendingPresentTimings.front().presentId,
+                            stats.PresentCount)) {
+        // A newer SyncInterval-0 Present replaced this image before scanout.
+        m_PendingPresentTimings.pop_front();
+    }
+
+    if (m_PendingPresentTimings.empty() ||
+            m_PendingPresentTimings.front().presentId != stats.PresentCount) {
+        return;
+    }
+
+    const PendingPresentTiming pending = m_PendingPresentTimings.front();
+    m_PendingPresentTimings.pop_front();
+
+    uint64_t displayTimeUs = frameStatisticsTimeUs(
+        stats, pending.variableRefreshTiming);
+    if (displayTimeUs == 0) {
+        return;
+    }
+    if (displayTimeUs < pending.submissionTimeUs) {
+        // Never manufacture a plausible timestamp by clamping inconsistent
+        // feedback to Present. Drop it and retain the honest fallback.
+        return;
+    }
+
+    const uint64_t nowUs = LiGetMicroseconds();
+    const uint64_t maximumFutureUs = nowUs +
+        static_cast<uint64_t>(1000000 / m_PresentationDisplayRefreshHz);
+    if (displayTimeUs < pending.frameReadyUs ||
+            displayTimeUs > maximumFutureUs) {
+        return;
+    }
+
+    m_DisplayedFrameTimings.push_back({
+        pending.frameReadyUs,
+        displayTimeUs,
+    });
+}
+
+bool D3D11VARenderer::takeDisplayedFrameTiming(
+    DisplayedFrameTiming& timing)
+{
+    if (m_DisplayedFrameTimings.empty()) {
+        return false;
+    }
+
+    timing = m_DisplayedFrameTimings.front();
+    m_DisplayedFrameTimings.pop_front();
+    return true;
+}
+
+void D3D11VARenderer::resetDisplayedFrameTimings()
+{
+    m_PendingPresentTimings.clear();
+    m_DisplayedFrameTimings.clear();
+    m_LastCollectedPresentId = 0;
+    m_HaveCollectedPresentId = false;
 }
 
 IVrrFramePresenter* D3D11VARenderer::getVrrFramePresenter()
@@ -1820,6 +2038,8 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame)
     if (m_VrrSuspended || frame == nullptr) {
         return result;
     }
+
+    m_VrrPreparedFrameReadyUs = static_cast<uint64_t>(frame->pkt_dts);
 
     // The contract guarantees one worker, but make an accidental second
     // preparation recoverable instead of leaking a retained context lock.
@@ -1900,8 +2120,9 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
 
     // The worker anchors its display-spacing floor at this instant rather
     // than at its own call boundary, so capture it immediately before Present.
-    const uint64_t submissionTimeUs = LiGetMicroseconds();
-    HRESULT hr = presentPreparedFrame(presentFlags);
+    uint64_t submissionTimeUs = 0;
+    HRESULT hr = presentPreparedFrame(
+        presentFlags, m_VrrPreparedFrameReadyUs, true, &submissionTimeUs);
 
     if (FAILED(hr)) {
         releasePreparedVrrFrame();

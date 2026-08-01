@@ -6,6 +6,7 @@
 
 #include "streaming/video/decoder.h"
 #include "streaming/video/overlaymanager.h"
+#include "presentationtiming.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -162,6 +163,12 @@ public:
     virtual bool initialize(PDECODER_PARAMETERS params) = 0;
     virtual bool prepareDecoderContext(AVCodecContext* context, AVDictionary** options) = 0;
     virtual void renderFrame(AVFrame* frame) = 0;
+
+    // Returns delayed platform feedback for frames that actually reached
+    // scanout. Most renderers cannot provide this and retain the default.
+    virtual bool takeDisplayedFrameTiming(DisplayedFrameTiming&) {
+        return false;
+    }
 
     enum class InitFailureReason
     {

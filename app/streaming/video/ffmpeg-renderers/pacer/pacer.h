@@ -68,6 +68,8 @@ private:
 
     void renderFrame(AVFrame* frame);
 
+    void collectDisplayedFrameTimings();
+
     void dropFrameForEnqueue(QQueue<AVFrame*>& queue);
 
     QQueue<AVFrame*> m_RenderQueue;

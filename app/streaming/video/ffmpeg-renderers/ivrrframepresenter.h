@@ -1,5 +1,7 @@
 #pragma once
 
+#include "presentationtiming.h"
+
 #include <cstdint>
 
 struct AVFrame;
@@ -100,6 +102,13 @@ public:
     // path without intentionally waiting.
     virtual VrrPresentFeedback presentAdaptive(
         const VrrPresentRequest& request) = 0;
+
+    // Delayed feedback for an earlier frame that the platform confirmed was
+    // displayed. Adaptive and fixed presentation use the same endpoint.
+    virtual bool takeDisplayedFrameTiming(DisplayedFrameTiming&)
+    {
+        return false;
+    }
 
     // Releases a prepared image. The result must report a native submission
     // when the platform cannot abandon an acquired image without submitting.

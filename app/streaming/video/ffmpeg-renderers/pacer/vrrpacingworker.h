@@ -45,6 +45,7 @@ private:
     void discardQueuedFrames(bool countDrops);
     uint32_t consumeWindowStateNotifications();
     bool presentationSuspended() const;
+    void collectDisplayedFrameTimings();
     bool isStopping() const;
     void waitForSubmissionFloor(const VrrTimingDecision& decision);
     void recordSubmission(const VrrPresentFeedback& feedback,

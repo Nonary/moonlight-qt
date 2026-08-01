@@ -269,6 +269,7 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/pacer.h \
         streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h \
         streaming/video/ffmpeg-renderers/ivrrframepresenter.h \
+        streaming/video/ffmpeg-renderers/presentationtiming.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h

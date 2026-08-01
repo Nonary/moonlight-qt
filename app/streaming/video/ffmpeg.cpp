@@ -829,6 +829,19 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalHostCaptureLatency += src.totalHostCaptureLatency;
     dst.framesWithHostCaptureLatency += src.framesWithHostCaptureLatency;
 
+    if (dst.minHostTransportLatency == 0) {
+        dst.minHostTransportLatency = src.minHostTransportLatency;
+    }
+    else if (src.minHostTransportLatency != 0) {
+        dst.minHostTransportLatency = qMin(dst.minHostTransportLatency, src.minHostTransportLatency);
+    }
+    dst.maxHostTransportLatency = qMax(dst.maxHostTransportLatency, src.maxHostTransportLatency);
+    dst.totalHostTransportLatency += src.totalHostTransportLatency;
+    dst.framesWithHostTransportLatency += src.framesWithHostTransportLatency;
+
+    dst.totalClientPresentationTimeUs += src.totalClientPresentationTimeUs;
+    dst.framesWithClientPresentationTime += src.framesWithClientPresentationTime;
+
     if (!LiGetEstimatedRttInfo(&dst.lastRtt, &dst.lastRttVariance)) {
         dst.lastRtt = 0;
         dst.lastRttVariance = 0;
@@ -1012,6 +1025,21 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         offset += ret;
     }
 
+    if (stats.framesWithHostTransportLatency > 0) {
+        ret = snprintf(&output[offset],
+                       length - offset,
+                       "Host transport preparation min/max/average: %.1f/%.1f/%.1f ms\n",
+                       (float)stats.minHostTransportLatency / 10,
+                       (float)stats.maxHostTransportLatency / 10,
+                       (float)stats.totalHostTransportLatency / 10 / stats.framesWithHostTransportLatency);
+        if (ret < 0 || ret >= length - offset) {
+            SDL_assert(false);
+            return;
+        }
+
+        offset += ret;
+    }
+
     if (stats.renderedFrames != 0) {
         char rttString[32];
 
@@ -1029,7 +1057,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                        "Average network latency: %s\n"
                        "Average decoding time: %.2f ms\n"
                        "Average frame queue delay: %.2f ms\n"
-                       "Average rendering time (including monitor V-sync latency): %.2f ms\n",
+                       "Average render/presentation scheduling time: %.2f ms\n",
                        (float)stats.networkDroppedFrames / stats.totalFrames * 100,
                        (float)stats.pacerDroppedFrames / stats.decodedFrames * 100,
                        rttString,
@@ -1044,33 +1072,88 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         offset += ret;
     }
 
+    if (stats.framesWithClientPresentationTime > 0) {
+        ret = snprintf(&output[offset],
+                       length - offset,
+                       "Average client presentation (decode-ready to scanout midpoint): %.2f ms\n",
+                       (double)(stats.totalClientPresentationTimeUs / 1000.0) /
+                           stats.framesWithClientPresentationTime);
+        if (ret < 0 || ret >= length - offset) {
+            SDL_assert(false);
+            return;
+        }
+
+        offset += ret;
+    }
+
     if (stats.renderedFrames != 0 && stats.decodedFrames != 0 &&
             stats.receivedFrames != 0 &&
             stats.framesWithHostProcessingLatency > 0 && stats.lastRtt != 0) {
-        // Host and client clocks are never compared directly: the host ships
-        // its capture-to-send time over RTP as a duration, and every client
-        // term (reassembly, decode, pacing/VRR queue wait, render) is measured
-        // on the local clock. Only the one-way network hop is an estimate,
-        // taken as half the ENet round-trip time.
-        double totalEndToEndMs =
+        // Host and client clocks are never compared directly. Every host term
+        // is shipped as a duration and every client term uses the local clock.
+        // Only the one-way network hop is estimated as half the ENet RTT.
+        double videoPipelineMs =
             (double)stats.totalHostProcessingLatency / 10 / stats.framesWithHostProcessingLatency +
             (double)stats.lastRtt / 2 +
             (double)(stats.totalReassemblyTimeUs / 1000.0) / stats.receivedFrames +
-            (double)(stats.totalDecodeTimeUs / 1000.0) / stats.decodedFrames +
-            (double)(stats.totalPacerTimeUs / 1000.0) / stats.renderedFrames +
-            (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames;
+            (double)(stats.totalDecodeTimeUs / 1000.0) / stats.decodedFrames;
 
         // The capture wait is disjoint from host processing latency, so a
         // host that reports it extends the total back to compositor present.
         if (stats.framesWithHostCaptureLatency > 0) {
-            totalEndToEndMs +=
+            videoPipelineMs +=
                 (double)stats.totalHostCaptureLatency / 10 / stats.framesWithHostCaptureLatency;
+        }
+
+        if (stats.framesWithHostTransportLatency > 0) {
+            videoPipelineMs +=
+                (double)stats.totalHostTransportLatency / 10 /
+                    stats.framesWithHostTransportLatency;
+        }
+
+        const bool hasCaptureStart =
+            stats.framesWithHostCaptureLatency > 0;
+        const bool hasHostTransport =
+            stats.framesWithHostTransportLatency > 0;
+        const bool hasScanoutFeedback =
+            stats.framesWithClientPresentationTime > 0;
+        if (hasScanoutFeedback) {
+            videoPipelineMs +=
+                (double)(stats.totalClientPresentationTimeUs / 1000.0) /
+                    stats.framesWithClientPresentationTime;
+        }
+        else {
+            // Unsupported renderers can only stop at the native Present call.
+            // Keep that endpoint explicit rather than pretending it is scanout.
+            videoPipelineMs +=
+                (double)(stats.totalPacerTimeUs / 1000.0) / stats.renderedFrames +
+                (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames;
         }
 
         ret = snprintf(&output[offset],
                        length - offset,
-                       "Estimated end-to-end latency (host capture to client present): %.1f ms\n",
-                       totalEndToEndMs);
+                       hasCaptureStart && hasHostTransport && hasScanoutFeedback ?
+                           "Estimated video-pipeline latency (%s to %s%s): %.1f ms\n" :
+                           "Estimated partial video-pipeline latency (%s to %s%s): %.1f ms\n",
+                       hasCaptureStart ?
+                           "host compositor present" :
+                           "host capture-processing start",
+                       hasScanoutFeedback ?
+                           "client scanout midpoint" :
+                           "client renderer submission",
+                       hasHostTransport ? "" :
+                           ", host transport unavailable",
+                       videoPipelineMs);
+        if (ret < 0 || ret >= length - offset) {
+            SDL_assert(false);
+            return;
+        }
+
+        offset += ret;
+
+        ret = snprintf(&output[offset],
+                       length - offset,
+                       "Not included in input-to-photon latency: client input capture/transmission, game response/rendering, and panel response\n");
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);
             return;
@@ -1083,7 +1166,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
 {
     if (stats.renderedFps > 0 || stats.renderedFrames != 0) {
-        char videoStatsStr[512];
+        char videoStatsStr[1024];
         stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr));
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -2052,20 +2135,21 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     // Restore default log level after a successful decode
                     av_log_set_level(AV_LOG_INFO);
 
-                    // Keep the established legacy pacing timestamp at its
-                    // original handoff point. VRR never reads pkt_dts: its
-                    // PacedFrame carries the earlier decoder-complete stamp.
-                    frame->pkt_dts = LiGetMicroseconds();
+                    // This is the common client-presentation boundary for
+                    // fixed and VRR accounting. VRR retains its earlier
+                    // decoder-complete stamp separately for scheduling only.
+                    const uint64_t presentationReadyUs = LiGetMicroseconds();
+                    frame->pkt_dts = presentationReadyUs;
 
                     if (!m_FrameInfoQueue.isEmpty()) {
                         // Data buffers in the DU are not valid here!
                         DECODE_UNIT du = m_FrameInfoQueue.dequeue();
 
-                        // Preserve the legacy measurement point. VRR's
-                        // decode-complete timestamp above is intentionally a
-                        // separate, earlier value used only for scheduling.
+                        // End decode accounting at the exact boundary where
+                        // presentation accounting begins so the two stages
+                        // neither overlap nor leave a gap.
                         m_ActiveWndVideoStats.totalDecodeTimeUs +=
-                            (LiGetMicroseconds() - du.enqueueTimeUs);
+                            (presentationReadyUs - du.enqueueTimeUs);
 
                         // Store the presentation time (90 kHz timebase) for
                         // existing renderers. VRR uses PacedFrame instead.
@@ -2209,6 +2293,24 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     }
     m_ActiveWndVideoStats.maxHostCaptureLatency = qMax(m_ActiveWndVideoStats.maxHostCaptureLatency, du->frameCaptureLatency);
     m_ActiveWndVideoStats.totalHostCaptureLatency += du->frameCaptureLatency;
+
+    if (du->frameTransportPrepLatency != 0) {
+        if (m_ActiveWndVideoStats.minHostTransportLatency != 0) {
+            m_ActiveWndVideoStats.minHostTransportLatency = qMin(
+                m_ActiveWndVideoStats.minHostTransportLatency,
+                du->frameTransportPrepLatency);
+        }
+        else {
+            m_ActiveWndVideoStats.minHostTransportLatency =
+                du->frameTransportPrepLatency;
+        }
+        m_ActiveWndVideoStats.framesWithHostTransportLatency += 1;
+    }
+    m_ActiveWndVideoStats.maxHostTransportLatency = qMax(
+        m_ActiveWndVideoStats.maxHostTransportLatency,
+        du->frameTransportPrepLatency);
+    m_ActiveWndVideoStats.totalHostTransportLatency +=
+        du->frameTransportPrepLatency;
 
     m_ActiveWndVideoStats.receivedFrames++;
     m_ActiveWndVideoStats.totalFrames++;

@@ -391,17 +391,24 @@ int VrrPacingWorker::run()
         recordSubmission(feedback, presentStartUs, presentEndUs);
 
         if (feedback.presented && !feedback.cancelled) {
+            const uint64_t frameReadyUs =
+                static_cast<uint64_t>(frame.frame()->pkt_dts);
             m_VideoStats->totalPacerTimeUs +=
-                preparationStartUs >= frame.decodeCompleteUs() ?
-                    preparationStartUs - frame.decodeCompleteUs() : 0;
-            m_VideoStats->totalRenderTimeUs += preparationDurationUs +
-                (presentEndUs >= presentStartUs ?
-                    presentEndUs - presentStartUs : 0);
+                preparationStartUs >= frameReadyUs ?
+                    preparationStartUs - frameReadyUs : 0;
+            // Include the prepared-frame hold between preparation and Present.
+            // The old split omitted that interval entirely, making the VRR
+            // path incomparable with fixed presentation.
+            m_VideoStats->totalRenderTimeUs +=
+                presentEndUs >= preparationStartUs ?
+                    presentEndUs - preparationStartUs : 0;
             m_VideoStats->renderedFrames++;
         }
         else {
             m_VideoStats->pacerDroppedFrames++;
         }
+
+        collectDisplayedFrameTimings();
 
         m_DeferredFrame = std::move(frame);
     }
@@ -409,6 +416,20 @@ int VrrPacingWorker::run()
     // Release any native state retained between preparation and presentation.
     m_Presenter->cancelFrame();
     return 0;
+}
+
+void VrrPacingWorker::collectDisplayedFrameTimings()
+{
+    DisplayedFrameTiming timing;
+    while (m_Presenter->takeDisplayedFrameTiming(timing)) {
+        if (timing.displayTimeUs < timing.frameReadyUs) {
+            continue;
+        }
+
+        m_VideoStats->totalClientPresentationTimeUs +=
+            timing.displayTimeUs - timing.frameReadyUs;
+        m_VideoStats->framesWithClientPresentationTime++;
+    }
 }
 
 bool VrrPacingWorker::dequeueFrame(PacedFrame& frame)
