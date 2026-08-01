@@ -17,6 +17,7 @@ constexpr uint64_t kBaseGuardDivisor = 96;
 constexpr uint64_t kMinimumGuardUs = 100;
 constexpr uint64_t kMaximumBaseGuardUs = 250;
 constexpr uint64_t kMaximumAdaptiveGuardUs = 1000;
+constexpr uint64_t kLowLatencyScanoutGuardUs = 1000;
 constexpr uint64_t kGuardStepUs = 50;
 constexpr size_t kGuardDecayFrames = 120;
 
@@ -107,9 +108,12 @@ VrrTimingController::VrrTimingController(const VrrSessionConfig& config,
         m_Config.streamRateHz, m_DisplayPeriodUs * kQ16One);
     m_ConfiguredStreamPeriodUs = std::max<uint64_t>(
         1, roundedQ16(m_ConfiguredStreamPeriodQ16));
-    m_BaseGuardUs = clampUnsigned(m_DisplayPeriodUs / kBaseGuardDivisor,
-                                  kMinimumGuardUs,
-                                  kMaximumBaseGuardUs);
+    m_BaseGuardUs = m_Config.lowLatency ?
+        std::min(kLowLatencyScanoutGuardUs,
+                 std::max(kMinimumGuardUs, m_DisplayPeriodUs / 4)) :
+        clampUnsigned(m_DisplayPeriodUs / kBaseGuardDivisor,
+                      kMinimumGuardUs,
+                      kMaximumBaseGuardUs);
     clearTimeline(false);
 }
 
@@ -126,9 +130,10 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_SourcePeriodUsQ16 = m_ConfiguredStreamPeriodQ16;
     m_SourcePeriodUs = std::max<uint64_t>(
         1, roundedQ16(m_SourcePeriodUsQ16));
-    m_LatchedPresentation = m_CanLatchPresentation && m_SourcePeriodUs <
-        saturatingAdd(m_DisplayPeriodUs,
-                      latchedPresentationHeadroomUs());
+    m_LatchedPresentation = !m_Config.lowLatency &&
+        m_CanLatchPresentation && m_SourcePeriodUs <
+            saturatingAdd(m_DisplayPeriodUs,
+                          latchedPresentationHeadroomUs());
     m_ReadinessBudgetUs = 0;
     m_ReadinessPhaseUs = 0;
     m_ReadinessDemandUs = retainLearnedBudgets ?
@@ -305,9 +310,16 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         applyReadinessBudget(false);
     }
 
-    uint64_t targetUs = saturatingAdd(
-        std::max(addSigned(m_SourceTimeUs, m_ReadinessBudgetUs), nowUs),
-        m_RenderLeadUs);
+    // Smooth VRR uses a projected sender clock and readiness reserve to hide
+    // arrival variation. Low-latency VRR is deliberately arrival-driven:
+    // present the newest decoded frame as soon as preparation permits, then
+    // let the display-spacing floor absorb bursts and use refresh headroom to
+    // catch up after a late decode. Applying the projected readiness reserve
+    // here would turn already-absorbed jitter into standing latency.
+    const uint64_t presentationBaseUs = m_Config.lowLatency ?
+        std::max(frame.decodeCompleteUs(), nowUs) :
+        std::max(addSigned(m_SourceTimeUs, m_ReadinessBudgetUs), nowUs);
+    uint64_t targetUs = saturatingAdd(presentationBaseUs, m_RenderLeadUs);
 
     // This is a live, one-slot path. An unconfirmed RTP/frame jump may
     // describe already-skipped content, never hundreds of milliseconds that
@@ -343,7 +355,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.targetWakeLeadUs = m_TargetWakeLeadUs;
 
     const uint64_t learnedHeadroomUs = headroomUs();
-    if (!m_CanLatchPresentation) {
+    if (m_Config.lowLatency || !m_CanLatchPresentation) {
         m_LatchedPresentation = false;
     }
     else if (m_LatchedPresentation) {
@@ -799,7 +811,7 @@ void VrrTimingController::applyReadinessBudget(bool acquireReserve)
     // quantized late arrivals clamp the target to "now" and turns their 8/16
     // ms atoms into visible presentation bursts. Credit slack only when at
     // least a full additional display period is available; tight and
-    // near-ceiling cadences retain the complete learned cushion.
+    // near-ceiling smooth cadences retain the complete learned cushion.
     const uint64_t cadenceHeadroomUs = headroomUs();
     const uint64_t usableHeadroomUs =
         m_SourcePeriodUs >= m_DisplayPeriodUs * kLooseHeadroomDisplayPeriods ?

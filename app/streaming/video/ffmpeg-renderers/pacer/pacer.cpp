@@ -292,6 +292,8 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         config.streamRateHz = maxVideoFps;
         config.displayRefreshHz = vrrDisplayRefreshHz;
+        config.lowLatency = maxVideoFps ==
+            VrrRatePolicy::lowLatencyRateForRefresh(vrrDisplayRefreshHz);
 
         if (!enableVsync) {
             fallbackReason = VrrFallbackReason::IneffectiveVsync;
@@ -326,7 +328,8 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                     if (m_VrrWorker->start()) {
                         m_DisplayFps = config.displayRefreshHz;
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "VRR pacing: target %d Hz with %d FPS stream",
+                                    "VRR pacing: %s target %d Hz with %d FPS stream",
+                                    config.lowLatency ? "low-latency" : "smooth",
                                     m_DisplayFps, m_MaxVideoFps);
                         return true;
                     }
