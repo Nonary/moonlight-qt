@@ -819,6 +819,16 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalHostProcessingLatency += src.totalHostProcessingLatency;
     dst.framesWithHostProcessingLatency += src.framesWithHostProcessingLatency;
 
+    if (dst.minHostCaptureLatency == 0) {
+        dst.minHostCaptureLatency = src.minHostCaptureLatency;
+    }
+    else if (src.minHostCaptureLatency != 0) {
+        dst.minHostCaptureLatency = qMin(dst.minHostCaptureLatency, src.minHostCaptureLatency);
+    }
+    dst.maxHostCaptureLatency = qMax(dst.maxHostCaptureLatency, src.maxHostCaptureLatency);
+    dst.totalHostCaptureLatency += src.totalHostCaptureLatency;
+    dst.framesWithHostCaptureLatency += src.framesWithHostCaptureLatency;
+
     if (!LiGetEstimatedRttInfo(&dst.lastRtt, &dst.lastRttVariance)) {
         dst.lastRtt = 0;
         dst.lastRttVariance = 0;
@@ -985,6 +995,23 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         offset += ret;
     }
 
+    // The capture wait (compositor present to capture dequeue) is reported
+    // separately from host processing latency, never merged into it.
+    if (stats.framesWithHostCaptureLatency > 0) {
+        ret = snprintf(&output[offset],
+                       length - offset,
+                       "Host capture latency min/max/average: %.1f/%.1f/%.1f ms\n",
+                       (float)stats.minHostCaptureLatency / 10,
+                       (float)stats.maxHostCaptureLatency / 10,
+                       (float)stats.totalHostCaptureLatency / 10 / stats.framesWithHostCaptureLatency);
+        if (ret < 0 || ret >= length - offset) {
+            SDL_assert(false);
+            return;
+        }
+
+        offset += ret;
+    }
+
     if (stats.renderedFrames != 0) {
         char rttString[32];
 
@@ -1009,6 +1036,41 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                        (double)(stats.totalDecodeTimeUs / 1000.0) / stats.decodedFrames,
                        (double)(stats.totalPacerTimeUs / 1000.0) / stats.renderedFrames,
                        (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames);
+        if (ret < 0 || ret >= length - offset) {
+            SDL_assert(false);
+            return;
+        }
+
+        offset += ret;
+    }
+
+    if (stats.renderedFrames != 0 && stats.decodedFrames != 0 &&
+            stats.receivedFrames != 0 &&
+            stats.framesWithHostProcessingLatency > 0 && stats.lastRtt != 0) {
+        // Host and client clocks are never compared directly: the host ships
+        // its capture-to-send time over RTP as a duration, and every client
+        // term (reassembly, decode, pacing/VRR queue wait, render) is measured
+        // on the local clock. Only the one-way network hop is an estimate,
+        // taken as half the ENet round-trip time.
+        double totalEndToEndMs =
+            (double)stats.totalHostProcessingLatency / 10 / stats.framesWithHostProcessingLatency +
+            (double)stats.lastRtt / 2 +
+            (double)(stats.totalReassemblyTimeUs / 1000.0) / stats.receivedFrames +
+            (double)(stats.totalDecodeTimeUs / 1000.0) / stats.decodedFrames +
+            (double)(stats.totalPacerTimeUs / 1000.0) / stats.renderedFrames +
+            (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames;
+
+        // The capture wait is disjoint from host processing latency, so a
+        // host that reports it extends the total back to compositor present.
+        if (stats.framesWithHostCaptureLatency > 0) {
+            totalEndToEndMs +=
+                (double)stats.totalHostCaptureLatency / 10 / stats.framesWithHostCaptureLatency;
+        }
+
+        ret = snprintf(&output[offset],
+                       length - offset,
+                       "Estimated end-to-end latency (host capture to client present): %.1f ms\n",
+                       totalEndToEndMs);
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);
             return;
@@ -2135,6 +2197,18 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     }
     m_ActiveWndVideoStats.maxHostProcessingLatency = qMax(m_ActiveWndVideoStats.maxHostProcessingLatency, du->frameHostProcessingLatency);
     m_ActiveWndVideoStats.totalHostProcessingLatency += du->frameHostProcessingLatency;
+
+    if (du->frameCaptureLatency != 0) {
+        if (m_ActiveWndVideoStats.minHostCaptureLatency != 0) {
+            m_ActiveWndVideoStats.minHostCaptureLatency = qMin(m_ActiveWndVideoStats.minHostCaptureLatency, du->frameCaptureLatency);
+        }
+        else {
+            m_ActiveWndVideoStats.minHostCaptureLatency = du->frameCaptureLatency;
+        }
+        m_ActiveWndVideoStats.framesWithHostCaptureLatency += 1;
+    }
+    m_ActiveWndVideoStats.maxHostCaptureLatency = qMax(m_ActiveWndVideoStats.maxHostCaptureLatency, du->frameCaptureLatency);
+    m_ActiveWndVideoStats.totalHostCaptureLatency += du->frameCaptureLatency;
 
     m_ActiveWndVideoStats.receivedFrames++;
     m_ActiveWndVideoStats.totalFrames++;

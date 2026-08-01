@@ -9,11 +9,10 @@
 
 namespace {
 
-// Keep enough decoded successors to absorb the short gap-then-burst delivery
-// pattern seen near the panel ceiling. Capacity remains bounded and evicts the
-// oldest queued successor under sustained pressure, so it cannot accumulate
-// an unbounded latency backlog.
-constexpr size_t kMaximumQueuedFrames = 3;
+// VRR is the explicit lowest-latency mode. Retain only the newest decoded
+// successor while the worker prepares or presents the current frame, so a
+// decoder burst cannot become a client-side playout backlog.
+constexpr size_t kMaximumQueuedFrames = 1;
 
 constexpr uint32_t kVrrWindowStateMask =
     WINDOW_STATE_CHANGE_SIZE |
