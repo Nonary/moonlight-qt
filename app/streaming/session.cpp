@@ -1465,6 +1465,16 @@ void Session::updateOptimalWindowDisplayMode()
     SDL_DisplayMode desktopMode, bestMode, mode;
     int displayIndex = SDL_GetWindowDisplayIndex(m_Window);
 
+    // Borderless VRR must stay in the desktop's active mode. Selecting a mode
+    // whose refresh evenly divides the requested FPS is fixed-refresh policy;
+    // at 100 FPS it can preselect 100 Hz and remove the 120 Hz catch-up range
+    // that adaptive presentation is meant to use.
+    if (m_PresentationSettings.enableVrr) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "VRR active; retaining current desktop display mode");
+        return;
+    }
+
     // Try the current display mode first. On macOS, this will be the normal
     // scaled desktop resolution setting.
     if (SDL_GetDesktopDisplayMode(displayIndex, &desktopMode) == 0) {

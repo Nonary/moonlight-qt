@@ -15,6 +15,7 @@ extern "C" {
 struct VrrSessionConfig {
     int displayRefreshHz = 0;
     int streamRateHz = 0;
+    bool lowLatency = false;
 };
 
 // A move-only frame record.  Decoder completion is captured while the
