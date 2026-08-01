@@ -874,6 +874,11 @@ uint64_t VrrTimingController::displayPeriodUs() const
     return m_DisplayPeriodUs;
 }
 
+uint64_t VrrTimingController::preparationBudgetUs() const
+{
+    return saturatingAdd(m_RenderLeadUs, m_RenderWakeLeadUs);
+}
+
 uint64_t VrrTimingController::earliestSubmissionUs() const
 {
     if (!m_HaveLastSubmission) {

@@ -1981,15 +1981,14 @@ bool D3D11VARenderer::initializeBlackFrameInsertion()
                 m_DecoderParams.enableVrr ? " using VRR" : "");
     if (m_DecoderParams.enableVrr && displayRefreshHz > 4 &&
             requiredRefreshHz > displayRefreshHz - 4) {
-        // Total presents per second should stop below the nominal refresh,
-        // matching the plain-VRR headroom rule (116 FPS on 120 Hz). Above
-        // it, the pacer's ceiling governor evens the books by occasionally
-        // presenting a frame without its black transition.
+        // Total presents per second stop below nominal refresh, matching the
+        // plain-VRR headroom rule (116 presents/sec on 120 Hz). The pacer
+        // keeps a fixed black/video carrier at that sustainable rate and
+        // samples source frames into it without changing luminance duty cycle.
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "BFI at %d FPS submits %d presents/sec, above the "
-                    "adaptive headroom ceiling of %d/sec; governed black "
-                    "skips will occur. A %d FPS stream gives every frame "
-                    "a full pair.",
+                    "adaptive headroom ceiling of %d/sec; the fixed carrier "
+                    "will run at %d pairs/sec and sample source frames.",
                     m_DecoderParams.frameRate, requiredRefreshHz,
                     displayRefreshHz - 4, (displayRefreshHz - 4) / 2);
     }
@@ -2249,83 +2248,10 @@ VrrPresentFeedback D3D11VARenderer::presentIdlePreFrame(
     return feedback;
 }
 
-VrrPresentFeedback D3D11VARenderer::presentIdleFrameRecovery(
+VrrPresentFeedback D3D11VARenderer::presentIdleFrameRepeat(
     const VrrPresentRequest& request)
 {
-    VrrPresentFeedback feedback;
-    if (!m_BlackFrameInsertionActive || m_VrrSuspended ||
-            m_VrrFramePrepared || m_VrrContextLocked) {
-        return feedback;
-    }
-
-    // No source frame is prepared while the worker waits, so serialize this
-    // small cached-image pass explicitly against FFmpeg and window changes.
-    lockContext(this);
-    if (!m_BlackFrameInsertionActive || m_VrrSuspended ||
-            m_RenderDeviceContext == nullptr ||
-            m_RenderTargetView == nullptr ||
-            m_BlackFrameInsertionVideoTextureSrv == nullptr ||
-            m_BlackFrameInsertionFullscreenVertexBuffer == nullptr ||
-            m_BlackFrameInsertionDimPixelShader == nullptr ||
-            m_SwapChain == nullptr) {
-        unlockContext(this);
-        return feedback;
-    }
-
-    m_RenderDeviceContext->OMSetRenderTargets(
-        1, m_RenderTargetView.GetAddressOf(), nullptr);
-
-    UINT stride = sizeof(VERTEX);
-    UINT offset = 0;
-    ID3D11Buffer* fullscreenVertexBuffer =
-        m_BlackFrameInsertionFullscreenVertexBuffer.Get();
-    m_RenderDeviceContext->IASetVertexBuffers(
-        0, 1, &fullscreenVertexBuffer, &stride, &offset);
-    m_RenderDeviceContext->PSSetShader(
-        m_BlackFrameInsertionDimPixelShader.Get(), nullptr, 0);
-    ID3D11ShaderResourceView* cachedVideoSrv =
-        m_BlackFrameInsertionVideoTextureSrv.Get();
-    m_RenderDeviceContext->PSSetShaderResources(
-        0, 1, &cachedVideoSrv);
-    m_RenderDeviceContext->OMSetBlendState(
-        m_VideoBlendState.Get(), nullptr, 0xffffffff);
-    m_RenderDeviceContext->DrawIndexed(6, 0, 0);
-
-    // The next decoded frame copies the back buffer into this cache. Unbind it
-    // now so that CopyResource never sees the destination still bound as an
-    // input resource.
-    ID3D11ShaderResourceView* nullSrv = nullptr;
-    m_RenderDeviceContext->PSSetShaderResources(0, 1, &nullSrv);
-
-    const UINT presentFlags = bfiVrrPresentFlags(request);
-    const uint64_t submissionTimeUs = LiGetMicroseconds();
-    const HRESULT hr = presentPreparedFrame(presentFlags);
-    unlockContext(this);
-
-    if (FAILED(hr)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "D3D11 VRR BFI idle brightness recovery failed: %x",
-                     hr);
-        queueRenderDeviceReset();
-        feedback.cancelled = true;
-        return feedback;
-    }
-    if (hr != S_OK) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "D3D11 VRR BFI idle brightness recovery returned non-display status: %x",
-                    hr);
-        feedback.cancelled = true;
-        return feedback;
-    }
-
-    feedback.presented = true;
-    feedback.submissionTimeValid = true;
-    feedback.submissionTimeUs = submissionTimeUs;
-    // This normal-luminance image completes an idle-started black phase when
-    // no decoded successor arrived before its video deadline.
-    m_BlackFrameInsertionBlackPresented = false;
-    populateVrrPresentFeedback(feedback, presentFlags);
-    return feedback;
+    return presentPairRepeatVideo(request);
 }
 
 VrrPresentFeedback D3D11VARenderer::presentPairRepeatBlack(
@@ -2371,6 +2297,7 @@ VrrPresentFeedback D3D11VARenderer::presentPairRepeatBlack(
     feedback.presented = true;
     feedback.submissionTimeValid = true;
     feedback.submissionTimeUs = submissionTimeUs;
+    m_BlackFrameInsertionBlackPresented = true;
     populateVrrPresentFeedback(feedback, presentFlags);
     return feedback;
 }
@@ -2415,6 +2342,7 @@ VrrPresentFeedback D3D11VARenderer::presentPairRepeatVideo(
     feedback.presented = true;
     feedback.submissionTimeValid = true;
     feedback.submissionTimeUs = submissionTimeUs;
+    m_BlackFrameInsertionBlackPresented = false;
     populateVrrPresentFeedback(feedback, presentFlags);
     return feedback;
 }

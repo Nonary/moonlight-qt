@@ -100,14 +100,8 @@ private:
     // a display whose VRR genuinely follows our presents. Opt-in only.
     bool m_BfiGridLockEnabled = false;
 
-    // A pair costs two refreshes of the panel's true minimum period. When
-    // that exceeds the source period (stream rate * 2 above the real VRR
-    // ceiling), the overdraft accumulates here and is repaid by presenting
-    // one frame without its black transition at normal luminance.
-    uint64_t m_BfiCeilingDebtQ16 = 0;
-
     // The same adaptive-refresh headroom rule the plain VRR path uses:
-    // total presents per second stop a few Hz below the nominal refresh
-    // (116/s on a 120 Hz panel), never scale up to the nominal ceiling.
+    // the fixed BFI carrier phase is never shorter than this period, so total
+    // presents stop a few Hz below nominal without luminance-changing skips.
     uint64_t m_BfiSafePresentPeriodQ16 = 0;
 };

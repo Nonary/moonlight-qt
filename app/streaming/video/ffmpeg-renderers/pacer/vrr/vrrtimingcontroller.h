@@ -54,6 +54,7 @@ public:
     void noteAuxiliarySubmission(uint64_t submissionUs);
 
     uint64_t displayPeriodUs() const;
+    uint64_t preparationBudgetUs() const;
     uint64_t earliestSubmissionUs() const;
     uint64_t lastSubmissionUs() const;
     bool hasLastSubmission() const;

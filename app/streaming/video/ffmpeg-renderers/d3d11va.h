@@ -34,7 +34,7 @@ public:
         const VrrPresentRequest& request) override;
     virtual void setFrameDropRecovery(bool enabled) override
         { m_BlackFrameInsertionDropRecovery = enabled; }
-    virtual VrrPresentFeedback presentIdleFrameRecovery(
+    virtual VrrPresentFeedback presentIdleFrameRepeat(
         const VrrPresentRequest& request) override;
     virtual VrrPresentFeedback presentPairRepeatBlack(
         const VrrPresentRequest& request) override;

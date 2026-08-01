@@ -144,10 +144,10 @@ public:
     }
 
     // If a decoded frame still has not arrived by the end of an idle-started
-    // black phase, replace it with a normal-luminance cached image so a true
-    // source/network stall cannot leave black on screen. This is an auxiliary
-    // display transition with no prepared frame.
-    virtual VrrPresentFeedback presentIdleFrameRecovery(
+    // black phase, re-present the cached boosted image. Repeating the complete
+    // black/video carrier pair keeps luminance stable through arbitrary source
+    // cadence changes. This is an auxiliary transition with no prepared frame.
+    virtual VrrPresentFeedback presentIdleFrameRepeat(
         const VrrPresentRequest&)
     {
         return {};

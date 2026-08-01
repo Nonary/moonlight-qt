@@ -722,10 +722,10 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
                     "MOONLIGHT_BFI_GRID_LOCK: assumes a fixed refresh grid");
     }
 
-    // Same headroom rule as the plain VRR path: total presents per second
-    // stop a few Hz below the nominal refresh instead of scaling to the
-    // ceiling. A stream at or below (refresh - headroom) / 2 FPS gives
-    // every frame a full pair with the governor permanently silent.
+    // Same headroom rule as the plain VRR path: the fixed carrier never
+    // submits faster than a few Hz below nominal refresh. If the source rate
+    // exceeds half that ceiling, content is sampled into the sustainable
+    // carrier instead of changing its black/video duty cycle.
     if (config.displayRefreshHz > kBfiAdaptiveHeadroomHz) {
         const uint64_t safeRateHz = static_cast<uint64_t>(
             config.displayRefreshHz - kBfiAdaptiveHeadroomHz);
@@ -907,6 +907,18 @@ int VrrPacingWorker::run()
 
         const uint64_t nominalPrePresentLeadUs =
             m_Presenter->prePresentLeadTimeUs();
+        const uint64_t safePresentPeriodUs =
+            (m_BfiSafePresentPeriodQ16 + 0xffff) >> 16;
+        const uint64_t measuredGridPeriodUs =
+            (m_BfiGridPeriodQ16 + 0xffff) >> 16;
+        // BFI runs as a fixed carrier independent of source cadence. The
+        // carrier cannot exceed the configured duty-cycle rate, the physical
+        // display period, or the VRR headroom ceiling. New frames are sampled
+        // into lit phases; they never move a black/video boundary.
+        const uint64_t bfiPhaseDurationUs = std::max(
+            std::max(nominalPrePresentLeadUs,
+                     m_TimingController->displayPeriodUs()),
+            std::max(safePresentPeriodUs, measuredGridPeriodUs));
         const bool bfiDiagnosticsEnabled =
             nominalPrePresentLeadUs != 0;
         const uint64_t loopNowUs = LiGetMicroseconds();
@@ -937,15 +949,12 @@ int VrrPacingWorker::run()
 
         uint64_t idleTransitionDeadlineUs = 0;
         if (nominalPrePresentLeadUs != 0) {
-            const uint64_t idlePhaseDurationUs =
-                std::max(nominalPrePresentLeadUs,
-                         m_TimingController->displayPeriodUs());
             if (m_BfiIdleBlackPending) {
                 // Bound an idle-started black phase. If no source frame has
-                // arrived by its video deadline, fall back to the cached image
-                // at normal luminance rather than leaving black on screen.
+                // arrived by its video deadline, repeat the cached boosted
+                // image rather than changing the carrier waveform.
                 idleTransitionDeadlineUs = saturatingAdd(
-                    m_BfiIdleBlackSubmissionUs, idlePhaseDurationUs);
+                    m_BfiIdleBlackSubmissionUs, bfiPhaseDurationUs);
             }
             else if (m_BfiBrightFrameHeld &&
                     m_TimingController->hasLastSubmission()) {
@@ -954,7 +963,7 @@ int VrrPacingWorker::run()
                 // black interval instead of delaying the luminance transition.
                 idleTransitionDeadlineUs = saturatingAdd(
                     m_TimingController->lastSubmissionUs(),
-                    idlePhaseDurationUs);
+                    bfiPhaseDurationUs);
             }
         }
 
@@ -994,7 +1003,7 @@ int VrrPacingWorker::run()
                     idleStartUs - idleTransitionDeadlineUs : 0;
             const VrrPresentFeedback idleFeedback =
                 completingIdleBlack ?
-                    m_Presenter->presentIdleFrameRecovery(idleRequest) :
+                    m_Presenter->presentIdleFrameRepeat(idleRequest) :
                     m_Presenter->presentIdlePreFrame(idleRequest);
             const uint64_t idleEndUs = LiGetMicroseconds();
             const uint64_t idleDurationUs =
@@ -1004,7 +1013,7 @@ int VrrPacingWorker::run()
                 idleFeedback, idleStartUs, idleEndUs);
             m_Diagnostics->observePresent(
                 completingIdleBlack ?
-                    BfiPresentPhase::Recovery :
+                    BfiPresentPhase::Video :
                     BfiPresentPhase::Black,
                 idleFeedback,
                 idleSubmissionUs);
@@ -1064,6 +1073,10 @@ int VrrPacingWorker::run()
                 m_Diagnostics->interval.idleRecoveryAttempts++;
                 if (idleSucceeded) {
                     m_Diagnostics->interval.idleRecoverySuccesses++;
+                    if (idleSubmissionUs >= m_BfiIdleBlackSubmissionUs) {
+                        m_Diagnostics->interval.pairGap.add(
+                            idleSubmissionUs - m_BfiIdleBlackSubmissionUs);
+                    }
                     m_TimingController->noteAuxiliarySubmission(
                         idleSubmissionUs);
                 }
@@ -1079,7 +1092,7 @@ int VrrPacingWorker::run()
                         idleEndUs, suppressed)) {
                     SDL_LogWarn(
                         SDL_LOG_CATEGORY_APPLICATION,
-                        "VRR-BFI recovery idle-dim: success=%d presented=%d "
+                        "VRR-BFI idle-video-repeat: success=%d presented=%d "
                         "cancelled=%d deadline_late=%lluus call=%lluus "
                         "pair_target=%lluus black_timeout=1 suppressed=%llu",
                         idleSucceeded ? 1 : 0,
@@ -1094,11 +1107,11 @@ int VrrPacingWorker::run()
             }
 
             // No decoded frame is consumed by either idle transition. A
-            // successful idle-black keeps its renderer-side transition state
-            // pending for the next prepared video; the fallback dim completes
-            // that transition and waits for a future source frame.
-            m_BfiBrightFrameHeld = false;
-            m_LastBfiBrightSubmissionUs = 0;
+            // successful black starts the pending half-cycle; a successful
+            // cached-video repeat completes it and keeps the carrier running.
+            m_BfiBrightFrameHeld = completingIdleBlack && idleSucceeded;
+            m_LastBfiBrightSubmissionUs = m_BfiBrightFrameHeld ?
+                idleSubmissionUs : 0;
             continue;
         }
         if (!frame) {
@@ -1127,13 +1140,10 @@ int VrrPacingWorker::run()
                 frame.decodeCompleteUs() ?
             scheduleNowUs - frame.decodeCompleteUs() : 0;
 
-        // Slow cadence and source gaps no longer switch the renderer into a
-        // multi-frame normal-luminance regime. The scheduled idle-black path
-        // now owns the duty cycle independently of decode arrival: it starts
-        // black on time, lets preparation occupy that interval, and falls back
-        // to a cached normal-luminance image only if the entire black phase
-        // expires without a successor. Avoiding the old 12-frame regime switch
-        // removes a second source of visible brightness pulsing.
+        // Slow cadence and source gaps never change the luminance waveform.
+        // The fixed carrier repeats the cached boosted image when a successor
+        // misses a lit phase, then samples the next ready frame into a later
+        // phase without moving either boundary.
         const uint64_t nominalSourcePeriodUs = nominalPrePresentLeadUs * 2;
         if (nominalPrePresentLeadUs != 0 &&
                 decision.sourcePeriodUs >
@@ -1157,44 +1167,6 @@ int VrrPacingWorker::run()
             }
         }
 
-        // VRR ceiling governor. Two presents per source frame can exceed
-        // the panel's true minimum refresh period (a nominal 120 Hz panel
-        // may only sustain ~118 Hz), and the resulting queue pressure has
-        // to discharge somewhere - visibly, as an uncontrolled repeat or a
-        // walking beat. When the measured overdraft reaches one refresh,
-        // repay it deliberately: present this one frame without its black
-        // transition at normal luminance, which is luminance-neutral and
-        // relieves a full refresh of pressure.
-        const uint64_t presentPeriodFloorQ16 = std::max(
-            m_BfiGridValid ? m_BfiGridPeriodQ16 : 0,
-            m_BfiSafePresentPeriodQ16);
-        bool governorSkip = false;
-        if (nominalPrePresentLeadUs != 0 &&
-                presentPeriodFloorQ16 != 0 &&
-                m_BfiCeilingDebtQ16 >= presentPeriodFloorQ16) {
-            governorSkip = true;
-            m_BfiCeilingDebtQ16 -= presentPeriodFloorQ16;
-            m_Diagnostics->interval.ceilingGovernorSkips++;
-            uint64_t suppressed = 0;
-            if (m_Diagnostics->shouldLog(
-                    BfiDiagnosticWarning::CeilingGovernor,
-                    scheduleNowUs, suppressed)) {
-                SDL_LogInfo(
-                    SDL_LOG_CATEGORY_APPLICATION,
-                    "VRR-BFI ceiling-governor: black skipped to repay "
-                    "refresh overdraft, present_floor=%llu.%02lluus "
-                    "source_period=%lluus stream_at_or_below_half_floor_"
-                    "silences_this suppressed=%llu",
-                    static_cast<unsigned long long>(
-                        presentPeriodFloorQ16 >> 16),
-                    static_cast<unsigned long long>(
-                        ((presentPeriodFloorQ16 & 0xffff) * 100) >> 16),
-                    static_cast<unsigned long long>(
-                        decision.sourcePeriodUs),
-                    static_cast<unsigned long long>(suppressed));
-            }
-        }
-
         const bool pendingIdleBlack =
             m_BfiIdleBlackPending &&
             m_BfiIdleBlackSubmissionUs != 0 &&
@@ -1202,10 +1174,11 @@ int VrrPacingWorker::run()
         // An idle-started black has already committed this source frame to a
         // boosted video half-cycle. Complete that pair before any newly
         // detected source-gap/cadence recovery takes effect on later frames.
-        const bool frameDropRecovery =
-            !pendingIdleBlack &&
-            governorSkip &&
-            nominalPrePresentLeadUs != 0;
+        // The former ceiling governor inserted a normal-luminance frame to
+        // shed one Present. Even with equal time-averaged luminance, switching
+        // waveforms was visible. The fixed carrier incorporates the safe
+        // present period directly, so no steady-state recovery is required.
+        const bool frameDropRecovery = false;
         const uint64_t prePresentLeadUs =
             frameDropRecovery || pendingIdleBlack ?
                 0 : nominalPrePresentLeadUs;
@@ -1288,7 +1261,7 @@ int VrrPacingWorker::run()
         uint64_t plannedBlackSubmitUs = 0;
         uint64_t plannedVideoSubmitUs = 0;
         uint64_t plannedVideoSlotSeq = 0;
-        uint64_t preparationBudgetUs =
+        const uint64_t preparationBudgetUs =
             decision.targetUs > decision.renderStartUs ?
                 decision.targetUs - decision.renderStartUs : 0;
         if (m_BfiGridLockEnabled && prePresentLeadUs != 0) {
@@ -1470,13 +1443,27 @@ int VrrPacingWorker::run()
         // A BFI frame must be fully prepared for the black transition, not
         // merely for the later lit-video target. Starting at the ordinary
         // render deadline made preparation consume the pre-present interval,
-        // so black and video both slipped by one half-cycle.
+        // so black and video both slipped by one half-cycle. A governor
+        // recovery also replaces the black transition, so it must be ready at
+        // that same boundary instead of leaving the previous boosted frame
+        // latched until the ordinary video target.
+        const uint64_t preparationPhaseLeadUs = frameDropRecovery ?
+            nominalPrePresentLeadUs : prePresentLeadUs;
+        const bool carrierBlackScheduled =
+            prePresentLeadUs != 0 && m_BfiBrightFrameHeld &&
+            m_TimingController->hasLastSubmission();
+        const uint64_t carrierBlackTargetUs = carrierBlackScheduled ?
+            saturatingAdd(m_TimingController->lastSubmissionUs(),
+                          bfiPhaseDurationUs) : 0;
         const uint64_t renderStartUs = pendingIdleBlack ? 0 :
             (gridLocked ?
                 (plannedBlackSubmitUs > preparationBudgetUs ?
                     plannedBlackSubmitUs - preparationBudgetUs : 0) :
-                (decision.renderStartUs > prePresentLeadUs ?
-                    decision.renderStartUs - prePresentLeadUs : 0));
+                (carrierBlackScheduled ?
+                    (carrierBlackTargetUs > preparationBudgetUs ?
+                        carrierBlackTargetUs - preparationBudgetUs : 0) :
+                    (decision.renderStartUs > preparationPhaseLeadUs ?
+                        decision.renderStartUs - preparationPhaseLeadUs : 0)));
         const VrrTargetWaitResult renderWait =
             m_TargetWaiter.waitUntil(renderStartUs);
         // A deadline that was already in the past is not an OS wake delay.
@@ -1535,8 +1522,8 @@ int VrrPacingWorker::run()
             continue;
         }
 
-        // Recovery occupies the existing video slot at half luminance and
-        // omits its black pre-transition. It adds neither a Present nor a
+        // Recovery replaces the black half-cycle at half luminance and omits
+        // the boosted video transition. It adds neither a Present nor a
         // full-screen correction pass to the queue.
         m_Presenter->setFrameDropRecovery(frameDropRecovery);
         const uint64_t preparationStartUs = LiGetMicroseconds();
@@ -1605,23 +1592,31 @@ int VrrPacingWorker::run()
         uint64_t preSubmissionUs = pendingIdleBlack ?
             m_BfiIdleBlackSubmissionUs : 0;
 
-        // A 50% duty cycle belongs to the actual source cadence, not the
-        // negotiated rate: with the black interval fixed at the nominal lead,
-        // a source running slightly slow stretches only the bright phase and
-        // the average luminance climbs. Stretch the black-to-video interval
-        // to half the learned period so black and bright stay equal. The
-        // cadence hold bounds the learned period at 9/8 nominal for pair
-        // frames, and the same bound is applied here defensively.
-        const uint64_t pairIntervalUs = std::min(
-            std::max(nominalPrePresentLeadUs, decision.sourcePeriodUs / 2),
-            saturatingAdd(nominalPrePresentLeadUs,
-                          nominalPrePresentLeadUs /
-                              kBfiSlowCadenceToleranceDivisor));
+        if (frameDropRecovery) {
+            // A single 300-nit recovery held for the complete source period
+            // has the same average luminance as a 600-nit 50% duty-cycle pair.
+            // Submit it where black would normally begin; waiting for the
+            // ordinary video target visibly extends the preceding 600-nit
+            // phase and turns every governor action into a bright flash.
+            const uint64_t requestedRecoveryTargetUs =
+                decision.targetUs > nominalPrePresentLeadUs ?
+                    decision.targetUs - nominalPrePresentLeadUs : 0;
+            const uint64_t minimumRecoveryTargetUs =
+                m_TimingController->hasLastSubmission() ?
+                    saturatingAdd(
+                        m_TimingController->lastSubmissionUs(),
+                        m_TimingController->displayPeriodUs()) : 0;
+            videoTargetUs = std::max(requestedRecoveryTargetUs,
+                                     minimumRecoveryTargetUs);
+        }
+
+        // Source cadence selects content, not luminance timing. Every black
+        // and video phase uses the same fixed carrier interval.
+        const uint64_t pairIntervalUs = bfiPhaseDurationUs;
         if (pendingIdleBlack &&
                 preSubmissionUs <=
                     std::numeric_limits<uint64_t>::max() - pairIntervalUs) {
-            videoTargetUs = std::max(
-                videoTargetUs, preSubmissionUs + pairIntervalUs);
+            videoTargetUs = preSubmissionUs + pairIntervalUs;
         }
         if (prePresentLeadUs != 0) {
             m_Diagnostics->interval.pairAttempts++;
@@ -1639,10 +1634,11 @@ int VrrPacingWorker::run()
                 m_TimingController->hasLastSubmission() ?
                     saturatingAdd(
                         m_TimingController->lastSubmissionUs(),
-                        m_TimingController->displayPeriodUs()) : 0;
+                        bfiPhaseDurationUs) : 0;
             const uint64_t preTargetUs = gridLocked ?
                 std::max(plannedBlackSubmitUs, minimumPreTargetUs) :
-                std::max(requestedPreTargetUs, minimumPreTargetUs);
+                (carrierBlackScheduled ? minimumPreTargetUs :
+                    std::max(requestedPreTargetUs, minimumPreTargetUs));
             m_TargetWaiter.waitUntil(
                 preTargetUs, decision.targetWakeLeadUs);
             while (LiGetMicroseconds() < preTargetUs) {
@@ -1731,9 +1727,7 @@ int VrrPacingWorker::run()
                     preSubmissionUs <=
                         std::numeric_limits<uint64_t>::max() -
                             pairIntervalUs) {
-                videoTargetUs = std::max(
-                    videoTargetUs,
-                    preSubmissionUs + pairIntervalUs);
+                videoTargetUs = preSubmissionUs + pairIntervalUs;
             }
         }
 
@@ -1768,8 +1762,19 @@ int VrrPacingWorker::run()
         // clock must not turn an early return into an early submission.
         // This frame's floor is fixed before the clean-spacing feedback, so a
         // guard decay can only take effect from the next frame onward.
+        // Pair black transitions intentionally use the physical display
+        // period without the controller's adaptive guard. Governor recovery
+        // replaces that transition and must use the same floor or the guard
+        // would lengthen the boosted phase again.
+        const uint64_t submissionSpacingFloorUs =
+            frameDropRecovery &&
+                    m_TimingController->hasLastSubmission() ?
+                saturatingAdd(
+                    m_TimingController->lastSubmissionUs(),
+                    m_TimingController->displayPeriodUs()) :
+                m_TimingController->earliestSubmissionUs();
         const uint64_t presentationFloorUs = std::max(
-            videoTargetUs, m_TimingController->earliestSubmissionUs());
+            videoTargetUs, submissionSpacingFloorUs);
         m_TimingController->noteSpacingDeficit(0);
         while (LiGetMicroseconds() < presentationFloorUs) {
             m_TargetWaiter.waitUntil(presentationFloorUs);
@@ -1871,6 +1876,11 @@ int VrrPacingWorker::run()
                 BfiPresentPhase::Video,
             feedback,
             videoSubmissionUs);
+        if (frameDropRecovery && m_LastBfiBrightSubmissionUs != 0 &&
+                videoSubmissionUs >= m_LastBfiBrightSubmissionUs) {
+            m_Diagnostics->interval.brightGap.add(
+                videoSubmissionUs - m_LastBfiBrightSubmissionUs);
+        }
         observeGridSample(feedback);
         if (pendingIdleBlack) {
             m_BfiIdleBlackPending = false;
@@ -1974,27 +1984,6 @@ int VrrPacingWorker::run()
                 m_BfiLastVideoSlotSeq = plannedVideoSlotSeq;
             }
 
-            // Ceiling-overdraft accounting: a completed pair consumed two
-            // refreshes of the governed present period against one source
-            // period of real time. A single-present frame (recovery or a
-            // governor skip) relieves all standing pressure.
-            if (preSubmissionUs != 0 && presentPeriodFloorQ16 != 0 &&
-                    decision.sourcePeriodUs <=
-                        std::numeric_limits<uint64_t>::max() >> 16) {
-                const uint64_t pairCostQ16 = 2 * presentPeriodFloorQ16;
-                const uint64_t sourceQ16 = decision.sourcePeriodUs << 16;
-                if (pairCostQ16 > sourceQ16) {
-                    m_BfiCeilingDebtQ16 = saturatingAdd(
-                        m_BfiCeilingDebtQ16, pairCostQ16 - sourceQ16);
-                }
-                else {
-                    m_BfiCeilingDebtQ16 = 0;
-                }
-            }
-            else if (preSubmissionUs == 0) {
-                m_BfiCeilingDebtQ16 = 0;
-            }
-
             if (frameDropRecovery) {
                 m_Diagnostics->interval.recoveryFrames++;
             }
@@ -2041,6 +2030,34 @@ bool VrrPacingWorker::dequeueFrame(PacedFrame& frame,
 {
     idleTransitionDue = false;
     QMutexLocker lock(&m_FrameQueueLock);
+
+    // During black, do not accept a newly arrived frame if the learned
+    // preparation budget no longer fits before the lit boundary. Wait out the
+    // remaining interval and repeat the cached video instead. The queued frame
+    // remains available for the next carrier cycle, trading content freshness
+    // for an invariant luminance waveform.
+    if (m_BfiIdleBlackPending && idleTransitionDeadlineUs != 0 &&
+            !m_FrameQueue.empty() && !isStopping() &&
+            !m_Suspended.load() &&
+            m_PendingWindowStateFlags.load() == 0) {
+        const uint64_t preparationBudgetUs =
+            m_TimingController->preparationBudgetUs();
+        uint64_t nowUs = LiGetMicroseconds();
+        while (!isStopping() && !m_Suspended.load() &&
+                m_PendingWindowStateFlags.load() == 0 &&
+                nowUs < idleTransitionDeadlineUs &&
+                idleTransitionDeadlineUs - nowUs <= preparationBudgetUs) {
+            const uint64_t remainingUs = idleTransitionDeadlineUs - nowUs;
+            const uint64_t remainingMs = (remainingUs + 999) / 1000;
+            m_FrameQueueNotEmpty.wait(
+                &m_FrameQueueLock,
+                static_cast<unsigned long>(std::min<uint64_t>(
+                    remainingMs,
+                    std::numeric_limits<unsigned long>::max())));
+            nowUs = LiGetMicroseconds();
+        }
+    }
+
     while (!isStopping() && !m_Suspended.load() &&
             m_PendingWindowStateFlags.load() == 0 &&
             m_FrameQueue.empty()) {
@@ -2066,6 +2083,17 @@ bool VrrPacingWorker::dequeueFrame(PacedFrame& frame,
 
     if (isStopping()) {
         return false;
+    }
+    // A frame arriving at either phase deadline wakes the queue wait and makes
+    // its empty-queue loop condition false. Recheck the deadline before
+    // popping it: start black on time, or finish black with a cached boosted
+    // repeat and sample the queued frame into the next lit phase.
+    if (!m_Suspended.load() &&
+            m_PendingWindowStateFlags.load() == 0 &&
+            idleTransitionDeadlineUs != 0 &&
+            LiGetMicroseconds() >= idleTransitionDeadlineUs) {
+        idleTransitionDue = true;
+        return true;
     }
     if (m_Suspended.load() || m_FrameQueue.empty()) {
         return true;
