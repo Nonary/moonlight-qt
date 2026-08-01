@@ -205,6 +205,7 @@ NvHTTP::startApp(QString verb,
                  bool localAudio,
                  int gamepadMask,
                  bool persistGameControllersOnDisconnect,
+                 bool clientVrrRequested,
                  QString& rtspSessionUrl)
 {
     int riKeyId;
@@ -234,6 +235,10 @@ NvHTTP::startApp(QString verb,
                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+
                                    "&gcmap="+QString::number(gamepadMask)+
                                    "&gcpersist="+QString::number(persistGameControllersOnDisconnect ? 1 : 0)+
+                                   // This reports launch-time VRR qualification. The
+                                   // renderer can still reject VRR after the stream starts.
+                                   ((clientVrrRequested && !isGfe) ?
+                                       "&clientVrrRequested=1" : "")+
                                    LiGetLaunchUrlQueryParameters(),
                                    LAUNCH_TIMEOUT_MS);
 
