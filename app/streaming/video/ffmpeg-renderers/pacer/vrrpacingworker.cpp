@@ -20,6 +20,12 @@ constexpr size_t kMaximumQueuedFrames = 3;
 constexpr uint64_t kBfiDiagnosticSummaryIntervalUs = 30ULL * 1000 * 1000;
 constexpr uint64_t kBfiDiagnosticWarningCooldownUs = 60ULL * 1000 * 1000;
 
+// QWaitCondition accepts whole milliseconds. Keep the queue wait interruptible
+// for most of an idle BFI phase, then use the normal high-resolution target
+// waiter for the final portion so black/video transitions do not inherit up to
+// one millisecond of timeout rounding.
+constexpr uint64_t kBfiIdlePrecisionWaitUs = 2000;
+
 // A frame that arrives too late to reach its black transition on time is a
 // slowdown signal: present it promptly at normal luminance instead of
 // discarding it for a recycled dim image. The tolerance absorbs scheduler
@@ -2031,6 +2037,27 @@ bool VrrPacingWorker::dequeueFrame(PacedFrame& frame,
     idleTransitionDue = false;
     QMutexLocker lock(&m_FrameQueueLock);
 
+    const auto finishIdleTransitionWait = [this, &lock,
+                                            idleTransitionDeadlineUs,
+                                            &idleTransitionDue]() {
+        // A frame that arrives during this bounded final wait remains queued
+        // for the next lit slot. The caller rechecks stop, suspension, and
+        // window-state notifications before issuing the idle transition.
+        lock.unlock();
+        while (LiGetMicroseconds() < idleTransitionDeadlineUs) {
+            m_TargetWaiter.waitUntil(idleTransitionDeadlineUs);
+        }
+        idleTransitionDue = true;
+        return true;
+    };
+
+    const auto coarseWaitMilliseconds = [](uint64_t remainingUs) {
+        const uint64_t coarseWaitUs =
+            remainingUs > kBfiIdlePrecisionWaitUs ?
+                remainingUs - kBfiIdlePrecisionWaitUs : 0;
+        return std::max<uint64_t>(1, (coarseWaitUs + 999) / 1000);
+    };
+
     // During black, do not accept a newly arrived frame if the learned
     // preparation budget no longer fits before the lit boundary. Wait out the
     // remaining interval and repeat the cached video instead. The queued frame
@@ -2048,7 +2075,11 @@ bool VrrPacingWorker::dequeueFrame(PacedFrame& frame,
                 nowUs < idleTransitionDeadlineUs &&
                 idleTransitionDeadlineUs - nowUs <= preparationBudgetUs) {
             const uint64_t remainingUs = idleTransitionDeadlineUs - nowUs;
-            const uint64_t remainingMs = (remainingUs + 999) / 1000;
+            if (remainingUs <= kBfiIdlePrecisionWaitUs) {
+                return finishIdleTransitionWait();
+            }
+            const uint64_t remainingMs =
+                coarseWaitMilliseconds(remainingUs);
             m_FrameQueueNotEmpty.wait(
                 &m_FrameQueueLock,
                 static_cast<unsigned long>(std::min<uint64_t>(
@@ -2073,7 +2104,11 @@ bool VrrPacingWorker::dequeueFrame(PacedFrame& frame,
         }
 
         const uint64_t remainingUs = idleTransitionDeadlineUs - nowUs;
-        const uint64_t remainingMs = (remainingUs + 999) / 1000;
+        if (remainingUs <= kBfiIdlePrecisionWaitUs) {
+            return finishIdleTransitionWait();
+        }
+        const uint64_t remainingMs =
+            coarseWaitMilliseconds(remainingUs);
         m_FrameQueueNotEmpty.wait(
             &m_FrameQueueLock,
             static_cast<unsigned long>(std::min<uint64_t>(

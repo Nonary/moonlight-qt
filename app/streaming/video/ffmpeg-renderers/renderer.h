@@ -200,6 +200,19 @@ public:
         // Nothing
     }
 
+    // Some presentation effects must keep advancing even when the decoder has
+    // no new frame. The render thread calls renderFrameIndependentRefresh()
+    // after the first decoded frame and then once per loop while this remains
+    // true. Implementations are expected to pace the call in the native
+    // presentation API rather than busy-waiting.
+    virtual bool needsFrameIndependentRefresh() const {
+        return false;
+    }
+
+    virtual bool renderFrameIndependentRefresh() {
+        return false;
+    }
+
     virtual bool testRenderFrame(AVFrame*) {
         // If the renderer doesn't provide an explicit test routine,
         // we will always assume that any returned AVFrame can be

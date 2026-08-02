@@ -873,7 +873,7 @@ Flickable {
                         ToolTip.delay: 1000
                         ToolTip.timeout: 5000
                         ToolTip.visible: hovered
-                        ToolTip.text: enabled ? qsTr("Uses an HDR display to alternate equal-duration black and boosted SDR video intervals. Fixed V-Sync requires exactly twice the stream frame rate; VRR supports refresh rates at least twice the stream frame rate.")
+                        ToolTip.text: enabled ? qsTr("Uses an HDR display to alternate equal-duration black and boosted SDR video intervals. Requires fixed V-Sync at exactly twice the stream frame rate; VRR is disabled for the session.")
                                               : qsTr("Black frame insertion requires V-Sync and is unavailable with HDR streaming.")
                     }
                 }

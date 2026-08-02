@@ -22,6 +22,9 @@ public:
     virtual bool prepareDecoderContext(AVCodecContext* context, AVDictionary**) override;
     virtual bool prepareDecoderContextInGetFormat(AVCodecContext* context, AVPixelFormat pixelFormat) override;
     virtual void renderFrame(AVFrame* frame) override;
+    virtual bool needsFrameIndependentRefresh() const override;
+    virtual bool renderFrameIndependentRefresh() override;
+    virtual void cleanupRenderContext() override;
     virtual IVrrFramePresenter* getVrrFramePresenter() override;
 
     virtual bool canLatchAdaptivePresent() const override { return true; }
@@ -134,6 +137,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Fence> m_DecodeR2DFence, m_RenderR2DFence;
     UINT64 m_R2DFenceValue;
     SDL_mutex* m_ContextLock;
+    // Serializes swapchain presentation against resize/display changes without
+    // forcing decoder work to wait through blocking fixed-VSync Presents.
+    SDL_mutex* m_PresentationLock;
     bool m_BindDecoderOutputTextures;
 
     DECODER_PARAMETERS m_DecoderParams;

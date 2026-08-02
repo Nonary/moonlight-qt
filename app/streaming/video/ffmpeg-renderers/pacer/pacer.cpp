@@ -153,6 +153,9 @@ int Pacer::vsyncThread(void *context)
 int Pacer::renderThread(void* context)
 {
     Pacer* me = reinterpret_cast<Pacer*>(context);
+    bool frameIndependentRefreshStarted = false;
+    bool frameIndependentLitUpdateDue = false;
+    bool frameIndependentBufferPrimed = false;
 
     if (SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH) < 0) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -161,15 +164,24 @@ int Pacer::renderThread(void* context)
     }
 
     while (!me->m_Stopping) {
-        // Wait for the renderer to be ready for the next frame
-        me->m_VsyncRenderer->waitToRender();
+        const bool frameIndependentRefresh =
+            frameIndependentRefreshStarted &&
+            me->m_VsyncRenderer->needsFrameIndependentRefresh();
+
+        // The ordinary path blocks until a decoded frame is available. Once a
+        // frame-independent carrier has its first image, its native Present()
+        // calls pace this loop and the queue is sampled opportunistically.
+        if (!frameIndependentRefresh) {
+            me->m_VsyncRenderer->waitToRender();
+        }
 
         // Acquire the frame queue lock to protect the queue and
         // the not empty condition
         me->m_FrameQueueLock.lock();
 
         // Wait for a frame to be ready to render
-        while (!me->m_Stopping && me->m_RenderQueue.isEmpty()) {
+        while (!me->m_Stopping && me->m_RenderQueue.isEmpty() &&
+                !frameIndependentRefresh) {
             me->m_RenderQueueNotEmpty.wait(&me->m_FrameQueueLock);
         }
 
@@ -179,10 +191,54 @@ int Pacer::renderThread(void* context)
             break;
         }
 
-        AVFrame* frame = me->m_RenderQueue.dequeue();
+        AVFrame* frame = nullptr;
+        if (!me->m_RenderQueue.isEmpty()) {
+            if (!frameIndependentRefresh) {
+                frame = me->m_RenderQueue.dequeue();
+            }
+            else if (frameIndependentLitUpdateDue &&
+                    (frameIndependentBufferPrimed ||
+                     me->m_RenderQueue.size() >= 2)) {
+                // Only replace the cached image while black is already on
+                // screen. Priming with one queued successor absorbs ordinary
+                // decode/network jitter instead of turning it into alternating
+                // duplicates and skips. Once primed, consume FIFO at most once
+                // per complete black/video pair; an empty queue repeats the
+                // previous complete pair without changing carrier timing.
+                frameIndependentBufferPrimed = true;
+                frame = me->m_RenderQueue.dequeue();
+            }
+        }
         me->m_FrameQueueLock.unlock();
 
-        me->renderFrame(frame);
+        if (frame != nullptr) {
+            if (frameIndependentRefresh) {
+                me->m_VsyncRenderer->waitToRender();
+            }
+            me->renderFrame(frame);
+            const bool refreshWasStarted = frameIndependentRefreshStarted;
+            frameIndependentRefreshStarted =
+                me->m_VsyncRenderer->needsFrameIndependentRefresh();
+            if (!refreshWasStarted && frameIndependentRefreshStarted) {
+                frameIndependentLitUpdateDue = false;
+                frameIndependentBufferPrimed = false;
+            }
+        }
+
+        if (frameIndependentRefreshStarted) {
+            if (me->m_VsyncRenderer->renderFrameIndependentRefresh()) {
+                // The fixed carrier starts with black. Thereafter, alternate
+                // one black-held content-update opportunity with one bright
+                // half-cycle where queued content must remain untouched.
+                frameIndependentLitUpdateDue =
+                    !frameIndependentLitUpdateDue;
+            }
+            else {
+                frameIndependentRefreshStarted = false;
+                frameIndependentLitUpdateDue = false;
+                frameIndependentBufferPrimed = false;
+            }
+        }
     }
 
     // Notify the renderer that it is being destroyed soon
@@ -362,6 +418,15 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
     // cannot invent a 60 Hz value or produce an unrelated warning.
     m_DisplayFps = StreamUtils::getDisplayRefreshRate(window);
 
+    if (m_VsyncRenderer->needsFrameIndependentRefresh()) {
+        // Native Present() calls are the sole clock for frame-independent BFI.
+        // Running the legacy V-Sync source in parallel would gate arrivals on
+        // a second clock before the carrier can place them into lit slots.
+        enablePacing = false;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Frame pacing delegated to frame-independent refresh carrier");
+    }
+
     if (enablePacing) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Frame pacing: target %d Hz with %d FPS stream",
@@ -460,7 +525,13 @@ void Pacer::renderFrame(AVFrame* frame)
 
     int frameDropTarget;
 
-    if (m_RendererAttributes & RENDERER_ATTRIBUTE_NO_BUFFERING) {
+    if (m_VsyncRenderer->needsFrameIndependentRefresh()) {
+        // The frame-independent carrier consumes exactly one FIFO entry per
+        // lit slot and deliberately keeps a jitter reserve. Queue overflow is
+        // still bounded centrally by MAX_QUEUED_FRAMES on submission.
+        frameDropTarget = MAX_QUEUED_FRAMES;
+    }
+    else if (m_RendererAttributes & RENDERER_ATTRIBUTE_NO_BUFFERING) {
         // Renderers that don't buffer any frames but don't support waitToRender() need us to buffer
         // an extra frame to ensure they don't starve while waiting to present.
         frameDropTarget = 1;

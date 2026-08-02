@@ -621,6 +621,19 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
         return;
     }
 
+#ifdef Q_OS_WIN32
+    // BFI needs a fixed black/video carrier. Adaptive presentation coupled the
+    // carrier to imperfect source cadence and made ordinary game-frame misses
+    // visible as luminance flicker. Keep the user's VRR preference intact for
+    // later sessions, but select fixed V-Sync for this BFI session.
+    if (m_Preferences->enableBlackFrameInsertion &&
+            !m_Preferences->enableHdr) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "VRR disabled for black frame insertion; using fixed V-Sync carrier");
+        return;
+    }
+#endif
+
     // VRR must never qualify against an invented refresh rate, so this uses
     // the strict query rather than getDisplayRefreshRate()'s 60 Hz guess.
     // Requiring adaptive headroom also implies the stream rate stays below the

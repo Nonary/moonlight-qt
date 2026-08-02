@@ -122,6 +122,7 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_HwDeviceContext(nullptr)
 {
     m_ContextLock = SDL_CreateMutex();
+    m_PresentationLock = SDL_CreateMutex();
     DwmEnableMMCSS(TRUE);
 }
 
@@ -133,6 +134,7 @@ D3D11VARenderer::~D3D11VARenderer()
     // Release the retained D3D context lock before destroying it or any
     // back-buffer objects.
     cancelFrame();
+    SDL_DestroyMutex(m_PresentationLock);
     SDL_DestroyMutex(m_ContextLock);
 
     m_VideoVertexBuffer.Reset();
@@ -798,6 +800,11 @@ bool D3D11VARenderer::prepareDecoderContextInGetFormat(AVCodecContext *context, 
 
 void D3D11VARenderer::renderFrame(AVFrame* frame)
 {
+    const bool frameIndependentRefresh = needsFrameIndependentRefresh();
+    if (frameIndependentRefresh) {
+        SDL_LockMutex(m_PresentationLock);
+    }
+
     // Acquire the context lock for rendering to prevent concurrent
     // access from inside FFmpeg's decoding code
     if (m_DecodeDevice == m_RenderDevice) {
@@ -817,9 +824,15 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
 
     bool prepared = prepareFrameForPresent(frame);
     HRESULT hr = E_FAIL;
-    if (prepared && m_BlackFrameInsertionActive) {
-        // End on the lit frame. A delayed or dropped source frame now holds
-        // the previous video image instead of extending the black interval.
+    if (prepared && frameIndependentRefresh) {
+        // The fixed-VSync carrier owns presentation. This decoded frame only
+        // replaces the cached lit image, so irregular source delivery cannot
+        // alter the black/video duty cycle.
+        hr = S_OK;
+    }
+    else if (prepared && m_BlackFrameInsertionActive) {
+        // Adaptive BFI is retained only as a defensive legacy fallback. New
+        // sessions deliberately select the fixed carrier below.
         hr = presentBlackFrame(1, 0);
         if (SUCCEEDED(hr)) {
             hr = restoreBlackFrameInsertionVideo() ?
@@ -833,6 +846,9 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     if (m_DecodeDevice == m_RenderDevice) {
         // Release the context lock
         unlockContext(this);
+    }
+    if (frameIndependentRefresh) {
+        SDL_UnlockMutex(m_PresentationLock);
     }
 
     if (FAILED(hr)) {
@@ -850,6 +866,99 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         queueRenderDeviceReset();
         return;
     }
+}
+
+bool D3D11VARenderer::needsFrameIndependentRefresh() const
+{
+    return m_BlackFrameInsertionActive &&
+        !m_DecoderParams.enableVrr;
+}
+
+bool D3D11VARenderer::renderFrameIndependentRefresh()
+{
+    if (!needsFrameIndependentRefresh()) {
+        return false;
+    }
+
+    // Advance one half of the fixed carrier per render-loop iteration. This
+    // lets the loop sample a frame that finishes decoding during black before
+    // it commits the following lit slot, avoiding an unnecessary extra dupe.
+    SDL_LockMutex(m_PresentationLock);
+
+    HRESULT hr = E_FAIL;
+    lockContext(this);
+    if (m_SwapChain != nullptr) {
+        if (m_BlackFrameInsertionBlackPresented) {
+            hr = restoreBlackFrameInsertionVideo() ? S_OK : E_FAIL;
+        }
+        else if (m_RenderDeviceContext != nullptr &&
+                m_RenderTargetView != nullptr) {
+            const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            m_RenderDeviceContext->ClearRenderTargetView(
+                m_RenderTargetView.Get(), black);
+            hr = S_OK;
+        }
+    }
+    unlockContext(this);
+
+    // Never retain the shared D3D context mutex through the blocking V-Sync
+    // wait. Decode remains free to make progress during either carrier phase.
+    if (hr == S_OK) {
+        hr = m_SwapChain->Present(1, 0);
+    }
+
+    SDL_UnlockMutex(m_PresentationLock);
+
+    if (hr == DXGI_STATUS_OCCLUDED) {
+        // Keep the renderer's logical phase synchronized with the render
+        // thread even though DWM did not make the occluded Present visible.
+        // The phase itself is irrelevant while hidden, but matching the
+        // successful-call contract prevents content updates on bright phases
+        // after the window becomes visible again.
+        m_BlackFrameInsertionBlackPresented =
+            !m_BlackFrameInsertionBlackPresented;
+        SDL_Delay(10);
+        return true;
+    }
+    if (hr != S_OK) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 fixed BFI carrier Present() failed: phase=%s hr=%x",
+                     m_BlackFrameInsertionBlackPresented ? "video" : "black",
+                     hr);
+        m_BlackFrameInsertionActive = false;
+        queueRenderDeviceReset();
+        return false;
+    }
+
+    m_BlackFrameInsertionBlackPresented =
+        !m_BlackFrameInsertionBlackPresented;
+    return true;
+}
+
+void D3D11VARenderer::cleanupRenderContext()
+{
+    if (!needsFrameIndependentRefresh() ||
+            !m_BlackFrameInsertionBlackPresented) {
+        return;
+    }
+
+    // Shutdown can arrive after the black half of the carrier. Complete that
+    // pair synchronously so the swapchain never remains black while teardown
+    // and HDR desktop restoration finish.
+    SDL_LockMutex(m_PresentationLock);
+    lockContext(this);
+    const bool restored = restoreBlackFrameInsertionVideo();
+    unlockContext(this);
+    const HRESULT hr = restored && m_SwapChain != nullptr ?
+        m_SwapChain->Present(1, 0) : E_FAIL;
+    if (hr == S_OK) {
+        m_BlackFrameInsertionBlackPresented = false;
+    }
+    else if (hr != DXGI_STATUS_OCCLUDED) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 fixed BFI shutdown restore failed: %x", hr);
+    }
+    SDL_UnlockMutex(m_PresentationLock);
 }
 
 void D3D11VARenderer::renderOverlay(Overlay::OverlayType type)
@@ -1284,6 +1393,7 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         // A same-GPU display move keeps this renderer alive. Serialize the
         // refreshed swapchain eligibility against the context lock the VRR
         // worker retains from preparation through Present.
+        SDL_LockMutex(m_PresentationLock);
         lockContext(this);
         refreshVrrDisplayState();
         const bool wasBlackFrameInsertionActive =
@@ -1291,14 +1401,17 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         m_BlackFrameInsertionActive = false;
         if (!initializeBlackFrameInsertion()) {
             unlockContext(this);
+            SDL_UnlockMutex(m_PresentationLock);
             return false;
         }
         if (m_BlackFrameInsertionActive !=
                 wasBlackFrameInsertionActive) {
             unlockContext(this);
+            SDL_UnlockMutex(m_PresentationLock);
             return false;
         }
         unlockContext(this);
+        SDL_UnlockMutex(m_PresentationLock);
 
         // We've handled this state change
         stateInfo->stateChangeFlags &= ~WINDOW_STATE_CHANGE_DISPLAY;
@@ -1306,6 +1419,8 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
 
     if (stateInfo->stateChangeFlags & WINDOW_STATE_CHANGE_SIZE) {
         // Resize our swapchain and reconstruct size-dependent resources
+
+        SDL_LockMutex(m_PresentationLock);
 
         DXGI_SWAP_CHAIN_DESC1 swapchainDesc;
         m_SwapChain->GetDesc1(&swapchainDesc);
@@ -1345,12 +1460,14 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
                          "IDXGISwapChain::ResizeBuffers() failed: %x",
                          hr);
             unlockContext(this);
+            SDL_UnlockMutex(m_PresentationLock);
             return false;
         }
 
         // Reset swapchain-dependent resources (RTV, viewport, etc)
         if (!setupSwapchainDependentResources()) {
             unlockContext(this);
+            SDL_UnlockMutex(m_PresentationLock);
             return false;
         }
 
@@ -1359,6 +1476,7 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         refreshVrrDisplayState();
 
         unlockContext(this);
+        SDL_UnlockMutex(m_PresentationLock);
 
         // We've handled this state change
         stateInfo->stateChangeFlags &= ~WINDOW_STATE_CHANGE_SIZE;
@@ -1941,14 +2059,12 @@ bool D3D11VARenderer::initializeBlackFrameInsertion()
     }
 
     const int requiredRefreshHz = m_DecoderParams.frameRate * 2;
-    const bool refreshRateSupported = m_DecoderParams.enableVrr ?
-        displayRefreshHz >= requiredRefreshHz :
+    const bool refreshRateSupported = !m_DecoderParams.enableVrr &&
         displayRefreshHz == requiredRefreshHz;
     if (!refreshRateSupported) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "Black frame insertion disabled: %d FPS stream requires %d Hz%s",
-                    m_DecoderParams.frameRate, requiredRefreshHz,
-                    m_DecoderParams.enableVrr ? " or higher with VRR" : "");
+                    "Black frame insertion disabled: %d FPS stream requires fixed %d Hz V-Sync",
+                    m_DecoderParams.frameRate, requiredRefreshHz);
         return true;
     }
 
@@ -1978,20 +2094,7 @@ bool D3D11VARenderer::initializeBlackFrameInsertion()
                 "Black frame insertion enabled: SDR reference white is rendered at 600 nits with a 50%% duty cycle (%llu us black interval)%s",
                 static_cast<unsigned long long>(
                     m_BlackFrameInsertionLeadTimeUs),
-                m_DecoderParams.enableVrr ? " using VRR" : "");
-    if (m_DecoderParams.enableVrr && displayRefreshHz > 4 &&
-            requiredRefreshHz > displayRefreshHz - 4) {
-        // Total presents per second stop below nominal refresh, matching the
-        // plain-VRR headroom rule (116 presents/sec on 120 Hz). The pacer
-        // keeps a fixed black/video carrier at that sustainable rate and
-        // samples source frames into it without changing luminance duty cycle.
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "BFI at %d FPS submits %d presents/sec, above the "
-                    "adaptive headroom ceiling of %d/sec; the fixed carrier "
-                    "will run at %d pairs/sec and sample source frames.",
-                    m_DecoderParams.frameRate, requiredRefreshHz,
-                    displayRefreshHz - 4, (displayRefreshHz - 4) / 2);
-    }
+                " using a frame-independent fixed-VSync carrier");
     if (m_BlackFrameInsertionForceTearing) {
         SDL_LogWarn(
             SDL_LOG_CATEGORY_APPLICATION,
