@@ -155,7 +155,6 @@ int Pacer::renderThread(void* context)
     Pacer* me = reinterpret_cast<Pacer*>(context);
     bool frameIndependentRefreshStarted = false;
     bool frameIndependentLitUpdateDue = false;
-    bool frameIndependentBufferPrimed = false;
 
     if (SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH) < 0) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -196,16 +195,11 @@ int Pacer::renderThread(void* context)
             if (!frameIndependentRefresh) {
                 frame = me->m_RenderQueue.dequeue();
             }
-            else if (frameIndependentLitUpdateDue &&
-                    (frameIndependentBufferPrimed ||
-                     me->m_RenderQueue.size() >= 2)) {
+            else if (frameIndependentLitUpdateDue) {
                 // Only replace the cached image while black is already on
-                // screen. Priming with one queued successor absorbs ordinary
-                // decode/network jitter instead of turning it into alternating
-                // duplicates and skips. Once primed, consume FIFO at most once
-                // per complete black/video pair; an empty queue repeats the
-                // previous complete pair without changing carrier timing.
-                frameIndependentBufferPrimed = true;
+                // screen. Consume a ready frame immediately; a missing frame
+                // repeats the completed black/video pair without adding a
+                // standing one-frame reserve.
                 frame = me->m_RenderQueue.dequeue();
             }
         }
@@ -221,7 +215,6 @@ int Pacer::renderThread(void* context)
                 me->m_VsyncRenderer->needsFrameIndependentRefresh();
             if (!refreshWasStarted && frameIndependentRefreshStarted) {
                 frameIndependentLitUpdateDue = false;
-                frameIndependentBufferPrimed = false;
             }
         }
 
@@ -236,7 +229,6 @@ int Pacer::renderThread(void* context)
             else {
                 frameIndependentRefreshStarted = false;
                 frameIndependentLitUpdateDue = false;
-                frameIndependentBufferPrimed = false;
             }
         }
     }
