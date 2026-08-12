@@ -171,7 +171,11 @@ set LDFLAGS=/LTCG
 
 echo Configuring the project
 pushd %BUILD_FOLDER%
-%QMAKE_CMD% %SOURCE_ROOT%\moonlight-qt.pro
+if defined MOONLIGHT_QMAKE_ARGS (
+    %QMAKE_CMD% %SOURCE_ROOT%\moonlight-qt.pro %MOONLIGHT_QMAKE_ARGS%
+) else (
+    %QMAKE_CMD% %SOURCE_ROOT%\moonlight-qt.pro
+)
 if !ERRORLEVEL! NEQ 0 goto Error
 popd
 

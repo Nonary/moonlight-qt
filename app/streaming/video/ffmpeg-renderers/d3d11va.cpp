@@ -53,6 +53,10 @@ typedef struct _BFI_CONST_BUF
 {
     float referenceWhiteNits;
     float padding[3];
+
+    // Rows of the source RGB -> BT.2020 RGB matrix. Keeping these as rows
+    // avoids relying on HLSL's matrix-major packing rules.
+    float sourceToBt2020[3][4];
 } BFI_CONST_BUF;
 static_assert(sizeof(BFI_CONST_BUF) % 16 == 0,
               "Constant buffer sizes must be a multiple of 16");
@@ -95,6 +99,63 @@ static bool translateQpcToPacingTime(LARGE_INTEGER syncQpcTime,
     return true;
 }
 
+// The BFI swapchain is declared as HDR10 BT.2020. SDR video is normally
+// BT.709, but keep the other matrices available for streams whose metadata
+// identifies SD or BT.2020 primaries.
+static const float k_BfiSourceToBt2020[3][3][3] =
+{
+    {
+        { 0.5952542f, 0.3493140f, 0.0554320f },
+        { 0.0812437f, 0.8915034f, 0.0272521f },
+        { 0.0155123f, 0.0819116f, 0.9025760f },
+    },
+    {
+        { 0.6274039f, 0.3292830f, 0.0433131f },
+        { 0.0690973f, 0.9195404f, 0.0113623f },
+        { 0.0163914f, 0.0880133f, 0.8955953f },
+    },
+    {
+        { 1.0f, 0.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f },
+        { 0.0f, 0.0f, 1.0f },
+    },
+};
+
+// Keep the established BFI luminance targets: 600 nits for the visible frame
+// and 300 nits for recovery across the 50% black/video duty cycle.
+static constexpr float k_BfiReferenceWhiteNits = 600.0f;
+
+static int bfiColorSpaceIndex(int colorSpace)
+{
+    switch (colorSpace) {
+    case COLORSPACE_REC_601:
+        return 0;
+    case COLORSPACE_REC_2020:
+        return 2;
+    case COLORSPACE_REC_709:
+    default:
+        return 1;
+    }
+}
+
+static int bfiColorSpaceIndex(const AVFrame* frame, int fallbackColorSpace)
+{
+    // Primaries describe the RGB gamut. The colorspace field describes the
+    // YUV-to-RGB matrix, so prefer primaries for the gamut conversion and use
+    // the matrix as the fallback when stream metadata is incomplete.
+    switch (frame->color_primaries) {
+    case AVCOL_PRI_BT470BG:
+    case AVCOL_PRI_SMPTE170M:
+        return 0;
+    case AVCOL_PRI_BT709:
+        return 1;
+    case AVCOL_PRI_BT2020:
+        return 2;
+    default:
+        return bfiColorSpaceIndex(fallbackColorSpace);
+    }
+}
+
 D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
     : IFFmpegRenderer(RendererType::D3D11VA),
       m_DecoderSelectionPass(decoderSelectionPass),
@@ -124,6 +185,59 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
     m_ContextLock = SDL_CreateMutex();
     m_PresentationLock = SDL_CreateMutex();
     DwmEnableMMCSS(TRUE);
+}
+
+bool D3D11VARenderer::updateBfiConstants(const AVFrame* frame)
+{
+    if (frame == nullptr ||
+            m_BlackFrameInsertionBrightConstants == nullptr ||
+            m_BlackFrameInsertionRecoveryConstants == nullptr) {
+        return false;
+    }
+
+    const int colorSpace = bfiColorSpaceIndex(frame, getFrameColorspace(frame));
+    if (colorSpace == m_LastBfiColorSpace) {
+        return true;
+    }
+
+    const auto updateBuffer = [&](ID3D11Buffer* buffer,
+                                  float referenceWhiteNits) {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        HRESULT hr = m_RenderDeviceContext->Map(
+            buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "ID3D11DeviceContext::Map() failed for BFI constants: %x",
+                         hr);
+            return false;
+        }
+
+        auto* constants = static_cast<BFI_CONST_BUF*>(mapped.pData);
+        constants->referenceWhiteNits = referenceWhiteNits;
+        constants->padding[0] = 0.0f;
+        constants->padding[1] = 0.0f;
+        constants->padding[2] = 0.0f;
+        for (int row = 0; row < 3; row++) {
+            for (int column = 0; column < 3; column++) {
+                constants->sourceToBt2020[row][column] =
+                    k_BfiSourceToBt2020[colorSpace][row][column];
+            }
+            constants->sourceToBt2020[row][3] = 0.0f;
+        }
+
+        m_RenderDeviceContext->Unmap(buffer, 0);
+        return true;
+    };
+
+    if (!updateBuffer(m_BlackFrameInsertionBrightConstants.Get(),
+                      k_BfiReferenceWhiteNits) ||
+            !updateBuffer(m_BlackFrameInsertionRecoveryConstants.Get(),
+                          k_BfiReferenceWhiteNits * 0.5f)) {
+        return false;
+    }
+
+    m_LastBfiColorSpace = colorSpace;
+    return true;
 }
 
 D3D11VARenderer::~D3D11VARenderer()
@@ -1883,6 +1997,10 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame)
     m_RenderDeviceContext->OMSetRenderTargets(1, m_RenderTargetView.GetAddressOf(), nullptr);
 
     if (m_BlackFrameInsertionActive) {
+        if (!updateBfiConstants(frame)) {
+            return false;
+        }
+
         ID3D11Buffer* brightnessConstants =
             m_BlackFrameInsertionDropRecovery ?
                 m_BlackFrameInsertionRecoveryConstants.Get() :
@@ -2037,6 +2155,9 @@ HRESULT D3D11VARenderer::presentPreparedFrame(UINT flags)
 
 bool D3D11VARenderer::initializeBlackFrameInsertion()
 {
+    // The D3D resources may be recreated when the display changes. Force the
+    // first frame after reinitialization to repopulate both dynamic buffers.
+    m_LastBfiColorSpace = -1;
     m_BlackFrameInsertionLeadTimeUs = 0;
     m_BlackFrameInsertionDropRecovery = false;
     m_BlackFrameInsertionForceTearing = false;
@@ -2745,15 +2866,12 @@ bool D3D11VARenderer::setupRenderingResources()
 
         D3D11_BUFFER_DESC constantBufferDesc = {};
         constantBufferDesc.ByteWidth = sizeof(BFI_CONST_BUF);
-        constantBufferDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        constantBufferDesc.Usage = D3D11_USAGE_DYNAMIC;
         constantBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        constantBufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-        BFI_CONST_BUF brightConstants = {};
-        brightConstants.referenceWhiteNits = 600.0f;
-        D3D11_SUBRESOURCE_DATA brightData = {};
-        brightData.pSysMem = &brightConstants;
         hr = m_RenderDevice->CreateBuffer(
-            &constantBufferDesc, &brightData,
+            &constantBufferDesc, nullptr,
             &m_BlackFrameInsertionBrightConstants);
         if (FAILED(hr)) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -2762,12 +2880,8 @@ bool D3D11VARenderer::setupRenderingResources()
             return false;
         }
 
-        BFI_CONST_BUF recoveryConstants = {};
-        recoveryConstants.referenceWhiteNits = 300.0f;
-        D3D11_SUBRESOURCE_DATA recoveryData = {};
-        recoveryData.pSysMem = &recoveryConstants;
         hr = m_RenderDevice->CreateBuffer(
-            &constantBufferDesc, &recoveryData,
+            &constantBufferDesc, nullptr,
             &m_BlackFrameInsertionRecoveryConstants);
         if (FAILED(hr)) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,

@@ -76,6 +76,7 @@ private:
     bool setupVideoTexture(AVHWFramesContext* framesContext); // for !m_BindDecoderOutputTextures
     bool setupTexturePoolViews(AVHWFramesContext* framesContext); // for m_BindDecoderOutputTextures
     bool prepareFrameForPresent(AVFrame* frame);
+    bool updateBfiConstants(const AVFrame* frame);
     bool initializeBlackFrameInsertion();
     bool restoreBlackFrameInsertionVideo();
     HRESULT presentBlackFrame(UINT syncInterval, UINT flags);
@@ -147,6 +148,7 @@ private:
     int m_DisplayWidth;
     int m_DisplayHeight;
     AVColorTransferCharacteristic m_LastColorTrc;
+    int m_LastBfiColorSpace = -1;
 
     bool m_AllowTearing;
     bool m_BlackFrameInsertionActive;
