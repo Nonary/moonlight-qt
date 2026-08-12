@@ -170,6 +170,10 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_BlackFrameInsertionDropRecovery(false),
       m_BlackFrameInsertionForceTearing(false),
       m_BlackFrameInsertionLeadTimeUs(0),
+      m_BlackFrameInsertionCacheValid(false),
+      m_BlackFrameInsertionCacheWidth(0),
+      m_BlackFrameInsertionCacheHeight(0),
+      m_BlackFrameInsertionRestoreRejects(0),
       m_VrrBorderlessFlipModel(false),
       m_VrrSwapChainAllowsTearing(false),
       m_VrrSuspended(false),
@@ -1002,11 +1006,17 @@ bool D3D11VARenderer::renderFrameIndependentRefresh()
     HRESULT hr = E_FAIL;
     lockContext(this);
     if (m_SwapChain != nullptr) {
-        if (m_BlackFrameInsertionBlackPresented) {
-            hr = restoreBlackFrameInsertionVideo() ? S_OK : E_FAIL;
+        if (m_BlackFrameInsertionBlackPresented &&
+                restoreBlackFrameInsertionVideo()) {
+            hr = S_OK;
         }
         else if (m_RenderDeviceContext != nullptr &&
                 m_RenderTargetView != nullptr) {
+            // Either this is the black half of the carrier, or the video
+            // restore was rejected because the cache has no complete copy of
+            // the current render target (for example immediately after a
+            // resize). Presenting black preserves the carrier cadence; the
+            // next prepared frame republishes the cache and relights it.
             const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
             m_RenderDeviceContext->ClearRenderTargetView(
                 m_RenderTargetView.Get(), black);
@@ -1561,7 +1571,14 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         }
         SDL_AtomicUnlock(&m_OverlayLock);
 
-        // We must release all references to the back buffer
+        // The outgoing BFI cache belongs to the outgoing backbuffer. Revoke
+        // its restore eligibility before any release so no restore path can
+        // copy stale or uninitialized data into the replacement target.
+        m_BlackFrameInsertionCacheValid = false;
+
+        // We must release all references to the back buffer, including any
+        // render target binding still held by the context state.
+        m_RenderDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
         m_BlackFrameInsertionVideoTextureSrv.Reset();
         m_BlackFrameInsertionVideoTexture.Reset();
         m_RenderTargetView.Reset();
@@ -2051,6 +2068,15 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame)
         m_RenderDeviceContext->CopyResource(
             m_BlackFrameInsertionVideoTexture.Get(),
             m_RenderTargetTexture.Get());
+
+        // Publish restore eligibility only after the complete copy has been
+        // submitted. The immediate context orders the later restore copy
+        // after this one, so a valid cache always yields the full surface.
+        D3D11_TEXTURE2D_DESC cacheDesc = {};
+        m_BlackFrameInsertionVideoTexture->GetDesc(&cacheDesc);
+        m_BlackFrameInsertionCacheWidth = cacheDesc.Width;
+        m_BlackFrameInsertionCacheHeight = cacheDesc.Height;
+        m_BlackFrameInsertionCacheValid = true;
     }
 
     return true;
@@ -2232,6 +2258,32 @@ bool D3D11VARenderer::restoreBlackFrameInsertionVideo()
     if (m_RenderDeviceContext == nullptr ||
             m_RenderTargetTexture == nullptr ||
             m_BlackFrameInsertionVideoTexture == nullptr) {
+        return false;
+    }
+
+    // Cache existence is not restore eligibility. Without a published
+    // complete copy for the current target, the cache may hold uninitialized
+    // or stale data (for example between a resize and the next prepared
+    // frame), so fail closed and let the caller's black/reprepare path run.
+    bool sizeMatched = true;
+    if (m_BlackFrameInsertionCacheValid) {
+        D3D11_TEXTURE2D_DESC targetDesc = {};
+        m_RenderTargetTexture->GetDesc(&targetDesc);
+        sizeMatched = targetDesc.Width == m_BlackFrameInsertionCacheWidth &&
+            targetDesc.Height == m_BlackFrameInsertionCacheHeight;
+    }
+    if (!m_BlackFrameInsertionCacheValid || !sizeMatched) {
+        m_BlackFrameInsertionCacheValid = false;
+        m_BlackFrameInsertionRestoreRejects++;
+        // Power-of-two backoff keeps this diagnostic bounded if rejection
+        // recurs at the carrier rate.
+        if ((m_BlackFrameInsertionRestoreRejects &
+                (m_BlackFrameInsertionRestoreRejects - 1)) == 0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "BFI video restore rejected: cache is not a complete copy of the current render target (%s, count=%u)",
+                        sizeMatched ? "not published" : "dimension mismatch",
+                        m_BlackFrameInsertionRestoreRejects);
+        }
         return false;
     }
 
@@ -2944,6 +2996,11 @@ bool D3D11VARenderer::setupRenderingResources()
 bool D3D11VARenderer::setupSwapchainDependentResources()
 {
     HRESULT hr;
+
+    // A freshly created BFI cache texture has undefined contents. Publish it
+    // as invalid; only a complete copy in prepareFrameForPresent() may make
+    // it eligible for restoration.
+    m_BlackFrameInsertionCacheValid = false;
 
     // Create our render target view
     {

@@ -156,6 +156,17 @@ private:
     bool m_BlackFrameInsertionDropRecovery;
     bool m_BlackFrameInsertionForceTearing;
     uint64_t m_BlackFrameInsertionLeadTimeUs;
+    // The BFI cache texture is only a trustworthy restore source after a
+    // complete copy of the current render target has been submitted into it.
+    // Cleared before any swapchain-dependent resource replacement and
+    // published true only after the copy in prepareFrameForPresent().
+    // Consistency is guaranteed by the existing lock discipline: replacement
+    // holds both m_PresentationLock and the context lock, while every
+    // reader/writer holds at least one of them.
+    bool m_BlackFrameInsertionCacheValid;
+    UINT m_BlackFrameInsertionCacheWidth;
+    UINT m_BlackFrameInsertionCacheHeight;
+    uint32_t m_BlackFrameInsertionRestoreRejects;
     bool m_VrrBorderlessFlipModel;
     bool m_VrrSwapChainAllowsTearing;
     bool m_VrrSuspended;
