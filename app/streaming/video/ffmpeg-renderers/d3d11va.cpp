@@ -174,6 +174,8 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_BlackFrameInsertionCacheWidth(0),
       m_BlackFrameInsertionCacheHeight(0),
       m_BlackFrameInsertionRestoreRejects(0),
+      m_BlackFrameInsertionWaitableSwapchain(false),
+      m_BfiFrameLatencyWaitableObject(nullptr),
       m_VrrBorderlessFlipModel(false),
       m_VrrSwapChainAllowsTearing(false),
       m_VrrSuspended(false),
@@ -301,6 +303,8 @@ D3D11VARenderer::~D3D11VARenderer()
         m_VrrPresentReadyFenceEvent = nullptr;
     }
 
+    releaseBfiBackbuffer();
+    releaseBfiFrameLatencyWaitable();
     m_BlackFrameInsertionVideoTextureSrv.Reset();
     m_BlackFrameInsertionVideoTexture.Reset();
     m_RenderTargetView.Reset();
@@ -748,7 +752,20 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     //
     // NB: 3 total buffers seems sufficient on NVIDIA hardware but
     // causes performance issues (buffer starvation) on AMD GPUs.
-    swapChainDesc.BufferCount = 3 + 1 + 1;
+    //
+    // BFI presents one image per refresh with Present(1). A 5-deep flip
+    // queue lets those calls return before the image is latched, so the
+    // CPU phase walks ahead of scanout and the queued black/video pair
+    // can be composed as a moving seam. A waitable 3-buffer chain with
+    // swapchain frame latency 1 keeps each half on one vblank.
+    if (params->enableBlackFrameInsertion) {
+        swapChainDesc.BufferCount = 3;
+        swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        m_BlackFrameInsertionWaitableSwapchain = true;
+    }
+    else {
+        swapChainDesc.BufferCount = 3 + 1 + 1;
+    }
 
     // Use the current window size as the swapchain size
     SDL_GetWindowSize(params->window, (int*)&swapChainDesc.Width, (int*)&swapChainDesc.Height);
@@ -789,6 +806,21 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
                                            nullptr,
                                            &swapChain);
 
+    if (FAILED(hr) && m_BlackFrameInsertionWaitableSwapchain) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "BFI waitable swapchain creation failed (%x); retrying without the waitable object",
+                    hr);
+        swapChainDesc.Flags &= ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        swapChainDesc.BufferCount = 3 + 1 + 1;
+        m_BlackFrameInsertionWaitableSwapchain = false;
+        hr = m_Factory->CreateSwapChainForHwnd(m_RenderDevice.Get(),
+                                               info.info.win.window,
+                                               &swapChainDesc,
+                                               nullptr,
+                                               nullptr,
+                                               &swapChain);
+    }
+
     if (FAILED(hr)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "IDXGIFactory::CreateSwapChainForHwnd() failed: %x",
@@ -802,6 +834,13 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
                      "IDXGISwapChain::QueryInterface(IDXGISwapChain4) failed: %x",
                      hr);
         return false;
+    }
+
+    if (m_BlackFrameInsertionWaitableSwapchain &&
+            !acquireBfiFrameLatencyWaitable()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "BFI waitable swapchain object is unavailable; carrier will use ordinary Present(1, 0) pacing");
+        m_BlackFrameInsertionWaitableSwapchain = false;
     }
 
     // Disable Alt+Enter, PrintScreen, and window message snooping. This makes
@@ -954,7 +993,7 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         hr = presentBlackFrame(1, 0);
         if (SUCCEEDED(hr)) {
             hr = restoreBlackFrameInsertionVideo() ?
-                m_SwapChain->Present(1, 0) : E_FAIL;
+                presentPreparedBfiSwapchain(1, 0) : E_FAIL;
         }
     }
     else if (prepared) {
@@ -1003,23 +1042,22 @@ bool D3D11VARenderer::renderFrameIndependentRefresh()
     // it commits the following lit slot, avoiding an unnecessary extra dupe.
     SDL_LockMutex(m_PresentationLock);
 
+    // Align with the previous flip before touching a backbuffer. Do not hold
+    // the D3D context lock across this wait or the later Present(1, 0).
+    waitForBfiPresentSlot();
+
     HRESULT hr = E_FAIL;
     lockContext(this);
     if (m_SwapChain != nullptr) {
-        if (m_BlackFrameInsertionBlackPresented &&
-                restoreBlackFrameInsertionVideo()) {
-            hr = S_OK;
+        const bool presentVideo = m_BlackFrameInsertionBlackPresented;
+        bool prepared = prepareBfiSwapchain(presentVideo);
+        if (!prepared && presentVideo) {
+            // A rejected compose copy presents black for this half so the
+            // carrier keeps its cadence. The next prepared frame republishes
+            // the compose target and relights it.
+            prepared = prepareBfiSwapchain(false);
         }
-        else if (m_RenderDeviceContext != nullptr &&
-                m_RenderTargetView != nullptr) {
-            // Either this is the black half of the carrier, or the video
-            // restore was rejected because the cache has no complete copy of
-            // the current render target (for example immediately after a
-            // resize). Presenting black preserves the carrier cadence; the
-            // next prepared frame republishes the cache and relights it.
-            const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            m_RenderDeviceContext->ClearRenderTargetView(
-                m_RenderTargetView.Get(), black);
+        if (prepared) {
             hr = S_OK;
         }
     }
@@ -1028,7 +1066,7 @@ bool D3D11VARenderer::renderFrameIndependentRefresh()
     // Never retain the shared D3D context mutex through the blocking V-Sync
     // wait. Decode remains free to make progress during either carrier phase.
     if (hr == S_OK) {
-        hr = m_SwapChain->Present(1, 0);
+        hr = presentPreparedBfiSwapchain(1, 0);
     }
 
     SDL_UnlockMutex(m_PresentationLock);
@@ -1070,11 +1108,12 @@ void D3D11VARenderer::cleanupRenderContext()
     // pair synchronously so the swapchain never remains black while teardown
     // and HDR desktop restoration finish.
     SDL_LockMutex(m_PresentationLock);
+    waitForBfiPresentSlot();
     lockContext(this);
-    const bool restored = restoreBlackFrameInsertionVideo();
+    const bool restored = prepareBfiSwapchain(true);
     unlockContext(this);
-    const HRESULT hr = restored && m_SwapChain != nullptr ?
-        m_SwapChain->Present(1, 0) : E_FAIL;
+    const HRESULT hr = restored ?
+        presentPreparedBfiSwapchain(1, 0) : E_FAIL;
     if (hr == S_OK) {
         m_BlackFrameInsertionBlackPresented = false;
     }
@@ -1571,14 +1610,16 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         }
         SDL_AtomicUnlock(&m_OverlayLock);
 
-        // The outgoing BFI cache belongs to the outgoing backbuffer. Revoke
-        // its restore eligibility before any release so no restore path can
-        // copy stale or uninitialized data into the replacement target.
+        // The outgoing BFI compose target belongs to the outgoing size.
+        // Revoke restore eligibility before any release so no present path
+        // can copy stale or uninitialized data onto the replacement buffer.
         m_BlackFrameInsertionCacheValid = false;
 
         // We must release all references to the back buffer, including any
         // render target binding still held by the context state.
         m_RenderDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+        releaseBfiBackbuffer();
+        releaseBfiFrameLatencyWaitable();
         m_BlackFrameInsertionVideoTextureSrv.Reset();
         m_BlackFrameInsertionVideoTexture.Reset();
         m_RenderTargetView.Reset();
@@ -1593,6 +1634,12 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
             unlockContext(this);
             SDL_UnlockMutex(m_PresentationLock);
             return false;
+        }
+
+        if ((swapchainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0 &&
+                !acquireBfiFrameLatencyWaitable()) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "BFI waitable swapchain object was lost during resize");
         }
 
         // Reset swapchain-dependent resources (RTV, viewport, etc)
@@ -1979,6 +2026,7 @@ void D3D11VARenderer::releasePreparedVrrFrame(
             m_RenderDeviceContext != nullptr) {
         m_RenderDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
     }
+    releaseBfiBackbuffer();
 
     m_VrrFramePrepared = false;
     if (!preserveBlackTransition) {
@@ -2005,12 +2053,13 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame)
         return false;
     }
 
-    // Clear the back buffer.
+    // Clear the compose target. For BFI this is an offscreen surface, not
+    // the swapchain backbuffer.
     const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     m_RenderDeviceContext->ClearRenderTargetView(m_RenderTargetView.Get(), clearColor);
 
-    // Bind the back buffer. This needs to be done each time because Present()
-    // unbinds the render target view.
+    // Bind the compose/render target. Present() unbinds a swapchain RTV, so
+    // non-BFI frames must rebind here; BFI keeps the offscreen target.
     m_RenderDeviceContext->OMSetRenderTargets(1, m_RenderTargetView.GetAddressOf(), nullptr);
 
     if (m_BlackFrameInsertionActive) {
@@ -2061,22 +2110,19 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame)
     }
 
     if (m_BlackFrameInsertionActive) {
-        if (m_RenderTargetTexture == nullptr ||
-                m_BlackFrameInsertionVideoTexture == nullptr) {
+        if (m_RenderTargetTexture == nullptr) {
             return false;
         }
-        m_RenderDeviceContext->CopyResource(
-            m_BlackFrameInsertionVideoTexture.Get(),
-            m_RenderTargetTexture.Get());
 
-        // Publish restore eligibility only after the complete copy has been
-        // submitted. The immediate context orders the later restore copy
-        // after this one, so a valid cache always yields the full surface.
+        // Video was drawn into the offscreen compose target. That surface is
+        // the published cache; do not CopyResource it onto a swapchain
+        // buffer until the carrier has a free backbuffer.
         D3D11_TEXTURE2D_DESC cacheDesc = {};
-        m_BlackFrameInsertionVideoTexture->GetDesc(&cacheDesc);
+        m_RenderTargetTexture->GetDesc(&cacheDesc);
         m_BlackFrameInsertionCacheWidth = cacheDesc.Width;
         m_BlackFrameInsertionCacheHeight = cacheDesc.Height;
         m_BlackFrameInsertionCacheValid = true;
+        m_BlackFrameInsertionVideoTexture = m_RenderTargetTexture;
     }
 
     return true;
@@ -2176,7 +2222,204 @@ HRESULT D3D11VARenderer::presentPreparedFrame(UINT flags)
         return E_FAIL;
     }
 
+    if (m_BlackFrameInsertionActive && m_BfiBackbufferTexture != nullptr) {
+        return presentPreparedBfiSwapchain(0, flags);
+    }
+
+    if (m_BfiFrameLatencyWaitableObject != nullptr) {
+        waitForBfiPresentSlot();
+    }
+
     return m_SwapChain->Present(0, flags);
+}
+
+void D3D11VARenderer::releaseBfiFrameLatencyWaitable()
+{
+    if (m_BfiFrameLatencyWaitableObject != nullptr) {
+        CloseHandle(m_BfiFrameLatencyWaitableObject);
+        m_BfiFrameLatencyWaitableObject = nullptr;
+    }
+}
+
+bool D3D11VARenderer::acquireBfiFrameLatencyWaitable()
+{
+    releaseBfiFrameLatencyWaitable();
+    if (m_SwapChain == nullptr) {
+        return false;
+    }
+
+    ComPtr<IDXGISwapChain2> swapChain2;
+    const HRESULT hr = m_SwapChain.As(&swapChain2);
+    if (FAILED(hr) || swapChain2 == nullptr) {
+        return false;
+    }
+
+    m_BfiFrameLatencyWaitableObject = swapChain2->GetFrameLatencyWaitableObject();
+    return m_BfiFrameLatencyWaitableObject != nullptr;
+}
+
+bool D3D11VARenderer::setBfiSwapchainFrameLatency(UINT latency)
+{
+    if (m_SwapChain == nullptr) {
+        return false;
+    }
+
+    ComPtr<IDXGISwapChain2> swapChain2;
+    const HRESULT hr = m_SwapChain.As(&swapChain2);
+    if (FAILED(hr) || swapChain2 == nullptr) {
+        return false;
+    }
+
+    return SUCCEEDED(swapChain2->SetMaximumFrameLatency(latency));
+}
+
+bool D3D11VARenderer::waitForBfiPresentSlot()
+{
+    if (m_BfiFrameLatencyWaitableObject == nullptr) {
+        return true;
+    }
+
+    // One queued image is already on the way to scanout. Waiting here makes
+    // the next GetBuffer/Present target a buffer the display has released.
+    const DWORD waitResult = WaitForSingleObject(
+        m_BfiFrameLatencyWaitableObject, 100);
+    if (waitResult == WAIT_OBJECT_0) {
+        return true;
+    }
+
+    if (waitResult != WAIT_TIMEOUT) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "BFI waitable present slot wait failed: %lu",
+                    static_cast<unsigned long>(waitResult));
+    }
+    return true;
+}
+
+void D3D11VARenderer::releaseBfiBackbuffer()
+{
+    m_BfiBackbufferRtv.Reset();
+    m_BfiBackbufferTexture.Reset();
+}
+
+bool D3D11VARenderer::acquireBfiBackbuffer()
+{
+    releaseBfiBackbuffer();
+    if (m_SwapChain == nullptr || m_RenderDevice == nullptr ||
+            m_RenderDeviceContext == nullptr) {
+        return false;
+    }
+
+    HRESULT hr = m_SwapChain->GetBuffer(
+        0, IID_PPV_ARGS(&m_BfiBackbufferTexture));
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "BFI GetBuffer() failed: %x", hr);
+        return false;
+    }
+
+    hr = m_RenderDevice->CreateRenderTargetView(
+        m_BfiBackbufferTexture.Get(), nullptr, &m_BfiBackbufferRtv);
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "BFI backbuffer CreateRenderTargetView() failed: %x", hr);
+        releaseBfiBackbuffer();
+        return false;
+    }
+
+    return true;
+}
+
+bool D3D11VARenderer::copyBfiComposeToBackbuffer()
+{
+    if (m_RenderDeviceContext == nullptr ||
+            m_RenderTargetTexture == nullptr ||
+            m_BfiBackbufferTexture == nullptr) {
+        return false;
+    }
+
+    bool sizeMatched = true;
+    if (m_BlackFrameInsertionCacheValid) {
+        D3D11_TEXTURE2D_DESC composeDesc = {};
+        D3D11_TEXTURE2D_DESC backbufferDesc = {};
+        m_RenderTargetTexture->GetDesc(&composeDesc);
+        m_BfiBackbufferTexture->GetDesc(&backbufferDesc);
+        sizeMatched = composeDesc.Width == m_BlackFrameInsertionCacheWidth &&
+            composeDesc.Height == m_BlackFrameInsertionCacheHeight &&
+            composeDesc.Width == backbufferDesc.Width &&
+            composeDesc.Height == backbufferDesc.Height;
+    }
+    if (!m_BlackFrameInsertionCacheValid || !sizeMatched) {
+        m_BlackFrameInsertionCacheValid = false;
+        m_BlackFrameInsertionRestoreRejects++;
+        if ((m_BlackFrameInsertionRestoreRejects &
+                (m_BlackFrameInsertionRestoreRejects - 1)) == 0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "BFI video present rejected: compose target is not a complete copy of the current backbuffer (%s, count=%u)",
+                        sizeMatched ? "not published" : "dimension mismatch",
+                        m_BlackFrameInsertionRestoreRejects);
+        }
+        return false;
+    }
+
+    // CopyResource cannot use a texture that is still bound as an RTV.
+    m_RenderDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+    m_RenderDeviceContext->CopyResource(
+        m_BfiBackbufferTexture.Get(),
+        m_RenderTargetTexture.Get());
+    return true;
+}
+
+void D3D11VARenderer::clearBfiBackbuffer()
+{
+    if (m_RenderDeviceContext == nullptr || m_BfiBackbufferRtv == nullptr) {
+        return;
+    }
+
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    m_RenderDeviceContext->ClearRenderTargetView(
+        m_BfiBackbufferRtv.Get(), black);
+}
+
+bool D3D11VARenderer::prepareBfiSwapchain(bool presentVideo)
+{
+    if (!acquireBfiBackbuffer()) {
+        return false;
+    }
+
+    if (presentVideo) {
+        if (!copyBfiComposeToBackbuffer()) {
+            releaseBfiBackbuffer();
+            return false;
+        }
+    }
+    else {
+        clearBfiBackbuffer();
+    }
+
+    m_RenderDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+    return true;
+}
+
+HRESULT D3D11VARenderer::presentPreparedBfiSwapchain(UINT syncInterval, UINT flags)
+{
+    if (m_SwapChain == nullptr || m_BfiBackbufferTexture == nullptr) {
+        releaseBfiBackbuffer();
+        return E_FAIL;
+    }
+
+    const HRESULT hr = m_SwapChain->Present(syncInterval, flags);
+    releaseBfiBackbuffer();
+    return hr;
+}
+
+HRESULT D3D11VARenderer::presentBfiSwapchain(
+    bool presentVideo, UINT syncInterval, UINT flags)
+{
+    if (!prepareBfiSwapchain(presentVideo)) {
+        return E_FAIL;
+    }
+
+    return presentPreparedBfiSwapchain(syncInterval, flags);
 }
 
 bool D3D11VARenderer::initializeBlackFrameInsertion()
@@ -2196,12 +2439,14 @@ bool D3D11VARenderer::initializeBlackFrameInsertion()
             m_DecoderParams.window, displayRefreshHz)) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "Black frame insertion disabled: display refresh rate is unavailable");
+        setBfiSwapchainFrameLatency(3);
         return true;
     }
 
     if (m_DecoderParams.frameRate <= 0) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "Black frame insertion disabled: stream frame rate is invalid");
+        setBfiSwapchainFrameLatency(3);
         return true;
     }
 
@@ -2212,6 +2457,7 @@ bool D3D11VARenderer::initializeBlackFrameInsertion()
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "Black frame insertion disabled: %d FPS stream requires fixed %d Hz V-Sync",
                     m_DecoderParams.frameRate, requiredRefreshHz);
+        setBfiSwapchainFrameLatency(3);
         return true;
     }
 
@@ -2221,6 +2467,7 @@ bool D3D11VARenderer::initializeBlackFrameInsertion()
     if (FAILED(hr) || !(colorSpaceSupport & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "Black frame insertion disabled: the current display does not support HDR10 presentation");
+        setBfiSwapchainFrameLatency(3);
         return true;
     }
 
@@ -2238,10 +2485,32 @@ bool D3D11VARenderer::initializeBlackFrameInsertion()
         qEnvironmentVariableIntValue(
             "MOONLIGHT_BFI_FORCE_TEARING") != 0;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Black frame insertion enabled: SDR reference white is rendered at 600 nits with a 50%% duty cycle (%llu us black interval)%s",
+                "Black frame insertion enabled: SDR reference white is rendered at 600 nits with a 50%% duty cycle (%llu us black interval) using a frame-independent fixed-VSync carrier%s",
                 static_cast<unsigned long long>(
                     m_BlackFrameInsertionLeadTimeUs),
-                " using a frame-independent fixed-VSync carrier");
+                m_BfiFrameLatencyWaitableObject != nullptr ?
+                    " with a waitable 1-frame swapchain" :
+                    "");
+
+    if (m_RenderTargetView != nullptr && m_RenderDeviceContext != nullptr) {
+        m_RenderDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+        releaseBfiBackbuffer();
+        m_BlackFrameInsertionVideoTextureSrv.Reset();
+        m_BlackFrameInsertionVideoTexture.Reset();
+        m_RenderTargetView.Reset();
+        m_RenderTargetTexture.Reset();
+        m_RenderDeviceContext->Flush();
+        if (!setupSwapchainDependentResources()) {
+            m_BlackFrameInsertionActive = false;
+            return false;
+        }
+    }
+    if (m_BfiFrameLatencyWaitableObject != nullptr) {
+        if (!setBfiSwapchainFrameLatency(1)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "BFI could not set swapchain frame latency to 1");
+        }
+    }
     if (m_BlackFrameInsertionForceTearing) {
         SDL_LogWarn(
             SDL_LOG_CATEGORY_APPLICATION,
@@ -2255,55 +2524,13 @@ bool D3D11VARenderer::initializeBlackFrameInsertion()
 
 bool D3D11VARenderer::restoreBlackFrameInsertionVideo()
 {
-    if (m_RenderDeviceContext == nullptr ||
-            m_RenderTargetTexture == nullptr ||
-            m_BlackFrameInsertionVideoTexture == nullptr) {
-        return false;
-    }
-
-    // Cache existence is not restore eligibility. Without a published
-    // complete copy for the current target, the cache may hold uninitialized
-    // or stale data (for example between a resize and the next prepared
-    // frame), so fail closed and let the caller's black/reprepare path run.
-    bool sizeMatched = true;
-    if (m_BlackFrameInsertionCacheValid) {
-        D3D11_TEXTURE2D_DESC targetDesc = {};
-        m_RenderTargetTexture->GetDesc(&targetDesc);
-        sizeMatched = targetDesc.Width == m_BlackFrameInsertionCacheWidth &&
-            targetDesc.Height == m_BlackFrameInsertionCacheHeight;
-    }
-    if (!m_BlackFrameInsertionCacheValid || !sizeMatched) {
-        m_BlackFrameInsertionCacheValid = false;
-        m_BlackFrameInsertionRestoreRejects++;
-        // Power-of-two backoff keeps this diagnostic bounded if rejection
-        // recurs at the carrier rate.
-        if ((m_BlackFrameInsertionRestoreRejects &
-                (m_BlackFrameInsertionRestoreRejects - 1)) == 0) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "BFI video restore rejected: cache is not a complete copy of the current render target (%s, count=%u)",
-                        sizeMatched ? "not published" : "dimension mismatch",
-                        m_BlackFrameInsertionRestoreRejects);
-        }
-        return false;
-    }
-
-    m_RenderDeviceContext->CopyResource(
-        m_RenderTargetTexture.Get(),
-        m_BlackFrameInsertionVideoTexture.Get());
-    return true;
+    return prepareBfiSwapchain(true);
 }
 
 HRESULT D3D11VARenderer::presentBlackFrame(
     UINT syncInterval, UINT flags)
 {
-    if (m_RenderDeviceContext == nullptr || m_RenderTargetView == nullptr ||
-            m_SwapChain == nullptr) {
-        return E_FAIL;
-    }
-
-    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    m_RenderDeviceContext->ClearRenderTargetView(m_RenderTargetView.Get(), black);
-    return m_SwapChain->Present(syncInterval, flags);
+    return presentBfiSwapchain(false, syncInterval, flags);
 }
 
 UINT D3D11VARenderer::bfiVrrPresentFlags(
@@ -2997,13 +3224,64 @@ bool D3D11VARenderer::setupSwapchainDependentResources()
 {
     HRESULT hr;
 
-    // A freshly created BFI cache texture has undefined contents. Publish it
-    // as invalid; only a complete copy in prepareFrameForPresent() may make
-    // it eligible for restoration.
+    // A freshly created BFI compose target has undefined contents. Publish
+    // it as invalid; only a completed prepareFrameForPresent() draw may
+    // make it eligible for a video Present.
     m_BlackFrameInsertionCacheValid = false;
+    releaseBfiBackbuffer();
 
-    // Create our render target view
-    {
+    if (m_BlackFrameInsertionActive) {
+        DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
+        hr = m_SwapChain->GetDesc1(&swapChainDesc);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "IDXGISwapChain::GetDesc1() failed: %x",
+                         hr);
+            return false;
+        }
+
+        // Compose offscreen so prepare/clear/draw never writes a buffer that
+        // DXGI may still be scanning or queuing as the front buffer.
+        D3D11_TEXTURE2D_DESC textureDesc = {};
+        textureDesc.Width = swapChainDesc.Width;
+        textureDesc.Height = swapChainDesc.Height;
+        textureDesc.MipLevels = 1;
+        textureDesc.ArraySize = 1;
+        textureDesc.Format = swapChainDesc.Format;
+        textureDesc.SampleDesc.Count = 1;
+        textureDesc.Usage = D3D11_USAGE_DEFAULT;
+        textureDesc.BindFlags = D3D11_BIND_RENDER_TARGET |
+            D3D11_BIND_SHADER_RESOURCE;
+        hr = m_RenderDevice->CreateTexture2D(
+            &textureDesc, nullptr, &m_RenderTargetTexture);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Unable to create BFI compose target: %x",
+                         hr);
+            return false;
+        }
+
+        hr = m_RenderDevice->CreateRenderTargetView(
+            m_RenderTargetTexture.Get(), nullptr, &m_RenderTargetView);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "ID3D11Device::CreateRenderTargetView() failed: %x",
+                         hr);
+            return false;
+        }
+
+        m_BlackFrameInsertionVideoTexture = m_RenderTargetTexture;
+        hr = m_RenderDevice->CreateShaderResourceView(
+            m_BlackFrameInsertionVideoTexture.Get(), nullptr,
+            &m_BlackFrameInsertionVideoTextureSrv);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Unable to create BFI compose shader view: %x",
+                         hr);
+            return false;
+        }
+    }
+    else {
         hr = m_SwapChain->GetBuffer(
             0, IID_PPV_ARGS(&m_RenderTargetTexture));
         if (FAILED(hr)) {
@@ -3020,34 +3298,6 @@ bool D3D11VARenderer::setupSwapchainDependentResources()
                          "ID3D11Device::CreateRenderTargetView() failed: %x",
                          hr);
             return false;
-        }
-
-        if (m_BlackFrameInsertionActive) {
-            D3D11_TEXTURE2D_DESC textureDesc = {};
-            m_RenderTargetTexture->GetDesc(&textureDesc);
-            textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            textureDesc.CPUAccessFlags = 0;
-            textureDesc.MiscFlags = 0;
-            textureDesc.Usage = D3D11_USAGE_DEFAULT;
-            hr = m_RenderDevice->CreateTexture2D(
-                &textureDesc, nullptr,
-                &m_BlackFrameInsertionVideoTexture);
-            if (FAILED(hr)) {
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                             "Unable to create BFI video cache texture: %x",
-                             hr);
-                return false;
-            }
-
-            hr = m_RenderDevice->CreateShaderResourceView(
-                m_BlackFrameInsertionVideoTexture.Get(), nullptr,
-                &m_BlackFrameInsertionVideoTextureSrv);
-            if (FAILED(hr)) {
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                             "Unable to create BFI video cache view: %x",
-                             hr);
-                return false;
-            }
         }
     }
 

@@ -78,6 +78,17 @@ private:
     bool prepareFrameForPresent(AVFrame* frame);
     bool updateBfiConstants(const AVFrame* frame);
     bool initializeBlackFrameInsertion();
+    void releaseBfiFrameLatencyWaitable();
+    bool acquireBfiFrameLatencyWaitable();
+    bool setBfiSwapchainFrameLatency(UINT latency);
+    bool waitForBfiPresentSlot();
+    void releaseBfiBackbuffer();
+    bool acquireBfiBackbuffer();
+    bool copyBfiComposeToBackbuffer();
+    void clearBfiBackbuffer();
+    bool prepareBfiSwapchain(bool presentVideo);
+    HRESULT presentPreparedBfiSwapchain(UINT syncInterval, UINT flags);
+    HRESULT presentBfiSwapchain(bool presentVideo, UINT syncInterval, UINT flags);
     bool restoreBlackFrameInsertionVideo();
     HRESULT presentBlackFrame(UINT syncInterval, UINT flags);
     UINT bfiVrrPresentFlags(const VrrPresentRequest& request) const;
@@ -129,6 +140,12 @@ private:
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_RenderTargetView;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_BlackFrameInsertionVideoTexture;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_BlackFrameInsertionVideoTextureSrv;
+    // Transient swapchain backbuffer used only for the current BFI Present.
+    // Video is composed offscreen; these are acquired after the waitable slot
+    // is free and released before the next carrier half.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_BfiBackbufferTexture;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_BfiBackbufferRtv;
+    HANDLE m_BfiFrameLatencyWaitableObject = nullptr;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_VideoBlendState;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_OverlayBlendState;
 
@@ -156,17 +173,17 @@ private:
     bool m_BlackFrameInsertionDropRecovery;
     bool m_BlackFrameInsertionForceTearing;
     uint64_t m_BlackFrameInsertionLeadTimeUs;
-    // The BFI cache texture is only a trustworthy restore source after a
-    // complete copy of the current render target has been submitted into it.
-    // Cleared before any swapchain-dependent resource replacement and
-    // published true only after the copy in prepareFrameForPresent().
-    // Consistency is guaranteed by the existing lock discipline: replacement
-    // holds both m_PresentationLock and the context lock, while every
-    // reader/writer holds at least one of them.
+    // The offscreen compose target is only a trustworthy Present source after
+    // prepareFrameForPresent() has finished drawing into it. Cleared before
+    // any swapchain-dependent resource replacement. Consistency is guaranteed
+    // by the existing lock discipline: replacement holds both
+    // m_PresentationLock and the context lock, while every reader/writer
+    // holds at least one of them.
     bool m_BlackFrameInsertionCacheValid;
     UINT m_BlackFrameInsertionCacheWidth;
     UINT m_BlackFrameInsertionCacheHeight;
     uint32_t m_BlackFrameInsertionRestoreRejects;
+    bool m_BlackFrameInsertionWaitableSwapchain = false;
     bool m_VrrBorderlessFlipModel;
     bool m_VrrSwapChainAllowsTearing;
     bool m_VrrSuspended;
