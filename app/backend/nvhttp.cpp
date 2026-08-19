@@ -205,12 +205,27 @@ NvHTTP::startApp(QString verb,
                  bool localAudio,
                  int gamepadMask,
                  bool persistGameControllersOnDisconnect,
+                 bool sendClientHdrPeak,
+                 int clientHdrPeakCalibratedNits,
+                 int clientHdrPeakEdidNits,
                  QString& rtspSessionUrl)
 {
     int riKeyId;
 
     memcpy(&riKeyId, streamConfig->remoteInputAesIv, sizeof(riKeyId));
     riKeyId = qFromBigEndian(riKeyId);
+
+    QString clientHdrPeakArguments;
+    if (sendClientHdrPeak && (streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT)) {
+        if (clientHdrPeakCalibratedNits > 0) {
+            clientHdrPeakArguments += QStringLiteral("&clientHdrPeakCalibrated=") +
+                                      QString::number(clientHdrPeakCalibratedNits);
+        }
+        if (clientHdrPeakEdidNits > 0) {
+            clientHdrPeakArguments += QStringLiteral("&clientHdrPeakEdid=") +
+                                      QString::number(clientHdrPeakEdidNits);
+        }
+    }
 
     QString response =
             openConnectionToString(m_BaseUrlHttps,
@@ -229,6 +244,7 @@ NvHTTP::startApp(QString verb,
                                    ((streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) ?
                                        "&hdrMode=1&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0" :
                                         "")+
+                                   clientHdrPeakArguments+
                                    "&localAudioPlayMode="+QString::number(localAudio ? 1 : 0)+
                                    "&surroundAudioInfo="+QString::number(SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(streamConfig->audioConfiguration))+
                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+

@@ -32,6 +32,8 @@ private:
     bool pendingQuit;
 
 public:
+    static constexpr int kClientHdrPeakVersion = 1;
+
     NvComputer() = default;
 
     // Caller is responsible for synchronizing read access to the other host
@@ -98,6 +100,9 @@ public:
     QVector<NvDisplayMode> displayModes;
     int maxLumaPixelsHEVC;
     int serverCodecModeSupport;
+    // Ephemeral host capability. This is intentionally not serialized: it is
+    // re-read from serverinfo so stale hosts cannot enable the launch field.
+    int clientHdrPeakVersion = 0;
     QString gpuModel;
     bool isSupportedServerVersion;
 
