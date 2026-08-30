@@ -45,6 +45,12 @@ void VrrReplayConfigTest::defaultsRoundTrip()
     QCOMPARE(config.scenarios.size(), 1);
     QCOMPARE(config.scenarios.front().controller.renderLeadFloorUs,
              uint64_t(1000));
+    QCOMPARE(config.scenarios.front().controller.renderLeadCeilingUs,
+             uint64_t(0));
+    QCOMPARE(config.scenarios.front().controller.renderBaselinePercentile,
+             50U);
+    QCOMPARE(config.scenarios.front().controller.pacingLatencyBudgetDivisor,
+             uint64_t(2));
     QCOMPARE(config.scenarios.front().worker.queueCapacity, size_t(3));
     QCOMPARE(config.scenarios.front().display.calibrationConfirmed, 0U);
     QCOMPARE(config.scenarios.front().display.scanoutPeriodPs, uint64_t(0));
@@ -75,6 +81,10 @@ void VrrReplayConfigTest::defaultsRoundTrip()
             removePrePresentRasterProbeOverhead,
         0U);
     QVERIFY(vrrReplayParameterNames().contains("controller.guard_step_us"));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.render_baseline_percentile"));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.pacing_latency_budget_divisor"));
     QVERIFY(vrrReplayParameterNames().contains(
         "display.active_scanout_percent"));
     QVERIFY(vrrReplayParameterNames().contains(
@@ -272,6 +282,17 @@ void VrrReplayConfigTest::rejectsInvalidInput()
         R"({"config_schema":1,"parameters":{"controller":{"base_guard_divisor":0}},"scenarios":[{"name":"x"}]})",
         config, error));
     QVERIFY(error.contains("denominators"));
+
+    QVERIFY2(loadVrrReplayConfiguration(
+        R"({"config_schema":1,"parameters":{"controller":{"pacing_latency_budget_divisor":0}},"scenarios":[{"name":"x"}]})",
+        config, error), qPrintable(error));
+    QCOMPARE(config.scenarios.front().controller.pacingLatencyBudgetDivisor,
+             uint64_t(0));
+
+    QVERIFY(!loadVrrReplayConfiguration(
+        R"({"config_schema":1,"parameters":{"controller":{"render_baseline_percentile":100,"preparation_percentile":99}},"scenarios":[{"name":"x"}]})",
+        config, error));
+    QVERIFY(error.contains("render percentiles"));
 
     VrrReplayScenario scenario;
     QVERIFY(!applyVrrReplayOverride("guard_step_us=25", scenario, error));

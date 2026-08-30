@@ -365,7 +365,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.latchedPresentationExitHeadroomPeriodDenominator == 0) {
         return fail("parameter denominators must be non-zero");
     }
-    if (value.renderLeadFloorUs > value.renderLeadCeilingUs ||
+    if ((value.renderLeadCeilingUs != 0 &&
+         value.renderLeadFloorUs > value.renderLeadCeilingUs) ||
             value.minimumGuardUs > value.maximumBaseGuardUs ||
             value.maximumBaseGuardUs > value.maximumAdaptiveGuardUs ||
             value.minimumReadinessReserveUs > value.readinessCeilingUs ||
@@ -392,7 +393,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
         return fail("sample counts and frame thresholds must be consistent and non-zero");
     }
     const unsigned int percents[] = {
-        value.materialRateChangePercent, value.preparationPercentile,
+        value.materialRateChangePercent, value.renderBaselinePercentile,
+        value.preparationPercentile,
         value.schedulerPercentile, value.readinessLowPercentile,
         value.readinessTightPercentile, value.readinessLoosePercentile,
     };
@@ -402,6 +404,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.readinessLowPercentile > value.readinessLoosePercentile ||
             value.readinessLoosePercentile > value.readinessTightPercentile) {
         return fail("readiness percentiles must be low <= loose <= tight");
+    }
+    if (value.renderBaselinePercentile > value.preparationPercentile) {
+        return fail("render percentiles must be baseline <= preparation");
     }
     return true;
 }

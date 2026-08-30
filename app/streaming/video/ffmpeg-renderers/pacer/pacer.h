@@ -56,7 +56,8 @@ public:
 
     bool initialize(SDL_Window* window, int maxVideoFps,
                     bool enablePacing, bool enableVsync,
-                    bool enableVrr, int vrrDisplayRefreshHz);
+                    bool enableVrr, int vrrDisplayRefreshHz,
+                    bool vrrSmoothness);
 
     void notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info);
 

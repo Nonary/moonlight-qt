@@ -550,7 +550,8 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
                                  params->enableFramePacing || (params->enableVsync && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_FORCE_PACING)),
                                  params->enableVsync,
                                  params->enableVrr,
-                                 params->vrrDisplayRefreshHz)) {
+                                 params->vrrDisplayRefreshHz,
+                                 params->vrrSmoothness)) {
             return false;
         }
     }

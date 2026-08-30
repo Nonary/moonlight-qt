@@ -754,7 +754,9 @@ void testQuantizedCadenceProjectsSmoothTargets()
 {
     constexpr uint64_t epochUs = 1000000;
     constexpr uint64_t expectedPeriodUs = 10000;
-    VrrTimingController controller(config(116, 120));
+    VrrSessionConfig smoothnessConfig = config(116, 120);
+    smoothnessConfig.allowAdditionalQueuedFrame = true;
+    VrrTimingController controller(smoothnessConfig);
     VrrTimingDecision decision = controller.schedule(
         frame(0, 0, true, epochUs), epochUs);
     controller.noteSubmission(true, false, decision.targetUs);
@@ -840,6 +842,124 @@ void testSchedulerDelayFeedback()
     }
     expect(controller.targetWakeLeadUs() == 300,
            "frames without a coarse target sleep must retain learned delay");
+}
+
+void trainRenderDurations(VrrTimingController& controller,
+                          uint64_t baselineUs, uint64_t tailUs)
+{
+    constexpr uint64_t epochUs = 1000000;
+    for (int i = 0; i < 96; ++i) {
+        const uint64_t decodedUs = epochUs +
+            static_cast<uint64_t>(i) * 10000ULL;
+        VrrTimingDecision decision = controller.schedule(
+            frame(i, static_cast<uint32_t>(i * 900), true, decodedUs),
+            decodedUs);
+        controller.notePreparationDuration(i == 95 ? tailUs : baselineUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+    }
+}
+
+void testRenderBaselineDoesNotConsumePacingBudget()
+{
+    VrrTimingController controller(config(100, 120));
+    trainRenderDurations(controller, 9000, 9000);
+
+    const VrrTimingDiagnostics diagnostics = controller.diagnostics();
+    expect(diagnostics.renderBaselineUs == 9000 &&
+               controller.renderLeadUs() == 9000,
+           "stable render work above the old ceiling must be learned in full");
+    expect(diagnostics.renderInsuranceUs == 0,
+           "stable render work must not be counted as pacing insurance");
+    expect(controller.timingBudgetUs() <=
+               diagnostics.pacingLatencyBudgetUs,
+           "unavoidable render baseline must not consume the half-scanout budget");
+}
+
+void testRenderTailSharesHalfScanoutBudget()
+{
+    VrrTimingController controller(config(100, 120));
+    trainRenderDurations(controller, 4000, 10000);
+
+    const VrrTimingDiagnostics diagnostics = controller.diagnostics();
+    expect(diagnostics.renderBaselineUs == 4000,
+           "render baseline must use the configured median percentile");
+    expect(controller.renderLeadUs() >= 7600 &&
+               controller.renderLeadUs() <= 7700,
+           "render p99 must be capped to baseline plus available tail insurance");
+    expect(diagnostics.renderInsuranceUs >= 3600 &&
+               diagnostics.renderInsuranceUs <= 3700,
+           "only the p99-minus-median render tail must consume pacing budget");
+    expect(diagnostics.appliedReadinessReserveUs == 500,
+           "render tail must leave the minimum readiness reserve intact");
+    expect(controller.timingBudgetUs() <=
+               diagnostics.pacingLatencyBudgetUs,
+           "readiness and render-tail insurance must not exceed half a scanout");
+}
+
+void testPacingBudgetAtExtremeRefreshRates()
+{
+    for (int displayRefreshHz = 60; displayRefreshHz <= 2000;
+            displayRefreshHz += 37) {
+        VrrTimingController controller(config(100, displayRefreshHz));
+        trainRenderDurations(controller, 400, 2400);
+        const VrrTimingDiagnostics diagnostics = controller.diagnostics();
+        if (controller.timingBudgetUs() >
+                diagnostics.pacingLatencyBudgetUs) {
+            std::fprintf(stderr,
+                         "refresh %d: pacing=%llu budget=%llu baseline=%llu insurance=%llu readiness=%llu\n",
+                         displayRefreshHz,
+                         static_cast<unsigned long long>(
+                             controller.timingBudgetUs()),
+                         static_cast<unsigned long long>(
+                             diagnostics.pacingLatencyBudgetUs),
+                         static_cast<unsigned long long>(
+                             diagnostics.renderBaselineUs),
+                         static_cast<unsigned long long>(
+                             diagnostics.renderInsuranceUs),
+                         static_cast<unsigned long long>(
+                             diagnostics.appliedReadinessReserveUs));
+        }
+        expect(controller.timingBudgetUs() <=
+                   diagnostics.pacingLatencyBudgetUs,
+               "pacing reserve must remain bounded from 60 through 2000 Hz");
+    }
+}
+
+void testSmoothnessAddsOneSourcePeriodOfReserve()
+{
+    VrrSessionConfig lowLatencyConfig = config(100, 120);
+    VrrSessionConfig smoothnessConfig = lowLatencyConfig;
+    smoothnessConfig.allowAdditionalQueuedFrame = true;
+    VrrTimingController lowLatency(lowLatencyConfig);
+    VrrTimingController smoothness(smoothnessConfig);
+
+    const VrrTimingDiagnostics lowLatencyDiagnostics =
+        lowLatency.diagnostics();
+    const VrrTimingDiagnostics smoothnessDiagnostics =
+        smoothness.diagnostics();
+    expect(smoothnessDiagnostics.pacingLatencyBudgetUs ==
+               lowLatencyDiagnostics.pacingLatencyBudgetUs +
+                   smoothness.sourcePeriodUs(),
+           "smoothness mode must grant exactly one source period of reserve");
+}
+
+void testLegacyReplayPolicyRetainsAbsoluteRenderCeiling()
+{
+    VrrTimingParameters parameters;
+    parameters.renderLeadCeilingUs = 6500;
+    parameters.pacingLatencyBudgetDivisor = 0;
+    VrrTimingController controller(config(100, 120), true, parameters);
+    trainRenderDurations(controller, 9000, 9000);
+
+    const VrrTimingDiagnostics diagnostics = controller.diagnostics();
+    expect(controller.renderLeadUs() == 6500,
+           "legacy replay mode must retain the captured absolute render ceiling");
+    expect(diagnostics.pacingLatencyBudgetUs == 0,
+           "legacy replay mode must mark the pacing latency policy disabled");
+    expect(controller.timingBudgetUs() ==
+               diagnostics.appliedReadinessReserveUs +
+                   controller.renderLeadUs(),
+           "legacy replay timing budget must include the full render lead");
 }
 
 void testTargetWaiterBoundaries()
@@ -994,6 +1114,11 @@ int main()
     testQuantizedCadenceProjectsSmoothTargets();
     testSkippedLocalFramePreservesCadence();
     testSchedulerDelayFeedback();
+    testRenderBaselineDoesNotConsumePacingBudget();
+    testRenderTailSharesHalfScanoutBudget();
+    testPacingBudgetAtExtremeRefreshRates();
+    testSmoothnessAddsOneSourcePeriodOfReserve();
+    testLegacyReplayPolicyRetainsAbsoluteRenderCeiling();
     testTargetWaiterBoundaries();
     testRuntimeParametersChangePolicy();
     return failures == 0 ? 0 : 1;

@@ -295,6 +295,7 @@ bool validateTraceRowSyntax(const QList<QByteArray>& header,
         "queue_discontinuity",
         "decision_valid",
         "can_latch_present",
+        "additional_queued_frame",
         "render_scheduler_delay_valid",
         "render_deadline_already_elapsed",
         "render_wait_coarse_clock_stalled",
@@ -450,6 +451,7 @@ struct Columns {
     int decisionUs = -1;
     int displayRefreshHz = -1;
     int streamRateHz = -1;
+    int additionalQueuedFrame = -1;
     int displayPeriodUs = -1;
     int canLatch = -1;
     int sourceIntervalUs = -1;
@@ -687,6 +689,9 @@ struct Columns {
     int readinessPhaseUs = -1;
     int readinessDemandUs = -1;
     int appliedReadinessReserveUs = -1;
+    int renderBaselineUs = -1;
+    int renderInsuranceUs = -1;
+    int pacingLatencyBudgetUs = -1;
     int cadenceSampleCount = -1;
     int rateCandidateSampleCount = -1;
     int readinessSampleCount = -1;
@@ -730,6 +735,7 @@ struct Columns {
         decisionUs = find("decision_us");
         displayRefreshHz = find("display_refresh_hz");
         streamRateHz = find("stream_rate_hz");
+        additionalQueuedFrame = find("additional_queued_frame");
         displayPeriodUs = find("display_period_us");
         canLatch = find("can_latch_present");
         sourceIntervalUs = find("sender_interval_us");
@@ -1094,6 +1100,9 @@ struct Columns {
         readinessPhaseUs = find("readiness_phase_us");
         readinessDemandUs = find("readiness_demand_us");
         appliedReadinessReserveUs = find("applied_readiness_reserve_us");
+        renderBaselineUs = find("render_baseline_us");
+        renderInsuranceUs = find("render_insurance_us");
+        pacingLatencyBudgetUs = find("pacing_latency_budget_us");
         cadenceSampleCount = find("cadence_sample_count");
         rateCandidateSampleCount = find("rate_candidate_sample_count");
         readinessSampleCount = find("readiness_sample_count");
@@ -1486,6 +1495,7 @@ struct Metrics {
     TraceFooter traceFooter;
     uint64_t displayRefreshMismatchRows = 0;
     uint64_t streamRateMismatchRows = 0;
+    uint64_t additionalQueuedFrameMismatchRows = 0;
     uint64_t latchCapabilityMismatchRows = 0;
     uint64_t displayPeriodMismatchRows = 0;
     uint64_t controllerParameterMismatchRows = 0;
@@ -2013,6 +2023,9 @@ struct Metrics {
     Distribution referenceReadinessPhaseDrift;
     Distribution referenceReadinessDemandDrift;
     Distribution referenceAppliedReadinessReserveDrift;
+    Distribution referenceRenderBaselineDrift;
+    Distribution referenceRenderInsuranceDrift;
+    Distribution referencePacingLatencyBudgetDrift;
     Distribution referenceCadenceSampleCountDrift;
     Distribution referenceRateCandidateSampleCountDrift;
     Distribution referenceReadinessSampleCountDrift;
@@ -2197,6 +2210,19 @@ void addReferenceControllerDiagnostics(
             diagnostics.appliedReadinessReserveUs,
             optionalUnsignedField(
                 fields, columns.appliedReadinessReserveUs))));
+    metrics.referenceRenderBaselineDrift.add(absoluteValue(
+        signedDifference(
+            diagnostics.renderBaselineUs,
+            optionalUnsignedField(fields, columns.renderBaselineUs))));
+    metrics.referenceRenderInsuranceDrift.add(absoluteValue(
+        signedDifference(
+            diagnostics.renderInsuranceUs,
+            optionalUnsignedField(fields, columns.renderInsuranceUs))));
+    metrics.referencePacingLatencyBudgetDrift.add(absoluteValue(
+        signedDifference(
+            diagnostics.pacingLatencyBudgetUs,
+            optionalUnsignedField(
+                fields, columns.pacingLatencyBudgetUs))));
     metrics.referenceCadenceSampleCountDrift.add(absoluteValue(
         signedDifference(
             static_cast<uint64_t>(diagnostics.cadenceSamples),
@@ -2942,6 +2968,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
                           const QString& decodedTraceSha256,
                           int capturedDisplayHz, int capturedStreamFps,
                           int simulatedDisplayHz, int simulatedStreamFps,
+                          bool additionalQueuedFrame,
                           bool simulatedCanLatch,
                           const VrrReplayScenario& scenario)
 {
@@ -3039,11 +3066,15 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         "DXGI stores SyncQPCTime paired with latch_sync_refresh_seq; it is not generally the timestamp of latch_present_refresh_seq";
     capture["display_hz"] = capturedDisplayHz;
     capture["stream_fps"] = capturedStreamFps;
+    capture["additional_queued_frame"] = additionalQueuedFrame;
     QJsonObject sessionConfigIntegrity;
     sessionConfigIntegrity["display_refresh_mismatch_rows"] =
         static_cast<qint64>(metrics.displayRefreshMismatchRows);
     sessionConfigIntegrity["stream_rate_mismatch_rows"] =
         static_cast<qint64>(metrics.streamRateMismatchRows);
+    sessionConfigIntegrity["additional_queued_frame_mismatch_rows"] =
+        static_cast<qint64>(
+            metrics.additionalQueuedFrameMismatchRows);
     sessionConfigIntegrity["latch_capability_mismatch_rows"] =
         static_cast<qint64>(metrics.latchCapabilityMismatchRows);
     sessionConfigIntegrity["display_period_mismatch_rows"] =
@@ -3053,6 +3084,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     sessionConfigIntegrity["valid"] =
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
+        metrics.additionalQueuedFrameMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
         metrics.controllerParameterMismatchRows == 0;
@@ -3380,6 +3412,10 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         exactScheduledDistribution(metrics.referenceReadinessDemandDrift) &&
         exactScheduledDistribution(
             metrics.referenceAppliedReadinessReserveDrift) &&
+        exactScheduledDistribution(metrics.referenceRenderBaselineDrift) &&
+        exactScheduledDistribution(metrics.referenceRenderInsuranceDrift) &&
+        exactScheduledDistribution(
+            metrics.referencePacingLatencyBudgetDrift) &&
         exactScheduledDistribution(
             metrics.referenceCadenceSampleCountDrift) &&
         exactScheduledDistribution(
@@ -5188,6 +5224,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     simulation["model"] = kReplayModel;
     simulation["display_hz"] = simulatedDisplayHz;
     simulation["stream_fps"] = simulatedStreamFps;
+    simulation["additional_queued_frame"] = additionalQueuedFrame;
     simulation["can_latch_present"] = simulatedCanLatch;
     simulation["scenario"] = scenario.name;
     simulation["mode"] = scenario.mode;
@@ -5593,6 +5630,12 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     referenceControllerDiagnostics["applied_readiness_reserve_drift_us"] =
         distributionObject(
             metrics.referenceAppliedReadinessReserveDrift);
+    referenceControllerDiagnostics["render_baseline_drift_us"] =
+        distributionObject(metrics.referenceRenderBaselineDrift);
+    referenceControllerDiagnostics["render_insurance_drift_us"] =
+        distributionObject(metrics.referenceRenderInsuranceDrift);
+    referenceControllerDiagnostics["pacing_latency_budget_drift_us"] =
+        distributionObject(metrics.referencePacingLatencyBudgetDrift);
     referenceControllerDiagnostics["cadence_sample_count_drift"] =
         distributionObject(metrics.referenceCadenceSampleCountDrift);
     referenceControllerDiagnostics["rate_candidate_sample_count_drift"] =
@@ -5662,6 +5705,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         semanticIntegrityReady &&
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
+        metrics.additionalQueuedFrameMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
         metrics.controllerParameterMismatchRows == 0 &&
@@ -5890,6 +5934,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     const bool sessionConfigIntegrityReady =
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
+        metrics.additionalQueuedFrameMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
         metrics.controllerParameterMismatchRows == 0;
@@ -10855,6 +10900,8 @@ int main(int argc, char* argv[])
             static_cast<int>(rowStreamRateValue);
         const bool rowCanLatch =
             unsignedField(fields, columns.canLatch) != 0;
+        const bool rowAdditionalQueuedFrame = optionalUnsignedField(
+            fields, columns.additionalQueuedFrame) != 0;
         if (periodForRate(rowDisplayRefreshHz) == 0 ||
                 periodForRate(rowStreamRateHz) == 0) {
             std::fprintf(
@@ -10871,6 +10918,8 @@ int main(int argc, char* argv[])
         if (capturedConfig.displayRefreshHz == 0) {
             capturedConfig.displayRefreshHz = rowDisplayRefreshHz;
             capturedConfig.streamRateHz = rowStreamRateHz;
+            capturedConfig.allowAdditionalQueuedFrame =
+                rowAdditionalQueuedFrame;
             capturedCanLatch = rowCanLatch;
             if (traceSchema >= 5) {
                 VrrReplayScenario capturedScenario;
@@ -10880,12 +10929,20 @@ int main(int argc, char* argv[])
                     const auto column = columns.capturedParameterColumns.find(
                         path);
                     if (column == columns.capturedParameterColumns.end()) {
-                        // These display-period-scaled latch thresholds were
-                        // added after schema 5. Preserve the absolute-us
-                        // semantics captured by older schema-5 traces while
-                        // new traces record the ratios explicitly.
+                        // Preserve the policy semantics of schema-5 fields
+                        // added after the initial release. Older captures use
+                        // absolute latch thresholds and predate render-tail
+                        // pacing budgets; new traces record both explicitly.
                         QString legacyValue;
-                        if (path.endsWith("_period_numerator")) {
+                        if (path ==
+                                "controller.render_baseline_percentile") {
+                            legacyValue = "50";
+                        }
+                        else if (path ==
+                                 "controller.pacing_latency_budget_divisor") {
+                            legacyValue = "0";
+                        }
+                        else if (path.endsWith("_period_numerator")) {
                             legacyValue = "0";
                         }
                         else if (path.endsWith("_period_denominator")) {
@@ -10941,6 +10998,9 @@ int main(int argc, char* argv[])
                 rowDisplayRefreshHz != capturedConfig.displayRefreshHz ? 1 : 0;
             metrics.streamRateMismatchRows +=
                 rowStreamRateHz != capturedConfig.streamRateHz ? 1 : 0;
+            metrics.additionalQueuedFrameMismatchRows +=
+                rowAdditionalQueuedFrame !=
+                    capturedConfig.allowAdditionalQueuedFrame ? 1 : 0;
             metrics.latchCapabilityMismatchRows +=
                 rowCanLatch != capturedCanLatch ? 1 : 0;
         }
@@ -13527,6 +13587,7 @@ int main(int argc, char* argv[])
         QString::fromLatin1(decodedTraceHash.result().toHex()),
         capturedConfig.displayRefreshHz, capturedConfig.streamRateHz,
         simulatedConfig.displayRefreshHz, simulatedConfig.streamRateHz,
+        capturedConfig.allowAdditionalQueuedFrame,
         simulatedCanLatch, scenario);
     bool comparisonCompatible = true;
     if (parser.isSet(compareOption)) {

@@ -25,12 +25,16 @@ learning for every integer rate from 30 through 116 FPS on a 120 Hz-quantized
 capture clock, a continuous one-FPS-per-second sweep in both directions,
 isolated hitch rejection, rapid 30 FPS cutscene transitions, high-rate
 recovery, and smooth projected targets from mixed 8.33/16.67 ms timestamp
-intervals.
+intervals in the explicit smoothness mode. It also verifies that low-latency
+mode counts only p99-minus-p50 render-tail insurance and readiness against a
+half-scanout budget, while stable render work remains outside that ceiling.
 
 `tst_vrrpacingworker` supplies a fake frame presenter and a test-owned
 `LiGetMicroseconds()` epoch. It verifies the bounded worker queue,
 drop accounting, minimize/restore discard and fresh-frame behavior, deferred
 AVFrame lifetime, presenter eligibility rejection, display-period spacing,
+one-source-period low-latency staleness and the opt-in additional smoothness
+period,
 native submission timing across pre-submit work and blocking
 returns, clean-close trace accounting, explicit window-state rebase
 provenance, and the minimal prepare/present/cancel contract. D3D11 completes
@@ -75,6 +79,7 @@ controller parameter set, controller call duration and learned-model state,
 stale-check age, render/target wait boundaries, both spacing-floor checks,
 correction-wait boundaries, explicit worker-requested rebase cause, and
 terminal time. Header-resolved schema-5 extensions also record the native
+queue policy, render baseline, render-tail insurance, pacing-latency budget,
 presentation backend/result, signed `GetLastPresentCount()` and
 `GetFrameStatistics()` results, the exact DXGI Present sync interval/flags,
 the renderer's VRR eligibility snapshot, desktop monitor count, the startup
@@ -90,6 +95,11 @@ before-state, native-call, and GPU-ready observations remain opt-in because
 they can perturb the renderer; the essential post-Present submission/latch
 queries are collected in both modes, while their extra timing brackets remain
 deep-only.
+
+New captures use `controller.pacing_latency_budget_divisor=2`. A value of zero
+is a replay-only compatibility mode that disables the baseline/tail ceiling;
+older schema-5 headers missing this field resolve to zero and keep their
+captured absolute render-lead ceiling. Production defaults never select zero.
 
 `MOONLIGHT_VRR_ALIGN=1` adds observation-only Windows raster sampling to a
 deep trace. It opens the GDI display's D3DKMT source once per display epoch and
@@ -580,7 +590,7 @@ silently joining observations from two display timelines. An explicit external
 rebase starts a new epoch, discards its ambiguous cached before-state anchor,
 and begins again with post-Present evidence.
 The readiness gate compares all numeric and boolean decision fields
-and all schema-5 learned-state counters after every `decision_valid` worker
+and all schema-5 learned-state values and counters after every `decision_valid` worker
 row. Producer-side queue/suspension terminal rows
 carry zero controller diagnostics so tracing never reads worker-owned learned
 state concurrently.

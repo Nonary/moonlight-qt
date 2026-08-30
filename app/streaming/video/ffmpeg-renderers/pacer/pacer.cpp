@@ -292,7 +292,8 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
 
 bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                        bool enablePacing, bool enableVsync,
-                       bool enableVrr, int vrrDisplayRefreshHz)
+                       bool enableVrr, int vrrDisplayRefreshHz,
+                       bool vrrSmoothness)
 {
     m_MaxVideoFps = maxVideoFps;
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
@@ -305,6 +306,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         config.streamRateHz = maxVideoFps;
         config.displayRefreshHz = vrrDisplayRefreshHz;
+        config.allowAdditionalQueuedFrame = vrrSmoothness;
 
         if (!enableVsync) {
             fallbackReason = VrrFallbackReason::IneffectiveVsync;
@@ -339,8 +341,10 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                     if (m_VrrWorker->start()) {
                         m_DisplayFps = config.displayRefreshHz;
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "VRR pacing: target %d Hz with %d FPS stream",
-                                    m_DisplayFps, m_MaxVideoFps);
+                                    "VRR pacing: target %d Hz with %d FPS stream (%s queue)",
+                                    m_DisplayFps, m_MaxVideoFps,
+                                    config.allowAdditionalQueuedFrame ?
+                                        "one-frame smoothness" : "low-latency");
                         return true;
                     }
 

@@ -282,6 +282,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             int frameRate, bool enableVsync, bool enableFramePacing,
                             bool testOnly, IVideoDecoder*& chosenDecoder,
                             bool enableVrr, int vrrDisplayRefreshHz,
+                            bool vrrSmoothness,
                             [[maybe_unused]] bool* effectiveVrr)
 {
     DECODER_PARAMETERS params = {};
@@ -301,6 +302,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.enableFramePacing = enableFramePacing;
     params.enableVrr = enableVrr;
     params.vrrDisplayRefreshHz = vrrDisplayRefreshHz;
+    params.vrrSmoothness = enableVrr && vrrSmoothness;
     params.testOnly = testOnly;
     params.vds = vds;
     params.renderer = renderer;
@@ -320,6 +322,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     DECODER_PARAMETERS slVideoParams = params;
     slVideoParams.enableVrr = false;
     slVideoParams.vrrDisplayRefreshHz = 0;
+    slVideoParams.vrrSmoothness = false;
     chosenDecoder = new SLVideoDecoder(testOnly);
     if (chosenDecoder->initialize(&slVideoParams)) {
         if (enableVrr) {
@@ -650,6 +653,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
     m_PresentationSettings.enableFramePacing = m_PresentationSettings.effectiveVsync &&
                                                m_Preferences->framePacing;
     m_PresentationSettings.enableVrr = false;
+    m_PresentationSettings.vrrSmoothness = false;
 
     if (requestedVrr) {
         const bool hasAdaptiveHeadroom = hasStrictRefreshRate &&
@@ -672,6 +676,8 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
         if (hasStrictRefreshRate && m_PresentationSettings.effectiveVsync &&
                 hasAdaptiveHeadroom) {
             m_PresentationSettings.enableVrr = true;
+            m_PresentationSettings.vrrSmoothness =
+                m_Preferences->vrrSmoothness;
             m_PresentationSettings.effectiveWindowMode = StreamingPreferences::WM_FULLSCREEN_DESKTOP;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "VRR requested at %d Hz; forcing borderless desktop fullscreen for this session",
@@ -2391,6 +2397,7 @@ void Session::exec()
                                s_ActiveSession->m_VideoDecoder,
                                m_PresentationSettings.enableVrr,
                                m_PresentationSettings.refreshRate,
+                               m_PresentationSettings.vrrSmoothness,
                                &m_PresentationSettings.enableVrr)) {
                 SDL_UnlockMutex(m_DecoderLock);
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,

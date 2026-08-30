@@ -88,6 +88,7 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
 {
     const uint64_t previousReadinessDemandUs = m_ReadinessDemandUs;
     const bool previousReadinessModelValid = m_ReadinessModelValid;
+    const uint64_t previousRenderBaselineUs = m_RenderBaselineUs;
     const uint64_t previousRenderLeadUs = m_RenderLeadUs;
     const uint64_t previousRenderWakeLeadUs = m_RenderWakeLeadUs;
     const uint64_t previousTargetWakeLeadUs = m_TargetWakeLeadUs;
@@ -130,6 +131,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_Pending = PendingFrame {};
 
     if (retainLearnedBudgets) {
+        m_RenderBaselineUs = std::min(previousRenderBaselineUs,
+                                      m_SourcePeriodUs);
         m_RenderLeadUs = clampUnsigned(previousRenderLeadUs,
                                        renderLeadFloorUs(),
                                        renderLeadCeilingUs());
@@ -142,6 +145,10 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
                                   guardCeilingUs());
     }
     else {
+        // Until measurements arrive, treat the historical 1 ms lead as
+        // unavoidable render work rather than pacing latency insurance.
+        m_RenderBaselineUs = std::min(m_Parameters.renderLeadFloorUs,
+                                      m_SourcePeriodUs);
         m_RenderLeadUs = clampUnsigned(m_Parameters.renderLeadFloorUs,
                                        renderLeadFloorUs(),
                                        renderLeadCeilingUs());
@@ -149,6 +156,7 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_TargetWakeLeadUs = 0;
         m_GuardUs = m_BaseGuardUs;
     }
+    clampReadinessReserveToPolicy();
 }
 
 void VrrTimingController::initializeTimeline(const PacedFrame& frame)
@@ -634,12 +642,15 @@ bool VrrTimingController::acceptSourcePeriodQ16(uint64_t periodUsQ16)
     const uint64_t previousPeriodUs = m_SourcePeriodUs;
     m_SourcePeriodUsQ16 = periodUsQ16;
     m_SourcePeriodUs = std::max<uint64_t>(1, roundedQ16(periodUsQ16));
+    m_RenderBaselineUs = std::min(m_RenderBaselineUs,
+                                  m_SourcePeriodUs);
     m_RenderLeadUs = clampUnsigned(m_RenderLeadUs,
                                    renderLeadFloorUs(),
                                    renderLeadCeilingUs());
     m_GuardUs = clampUnsigned(m_GuardUs,
                               m_BaseGuardUs,
                               guardCeilingUs());
+    clampReadinessReserveToPolicy();
     return !withinPercent(m_SourcePeriodUs, previousPeriodUs,
                           m_Parameters.materialRateChangePercent);
 }
@@ -728,12 +739,20 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
 void VrrTimingController::updateLearnedBudgets()
 {
     if (!m_PreparationDurations.empty()) {
+        m_RenderBaselineUs = std::min(
+            percentile(m_PreparationDurations,
+                       m_Parameters.renderBaselinePercentile),
+            m_SourcePeriodUs);
         m_RenderLeadUs = clampUnsigned(
             saturatingAdd(percentile(
                               m_PreparationDurations,
                               m_Parameters.preparationPercentile),
                           m_Parameters.renderLeadSlackUs),
             renderLeadFloorUs(), renderLeadCeilingUs());
+        // The p99 tail and readiness reserve share one hard policy budget.
+        // Enforce a newly larger render tail immediately without advancing
+        // the gradual readiness acquisition a second time.
+        clampReadinessReserveToPolicy();
     }
 
     if (!m_RenderSchedulerDelays.empty()) {
@@ -817,10 +836,11 @@ void VrrTimingController::applyReadinessBudget(bool acquireReserve)
                 m_Parameters.usableHeadroomDenominator : 0;
     const uint64_t effectiveDemandUs = m_ReadinessModelValid ?
         m_ReadinessDemandUs : m_Parameters.coldStartReadinessDemandUs;
-    m_AppliedReadinessReserveUs = std::max(
-        m_Parameters.minimumReadinessReserveUs,
-        effectiveDemandUs > usableHeadroomUs ?
-            effectiveDemandUs - usableHeadroomUs : 0);
+    m_AppliedReadinessReserveUs = std::min(
+        readinessReserveCeilingUs(),
+        std::max(minimumReadinessReserveUs(),
+                 effectiveDemandUs > usableHeadroomUs ?
+                     effectiveDemandUs - usableHeadroomUs : 0));
 
     const int64_t ceilingUs = static_cast<int64_t>(readinessCeilingUs());
     const int64_t reserveUs = static_cast<int64_t>(
@@ -846,13 +866,37 @@ void VrrTimingController::applyReadinessBudget(bool acquireReserve)
             m_ReadinessBudgetUs - clampedDesiredUs,
             static_cast<int64_t>(m_Parameters.readinessAcquireStepUs));
     }
+
+    clampReadinessReserveToPolicy();
+}
+
+void VrrTimingController::clampReadinessReserveToPolicy()
+{
+    // Demand release remains gradual, but a larger render tail must not leave
+    // the combined pacing reserve above the half-scanout policy ceiling.
+    const int64_t ceilingUs = static_cast<int64_t>(readinessCeilingUs());
+    m_AppliedReadinessReserveUs = std::min(
+        m_AppliedReadinessReserveUs,
+        std::min(readinessReserveCeilingUs(),
+                 static_cast<uint64_t>(ceilingUs)));
+    const int64_t reserveUs = static_cast<int64_t>(
+        m_AppliedReadinessReserveUs);
+    const int64_t policyCeilingUs = m_ReadinessPhaseUs >
+            std::numeric_limits<int64_t>::max() - reserveUs ?
+        std::numeric_limits<int64_t>::max() :
+        m_ReadinessPhaseUs + reserveUs;
+    m_ReadinessBudgetUs = std::min(
+        m_ReadinessBudgetUs,
+        std::max(-ceilingUs, std::min(policyCeilingUs, ceilingUs)));
 }
 
 uint64_t VrrTimingController::timingBudgetUs() const
 {
     return saturatingAdd(
         m_AppliedReadinessReserveUs,
-        saturatingAdd(m_RenderLeadUs, m_Parameters.presentationSafetyUs));
+        saturatingAdd(pacingLatencyPolicyEnabled() ?
+                          renderInsuranceUs() : m_RenderLeadUs,
+                      m_Parameters.presentationSafetyUs));
 }
 
 int64_t VrrTimingController::readinessBudgetUs() const
@@ -953,6 +997,9 @@ VrrTimingDiagnostics VrrTimingController::diagnostics() const
     value.readinessPhaseUs = m_ReadinessPhaseUs;
     value.readinessDemandUs = m_ReadinessDemandUs;
     value.appliedReadinessReserveUs = m_AppliedReadinessReserveUs;
+    value.renderBaselineUs = m_RenderBaselineUs;
+    value.renderInsuranceUs = renderInsuranceUs();
+    value.pacingLatencyBudgetUs = pacingLatencyBudgetUs();
     value.cadenceSamples = m_CadenceSamples.size();
     value.rateCandidateSamples = m_RateCandidateSamples.size();
     value.readinessSamples = m_ReadyOffsets.size();
@@ -967,14 +1014,85 @@ VrrTimingDiagnostics VrrTimingController::diagnostics() const
 
 uint64_t VrrTimingController::renderLeadFloorUs() const
 {
-    return std::min(m_Parameters.renderLeadFloorUs, m_SourcePeriodUs);
+    // Once measurements show a lower baseline, the historical 1 ms floor is
+    // discretionary too and cannot violate the pacing policy at very high Hz.
+    return std::min(
+        std::min(m_Parameters.renderLeadFloorUs, m_SourcePeriodUs),
+        saturatingAdd(m_RenderBaselineUs, renderInsuranceCeilingUs()));
 }
 
 uint64_t VrrTimingController::renderLeadCeilingUs() const
 {
-    const uint64_t ceilingUs = std::min(m_Parameters.renderLeadCeilingUs,
-                                        m_SourcePeriodUs);
+    uint64_t ceilingUs = std::min(
+        saturatingAdd(m_RenderBaselineUs, renderInsuranceCeilingUs()),
+        m_SourcePeriodUs);
+    // Zero disables the legacy absolute render ceiling. Nonzero values remain
+    // available to replay old captures and run explicit policy experiments.
+    if (m_Parameters.renderLeadCeilingUs != 0) {
+        ceilingUs = std::min(ceilingUs,
+                             m_Parameters.renderLeadCeilingUs);
+    }
     return std::max(renderLeadFloorUs(), ceilingUs);
+}
+
+uint64_t VrrTimingController::pacingLatencyBudgetUs() const
+{
+    if (!pacingLatencyPolicyEnabled()) {
+        return 0;
+    }
+    // Immediate VRR presentation saves roughly half a scanout on average.
+    // Spend no more than that on readiness plus render-tail insurance. The
+    // render baseline is unavoidable work in fixed and adaptive modes alike.
+    // Smoothness mode explicitly permits one additional source frame of
+    // standing latency, matching the worker's extra stale-frame tolerance.
+    const uint64_t lowLatencyBudgetUs = m_DisplayPeriodUs /
+        std::max<uint64_t>(1, m_Parameters.pacingLatencyBudgetDivisor);
+    return m_Config.allowAdditionalQueuedFrame ?
+        saturatingAdd(lowLatencyBudgetUs, m_SourcePeriodUs) :
+        lowLatencyBudgetUs;
+}
+
+bool VrrTimingController::pacingLatencyPolicyEnabled() const
+{
+    // Zero is reserved for replaying schema-5 captures made before the
+    // baseline/tail policy existed. New production configurations use 2.
+    return m_Parameters.pacingLatencyBudgetDivisor != 0;
+}
+
+uint64_t VrrTimingController::minimumReadinessReserveUs() const
+{
+    if (!pacingLatencyPolicyEnabled()) {
+        return m_Parameters.minimumReadinessReserveUs;
+    }
+    return std::min(m_Parameters.minimumReadinessReserveUs,
+                    pacingLatencyBudgetUs());
+}
+
+uint64_t VrrTimingController::renderInsuranceCeilingUs() const
+{
+    if (!pacingLatencyPolicyEnabled()) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    const uint64_t budgetUs = pacingLatencyBudgetUs();
+    const uint64_t minimumReserveUs = minimumReadinessReserveUs();
+    return budgetUs > minimumReserveUs ?
+        budgetUs - minimumReserveUs : 0;
+}
+
+uint64_t VrrTimingController::renderInsuranceUs() const
+{
+    return m_RenderLeadUs > m_RenderBaselineUs ?
+        m_RenderLeadUs - m_RenderBaselineUs : 0;
+}
+
+uint64_t VrrTimingController::readinessReserveCeilingUs() const
+{
+    if (!pacingLatencyPolicyEnabled()) {
+        return readinessCeilingUs();
+    }
+    const uint64_t budgetUs = pacingLatencyBudgetUs();
+    const uint64_t insuranceUs = renderInsuranceUs();
+    return budgetUs > insuranceUs ? budgetUs - insuranceUs : 0;
 }
 
 uint64_t VrrTimingController::readinessCeilingUs() const

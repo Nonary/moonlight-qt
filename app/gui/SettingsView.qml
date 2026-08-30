@@ -870,6 +870,25 @@ Flickable {
                 }
 
                 CheckBox {
+                    width: parent.width
+                    hoverEnabled: true
+                    text: qsTr("VRR smoothness")
+                    font.pointSize: 12
+                    enabled: StreamingPreferences.enableVsync &&
+                             StreamingPreferences.enableVrr
+                    checked: StreamingPreferences.vrrSmoothness
+                    onCheckedChanged: {
+                        StreamingPreferences.vrrSmoothness = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: enabled ? qsTr("Allows VRR to retain one additional frame during short rendering stalls. This can reduce stutter but may add up to one frame of latency.")
+                                              : qsTr("Enable V-Sync and VRR to use the smoothness queue.")
+                }
+
+                CheckBox {
                     id: enableHdr
                     width: parent.width
                     text: qsTr("Enable HDR")

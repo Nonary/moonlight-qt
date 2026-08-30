@@ -12,8 +12,10 @@
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
     X(uint64_t, maximum_forward_movement_us, maximumForwardMovementUs, 1000000) \
     X(uint64_t, render_lead_floor_us, renderLeadFloorUs, 1000) \
-    X(uint64_t, render_lead_ceiling_us, renderLeadCeilingUs, 6500) \
+    X(uint64_t, render_lead_ceiling_us, renderLeadCeilingUs, 0) \
     X(uint64_t, render_lead_slack_us, renderLeadSlackUs, 0) \
+    X(unsigned int, render_baseline_percentile, renderBaselinePercentile, 50) \
+    X(uint64_t, pacing_latency_budget_divisor, pacingLatencyBudgetDivisor, 2) \
     X(uint64_t, presentation_safety_us, presentationSafetyUs, 0) \
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
     X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
@@ -75,6 +77,9 @@ struct VrrTimingDiagnostics {
     int64_t readinessPhaseUs = 0;
     uint64_t readinessDemandUs = 0;
     uint64_t appliedReadinessReserveUs = 0;
+    uint64_t renderBaselineUs = 0;
+    uint64_t renderInsuranceUs = 0;
+    uint64_t pacingLatencyBudgetUs = 0;
     size_t cadenceSamples = 0;
     size_t rateCandidateSamples = 0;
     size_t readinessSamples = 0;
@@ -204,7 +209,14 @@ private:
     void updateLearnedBudgets();
     void updateReadinessModel();
     void applyReadinessBudget(bool acquireReserve);
+    void clampReadinessReserveToPolicy();
 
+    uint64_t pacingLatencyBudgetUs() const;
+    bool pacingLatencyPolicyEnabled() const;
+    uint64_t minimumReadinessReserveUs() const;
+    uint64_t renderInsuranceCeilingUs() const;
+    uint64_t renderInsuranceUs() const;
+    uint64_t readinessReserveCeilingUs() const;
     uint64_t renderLeadFloorUs() const;
     uint64_t renderLeadCeilingUs() const;
     uint64_t readinessCeilingUs() const;
@@ -237,6 +249,7 @@ private:
     uint64_t m_ReadinessDemandUs = 0;
     uint64_t m_AppliedReadinessReserveUs = 0;
     bool m_ReadinessModelValid = false;
+    uint64_t m_RenderBaselineUs = 0;
     uint64_t m_RenderLeadUs = 0;
     uint64_t m_RenderWakeLeadUs = 0;
     uint64_t m_TargetWakeLeadUs = 0;

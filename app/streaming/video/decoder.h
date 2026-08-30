@@ -76,6 +76,9 @@ typedef struct _DECODER_PARAMETERS {
     // the session was not qualified for VRR; Pacer must not substitute a
     // legacy 60 Hz fallback when this path is requested.
     int vrrDisplayRefreshHz;
+    // Allows one additional source interval of bounded VRR queue latency.
+    // Ignored unless enableVrr is true.
+    bool vrrSmoothness;
     bool testOnly;
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;
 
