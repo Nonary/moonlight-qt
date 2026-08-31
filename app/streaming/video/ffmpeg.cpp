@@ -1168,54 +1168,27 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             stats.vrrPacingDroppedFrames != 0 ||
             stats.vrrPresentFailedFrames != 0 ||
             stats.vrrPresentCancelledFrames != 0) {
-        const auto percentOfEligible = [&stats](uint64_t count) {
-            return stats.vrrEligibleFrames == 0 ? 0.0 :
-                static_cast<double>(count) * 100.0 /
-                static_cast<double>(stats.vrrEligibleFrames);
-        };
-        char sampleAge[64];
-        if (stats.vrrStateSequence == 0) {
-            snprintf(sampleAge, sizeof(sampleAge), "N/A");
+        if (stats.vrrEligibleFrames == 0) {
+            ret = snprintf(&output[offset],
+                           length - offset,
+                           "VRR pacing: %s (starting...)\n",
+                           stats.vrrTelemetryActive ? "Active" : "Inactive");
         }
         else {
-            const uint64_t nowUs = LiGetMicroseconds();
-            const uint64_t ageUs = nowUs >= stats.vrrStateSampleTimeUs ?
-                nowUs - stats.vrrStateSampleTimeUs : 0;
-            snprintf(sampleAge, sizeof(sampleAge), "%.2f ms, seq %llu",
-                     static_cast<double>(ageUs) / 1000.0,
-                     static_cast<unsigned long long>(stats.vrrStateSequence));
-        }
+            const uint64_t lateFrames = qMin(stats.vrrPrepareLateFrames,
+                                             stats.vrrEligibleFrames);
+            const double readyOnTimePercent =
+                static_cast<double>(stats.vrrEligibleFrames - lateFrames) *
+                100.0 / static_cast<double>(stats.vrrEligibleFrames);
 
-        ret = snprintf(&output[offset],
-                       length - offset,
-                       "VRR eligible: %llu; prepare late %.2f%% (%llu, late-prep magnitude p50/p95/p99 (up to 128 retained late frames): %.2f/%.2f/%.2f ms)\n"
-                       "VRR wait-entry late: %.2f%%; submit error p50/p95/p99/max (up to 128 retained successful presentations): %+.2f/%+.2f/%+.2f/%+.2f ms\n"
-                       "VRR failed/cancelled: %llu/%llu; drops/spacing: %llu/%llu\n"
-                       "VRR decision readiness/timing reserve/guard: %.2f/%.2f/%.2f ms (sample %s)\n"
-                       "VRR render lead/wake lead (render/target)/source: %.2f/%.2f/%.2f/%.2f ms\n",
-                       static_cast<unsigned long long>(stats.vrrEligibleFrames),
-                       percentOfEligible(stats.vrrPrepareLateFrames),
-                       static_cast<unsigned long long>(stats.vrrPrepareLateFrames),
-                       static_cast<double>(stats.vrrPrepareLatenessP50Us) / 1000.0,
-                       static_cast<double>(stats.vrrPrepareLatenessP95Us) / 1000.0,
-                       static_cast<double>(stats.vrrPrepareLatenessP99Us) / 1000.0,
-                       percentOfEligible(stats.vrrTargetWaitEntryLateFrames),
-                       static_cast<double>(stats.vrrSubmitErrorP50Us) / 1000.0,
-                       static_cast<double>(stats.vrrSubmitErrorP95Us) / 1000.0,
-                       static_cast<double>(stats.vrrSubmitErrorP99Us) / 1000.0,
-                       static_cast<double>(stats.vrrSubmitErrorMaxUs) / 1000.0,
-                       static_cast<unsigned long long>(stats.vrrPresentFailedFrames),
-                       static_cast<unsigned long long>(stats.vrrPresentCancelledFrames),
-                       static_cast<unsigned long long>(stats.vrrPacingDroppedFrames),
-                       static_cast<unsigned long long>(stats.vrrSpacingCorrections),
-                       static_cast<double>(stats.vrrReadinessBudgetUs) / 1000.0,
-                       static_cast<double>(stats.vrrTimingBudgetUs) / 1000.0,
-                       static_cast<double>(stats.vrrGuardUs) / 1000.0,
-                       sampleAge,
-                       static_cast<double>(stats.vrrRenderLeadUs) / 1000.0,
-                       static_cast<double>(stats.vrrRenderWakeLeadUs) / 1000.0,
-                       static_cast<double>(stats.vrrTargetWakeLeadUs) / 1000.0,
-                       static_cast<double>(stats.vrrSourcePeriodUs) / 1000.0);
+            ret = snprintf(&output[offset],
+                           length - offset,
+                           "VRR pacing: %s | Ready on time: %.1f%% | Dropped: %llu | Errors: %llu\n",
+                           stats.vrrTelemetryActive ? "Active" : "Inactive",
+                           readyOnTimePercent,
+                           static_cast<unsigned long long>(stats.vrrPacingDroppedFrames),
+                           static_cast<unsigned long long>(stats.vrrPresentFailedFrames));
+        }
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);
             return;
