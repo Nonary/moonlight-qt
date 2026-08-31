@@ -233,6 +233,11 @@ void VrrPacingWorker::submit(PacedFrame&& frame)
         return;
     }
 
+    // Capture an asynchronous decoder boundary before a newer frame can add
+    // work behind it. A later render must wait for this frame, not everything
+    // the decoder happened to queue before the pacing worker ran.
+    frame.setDecodeBoundary(m_Presenter->captureDecodeBoundary());
+
     QueuedFrame incoming;
     incoming.frame = std::move(frame);
     if (m_TraceAcceptingRows.load()) {
@@ -480,7 +485,7 @@ int VrrPacingWorker::run()
 
         telemetry.preparationStartUs = LiGetMicroseconds();
         const VrrPrepareResult preparation =
-            m_Presenter->prepareFrame(frame.frame());
+            m_Presenter->prepareFrame(frame.frame(), frame.decodeBoundary());
         telemetry.preparationEndUs = LiGetMicroseconds();
         telemetry.preparationDurationUs =
             telemetry.preparationEndUs >= telemetry.preparationStartUs ?
@@ -543,6 +548,14 @@ int VrrPacingWorker::run()
             noteDrop();
             deferFrame(std::move(frame));
             continue;
+        }
+
+        if (preparation.sourceFrameReusable) {
+            // The backend has completed every GPU read from this decoder
+            // surface. Release it before the target wait so high-resolution
+            // pacing cannot exhaust the decoder surface pool.
+            AVFrame* reusableFrame = frame.release();
+            av_frame_free(&reusableFrame);
         }
 
         telemetry.targetWaitEntryUs = LiGetMicroseconds();

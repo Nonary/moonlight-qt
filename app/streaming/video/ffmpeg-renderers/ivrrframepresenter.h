@@ -271,6 +271,11 @@ struct VrrPresentRequest {
 
 struct VrrPrepareResult {
     bool prepared = false;
+    // True only when all backend GPU reads from the decoder-owned AVFrame
+    // completed before prepareFrame() returned. The worker may then release
+    // that frame before waiting for the presentation target, avoiding decoder
+    // surface-pool backpressure while the prepared swap-chain image is held.
+    bool sourceFrameReusable = false;
     // Some acquired images (notably Vulkan swapchain frames) can only be
     // abandoned by submitting them. The worker owns any required wait.
     bool cancellationMaySubmit = false;
@@ -295,7 +300,17 @@ public:
 
     // May acquire a swapchain image and submit rendering work, but must not
     // intentionally pace or wait for the worker's presentation target.
-    virtual VrrPrepareResult prepareFrame(AVFrame* frame) = 0;
+    // Called on the decoder-output thread immediately before a frame enters
+    // the pacing queue. Backends with asynchronous decode can insert a fence
+    // here and return an opaque value that identifies this frame's decode
+    // boundary. Zero means no backend-specific boundary is available.
+    virtual uint64_t captureDecodeBoundary()
+    {
+        return 0;
+    }
+
+    virtual VrrPrepareResult prepareFrame(AVFrame* frame,
+                                          uint64_t decodeBoundary) = 0;
 
     // Presents the prepared image using the backend's adaptive presentation
     // path without intentionally waiting.

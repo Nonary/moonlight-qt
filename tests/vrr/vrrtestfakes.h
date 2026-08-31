@@ -29,11 +29,22 @@ public:
         return m_Support;
     }
 
-    VrrPrepareResult prepareFrame(AVFrame* frame) override
+    uint64_t captureDecodeBoundary() override
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        ++m_DecodeBoundaryCaptureCount;
+        return m_DecodeBoundary;
+    }
+
+    VrrPrepareResult prepareFrame(AVFrame* frame,
+                                  uint64_t decodeBoundary) override
     {
         VrrPrepareResult result;
         std::unique_lock<std::mutex> lock(m_Mutex);
         m_PreparedFrame = frame;
+        m_PreparedDecodeBoundaries.push_back(decodeBoundary);
+        m_PreparedFrameNumber = frame == nullptr ? -1 : static_cast<int>(
+            reinterpret_cast<intptr_t>(frame->opaque));
         ++m_PrepareCount;
         m_Condition.notify_all();
 
@@ -42,6 +53,7 @@ public:
         }
 
         result.prepared = m_PreparationSucceeds && frame != nullptr;
+        result.sourceFrameReusable = m_SourceFrameReusable && result.prepared;
         result.cancellationMaySubmit =
             m_CancellationMaySubmit && frame != nullptr;
         if (!result.prepared && !result.cancellationMaySubmit) {
@@ -69,8 +81,7 @@ public:
                 return feedback;
             }
 
-            frameNumber = static_cast<int>(
-                reinterpret_cast<intptr_t>(m_PreparedFrame->opaque));
+            frameNumber = m_PreparedFrameNumber;
             m_PreparedFrame = nullptr;
             preSubmissionDelayUs = m_PreSubmissionDelayUs;
             postSubmissionDelayUs = m_PresentDelayUs;
@@ -123,8 +134,7 @@ public:
             feedback.nativePresentResult = m_CancelSubmits ? 0 : -1;
         }
         if (m_CancelSubmits && m_PreparedFrame != nullptr) {
-            const int frameNumber = static_cast<int>(
-                reinterpret_cast<intptr_t>(m_PreparedFrame->opaque));
+            const int frameNumber = m_PreparedFrameNumber;
             const uint64_t callTimeUs = LiGetMicroseconds();
             m_PresentedFrames.push_back(frameNumber);
             m_PresentCallTimesUs.push_back(callTimeUs);
@@ -169,6 +179,18 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_Mutex);
         m_CancellationMaySubmit = maySubmit;
+    }
+
+    void setSourceFrameReusable(bool reusable)
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        m_SourceFrameReusable = reusable;
+    }
+
+    void setDecodeBoundary(uint64_t decodeBoundary)
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        m_DecodeBoundary = decodeBoundary;
     }
 
     void setPresentDelayUs(uint64_t delayUs)
@@ -282,26 +304,43 @@ public:
         return m_PresentRequests;
     }
 
+    size_t decodeBoundaryCaptureCount() const
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        return m_DecodeBoundaryCaptureCount;
+    }
+
+    std::vector<uint64_t> preparedDecodeBoundaries() const
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        return m_PreparedDecodeBoundaries;
+    }
+
 private:
     mutable std::mutex m_Mutex;
     std::condition_variable m_Condition;
     VrrFallbackReason m_Support = VrrFallbackReason::NoFallback;
     bool m_PreparationSucceeds = true;
     bool m_CancellationMaySubmit = false;
+    bool m_SourceFrameReusable = false;
     bool m_CancelSubmits = false;
     bool m_BlockPreparation = false;
     bool m_ReleasePreparation = false;
     bool m_PresentCancelled = false;
     uint64_t m_PreSubmissionDelayUs = 0;
     uint64_t m_PresentDelayUs = 0;
+    uint64_t m_DecodeBoundary = 0;
     size_t m_PrepareCount = 0;
     size_t m_PresentCount = 0;
     size_t m_CancelCount = 0;
     size_t m_SuspendedCount = 0;
     size_t m_ResumedCount = 0;
+    size_t m_DecodeBoundaryCaptureCount = 0;
     AVFrame* m_PreparedFrame = nullptr;
+    int m_PreparedFrameNumber = -1;
     std::vector<int> m_PresentedFrames;
     std::vector<VrrPresentRequest> m_PresentRequests;
+    std::vector<uint64_t> m_PreparedDecodeBoundaries;
     std::vector<uint64_t> m_PresentCallTimesUs;
     std::vector<uint64_t> m_PresentReturnTimesUs;
 };

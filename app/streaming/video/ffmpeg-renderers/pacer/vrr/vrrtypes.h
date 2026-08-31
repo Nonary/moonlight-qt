@@ -76,6 +76,16 @@ public:
         return m_DecodeCompleteUs;
     }
 
+    void setDecodeBoundary(uint64_t decodeBoundary)
+    {
+        m_DecodeBoundary = decodeBoundary;
+    }
+
+    uint64_t decodeBoundary() const
+    {
+        return m_DecodeBoundary;
+    }
+
 private:
     struct FrameDeleter {
         void operator()(AVFrame* frame) const
@@ -89,4 +99,5 @@ private:
     uint32_t m_RtpTimestamp = 0;
     bool m_TimestampValid = false;
     uint64_t m_DecodeCompleteUs = 0;
+    uint64_t m_DecodeBoundary = 0;
 };

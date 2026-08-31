@@ -425,6 +425,53 @@ void testDeferredSurfaceLifetime()
            "worker destruction must release the final deferred surface");
 }
 
+void testReusableSurfaceReleasedWithoutSuccessor()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.setSourceFrameReusable(true);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime reusable;
+
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "worker must start for reusable lifetime testing");
+        worker.submit(frame(1, reusable));
+        expect(backend.waitForPresentCount(1), "reusable frame must present");
+        expect(waitFor([&reusable] { return reusable.releases.load() == 1; }),
+               "a GPU-complete decoder surface must release without a successor");
+        const std::vector<int> presented = backend.presentedFrames();
+        expect(presented.size() == 1 && presented.front() == 1,
+               "presentation must not depend on the released source frame");
+    }
+
+    expect(reusable.releases.load() == 1,
+           "worker destruction must not release a reusable surface twice");
+}
+
+void testDecodeBoundaryCapturedBeforeQueueAndPreparedExactly()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.setDecodeBoundary(73);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime;
+
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "worker must start for decode-boundary testing");
+        worker.submit(frame(1, lifetime));
+        expect(backend.waitForPresentCount(1),
+               "decode-boundary frame must present");
+        const std::vector<uint64_t> boundaries =
+            backend.preparedDecodeBoundaries();
+        expect(backend.decodeBoundaryCaptureCount() == 1,
+               "each submitted frame must capture one decoder boundary");
+        expect(boundaries.size() == 1 && boundaries.front() == 73,
+               "preparation must receive the submitted frame's exact boundary");
+    }
+}
+
 void testCancelledPresentationCountsAsDroppedOutput()
 {
     resetFakeClock();
@@ -1274,6 +1321,8 @@ int main()
     testTelemetrySnapshotsRemainCumulative();
     testSuspendDiscardAndFreshFrame();
     testDeferredSurfaceLifetime();
+    testReusableSurfaceReleasedWithoutSuccessor();
+    testDecodeBoundaryCapturedBeforeQueueAndPreparedExactly();
     testCancelledPresentationCountsAsDroppedOutput();
     testPresentCallSpacingSetsDisplayFloor();
     testBlockingPresentUsesWorkerCallBoundary();
