@@ -10921,7 +10921,23 @@ int main(int argc, char* argv[])
             capturedConfig.allowAdditionalQueuedFrame =
                 rowAdditionalQueuedFrame;
             capturedCanLatch = rowCanLatch;
-            if (traceSchema >= 5) {
+            if (traceSchema < 5) {
+                // Schema-3/4 rows predate captured controller parameters.
+                // Reconstruct the absolute latch policy used to record them
+                // instead of inheriting current production defaults.
+                capturedParameters.latchedPresentationHeadroomUs = 1500;
+                capturedParameters.latchedPresentationExitHeadroomUs = 2000;
+                capturedParameters.
+                    latchedPresentationHeadroomPeriodNumerator = 0;
+                capturedParameters.
+                    latchedPresentationHeadroomPeriodDenominator = 1;
+                capturedParameters.
+                    latchedPresentationExitHeadroomPeriodNumerator = 0;
+                capturedParameters.
+                    latchedPresentationExitHeadroomPeriodDenominator = 1;
+                capturedParameters.latchedPresentationBaseGuardExit = 1;
+            }
+            else {
                 VrrReplayScenario capturedScenario;
                 int expectedParameterColumns = 0;
                 for (const QString& path : vrrReplayParameterNames()) {
@@ -10931,8 +10947,9 @@ int main(int argc, char* argv[])
                     if (column == columns.capturedParameterColumns.end()) {
                         // Preserve the policy semantics of schema-5 fields
                         // added after the initial release. Older captures use
-                        // absolute latch thresholds and predate render-tail
-                        // pacing budgets; new traces record both explicitly.
+                        // absolute latch thresholds, allow base-guard latch
+                        // exit, and predate render-tail pacing budgets; new
+                        // traces record all of these explicitly.
                         QString legacyValue;
                         if (path ==
                                 "controller.render_baseline_percentile") {
@@ -10946,6 +10963,10 @@ int main(int argc, char* argv[])
                             legacyValue = "0";
                         }
                         else if (path.endsWith("_period_denominator")) {
+                            legacyValue = "1";
+                        }
+                        else if (path ==
+                                 "controller.latch_base_guard_exit") {
                             legacyValue = "1";
                         }
                         if (legacyValue.isEmpty() ||

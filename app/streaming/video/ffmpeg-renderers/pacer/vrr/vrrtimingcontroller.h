@@ -8,7 +8,10 @@
 
 // This list is also the replay/trace parameter schema. Keeping the JSON name,
 // C++ member, type, and production default together prevents those copies from
-// drifting while avoiding hand-written serialization for every field.
+// drifting while avoiding hand-written serialization for every field. The
+// display-period latch terms default to zero so production uses the absolute
+// headroom thresholds; non-zero ratios remain available to replay captures
+// made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
     X(uint64_t, maximum_forward_movement_us, maximumForwardMovementUs, 1000000) \
     X(uint64_t, render_lead_floor_us, renderLeadFloorUs, 1000) \
@@ -25,12 +28,13 @@
     X(uint64_t, maximum_render_wake_lead_us, maximumRenderWakeLeadUs, 2000) \
     X(uint64_t, maximum_target_wake_lead_us, maximumTargetWakeLeadUs, 500) \
     X(uint64_t, minimum_guard_us, minimumGuardUs, 100) \
-    X(uint64_t, latch_enter_headroom_us, latchedPresentationHeadroomUs, 1500) \
-    X(uint64_t, latch_exit_headroom_us, latchedPresentationExitHeadroomUs, 2000) \
-    X(uint64_t, latch_enter_headroom_period_numerator, latchedPresentationHeadroomPeriodNumerator, 3) \
+    X(uint64_t, latch_enter_headroom_us, latchedPresentationHeadroomUs, 225) \
+    X(uint64_t, latch_exit_headroom_us, latchedPresentationExitHeadroomUs, 400) \
+    X(uint64_t, latch_base_guard_exit, latchedPresentationBaseGuardExit, 0) \
+    X(uint64_t, latch_enter_headroom_period_numerator, latchedPresentationHeadroomPeriodNumerator, 0) \
     X(uint64_t, latch_enter_headroom_period_denominator, latchedPresentationHeadroomPeriodDenominator, 1) \
-    X(uint64_t, latch_exit_headroom_period_numerator, latchedPresentationExitHeadroomPeriodNumerator, 13) \
-    X(uint64_t, latch_exit_headroom_period_denominator, latchedPresentationExitHeadroomPeriodDenominator, 4) \
+    X(uint64_t, latch_exit_headroom_period_numerator, latchedPresentationExitHeadroomPeriodNumerator, 0) \
+    X(uint64_t, latch_exit_headroom_period_denominator, latchedPresentationExitHeadroomPeriodDenominator, 1) \
     X(uint64_t, maximum_base_guard_us, maximumBaseGuardUs, 250) \
     X(uint64_t, maximum_adaptive_guard_us, maximumAdaptiveGuardUs, 1000) \
     X(uint64_t, guard_step_us, guardStepUs, 50) \

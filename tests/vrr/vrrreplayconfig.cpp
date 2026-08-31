@@ -392,6 +392,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.rateCandidateSamples < 2 || value.phaseErrorFrames == 0) {
         return fail("sample counts and frame thresholds must be consistent and non-zero");
     }
+    if (value.latchedPresentationBaseGuardExit > 1) {
+        return fail("latch_base_guard_exit must be 0 or 1");
+    }
     const unsigned int percents[] = {
         value.materialRateChangePercent, value.renderBaselinePercentile,
         value.preparationPercentile,

@@ -344,16 +344,15 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         m_LatchedPresentation = false;
     }
     else if (m_LatchedPresentation) {
-        // A temporary spacing correction can take a cadence just below the
-        // entry threshold and correctly select the conservative path. Once
-        // that guard has completely decayed, however, retaining the wider
-        // hysteresis band would make an otherwise safe 100 FPS / 120 Hz
-        // stream stay latched indefinitely. Keep hysteresis while protection
-        // is still elevated, then restore immediate presentation at the
-        // normal eligibility boundary.
+        // Production requires the full exit threshold so small guard or
+        // cadence fluctuations cannot bounce a borderline stream between
+        // adaptive and latched presentation. The base-guard shortcut remains
+        // parameterized only to reproduce captures made under the legacy
+        // absolute/scaled latch policies.
         if (learnedHeadroomUs >=
                 latchedPresentationExitHeadroomUs() ||
-            (m_GuardUs == m_BaseGuardUs &&
+            (m_Parameters.latchedPresentationBaseGuardExit != 0 &&
+             m_GuardUs == m_BaseGuardUs &&
              learnedHeadroomUs >=
                 latchedPresentationHeadroomUs())) {
             m_LatchedPresentation = false;

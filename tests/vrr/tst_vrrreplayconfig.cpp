@@ -283,6 +283,11 @@ void VrrReplayConfigTest::rejectsInvalidInput()
         config, error));
     QVERIFY(error.contains("denominators"));
 
+    QVERIFY(!loadVrrReplayConfiguration(
+        R"({"config_schema":1,"parameters":{"controller":{"latch_base_guard_exit":2}},"scenarios":[{"name":"x"}]})",
+        config, error));
+    QVERIFY(error.contains("latch_base_guard_exit"));
+
     QVERIFY2(loadVrrReplayConfiguration(
         R"({"config_schema":1,"parameters":{"controller":{"pacing_latency_budget_divisor":0}},"scenarios":[{"name":"x"}]})",
         config, error), qPrintable(error));
