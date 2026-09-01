@@ -647,17 +647,16 @@ timeline for that display; controller/cadence results remain available:
 .\vrr\release\vrrreplay.exe capture.vrrtrace --display-hz 120 --stream-fps 116
 ```
 
-The smoothness queue policy is a fixed jitter buffer anchored to the sender
+Both queue policies are a fixed jitter buffer anchored to the sender
 timestamps (`controller.timestamp_playout_enabled`): every frame targets its
 RTP time mapped into the local clock plus `controller.source_playout_delay_us`
-(5 ms) plus the render lead. The mapping offset is the windowed minimum of
+(2 ms for low latency, 5 ms for smoothness) plus the render lead. The mapping offset is the windowed minimum of
 decode-complete minus RTP time (`playout_offset_window_us`), slewed at most
 `playout_offset_slew_us` per frame so clock drift is followed without moving
 one frame relative to its neighbours. No learned readiness reserve is applied
 or reported, and a late or early frame never re-anchors the clock: a frame
 later than the delay clamps to "now" and the next frame returns to its own
-slot. Low-latency sessions retain the direct projected-clock controller
-defaults. All resolved values are captured in schema 5, so exact replay and
+slot. All resolved values are captured in schema 5, so exact replay and
 candidate sweeps use the production policy without inferring it from the
 queue-mode flag. Note that a `--set` or config scenario is treated as
 customized and does not inherit the session policy: a smoothness sweep must

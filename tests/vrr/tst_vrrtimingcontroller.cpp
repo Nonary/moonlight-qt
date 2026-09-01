@@ -163,10 +163,15 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
         vrrTimingParametersForSession(lowLatency);
     const VrrTimingParameters smoothnessPolicy =
         vrrTimingParametersForSession(smoothness);
-    expect(lowLatencyPolicy.readinessLowPercentile == 0 &&
-               lowLatencyPolicy.readinessLoosePercentile == 80 &&
-               lowLatencyPolicy.sourcePlayoutDelayUs == 0,
-           "low-latency sessions must retain the controller readiness defaults");
+    expect(lowLatencyPolicy.timestampPlayoutEnabled == 1 &&
+               lowLatencyPolicy.sourcePlayoutDelayUs == 2000 &&
+               lowLatencyPolicy.pacingLatencyExtraPeriodNumerator == 0 &&
+               lowLatencyPolicy.readinessLowPercentile == 0 &&
+               lowLatencyPolicy.readinessLoosePercentile == 80,
+           "low-latency sessions must resolve the fixed 2 ms timestamp playout policy");
+    expect(smoothnessPolicy.sourcePlayoutDelayUs >
+               lowLatencyPolicy.sourcePlayoutDelayUs,
+           "smoothness must buffer more than low latency");
     expect(smoothnessPolicy.timestampPlayoutEnabled == 1 &&
                 smoothnessPolicy.sourcePlayoutDelayUs == 5000 &&
                 smoothnessPolicy.readinessLowPercentile == 0 &&

@@ -10,11 +10,13 @@ constexpr uint64_t kMicrosecondsPerSecond = 1000000ULL;
 constexpr uint64_t kRtpClockRate = 90000ULL;
 constexpr uint64_t kQ16One = 1ULL << 16;
 constexpr uint64_t kQ16Half = kQ16One >> 1;
-// Smoothness mode is a fixed jitter buffer hung off the sender timestamps:
-// every frame presents at its RTP time plus one constant delay. Arrival
-// variation up to that delay is invisible; anything larger is one late frame
-// and nothing else moves. 5 ms covers roughly p97 of decode-versus-RTP jitter
-// on the reference 116 FPS / 120 Hz rig.
+// Both queue policies are a fixed jitter buffer hung off the sender
+// timestamps: every frame presents at its RTP time plus one constant delay.
+// Arrival variation up to that delay is invisible; anything larger is one
+// late frame and nothing else moves. On the reference 116 FPS / 120 Hz rig
+// decode-versus-RTP jitter is about 1 ms at p50 and 4 ms at p95, so 2 ms
+// absorbs the common case at low latency and 5 ms covers roughly p97.
+constexpr uint64_t kLowLatencyPlayoutDelayUs = 2000;
 constexpr uint64_t kSmoothnessPlayoutDelayUs = 5000;
 
 uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)
@@ -54,17 +56,21 @@ VrrTimingParameters vrrTimingParametersForSession(
     const VrrSessionConfig& config)
 {
     VrrTimingParameters parameters;
+    // Present at sender time plus a constant delay. The learned readiness
+    // reserve, its per-frame slewing, and every phase re-anchor are off on
+    // this path: they each moved the target between frames the source had
+    // spaced evenly, which was the visible stutter. The projected-clock
+    // policy remains reachable through explicit parameters for replay.
+    parameters.timestampPlayoutEnabled = 1;
     if (config.allowAdditionalQueuedFrame) {
-        // Present at sender time plus a constant delay. The learned readiness
-        // reserve, its per-frame slewing, and every phase re-anchor are off
-        // on this path: they each moved the target between frames the source
-        // had spaced evenly, which was the visible stutter.
-        parameters.timestampPlayoutEnabled = 1;
         parameters.sourcePlayoutDelayUs = kSmoothnessPlayoutDelayUs;
         // The worker tolerates one extra source interval of queue age in this
         // mode; keep the render-tail insurance budget matched to it.
         parameters.pacingLatencyExtraPeriodNumerator = 1;
         parameters.pacingLatencyExtraPeriodDenominator = 1;
+    }
+    else {
+        parameters.sourcePlayoutDelayUs = kLowLatencyPlayoutDelayUs;
     }
     return parameters;
 }
