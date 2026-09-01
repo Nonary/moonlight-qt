@@ -4,7 +4,9 @@ TEMPLATE = subdirs
 CONFIG += ordered
 
 contains(CONFIG, tests) {
-    SUBDIRS += vrr
+    SUBDIRS += vrr hdr
+
+    hdr.file = $$PWD/hdr/hdr.pro
 } else {
     message(VRR tests are disabled; rerun qmake with CONFIG+=tests)
 }

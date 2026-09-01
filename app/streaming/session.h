@@ -146,6 +146,10 @@ signals:
 private:
     void exec();
 
+#ifdef Q_OS_WIN32
+    void prepareClientHdrPeakReport();
+#endif
+
     bool startConnectionAsync();
 
     bool validateLaunch(SDL_Window* testWindow);
@@ -280,6 +284,9 @@ private:
     int m_FlushingWindowEventsRef;
     QStringList m_LaunchWarnings;
     bool m_ShouldExit;
+
+    int m_ClientHdrPeakCalibratedNits = 0;
+    int m_ClientHdrPeakEdidNits = 0;
 
     bool m_AsyncConnectionSuccess;
     int m_PortTestResults;

@@ -174,6 +174,7 @@ SOURCES += \
     backend/identitymanager.cpp \
     backend/nvcomputer.cpp \
     backend/nvhttp.cpp \
+    backend/clientdisplaycapabilities.cpp \
     backend/nvpairingmanager.cpp \
     backend/computermanager.cpp \
     backend/boxartmanager.cpp \
@@ -219,6 +220,7 @@ HEADERS += \
     backend/identitymanager.h \
     backend/nvcomputer.h \
     backend/nvhttp.h \
+    backend/clientdisplaycapabilities.h \
     backend/nvpairingmanager.h \
     backend/computermanager.h \
     backend/boxartmanager.h \
@@ -407,11 +409,13 @@ win32:!winrt {
     message(DXVA2 and D3D11VA renderers selected)
 
     SOURCES += \
+        backend/clientdisplaycapabilities_win.cpp \
         streaming/video/ffmpeg-renderers/dxva2.cpp \
         streaming/video/ffmpeg-renderers/d3d11va.cpp \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.cpp
 
     HEADERS += \
+        backend/clientdisplaycapabilities_win.h \
         streaming/video/ffmpeg-renderers/dxva2.h \
         streaming/video/ffmpeg-renderers/d3d11va.h \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.h
