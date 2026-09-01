@@ -1273,6 +1273,92 @@ struct Distribution {
     }
 };
 
+// Sender-spacing cadence. Compares each consecutive pair of presented
+// submissions against the sender's own RTP spacing, which is the cadence the
+// game produced. Pairs whose sender or arrival interval exceeds the stall
+// threshold are excluded so host capture stalls do not dominate the tails. A
+// hitch is a pair presented more than two milliseconds wider than the sender
+// spacing; hitches are attributed to a frame that arrived later than the
+// playout delay, a render-lead jump, the display-spacing floor, or other.
+struct SenderCadenceTracker {
+    static constexpr uint64_t kStallIntervalUs = 25000;
+    static constexpr uint64_t kHitchUs = 2000;
+    static constexpr uint64_t kRenderLeadJumpUs = 500;
+    static constexpr uint64_t kFloorSlackUs = 300;
+
+    bool havePrior = false;
+    bool haveResidual = false;
+    uint64_t priorSenderUs = 0;
+    uint64_t priorDecodeUs = 0;
+    uint64_t priorSubmissionUs = 0;
+    int64_t priorResidualUs = 0;
+    uint64_t pairs = 0;
+    uint64_t hitches = 0;
+    uint64_t hitchLateArrivals = 0;
+    uint64_t hitchRenderLeadJumps = 0;
+    uint64_t hitchDisplayFloor = 0;
+    uint64_t hitchOther = 0;
+    Distribution absoluteSpacingErrorUs;
+    Distribution absoluteJerkUs;
+
+    void observe(uint64_t senderUs, uint64_t decodeUs, uint64_t submissionUs,
+                 bool lateArrival, bool renderLeadJump,
+                 uint64_t displayPeriodUs)
+    {
+        if (havePrior && senderUs > priorSenderUs &&
+                decodeUs >= priorDecodeUs &&
+                submissionUs >= priorSubmissionUs) {
+            const uint64_t senderIntervalUs = senderUs - priorSenderUs;
+            const uint64_t arrivalIntervalUs = decodeUs - priorDecodeUs;
+            if (senderIntervalUs <= kStallIntervalUs &&
+                    arrivalIntervalUs <= kStallIntervalUs) {
+                const uint64_t submissionIntervalUs =
+                    submissionUs - priorSubmissionUs;
+                const int64_t residualUs =
+                    static_cast<int64_t>(submissionIntervalUs) -
+                    static_cast<int64_t>(senderIntervalUs);
+                ++pairs;
+                absoluteSpacingErrorUs.add(static_cast<uint64_t>(
+                    residualUs < 0 ? -residualUs : residualUs));
+                if (haveResidual) {
+                    const int64_t jerkUs = residualUs - priorResidualUs;
+                    absoluteJerkUs.add(static_cast<uint64_t>(
+                        jerkUs < 0 ? -jerkUs : jerkUs));
+                }
+                haveResidual = true;
+                priorResidualUs = residualUs;
+                if (residualUs > static_cast<int64_t>(kHitchUs)) {
+                    ++hitches;
+                    if (lateArrival) {
+                        ++hitchLateArrivals;
+                    }
+                    else if (renderLeadJump) {
+                        ++hitchRenderLeadJumps;
+                    }
+                    else if (senderIntervalUs < displayPeriodUs &&
+                             submissionIntervalUs <=
+                                 displayPeriodUs + kFloorSlackUs) {
+                        ++hitchDisplayFloor;
+                    }
+                    else {
+                        ++hitchOther;
+                    }
+                }
+            }
+            else {
+                haveResidual = false;
+            }
+        }
+        else {
+            haveResidual = false;
+        }
+        havePrior = true;
+        priorSenderUs = senderUs;
+        priorDecodeUs = decodeUs;
+        priorSubmissionUs = submissionUs;
+    }
+};
+
 // Rate-band and paired-delta diagnostics are supplemental. Keep their memory
 // fixed even for multi-hour or unusually high-rate traces while retaining
 // exact count/mean/stddev/min/max and a deterministic quantile sample.
@@ -1505,6 +1591,18 @@ struct Metrics {
     uint64_t modeledIdleLatencyUs = 0;
     bool modeledIdleLatencyValid = false;
     Distribution occupancyDecisionShiftUs;
+    // Sender-spacing cadence for the recorded session, the candidate, and a
+    // stock-style present-on-render emulation (decode + prepare + present).
+    SenderCadenceTracker observedSenderCadence;
+    SenderCadenceTracker simulatedSenderCadence;
+    SenderCadenceTracker stockSenderCadence;
+    bool senderClockValid = false;
+    uint32_t senderPriorRtpTimestamp = 0;
+    uint64_t senderUnwrappedTicks = 0;
+    bool observedPriorRenderLeadValid = false;
+    uint64_t observedPriorRenderLeadUs = 0;
+    bool simulatedPriorRenderLeadValid = false;
+    uint64_t simulatedPriorRenderLeadUs = 0;
     uint64_t arrivalSequenceGaps = 0;
     uint64_t arrivalSequenceDuplicates = 0;
     uint64_t arrivalSequenceOutOfOrderTransitions = 0;
@@ -2682,6 +2780,32 @@ QJsonObject distributionObject(const Distribution& distribution)
     object["p99_95"] = static_cast<qint64>(
         distribution.percentileRatio(9995, 10000));
     object["max"] = static_cast<qint64>(distribution.maximum);
+    return object;
+}
+
+QJsonObject senderCadenceObject(const SenderCadenceTracker& tracker,
+                                uint64_t durationUs)
+{
+    QJsonObject object;
+    object["pairs"] = static_cast<qint64>(tracker.pairs);
+    object["stall_interval_exclusion_us"] =
+        static_cast<qint64>(SenderCadenceTracker::kStallIntervalUs);
+    object["hitch_threshold_us"] =
+        static_cast<qint64>(SenderCadenceTracker::kHitchUs);
+    object["hitches"] = static_cast<qint64>(tracker.hitches);
+    object["hitches_per_second"] = durationUs != 0 ?
+        static_cast<double>(tracker.hitches) * 1000000.0 /
+            static_cast<double>(durationUs) : 0.0;
+    object["hitch_late_arrivals"] =
+        static_cast<qint64>(tracker.hitchLateArrivals);
+    object["hitch_render_lead_jumps"] =
+        static_cast<qint64>(tracker.hitchRenderLeadJumps);
+    object["hitch_display_floor"] =
+        static_cast<qint64>(tracker.hitchDisplayFloor);
+    object["hitch_other"] = static_cast<qint64>(tracker.hitchOther);
+    object["absolute_spacing_error_us"] = distributionObject(
+        tracker.absoluteSpacingErrorUs);
+    object["absolute_jerk_us"] = distributionObject(tracker.absoluteJerkUs);
     return object;
 }
 
@@ -5132,6 +5256,15 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     observed["drops"] = static_cast<qint64>(metrics.originalDrops);
     observed["latency_us"] = observedLatency;
     observed["execution_cost_us"] = observedCosts;
+    {
+        const uint64_t durationUs =
+            metrics.lastArrivalUs >= metrics.firstArrivalUs ?
+                metrics.lastArrivalUs - metrics.firstArrivalUs : 0;
+        observed["sender_cadence"] = senderCadenceObject(
+            metrics.observedSenderCadence, durationUs);
+        observed["stock_present_on_render_sender_cadence"] =
+            senderCadenceObject(metrics.stockSenderCadence, durationUs);
+    }
     observed["absolute_submit_error_us"] = distributionObject(
         metrics.observedAbsoluteSubmitError);
     observed["cadence_by_rounded_source_rate_fps"] = cadenceBandsObject(
@@ -5596,6 +5729,22 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     simulation["drops"] = static_cast<qint64>(scenario.mode == "worker" ?
         metrics.workerCapacityEvictions : metrics.originalDrops);
     simulation["latency_us"] = simulatedLatency;
+    // How far the worker-occupancy model moved each decision from the
+    // recorded instant. A median shift beyond one source period means the
+    // candidate keeps the single worker busier than the source cadence; the
+    // live worker would shed frames through its stale check, which this
+    // fixed-admission replay does not emulate, so latency runs away instead.
+    simulation["occupancy_decision_shift_us"] = distributionObject(
+        metrics.occupancyDecisionShiftUs);
+    simulation["worker_saturated"] =
+        metrics.occupancyDecisionShiftUs.count != 0 &&
+        metrics.occupancyDecisionShiftUs.percentile(50) >
+            periodForRate(simulatedStreamFps > 0 ?
+                              simulatedStreamFps : 1);
+    simulation["sender_cadence"] = senderCadenceObject(
+        metrics.simulatedSenderCadence,
+        metrics.lastArrivalUs >= metrics.firstArrivalUs ?
+            metrics.lastArrivalUs - metrics.firstArrivalUs : 0);
     simulation["absolute_submit_error_us"] = distributionObject(
         metrics.simulatedAbsoluteSubmitError);
     simulation["target_drift_us"] = distributionObject(
@@ -6554,6 +6703,50 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         "interval violations and raster exposure bounds are deterministic software models, not literal optical tear observations";
     summary["raster_model_scope"] =
         "schema-5 integrity-checked DXGI SyncQPCTime/SyncRefreshCount history, stable QueryDisplayConfig physical-signal timing, and observation-only D3DKMT scan-position brackets anchor and audit modeled transitions across ideal VRR flip-following versus free-running fixed-refresh raster states; PresentRefreshCount is never treated as its timestamp";
+
+    // Sender-spacing cadence headline numbers for sweep tables.
+    {
+        const auto addSenderScalars = [&summary](
+            const QString& prefix, const SenderCadenceTracker& tracker,
+            uint64_t durationUs) {
+            summary[prefix + "sender_pairs"] =
+                static_cast<qint64>(tracker.pairs);
+            summary[prefix + "sender_hitches"] =
+                static_cast<qint64>(tracker.hitches);
+            summary[prefix + "sender_hitches_per_second"] = durationUs != 0 ?
+                static_cast<double>(tracker.hitches) * 1000000.0 /
+                    static_cast<double>(durationUs) : 0.0;
+            summary[prefix + "sender_hitch_late_arrivals"] =
+                static_cast<qint64>(tracker.hitchLateArrivals);
+            summary[prefix + "sender_spacing_error_p50_us"] =
+                static_cast<qint64>(
+                    tracker.absoluteSpacingErrorUs.percentile(50));
+            summary[prefix + "sender_spacing_error_p90_us"] =
+                static_cast<qint64>(
+                    tracker.absoluteSpacingErrorUs.percentile(90));
+            summary[prefix + "sender_spacing_error_p99_us"] =
+                static_cast<qint64>(
+                    tracker.absoluteSpacingErrorUs.percentile(99));
+            summary[prefix + "sender_jerk_p99_us"] =
+                static_cast<qint64>(tracker.absoluteJerkUs.percentile(99));
+        };
+        addSenderScalars("replay_", metrics.simulatedSenderCadence,
+                         captureDurationUs);
+        addSenderScalars("original_", metrics.observedSenderCadence,
+                         captureDurationUs);
+        addSenderScalars("stock_", metrics.stockSenderCadence,
+                         captureDurationUs);
+        summary["replay_decode_to_submission_p50_us"] =
+            static_cast<qint64>(
+                metrics.simulatedDecodeToSubmission.percentile(50));
+        summary["replay_worker_saturated"] =
+            metrics.occupancyDecisionShiftUs.count != 0 &&
+            metrics.occupancyDecisionShiftUs.percentile(50) >
+                periodForRate(simulatedStreamFps > 0 ? simulatedStreamFps : 1);
+        summary["original_decode_to_submission_p50_us"] =
+            static_cast<qint64>(
+                metrics.observedDecodeToSubmission.percentile(50));
+    }
 
     // Stable top-level fields retain compatibility with existing launcher
     // summaries and comparison files.
@@ -13650,6 +13843,57 @@ int main(int argc, char* argv[])
             metrics.pairedSubmissionDelta.add(pairedDelta);
             metrics.pairedAbsoluteSubmissionDelta.add(absoluteValue(
                 pairedDelta));
+
+            // Sender-spacing cadence for the recorded run, the candidate and
+            // a stock-style present-on-render emulation.
+            if (unsignedField(fields, columns.rtpValid) != 0) {
+                if (metrics.senderClockValid) {
+                    metrics.senderUnwrappedTicks += static_cast<uint32_t>(
+                        rtpTimestamp - metrics.senderPriorRtpTimestamp);
+                }
+                metrics.senderPriorRtpTimestamp = rtpTimestamp;
+                metrics.senderClockValid = true;
+                const uint64_t senderUs =
+                    metrics.senderUnwrappedTicks * 1000ULL / 90ULL;
+                const uint64_t simulatedDisplayPeriodUs = periodForRate(
+                    simulatedConfig.displayRefreshHz);
+                const uint64_t recordedRenderLeadUs = unsignedField(
+                    fields, columns.renderLeadUs);
+                const bool recordedLeadJump =
+                    metrics.observedPriorRenderLeadValid &&
+                    absoluteValue(signedDifference(
+                        recordedRenderLeadUs,
+                        metrics.observedPriorRenderLeadUs)) >
+                        SenderCadenceTracker::kRenderLeadJumpUs;
+                metrics.observedPriorRenderLeadUs = recordedRenderLeadUs;
+                metrics.observedPriorRenderLeadValid = true;
+                const bool simulatedLeadJump =
+                    metrics.simulatedPriorRenderLeadValid &&
+                    absoluteValue(signedDifference(
+                        simulatedDecision.renderLeadUs,
+                        metrics.simulatedPriorRenderLeadUs)) >
+                        SenderCadenceTracker::kRenderLeadJumpUs;
+                metrics.simulatedPriorRenderLeadUs =
+                    simulatedDecision.renderLeadUs;
+                metrics.simulatedPriorRenderLeadValid = true;
+                const bool simulatedLateArrival =
+                    scenario.controller.timestampPlayoutEnabled != 0 &&
+                    simulatedDecision.readyOffsetUs > static_cast<int64_t>(
+                        scenario.controller.sourcePlayoutDelayUs);
+                metrics.observedSenderCadence.observe(
+                    senderUs, decodeCompleteUs, recordedSubmissionUs,
+                    false, recordedLeadJump, simulatedDisplayPeriodUs);
+                metrics.simulatedSenderCadence.observe(
+                    senderUs, decodeCompleteUs, simulatedSubmissionUs,
+                    simulatedLateArrival, simulatedLeadJump,
+                    simulatedDisplayPeriodUs);
+                metrics.stockSenderCadence.observe(
+                    senderUs, decodeCompleteUs,
+                    saturatingAdd(decodeCompleteUs,
+                                  saturatingAdd(preparationUs,
+                                                recordedPresentCallUs)),
+                    false, false, simulatedDisplayPeriodUs);
+            }
             addCadenceFrame(metrics.observedRateBands,
                 timelineDetails.recordedSourceRateHz, decodeCompleteUs,
                 recordedSubmissionUs, timelineDetails.recordedCadence,

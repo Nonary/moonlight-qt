@@ -914,6 +914,29 @@ Distribution summaries include p99.5, p99.9, and p99.95 in addition to the
 standard p50/p90/p95/p99 values, so extreme-tail sweeps do not require a large
 per-frame timeline.
 
+Every summary also carries sender-spacing cadence: each consecutive pair of
+presented frames is compared against the sender's own RTP spacing, excluding
+pairs whose sender or arrival interval exceeds 25 ms, and a pair presented more
+than 2 ms wider than the sender spacing is a hitch attributed to late arrival
+(ready offset above the playout delay), a render-lead jump, the display floor,
+or other. The same metric is computed for the recorded session
+(`original_sender_*`, `observed.sender_cadence`), the candidate
+(`replay_sender_*`, `simulation.sender_cadence`), and a stock-style
+present-on-render emulation built from decode completion plus the recorded
+prepare and present durations (`stock_sender_*`). Because the replay's own
+band residual measures each policy against its own source clock, use the
+sender-spacing fields to compare policies with different clock models.
+`replay_worker_saturated` is set when the worker-occupancy decision model
+shifts the median decision by more than a source period: the candidate keeps
+the single worker busier than the source cadence, the live worker would shed
+frames through its stale check, and this fixed-admission replay lets latency
+run away instead, so treat that scenario's numbers as invalid. The playout
+delay sweeps are `tests\vrr\configs\playout-delay-sweep-lowlatency.json` and
+`playout-delay-sweep-smoothness.json` (the latter carries the smoothness
+render-lead budget, which saturates render-bound low-latency captures); run
+one with `--config ... --jobs 0 --output sweep.json` and print the table with
+`scripts\vrr-sweep-table.ps1 sweep.json`.
+
 `mode: fixed` preserves recorded admission and lifecycle for rigorous A/B
 controller comparisons. `mode: worker` requires schema 5 and audits recorded
 arrival/queue depth against a candidate capacity. It does not synthesize an

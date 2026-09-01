@@ -1,0 +1,17 @@
+{
+    "config_schema": 1,
+    "scenarios": [
+        { "name": "session-policy", "mode": "fixed" },
+        {
+            "name": "old-projected-lowlatency", "mode": "fixed",
+            "parameters": { "controller": { "timestamp_playout_enabled": 0 } }
+        },
+        { "name": "fixed-1ms", "mode": "fixed", "parameters": { "controller": { "timestamp_playout_enabled": 1, "source_playout_delay_us": 1000 } } },
+        { "name": "fixed-2ms", "mode": "fixed", "parameters": { "controller": { "timestamp_playout_enabled": 1, "source_playout_delay_us": 2000 } } },
+        { "name": "fixed-3ms", "mode": "fixed", "parameters": { "controller": { "timestamp_playout_enabled": 1, "source_playout_delay_us": 3000 } } },
+        { "name": "fixed-4ms", "mode": "fixed", "parameters": { "controller": { "timestamp_playout_enabled": 1, "source_playout_delay_us": 4000 } } },
+        { "name": "fixed-5ms", "mode": "fixed", "parameters": { "controller": { "timestamp_playout_enabled": 1, "source_playout_delay_us": 5000 } } },
+        { "name": "fixed-6ms", "mode": "fixed", "parameters": { "controller": { "timestamp_playout_enabled": 1, "source_playout_delay_us": 6000 } } },
+        { "name": "fixed-8ms", "mode": "fixed", "parameters": { "controller": { "timestamp_playout_enabled": 1, "source_playout_delay_us": 8000 } } }
+    ]
+}
