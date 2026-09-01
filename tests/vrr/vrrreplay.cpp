@@ -1498,6 +1498,13 @@ struct Metrics {
     uint64_t firstArrivalSequence = 0;
     uint64_t lastArrivalSequence = 0;
     uint64_t priorArrivalSequence = 0;
+    // Worker-occupancy decision model state: the last recorded gap between a
+    // submission and the next dequeue while the worker was busy, and the
+    // smallest recorded arrival-to-decision latency while it was idle.
+    uint64_t modeledBusyGapUs = 300;
+    uint64_t modeledIdleLatencyUs = 0;
+    bool modeledIdleLatencyValid = false;
+    Distribution occupancyDecisionShiftUs;
     uint64_t arrivalSequenceGaps = 0;
     uint64_t arrivalSequenceDuplicates = 0;
     uint64_t arrivalSequenceOutOfOrderTransitions = 0;
@@ -6706,6 +6713,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     summary["diagnostic_capture_ready"] = diagnosticCaptureReady;
     summary["raster_simulation_ready"] = rasterSimulationReady;
     summary["model"] = kReplayModel;
+    summary["decision_time_model"] = "worker-occupancy-v1";
     return summary;
 }
 
@@ -6714,6 +6722,10 @@ struct TimelineDetails {
     int simulatedSourceRateHz = 0;
     uint64_t recordedSourcePeriodUs = 0;
     uint64_t simulatedSourcePeriodUs = 0;
+    int64_t simulatedReadyOffsetUs = 0;
+    uint64_t simulatedRenderLeadUs = 0;
+    int64_t simulatedReadinessBudgetUs = 0;
+    uint64_t simulatedSourceTimeUs = 0;
     CadenceSample recordedCadence;
     CadenceSample simulatedCadence;
     int64_t recordedSpacingMarginUs = 0;
@@ -6960,6 +6972,8 @@ bool writeTimelineHeader(QFile& file)
         "recorded_tear_classification,simulated_tear_classification,"
         "recorded_source_rate_hz_rounded,simulated_source_rate_hz_rounded,"
         "recorded_source_period_us,simulated_source_period_us,"
+        "simulated_ready_offset_us,simulated_render_lead_us,"
+        "simulated_readiness_budget_us,simulated_source_time_us,"
         "recorded_cadence_valid,simulated_cadence_valid,"
         "recorded_source_elapsed_us,simulated_source_elapsed_us,"
         "recorded_submission_elapsed_us,simulated_submission_elapsed_us,"
@@ -7236,6 +7250,10 @@ bool writeTimelineRow(QFile& file, uint64_t arrivalSequence, int frame,
     append(QByteArray::number(details.simulatedSourceRateHz));
     append(QByteArray::number(details.recordedSourcePeriodUs));
     append(QByteArray::number(details.simulatedSourcePeriodUs));
+    append(QByteArray::number(details.simulatedReadyOffsetUs));
+    append(QByteArray::number(details.simulatedRenderLeadUs));
+    append(QByteArray::number(details.simulatedReadinessBudgetUs));
+    append(QByteArray::number(details.simulatedSourceTimeUs));
     append(QByteArray::number(details.recordedCadence.valid ? 1 : 0));
     append(QByteArray::number(details.simulatedCadence.valid ? 1 : 0));
     append(QByteArray::number(details.recordedCadence.sourceElapsedUs));
@@ -12303,8 +12321,62 @@ int main(int argc, char* argv[])
         const uint64_t injectedDisplayTransitionDelayUs =
             simulatedPresentTransportUs -
                 rasterDisplayParameters.presentTransportUs;
+        // Worker-occupancy decision model. The recorded decision instant
+        // embeds the recorded schedule of the previous frame: the single
+        // pacing worker dequeues the next frame only after it has submitted
+        // the previous one. Re-derive the instant from the simulated previous
+        // submission so a candidate that presents earlier frees the worker
+        // earlier and one that presents later holds it longer. When the
+        // simulated and recorded previous submissions coincide, as they do
+        // for the unchanged reference policy, this reproduces the recorded
+        // instant exactly.
+        uint64_t occupancyDecisionUs = decisionUs;
+        if (rowDecisionValid && decisionUs != 0 &&
+                simulatedController->hasLastSubmission() &&
+                referenceController->hasLastSubmission()) {
+            const uint64_t recordedPreviousSubmissionUs =
+                referenceController->lastSubmissionUs();
+            const uint64_t simulatedPreviousSubmissionUs =
+                simulatedController->lastSubmissionUs();
+            const uint64_t idleLatencyUs = decisionUs >= pacerArrivalUs ?
+                decisionUs - pacerArrivalUs : 0;
+            if (decisionUs >= recordedPreviousSubmissionUs) {
+                const uint64_t postSubmissionGapUs =
+                    decisionUs - recordedPreviousSubmissionUs;
+                const bool workerWasBusy =
+                    postSubmissionGapUs < idleLatencyUs;
+                if (workerWasBusy) {
+                    metrics.modeledBusyGapUs = postSubmissionGapUs;
+                    if (!metrics.modeledIdleLatencyValid) {
+                        metrics.modeledIdleLatencyUs = idleLatencyUs;
+                        metrics.modeledIdleLatencyValid = true;
+                    }
+                    occupancyDecisionUs = std::max(
+                        saturatingAdd(pacerArrivalUs,
+                                      metrics.modeledIdleLatencyUs),
+                        saturatingAdd(simulatedPreviousSubmissionUs,
+                                      postSubmissionGapUs));
+                }
+                else {
+                    metrics.modeledIdleLatencyUs =
+                        metrics.modeledIdleLatencyValid ?
+                            std::min(metrics.modeledIdleLatencyUs,
+                                     idleLatencyUs) : idleLatencyUs;
+                    metrics.modeledIdleLatencyValid = true;
+                    if (simulatedPreviousSubmissionUs >
+                            recordedPreviousSubmissionUs) {
+                        occupancyDecisionUs = std::max(
+                            decisionUs,
+                            saturatingAdd(simulatedPreviousSubmissionUs,
+                                          metrics.modeledBusyGapUs));
+                    }
+                }
+                metrics.occupancyDecisionShiftUs.add(absoluteValue(
+                    signedDifference(occupancyDecisionUs, decisionUs)));
+            }
+        }
         const uint64_t simulatedDecisionUs = saturatingAdd(
-            decisionUs, injectedDecisionDelayUs);
+            occupancyDecisionUs, injectedDecisionDelayUs);
         timelineDetails.simulatedDecisionUs = simulatedDecisionUs;
         timelineDetails.injectedDecisionDelayUs =
             injectedDecisionDelayUs;
@@ -12373,6 +12445,14 @@ int main(int argc, char* argv[])
             simulatedController->schedule(frame, simulatedDecisionUs);
         timelineDetails.simulatedSourcePeriodUs =
             simulatedDecision.sourcePeriodUs;
+        timelineDetails.simulatedReadyOffsetUs =
+            simulatedDecision.readyOffsetUs;
+        timelineDetails.simulatedRenderLeadUs =
+            simulatedDecision.renderLeadUs;
+        timelineDetails.simulatedReadinessBudgetUs =
+            simulatedDecision.readinessBudgetUs;
+        timelineDetails.simulatedSourceTimeUs =
+            simulatedDecision.sourceTimeUs;
         timelineDetails.simulatedSourceRateHz = roundedRateForPeriod(
             simulatedDecision.sourcePeriodUs);
         timelineDetails.simulatedLatched =

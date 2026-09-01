@@ -666,7 +666,15 @@ captures and for explicit experiments.
 
 The replay is intentionally a fixed-recorded-admission model: it preserves the
 session's actual queue admission/drop and presentation lifecycle while using
-the real arrival timestamps and exogenous renderer costs. This makes
+the real arrival timestamps and exogenous renderer costs. One lifecycle instant
+is re-derived rather than copied: the candidate's decision time follows the
+worker-occupancy model (`decision_time_model`), which places it at the
+simulated previous submission plus the recorded post-submission gap whenever
+the recorded worker was still busy when the frame arrived, and at the recorded
+instant otherwise. Copying the recorded instant verbatim clamped every
+candidate that presented earlier than the recording to a stale "now" and
+manufactured spacing errors that the live worker would not produce. The
+unchanged reference policy still reproduces the recorded instant exactly. This makes
 timing-policy A/B results deterministic and permits an exact unchanged-policy
 baseline. A controller change that also changes decoder backpressure, queue
 admission, present-mode cost, or host/network latency still needs a live
