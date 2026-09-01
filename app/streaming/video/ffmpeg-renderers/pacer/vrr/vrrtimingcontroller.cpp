@@ -10,16 +10,12 @@ constexpr uint64_t kMicrosecondsPerSecond = 1000000ULL;
 constexpr uint64_t kRtpClockRate = 90000ULL;
 constexpr uint64_t kQ16One = 1ULL << 16;
 constexpr uint64_t kQ16Half = kQ16One >> 1;
-constexpr unsigned int kSmoothnessReadinessLowPercentile = 10;
-constexpr unsigned int kSmoothnessReadinessHighPercentile = 95;
-constexpr uint64_t kSmoothnessReadinessLearningWindowUs = 250000;
-constexpr size_t kSmoothnessReadinessLearningSampleCap = 120;
-constexpr uint64_t kSmoothnessReadinessPeriodFloorNumerator = 5;
-constexpr uint64_t kSmoothnessReadinessPeriodFloorDenominator = 8;
-constexpr uint64_t kSmoothnessReadinessCeilingUs = 16000;
-constexpr uint64_t kSmoothnessMinimumReadinessReserveUs = 1500;
-constexpr uint64_t kSmoothnessArrivalSpreadGuardUs = 500;
-constexpr uint64_t kSmoothnessReadinessReleaseDenominator = 256;
+// Smoothness mode is a fixed jitter buffer hung off the sender timestamps:
+// every frame presents at its RTP time plus one constant delay. Arrival
+// variation up to that delay is invisible; anything larger is one late frame
+// and nothing else moves. 5 ms covers roughly p97 of decode-versus-RTP jitter
+// on the reference 116 FPS / 120 Hz rig.
+constexpr uint64_t kSmoothnessPlayoutDelayUs = 5000;
 
 uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)
 {
@@ -59,41 +55,16 @@ VrrTimingParameters vrrTimingParametersForSession(
 {
     VrrTimingParameters parameters;
     if (config.allowAdditionalQueuedFrame) {
-        parameters.readinessLowPercentile =
-            kSmoothnessReadinessLowPercentile;
-        parameters.readinessLoosePercentile = std::max(
-            parameters.readinessLoosePercentile,
-            kSmoothnessReadinessHighPercentile);
-        parameters.minimumReadinessReserveUs = std::max(
-            parameters.minimumReadinessReserveUs,
-            kSmoothnessMinimumReadinessReserveUs);
-        parameters.readinessCeilingUs = std::max(
-            parameters.readinessCeilingUs,
-            kSmoothnessReadinessCeilingUs);
-        parameters.arrivalSpreadGuardUs =
-            kSmoothnessArrivalSpreadGuardUs;
-        parameters.readinessLearningWindowUs =
-            kSmoothnessReadinessLearningWindowUs;
-        parameters.readinessLearningSamples = std::max(
-            parameters.readinessLearningSamples,
-            kSmoothnessReadinessLearningSampleCap);
-        parameters.readinessPeriodFloorNumerator =
-            kSmoothnessReadinessPeriodFloorNumerator;
-        parameters.readinessPeriodFloorDenominator =
-            kSmoothnessReadinessPeriodFloorDenominator;
+        // Present at sender time plus a constant delay. The learned readiness
+        // reserve, its per-frame slewing, and every phase re-anchor are off
+        // on this path: they each moved the target between frames the source
+        // had spaced evenly, which was the visible stutter.
+        parameters.timestampPlayoutEnabled = 1;
+        parameters.sourcePlayoutDelayUs = kSmoothnessPlayoutDelayUs;
+        // The worker tolerates one extra source interval of queue age in this
+        // mode; keep the render-tail insurance budget matched to it.
         parameters.pacingLatencyExtraPeriodNumerator = 1;
         parameters.pacingLatencyExtraPeriodDenominator = 1;
-        parameters.retainReadinessOnPhaseReset = 1;
-        parameters.readinessReleaseDenominator = std::max(
-            parameters.readinessReleaseDenominator,
-            kSmoothnessReadinessReleaseDenominator);
-        // VRR8's policy reserve remained real below the display ceiling.
-        // Smoothness therefore does not spend cadence headroom as imaginary
-        // readiness credit; the learned reserve is explicit and accounted.
-        parameters.usableHeadroomNumerator = 0;
-        // Smoothness is entirely learned and cadence-scaled. Keep the legacy
-        // absolute source delay at zero so no device pays a fixed tax.
-        parameters.sourcePlayoutDelayUs = 0;
     }
     return parameters;
 }
@@ -166,6 +137,14 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_Parameters.coldStartReadinessDemandUs;
     m_ReadinessModelValid = retainLearnedBudgets &&
         previousReadinessModelValid;
+    if (timestampPlayoutEnabled()) {
+        // The fixed playout delay is the whole buffer. No learned reserve is
+        // applied or reported on top of it.
+        m_ReadinessDemandUs = 0;
+        m_AppliedReadinessReserveUs = 0;
+        m_ReadinessModelValid = false;
+    }
+    resetPlayoutOffsets();
     m_HaveTimeline = false;
     m_SourceTimeUs = 0;
     m_SourceTimeUsQ16 = 0;
@@ -290,57 +269,88 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         }
     }
 
-    int64_t readyOffsetUs = signedDifference(frame.decodeCompleteUs(),
-                                              m_SourceTimeUs);
-    if (!rebased && !cadence.phaseDiscontinuity && cadence.eligible) {
-        const int64_t ceilingUs = static_cast<int64_t>(readinessCeilingUs());
-        if (readyOffsetUs < -ceilingUs) {
-            // A frame that is ready well before the old slower clock must not
-            // wait behind an obsolete cutscene cadence. The display floor and
-            // latched near-refresh mode still bound how quickly it can submit.
-            anchorSourceTime(frame.decodeCompleteUs());
-            readyOffsetUs = 0;
-            cadence.phaseDiscontinuity = true;
-            cadence.eligible = false;
-            m_PhaseErrorFrames = 0;
-        }
-        else if (readyOffsetUs > ceilingUs) {
-            ++m_PhaseErrorFrames;
+    // Timestamp playout: the target is the sender timestamp mapped into the
+    // local clock plus one constant delay. The mapping offset is the windowed
+    // minimum of decode-complete minus RTP time, slewed a few microseconds per
+    // frame so host/client clock drift is tracked without ever moving one
+    // frame's target relative to its neighbours. Nothing below re-anchors on
+    // a late or early frame: a late frame simply clamps to "now" and the next
+    // frame returns to its own slot.
+    const bool timestampPlayout = timestampPlayoutEnabled() &&
+        frame.timestampValid() && (rebased || cadence.usedRtpTimestamp);
+    m_TimestampPlayoutActive = timestampPlayout;
+    const uint64_t rtpUs = timestampPlayout ?
+        rtpTicksToUs(m_UnwrappedRtpTicks) : 0;
+    int64_t readyOffsetUs = 0;
+    if (timestampPlayout) {
+        const int64_t offsetUs = signedDifference(frame.decodeCompleteUs(),
+                                                  rtpUs);
+        const int64_t appliedOffsetUs = observePlayoutOffset(
+            frame.decodeCompleteUs(), offsetUs);
+        anchorSourceTime(addSigned(rtpUs, appliedOffsetUs));
+        readyOffsetUs = signedDifference(frame.decodeCompleteUs(),
+                                         m_SourceTimeUs);
+        m_ReadinessBudgetUs = 0;
+        m_ReadinessPhaseUs = 0;
+        m_PhaseErrorFrames = 0;
+    }
+    else {
+        readyOffsetUs = signedDifference(frame.decodeCompleteUs(),
+                                         m_SourceTimeUs);
+        if (!rebased && !cadence.phaseDiscontinuity && cadence.eligible) {
+            const int64_t ceilingUs =
+                static_cast<int64_t>(readinessCeilingUs());
+            if (readyOffsetUs < -ceilingUs) {
+                // A frame that is ready well before the old slower clock must
+                // not wait behind an obsolete cutscene cadence. The display
+                // floor and latched near-refresh mode still bound how quickly
+                // it can submit.
+                anchorSourceTime(frame.decodeCompleteUs());
+                readyOffsetUs = 0;
+                cadence.phaseDiscontinuity = true;
+                cadence.eligible = false;
+                m_PhaseErrorFrames = 0;
+            }
+            else if (readyOffsetUs > ceilingUs) {
+                ++m_PhaseErrorFrames;
+            }
+            else {
+                m_PhaseErrorFrames = 0;
+            }
+
+            if (!cadence.phaseDiscontinuity &&
+                    m_PhaseErrorFrames >= m_Parameters.phaseErrorFrames) {
+                // A bounded readiness reserve cannot repay a sustained source
+                // phase error. Re-anchor locally while retaining the
+                // cumulative cadence fit, rather than repeatedly rebasing the
+                // whole model.
+                anchorSourceTime(frame.decodeCompleteUs());
+                readyOffsetUs = 0;
+                cadence.phaseDiscontinuity = true;
+                cadence.eligible = false;
+                m_PhaseErrorFrames = 0;
+            }
         }
         else {
             m_PhaseErrorFrames = 0;
         }
-
-        if (!cadence.phaseDiscontinuity &&
-                m_PhaseErrorFrames >= m_Parameters.phaseErrorFrames) {
-            // A bounded readiness reserve cannot repay a sustained source
-            // phase error. Re-anchor locally while retaining the cumulative
-            // cadence fit, rather than repeatedly rebasing the whole model.
-            anchorSourceTime(frame.decodeCompleteUs());
-            readyOffsetUs = 0;
-            cadence.phaseDiscontinuity = true;
-            cadence.eligible = false;
-            m_PhaseErrorFrames = 0;
+        if (rebased || cadence.sourceRateChanged ||
+            cadence.phaseDiscontinuity) {
+            // A new source epoch or local phase recovery is anchored by the
+            // first directly observed ready offset. Cadence history is
+            // retained for the phase-only cases above.
+            m_ReadyOffsets.clear();
+            const int64_t ceilingUs =
+                static_cast<int64_t>(readinessCeilingUs());
+            m_ReadinessPhaseUs = std::max(
+                -ceilingUs, std::min(readyOffsetUs, ceilingUs));
+            // A source-phase reset must not acquire a standing reserve in one
+            // cadence-breaking jump. Start on the observed phase and let
+            // clean arrival evidence build or release the reserve smoothly.
+            const bool retainReserve =
+                m_Parameters.retainReadinessOnPhaseReset != 0;
+            applyReadinessBudget(retainReserve, retainReserve);
         }
-    }
-    else {
-        m_PhaseErrorFrames = 0;
-    }
-    if (rebased || cadence.sourceRateChanged ||
-        cadence.phaseDiscontinuity) {
-        // A new source epoch or local phase recovery is anchored by the first
-        // directly observed ready offset. Cadence history is retained for the
-        // phase-only cases above.
-        m_ReadyOffsets.clear();
-        const int64_t ceilingUs = static_cast<int64_t>(readinessCeilingUs());
-        m_ReadinessPhaseUs = std::max(
-            -ceilingUs, std::min(readyOffsetUs, ceilingUs));
-        // A source-phase reset must not acquire a standing reserve in one
-        // cadence-breaking jump. Start on the observed phase and let clean
-        // arrival evidence build or release the reserve smoothly.
-        const bool retainReserve =
-            m_Parameters.retainReadinessOnPhaseReset != 0;
-        applyReadinessBudget(retainReserve, retainReserve);
     }
 
     uint64_t targetUs = saturatingAdd(
@@ -375,6 +385,15 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         m_ReadyOffsets.clear();
         m_ReadinessBudgetUs = 0;
         m_ReadinessPhaseUs = 0;
+        if (timestampPlayout) {
+            // The frame is more than a source period earlier than the mapped
+            // clock predicts: the sender clock jumped. Re-seed the offset on
+            // this frame rather than making it wait out a stale mapping.
+            resetPlayoutOffsets();
+            observePlayoutOffset(
+                frame.decodeCompleteUs(),
+                signedDifference(frame.decodeCompleteUs(), rtpUs));
+        }
         readyOffsetUs = 0;
         cadence.phaseDiscontinuity = true;
         cadence.eligible = false;
@@ -460,7 +479,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.rebased = rebased;
 
     m_Pending.valid = true;
-    m_Pending.cadenceEligible = decision.cadenceEligible;
+    // Timestamp playout never feeds the learned readiness reserve.
+    m_Pending.cadenceEligible = decision.cadenceEligible && !timestampPlayout;
     m_Pending.readyOffsetUs = readyOffsetUs;
     return decision;
 }
@@ -1088,6 +1108,94 @@ uint64_t VrrTimingController::lastSubmissionUs() const
 bool VrrTimingController::hasLastSubmission() const
 {
     return m_HaveLastSubmission;
+}
+
+int64_t VrrTimingController::playoutOffsetUs() const
+{
+    return m_AppliedPlayoutOffsetUs;
+}
+
+bool VrrTimingController::timestampPlayoutActive() const
+{
+    return m_TimestampPlayoutActive;
+}
+
+bool VrrTimingController::timestampPlayoutEnabled() const
+{
+    return m_Parameters.timestampPlayoutEnabled != 0;
+}
+
+void VrrTimingController::resetPlayoutOffsets()
+{
+    m_PlayoutOffsets.clear();
+    m_PlayoutOffsetValid = false;
+    m_AppliedPlayoutOffsetUs = 0;
+    m_PlayoutSamplesSeen = 0;
+    m_TimestampPlayoutActive = false;
+}
+
+int64_t VrrTimingController::observePlayoutOffset(uint64_t decodeCompleteUs,
+                                                  int64_t offsetUs)
+{
+    // Bound the window by both age and count so a pathological configuration
+    // cannot grow the deque without limit.
+    constexpr size_t kMaximumPlayoutOffsetSamples = 4096;
+    m_PlayoutOffsets.push_back(PlayoutOffsetSample { decodeCompleteUs,
+                                                     offsetUs });
+    const uint64_t windowUs = m_Parameters.playoutOffsetWindowUs;
+    while (m_PlayoutOffsets.size() > 1 &&
+           (m_PlayoutOffsets.size() > kMaximumPlayoutOffsetSamples ||
+            (decodeCompleteUs > windowUs &&
+             m_PlayoutOffsets.front().decodeCompleteUs <
+                 decodeCompleteUs - windowUs))) {
+        m_PlayoutOffsets.pop_front();
+    }
+
+    int64_t windowMinimumUs = std::numeric_limits<int64_t>::max();
+    for (const PlayoutOffsetSample& sample : m_PlayoutOffsets) {
+        windowMinimumUs = std::min(windowMinimumUs, sample.offsetUs);
+    }
+
+    ++m_PlayoutSamplesSeen;
+    if (!m_PlayoutOffsetValid) {
+        m_AppliedPlayoutOffsetUs = offsetUs;
+        m_PlayoutOffsetValid = true;
+    }
+    else if (m_PlayoutSamplesSeen <= m_Parameters.playoutOffsetWarmupSamples) {
+        // The first frame after an epoch is an arbitrary arrival. While the
+        // window is still filling, adopt an earlier arrival immediately so
+        // startup latency converges within a few frames instead of paying
+        // the slew rate for the first several seconds.
+        if (windowMinimumUs < m_AppliedPlayoutOffsetUs) {
+            m_AppliedPlayoutOffsetUs = windowMinimumUs;
+        }
+    }
+    else {
+        // Steady state: track the earliest arrival in the window at a rate
+        // far above clock drift but far below anything visible per frame.
+        const int64_t slewUs = static_cast<int64_t>(std::min<uint64_t>(
+            m_Parameters.playoutOffsetSlewUs,
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+        if (windowMinimumUs > m_AppliedPlayoutOffsetUs) {
+            m_AppliedPlayoutOffsetUs += std::min(
+                slewUs, windowMinimumUs - m_AppliedPlayoutOffsetUs);
+        }
+        else if (windowMinimumUs < m_AppliedPlayoutOffsetUs) {
+            m_AppliedPlayoutOffsetUs -= std::min(
+                slewUs, m_AppliedPlayoutOffsetUs - windowMinimumUs);
+        }
+    }
+    return m_AppliedPlayoutOffsetUs;
+}
+
+uint64_t VrrTimingController::rtpTicksToUs(uint64_t ticks)
+{
+    constexpr uint64_t kTicksPerMillisecond = kRtpClockRate / 1000;
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    if (ticks > maximum / 1000) {
+        return ticks / kTicksPerMillisecond * 1000;
+    }
+    return ticks * 1000 / kTicksPerMillisecond;
 }
 
 const VrrTimingParameters& VrrTimingController::parameters() const

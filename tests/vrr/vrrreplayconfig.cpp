@@ -400,6 +400,12 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.retainReadinessOnPhaseReset > 1) {
         return fail("retain_readiness_on_phase_reset must be 0 or 1");
     }
+    if (value.timestampPlayoutEnabled > 1) {
+        return fail("timestamp_playout_enabled must be 0 or 1");
+    }
+    if (value.playoutOffsetWindowUs == 0) {
+        return fail("playout_offset_window_us must be non-zero");
+    }
     const unsigned int percents[] = {
         value.materialRateChangePercent, value.renderBaselinePercentile,
         value.preparationPercentile,

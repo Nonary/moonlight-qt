@@ -58,6 +58,12 @@ void VrrReplayConfigTest::defaultsRoundTrip()
         uint64_t(0));
     QCOMPARE(config.scenarios.front().controller.sourcePlayoutDelayUs,
               uint64_t(0));
+    QCOMPARE(config.scenarios.front().controller.timestampPlayoutEnabled,
+              uint64_t(0));
+    QCOMPARE(config.scenarios.front().controller.playoutOffsetWindowUs,
+              uint64_t(3000000));
+    QCOMPARE(config.scenarios.front().controller.playoutOffsetSlewUs,
+              uint64_t(20));
     QCOMPARE(config.scenarios.front().controller.readinessLearningWindowUs,
               uint64_t(0));
     QCOMPARE(
@@ -109,6 +115,10 @@ void VrrReplayConfigTest::defaultsRoundTrip()
         "controller.readiness_floor_period_numerator"));
     QVERIFY(vrrReplayParameterNames().contains(
         "controller.retain_readiness_on_phase_reset"));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.timestamp_playout_enabled"));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.playout_offset_slew_us"));
     QVERIFY(vrrReplayParameterNames().contains(
         "display.active_scanout_percent"));
     QVERIFY(vrrReplayParameterNames().contains(

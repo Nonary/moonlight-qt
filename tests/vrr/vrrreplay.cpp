@@ -11103,6 +11103,24 @@ int main(int argc, char* argv[])
                             // reset.
                             legacyValue = "0";
                         }
+                        else if (path ==
+                                 "controller.timestamp_playout_enabled") {
+                            // Older schema-5 captures predate timestamp
+                            // playout and always projected a source clock.
+                            legacyValue = "0";
+                        }
+                        else if (path ==
+                                 "controller.playout_offset_window_us") {
+                            legacyValue = "3000000";
+                        }
+                        else if (path ==
+                                 "controller.playout_offset_slew_us") {
+                            legacyValue = "20";
+                        }
+                        else if (path ==
+                                 "controller.playout_offset_warmup_samples") {
+                            legacyValue = "64";
+                        }
                         bool validLegacyValue = false;
                         capturedValue = legacyValue.toULongLong(
                             &validLegacyValue);

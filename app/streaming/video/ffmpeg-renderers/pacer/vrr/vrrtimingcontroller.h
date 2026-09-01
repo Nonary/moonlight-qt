@@ -23,6 +23,10 @@
     X(uint64_t, pacing_latency_extra_period_denominator, pacingLatencyExtraPeriodDenominator, 1) \
     X(uint64_t, presentation_safety_us, presentationSafetyUs, 0) \
     X(uint64_t, source_playout_delay_us, sourcePlayoutDelayUs, 0) \
+    X(uint64_t, timestamp_playout_enabled, timestampPlayoutEnabled, 0) \
+    X(uint64_t, playout_offset_window_us, playoutOffsetWindowUs, 3000000) \
+    X(uint64_t, playout_offset_slew_us, playoutOffsetSlewUs, 20) \
+    X(size_t, playout_offset_warmup_samples, playoutOffsetWarmupSamples, 64) \
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
     X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
     X(uint64_t, cold_start_readiness_demand_us, coldStartReadinessDemandUs, 1500) \
@@ -182,6 +186,10 @@ public:
     uint64_t earliestSubmissionUs() const;
     uint64_t lastSubmissionUs() const;
     bool hasLastSubmission() const;
+    // Timestamp playout: the applied sender-to-local clock offset and whether
+    // the last scheduled frame used the fixed-delay timestamp path.
+    int64_t playoutOffsetUs() const;
+    bool timestampPlayoutActive() const;
     const VrrTimingParameters& parameters() const;
     VrrTimingDiagnostics diagnostics() const;
 
@@ -208,6 +216,17 @@ private:
         uint64_t frameOrdinal = 0;
         uint64_t rtpTicks = 0;
     };
+
+    struct PlayoutOffsetSample {
+        uint64_t decodeCompleteUs = 0;
+        int64_t offsetUs = 0;
+    };
+
+    bool timestampPlayoutEnabled() const;
+    void resetPlayoutOffsets();
+    int64_t observePlayoutOffset(uint64_t decodeCompleteUs,
+                                 int64_t offsetUs);
+    static uint64_t rtpTicksToUs(uint64_t ticks);
 
     void clearTimeline(bool retainLearnedBudgets);
     void initializeTimeline(const PacedFrame& frame);
@@ -294,6 +313,12 @@ private:
     uint64_t m_LastSubmissionUs = 0;
     unsigned int m_CleanSpacingFrames = 0;
     unsigned int m_PhaseErrorFrames = 0;
+
+    std::deque<PlayoutOffsetSample> m_PlayoutOffsets;
+    bool m_PlayoutOffsetValid = false;
+    int64_t m_AppliedPlayoutOffsetUs = 0;
+    uint64_t m_PlayoutSamplesSeen = 0;
+    bool m_TimestampPlayoutActive = false;
 
     std::deque<CadenceSample> m_CadenceSamples;
     std::deque<CadenceSample> m_RateCandidateSamples;

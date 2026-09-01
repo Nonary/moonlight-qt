@@ -167,66 +167,157 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
                lowLatencyPolicy.readinessLoosePercentile == 80 &&
                lowLatencyPolicy.sourcePlayoutDelayUs == 0,
            "low-latency sessions must retain the controller readiness defaults");
-    expect(smoothnessPolicy.readinessLowPercentile == 10 &&
-                smoothnessPolicy.readinessLoosePercentile == 95 &&
-                smoothnessPolicy.sourcePlayoutDelayUs == 0 &&
-                smoothnessPolicy.readinessLearningWindowUs == 250000 &&
-                smoothnessPolicy.readinessLearningSamples == 120 &&
-                smoothnessPolicy.readinessCeilingUs == 16000 &&
-                smoothnessPolicy.readinessPeriodFloorNumerator == 5 &&
-                smoothnessPolicy.readinessPeriodFloorDenominator == 8 &&
+    expect(smoothnessPolicy.timestampPlayoutEnabled == 1 &&
+                smoothnessPolicy.sourcePlayoutDelayUs == 5000 &&
+                smoothnessPolicy.readinessLowPercentile == 0 &&
+                smoothnessPolicy.readinessLoosePercentile == 80 &&
                 smoothnessPolicy.pacingLatencyExtraPeriodNumerator == 1 &&
                 smoothnessPolicy.pacingLatencyExtraPeriodDenominator == 1 &&
-                smoothnessPolicy.retainReadinessOnPhaseReset == 1 &&
-                smoothnessPolicy.usableHeadroomNumerator == 0 &&
-                smoothnessPolicy.readinessReleaseDenominator == 256,
-           "smoothness sessions must resolve the adaptive p10/p95 cadence-scaled policy without a fixed delay");
+                smoothnessPolicy.retainReadinessOnPhaseReset == 0,
+           "smoothness sessions must resolve the fixed 5 ms timestamp playout policy");
 }
 
-void testSmoothnessReserveScalesWithCadence()
+void testSmoothnessTimestampPlayoutHoldsFixedDelay()
 {
-    VrrSessionConfig nearCeilingConfig = config(116, 120);
-    nearCeilingConfig.allowAdditionalQueuedFrame = true;
-    const VrrTimingParameters smoothnessParameters =
-        vrrTimingParametersForSession(nearCeilingConfig);
-    VrrTimingController nearCeiling(
-        nearCeilingConfig, true, smoothnessParameters);
+    // 60 FPS on 120 Hz so the display-spacing floor never binds and every
+    // target is decided by the playout schedule alone.
+    VrrSessionConfig session = config(60, 120);
+    session.allowAdditionalQueuedFrame = true;
+    const VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingController controller(session, true, policy);
+    const uint64_t epochUs = 1000000;
+    const uint64_t delayUs = policy.sourcePlayoutDelayUs;
 
-    const VrrTimingDecision first = nearCeiling.schedule(
-        frame(1, 0, true, 100000), 100000);
-    const uint64_t expectedFloorUs = nearCeiling.sourcePeriodUs() * 5 / 8;
-    expect(first.readinessBudgetUs ==
-               static_cast<int64_t>(expectedFloorUs),
-           "smoothness must acquire its source-period reserve immediately near the display ceiling");
-    expect(nearCeiling.diagnostics().appliedReadinessReserveUs ==
-               expectedFloorUs,
-           "the cadence-scaled reserve must be included in latency diagnostics");
+    const auto rtpFor = [](int i) {
+        return static_cast<uint32_t>(static_cast<uint64_t>(i) * 90000ULL / 60ULL);
+    };
+    // Deterministic jitter in [0, 3000) us, all below the 5 ms delay. Every
+    // fiftieth frame arrives with zero jitter so the three-second offset
+    // window always contains the true floor and the mapping stays fixed.
+    const auto jitterFor = [](int i) {
+        if (i % 50 == 0) {
+            return static_cast<uint64_t>(0);
+        }
+        return static_cast<uint64_t>((static_cast<uint64_t>(i) * 7919ULL) % 3001ULL);
+    };
 
-    nearCeiling.noteSubmission(true, false, first.targetUs);
-    nearCeiling.rebase();
-    const VrrTimingDecision rebased = nearCeiling.schedule(
-        frame(2, 750, true, 108621), 108621);
-    expect(rebased.readinessBudgetUs ==
-               static_cast<int64_t>(expectedFloorUs),
-           "a source-phase rebase must retain the bounded adaptive reserve");
+    VrrTimingDecision decision;
+    uint64_t previousTargetUs = 0;
+    unsigned int spacingErrors = 0;
+    unsigned int reserveReports = 0;
+    for (int i = 0; i < 400; ++i) {
+        const uint32_t timestamp = rtpFor(i);
+        const uint64_t idealUs = decodedTimeForRtp(epochUs, timestamp);
+        const uint64_t decodedUs = idealUs + jitterFor(i);
+        decision = controller.schedule(
+            frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        expect(i == 0 || (!decision.rebased && !decision.phaseDiscontinuity),
+               "sub-delay jitter must never re-anchor the timestamp clock");
+        if (decision.readinessBudgetUs != 0 ||
+                controller.diagnostics().appliedReadinessReserveUs != 0) {
+            ++reserveReports;
+        }
+        if (i > 0) {
+            const uint64_t expectedSpacingUs =
+                idealUs - decodedTimeForRtp(epochUs, rtpFor(i - 1));
+            const uint64_t spacingUs = decision.targetUs - previousTargetUs;
+            if (spacingUs != expectedSpacingUs) {
+                if (spacingErrors < 5) {
+                    std::fprintf(stderr,
+                                 "playout spacing i=%d target=%llu ideal=%llu decoded=%llu spacing=%llu expected=%llu offset=%lld ready=%lld source=%llu lead=%llu flags=%d%d%d\n",
+                                 i,
+                                 static_cast<unsigned long long>(decision.targetUs),
+                                 static_cast<unsigned long long>(idealUs),
+                                 static_cast<unsigned long long>(decodedUs),
+                                 static_cast<unsigned long long>(spacingUs),
+                                 static_cast<unsigned long long>(expectedSpacingUs),
+                                 static_cast<long long>(controller.playoutOffsetUs()),
+                                 static_cast<long long>(decision.readyOffsetUs),
+                                 static_cast<unsigned long long>(decision.sourceTimeUs),
+                                 static_cast<unsigned long long>(decision.renderLeadUs),
+                                 decision.rebased ? 1 : 0,
+                                 decision.phaseDiscontinuity ? 1 : 0,
+                                 decision.sourceRateChanged ? 1 : 0);
+                }
+                ++spacingErrors;
+            }
+        }
+        previousTargetUs = decision.targetUs;
+    }
+    expect(spacingErrors == 0,
+           "timestamp playout must reproduce sender spacing exactly under sub-delay jitter");
+    expect(reserveReports == 0,
+           "timestamp playout must not apply or report a learned readiness reserve");
+    expect(controller.timestampPlayoutActive(),
+           "smoothness sessions with RTP timestamps must use timestamp playout");
+    expect(controller.playoutOffsetUs() == static_cast<int64_t>(epochUs),
+           "the applied offset must be the earliest arrival in the window");
+    expect(decision.targetUs ==
+               decodedTimeForRtp(epochUs, rtpFor(399)) + delayUs +
+                   decision.renderLeadUs,
+           "every target must sit exactly one fixed delay after mapped sender time");
+    expect(controller.timingBudgetUs() == delayUs,
+           "the timing budget must report only the fixed playout delay");
 
-    VrrSessionConfig looseConfig = config(50, 120);
-    looseConfig.allowAdditionalQueuedFrame = true;
-    VrrTimingController loose(
-        looseConfig, true, vrrTimingParametersForSession(looseConfig));
-    loose.schedule(frame(1, 0, true, 100000), 100000);
-    expect(loose.diagnostics().appliedReadinessReserveUs ==
-               smoothnessParameters.coldStartReadinessDemandUs,
-           "loose cadence must learn from arrival spread instead of carrying the near-ceiling period floor");
+    // A frame later than the delay clamps to now and nothing else moves.
+    const uint32_t lateTimestamp = rtpFor(400);
+    const uint64_t lateIdealUs = decodedTimeForRtp(epochUs, lateTimestamp);
+    const uint64_t lateDecodedUs = lateIdealUs + delayUs + 1500;
+    const VrrTimingDecision late = controller.schedule(
+        frame(401, lateTimestamp, true, lateDecodedUs), lateDecodedUs);
+    controller.noteSubmission(true, false, late.targetUs);
+    expect(late.targetUs == lateDecodedUs + late.renderLeadUs,
+           "a frame later than the delay must present as soon as it is ready");
+    expect(!late.phaseDiscontinuity && !late.rebased &&
+               controller.playoutOffsetUs() == static_cast<int64_t>(epochUs),
+           "one late frame must not move the sender clock mapping");
+
+    const uint32_t nextTimestamp = rtpFor(401);
+    const uint64_t nextIdealUs = decodedTimeForRtp(epochUs, nextTimestamp);
+    const VrrTimingDecision next = controller.schedule(
+        frame(402, nextTimestamp, true, nextIdealUs + 200), nextIdealUs + 200);
+    controller.noteSubmission(true, false, next.targetUs);
+    expect(next.targetUs == nextIdealUs + delayUs + next.renderLeadUs,
+           "the frame after a late frame must return to its own slot");
+
+    // Slow clock drift is followed at the slew rate, never as a jump.
+    const int64_t offsetBeforeDrift = controller.playoutOffsetUs();
+    uint64_t maximumSpacingErrorUs = 0;
+    previousTargetUs = next.targetUs;
+    for (int i = 402; i < 1400; ++i) {
+        const uint32_t timestamp = rtpFor(i);
+        const uint64_t idealUs = decodedTimeForRtp(epochUs, timestamp);
+        // Frames arrive one microsecond later per frame relative to RTP.
+        const uint64_t decodedUs = idealUs + static_cast<uint64_t>(i - 401);
+        decision = controller.schedule(
+            frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        const uint64_t expectedSpacingUs =
+            idealUs - decodedTimeForRtp(epochUs, rtpFor(i - 1));
+        const uint64_t spacingUs = decision.targetUs - previousTargetUs;
+        const uint64_t errorUs = spacingUs > expectedSpacingUs ?
+            spacingUs - expectedSpacingUs : expectedSpacingUs - spacingUs;
+        maximumSpacingErrorUs = std::max(maximumSpacingErrorUs, errorUs);
+        previousTargetUs = decision.targetUs;
+    }
+    expect(controller.playoutOffsetUs() > offsetBeforeDrift + 500,
+           "the mapping offset must follow sustained drift");
+    expect(maximumSpacingErrorUs <= policy.playoutOffsetSlewUs,
+           "drift tracking must never move a target by more than the slew per frame");
 }
 
 void testSmoothnessLearningWindowTracksCadence()
 {
+    // The quarter-second learning window remains a replay-selectable policy
+    // even though the production smoothness session no longer uses it.
     const auto learnedSampleCount = [](int sourceRateHz) {
         VrrSessionConfig session = config(sourceRateHz, 240);
         session.allowAdditionalQueuedFrame = true;
-        VrrTimingController controller(
-            session, true, vrrTimingParametersForSession(session));
+        VrrTimingParameters parameters;
+        parameters.readinessLearningWindowUs = 250000;
+        parameters.readinessLearningSamples = 120;
+        VrrTimingController controller(session, true, parameters);
         const uint64_t epochUs = 100000;
         for (int i = 0; i < 140; ++i) {
             const uint32_t timestamp = static_cast<uint32_t>(
@@ -1326,7 +1417,7 @@ int main()
     testRtpWrapResetAndFallback();
     testTimingFormulaeAndReserveCap();
     testSourcePlayoutDelayOffsetsProjectedTargets();
-    testSmoothnessReserveScalesWithCadence();
+    testSmoothnessTimestampPlayoutHoldsFixedDelay();
     testSmoothnessLearningWindowTracksCadence();
     testLongRunNearRefreshRtpCadence();
     testQuantizedCadenceDoesNotOscillate();

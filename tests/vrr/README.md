@@ -647,16 +647,23 @@ timeline for that display; controller/cadence results remain available:
 .\vrr\release\vrrreplay.exe capture.vrrtrace --display-hz 120 --stream-fps 116
 ```
 
-The smoothness queue policy uses a VRR8-style adaptive readiness reserve: a
-p10 phase anchor and p95 arrival-spread target over a cadence-scaled quarter-second
-window, immediate attack, slow release, and a five-eighths source-period floor
-only near the display ceiling. Learned reserve is retained across source-phase
-resets, bounded by the existing latency policy, and included in latency
-diagnostics. Cadence headroom is not deducted from this explicit reserve, and
-there is no fixed source-clock playout delay. Low-latency sessions
-retain the direct controller defaults. All resolved values are captured in
-schema 5, so exact replay and candidate sweeps use the production policy
-without inferring it from the queue-mode flag.
+The smoothness queue policy is a fixed jitter buffer anchored to the sender
+timestamps (`controller.timestamp_playout_enabled`): every frame targets its
+RTP time mapped into the local clock plus `controller.source_playout_delay_us`
+(5 ms) plus the render lead. The mapping offset is the windowed minimum of
+decode-complete minus RTP time (`playout_offset_window_us`), slewed at most
+`playout_offset_slew_us` per frame so clock drift is followed without moving
+one frame relative to its neighbours. No learned readiness reserve is applied
+or reported, and a late or early frame never re-anchors the clock: a frame
+later than the delay clamps to "now" and the next frame returns to its own
+slot. Low-latency sessions retain the direct projected-clock controller
+defaults. All resolved values are captured in schema 5, so exact replay and
+candidate sweeps use the production policy without inferring it from the
+queue-mode flag. Note that a `--set` or config scenario is treated as
+customized and does not inherit the session policy: a smoothness sweep must
+set `controller.timestamp_playout_enabled=1` explicitly alongside the delay.
+The adaptive readiness parameters remain available for replaying older
+captures and for explicit experiments.
 
 The replay is intentionally a fixed-recorded-admission model: it preserves the
 session's actual queue admission/drop and presentation lifecycle while using
