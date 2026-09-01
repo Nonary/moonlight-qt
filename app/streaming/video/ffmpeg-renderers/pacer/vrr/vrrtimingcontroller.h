@@ -19,18 +19,26 @@
     X(uint64_t, render_lead_slack_us, renderLeadSlackUs, 0) \
     X(unsigned int, render_baseline_percentile, renderBaselinePercentile, 50) \
     X(uint64_t, pacing_latency_budget_divisor, pacingLatencyBudgetDivisor, 2) \
+    X(uint64_t, pacing_latency_extra_period_numerator, pacingLatencyExtraPeriodNumerator, 0) \
+    X(uint64_t, pacing_latency_extra_period_denominator, pacingLatencyExtraPeriodDenominator, 1) \
     X(uint64_t, presentation_safety_us, presentationSafetyUs, 0) \
+    X(uint64_t, source_playout_delay_us, sourcePlayoutDelayUs, 0) \
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
     X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
     X(uint64_t, cold_start_readiness_demand_us, coldStartReadinessDemandUs, 1500) \
     X(uint64_t, arrival_spread_guard_us, arrivalSpreadGuardUs, 900) \
     X(uint64_t, readiness_acquire_step_us, readinessAcquireStepUs, 1000) \
+    X(uint64_t, readiness_learning_window_us, readinessLearningWindowUs, 0) \
+    X(uint64_t, readiness_floor_period_numerator, readinessPeriodFloorNumerator, 0) \
+    X(uint64_t, readiness_floor_period_denominator, readinessPeriodFloorDenominator, 1) \
+    X(uint64_t, retain_readiness_on_phase_reset, retainReadinessOnPhaseReset, 0) \
     X(uint64_t, maximum_render_wake_lead_us, maximumRenderWakeLeadUs, 2000) \
     X(uint64_t, maximum_target_wake_lead_us, maximumTargetWakeLeadUs, 500) \
     X(uint64_t, minimum_guard_us, minimumGuardUs, 100) \
     X(uint64_t, latch_enter_headroom_us, latchedPresentationHeadroomUs, 225) \
     X(uint64_t, latch_exit_headroom_us, latchedPresentationExitHeadroomUs, 400) \
     X(uint64_t, latch_base_guard_exit, latchedPresentationBaseGuardExit, 0) \
+    X(size_t, cadence_stability_latch_frames, cadenceStabilityLatchFrames, 64) \
     X(uint64_t, latch_enter_headroom_period_numerator, latchedPresentationHeadroomPeriodNumerator, 0) \
     X(uint64_t, latch_enter_headroom_period_denominator, latchedPresentationHeadroomPeriodDenominator, 1) \
     X(uint64_t, latch_exit_headroom_period_numerator, latchedPresentationExitHeadroomPeriodNumerator, 0) \
@@ -76,6 +84,11 @@ struct VrrTimingParameters {
     VRR_TIMING_PARAMETER_FIELDS(VRR_DECLARE_TIMING_PARAMETER)
 #undef VRR_DECLARE_TIMING_PARAMETER
 };
+
+// Resolve mode-dependent production policy once for both the live worker and
+// the replay baseline. Candidate replay configs may still override any field.
+VrrTimingParameters vrrTimingParametersForSession(
+    const VrrSessionConfig& config);
 
 struct VrrTimingDiagnostics {
     int64_t readinessPhaseUs = 0;
@@ -212,7 +225,8 @@ private:
     void anchorSourceTime(uint64_t sourceTimeUs);
     void updateLearnedBudgets();
     void updateReadinessModel();
-    void applyReadinessBudget(bool acquireReserve);
+    void applyReadinessBudget(bool acquireReserve,
+                              bool immediateAcquisition = false);
     void clampReadinessReserveToPolicy();
 
     uint64_t pacingLatencyBudgetUs() const;
@@ -221,6 +235,8 @@ private:
     uint64_t renderInsuranceCeilingUs() const;
     uint64_t renderInsuranceUs() const;
     uint64_t readinessReserveCeilingUs() const;
+    uint64_t readinessPeriodFloorUs() const;
+    size_t readinessLearningSampleLimit() const;
     uint64_t renderLeadFloorUs() const;
     uint64_t renderLeadCeilingUs() const;
     uint64_t readinessCeilingUs() const;
@@ -259,6 +275,7 @@ private:
     uint64_t m_TargetWakeLeadUs = 0;
     bool m_CanLatchPresentation = true;
     bool m_LatchedPresentation = false;
+    size_t m_CadenceStabilityLatchFramesRemaining = 0;
 
     bool m_HaveTimeline = false;
     uint64_t m_SourceTimeUs = 0;

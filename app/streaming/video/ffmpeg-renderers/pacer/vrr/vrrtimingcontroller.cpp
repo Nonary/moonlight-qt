@@ -10,6 +10,16 @@ constexpr uint64_t kMicrosecondsPerSecond = 1000000ULL;
 constexpr uint64_t kRtpClockRate = 90000ULL;
 constexpr uint64_t kQ16One = 1ULL << 16;
 constexpr uint64_t kQ16Half = kQ16One >> 1;
+constexpr unsigned int kSmoothnessReadinessLowPercentile = 10;
+constexpr unsigned int kSmoothnessReadinessHighPercentile = 95;
+constexpr uint64_t kSmoothnessReadinessLearningWindowUs = 250000;
+constexpr size_t kSmoothnessReadinessLearningSampleCap = 120;
+constexpr uint64_t kSmoothnessReadinessPeriodFloorNumerator = 5;
+constexpr uint64_t kSmoothnessReadinessPeriodFloorDenominator = 8;
+constexpr uint64_t kSmoothnessReadinessCeilingUs = 16000;
+constexpr uint64_t kSmoothnessMinimumReadinessReserveUs = 1500;
+constexpr uint64_t kSmoothnessArrivalSpreadGuardUs = 500;
+constexpr uint64_t kSmoothnessReadinessReleaseDenominator = 256;
 
 uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)
 {
@@ -43,6 +53,50 @@ void appendBounded(std::deque<T>& values, T value, size_t limit)
 }
 
 } // namespace
+
+VrrTimingParameters vrrTimingParametersForSession(
+    const VrrSessionConfig& config)
+{
+    VrrTimingParameters parameters;
+    if (config.allowAdditionalQueuedFrame) {
+        parameters.readinessLowPercentile =
+            kSmoothnessReadinessLowPercentile;
+        parameters.readinessLoosePercentile = std::max(
+            parameters.readinessLoosePercentile,
+            kSmoothnessReadinessHighPercentile);
+        parameters.minimumReadinessReserveUs = std::max(
+            parameters.minimumReadinessReserveUs,
+            kSmoothnessMinimumReadinessReserveUs);
+        parameters.readinessCeilingUs = std::max(
+            parameters.readinessCeilingUs,
+            kSmoothnessReadinessCeilingUs);
+        parameters.arrivalSpreadGuardUs =
+            kSmoothnessArrivalSpreadGuardUs;
+        parameters.readinessLearningWindowUs =
+            kSmoothnessReadinessLearningWindowUs;
+        parameters.readinessLearningSamples = std::max(
+            parameters.readinessLearningSamples,
+            kSmoothnessReadinessLearningSampleCap);
+        parameters.readinessPeriodFloorNumerator =
+            kSmoothnessReadinessPeriodFloorNumerator;
+        parameters.readinessPeriodFloorDenominator =
+            kSmoothnessReadinessPeriodFloorDenominator;
+        parameters.pacingLatencyExtraPeriodNumerator = 1;
+        parameters.pacingLatencyExtraPeriodDenominator = 1;
+        parameters.retainReadinessOnPhaseReset = 1;
+        parameters.readinessReleaseDenominator = std::max(
+            parameters.readinessReleaseDenominator,
+            kSmoothnessReadinessReleaseDenominator);
+        // VRR8's policy reserve remained real below the display ceiling.
+        // Smoothness therefore does not spend cadence headroom as imaginary
+        // readiness credit; the learned reserve is explicit and accounted.
+        parameters.usableHeadroomNumerator = 0;
+        // Smoothness is entirely learned and cadence-scaled. Keep the legacy
+        // absolute source delay at zero so no device pays a fixed tax.
+        parameters.sourcePlayoutDelayUs = 0;
+    }
+    return parameters;
+}
 
 VrrTimingController::VrrTimingController(const VrrSessionConfig& config,
                                          bool canLatchPresentation) :
@@ -87,6 +141,8 @@ void VrrTimingController::rebase()
 void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
 {
     const uint64_t previousReadinessDemandUs = m_ReadinessDemandUs;
+    const uint64_t previousAppliedReadinessReserveUs =
+        m_AppliedReadinessReserveUs;
     const bool previousReadinessModelValid = m_ReadinessModelValid;
     const uint64_t previousRenderBaselineUs = m_RenderBaselineUs;
     const uint64_t previousRenderLeadUs = m_RenderLeadUs;
@@ -104,7 +160,9 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_ReadinessPhaseUs = 0;
     m_ReadinessDemandUs = retainLearnedBudgets ?
         previousReadinessDemandUs : m_Parameters.coldStartReadinessDemandUs;
-    m_AppliedReadinessReserveUs =
+    m_AppliedReadinessReserveUs = retainLearnedBudgets &&
+            m_Parameters.retainReadinessOnPhaseReset != 0 ?
+        previousAppliedReadinessReserveUs :
         m_Parameters.coldStartReadinessDemandUs;
     m_ReadinessModelValid = retainLearnedBudgets &&
         previousReadinessModelValid;
@@ -121,6 +179,7 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_FrameConversionRemainder = 0;
     m_LastCadenceUsedRtp = false;
     m_PhaseErrorFrames = 0;
+    m_CadenceStabilityLatchFramesRemaining = 0;
 
     m_CadenceSamples.clear();
     m_RateCandidateSamples.clear();
@@ -279,12 +338,17 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         // A source-phase reset must not acquire a standing reserve in one
         // cadence-breaking jump. Start on the observed phase and let clean
         // arrival evidence build or release the reserve smoothly.
-        applyReadinessBudget(false);
+        const bool retainReserve =
+            m_Parameters.retainReadinessOnPhaseReset != 0;
+        applyReadinessBudget(retainReserve, retainReserve);
     }
 
     uint64_t targetUs = saturatingAdd(
         addSigned(m_SourceTimeUs, m_ReadinessBudgetUs),
-        saturatingAdd(m_RenderLeadUs, m_Parameters.presentationSafetyUs));
+        saturatingAdd(
+            m_Parameters.sourcePlayoutDelayUs,
+            saturatingAdd(m_RenderLeadUs,
+                          m_Parameters.presentationSafetyUs)));
     targetUs = std::max(
         targetUs,
         saturatingAdd(nowUs,
@@ -297,10 +361,12 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     // discarding the cumulative cadence model.
     const uint64_t maximumDirectTargetUs = saturatingAdd(
         nowUs,
-        saturatingAdd(std::max(m_ConfiguredStreamPeriodUs,
-                               m_SourcePeriodUs),
-                      saturatingAdd(m_RenderLeadUs,
-                                    m_Parameters.presentationSafetyUs)));
+        saturatingAdd(
+            std::max(m_ConfiguredStreamPeriodUs, m_SourcePeriodUs),
+            saturatingAdd(
+                m_Parameters.sourcePlayoutDelayUs,
+                saturatingAdd(m_RenderLeadUs,
+                              m_Parameters.presentationSafetyUs))));
     if (targetUs > maximumDirectTargetUs) {
         // Do not clear cadence history when a faster source makes the old
         // playout phase point into the future. Reseed phase from this already
@@ -315,8 +381,10 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         m_PhaseErrorFrames = 0;
         targetUs = saturatingAdd(
             std::max(frame.decodeCompleteUs(), nowUs),
-            saturatingAdd(m_RenderLeadUs,
-                          m_Parameters.presentationSafetyUs));
+            saturatingAdd(
+                m_Parameters.sourcePlayoutDelayUs,
+                saturatingAdd(m_RenderLeadUs,
+                              m_Parameters.presentationSafetyUs)));
     }
 
     targetUs = std::max(targetUs, earliestSubmissionUs());
@@ -340,8 +408,30 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.renderWakeLeadUs = m_RenderWakeLeadUs;
     decision.targetWakeLeadUs = m_TargetWakeLeadUs;
     const uint64_t learnedHeadroomUs = decision.headroomUs;
+    const bool cadenceUnstable = rebased || !cadence.eligible ||
+        cadence.sourceRateChanged || cadence.phaseDiscontinuity;
+    bool cadenceLatchActive = false;
+    if (m_Parameters.cadenceStabilityLatchFrames != 0) {
+        if (cadenceUnstable) {
+            // Immediate tearing presents are only safe after the source phase
+            // has remained coherent. A source hitch followed by a decoder
+            // burst can otherwise queue several adaptive presents into one
+            // scanout interval, overwriting frames and producing a visible
+            // fluidity break even though the display has ample rate headroom.
+            m_CadenceStabilityLatchFramesRemaining =
+                m_Parameters.cadenceStabilityLatchFrames;
+            cadenceLatchActive = true;
+        }
+        else if (m_CadenceStabilityLatchFramesRemaining != 0) {
+            cadenceLatchActive = true;
+            --m_CadenceStabilityLatchFramesRemaining;
+        }
+    }
     if (!m_CanLatchPresentation) {
         m_LatchedPresentation = false;
+    }
+    else if (cadenceLatchActive) {
+        m_LatchedPresentation = true;
     }
     else if (m_LatchedPresentation) {
         // Production requires the full exit threshold so small guard or
@@ -720,7 +810,7 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         if (!cancelled) {
             if (m_Pending.cadenceEligible) {
                 appendBounded(m_ReadyOffsets, m_Pending.readyOffsetUs,
-                              m_Parameters.readinessLearningSamples);
+                              readinessLearningSampleLimit());
             }
             if (m_Pending.hasPreparationDuration) {
                 appendBounded(m_PreparationDurations,
@@ -776,7 +866,10 @@ void VrrTimingController::updateReadinessModel()
     }
 
     // Learn exogenous decode-arrival variation, not absolute source phase or
-    // queue age created by this controller. P10 is the local phase baseline.
+    // queue age created by this controller. The selected low percentile is
+    // the local phase baseline. Smoothness mode uses a VRR8-style p10/p95
+    // spread so the reserve remains visible to the latency policy instead of
+    // hiding a high-percentile phase shift outside the budget.
     // Near the display ceiling, preserve the p90 arrival tail because there is
     // too little cadence slack to absorb a late frame. Slower sources can use
     // p80 and avoid making the slowest fifth standing latency for every frame.
@@ -815,7 +908,8 @@ void VrrTimingController::updateReadinessModel()
     applyReadinessBudget(true);
 }
 
-void VrrTimingController::applyReadinessBudget(bool acquireReserve)
+void VrrTimingController::applyReadinessBudget(bool acquireReserve,
+                                               bool immediateAcquisition)
 {
     // Cadence slack can absorb most arrival variation without committing a
     // decoded frame early. Preserve one quarter as service margin, matching
@@ -833,8 +927,10 @@ void VrrTimingController::applyReadinessBudget(bool acquireReserve)
                 m_Parameters.looseHeadroomDisplayPeriods ?
             cadenceHeadroomUs * m_Parameters.usableHeadroomNumerator /
                 m_Parameters.usableHeadroomDenominator : 0;
-    const uint64_t effectiveDemandUs = m_ReadinessModelValid ?
+    const uint64_t learnedDemandUs = m_ReadinessModelValid ?
         m_ReadinessDemandUs : m_Parameters.coldStartReadinessDemandUs;
+    const uint64_t effectiveDemandUs = std::max(
+        learnedDemandUs, readinessPeriodFloorUs());
     m_AppliedReadinessReserveUs = std::min(
         readinessReserveCeilingUs(),
         std::max(minimumReadinessReserveUs(),
@@ -854,6 +950,13 @@ void VrrTimingController::applyReadinessBudget(bool acquireReserve)
     if (!acquireReserve) {
         m_ReadinessBudgetUs = std::max(
             -ceilingUs, std::min(m_ReadinessPhaseUs, ceilingUs));
+    }
+    else if (immediateAcquisition) {
+        // A phase reset changes the source-clock origin, not the amount of
+        // arrival variation already learned for this device. Reapply the
+        // bounded reserve in the new epoch so cadence transitions cannot
+        // collapse smoothness back to zero for another learning window.
+        m_ReadinessBudgetUs = clampedDesiredUs;
     }
     else if (clampedDesiredUs > m_ReadinessBudgetUs) {
         m_ReadinessBudgetUs += std::min<int64_t>(
@@ -892,10 +995,12 @@ void VrrTimingController::clampReadinessReserveToPolicy()
 uint64_t VrrTimingController::timingBudgetUs() const
 {
     return saturatingAdd(
-        m_AppliedReadinessReserveUs,
-        saturatingAdd(pacingLatencyPolicyEnabled() ?
-                          renderInsuranceUs() : m_RenderLeadUs,
-                      m_Parameters.presentationSafetyUs));
+        m_Parameters.sourcePlayoutDelayUs,
+        saturatingAdd(
+            m_AppliedReadinessReserveUs,
+            saturatingAdd(pacingLatencyPolicyEnabled() ?
+                              renderInsuranceUs() : m_RenderLeadUs,
+                          m_Parameters.presentationSafetyUs)));
 }
 
 int64_t VrrTimingController::readinessBudgetUs() const
@@ -1042,13 +1147,25 @@ uint64_t VrrTimingController::pacingLatencyBudgetUs() const
     // Immediate VRR presentation saves roughly half a scanout on average.
     // Spend no more than that on readiness plus render-tail insurance. The
     // render baseline is unavoidable work in fixed and adaptive modes alike.
-    // Smoothness mode explicitly permits one additional source frame of
-    // standing latency, matching the worker's extra stale-frame tolerance.
+    // Smoothness mode explicitly permits a cadence-scaled additional source
+    // interval, matching the worker's extra stale-frame tolerance. A zero
+    // explicit ratio retains the pre-schema behavior for old captures.
     const uint64_t lowLatencyBudgetUs = m_DisplayPeriodUs /
         std::max<uint64_t>(1, m_Parameters.pacingLatencyBudgetDivisor);
-    return m_Config.allowAdditionalQueuedFrame ?
-        saturatingAdd(lowLatencyBudgetUs, m_SourcePeriodUs) :
-        lowLatencyBudgetUs;
+    uint64_t extraBudgetUs = 0;
+    if (m_Parameters.pacingLatencyExtraPeriodNumerator != 0) {
+        const uint64_t numerator =
+            m_Parameters.pacingLatencyExtraPeriodNumerator;
+        const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+        const uint64_t scaledUs = m_SourcePeriodUs > maximum / numerator ?
+            maximum : m_SourcePeriodUs * numerator;
+        extraBudgetUs = scaledUs /
+            m_Parameters.pacingLatencyExtraPeriodDenominator;
+    }
+    else if (m_Config.allowAdditionalQueuedFrame) {
+        extraBudgetUs = m_SourcePeriodUs;
+    }
+    return saturatingAdd(lowLatencyBudgetUs, extraBudgetUs);
 }
 
 bool VrrTimingController::pacingLatencyPolicyEnabled() const
@@ -1092,6 +1209,38 @@ uint64_t VrrTimingController::readinessReserveCeilingUs() const
     const uint64_t budgetUs = pacingLatencyBudgetUs();
     const uint64_t insuranceUs = renderInsuranceUs();
     return budgetUs > insuranceUs ? budgetUs - insuranceUs : 0;
+}
+
+uint64_t VrrTimingController::readinessPeriodFloorUs() const
+{
+    if (m_Parameters.readinessPeriodFloorNumerator == 0 ||
+            headroomUs() > m_DisplayPeriodUs) {
+        return 0;
+    }
+
+    const uint64_t numerator =
+        m_Parameters.readinessPeriodFloorNumerator;
+    const uint64_t denominator =
+        m_Parameters.readinessPeriodFloorDenominator;
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    const uint64_t scaledUs = m_SourcePeriodUs > maximum / numerator ?
+        maximum : m_SourcePeriodUs * numerator;
+    return scaledUs / denominator;
+}
+
+size_t VrrTimingController::readinessLearningSampleLimit() const
+{
+    if (m_Parameters.readinessLearningWindowUs == 0) {
+        return m_Parameters.readinessLearningSamples;
+    }
+
+    const uint64_t roundedSamples = std::max<uint64_t>(
+        1, (m_Parameters.readinessLearningWindowUs +
+            m_SourcePeriodUs / 2) / m_SourcePeriodUs);
+    return static_cast<size_t>(std::max<uint64_t>(
+        m_Parameters.minimumReadinessSamples,
+        std::min<uint64_t>(m_Parameters.readinessLearningSamples,
+                           roundedSamples)));
 }
 
 uint64_t VrrTimingController::readinessCeilingUs() const

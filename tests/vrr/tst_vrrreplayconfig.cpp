@@ -13,6 +13,7 @@ class VrrReplayConfigTest : public QObject
 private slots:
     void defaultsRoundTrip();
     void inheritanceAndOverride();
+    void controllerSnapshotIsAtomic();
     void rejectsInvalidInput();
     void rasterEnvelope();
     void rasterProbeOverheadRemoval();
@@ -50,7 +51,20 @@ void VrrReplayConfigTest::defaultsRoundTrip()
     QCOMPARE(config.scenarios.front().controller.renderBaselinePercentile,
              50U);
     QCOMPARE(config.scenarios.front().controller.pacingLatencyBudgetDivisor,
-             uint64_t(2));
+              uint64_t(2));
+    QCOMPARE(
+        config.scenarios.front().controller.
+            pacingLatencyExtraPeriodNumerator,
+        uint64_t(0));
+    QCOMPARE(config.scenarios.front().controller.sourcePlayoutDelayUs,
+              uint64_t(0));
+    QCOMPARE(config.scenarios.front().controller.readinessLearningWindowUs,
+              uint64_t(0));
+    QCOMPARE(
+        config.scenarios.front().controller.readinessPeriodFloorDenominator,
+        uint64_t(1));
+    QCOMPARE(config.scenarios.front().controller.retainReadinessOnPhaseReset,
+              uint64_t(0));
     QCOMPARE(config.scenarios.front().worker.queueCapacity, size_t(3));
     QCOMPARE(config.scenarios.front().display.calibrationConfirmed, 0U);
     QCOMPARE(config.scenarios.front().display.scanoutPeriodPs, uint64_t(0));
@@ -85,6 +99,16 @@ void VrrReplayConfigTest::defaultsRoundTrip()
         "controller.render_baseline_percentile"));
     QVERIFY(vrrReplayParameterNames().contains(
         "controller.pacing_latency_budget_divisor"));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.pacing_latency_extra_period_numerator"));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.source_playout_delay_us"));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.readiness_learning_window_us"));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.readiness_floor_period_numerator"));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.retain_readiness_on_phase_reset"));
     QVERIFY(vrrReplayParameterNames().contains(
         "display.active_scanout_percent"));
     QVERIFY(vrrReplayParameterNames().contains(
@@ -378,6 +402,30 @@ void VrrReplayConfigTest::rejectsInvalidInput()
         R"({"config_schema":1,"scenarios":[{"name":"x","assertions":[{"metric":"simulation.drops","operator":"==","value":0,"typo":1}]}]})",
         config, error));
     QVERIFY(error.contains("unknown scenario assertion key"));
+}
+
+void VrrReplayConfigTest::controllerSnapshotIsAtomic()
+{
+    VrrTimingParameters parameters;
+    QJsonObject snapshot;
+    snapshot["latch_enter_headroom_us"] = 1500;
+    snapshot["latch_exit_headroom_us"] = 2000;
+    snapshot["latch_base_guard_exit"] = 1;
+    snapshot["latch_enter_headroom_period_numerator"] = 3;
+    snapshot["latch_enter_headroom_period_denominator"] = 1;
+    snapshot["latch_exit_headroom_period_numerator"] = 13;
+    snapshot["latch_exit_headroom_period_denominator"] = 4;
+
+    QString error;
+    QVERIFY2(applyVrrReplayControllerSnapshot(
+                 snapshot, parameters, error), qPrintable(error));
+    QCOMPARE(parameters.latchedPresentationHeadroomUs, uint64_t(1500));
+    QCOMPARE(parameters.latchedPresentationExitHeadroomUs, uint64_t(2000));
+    QCOMPARE(parameters.latchedPresentationBaseGuardExit, uint64_t(1));
+    QCOMPARE(parameters.latchedPresentationHeadroomPeriodNumerator,
+             uint64_t(3));
+    QCOMPARE(parameters.latchedPresentationExitHeadroomPeriodNumerator,
+             uint64_t(13));
 }
 
 void VrrReplayConfigTest::rasterEnvelope()

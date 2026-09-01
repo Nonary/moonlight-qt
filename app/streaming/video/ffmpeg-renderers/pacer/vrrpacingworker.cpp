@@ -17,7 +17,12 @@ namespace {
 // oldest queued successor under sustained pressure, so it cannot accumulate
 // an unbounded latency backlog.
 constexpr size_t kMaximumQueuedFrames = 3;
-constexpr unsigned int kLowLatencyFrameAgePeriods = 1;
+// One source period of age is normal while the preceding frame traverses the
+// single pacing/presentation worker. Treating that ordinary occupancy as
+// stale caused isolated content skips whenever completion crossed the period
+// boundary by even a few hundred microseconds. A second period distinguishes
+// real backlog while the bounded queue remains the hard overload limit.
+constexpr unsigned int kLowLatencyFrameAgePeriods = 2;
 constexpr unsigned int kAdditionalSmoothnessFramePeriods = 1;
 // ~64 seconds of rows at 120 FPS. When the writer thread cannot keep up the
 // pacing thread drops rows rather than ever waiting on diagnostics.
@@ -168,7 +173,8 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
     m_CanLatchPresentation(presenter != nullptr &&
                            presenter->canLatchAdaptivePresent()),
     m_TimingController(std::make_unique<VrrTimingController>(
-        config, m_CanLatchPresentation))
+        config, m_CanLatchPresentation,
+        vrrTimingParametersForSession(config)))
 {
     const char* deepTraceEnv = SDL_getenv("MOONLIGHT_VRR_DEEP_TRACE");
     m_DeepTraceEnabled = deepTraceEnv != nullptr && deepTraceEnv[0] == '1';
@@ -397,10 +403,11 @@ int VrrPacingWorker::run()
         // schedule() deliberately clamps an overdue target to the current
         // one-slot deadline. That is right for the newest frame, but it makes
         // the later target-relative stale check unable to see time already
-        // spent waiting in this worker's transport queue. Low-latency mode
-        // tolerates one source interval; the explicit smoothness option
-        // tolerates one more. Sustained overload still drops older frames
-        // whenever a fresher successor exists, so the backlog remains bounded.
+        // spent waiting in this worker's transport queue. One interval of age
+        // is ordinary single-worker occupancy, so low-latency mode tolerates
+        // two source intervals; the explicit smoothness option tolerates one
+        // more. Sustained overload still drops older frames whenever a fresher
+        // successor exists, and queue capacity remains the hard bound.
         const uint64_t scheduleNowUs = LiGetMicroseconds();
         telemetry.staleCheckUs = scheduleNowUs;
         const uint64_t scheduleAgeUs = scheduleNowUs >=

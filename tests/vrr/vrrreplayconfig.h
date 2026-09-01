@@ -96,6 +96,7 @@ struct VrrReplayScenario {
     QString name = "candidate";
     QString mode = "fixed";
     VrrTimingParameters controller;
+    bool controllerCustomized = false;
     VrrReplayWorkerParameters worker;
     VrrReplayDisplayParameters display;
     VrrReplayExecutionParameters execution;
@@ -104,6 +105,7 @@ struct VrrReplayScenario {
 
 struct VrrReplayConfiguration {
     VrrTimingParameters commonController;
+    bool commonControllerCustomized = false;
     VrrReplayWorkerParameters commonWorker;
     VrrReplayDisplayParameters commonDisplay;
     VrrReplayExecutionParameters commonExecution;
@@ -124,6 +126,9 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
 bool applyVrrReplayOverride(const QString& expression,
                             VrrReplayScenario& scenario,
                             QString& error);
+bool applyVrrReplayControllerSnapshot(const QJsonObject& object,
+                                      VrrTimingParameters& parameters,
+                                      QString& error);
 bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error);
 bool validateVrrWorkerParameters(const VrrReplayWorkerParameters& value,

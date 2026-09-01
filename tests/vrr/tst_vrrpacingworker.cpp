@@ -242,6 +242,45 @@ void testQueuedStaleFrameYieldsToFreshSuccessor()
     }
 }
 
+void testSinglePeriodQueueDelayPreservesFluidity()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.blockPreparation();
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime first;
+    TrackedFrameLifetime retained;
+    TrackedFrameLifetime fresh;
+
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(),
+               "worker must start for single-period queue recovery");
+        worker.submit(frame(1, first));
+        expect(backend.waitForPrepareCount(1),
+               "active frame must enter preparation before queueing successors");
+
+        worker.submit(frame(2, retained));
+        worker.submit(frame(3, fresh));
+        // This crosses the 60 FPS source period but remains below the bounded
+        // two-period backlog threshold. The captured production bug dropped
+        // content at this boundary despite a valid future target.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        backend.releasePreparation();
+
+        expect(backend.waitForPresentCount(3),
+               "a one-period queue delay must retain every frame");
+        const std::vector<int> presentedFrames = backend.presentedFrames();
+        expect(presentedFrames.size() >= 3 &&
+                   presentedFrames[0] == 1 &&
+                   presentedFrames[1] == 2 &&
+                   presentedFrames[2] == 3,
+               "ordinary pipeline occupancy must preserve frame order");
+        expect(telemetryStats(telemetry).vrrPacingDroppedFrames == 0,
+               "ordinary pipeline occupancy must not manufacture a pacing drop");
+    }
+}
+
 void testSmoothnessRetainsOneAdditionalFrame()
 {
     resetFakeClock();
@@ -264,9 +303,9 @@ void testSmoothnessRetainsOneAdditionalFrame()
 
         worker.submit(frame(2, retained));
         worker.submit(frame(3, fresh));
-        // At 30 FPS this is older than the default one-period threshold but
-        // younger than the explicit two-period smoothness threshold.
-        std::this_thread::sleep_for(std::chrono::milliseconds(45));
+        // At 30 FPS this is older than the default two-period threshold but
+        // younger than the explicit three-period smoothness threshold.
+        std::this_thread::sleep_for(std::chrono::milliseconds(75));
         backend.releasePreparation();
 
         expect(backend.waitForPresentCount(3),
@@ -1106,6 +1145,77 @@ void testTraceCapturesEveryDeliveredFrame()
     SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
 }
 
+void testSmoothnessTraceCapturesReadinessPolicy()
+{
+    resetFakeClock();
+    QTemporaryDir traceDirectory;
+    expect(traceDirectory.isValid(),
+           "smoothness policy trace test must create a temporary directory");
+    const QString tracePath = traceDirectory.filePath("vrr-smoothness-policy.csv");
+    const QByteArray tracePathBytes = QFile::encodeName(tracePath);
+    SDL_setenv("MOONLIGHT_VRR_TRACE", tracePathBytes.constData(), 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
+
+    FakeVrrFramePresenter backend;
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime;
+    VrrSessionConfig smoothnessConfig = enabledConfig();
+    smoothnessConfig.allowAdditionalQueuedFrame = true;
+    {
+        VrrPacingWorker worker(&backend, smoothnessConfig, &telemetry);
+        expect(worker.start(),
+               "worker must start for smoothness policy tracing");
+        worker.submit(frame(1, lifetime));
+        expect(backend.waitForPresentCount(1),
+               "smoothness policy trace must present one frame");
+    }
+
+    const QList<QByteArray> lines = readExpandedTrace(tracePath).split('\n');
+    const QList<QByteArray> columns = lines.value(0).split(',');
+    const int dispositionColumn = columns.indexOf("disposition");
+    const int additionalQueueColumn =
+        columns.indexOf("additional_queued_frame");
+    const int lowPercentileColumn =
+        columns.indexOf("param_readiness_low_percentile");
+    const int loosePercentileColumn =
+        columns.indexOf("param_readiness_loose_percentile");
+    const int sourceDelayColumn =
+        columns.indexOf("param_source_playout_delay_us");
+    const int learningWindowColumn =
+        columns.indexOf("param_readiness_learning_window_us");
+    const int retainReserveColumn =
+        columns.indexOf("param_retain_readiness_on_phase_reset");
+    expect(dispositionColumn >= 0 && additionalQueueColumn >= 0 &&
+               lowPercentileColumn >= 0 && loosePercentileColumn >= 0 &&
+               sourceDelayColumn >= 0 && learningWindowColumn >= 0 &&
+               retainReserveColumn >= 0,
+           "smoothness trace must expose its resolved readiness policy");
+
+    bool foundPresentedRow = false;
+    for (int i = 1; i < lines.size(); ++i) {
+        if (lines[i].isEmpty() || lines[i].startsWith("#vrr_trace_footer,")) {
+            continue;
+        }
+        const QList<QByteArray> fields = lines[i].split(',');
+        if (fields.value(dispositionColumn) != "presented") {
+            continue;
+        }
+        foundPresentedRow = true;
+        expect(fields.value(additionalQueueColumn) == "1" &&
+                   fields.value(lowPercentileColumn) == "10" &&
+                   fields.value(loosePercentileColumn) == "95" &&
+                   fields.value(sourceDelayColumn) == "0" &&
+                   fields.value(learningWindowColumn) == "250000" &&
+                   fields.value(retainReserveColumn) == "1",
+                "smoothness mode must record its adaptive readiness policy without a fixed delay");
+    }
+    expect(foundPresentedRow,
+           "smoothness policy trace must contain a presented row");
+
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
+}
+
 void testFailedCancellationNativeEvidenceIsTraced()
 {
     resetFakeClock();
@@ -1317,6 +1427,7 @@ int main()
     testQueueCapacityAndDrops();
     testLatePreparedFramePresentsImmediately();
     testQueuedStaleFrameYieldsToFreshSuccessor();
+    testSinglePeriodQueueDelayPreservesFluidity();
     testSmoothnessRetainsOneAdditionalFrame();
     testTelemetrySnapshotsRemainCumulative();
     testSuspendDiscardAndFreshFrame();
@@ -1331,6 +1442,7 @@ int main()
     testSuspendedPreparedCancellationHonorsDisplayFloor();
     testImmutablePresentationContract();
     testTraceCapturesEveryDeliveredFrame();
+    testSmoothnessTraceCapturesReadinessPolicy();
     testFailedCancellationNativeEvidenceIsTraced();
     testDeepTraceRequestsNativeObservationsWithoutChangingMode();
 

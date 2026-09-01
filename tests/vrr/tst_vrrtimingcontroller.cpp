@@ -114,7 +114,9 @@ void testTimingFormulaeAndReserveCap()
                    expectedGuardUs,
            "headroom must subtract one display period and the guard");
     expect(first.targetUs ==
-               100000 + first.renderLeadUs + parameters.presentationSafetyUs &&
+               100000 + first.renderLeadUs +
+                   parameters.presentationSafetyUs +
+                   parameters.sourcePlayoutDelayUs &&
                first.renderStartUs ==
                    first.targetUs - first.renderLeadUs - first.renderWakeLeadUs,
            "target must include render lead and presentation safety");
@@ -133,6 +135,117 @@ void testTimingFormulaeAndReserveCap()
     capped.noteSubmission(true, false, cappedDecision.targetUs);
     expect(capped.renderLeadUs() <= capped.sourcePeriodUs(),
            "render lead must never exceed the source period");
+}
+
+void testSourcePlayoutDelayOffsetsProjectedTargets()
+{
+    VrrTimingParameters parameters;
+    parameters.sourcePlayoutDelayUs = 12000;
+    VrrTimingController buffered(config(60, 120), true, parameters);
+    VrrTimingController direct(config(60, 120), true,
+                               VrrTimingParameters {});
+
+    const VrrTimingDecision bufferedFirst = buffered.schedule(
+        frame(1, 0, true, 100000), 100000);
+    const VrrTimingDecision directFirst = direct.schedule(
+        frame(1, 0, true, 100000), 100000);
+    expect(bufferedFirst.targetUs ==
+               directFirst.targetUs + parameters.sourcePlayoutDelayUs,
+           "source playout delay must offset the projected target instead of the arrival-time clamp");
+    expect(bufferedFirst.timingBudgetUs ==
+               directFirst.timingBudgetUs + parameters.sourcePlayoutDelayUs,
+           "source playout delay must be reported in the timing budget");
+
+    const VrrSessionConfig lowLatency = config(60, 120);
+    VrrSessionConfig smoothness = lowLatency;
+    smoothness.allowAdditionalQueuedFrame = true;
+    const VrrTimingParameters lowLatencyPolicy =
+        vrrTimingParametersForSession(lowLatency);
+    const VrrTimingParameters smoothnessPolicy =
+        vrrTimingParametersForSession(smoothness);
+    expect(lowLatencyPolicy.readinessLowPercentile == 0 &&
+               lowLatencyPolicy.readinessLoosePercentile == 80 &&
+               lowLatencyPolicy.sourcePlayoutDelayUs == 0,
+           "low-latency sessions must retain the controller readiness defaults");
+    expect(smoothnessPolicy.readinessLowPercentile == 10 &&
+                smoothnessPolicy.readinessLoosePercentile == 95 &&
+                smoothnessPolicy.sourcePlayoutDelayUs == 0 &&
+                smoothnessPolicy.readinessLearningWindowUs == 250000 &&
+                smoothnessPolicy.readinessLearningSamples == 120 &&
+                smoothnessPolicy.readinessCeilingUs == 16000 &&
+                smoothnessPolicy.readinessPeriodFloorNumerator == 5 &&
+                smoothnessPolicy.readinessPeriodFloorDenominator == 8 &&
+                smoothnessPolicy.pacingLatencyExtraPeriodNumerator == 1 &&
+                smoothnessPolicy.pacingLatencyExtraPeriodDenominator == 1 &&
+                smoothnessPolicy.retainReadinessOnPhaseReset == 1 &&
+                smoothnessPolicy.usableHeadroomNumerator == 0 &&
+                smoothnessPolicy.readinessReleaseDenominator == 256,
+           "smoothness sessions must resolve the adaptive p10/p95 cadence-scaled policy without a fixed delay");
+}
+
+void testSmoothnessReserveScalesWithCadence()
+{
+    VrrSessionConfig nearCeilingConfig = config(116, 120);
+    nearCeilingConfig.allowAdditionalQueuedFrame = true;
+    const VrrTimingParameters smoothnessParameters =
+        vrrTimingParametersForSession(nearCeilingConfig);
+    VrrTimingController nearCeiling(
+        nearCeilingConfig, true, smoothnessParameters);
+
+    const VrrTimingDecision first = nearCeiling.schedule(
+        frame(1, 0, true, 100000), 100000);
+    const uint64_t expectedFloorUs = nearCeiling.sourcePeriodUs() * 5 / 8;
+    expect(first.readinessBudgetUs ==
+               static_cast<int64_t>(expectedFloorUs),
+           "smoothness must acquire its source-period reserve immediately near the display ceiling");
+    expect(nearCeiling.diagnostics().appliedReadinessReserveUs ==
+               expectedFloorUs,
+           "the cadence-scaled reserve must be included in latency diagnostics");
+
+    nearCeiling.noteSubmission(true, false, first.targetUs);
+    nearCeiling.rebase();
+    const VrrTimingDecision rebased = nearCeiling.schedule(
+        frame(2, 750, true, 108621), 108621);
+    expect(rebased.readinessBudgetUs ==
+               static_cast<int64_t>(expectedFloorUs),
+           "a source-phase rebase must retain the bounded adaptive reserve");
+
+    VrrSessionConfig looseConfig = config(50, 120);
+    looseConfig.allowAdditionalQueuedFrame = true;
+    VrrTimingController loose(
+        looseConfig, true, vrrTimingParametersForSession(looseConfig));
+    loose.schedule(frame(1, 0, true, 100000), 100000);
+    expect(loose.diagnostics().appliedReadinessReserveUs ==
+               smoothnessParameters.coldStartReadinessDemandUs,
+           "loose cadence must learn from arrival spread instead of carrying the near-ceiling period floor");
+}
+
+void testSmoothnessLearningWindowTracksCadence()
+{
+    const auto learnedSampleCount = [](int sourceRateHz) {
+        VrrSessionConfig session = config(sourceRateHz, 240);
+        session.allowAdditionalQueuedFrame = true;
+        VrrTimingController controller(
+            session, true, vrrTimingParametersForSession(session));
+        const uint64_t epochUs = 100000;
+        for (int i = 0; i < 140; ++i) {
+            const uint32_t timestamp = static_cast<uint32_t>(
+                static_cast<uint64_t>(i) * 90000ULL /
+                static_cast<uint64_t>(sourceRateHz));
+            const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp);
+            const VrrTimingDecision decision = controller.schedule(
+                frame(i + 1, timestamp, true, decodedUs), decodedUs);
+            controller.noteSubmission(true, false, decision.targetUs);
+        }
+        return controller.diagnostics().readinessSamples;
+    };
+
+    const size_t samples60 = learnedSampleCount(60);
+    const size_t samples120 = learnedSampleCount(120);
+    expect(samples60 == 16,
+           "the quarter-second readiness window must retain its robust 16-sample floor at 60 FPS");
+    expect(samples120 >= 29 && samples120 <= 31,
+           "the quarter-second readiness window must contain about 30 samples at 120 FPS");
 }
 
 void testLongRunNearRefreshRtpCadence()
@@ -324,21 +437,26 @@ void testSpacingGuardFeedback()
 
 void testNearRefreshRequestsLatchedPresentation()
 {
+    VrrTimingParameters headroomOnlyParameters;
+    headroomOnlyParameters.cadenceStabilityLatchFrames = 0;
     for (int streamRateHz = 30; streamRateHz <= 115; ++streamRateHz) {
-        VrrTimingController withHeadroom(config(streamRateHz, 120));
+        VrrTimingController withHeadroom(
+            config(streamRateHz, 120), true, headroomOnlyParameters);
         const VrrTimingDecision decision = withHeadroom.schedule(
             frame(1, 0, true, 100000), 100000);
         expect(!decision.latchedPresentation,
                "useful in-range cadences at 120 Hz must retain adaptive presentation");
     }
 
-    VrrTimingController nearRefresh(config(116, 120));
+    VrrTimingController nearRefresh(
+        config(116, 120), true, headroomOnlyParameters);
     VrrTimingDecision decision = nearRefresh.schedule(
         frame(1, 0, true, 100000), 100000);
     expect(decision.headroomUs == 188 && decision.latchedPresentation,
            "116 FPS must retain its 188 us near-refresh latched path");
 
-    VrrTimingController boundary(config(115, 120));
+    VrrTimingController boundary(
+        config(115, 120), true, headroomOnlyParameters);
     decision = boundary.schedule(frame(1, 0, true, 100000), 100000);
     expect(decision.headroomUs == 263 && !decision.latchedPresentation,
            "115 FPS must remain adaptive with 263 us of headroom");
@@ -368,7 +486,10 @@ void testLatchedPresentationUsesFullHysteresis()
     // 115 FPS begins between the entry and exit thresholds. A small guard
     // excursion should latch it, and returning to the base guard must not
     // immediately undo that decision while it remains inside the band.
-    VrrTimingController borderline(config(115, 120));
+    VrrTimingParameters hysteresisParameters;
+    hysteresisParameters.cadenceStabilityLatchFrames = 0;
+    VrrTimingController borderline(
+        config(115, 120), true, hysteresisParameters);
     VrrTimingDecision decision = borderline.schedule(
         frame(1, 0, true, 100000), 100000);
     expect(!decision.latchedPresentation,
@@ -397,7 +518,8 @@ void testLatchedPresentationUsesFullHysteresis()
 
     // 113 FPS has enough base headroom to cross the exit threshold after the
     // same temporary guard protection decays.
-    VrrTimingController recoverable(config(113, 120));
+    VrrTimingController recoverable(
+        config(113, 120), true, hysteresisParameters);
     decision = recoverable.schedule(
         frame(1, 0, true, 100000), 100000);
     const uint64_t recoverableBaseGuardUs = decision.guardUs;
@@ -422,6 +544,7 @@ void testLatchedPresentationUsesFullHysteresis()
     // that behavior selectable so exact baseline replay remains possible.
     VrrTimingParameters legacyParameters;
     legacyParameters.latchedPresentationBaseGuardExit = 1;
+    legacyParameters.cadenceStabilityLatchFrames = 0;
     VrrTimingController legacy(config(115, 120), true, legacyParameters);
     decision = legacy.schedule(frame(1, 0, true, 100000), 100000);
     const uint64_t legacyBaseGuardUs = decision.guardUs;
@@ -442,6 +565,7 @@ void testLatchedPresentationUsesFullHysteresis()
 void testOptionalDisplayScaledLatchedPresentationBoundary()
 {
     VrrTimingParameters parameters;
+    parameters.cadenceStabilityLatchFrames = 0;
     parameters.latchedPresentationHeadroomPeriodNumerator = 3;
     parameters.latchedPresentationHeadroomPeriodDenominator = 1;
     parameters.latchedPresentationExitHeadroomPeriodNumerator = 13;
@@ -476,6 +600,50 @@ void testOptionalDisplayScaledLatchedPresentationBoundary()
         expect(!adaptiveDecision.latchedPresentation,
                "cadence beyond the three-period window must stay adaptive at every display rate");
     }
+}
+
+void testCadenceInstabilityUsesLatchedRecovery()
+{
+    constexpr int sourceRateHz = 90;
+    constexpr uint64_t epochUs = 100000;
+    VrrTimingController controller(config(sourceRateHz, 120));
+    const VrrTimingParameters& parameters = controller.parameters();
+
+    VrrTimingDecision decision = controller.schedule(
+        frame(0, 0, true, epochUs), epochUs);
+    expect(decision.latchedPresentation,
+           "an uninitialized source phase must begin on the safe latched path");
+
+    for (size_t i = 1;
+         i <= parameters.cadenceStabilityLatchFrames; ++i) {
+        const uint32_t timestamp = static_cast<uint32_t>(
+            i * 90000ULL / sourceRateHz);
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp);
+        decision = controller.schedule(
+            frame(static_cast<int>(i), timestamp, true, decodedUs),
+            decodedUs);
+        expect(decision.latchedPresentation,
+               "cadence recovery must remain latched for the configured clean window");
+    }
+
+    const size_t adaptiveFrame = parameters.cadenceStabilityLatchFrames + 1;
+    uint32_t timestamp = static_cast<uint32_t>(
+        adaptiveFrame * 90000ULL / sourceRateHz);
+    uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp);
+    decision = controller.schedule(
+        frame(static_cast<int>(adaptiveFrame), timestamp, true, decodedUs),
+        decodedUs);
+    expect(!decision.latchedPresentation,
+           "a stable source with ample display headroom must recover adaptive VRR");
+
+    const size_t hitchFrame = adaptiveFrame + 1;
+    timestamp += 9000;
+    decodedUs += 100000;
+    decision = controller.schedule(
+        frame(static_cast<int>(hitchFrame), timestamp, true, decodedUs),
+        decodedUs);
+    expect(decision.phaseDiscontinuity && decision.latchedPresentation,
+           "a source hitch must immediately restore latched protection");
 }
 
 void testHeadroomAwareReadinessReserve()
@@ -1157,6 +1325,9 @@ int main()
 {
     testRtpWrapResetAndFallback();
     testTimingFormulaeAndReserveCap();
+    testSourcePlayoutDelayOffsetsProjectedTargets();
+    testSmoothnessReserveScalesWithCadence();
+    testSmoothnessLearningWindowTracksCadence();
     testLongRunNearRefreshRtpCadence();
     testQuantizedCadenceDoesNotOscillate();
     testNegotiatedRateCeiling();
@@ -1164,6 +1335,7 @@ int main()
     testNearRefreshRequestsLatchedPresentation();
     testLatchedPresentationUsesFullHysteresis();
     testOptionalDisplayScaledLatchedPresentationBoundary();
+    testCadenceInstabilityUsesLatchedRecovery();
     testHeadroomAwareReadinessReserve();
     testCadenceGapAndRateChange();
     testFutureSourceProjectionReseedsPhase();

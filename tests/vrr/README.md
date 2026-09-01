@@ -33,8 +33,9 @@ half-scanout budget, while stable render work remains outside that ceiling.
 `LiGetMicroseconds()` epoch. It verifies the bounded worker queue,
 drop accounting, minimize/restore discard and fresh-frame behavior, deferred
 AVFrame lifetime, presenter eligibility rejection, display-period spacing,
-one-source-period low-latency staleness and the opt-in additional smoothness
-period,
+two-source-period low-latency staleness and the opt-in additional smoothness
+period, including regression coverage that ordinary one-period worker
+occupancy does not manufacture a content drop,
 native submission timing across pre-submit work and blocking
 returns, clean-close trace accounting, explicit window-state rebase
 provenance, and the minimal prepare/present/cancel contract. D3D11 completes
@@ -646,6 +647,17 @@ timeline for that display; controller/cadence results remain available:
 .\vrr\release\vrrreplay.exe capture.vrrtrace --display-hz 120 --stream-fps 116
 ```
 
+The smoothness queue policy uses a VRR8-style adaptive readiness reserve: a
+p10 phase anchor and p95 arrival-spread target over a cadence-scaled quarter-second
+window, immediate attack, slow release, and a five-eighths source-period floor
+only near the display ceiling. Learned reserve is retained across source-phase
+resets, bounded by the existing latency policy, and included in latency
+diagnostics. Cadence headroom is not deducted from this explicit reserve, and
+there is no fixed source-clock playout delay. Low-latency sessions
+retain the direct controller defaults. All resolved values are captured in
+schema 5, so exact replay and candidate sweeps use the production policy
+without inferring it from the queue-mode flag.
+
 The replay is intentionally a fixed-recorded-admission model: it preserves the
 session's actual queue admission/drop and presentation lifecycle while using
 the real arrival timestamps and exogenous renderer costs. This makes
@@ -743,6 +755,16 @@ A future policy should derive them from measured scheduler wake error,
 present-ready uncertainty, and native presentation/scanout evidence so latch
 selection reflects whether the current system can reliably use its available
 headroom.
+
+Adaptive presentation also requires a coherent source phase. After startup,
+a cadence-rate change, or a source-phase discontinuity, production uses the
+latched path until `controller.cadence_stability_latch_frames` consecutive
+clean cadence observations have completed (64 by default). This prevents a
+source hitch followed by a decoder burst from placing multiple immediate
+presents into one physical scanout interval. Stable sources with sufficient
+headroom return to adaptive presentation after the recovery window. Older
+schema-5 captures that lack this parameter replay it as zero so their original
+presentation decisions remain exact.
 
 `display.present_transport_us` is also the deterministic phase-sweep control.
 Sweep it from zero through one scanout period to test whether a candidate
@@ -869,6 +891,14 @@ Use `replay-scenarios.example.json` as the batch format. Top-level parameters
 are inherited by each named scenario, scenario parameters override them, and
 CLI `--set` values have final precedence. Assertions use dotted result paths
 and `<`, `<=`, `==`, `>=`, or `>`; a failed assertion exits with code 4.
+Batch scenarios run concurrently because each scenario is independent. The
+automatic limit is the available logical-processor count, capped at sixteen;
+use `--jobs N` to select an explicit limit or `--jobs 1` to force serial
+execution. Results remain in configuration order regardless of completion
+order, and the batch summary records `parallel_jobs` and `elapsed_ms`.
+Distribution summaries include p99.5, p99.9, and p99.95 in addition to the
+standard p50/p90/p95/p99 values, so extreme-tail sweeps do not require a large
+per-frame timeline.
 
 `mode: fixed` preserves recorded admission and lifecycle for rigorous A/B
 controller comparisons. `mode: worker` requires schema 5 and audits recorded

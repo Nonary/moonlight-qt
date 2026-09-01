@@ -16,6 +16,7 @@
 #include <QMap>
 #include <QProcess>
 #include <QSet>
+#include <QThread>
 
 #include <algorithm>
 #include <array>
@@ -1244,14 +1245,18 @@ struct Distribution {
         }
     }
 
-    uint64_t percentile(unsigned int percent) const
+    uint64_t percentileRatio(uint64_t numerator, uint64_t denominator) const
     {
-        if (count == 0) {
+        if (count == 0 || denominator == 0) {
             return 0;
         }
-        const uint64_t boundedPercent = std::min(100U, percent);
+        const uint64_t boundedNumerator = std::min(denominator, numerator);
         const uint64_t rank = std::max<uint64_t>(
-            1, (count * boundedPercent + 99) / 100);
+            1,
+            (count / denominator) * boundedNumerator +
+                ((count % denominator) * boundedNumerator +
+                 denominator - 1) /
+                    denominator);
         uint64_t cumulative = 0;
         for (size_t bucket = 0; bucket < histogram.size(); ++bucket) {
             cumulative += histogram[bucket];
@@ -1260,6 +1265,11 @@ struct Distribution {
             }
         }
         return maximum;
+    }
+
+    uint64_t percentile(unsigned int percent) const
+    {
+        return percentileRatio(percent, 100);
     }
 };
 
@@ -2643,6 +2653,9 @@ QJsonObject distributionObject(const Distribution& distribution)
         object["p90"] = 0;
         object["p95"] = 0;
         object["p99"] = 0;
+        object["p99_5"] = 0;
+        object["p99_9"] = 0;
+        object["p99_95"] = 0;
         object["max"] = 0;
         return object;
     }
@@ -2655,6 +2668,12 @@ QJsonObject distributionObject(const Distribution& distribution)
     object["p90"] = static_cast<qint64>(distribution.percentile(90));
     object["p95"] = static_cast<qint64>(distribution.percentile(95));
     object["p99"] = static_cast<qint64>(distribution.percentile(99));
+    object["p99_5"] = static_cast<qint64>(
+        distribution.percentileRatio(995, 1000));
+    object["p99_9"] = static_cast<qint64>(
+        distribution.percentileRatio(999, 1000));
+    object["p99_95"] = static_cast<qint64>(
+        distribution.percentileRatio(9995, 10000));
     object["max"] = static_cast<qint64>(distribution.maximum);
     return object;
 }
@@ -2677,15 +2696,28 @@ QJsonObject boundedDistributionObject(const BoundedDistribution& distribution)
         object["p90"] = 0;
         object["p95"] = 0;
         object["p99"] = 0;
+        object["p99_5"] = 0;
+        object["p99_9"] = 0;
+        object["p99_95"] = 0;
         object["max"] = 0;
         return object;
     }
 
     std::vector<uint64_t> sortedValues = distribution.samples;
     std::sort(sortedValues.begin(), sortedValues.end());
-    const auto sampledPercentile = [&sortedValues](unsigned int percent) {
+    const auto sampledPercentile = [&sortedValues](
+                                       size_t numerator,
+                                       size_t denominator) {
+        if (denominator == 0) {
+            return uint64_t { 0 };
+        }
+        const size_t boundedNumerator = std::min(denominator, numerator);
         const size_t rank = std::max<size_t>(
-            1, (sortedValues.size() * std::min(100U, percent) + 99) / 100);
+            1,
+            (sortedValues.size() / denominator) * boundedNumerator +
+                ((sortedValues.size() % denominator) * boundedNumerator +
+                 denominator - 1) /
+                    denominator);
         return sortedValues[rank - 1];
     };
     object["min"] = static_cast<qint64>(distribution.minimum);
@@ -2693,10 +2725,14 @@ QJsonObject boundedDistributionObject(const BoundedDistribution& distribution)
     object["stddev"] = static_cast<double>(std::sqrt(
         distribution.squaredDifferenceTotal /
         static_cast<long double>(distribution.count)));
-    object["p50"] = static_cast<qint64>(sampledPercentile(50));
-    object["p90"] = static_cast<qint64>(sampledPercentile(90));
-    object["p95"] = static_cast<qint64>(sampledPercentile(95));
-    object["p99"] = static_cast<qint64>(sampledPercentile(99));
+    object["p50"] = static_cast<qint64>(sampledPercentile(50, 100));
+    object["p90"] = static_cast<qint64>(sampledPercentile(90, 100));
+    object["p95"] = static_cast<qint64>(sampledPercentile(95, 100));
+    object["p99"] = static_cast<qint64>(sampledPercentile(99, 100));
+    object["p99_5"] = static_cast<qint64>(sampledPercentile(995, 1000));
+    object["p99_9"] = static_cast<qint64>(sampledPercentile(999, 1000));
+    object["p99_95"] = static_cast<qint64>(
+        sampledPercentile(9995, 10000));
     object["max"] = static_cast<qint64>(distribution.maximum);
     return object;
 }
@@ -7515,6 +7551,10 @@ int main(int argc, char* argv[])
         "config", "Load versioned replay scenarios and parameters", "json");
     QCommandLineOption scenarioOption(
         "scenario", "Run only the named scenario (repeatable)", "name");
+    QCommandLineOption jobsOption(
+        "jobs",
+        "Maximum parallel replay processes for a batch (0 selects an automatic limit)",
+        "count", "0");
     QCommandLineOption setOption(
         "set", "Override a resolved parameter as section.name=value", "override");
     QCommandLineOption modeOption(
@@ -7536,6 +7576,7 @@ int main(int argc, char* argv[])
     parser.addOption(counterfactualRefreshReadyOption);
     parser.addOption(configOption);
     parser.addOption(scenarioOption);
+    parser.addOption(jobsOption);
     parser.addOption(setOption);
     parser.addOption(modeOption);
     parser.addOption(listParametersOption);
@@ -7605,6 +7646,12 @@ int main(int argc, char* argv[])
                            displayOverrideHz) ||
             !parseRateOverride(streamOption, "--stream-fps",
                                streamOverrideFps)) {
+        return 2;
+    }
+    bool jobsOk = false;
+    const int requestedJobs = parser.value(jobsOption).toInt(&jobsOk);
+    if (!jobsOk || requestedJobs < 0 || requestedJobs > 64) {
+        std::fprintf(stderr, "--jobs must be an integer from 0 through 64\n");
         return 2;
     }
 
@@ -7691,14 +7738,43 @@ int main(int argc, char* argv[])
                          "--timeline requires selecting a single scenario\n");
             return 2;
         }
-        QJsonArray scenarioResults;
+        const int idealThreadCount = std::max(1, QThread::idealThreadCount());
+        const int automaticJobs = std::min(
+            16, idealThreadCount);
+        const int parallelJobs = std::min(
+            static_cast<int>(replayConfiguration.scenarios.size()),
+            requestedJobs == 0 ? automaticJobs : requestedJobs);
+        struct BatchJob {
+            int index = 0;
+            QString name;
+            std::unique_ptr<QProcess> process;
+            QByteArray output;
+            QByteArray errors;
+        };
+        std::vector<std::unique_ptr<BatchJob>> activeJobs;
+        std::vector<QJsonObject> orderedResults(
+            static_cast<size_t>(replayConfiguration.scenarios.size()));
         bool allPassed = true;
         int firstFailureExitCode = 0;
-        for (const VrrReplayScenario& scenario :
-             replayConfiguration.scenarios) {
+        int nextScenario = 0;
+        QElapsedTimer batchTimer;
+        batchTimer.start();
+        const auto stopActiveJobs = [&activeJobs]() {
+            for (const std::unique_ptr<BatchJob>& job : activeJobs) {
+                if (job->process->state() == QProcess::NotRunning) {
+                    continue;
+                }
+                job->process->terminate();
+                if (!job->process->waitForFinished(2000)) {
+                    job->process->kill();
+                    job->process->waitForFinished(2000);
+                }
+            }
+        };
+        const auto scenarioArguments = [&](const QString& scenarioName) {
             QStringList arguments { tracePath, "--config",
                                     parser.value(configOption), "--scenario",
-                                    scenario.name };
+                                    scenarioName };
             for (const QString& overrideValue : parser.values(setOption))
                 arguments << "--set" << overrideValue;
             if (parser.isSet(modeOption)) arguments << "--mode" << parser.value(modeOption);
@@ -7714,40 +7790,73 @@ int main(int argc, char* argv[])
                 arguments << "--require-raster-ready";
             if (parser.isSet(counterfactualRefreshReadyOption))
                 arguments << "--require-counterfactual-refresh-ready";
-            QProcess child;
-            child.start(QCoreApplication::applicationFilePath(), arguments);
-            if (!child.waitForStarted()) {
-                std::fprintf(stderr, "Unable to start replay scenario %s: %s\n",
-                             qPrintable(scenario.name),
-                             qPrintable(child.errorString()));
-                return 1;
+            return arguments;
+        };
+        while (nextScenario < replayConfiguration.scenarios.size() ||
+               !activeJobs.empty()) {
+            while (nextScenario < replayConfiguration.scenarios.size() &&
+                   static_cast<int>(activeJobs.size()) < parallelJobs) {
+                const VrrReplayScenario& scenario =
+                    replayConfiguration.scenarios.at(nextScenario);
+                auto job = std::make_unique<BatchJob>();
+                job->index = nextScenario;
+                job->name = scenario.name;
+                job->process = std::make_unique<QProcess>();
+                job->process->start(
+                    QCoreApplication::applicationFilePath(),
+                    scenarioArguments(scenario.name));
+                if (!job->process->waitForStarted()) {
+                    std::fprintf(
+                        stderr, "Unable to start replay scenario %s: %s\n",
+                        qPrintable(scenario.name),
+                        qPrintable(job->process->errorString()));
+                    stopActiveJobs();
+                    return 1;
+                }
+                activeJobs.push_back(std::move(job));
+                ++nextScenario;
             }
-            QByteArray childOutput;
-            QByteArray childErrors;
-            while (child.state() != QProcess::NotRunning) {
-                child.waitForReadyRead(250);
-                childOutput.append(child.readAllStandardOutput());
-                childErrors.append(child.readAllStandardError());
+            bool completedJob = false;
+            for (auto jobIt = activeJobs.begin();
+                 jobIt != activeJobs.end();) {
+                BatchJob& job = **jobIt;
+                job.process->waitForFinished(1);
+                job.output.append(job.process->readAllStandardOutput());
+                job.errors.append(job.process->readAllStandardError());
+                if (job.process->state() != QProcess::NotRunning) {
+                    ++jobIt;
+                    continue;
+                }
+                completedJob = true;
+                QJsonParseError childError;
+                const QJsonDocument childDocument = QJsonDocument::fromJson(
+                    job.output, &childError);
+                if (!childDocument.isObject()) {
+                    std::fprintf(stderr, "Scenario %s failed: %s%s\n",
+                                 qPrintable(job.name),
+                                 qPrintable(childError.errorString()),
+                                 job.errors.constData());
+                    const int exitCode = job.process->exitCode();
+                    stopActiveJobs();
+                    return exitCode == 0 ? 1 : exitCode;
+                }
+                QJsonObject result = childDocument.object();
+                result["scenario"] = job.name;
+                result["exit_code"] = job.process->exitCode();
+                orderedResults[static_cast<size_t>(job.index)] = result;
+                allPassed = allPassed && job.process->exitCode() == 0;
+                if (firstFailureExitCode == 0 &&
+                        job.process->exitCode() != 0) {
+                    firstFailureExitCode = job.process->exitCode();
+                }
+                jobIt = activeJobs.erase(jobIt);
             }
-            childOutput.append(child.readAllStandardOutput());
-            childErrors.append(child.readAllStandardError());
-            QJsonParseError childError;
-            const QJsonDocument childDocument = QJsonDocument::fromJson(
-                childOutput, &childError);
-            if (!childDocument.isObject()) {
-                std::fprintf(stderr, "Scenario %s failed: %s%s\n",
-                             qPrintable(scenario.name),
-                             qPrintable(childError.errorString()),
-                             childErrors.constData());
-                return child.exitCode() == 0 ? 1 : child.exitCode();
+            if (!completedJob && !activeJobs.empty()) {
+                QThread::msleep(1);
             }
-            QJsonObject result = childDocument.object();
-            result["scenario"] = scenario.name;
-            result["exit_code"] = child.exitCode();
-            allPassed = allPassed && child.exitCode() == 0;
-            if (firstFailureExitCode == 0 && child.exitCode() != 0) {
-                firstFailureExitCode = child.exitCode();
-            }
+        }
+        QJsonArray scenarioResults;
+        for (const QJsonObject& result : orderedResults) {
             scenarioResults.append(result);
         }
         QJsonObject batch;
@@ -7755,6 +7864,8 @@ int main(int argc, char* argv[])
         batch["trace"] = QFileInfo(tracePath).fileName();
         batch["scenarios"] = scenarioResults;
         batch["passed"] = allPassed;
+        batch["parallel_jobs"] = parallelJobs;
+        batch["elapsed_ms"] = static_cast<double>(batchTimer.elapsed());
         const QByteArray output = QJsonDocument(batch).toJson(
             QJsonDocument::Indented);
         if (parser.isSet(outputOption)) {
@@ -10938,12 +11049,13 @@ int main(int argc, char* argv[])
                 capturedParameters.latchedPresentationBaseGuardExit = 1;
             }
             else {
-                VrrReplayScenario capturedScenario;
+                QJsonObject capturedControllerSnapshot;
                 int expectedParameterColumns = 0;
                 for (const QString& path : vrrReplayParameterNames()) {
                     if (!path.startsWith("controller.")) continue;
                     const auto column = columns.capturedParameterColumns.find(
                         path);
+                    uint64_t capturedValue = 0;
                     if (column == columns.capturedParameterColumns.end()) {
                         // Preserve the policy semantics of schema-5 fields
                         // added after the initial release. Older captures use
@@ -10969,29 +11081,54 @@ int main(int argc, char* argv[])
                                  "controller.latch_base_guard_exit") {
                             legacyValue = "1";
                         }
-                        if (legacyValue.isEmpty() ||
-                                !applyVrrReplayOverride(
-                                    path + "=" + legacyValue,
-                                    capturedScenario, error)) {
+                        else if (path ==
+                                 "controller.cadence_stability_latch_frames") {
+                            // Captures made before cadence-instability
+                            // protection must retain their recorded adaptive
+                            // presentation decisions for exact replay.
+                            legacyValue = "0";
+                        }
+                        else if (path ==
+                                 "controller.source_playout_delay_us") {
+                            // Older schema-5 captures predate the explicit
+                            // source-clock playout reserve.
+                            legacyValue = "0";
+                        }
+                        else if (path ==
+                                 "controller.readiness_learning_window_us" ||
+                                 path ==
+                                 "controller.retain_readiness_on_phase_reset") {
+                            // Older schema-5 captures used a fixed sample
+                            // count and reacquired readiness after each phase
+                            // reset.
+                            legacyValue = "0";
+                        }
+                        bool validLegacyValue = false;
+                        capturedValue = legacyValue.toULongLong(
+                            &validLegacyValue);
+                        if (legacyValue.isEmpty() || !validLegacyValue) {
                             std::fprintf(stderr,
                                          "Schema 5 trace is missing captured controller parameter: %s\n",
                                          qPrintable(path));
                             return 1;
                         }
-                        continue;
                     }
-                    ++expectedParameterColumns;
-                    if (!applyVrrReplayOverride(
-                                path + "=" + QString::number(unsignedField(
-                                    fields, column.value())),
-                                capturedScenario, error)) {
+                    else {
+                        ++expectedParameterColumns;
+                        capturedValue = unsignedField(
+                            fields, column.value());
+                        capturedParameterValues.insert(
+                            column.value(), fields[column.value()]);
+                    }
+                    if (capturedValue > 9007199254740991ULL) {
                         std::fprintf(stderr,
-                                     "Schema 5 trace has invalid captured parameters: %s\n",
-                                     qPrintable(error));
+                                     "Schema 5 trace has an inexact captured controller parameter: %s\n",
+                                     qPrintable(path));
                         return 1;
                     }
-                    capturedParameterValues.insert(
-                        column.value(), fields[column.value()]);
+                    capturedControllerSnapshot.insert(
+                        path.section('.', 1, 1),
+                        static_cast<double>(capturedValue));
                 }
                 if (columns.capturedParameterColumns.size() !=
                         expectedParameterColumns) {
@@ -10999,7 +11136,14 @@ int main(int argc, char* argv[])
                                  "Schema 5 trace is missing captured controller parameters\n");
                     return 1;
                 }
-                capturedParameters = capturedScenario.controller;
+                if (!applyVrrReplayControllerSnapshot(
+                            capturedControllerSnapshot,
+                            capturedParameters, error)) {
+                    std::fprintf(stderr,
+                                 "Schema 5 trace has invalid captured parameters: %s\n",
+                                 qPrintable(error));
+                    return 1;
+                }
             }
             simulatedConfig = capturedConfig;
             if (parser.isSet(displayOption)) {
@@ -11009,6 +11153,10 @@ int main(int argc, char* argv[])
                 simulatedConfig.streamRateHz = streamOverrideFps;
             }
             simulatedCanLatch = capturedCanLatch && !parser.isSet(latchOption);
+            if (!scenario.controllerCustomized) {
+                scenario.controller = vrrTimingParametersForSession(
+                    simulatedConfig);
+            }
             referenceController = std::make_unique<VrrTimingController>(
                 capturedConfig, capturedCanLatch, capturedParameters);
             simulatedController = std::make_unique<VrrTimingController>(
