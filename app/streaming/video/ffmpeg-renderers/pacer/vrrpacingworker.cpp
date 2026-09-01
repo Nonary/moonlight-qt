@@ -23,7 +23,6 @@ constexpr size_t kMaximumQueuedFrames = 3;
 // boundary by even a few hundred microseconds. A second period distinguishes
 // real backlog while the bounded queue remains the hard overload limit.
 constexpr unsigned int kLowLatencyFrameAgePeriods = 2;
-constexpr unsigned int kAdditionalSmoothnessFramePeriods = 1;
 // ~64 seconds of rows at 120 FPS. When the writer thread cannot keep up the
 // pacing thread drops rows rather than ever waiting on diagnostics.
 constexpr size_t kMaximumTraceQueueRows = 8192;
@@ -404,22 +403,19 @@ int VrrPacingWorker::run()
         // one-slot deadline. That is right for the newest frame, but it makes
         // the later target-relative stale check unable to see time already
         // spent waiting in this worker's transport queue. One interval of age
-        // is ordinary single-worker occupancy, so low-latency mode tolerates
-        // two source intervals; the explicit smoothness option tolerates one
-        // more. Sustained overload still drops older frames whenever a fresher
-        // successor exists, and queue capacity remains the hard bound.
+        // is ordinary single-worker occupancy, so two source intervals are
+        // tolerated. Sustained overload still drops older frames whenever a
+        // fresher successor exists, and queue capacity remains the hard bound.
+        // A third interval was once granted to a "smoothness" option; on a
+        // render-bound client it only deepened the standing backlog.
         const uint64_t scheduleNowUs = LiGetMicroseconds();
         telemetry.staleCheckUs = scheduleNowUs;
         const uint64_t scheduleAgeUs = scheduleNowUs >=
                 frame.decodeCompleteUs() ?
             scheduleNowUs - frame.decodeCompleteUs() : 0;
         telemetry.staleAgeUs = scheduleAgeUs;
-        const unsigned int maximumFrameAgePeriods =
-            kLowLatencyFrameAgePeriods +
-            (m_Config.allowAdditionalQueuedFrame ?
-                 kAdditionalSmoothnessFramePeriods : 0);
         const uint64_t maximumFrameAgeUs = queueAgeToleranceUs(
-            decision.sourcePeriodUs, maximumFrameAgePeriods);
+            decision.sourcePeriodUs, kLowLatencyFrameAgePeriods);
         if (decision.sourcePeriodUs != 0 &&
             scheduleAgeUs > maximumFrameAgeUs && hasQueuedFrame()) {
             writeTrace(queuedFrame, decision, VrrPresentFeedback {}, telemetry,

@@ -281,46 +281,6 @@ void testSinglePeriodQueueDelayPreservesFluidity()
     }
 }
 
-void testSmoothnessRetainsOneAdditionalFrame()
-{
-    resetFakeClock();
-    FakeVrrFramePresenter backend;
-    backend.blockPreparation();
-    PacerTelemetry telemetry;
-    TrackedFrameLifetime first;
-    TrackedFrameLifetime retained;
-    TrackedFrameLifetime fresh;
-    VrrSessionConfig smoothnessConfig = enabledConfig();
-    smoothnessConfig.streamRateHz = 30;
-    smoothnessConfig.allowAdditionalQueuedFrame = true;
-
-    {
-        VrrPacingWorker worker(&backend, smoothnessConfig, &telemetry);
-        expect(worker.start(), "worker must start in VRR smoothness mode");
-        worker.submit(frame(1, first));
-        expect(backend.waitForPrepareCount(1),
-               "active smoothness frame must enter preparation");
-
-        worker.submit(frame(2, retained));
-        worker.submit(frame(3, fresh));
-        // At 30 FPS this is older than the default two-period threshold but
-        // younger than the explicit three-period smoothness threshold.
-        std::this_thread::sleep_for(std::chrono::milliseconds(75));
-        backend.releasePreparation();
-
-        expect(backend.waitForPresentCount(3),
-               "smoothness mode must retain the one-period-old successor");
-        const std::vector<int> presentedFrames = backend.presentedFrames();
-        expect(presentedFrames.size() >= 3 &&
-                   presentedFrames[0] == 1 &&
-                   presentedFrames[1] == 2 &&
-                   presentedFrames[2] == 3,
-               "smoothness mode must preserve the bounded three-frame order");
-        expect(telemetryStats(telemetry).vrrPacingDroppedFrames == 0,
-               "the additional smoothness interval must avoid a stale drop");
-    }
-}
-
 void testTelemetrySnapshotsRemainCumulative()
 {
     PacerTelemetry telemetry;
@@ -1160,11 +1120,10 @@ void testSmoothnessTraceCapturesReadinessPolicy()
     PacerTelemetry telemetry;
     TrackedFrameLifetime lifetime;
     VrrSessionConfig smoothnessConfig = enabledConfig();
-    smoothnessConfig.allowAdditionalQueuedFrame = true;
     {
         VrrPacingWorker worker(&backend, smoothnessConfig, &telemetry);
         expect(worker.start(),
-               "worker must start for smoothness policy tracing");
+               "worker must start for playout policy tracing");
         worker.submit(frame(1, lifetime));
         expect(backend.waitForPresentCount(1),
                "smoothness policy trace must present one frame");
@@ -1205,15 +1164,15 @@ void testSmoothnessTraceCapturesReadinessPolicy()
             continue;
         }
         foundPresentedRow = true;
-        expect(fields.value(additionalQueueColumn) == "1" &&
+        expect(fields.value(additionalQueueColumn) == "0" &&
                    fields.value(lowPercentileColumn) == "0" &&
                    fields.value(loosePercentileColumn) == "80" &&
-                   fields.value(sourceDelayColumn) == "5000" &&
+                   fields.value(sourceDelayColumn) == "3000" &&
                    fields.value(timestampPlayoutColumn) == "1" &&
                    fields.value(adaptiveColumn) == "1" &&
                    fields.value(retainReserveColumn) == "0" &&
-                   fields.value(playoutDelayColumn).toULongLong() >= 2000,
-                "smoothness mode must record the adaptive timestamp playout policy");
+                   fields.value(playoutDelayColumn).toULongLong() >= 1000,
+                "the session must record the single adaptive timestamp playout policy");
     }
     expect(foundPresentedRow,
            "smoothness policy trace must contain a presented row");
@@ -1434,7 +1393,6 @@ int main()
     testLatePreparedFramePresentsImmediately();
     testQueuedStaleFrameYieldsToFreshSuccessor();
     testSinglePeriodQueueDelayPreservesFluidity();
-    testSmoothnessRetainsOneAdditionalFrame();
     testTelemetrySnapshotsRemainCumulative();
     testSuspendDiscardAndFreshFrame();
     testDeferredSurfaceLifetime();

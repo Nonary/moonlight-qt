@@ -23,6 +23,7 @@
     X(uint64_t, pacing_latency_budget_divisor, pacingLatencyBudgetDivisor, 2) \
     X(uint64_t, pacing_latency_extra_period_numerator, pacingLatencyExtraPeriodNumerator, 0) \
     X(uint64_t, pacing_latency_extra_period_denominator, pacingLatencyExtraPeriodDenominator, 1) \
+    X(uint64_t, pacing_latency_queue_mode_extra, pacingLatencyQueueModeExtra, 1) \
     X(uint64_t, presentation_safety_us, presentationSafetyUs, 0) \
     X(uint64_t, source_playout_delay_us, sourcePlayoutDelayUs, 0) \
     X(uint64_t, timestamp_playout_enabled, timestampPlayoutEnabled, 0) \

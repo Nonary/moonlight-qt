@@ -348,7 +348,6 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     parser.addValueOption("resolution", "custom <width>x<height> resolution");
     parser.addToggleOption("vsync", "V-Sync");
     parser.addToggleOption("vrr", "VRR");
-    parser.addToggleOption("vrr-smoothness", "VRR smoothness queue");
     parser.addValueOption("fps", "FPS");
     parser.addValueOption("bitrate", "bitrate in Kbps");
     parser.addValueOption("packet-size", "video packet size");
@@ -444,10 +443,6 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     // command-line settings.  It must not persist a CLI choice back to the
     // normal settings UI.
     preferences->enableVrr = parser.getToggleOptionValue("vrr", preferences->enableVrr);
-
-    // Resolve --vrr-smoothness and --no-vrr-smoothness options
-    preferences->vrrSmoothness = parser.getToggleOptionValue(
-        "vrr-smoothness", preferences->vrrSmoothness);
 
     // Resolve --audio-config option
     if (parser.isSet("audio-config")) {

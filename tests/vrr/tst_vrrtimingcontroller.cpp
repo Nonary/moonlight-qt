@@ -165,32 +165,37 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
         vrrTimingParametersForSession(smoothness);
     expect(lowLatencyPolicy.timestampPlayoutEnabled == 1 &&
                lowLatencyPolicy.playoutDelayAdaptive == 1 &&
-               lowLatencyPolicy.sourcePlayoutDelayUs == 2000 &&
-               lowLatencyPolicy.playoutDelayStartUs == 4000 &&
+               lowLatencyPolicy.sourcePlayoutDelayUs == 3000 &&
+               lowLatencyPolicy.playoutDelayStartUs == 6000 &&
                lowLatencyPolicy.playoutDelayMinimumUs == 1000 &&
-               lowLatencyPolicy.playoutDelayMaximumUs == 6000 &&
-               lowLatencyPolicy.playoutDelayPercentilePerMille == 980 &&
+               lowLatencyPolicy.playoutDelayMaximumUs == 8000 &&
+               lowLatencyPolicy.playoutDelayPercentilePerMille == 990 &&
                lowLatencyPolicy.pacingLatencyExtraPeriodNumerator == 0 &&
+               lowLatencyPolicy.pacingLatencyQueueModeExtra == 0 &&
                lowLatencyPolicy.readinessLowPercentile == 0 &&
-               lowLatencyPolicy.readinessLoosePercentile == 80,
-           "low-latency sessions must resolve the adaptive p98 timestamp playout policy");
-    expect(smoothnessPolicy.playoutDelayAdaptive == 1 &&
-               smoothnessPolicy.playoutDelayStartUs == 8000 &&
-               smoothnessPolicy.playoutDelayMinimumUs == 2000 &&
-               smoothnessPolicy.playoutDelayMaximumUs == 12000 &&
-               smoothnessPolicy.playoutDelayPercentilePerMille == 997 &&
-               smoothnessPolicy.sourcePlayoutDelayUs >
-                   lowLatencyPolicy.sourcePlayoutDelayUs,
-           "smoothness must target a tighter hitch budget than low latency");
-    expect(smoothnessPolicy.timestampPlayoutEnabled == 1 &&
-                smoothnessPolicy.playoutDelayAdaptive == 1 &&
-                smoothnessPolicy.sourcePlayoutDelayUs == 5000 &&
-                smoothnessPolicy.readinessLowPercentile == 0 &&
-                smoothnessPolicy.readinessLoosePercentile == 80 &&
-                smoothnessPolicy.pacingLatencyExtraPeriodNumerator == 1 &&
-                smoothnessPolicy.pacingLatencyExtraPeriodDenominator == 1 &&
-                smoothnessPolicy.retainReadinessOnPhaseReset == 0,
-           "smoothness sessions must resolve the fixed 5 ms timestamp playout policy");
+               lowLatencyPolicy.readinessLoosePercentile == 80 &&
+               lowLatencyPolicy.retainReadinessOnPhaseReset == 0,
+           "sessions must resolve the single adaptive p99 timestamp playout policy");
+    expect(smoothnessPolicy.playoutDelayAdaptive ==
+                   lowLatencyPolicy.playoutDelayAdaptive &&
+               smoothnessPolicy.playoutDelayStartUs ==
+                   lowLatencyPolicy.playoutDelayStartUs &&
+               smoothnessPolicy.playoutDelayMaximumUs ==
+                   lowLatencyPolicy.playoutDelayMaximumUs &&
+               smoothnessPolicy.playoutDelayPercentilePerMille ==
+                   lowLatencyPolicy.playoutDelayPercentilePerMille &&
+               smoothnessPolicy.pacingLatencyQueueModeExtra == 0,
+           "the retired smoothness flag must not change the session policy");
+    VrrSessionConfig legacySmoothness = config(100, 120);
+    legacySmoothness.allowAdditionalQueuedFrame = true;
+    VrrTimingParameters legacyParameters;
+    legacyParameters.timestampPlayoutEnabled = 0;
+    VrrTimingController legacy(legacySmoothness, true, legacyParameters);
+    VrrTimingController current(legacySmoothness, true, smoothnessPolicy);
+    expect(legacy.diagnostics().pacingLatencyBudgetUs ==
+               current.diagnostics().pacingLatencyBudgetUs +
+                   legacy.sourcePeriodUs(),
+           "only captures made under the retired option keep its extra render budget");
 }
 
 void testSmoothnessTimestampPlayoutHoldsFixedDelay()

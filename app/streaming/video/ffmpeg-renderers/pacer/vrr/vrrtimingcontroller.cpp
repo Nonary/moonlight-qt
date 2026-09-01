@@ -16,21 +16,17 @@ constexpr uint64_t kQ16Half = kQ16One >> 1;
 // late frame and nothing else moves. On the reference 116 FPS / 120 Hz rig
 // decode-versus-RTP jitter is about 1 ms at p50 and 4 ms at p95, so 2 ms
 // absorbs the common case at low latency and 5 ms covers roughly p97.
-constexpr uint64_t kLowLatencyPlayoutDelayUs = 2000;
-constexpr uint64_t kSmoothnessPlayoutDelayUs = 5000;
-// The adaptive calibrator learns the delay per source-rate band from the
-// exogenous lateness of arrivals against the mapped sender clock. Each mode
-// is a hitch budget expressed as a lateness percentile; both start high for
-// a new band and release slowly so startup and regime changes cost latency
-// rather than hitches.
-constexpr uint64_t kLowLatencyPlayoutStartUs = 4000;
-constexpr uint64_t kLowLatencyPlayoutMinimumUs = 1000;
-constexpr uint64_t kLowLatencyPlayoutMaximumUs = 6000;
-constexpr uint64_t kLowLatencyPlayoutPercentilePerMille = 980;
-constexpr uint64_t kSmoothnessPlayoutStartUs = 8000;
-constexpr uint64_t kSmoothnessPlayoutMinimumUs = 2000;
-constexpr uint64_t kSmoothnessPlayoutMaximumUs = 12000;
-constexpr uint64_t kSmoothnessPlayoutPercentilePerMille = 997;
+// One VRR queue policy. The adaptive calibrator learns the playout delay per
+// source-rate band from the exogenous lateness of arrivals against the mapped
+// sender clock, targeting the p99 of lateness plus a margin within 1 to 8 ms.
+// A new band starts high and releases slowly so startup and regime changes
+// cost latency rather than hitches. The fixed delay below is only used when
+// the calibrator is disabled by replay parameters.
+constexpr uint64_t kFixedPlayoutDelayUs = 3000;
+constexpr uint64_t kPlayoutStartUs = 6000;
+constexpr uint64_t kPlayoutMinimumUs = 1000;
+constexpr uint64_t kPlayoutMaximumUs = 8000;
+constexpr uint64_t kPlayoutPercentilePerMille = 990;
 
 uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)
 {
@@ -68,34 +64,22 @@ void appendBounded(std::deque<T>& values, T value, size_t limit)
 VrrTimingParameters vrrTimingParametersForSession(
     const VrrSessionConfig& config)
 {
+    // Present at sender time plus a learned delay. The readiness reserve, its
+    // per-frame slewing, and every phase re-anchor are off on this path: they
+    // each moved the target between frames the source had spaced evenly,
+    // which was the visible stutter. The projected-clock policy and the
+    // retired smoothness budget remain reachable through explicit parameters
+    // so older captures replay under the policy they ran.
+    (void) config;
     VrrTimingParameters parameters;
-    // Present at sender time plus a constant delay. The learned readiness
-    // reserve, its per-frame slewing, and every phase re-anchor are off on
-    // this path: they each moved the target between frames the source had
-    // spaced evenly, which was the visible stutter. The projected-clock
-    // policy remains reachable through explicit parameters for replay.
     parameters.timestampPlayoutEnabled = 1;
     parameters.playoutDelayAdaptive = 1;
-    if (config.allowAdditionalQueuedFrame) {
-        parameters.sourcePlayoutDelayUs = kSmoothnessPlayoutDelayUs;
-        parameters.playoutDelayStartUs = kSmoothnessPlayoutStartUs;
-        parameters.playoutDelayMinimumUs = kSmoothnessPlayoutMinimumUs;
-        parameters.playoutDelayMaximumUs = kSmoothnessPlayoutMaximumUs;
-        parameters.playoutDelayPercentilePerMille =
-            kSmoothnessPlayoutPercentilePerMille;
-        // The worker tolerates one extra source interval of queue age in this
-        // mode; keep the render-tail insurance budget matched to it.
-        parameters.pacingLatencyExtraPeriodNumerator = 1;
-        parameters.pacingLatencyExtraPeriodDenominator = 1;
-    }
-    else {
-        parameters.sourcePlayoutDelayUs = kLowLatencyPlayoutDelayUs;
-        parameters.playoutDelayStartUs = kLowLatencyPlayoutStartUs;
-        parameters.playoutDelayMinimumUs = kLowLatencyPlayoutMinimumUs;
-        parameters.playoutDelayMaximumUs = kLowLatencyPlayoutMaximumUs;
-        parameters.playoutDelayPercentilePerMille =
-            kLowLatencyPlayoutPercentilePerMille;
-    }
+    parameters.sourcePlayoutDelayUs = kFixedPlayoutDelayUs;
+    parameters.playoutDelayStartUs = kPlayoutStartUs;
+    parameters.playoutDelayMinimumUs = kPlayoutMinimumUs;
+    parameters.playoutDelayMaximumUs = kPlayoutMaximumUs;
+    parameters.playoutDelayPercentilePerMille = kPlayoutPercentilePerMille;
+    parameters.pacingLatencyQueueModeExtra = 0;
     return parameters;
 }
 
@@ -1487,7 +1471,9 @@ uint64_t VrrTimingController::pacingLatencyBudgetUs() const
         extraBudgetUs = scaledUs /
             m_Parameters.pacingLatencyExtraPeriodDenominator;
     }
-    else if (m_Config.allowAdditionalQueuedFrame) {
+    else if (m_Config.allowAdditionalQueuedFrame &&
+             m_Parameters.pacingLatencyQueueModeExtra != 0) {
+        // Pre-schema captures made under the retired smoothness option.
         extraBudgetUs = m_SourcePeriodUs;
     }
     return saturatingAdd(lowLatencyBudgetUs, extraBudgetUs);

@@ -647,20 +647,24 @@ timeline for that display; controller/cadence results remain available:
 .\vrr\release\vrrreplay.exe capture.vrrtrace --display-hz 120 --stream-fps 116
 ```
 
-Both queue policies are a jitter buffer anchored to the sender timestamps
-(`controller.timestamp_playout_enabled`): every frame targets its RTP time
-mapped into the local clock plus a playout delay plus the render lead. The
-delay is self-calibrated per source-rate band
+There is one VRR queue policy. It is a jitter buffer anchored to the sender
+timestamps (`controller.timestamp_playout_enabled`): every frame targets its
+RTP time mapped into the local clock plus a playout delay plus the render
+lead. The delay is self-calibrated per source-rate band
 (`controller.playout_delay_adaptive`): each band, the fitted source rate
 divided by `playout_band_width_hz`, keeps a reservoir of frame lateness
 against the mapped sender clock, excluding pairs that span a host stall, and
-targets the `playout_delay_percentile_per_mille` lateness plus
-`playout_delay_margin_us` (p98 for low latency, p99.7 for smoothness). A band
-starts at `playout_delay_start_us` (4 ms low latency, 8 ms smoothness), rises
-at most `playout_delay_attack_us` per frame, releases at most
+targets the `playout_delay_percentile_per_mille` lateness (p99) plus
+`playout_delay_margin_us`. A band starts at `playout_delay_start_us` (6 ms),
+rises at most `playout_delay_attack_us` per frame, releases at most
 `playout_delay_release_us` per frame and only after
-`playout_delay_release_samples`, and is clamped between the mode's minimum
-and maximum. A band unused for `playout_band_stale_us` re-converges from the
+`playout_delay_release_samples`, and is clamped between 1 and 8 ms. The former
+"smoothness" option, one extra source interval of queue age and one extra
+source period of render-lead budget, was retired: on a render-bound client it
+deepened the standing backlog and saturated the worker without reducing
+hitches. Captures made under it still replay with that budget through
+`additional_queued_frame` and `pacing_latency_queue_mode_extra`, which the
+production policy sets to zero. A band unused for `playout_band_stale_us` re-converges from the
 start value; a cadence change therefore starts high at the discontinuity
 where nobody can see the step. The lateness statistic does not depend on the
 delay chosen, so there is no feedback loop. With `playout_delay_adaptive`
@@ -946,11 +950,12 @@ shifts the median decision by more than a source period: the candidate keeps
 the single worker busier than the source cadence, the live worker would shed
 frames through its stale check, and this fixed-admission replay lets latency
 run away instead, so treat that scenario's numbers as invalid. The playout
-delay sweeps are `tests\vrr\configs\playout-delay-sweep-lowlatency.json` and
-`playout-delay-sweep-smoothness.json` (the latter carries the smoothness
-render-lead budget, which saturates render-bound low-latency captures); run
-one with `--config ... --jobs 0 --output sweep.json` and print the table with
-`scripts\vrr-sweep-table.ps1 sweep.json`.
+delay sweeps are `tests\vrr\configs\playout-delay-sweep-lowlatency.json`
+(the production budget) and `playout-delay-sweep-smoothness.json` (the retired
+extra render-lead budget, which saturates render-bound captures);
+`mode-compare.json` pits the two retired mode policies against the single
+production policy. Run one with `--config ... --jobs 0 --output sweep.json`
+and print the table with `scripts\vrr-sweep-table.ps1 sweep.json`.
 
 `mode: fixed` preserves recorded admission and lifecycle for rigorous A/B
 controller comparisons. `mode: worker` requires schema 5 and audits recorded
