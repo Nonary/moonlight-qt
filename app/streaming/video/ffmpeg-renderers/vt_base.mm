@@ -30,7 +30,7 @@ VTBaseRenderer::~VTBaseRenderer() {
     }
 }
 
-bool VTBaseRenderer::isAppleSilicon() {
+bool VTBaseRenderer::isAppleSilicon() const {
     static uint32_t cpuType = 0;
     if (cpuType == 0) {
         size_t size = sizeof(cpuType);

@@ -3,6 +3,7 @@
 #define AVMediaType AVMediaType_FFmpeg
 #include "vt.h"
 #include "pacer/pacer.h"
+#include "ivrrframepresenter.h"
 #undef AVMediaType
 
 #include <SDL_syswm.h>
@@ -51,7 +52,7 @@ class VTMetalRenderer;
 
 @end
 
-class VTMetalRenderer : public VTBaseRenderer
+class VTMetalRenderer : public VTBaseRenderer, public IVrrFramePresenter
 {
 public:
     VTMetalRenderer(bool hwAccel)
@@ -62,6 +63,13 @@ public:
           m_MetalLayer(nullptr),
           m_MetalDisplayLink(nullptr),
           m_LatestUnrenderedFrame(nullptr),
+          m_PreparedVrrFrame(nullptr),
+          m_VrrPresentPending(false),
+          m_VrrPresentComplete(false),
+          m_VrrSuspended(false),
+          m_VrrEnabled(false),
+          m_FixedFrameRate(0),
+          m_VrrPresentSerial(0),
           m_FrameLock(SDL_CreateMutex()),
           m_FrameReady(SDL_CreateCond()),
           m_TextureCache(nullptr),
@@ -87,6 +95,7 @@ public:
         // Stop the display link and free associated state
         stopDisplayLink();
         av_frame_free(&m_LatestUnrenderedFrame);
+        av_frame_free(&m_PreparedVrrFrame);
         SDL_DestroyCond(m_FrameReady);
         SDL_DestroyMutex(m_FrameLock);
 
@@ -474,7 +483,7 @@ public:
     }}
 
     // Caller frees frame after we return
-    virtual void renderFrameIntoDrawable(AVFrame* frame, id<CAMetalDrawable> drawable)
+    virtual uint64_t renderFrameIntoDrawable(AVFrame* frame, id<CAMetalDrawable> drawable)
     { @autoreleasepool {
         std::array<CVMetalTextureRef, MAX_VIDEO_PLANES> cvMetalTextures;
         size_t planes = getFramePlaneCount(frame);
@@ -482,7 +491,7 @@ public:
 
         if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
             if (!createTexturesFromFrame(frame, cvMetalTextures)) {
-                return;
+                return 0;
             }
         }
 
@@ -565,11 +574,13 @@ public:
         [renderEncoder endEncoding];
 
         // Flip to the newly rendered buffer
+        const uint64_t submissionTimeUs = LiGetMicroseconds();
         [commandBuffer presentDrawable:drawable];
         [commandBuffer commit];
 
         // Wait for the command buffer to complete and free our CVMetalTextureCache references
         [commandBuffer waitUntilCompleted];
+        return submissionTimeUs;
     }}
 
     // Caller frees frame after we return
@@ -662,7 +673,11 @@ public:
         int err;
 
         m_Window = params->window;
-        m_FrameRateRange = CAFrameRateRangeMake(params->frameRate, params->frameRate, params->frameRate);
+        m_VrrEnabled = params->enableVrr;
+        m_FixedFrameRate = params->frameRate;
+        m_FrameRateRange = m_VrrEnabled ?
+            CAFrameRateRangeMake(1, params->vrrDisplayRefreshHz, params->frameRate) :
+            CAFrameRateRangeMake(params->frameRate, params->frameRate, params->frameRate);
 
         id<MTLDevice> device = getMetalDevice();
         if (!device) {
@@ -744,6 +759,135 @@ public:
 
         return true;
     }}
+
+    virtual IVrrFramePresenter* getVrrFramePresenter() override
+    {
+        return this;
+    }
+
+    virtual VrrFallbackReason checkSupport() const override
+    {
+        if (!m_VrrEnabled) {
+            return VrrFallbackReason::UnsupportedRenderer;
+        }
+        if (@available(macOS 14, *)) {
+            if (!isAppleSilicon() || m_MetalLayer == nullptr ||
+                    !m_MetalLayer.displaySyncEnabled) {
+                return VrrFallbackReason::AdaptivePresentationUnavailable;
+            }
+            return VrrFallbackReason::NoFallback;
+        }
+        return VrrFallbackReason::AdaptivePresentationUnavailable;
+    }
+
+    virtual VrrPrepareResult prepareFrame(AVFrame* frame) override
+    { @autoreleasepool {
+        VrrPrepareResult result;
+        if (frame == nullptr || m_VrrSuspended ||
+                checkSupport() != VrrFallbackReason::NoFallback) {
+            return result;
+        }
+
+        if (!updateColorSpaceForFrame(frame) ||
+                !updateVideoRegionSizeForFrame(frame)) {
+            SDL_Event event;
+            event.type = SDL_RENDER_DEVICE_RESET;
+            SDL_PushEvent(&event);
+            return result;
+        }
+
+        startDisplayLink();
+        if (!hasDisplayLink()) {
+            return result;
+        }
+
+        AVFrame* preparedFrame = av_frame_alloc();
+        if (preparedFrame == nullptr || av_frame_ref(preparedFrame, frame) < 0) {
+            av_frame_free(&preparedFrame);
+            return result;
+        }
+
+        SDL_LockMutex(m_FrameLock);
+        av_frame_free(&m_PreparedVrrFrame);
+        m_PreparedVrrFrame = preparedFrame;
+        SDL_UnlockMutex(m_FrameLock);
+        result.prepared = true;
+        return result;
+    }}
+
+    virtual VrrPresentFeedback presentAdaptive(const VrrPresentRequest&) override
+    {
+        VrrPresentFeedback feedback;
+        SDL_LockMutex(m_FrameLock);
+        if (m_PreparedVrrFrame == nullptr || m_VrrSuspended || !hasDisplayLink()) {
+            SDL_UnlockMutex(m_FrameLock);
+            feedback.cancelled = true;
+            return feedback;
+        }
+
+        av_frame_free(&m_LatestUnrenderedFrame);
+        m_LatestUnrenderedFrame = m_PreparedVrrFrame;
+        m_PreparedVrrFrame = nullptr;
+        m_VrrPresentPending = true;
+        m_VrrPresentComplete = false;
+        const uint64_t presentSerial = ++m_VrrPresentSerial;
+        SDL_CondSignal(m_FrameReady);
+
+        while (!m_VrrPresentComplete && !m_VrrSuspended) {
+            if (SDL_CondWaitTimeout(m_FrameReady, m_FrameLock, 100) != 0) {
+                break;
+            }
+        }
+        if (m_VrrPresentComplete && presentSerial == m_VrrPresentSerial) {
+            feedback = m_VrrPresentFeedback;
+        }
+        else {
+            av_frame_free(&m_LatestUnrenderedFrame);
+            feedback.cancelled = true;
+        }
+        m_VrrPresentPending = false;
+        m_VrrPresentComplete = false;
+        SDL_UnlockMutex(m_FrameLock);
+        return feedback;
+    }
+
+    virtual VrrPresentFeedback cancelFrame() override
+    {
+        VrrPresentFeedback feedback;
+        feedback.cancelled = true;
+        SDL_LockMutex(m_FrameLock);
+        av_frame_free(&m_PreparedVrrFrame);
+        SDL_UnlockMutex(m_FrameLock);
+        return feedback;
+    }
+
+    virtual void setSuspended(bool suspended) override
+    {
+        SDL_LockMutex(m_FrameLock);
+        m_VrrSuspended = suspended;
+        if (suspended) {
+            av_frame_free(&m_PreparedVrrFrame);
+            av_frame_free(&m_LatestUnrenderedFrame);
+            m_VrrPresentFeedback = {};
+            m_VrrPresentFeedback.cancelled = true;
+            m_VrrPresentComplete = true;
+            SDL_CondBroadcast(m_FrameReady);
+        }
+        SDL_UnlockMutex(m_FrameLock);
+    }
+
+    virtual bool restoreFixedPresentation(VrrFallbackReason) override
+    {
+        m_VrrEnabled = false;
+        m_FrameRateRange = CAFrameRateRangeMake(
+            m_FixedFrameRate, m_FixedFrameRate, m_FixedFrameRate);
+        if (@available(macOS 14, *)) {
+            if (m_MetalDisplayLink != nullptr) {
+                m_MetalDisplayLink.preferredFrameRateRange = m_FrameRateRange;
+            }
+        }
+        return true;
+    }
 
     virtual void notifyOverlayUpdated(Overlay::OverlayType type) override
     { @autoreleasepool {
@@ -912,27 +1056,41 @@ public:
     void renderLatestFrameOnDrawable(id<CAMetalDrawable> drawable, CFTimeInterval targetTimestamp)
     {
         AVFrame* frame = nullptr;
+        uint64_t presentSerial = 0;
 
         // Determine how long we can wait depending on how long our CAMetalDisplayLink
         // says we have until the next frame needs to be rendered. We will wait up to
         // half the per-frame interval for a new frame to become available.
         int waitTimeMs = ((targetTimestamp - CACurrentMediaTime()) * 1000) / 2;
-        if (waitTimeMs < 0) {
-            return;
-        }
+        waitTimeMs = SDL_max(waitTimeMs, 0);
 
         // Wait for a new frame to be ready
         SDL_LockMutex(m_FrameLock);
         if (m_LatestUnrenderedFrame != nullptr || SDL_CondWaitTimeout(m_FrameReady, m_FrameLock, waitTimeMs) == 0) {
             frame = m_LatestUnrenderedFrame;
             m_LatestUnrenderedFrame = nullptr;
+            if (frame != nullptr && m_VrrPresentPending) {
+                presentSerial = m_VrrPresentSerial;
+            }
         }
         SDL_UnlockMutex(m_FrameLock);
 
         // Render a frame if we got one in time
         if (frame != nullptr) {
-            renderFrameIntoDrawable(frame, drawable);
+            const uint64_t submissionTimeUs = renderFrameIntoDrawable(frame, drawable);
             av_frame_free(&frame);
+
+            SDL_LockMutex(m_FrameLock);
+            if (m_VrrPresentPending && presentSerial != 0 &&
+                    presentSerial == m_VrrPresentSerial) {
+                m_VrrPresentFeedback = {};
+                m_VrrPresentFeedback.presented = submissionTimeUs != 0;
+                m_VrrPresentFeedback.submissionTimeValid = submissionTimeUs != 0;
+                m_VrrPresentFeedback.submissionTimeUs = submissionTimeUs;
+                m_VrrPresentComplete = true;
+                SDL_CondBroadcast(m_FrameReady);
+            }
+            SDL_UnlockMutex(m_FrameLock);
         }
     }
 
@@ -944,6 +1102,14 @@ private:
     CAMetalDisplayLink* m_MetalDisplayLink API_AVAILABLE(macos(14.0));
     CAFrameRateRange m_FrameRateRange;
     AVFrame* m_LatestUnrenderedFrame;
+    AVFrame* m_PreparedVrrFrame;
+    bool m_VrrPresentPending;
+    bool m_VrrPresentComplete;
+    bool m_VrrSuspended;
+    bool m_VrrEnabled;
+    int m_FixedFrameRate;
+    uint64_t m_VrrPresentSerial;
+    VrrPresentFeedback m_VrrPresentFeedback;
     SDL_mutex* m_FrameLock;
     SDL_cond* m_FrameReady;
     CVMetalTextureCacheRef m_TextureCache;
