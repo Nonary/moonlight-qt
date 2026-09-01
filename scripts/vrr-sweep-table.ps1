@@ -30,6 +30,8 @@ foreach ($scenario in $batch.scenarios) {
         late       = $s.replay_sender_hitch_late_arrivals
         lat_p50    = $s.replay_decode_to_submission_p50_us
         lat_p95    = $s.replay_decode_to_submission_p95_us
+        delay_p50  = $s.replay_playout_delay_p50_us
+        delay_max  = $s.replay_playout_delay_max_us
         saturated  = $(if ($s.replay_worker_saturated) { "YES" } else { "" })
     })
 }
@@ -39,13 +41,13 @@ if ($null -ne $first) {
         err_p50 = $first.stock_sender_spacing_error_p50_us; err_p90 = $first.stock_sender_spacing_error_p90_us; err_p99 = $first.stock_sender_spacing_error_p99_us
         jerk_p99 = $first.stock_sender_jerk_p99_us; hitches = $first.stock_sender_hitches
         per_sec = [math]::Round([double]$first.stock_sender_hitches_per_second, 2); late = ""
-        lat_p50 = ""; lat_p95 = ""; saturated = "" })
+        lat_p50 = ""; lat_p95 = ""; delay_p50 = ""; delay_max = ""; saturated = "" })
     $rows.Insert(1, [pscustomobject]@{
         scenario = "recorded session"
         err_p50 = $first.original_sender_spacing_error_p50_us; err_p90 = $first.original_sender_spacing_error_p90_us; err_p99 = $first.original_sender_spacing_error_p99_us
         jerk_p99 = $first.original_sender_jerk_p99_us; hitches = $first.original_sender_hitches
         per_sec = [math]::Round([double]$first.original_sender_hitches_per_second, 2); late = ""
-        lat_p50 = $first.original_decode_to_submission_p50_us; lat_p95 = $first.original_decode_to_submission_p95_us; saturated = "" })
+        lat_p50 = $first.original_decode_to_submission_p50_us; lat_p95 = $first.original_decode_to_submission_p95_us; delay_p50 = ""; delay_max = ""; saturated = "" })
 }
 "trace: $($batch.trace)  pairs: $($first.replay_sender_pairs)  jobs: $($batch.parallel_jobs)  elapsed: $($batch.elapsed_ms) ms"
 $rows | Format-Table -AutoSize

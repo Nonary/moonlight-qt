@@ -18,6 +18,19 @@ constexpr uint64_t kQ16Half = kQ16One >> 1;
 // absorbs the common case at low latency and 5 ms covers roughly p97.
 constexpr uint64_t kLowLatencyPlayoutDelayUs = 2000;
 constexpr uint64_t kSmoothnessPlayoutDelayUs = 5000;
+// The adaptive calibrator learns the delay per source-rate band from the
+// exogenous lateness of arrivals against the mapped sender clock. Each mode
+// is a hitch budget expressed as a lateness percentile; both start high for
+// a new band and release slowly so startup and regime changes cost latency
+// rather than hitches.
+constexpr uint64_t kLowLatencyPlayoutStartUs = 4000;
+constexpr uint64_t kLowLatencyPlayoutMinimumUs = 1000;
+constexpr uint64_t kLowLatencyPlayoutMaximumUs = 6000;
+constexpr uint64_t kLowLatencyPlayoutPercentilePerMille = 980;
+constexpr uint64_t kSmoothnessPlayoutStartUs = 8000;
+constexpr uint64_t kSmoothnessPlayoutMinimumUs = 2000;
+constexpr uint64_t kSmoothnessPlayoutMaximumUs = 12000;
+constexpr uint64_t kSmoothnessPlayoutPercentilePerMille = 997;
 
 uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)
 {
@@ -62,8 +75,14 @@ VrrTimingParameters vrrTimingParametersForSession(
     // spaced evenly, which was the visible stutter. The projected-clock
     // policy remains reachable through explicit parameters for replay.
     parameters.timestampPlayoutEnabled = 1;
+    parameters.playoutDelayAdaptive = 1;
     if (config.allowAdditionalQueuedFrame) {
         parameters.sourcePlayoutDelayUs = kSmoothnessPlayoutDelayUs;
+        parameters.playoutDelayStartUs = kSmoothnessPlayoutStartUs;
+        parameters.playoutDelayMinimumUs = kSmoothnessPlayoutMinimumUs;
+        parameters.playoutDelayMaximumUs = kSmoothnessPlayoutMaximumUs;
+        parameters.playoutDelayPercentilePerMille =
+            kSmoothnessPlayoutPercentilePerMille;
         // The worker tolerates one extra source interval of queue age in this
         // mode; keep the render-tail insurance budget matched to it.
         parameters.pacingLatencyExtraPeriodNumerator = 1;
@@ -71,6 +90,11 @@ VrrTimingParameters vrrTimingParametersForSession(
     }
     else {
         parameters.sourcePlayoutDelayUs = kLowLatencyPlayoutDelayUs;
+        parameters.playoutDelayStartUs = kLowLatencyPlayoutStartUs;
+        parameters.playoutDelayMinimumUs = kLowLatencyPlayoutMinimumUs;
+        parameters.playoutDelayMaximumUs = kLowLatencyPlayoutMaximumUs;
+        parameters.playoutDelayPercentilePerMille =
+            kLowLatencyPlayoutPercentilePerMille;
     }
     return parameters;
 }
@@ -151,6 +175,15 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_ReadinessModelValid = false;
     }
     resetPlayoutOffsets();
+    // Learned per-band delays survive a source-phase rebase like the other
+    // learned budgets; only a full reset discards them.
+    if (!retainLearnedBudgets) {
+        m_PlayoutBands.clear();
+        m_PlayoutBandValid = false;
+        m_AppliedPlayoutDelayUs = 0;
+    }
+    m_HaveLastDecodeComplete = false;
+    m_LastDecodeCompleteUs = 0;
     m_HaveTimeline = false;
     m_SourceTimeUs = 0;
     m_SourceTimeUsQ16 = 0;
@@ -299,6 +332,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         m_ReadinessBudgetUs = 0;
         m_ReadinessPhaseUs = 0;
         m_PhaseErrorFrames = 0;
+        updatePlayoutDelay(frame, cadence, rebased, readyOffsetUs, nowUs);
     }
     else {
         readyOffsetUs = signedDifference(frame.decodeCompleteUs(),
@@ -359,10 +393,12 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         }
     }
 
+    const uint64_t playoutDelayUs = timestampPlayout ?
+        effectivePlayoutDelayUs() : m_Parameters.sourcePlayoutDelayUs;
     uint64_t targetUs = saturatingAdd(
         addSigned(m_SourceTimeUs, m_ReadinessBudgetUs),
         saturatingAdd(
-            m_Parameters.sourcePlayoutDelayUs,
+            playoutDelayUs,
             saturatingAdd(m_RenderLeadUs,
                           m_Parameters.presentationSafetyUs)));
     targetUs = std::max(
@@ -380,7 +416,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         saturatingAdd(
             std::max(m_ConfiguredStreamPeriodUs, m_SourcePeriodUs),
             saturatingAdd(
-                m_Parameters.sourcePlayoutDelayUs,
+                playoutDelayUs,
                 saturatingAdd(m_RenderLeadUs,
                               m_Parameters.presentationSafetyUs))));
     if (targetUs > maximumDirectTargetUs) {
@@ -407,7 +443,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         targetUs = saturatingAdd(
             std::max(frame.decodeCompleteUs(), nowUs),
             saturatingAdd(
-                m_Parameters.sourcePlayoutDelayUs,
+                playoutDelayUs,
                 saturatingAdd(m_RenderLeadUs,
                               m_Parameters.presentationSafetyUs)));
     }
@@ -424,6 +460,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.sourcePeriodUs = m_SourcePeriodUs;
     decision.readyOffsetUs = readyOffsetUs;
     decision.readinessBudgetUs = m_ReadinessBudgetUs;
+    decision.playoutDelayUs = playoutDelayUs;
     decision.renderStartUs = renderStartUs;
     decision.targetUs = targetUs;
     decision.guardUs = m_GuardUs;
@@ -488,6 +525,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     // Timestamp playout never feeds the learned readiness reserve.
     m_Pending.cadenceEligible = decision.cadenceEligible && !timestampPlayout;
     m_Pending.readyOffsetUs = readyOffsetUs;
+    m_LastDecodeCompleteUs = frame.decodeCompleteUs();
+    m_HaveLastDecodeComplete = true;
     return decision;
 }
 
@@ -1021,7 +1060,8 @@ void VrrTimingController::clampReadinessReserveToPolicy()
 uint64_t VrrTimingController::timingBudgetUs() const
 {
     return saturatingAdd(
-        m_Parameters.sourcePlayoutDelayUs,
+        m_TimestampPlayoutActive ? effectivePlayoutDelayUs() :
+                                   m_Parameters.sourcePlayoutDelayUs,
         saturatingAdd(
             m_AppliedReadinessReserveUs,
             saturatingAdd(pacingLatencyPolicyEnabled() ?
@@ -1192,6 +1232,177 @@ int64_t VrrTimingController::observePlayoutOffset(uint64_t decodeCompleteUs,
         }
     }
     return m_AppliedPlayoutOffsetUs;
+}
+
+uint64_t VrrTimingController::playoutDelayUs() const
+{
+    return m_TimestampPlayoutActive ? effectivePlayoutDelayUs() :
+                                      m_Parameters.sourcePlayoutDelayUs;
+}
+
+unsigned int VrrTimingController::playoutBandIndex() const
+{
+    return m_PlayoutBandValid ? m_PlayoutBandIndex : 0;
+}
+
+uint64_t VrrTimingController::playoutBandSamples() const
+{
+    if (!m_PlayoutBandValid) {
+        return 0;
+    }
+    const auto band = m_PlayoutBands.find(m_PlayoutBandIndex);
+    return band != m_PlayoutBands.end() ? band->second.samplesSeen : 0;
+}
+
+uint64_t VrrTimingController::effectivePlayoutDelayUs() const
+{
+    if (m_Parameters.playoutDelayAdaptive != 0 && m_PlayoutBandValid) {
+        return m_AppliedPlayoutDelayUs;
+    }
+    return m_Parameters.sourcePlayoutDelayUs;
+}
+
+uint64_t VrrTimingController::playoutDelayMinimumUs() const
+{
+    return m_Parameters.playoutDelayMinimumUs;
+}
+
+uint64_t VrrTimingController::playoutDelayMaximumUs() const
+{
+    return std::max(m_Parameters.playoutDelayMaximumUs,
+                    m_Parameters.playoutDelayMinimumUs);
+}
+
+uint64_t VrrTimingController::playoutDelayStartUs() const
+{
+    const uint64_t startUs = m_Parameters.playoutDelayStartUs != 0 ?
+        m_Parameters.playoutDelayStartUs : m_Parameters.sourcePlayoutDelayUs;
+    return clampUnsigned(startUs, playoutDelayMinimumUs(),
+                         playoutDelayMaximumUs());
+}
+
+void VrrTimingController::updatePlayoutDelay(
+    const PacedFrame& frame, const CadenceObservation& cadence,
+    bool rebased, int64_t readyOffsetUs, uint64_t nowUs)
+{
+    if (m_Parameters.playoutDelayAdaptive == 0) {
+        m_PlayoutBandValid = false;
+        return;
+    }
+
+    // Band selection from the fitted source rate, with hysteresis so a rate
+    // hovering at a band edge does not bounce between two reservoirs.
+    const uint64_t rateHz = m_SourcePeriodUs != 0 ?
+        (kMicrosecondsPerSecond + m_SourcePeriodUs / 2) / m_SourcePeriodUs : 0;
+    const uint64_t widthHz = std::max<uint64_t>(
+        1, m_Parameters.playoutBandWidthHz);
+    const unsigned int candidate = static_cast<unsigned int>(
+        std::min<uint64_t>(rateHz / widthHz,
+                           std::numeric_limits<unsigned int>::max()));
+    bool switched = false;
+    if (!m_PlayoutBandValid) {
+        m_PlayoutBandIndex = candidate;
+        m_PlayoutBandValid = true;
+        switched = true;
+    }
+    else if (candidate != m_PlayoutBandIndex) {
+        const uint64_t lowEdgeHz = static_cast<uint64_t>(candidate) * widthHz;
+        const uint64_t highEdgeHz = lowEdgeHz + widthHz - 1;
+        const uint64_t hysteresisHz = std::max<uint64_t>(1, widthHz / 6);
+        const bool confirmed = candidate > m_PlayoutBandIndex ?
+            rateHz >= lowEdgeHz + hysteresisHz :
+            rateHz + hysteresisHz <= highEdgeHz;
+        if (confirmed) {
+            m_PlayoutBandIndex = candidate;
+            switched = true;
+        }
+    }
+
+    PlayoutBand& band = m_PlayoutBands[m_PlayoutBandIndex];
+    if (switched) {
+        // A band not visited for a long time re-converges from the start
+        // value instead of trusting a stale distribution.
+        if (band.applied && m_Parameters.playoutBandStaleUs != 0 &&
+                nowUs > band.lastUsedUs &&
+                nowUs - band.lastUsedUs > m_Parameters.playoutBandStaleUs) {
+            band = PlayoutBand {};
+        }
+        if (!band.applied) {
+            band.appliedDelayUs = playoutDelayStartUs();
+            band.applied = true;
+        }
+    }
+    band.lastUsedUs = nowUs;
+
+    // Admit this frame's lateness against the mapped sender clock. The
+    // statistic is exogenous: the delay we choose never changes it, so there
+    // is no feedback loop. Pairs spanning a host stall are excluded.
+    const bool steadyArrival = m_HaveLastDecodeComplete &&
+        frame.decodeCompleteUs() >= m_LastDecodeCompleteUs &&
+        frame.decodeCompleteUs() - m_LastDecodeCompleteUs <=
+            m_Parameters.playoutStallExclusionUs;
+    const bool steadySender = cadence.intervalUs != 0 &&
+        cadence.intervalUs <= m_Parameters.playoutStallExclusionUs;
+    if (!rebased && !switched && cadence.eligible &&
+            !cadence.phaseDiscontinuity && steadyArrival && steadySender) {
+        const uint64_t latenessUs = readyOffsetUs > 0 ?
+            static_cast<uint64_t>(readyOffsetUs) : 0;
+        const size_t capacity = std::max<size_t>(
+            1, m_Parameters.playoutDelayReservoirSamples);
+        if (band.latenessUs.size() < capacity) {
+            band.latenessUs.push_back(latenessUs);
+        }
+        else {
+            band.latenessUs[band.nextIndex % capacity] = latenessUs;
+        }
+        band.nextIndex = (band.nextIndex + 1) % capacity;
+        ++band.samplesSeen;
+    }
+
+    // Desired delay: the configured lateness percentile plus a margin, once
+    // the band has enough samples to estimate it.
+    uint64_t desiredUs = band.appliedDelayUs;
+    const size_t minimumSamples = std::max<size_t>(
+        1, m_Parameters.playoutDelayMinimumSamples);
+    if (band.latenessUs.size() >= minimumSamples) {
+        std::vector<uint64_t> ordered(band.latenessUs.begin(),
+                                      band.latenessUs.end());
+        const uint64_t perMille = std::min<uint64_t>(
+            1000, m_Parameters.playoutDelayPercentilePerMille);
+        const size_t rank = std::max<size_t>(
+            1, static_cast<size_t>(
+                   (static_cast<uint64_t>(ordered.size()) * perMille + 999) /
+                   1000));
+        std::nth_element(ordered.begin(), ordered.begin() + (rank - 1),
+                         ordered.end());
+        // A frame later than the delay by less than the tolerance is a
+        // sub-threshold stretch, not a hitch, so the delay only needs to
+        // cover lateness beyond the tolerance.
+        const uint64_t coveredUs = saturatingAdd(
+            ordered[rank - 1], m_Parameters.playoutDelayMarginUs);
+        desiredUs = clampUnsigned(
+            coveredUs > m_Parameters.playoutDelayToleranceUs ?
+                coveredUs - m_Parameters.playoutDelayToleranceUs : 0,
+            playoutDelayMinimumUs(), playoutDelayMaximumUs());
+    }
+
+    // Attack quickly, release slowly, and never release below the start
+    // value until the band has seen enough samples to trust its tail.
+    if (desiredUs > band.appliedDelayUs) {
+        band.appliedDelayUs += std::min(
+            desiredUs - band.appliedDelayUs,
+            m_Parameters.playoutDelayAttackUs);
+    }
+    else if (desiredUs < band.appliedDelayUs &&
+             band.samplesSeen >= m_Parameters.playoutDelayReleaseSamples) {
+        band.appliedDelayUs -= std::min(
+            band.appliedDelayUs - desiredUs,
+            m_Parameters.playoutDelayReleaseUs);
+    }
+    band.appliedDelayUs = clampUnsigned(
+        band.appliedDelayUs, playoutDelayMinimumUs(),
+        playoutDelayMaximumUs());
+    m_AppliedPlayoutDelayUs = band.appliedDelayUs;
 }
 
 uint64_t VrrTimingController::rtpTicksToUs(uint64_t ticks)

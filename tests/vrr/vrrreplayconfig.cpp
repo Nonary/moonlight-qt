@@ -406,6 +406,21 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutOffsetWindowUs == 0) {
         return fail("playout_offset_window_us must be non-zero");
     }
+    if (value.playoutDelayAdaptive > 1) {
+        return fail("playout_delay_adaptive must be 0 or 1");
+    }
+    if (value.playoutDelayMinimumUs > value.playoutDelayMaximumUs) {
+        return fail("playout_delay_minimum_us must not exceed playout_delay_maximum_us");
+    }
+    if (value.playoutDelayPercentilePerMille > 1000) {
+        return fail("playout_delay_percentile_per_mille must be in 0..1000");
+    }
+    if (value.playoutDelayMinimumSamples == 0 ||
+            value.playoutDelayReservoirSamples == 0 ||
+            value.playoutBandWidthHz == 0 ||
+            value.playoutStallExclusionUs == 0) {
+        return fail("playout delay sample counts, band width and stall exclusion must be non-zero");
+    }
     const unsigned int percents[] = {
         value.materialRateChangePercent, value.renderBaselinePercentile,
         value.preparationPercentile,

@@ -64,6 +64,12 @@ void VrrReplayConfigTest::defaultsRoundTrip()
               uint64_t(3000000));
     QCOMPARE(config.scenarios.front().controller.playoutOffsetSlewUs,
               uint64_t(20));
+    QCOMPARE(config.scenarios.front().controller.playoutDelayAdaptive,
+              uint64_t(0));
+    QCOMPARE(config.scenarios.front().controller.playoutDelayPercentilePerMille,
+              uint64_t(980));
+    QCOMPARE(config.scenarios.front().controller.playoutBandWidthHz,
+              uint64_t(20));
     QCOMPARE(config.scenarios.front().controller.readinessLearningWindowUs,
               uint64_t(0));
     QCOMPARE(

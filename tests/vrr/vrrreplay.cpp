@@ -702,6 +702,7 @@ struct Columns {
     int cleanSpacingFrames = -1;
     int phaseErrorFrames = -1;
     int readinessModelValid = -1;
+    int playoutDelayUs = -1;
     QMap<QString, int> capturedParameterColumns;
 
     bool resolve(const QList<QByteArray>& header, QString& error)
@@ -1113,6 +1114,7 @@ struct Columns {
         cleanSpacingFrames = find("clean_spacing_frames");
         phaseErrorFrames = find("phase_error_frames");
         readinessModelValid = find("readiness_model_valid");
+        playoutDelayUs = find("playout_delay_us");
         for (const QString& path : vrrReplayParameterNames()) {
             if (!path.startsWith("controller.")) continue;
             const QString key = path.mid(QString("controller.").size());
@@ -1157,6 +1159,19 @@ struct Columns {
 private:
     int m_Maximum = -1;
 };
+
+// Schema default for a controller parameter path, as text, or empty when the
+// path is not a controller parameter.
+QString vrrControllerParameterDefaultText(const QString& path)
+{
+#define VRR_REPLAY_PARAMETER_DEFAULT(type, jsonName, memberName, defaultValue) \
+    if (path == QStringLiteral("controller." #jsonName)) { \
+        return QString::number(static_cast<qulonglong>(defaultValue)); \
+    }
+    VRR_TIMING_PARAMETER_FIELDS(VRR_REPLAY_PARAMETER_DEFAULT)
+#undef VRR_REPLAY_PARAMETER_DEFAULT
+    return QString();
+}
 
 struct Distribution {
     static constexpr uint64_t kExactLimitUs = 100000;
@@ -1603,6 +1618,8 @@ struct Metrics {
     uint64_t observedPriorRenderLeadUs = 0;
     bool simulatedPriorRenderLeadValid = false;
     uint64_t simulatedPriorRenderLeadUs = 0;
+    Distribution simulatedPlayoutDelayUs;
+    Distribution observedPlayoutDelayUs;
     uint64_t arrivalSequenceGaps = 0;
     uint64_t arrivalSequenceDuplicates = 0;
     uint64_t arrivalSequenceOutOfOrderTransitions = 0;
@@ -5262,6 +5279,8 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
                 metrics.lastArrivalUs - metrics.firstArrivalUs : 0;
         observed["sender_cadence"] = senderCadenceObject(
             metrics.observedSenderCadence, durationUs);
+        observed["playout_delay_us"] = distributionObject(
+            metrics.observedPlayoutDelayUs);
         observed["stock_present_on_render_sender_cadence"] =
             senderCadenceObject(metrics.stockSenderCadence, durationUs);
     }
@@ -5741,6 +5760,8 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.occupancyDecisionShiftUs.percentile(50) >
             periodForRate(simulatedStreamFps > 0 ?
                               simulatedStreamFps : 1);
+    simulation["playout_delay_us"] = distributionObject(
+        metrics.simulatedPlayoutDelayUs);
     simulation["sender_cadence"] = senderCadenceObject(
         metrics.simulatedSenderCadence,
         metrics.lastArrivalUs >= metrics.firstArrivalUs ?
@@ -6743,6 +6764,12 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
             metrics.occupancyDecisionShiftUs.count != 0 &&
             metrics.occupancyDecisionShiftUs.percentile(50) >
                 periodForRate(simulatedStreamFps > 0 ? simulatedStreamFps : 1);
+        summary["replay_playout_delay_p50_us"] = static_cast<qint64>(
+            metrics.simulatedPlayoutDelayUs.percentile(50));
+        summary["replay_playout_delay_p90_us"] = static_cast<qint64>(
+            metrics.simulatedPlayoutDelayUs.percentile(90));
+        summary["replay_playout_delay_max_us"] = static_cast<qint64>(
+            metrics.simulatedPlayoutDelayUs.maximum);
         summary["original_decode_to_submission_p50_us"] =
             static_cast<qint64>(
                 metrics.observedDecodeToSubmission.percentile(50));
@@ -6919,6 +6946,7 @@ struct TimelineDetails {
     uint64_t simulatedRenderLeadUs = 0;
     int64_t simulatedReadinessBudgetUs = 0;
     uint64_t simulatedSourceTimeUs = 0;
+    uint64_t simulatedPlayoutDelayUs = 0;
     CadenceSample recordedCadence;
     CadenceSample simulatedCadence;
     int64_t recordedSpacingMarginUs = 0;
@@ -7167,6 +7195,7 @@ bool writeTimelineHeader(QFile& file)
         "recorded_source_period_us,simulated_source_period_us,"
         "simulated_ready_offset_us,simulated_render_lead_us,"
         "simulated_readiness_budget_us,simulated_source_time_us,"
+        "simulated_playout_delay_us,"
         "recorded_cadence_valid,simulated_cadence_valid,"
         "recorded_source_elapsed_us,simulated_source_elapsed_us,"
         "recorded_submission_elapsed_us,simulated_submission_elapsed_us,"
@@ -7447,6 +7476,7 @@ bool writeTimelineRow(QFile& file, uint64_t arrivalSequence, int frame,
     append(QByteArray::number(details.simulatedRenderLeadUs));
     append(QByteArray::number(details.simulatedReadinessBudgetUs));
     append(QByteArray::number(details.simulatedSourceTimeUs));
+    append(QByteArray::number(details.simulatedPlayoutDelayUs));
     append(QByteArray::number(details.recordedCadence.valid ? 1 : 0));
     append(QByteArray::number(details.simulatedCadence.valid ? 1 : 0));
     append(QByteArray::number(details.recordedCadence.sourceElapsedUs));
@@ -11332,6 +11362,15 @@ int main(int argc, char* argv[])
                                  "controller.playout_offset_warmup_samples") {
                             legacyValue = "64";
                         }
+                        else {
+                            // Any parameter added after a capture was made
+                            // takes its schema default: older captures ran
+                            // the controller exactly as if the parameter
+                            // did not exist, which is what the default
+                            // expresses.
+                            legacyValue =
+                                vrrControllerParameterDefaultText(path);
+                        }
                         bool validLegacyValue = false;
                         capturedValue = legacyValue.toULongLong(
                             &validLegacyValue);
@@ -12646,6 +12685,8 @@ int main(int argc, char* argv[])
             simulatedDecision.readinessBudgetUs;
         timelineDetails.simulatedSourceTimeUs =
             simulatedDecision.sourceTimeUs;
+        timelineDetails.simulatedPlayoutDelayUs =
+            simulatedDecision.playoutDelayUs;
         timelineDetails.simulatedSourceRateHz = roundedRateForPeriod(
             simulatedDecision.sourcePeriodUs);
         timelineDetails.simulatedLatched =
@@ -13879,10 +13920,24 @@ int main(int argc, char* argv[])
                 const bool simulatedLateArrival =
                     scenario.controller.timestampPlayoutEnabled != 0 &&
                     simulatedDecision.readyOffsetUs > static_cast<int64_t>(
-                        scenario.controller.sourcePlayoutDelayUs);
+                        simulatedDecision.playoutDelayUs);
+                metrics.simulatedPlayoutDelayUs.add(
+                    simulatedDecision.playoutDelayUs);
+                bool recordedLateArrival = false;
+                if (columns.playoutDelayUs >= 0) {
+                    const uint64_t recordedPlayoutDelayUs = unsignedField(
+                        fields, columns.playoutDelayUs);
+                    metrics.observedPlayoutDelayUs.add(
+                        recordedPlayoutDelayUs);
+                    recordedLateArrival =
+                        capturedParameters.timestampPlayoutEnabled != 0 &&
+                        signedField(fields, columns.readyOffsetUs) >
+                            static_cast<qint64>(recordedPlayoutDelayUs);
+                }
                 metrics.observedSenderCadence.observe(
                     senderUs, decodeCompleteUs, recordedSubmissionUs,
-                    false, recordedLeadJump, simulatedDisplayPeriodUs);
+                    recordedLateArrival, recordedLeadJump,
+                    simulatedDisplayPeriodUs);
                 metrics.simulatedSenderCadence.observe(
                     senderUs, decodeCompleteUs, simulatedSubmissionUs,
                     simulatedLateArrival, simulatedLeadJump,

@@ -164,15 +164,26 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
     const VrrTimingParameters smoothnessPolicy =
         vrrTimingParametersForSession(smoothness);
     expect(lowLatencyPolicy.timestampPlayoutEnabled == 1 &&
+               lowLatencyPolicy.playoutDelayAdaptive == 1 &&
                lowLatencyPolicy.sourcePlayoutDelayUs == 2000 &&
+               lowLatencyPolicy.playoutDelayStartUs == 4000 &&
+               lowLatencyPolicy.playoutDelayMinimumUs == 1000 &&
+               lowLatencyPolicy.playoutDelayMaximumUs == 6000 &&
+               lowLatencyPolicy.playoutDelayPercentilePerMille == 980 &&
                lowLatencyPolicy.pacingLatencyExtraPeriodNumerator == 0 &&
                lowLatencyPolicy.readinessLowPercentile == 0 &&
                lowLatencyPolicy.readinessLoosePercentile == 80,
-           "low-latency sessions must resolve the fixed 2 ms timestamp playout policy");
-    expect(smoothnessPolicy.sourcePlayoutDelayUs >
-               lowLatencyPolicy.sourcePlayoutDelayUs,
-           "smoothness must buffer more than low latency");
+           "low-latency sessions must resolve the adaptive p98 timestamp playout policy");
+    expect(smoothnessPolicy.playoutDelayAdaptive == 1 &&
+               smoothnessPolicy.playoutDelayStartUs == 8000 &&
+               smoothnessPolicy.playoutDelayMinimumUs == 2000 &&
+               smoothnessPolicy.playoutDelayMaximumUs == 12000 &&
+               smoothnessPolicy.playoutDelayPercentilePerMille == 997 &&
+               smoothnessPolicy.sourcePlayoutDelayUs >
+                   lowLatencyPolicy.sourcePlayoutDelayUs,
+           "smoothness must target a tighter hitch budget than low latency");
     expect(smoothnessPolicy.timestampPlayoutEnabled == 1 &&
+                smoothnessPolicy.playoutDelayAdaptive == 1 &&
                 smoothnessPolicy.sourcePlayoutDelayUs == 5000 &&
                 smoothnessPolicy.readinessLowPercentile == 0 &&
                 smoothnessPolicy.readinessLoosePercentile == 80 &&
@@ -188,7 +199,9 @@ void testSmoothnessTimestampPlayoutHoldsFixedDelay()
     // target is decided by the playout schedule alone.
     VrrSessionConfig session = config(60, 120);
     session.allowAdditionalQueuedFrame = true;
-    const VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    // This test covers the fixed-delay mechanism; the calibrator has its own.
+    policy.playoutDelayAdaptive = 0;
     VrrTimingController controller(session, true, policy);
     const uint64_t epochUs = 1000000;
     const uint64_t delayUs = policy.sourcePlayoutDelayUs;
@@ -310,6 +323,99 @@ void testSmoothnessTimestampPlayoutHoldsFixedDelay()
            "the mapping offset must follow sustained drift");
     expect(maximumSpacingErrorUs <= policy.playoutOffsetSlewUs,
            "drift tracking must never move a target by more than the slew per frame");
+}
+
+void testAdaptivePlayoutDelayCalibratesPerBand()
+{
+    VrrSessionConfig session = config(116, 120);
+    const VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingController controller(session, true, policy);
+    const uint64_t epochUs = 1000000;
+    const auto rtpFor = [](int i, int rateHz) {
+        return static_cast<uint32_t>(
+            static_cast<uint64_t>(i) * 90000ULL /
+            static_cast<uint64_t>(rateHz));
+    };
+    // Uniform-ish jitter in [0, 3000) us with a zero every 50th frame so the
+    // mapping floor stays fixed: p98 is about 2940 us.
+    const auto jitterFor = [](int i) {
+        if (i % 50 == 0) {
+            return static_cast<uint64_t>(0);
+        }
+        return static_cast<uint64_t>((static_cast<uint64_t>(i) * 7919ULL) % 3001ULL);
+    };
+
+    VrrTimingDecision decision;
+    bool startHeld = true;
+    uint64_t maximumStepUs = 0;
+    uint64_t previousDelayUs = 0;
+    for (int i = 0; i < 1500; ++i) {
+        const uint32_t timestamp = rtpFor(i, 116);
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + jitterFor(i);
+        decision = controller.schedule(frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        if (i < 400 && decision.playoutDelayUs != policy.playoutDelayStartUs) {
+            startHeld = false;
+        }
+        if (i > 0) {
+            const uint64_t stepUs = decision.playoutDelayUs > previousDelayUs ?
+                decision.playoutDelayUs - previousDelayUs :
+                previousDelayUs - decision.playoutDelayUs;
+            maximumStepUs = std::max(maximumStepUs, stepUs);
+        }
+        previousDelayUs = decision.playoutDelayUs;
+    }
+    expect(startHeld,
+           "the delay must hold the start value until the band has enough samples to release");
+    expect(controller.playoutBandIndex() == 116 / 20,
+           "the band must follow the fitted source rate");
+    const uint64_t expectedUs = 2940 + policy.playoutDelayMarginUs;
+    expect(decision.playoutDelayUs >= expectedUs - 200 &&
+               decision.playoutDelayUs <= expectedUs + 200,
+           "the delay must converge to the target lateness percentile plus margin");
+    expect(maximumStepUs <= std::max(policy.playoutDelayAttackUs,
+                                     policy.playoutDelayReleaseUs),
+           "the delay must never move more than one slew step per frame within a band");
+    expect(controller.timingBudgetUs() == decision.playoutDelayUs,
+           "the timing budget must report the applied adaptive delay");
+
+    // A worse regime: one frame in ten arrives 6 ms late. The delay must
+    // attack upward at the attack rate, never in one jump.
+    const uint64_t delayBeforeUs = decision.playoutDelayUs;
+    uint64_t maximumRiseUs = 0;
+    for (int i = 1500; i < 2500; ++i) {
+        const uint32_t timestamp = rtpFor(i, 116);
+        const uint64_t lateUs = (i % 10 == 0) ? 6000 : 0;
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + jitterFor(i) + lateUs;
+        decision = controller.schedule(frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        if (decision.playoutDelayUs > previousDelayUs) {
+            maximumRiseUs = std::max(maximumRiseUs, decision.playoutDelayUs - previousDelayUs);
+        }
+        previousDelayUs = decision.playoutDelayUs;
+    }
+    expect(decision.playoutDelayUs > delayBeforeUs + 2000,
+           "a sustained late regime must raise the delay");
+    expect(maximumRiseUs <= policy.playoutDelayAttackUs,
+           "the delay must rise at most one attack step per frame");
+
+    // A cadence change to 60 FPS opens a new band that starts high again.
+    const uint64_t baseUs = decodedTimeForRtp(epochUs, rtpFor(2500, 116));
+    bool sawStartInNewBand = false;
+    for (int i = 0; i < 200; ++i) {
+        const uint32_t timestamp = rtpFor(2500, 116) + rtpFor(i, 60);
+        const uint64_t decodedUs = baseUs + static_cast<uint64_t>(i) * 1000000ULL / 60ULL;
+        decision = controller.schedule(frame(2501 + i, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        if (controller.playoutBandIndex() == 60 / 20 &&
+                decision.playoutDelayUs == policy.playoutDelayStartUs) {
+            sawStartInNewBand = true;
+        }
+    }
+    expect(controller.playoutBandIndex() == 60 / 20,
+           "a material rate change must move to the new band");
+    expect(sawStartInNewBand,
+           "a new band must start from the mode's high start value");
 }
 
 void testSmoothnessLearningWindowTracksCadence()
@@ -1423,6 +1529,7 @@ int main()
     testTimingFormulaeAndReserveCap();
     testSourcePlayoutDelayOffsetsProjectedTargets();
     testSmoothnessTimestampPlayoutHoldsFixedDelay();
+    testAdaptivePlayoutDelayCalibratesPerBand();
     testSmoothnessLearningWindowTracksCadence();
     testLongRunNearRefreshRtpCadence();
     testQuantizedCadenceDoesNotOscillate();

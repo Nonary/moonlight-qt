@@ -1185,11 +1185,15 @@ void testSmoothnessTraceCapturesReadinessPolicy()
         columns.indexOf("param_timestamp_playout_enabled");
     const int retainReserveColumn =
         columns.indexOf("param_retain_readiness_on_phase_reset");
+    const int adaptiveColumn =
+        columns.indexOf("param_playout_delay_adaptive");
+    const int playoutDelayColumn = columns.indexOf("playout_delay_us");
     expect(dispositionColumn >= 0 && additionalQueueColumn >= 0 &&
                lowPercentileColumn >= 0 && loosePercentileColumn >= 0 &&
                sourceDelayColumn >= 0 && timestampPlayoutColumn >= 0 &&
-               retainReserveColumn >= 0,
-           "smoothness trace must expose its resolved playout policy");
+               retainReserveColumn >= 0 && adaptiveColumn >= 0 &&
+               playoutDelayColumn >= 0,
+           "smoothness trace must expose its resolved playout policy and the applied delay");
 
     bool foundPresentedRow = false;
     for (int i = 1; i < lines.size(); ++i) {
@@ -1206,8 +1210,10 @@ void testSmoothnessTraceCapturesReadinessPolicy()
                    fields.value(loosePercentileColumn) == "80" &&
                    fields.value(sourceDelayColumn) == "5000" &&
                    fields.value(timestampPlayoutColumn) == "1" &&
-                   fields.value(retainReserveColumn) == "0",
-                "smoothness mode must record the fixed timestamp playout policy");
+                   fields.value(adaptiveColumn) == "1" &&
+                   fields.value(retainReserveColumn) == "0" &&
+                   fields.value(playoutDelayColumn).toULongLong() >= 2000,
+                "smoothness mode must record the adaptive timestamp playout policy");
     }
     expect(foundPresentedRow,
            "smoothness policy trace must contain a presented row");

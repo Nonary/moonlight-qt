@@ -647,10 +647,25 @@ timeline for that display; controller/cadence results remain available:
 .\vrr\release\vrrreplay.exe capture.vrrtrace --display-hz 120 --stream-fps 116
 ```
 
-Both queue policies are a fixed jitter buffer anchored to the sender
-timestamps (`controller.timestamp_playout_enabled`): every frame targets its
-RTP time mapped into the local clock plus `controller.source_playout_delay_us`
-(2 ms for low latency, 5 ms for smoothness) plus the render lead. The mapping offset is the windowed minimum of
+Both queue policies are a jitter buffer anchored to the sender timestamps
+(`controller.timestamp_playout_enabled`): every frame targets its RTP time
+mapped into the local clock plus a playout delay plus the render lead. The
+delay is self-calibrated per source-rate band
+(`controller.playout_delay_adaptive`): each band, the fitted source rate
+divided by `playout_band_width_hz`, keeps a reservoir of frame lateness
+against the mapped sender clock, excluding pairs that span a host stall, and
+targets the `playout_delay_percentile_per_mille` lateness plus
+`playout_delay_margin_us` (p98 for low latency, p99.7 for smoothness). A band
+starts at `playout_delay_start_us` (4 ms low latency, 8 ms smoothness), rises
+at most `playout_delay_attack_us` per frame, releases at most
+`playout_delay_release_us` per frame and only after
+`playout_delay_release_samples`, and is clamped between the mode's minimum
+and maximum. A band unused for `playout_band_stale_us` re-converges from the
+start value; a cadence change therefore starts high at the discontinuity
+where nobody can see the step. The lateness statistic does not depend on the
+delay chosen, so there is no feedback loop. With `playout_delay_adaptive`
+off, `controller.source_playout_delay_us` is the fixed delay. The applied
+delay is recorded per frame as `playout_delay_us`. The mapping offset is the windowed minimum of
 decode-complete minus RTP time (`playout_offset_window_us`), slewed at most
 `playout_offset_slew_us` per frame so clock drift is followed without moving
 one frame relative to its neighbours. No learned readiness reserve is applied

@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
+#include <vector>
 
 // This list is also the replay/trace parameter schema. Keeping the JSON name,
 // C++ member, type, and production default together prevents those copies from
@@ -27,6 +29,21 @@
     X(uint64_t, playout_offset_window_us, playoutOffsetWindowUs, 3000000) \
     X(uint64_t, playout_offset_slew_us, playoutOffsetSlewUs, 20) \
     X(size_t, playout_offset_warmup_samples, playoutOffsetWarmupSamples, 64) \
+    X(uint64_t, playout_delay_adaptive, playoutDelayAdaptive, 0) \
+    X(uint64_t, playout_delay_start_us, playoutDelayStartUs, 0) \
+    X(uint64_t, playout_delay_minimum_us, playoutDelayMinimumUs, 1000) \
+    X(uint64_t, playout_delay_maximum_us, playoutDelayMaximumUs, 12000) \
+    X(uint64_t, playout_delay_percentile_per_mille, playoutDelayPercentilePerMille, 980) \
+    X(uint64_t, playout_delay_margin_us, playoutDelayMarginUs, 300) \
+    X(uint64_t, playout_delay_tolerance_us, playoutDelayToleranceUs, 0) \
+    X(uint64_t, playout_delay_attack_us, playoutDelayAttackUs, 50) \
+    X(uint64_t, playout_delay_release_us, playoutDelayReleaseUs, 10) \
+    X(size_t, playout_delay_minimum_samples, playoutDelayMinimumSamples, 250) \
+    X(size_t, playout_delay_release_samples, playoutDelayReleaseSamples, 500) \
+    X(size_t, playout_delay_reservoir_samples, playoutDelayReservoirSamples, 1024) \
+    X(uint64_t, playout_band_width_hz, playoutBandWidthHz, 20) \
+    X(uint64_t, playout_band_stale_us, playoutBandStaleUs, 120000000) \
+    X(uint64_t, playout_stall_exclusion_us, playoutStallExclusionUs, 25000) \
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
     X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
     X(uint64_t, cold_start_readiness_demand_us, coldStartReadinessDemandUs, 1500) \
@@ -124,6 +141,9 @@ struct VrrTimingDecision {
 
     int64_t readyOffsetUs = 0;
     int64_t readinessBudgetUs = 0;
+    // The source playout delay this target was built with: the adaptive
+    // per-band delay under timestamp playout, else the fixed parameter.
+    uint64_t playoutDelayUs = 0;
 
     uint64_t renderStartUs = 0;
     uint64_t targetUs = 0;
@@ -190,6 +210,12 @@ public:
     // the last scheduled frame used the fixed-delay timestamp path.
     int64_t playoutOffsetUs() const;
     bool timestampPlayoutActive() const;
+    // Adaptive playout delay: the delay currently applied, the rate band it
+    // belongs to (fitted source rate divided by the band width), and how many
+    // lateness samples that band has admitted.
+    uint64_t playoutDelayUs() const;
+    unsigned int playoutBandIndex() const;
+    uint64_t playoutBandSamples() const;
     const VrrTimingParameters& parameters() const;
     VrrTimingDiagnostics diagnostics() const;
 
@@ -222,11 +248,29 @@ private:
         int64_t offsetUs = 0;
     };
 
+    // Per-rate-band lateness reservoir and the delay learned from it.
+    struct PlayoutBand {
+        std::vector<uint64_t> latenessUs;
+        size_t nextIndex = 0;
+        uint64_t samplesSeen = 0;
+        uint64_t lastUsedUs = 0;
+        uint64_t appliedDelayUs = 0;
+        bool applied = false;
+    };
+
     bool timestampPlayoutEnabled() const;
     void resetPlayoutOffsets();
     int64_t observePlayoutOffset(uint64_t decodeCompleteUs,
                                  int64_t offsetUs);
     static uint64_t rtpTicksToUs(uint64_t ticks);
+    void updatePlayoutDelay(const PacedFrame& frame,
+                            const CadenceObservation& cadence,
+                            bool rebased, int64_t readyOffsetUs,
+                            uint64_t nowUs);
+    uint64_t effectivePlayoutDelayUs() const;
+    uint64_t playoutDelayStartUs() const;
+    uint64_t playoutDelayMinimumUs() const;
+    uint64_t playoutDelayMaximumUs() const;
 
     void clearTimeline(bool retainLearnedBudgets);
     void initializeTimeline(const PacedFrame& frame);
@@ -319,6 +363,12 @@ private:
     int64_t m_AppliedPlayoutOffsetUs = 0;
     uint64_t m_PlayoutSamplesSeen = 0;
     bool m_TimestampPlayoutActive = false;
+    std::map<unsigned int, PlayoutBand> m_PlayoutBands;
+    unsigned int m_PlayoutBandIndex = 0;
+    bool m_PlayoutBandValid = false;
+    uint64_t m_AppliedPlayoutDelayUs = 0;
+    uint64_t m_LastDecodeCompleteUs = 0;
+    bool m_HaveLastDecodeComplete = false;
 
     std::deque<CadenceSample> m_CadenceSamples;
     std::deque<CadenceSample> m_RateCandidateSamples;
