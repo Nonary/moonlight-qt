@@ -27,6 +27,7 @@ constexpr uint64_t kPlayoutStartUs = 6000;
 constexpr uint64_t kPlayoutMinimumUs = 1000;
 constexpr uint64_t kPlayoutMaximumUs = 8000;
 constexpr uint64_t kPlayoutPercentilePerMille = 990;
+constexpr uint64_t kPlayoutBurstExclusionPerMille = 750;
 
 uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)
 {
@@ -79,6 +80,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayMinimumUs = kPlayoutMinimumUs;
     parameters.playoutDelayMaximumUs = kPlayoutMaximumUs;
     parameters.playoutDelayPercentilePerMille = kPlayoutPercentilePerMille;
+    parameters.playoutBurstExclusionPerMille = kPlayoutBurstExclusionPerMille;
     parameters.pacingLatencyQueueModeExtra = 0;
     return parameters;
 }
@@ -1325,8 +1327,19 @@ void VrrTimingController::updatePlayoutDelay(
         frame.decodeCompleteUs() >= m_LastDecodeCompleteUs &&
         frame.decodeCompleteUs() - m_LastDecodeCompleteUs <=
             m_Parameters.playoutStallExclusionUs;
+    // A sender interval well below the fitted period is a host burst: frames
+    // captured back-to-back after a capture stall. They arrive spaced by
+    // encode time, so their lateness against the mapping is an artifact of
+    // the burst, not of the network or decoder, and it would only inflate the
+    // delay for every normal frame.
+    const uint64_t burstFloorUs = m_SourcePeriodUs / 1000 *
+        std::min<uint64_t>(1000, m_Parameters.playoutBurstExclusionPerMille) +
+        (m_SourcePeriodUs % 1000) *
+        std::min<uint64_t>(1000, m_Parameters.playoutBurstExclusionPerMille) /
+        1000;
     const bool steadySender = cadence.intervalUs != 0 &&
-        cadence.intervalUs <= m_Parameters.playoutStallExclusionUs;
+        cadence.intervalUs <= m_Parameters.playoutStallExclusionUs &&
+        cadence.intervalUs >= burstFloorUs;
     if (!rebased && !switched && cadence.eligible &&
             !cadence.phaseDiscontinuity && steadyArrival && steadySender) {
         const uint64_t latenessUs = readyOffsetUs > 0 ?

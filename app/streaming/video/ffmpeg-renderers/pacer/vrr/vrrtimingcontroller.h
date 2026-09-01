@@ -45,6 +45,7 @@
     X(uint64_t, playout_band_width_hz, playoutBandWidthHz, 20) \
     X(uint64_t, playout_band_stale_us, playoutBandStaleUs, 120000000) \
     X(uint64_t, playout_stall_exclusion_us, playoutStallExclusionUs, 25000) \
+    X(uint64_t, playout_burst_exclusion_per_mille, playoutBurstExclusionPerMille, 0) \
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
     X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
     X(uint64_t, cold_start_readiness_demand_us, coldStartReadinessDemandUs, 1500) \
