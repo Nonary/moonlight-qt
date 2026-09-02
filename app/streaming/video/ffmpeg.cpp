@@ -312,6 +312,7 @@ void FFmpegVideoDecoder::reset()
 
     m_FramesIn = m_FramesOut = 0;
     m_FrameInfoQueue.clear();
+    m_FrameSubmitTimeQueue.clear();
 
     if (m_Pacer != nullptr) {
         // Pacer owns all producer threads. Stop them first so this final
@@ -2088,6 +2089,9 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     int frameNumber = -1;
                     uint32_t rtpTimestamp = 0;
                     bool timestampValid = false;
+                    uint64_t receiveUs = 0;
+                    uint64_t reassembledUs = 0;
+                    uint64_t decodeSubmitUs = 0;
 
                     if (vrrActive) {
                         // Capture timing while the matching DECODE_UNIT is
@@ -2101,6 +2105,14 @@ void FFmpegVideoDecoder::decoderThreadProc()
                             frameNumber = du.frameNumber;
                             rtpTimestamp = du.rtpTimestamp;
                             timestampValid = true;
+                            // First packet from the network and completed
+                            // reassembly, stamped by moonlight-common-c on
+                            // the same clock as decodeCompleteUs.
+                            receiveUs = du.receiveTimeUs;
+                            reassembledUs = du.enqueueTimeUs;
+                        }
+                        if (!m_FrameSubmitTimeQueue.isEmpty()) {
+                            decodeSubmitUs = m_FrameSubmitTimeQueue.head();
                         }
                     }
 
@@ -2189,16 +2201,23 @@ void FFmpegVideoDecoder::decoderThreadProc()
                         // existing renderers. VRR uses PacedFrame instead.
                         frame->pts = (int64_t)du.rtpTimestamp;
                     }
+                    if (!m_FrameSubmitTimeQueue.isEmpty()) {
+                        m_FrameSubmitTimeQueue.dequeue();
+                    }
 
                     m_ActiveWndVideoStats.decodedFrames++;
 
                     // Queue the frame for rendering (or render now if pacer is disabled)
                     if (vrrActive) {
-                        m_Pacer->submitFrame(PacedFrame(frame,
-                                                        frameNumber,
-                                                        rtpTimestamp,
-                                                        timestampValid,
-                                                        decodeCompleteUs));
+                        PacedFrame pacedFrame(frame,
+                                              frameNumber,
+                                              rtpTimestamp,
+                                              timestampValid,
+                                              decodeCompleteUs);
+                        pacedFrame.setDeliveryTimeline(receiveUs,
+                                                       reassembledUs,
+                                                       decodeSubmitUs);
+                        m_Pacer->submitFrame(std::move(pacedFrame));
                     }
                     else {
                         m_Pacer->submitFrame(frame);
@@ -2350,6 +2369,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
 
     m_ActiveWndVideoStats.totalReassemblyTimeUs += (du->enqueueTimeUs - du->receiveTimeUs);
 
+    const uint64_t decodeSubmitUs = LiGetMicroseconds();
     err = avcodec_send_packet(m_VideoDecoderCtx, m_Pkt);
     if (err < 0) {
         char errorstring[512];
@@ -2378,6 +2398,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     }
 
     m_FrameInfoQueue.enqueue(*du);
+    m_FrameSubmitTimeQueue.enqueue(decodeSubmitUs);
 
     m_FramesIn++;
     return DR_OK;

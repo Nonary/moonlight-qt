@@ -140,6 +140,8 @@ private:
 
     // Data buffers in the queued DU are not valid
     QQueue<DECODE_UNIT> m_FrameInfoQueue;
+    // Parallel to m_FrameInfoQueue: when each packet was handed to the decoder.
+    QQueue<uint64_t> m_FrameSubmitTimeQueue;
 
     static const uint8_t k_H264TestFrame[];
     static const uint8_t k_HEVCMainTestFrame[];

@@ -41,7 +41,8 @@ constexpr char kTraceMagic[] = "MLVRR1\n";
 #define VRR_TRACE_PARAMETER_HEADER(type, jsonName, memberName, defaultValue) \
     ",param_" #jsonName
 constexpr char kTraceHeader[] =
-    "trace_schema,arrival_sequence,frame,rtp_timestamp,rtp_valid,decode_complete_us,pacer_arrival_us,"
+    "trace_schema,arrival_sequence,frame,rtp_timestamp,rtp_valid,decode_complete_us,"
+    "frame_receive_us,frame_reassembled_us,decode_submit_us,pacer_arrival_us,"
     "arrival_queue_depth_before,arrival_queue_depth_after,queue_accepted,dequeue_us,queue_discontinuity,decision_valid,decision_us,"
     "display_refresh_hz,stream_rate_hz,additional_queued_frame,display_period_us,can_latch_present,sender_interval_us,source_rate_hz,source_period_us,"
     "source_time_us,ready_offset_us,readiness_budget_us,timing_budget_us,render_lead_us,"
@@ -1016,6 +1017,9 @@ void VrrPacingWorker::writeTrace(const QueuedFrame& queuedFrame,
     row.rtpTimestamp = frame.rtpTimestamp();
     row.timestampValid = frame.timestampValid();
     row.decodeCompleteUs = frame.decodeCompleteUs();
+    row.receiveUs = frame.receiveUs();
+    row.reassembledUs = frame.reassembledUs();
+    row.decodeSubmitUs = frame.decodeSubmitUs();
     row.input = queuedFrame.trace;
     row.decision = decision;
     // submit() and window notifications may emit terminal rows from threads
@@ -1142,6 +1146,9 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(row.rtpTimestamp);
     addBool(row.timestampValid);
     addUnsigned(row.decodeCompleteUs);
+    addUnsigned(row.receiveUs);
+    addUnsigned(row.reassembledUs);
+    addUnsigned(row.decodeSubmitUs);
     addUnsigned(row.input.arrivalUs);
     addUnsigned(row.input.queueDepthBefore);
     addUnsigned(row.input.queueDepthAfter);

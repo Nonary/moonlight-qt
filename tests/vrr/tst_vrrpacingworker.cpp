@@ -1276,7 +1276,10 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     const QByteArray row = lines.value(1);
     const QList<QByteArray> columns = header.split(',');
     const QList<QByteArray> fields = row.split(',');
-    expect(header.contains("native_present_call_us") &&
+    expect(header.contains("frame_receive_us") &&
+               header.contains("frame_reassembled_us") &&
+               header.contains("decode_submit_us") &&
+               header.contains("native_present_call_us") &&
                header.contains("presenter_submission_time_valid") &&
                header.contains("presenter_submission_time_us") &&
                header.contains("presenter_submission_time_used") &&

@@ -76,6 +76,36 @@ public:
         return m_DecodeCompleteUs;
     }
 
+    // Pre-decode timeline of the same frame, all on the LiGetMicroseconds()
+    // clock: first packet received from the network, complete frame
+    // reassembled (queued for the decoder), and packet handed to the decoder.
+    // They exist so a late decode-complete can be attributed to the network,
+    // the depacketizer, or the decoder instead of inferred. Zero means the
+    // producer did not supply them.
+    void setDeliveryTimeline(uint64_t receiveUs,
+                             uint64_t reassembledUs,
+                             uint64_t decodeSubmitUs)
+    {
+        m_ReceiveUs = receiveUs;
+        m_ReassembledUs = reassembledUs;
+        m_DecodeSubmitUs = decodeSubmitUs;
+    }
+
+    uint64_t receiveUs() const
+    {
+        return m_ReceiveUs;
+    }
+
+    uint64_t reassembledUs() const
+    {
+        return m_ReassembledUs;
+    }
+
+    uint64_t decodeSubmitUs() const
+    {
+        return m_DecodeSubmitUs;
+    }
+
     void setDecodeBoundary(uint64_t decodeBoundary)
     {
         m_DecodeBoundary = decodeBoundary;
@@ -99,5 +129,8 @@ private:
     uint32_t m_RtpTimestamp = 0;
     bool m_TimestampValid = false;
     uint64_t m_DecodeCompleteUs = 0;
+    uint64_t m_ReceiveUs = 0;
+    uint64_t m_ReassembledUs = 0;
+    uint64_t m_DecodeSubmitUs = 0;
     uint64_t m_DecodeBoundary = 0;
 };

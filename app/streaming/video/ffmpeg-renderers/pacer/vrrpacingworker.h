@@ -127,6 +127,9 @@ private:
         uint32_t rtpTimestamp = 0;
         bool timestampValid = false;
         uint64_t decodeCompleteUs = 0;
+        uint64_t receiveUs = 0;
+        uint64_t reassembledUs = 0;
+        uint64_t decodeSubmitUs = 0;
         FrameTraceContext input;
         VrrTimingDecision decision;
         VrrTimingDiagnostics diagnostics;
