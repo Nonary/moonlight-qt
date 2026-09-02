@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <vector>
 
 namespace {
 
@@ -170,6 +171,8 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
                lowLatencyPolicy.playoutDelayMinimumUs == 1000 &&
                lowLatencyPolicy.playoutDelayMaximumUs == 8000 &&
                lowLatencyPolicy.playoutDelayPercentilePerMille == 999 &&
+               lowLatencyPolicy.playoutSmoothingGainPerMille == 150 &&
+               lowLatencyPolicy.playoutSmoothingMaxLagUs == 8000 &&
                lowLatencyPolicy.pacingLatencyExtraPeriodNumerator == 0 &&
                lowLatencyPolicy.pacingLatencyQueueModeExtra == 0 &&
                lowLatencyPolicy.readinessLowPercentile == 0 &&
@@ -205,8 +208,10 @@ void testSmoothnessTimestampPlayoutHoldsFixedDelay()
     VrrSessionConfig session = config(60, 120);
     session.allowAdditionalQueuedFrame = true;
     VrrTimingParameters policy = vrrTimingParametersForSession(session);
-    // This test covers the fixed-delay mechanism; the calibrator has its own.
+    // This test covers the fixed-delay mechanism; the calibrator and the
+    // cadence smoother have their own.
     policy.playoutDelayAdaptive = 0;
+    policy.playoutSmoothingGainPerMille = 0;
     VrrTimingController controller(session, true, policy);
     const uint64_t epochUs = 1000000;
     const uint64_t delayUs = policy.sourcePlayoutDelayUs;
@@ -328,6 +333,85 @@ void testSmoothnessTimestampPlayoutHoldsFixedDelay()
            "the mapping offset must follow sustained drift");
     expect(maximumSpacingErrorUs <= policy.playoutOffsetSlewUs,
            "drift tracking must never move a target by more than the slew per frame");
+}
+
+void testCadenceSmoothingEvensJitteredSource()
+{
+    // A steady 60 FPS game whose host stamps jitter +-3 ms per frame. With
+    // smoothing off the presented intervals copy that jitter; with the
+    // session policy they must be far more even, at a bounded lag behind
+    // the raw slot, without ever re-anchoring.
+    VrrSessionConfig session = config(60, 120);
+    const uint64_t epochUs = 1000000;
+    const auto stampFor = [](int i) {
+        // Deterministic jitter in [-3000, 3000) us on the sender stamp.
+        const int64_t jitterUs =
+            static_cast<int64_t>((static_cast<uint64_t>(i) * 7919ULL) % 6000ULL) -
+            3000;
+        // Start 10 ms in so the jitter never makes the first stamp wrap.
+        const int64_t idealUs = 10000 + static_cast<int64_t>(i) * 1000000LL / 60LL;
+        return static_cast<uint32_t>((idealUs + jitterUs) * 90LL / 1000LL);
+    };
+    const auto run = [&](uint64_t gainPerMille, double& spreadUs,
+                         int64_t& maximumLagUs, unsigned int& resets) {
+        VrrTimingParameters policy = vrrTimingParametersForSession(session);
+        policy.playoutDelayAdaptive = 0;
+        policy.sourcePlayoutDelayUs = 8000;
+        policy.playoutSmoothingGainPerMille = gainPerMille;
+        VrrTimingController controller(session, true, policy);
+        std::vector<int64_t> intervals;
+        uint64_t previousTargetUs = 0;
+        maximumLagUs = 0;
+        resets = 0;
+        for (int i = 0; i < 600; ++i) {
+            const uint32_t timestamp = stampFor(i);
+            // The frame decodes a fixed transport delay after its stamp.
+            const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + 500;
+            const VrrTimingDecision decision = controller.schedule(
+                frame(i + 1, timestamp, true, decodedUs), decodedUs);
+            controller.noteSubmission(true, false, decision.targetUs);
+            if (i > 0 && (decision.rebased || decision.phaseDiscontinuity)) {
+                ++resets;
+            }
+            if (i >= 100) {
+                intervals.push_back(static_cast<int64_t>(decision.targetUs) -
+                                    static_cast<int64_t>(previousTargetUs));
+                maximumLagUs = std::max(maximumLagUs,
+                                        decision.cadenceSmoothingUs);
+            }
+            previousTargetUs = decision.targetUs;
+        }
+        double mean = 0;
+        for (int64_t value : intervals) mean += static_cast<double>(value);
+        mean /= static_cast<double>(intervals.size());
+        double variance = 0;
+        for (int64_t value : intervals) {
+            variance += (static_cast<double>(value) - mean) *
+                (static_cast<double>(value) - mean);
+        }
+        spreadUs = std::sqrt(variance / static_cast<double>(intervals.size()));
+    };
+    double rawSpreadUs = 0;
+    double smoothSpreadUs = 0;
+    int64_t rawLagUs = 0;
+    int64_t smoothLagUs = 0;
+    unsigned int rawResets = 0;
+    unsigned int smoothResets = 0;
+    run(0, rawSpreadUs, rawLagUs, rawResets);
+    run(150, smoothSpreadUs, smoothLagUs, smoothResets);
+    std::fprintf(stderr,
+                 "cadence smoothing: raw spread=%.0f us lag=%lld resets=%u; smoothed spread=%.0f us lag=%lld resets=%u\n",
+                 rawSpreadUs, static_cast<long long>(rawLagUs), rawResets,
+                 smoothSpreadUs, static_cast<long long>(smoothLagUs),
+                 smoothResets);
+    expect(rawSpreadUs > 1500.0,
+           "with smoothing off the presented intervals must copy the sender jitter");
+    expect(smoothSpreadUs < rawSpreadUs / 3.0,
+           "the session smoother must cut the presented interval spread by at least 3x");
+    expect(smoothLagUs <= 8000 && smoothLagUs > 0,
+           "the smoothed schedule must lag the raw slot by at most the configured maximum");
+    expect(rawResets == 0 && smoothResets == 0,
+           "sender stamp jitter must never re-anchor the timestamp clock");
 }
 
 void testAdaptivePlayoutDelayCalibratesPerBand()
@@ -1534,6 +1618,7 @@ int main()
     testTimingFormulaeAndReserveCap();
     testSourcePlayoutDelayOffsetsProjectedTargets();
     testSmoothnessTimestampPlayoutHoldsFixedDelay();
+    testCadenceSmoothingEvensJitteredSource();
     testAdaptivePlayoutDelayCalibratesPerBand();
     testSmoothnessLearningWindowTracksCadence();
     testLongRunNearRefreshRtpCadence();

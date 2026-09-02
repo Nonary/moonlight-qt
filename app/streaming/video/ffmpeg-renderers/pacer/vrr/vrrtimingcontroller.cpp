@@ -31,6 +31,17 @@ constexpr uint64_t kPlayoutMinimumUs = 1000;
 constexpr uint64_t kPlayoutMaximumUs = 8000;
 constexpr uint64_t kPlayoutPercentilePerMille = 999;
 constexpr uint64_t kPlayoutBurstExclusionPerMille = 750;
+// Cadence smoothing. Host presentation stamps jitter frame to frame (about
+// +-2 ms at 1440p and +-5 ms at 4K on the reference rig) even when the game
+// runs at a steady rate, and a VRR display shows every one of those steps.
+// The schedule therefore advances by a tracked source period and only pulls
+// toward each frame's raw slot by this gain, so a 5 ms early or late stamp
+// moves the presented slot 0.75 ms. Lag behind the raw slot is capped so a
+// sustained shift cannot accumulate latency; a discontinuity, stall, burst,
+// or error beyond one period snaps back to the raw slot.
+constexpr uint64_t kPlayoutSmoothingGainPerMille = 150;
+constexpr uint64_t kPlayoutSmoothingPeriodAlphaPerMille = 50;
+constexpr uint64_t kPlayoutSmoothingMaxLagUs = 8000;
 
 uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)
 {
@@ -84,6 +95,10 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayMaximumUs = kPlayoutMaximumUs;
     parameters.playoutDelayPercentilePerMille = kPlayoutPercentilePerMille;
     parameters.playoutBurstExclusionPerMille = kPlayoutBurstExclusionPerMille;
+    parameters.playoutSmoothingGainPerMille = kPlayoutSmoothingGainPerMille;
+    parameters.playoutSmoothingPeriodAlphaPerMille =
+        kPlayoutSmoothingPeriodAlphaPerMille;
+    parameters.playoutSmoothingMaxLagUs = kPlayoutSmoothingMaxLagUs;
     parameters.pacingLatencyQueueModeExtra = 0;
     return parameters;
 }
@@ -173,6 +188,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     }
     m_HaveLastDecodeComplete = false;
     m_LastDecodeCompleteUs = 0;
+    resetCadenceSmoothing();
+    m_SmoothedPeriodUs = 0;
     m_HaveTimeline = false;
     m_SourceTimeUs = 0;
     m_SourceTimeUsQ16 = 0;
@@ -310,6 +327,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     const uint64_t rtpUs = timestampPlayout ?
         rtpTicksToUs(m_UnwrappedRtpTicks) : 0;
     int64_t readyOffsetUs = 0;
+    int64_t smoothingUs = 0;
     if (timestampPlayout) {
         const int64_t offsetUs = signedDifference(frame.decodeCompleteUs(),
                                                   rtpUs);
@@ -321,9 +339,21 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         m_ReadinessBudgetUs = 0;
         m_ReadinessPhaseUs = 0;
         m_PhaseErrorFrames = 0;
-        updatePlayoutDelay(frame, cadence, rebased, readyOffsetUs, nowUs);
+        // The smoothed slot is decided against the delay in force before this
+        // frame's lateness is admitted; the delay moves at most a few
+        // microseconds per frame so the difference is immaterial. The
+        // calibrator then sees lateness against the slot actually used, so
+        // a schedule that runs ahead of a late-stamped frame is paid for by
+        // the delay rather than by a late present.
+        const uint64_t delayBeforeUs = effectivePlayoutDelayUs();
+        smoothingUs = cadenceSmoothingAdjustUs(
+            cadence, rebased, saturatingAdd(m_SourceTimeUs, delayBeforeUs),
+            delayBeforeUs);
+        updatePlayoutDelay(frame, cadence, rebased,
+                           readyOffsetUs - smoothingUs, nowUs);
     }
     else {
+        resetCadenceSmoothing();
         readyOffsetUs = signedDifference(frame.decodeCompleteUs(),
                                          m_SourceTimeUs);
         if (!rebased && !cadence.phaseDiscontinuity && cadence.eligible) {
@@ -385,7 +415,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     const uint64_t playoutDelayUs = timestampPlayout ?
         effectivePlayoutDelayUs() : m_Parameters.sourcePlayoutDelayUs;
     uint64_t targetUs = saturatingAdd(
-        addSigned(m_SourceTimeUs, m_ReadinessBudgetUs),
+        addSigned(addSigned(m_SourceTimeUs, m_ReadinessBudgetUs),
+                  smoothingUs),
         saturatingAdd(
             playoutDelayUs,
             saturatingAdd(m_RenderLeadUs,
@@ -401,7 +432,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     // the client should wait again. Reseed poisoned playout phase without
     // discarding the cumulative cadence model.
     const uint64_t maximumDirectTargetUs = saturatingAdd(
-        nowUs,
+        saturatingAdd(nowUs,
+                      static_cast<uint64_t>(std::max<int64_t>(smoothingUs, 0))),
         saturatingAdd(
             std::max(m_ConfiguredStreamPeriodUs, m_SourcePeriodUs),
             saturatingAdd(
@@ -409,6 +441,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                 saturatingAdd(m_RenderLeadUs,
                               m_Parameters.presentationSafetyUs))));
     if (targetUs > maximumDirectTargetUs) {
+        smoothingUs = 0;
+        resetCadenceSmoothing();
         // Do not clear cadence history when a faster source makes the old
         // playout phase point into the future. Reseed phase from this already
         // decoded frame and let the cumulative fit heal the rate.
@@ -450,6 +484,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.readyOffsetUs = readyOffsetUs;
     decision.readinessBudgetUs = m_ReadinessBudgetUs;
     decision.playoutDelayUs = playoutDelayUs;
+    decision.cadenceSmoothingUs = smoothingUs;
     decision.renderStartUs = renderStartUs;
     decision.targetUs = targetUs;
     decision.guardUs = m_GuardUs;
@@ -516,7 +551,92 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     m_Pending.readyOffsetUs = readyOffsetUs;
     m_LastDecodeCompleteUs = frame.decodeCompleteUs();
     m_HaveLastDecodeComplete = true;
+    if (timestampPlayout &&
+            m_Parameters.playoutSmoothingGainPerMille != 0) {
+        // The schedule continues from the slot actually used, including a
+        // late clamp or floor wait, so the frames after a late present stay
+        // evenly spaced from it and the gain walks the lag back gradually.
+        const uint64_t leadUs = saturatingAdd(
+            m_RenderLeadUs, m_Parameters.presentationSafetyUs);
+        m_LastSmoothedBasisUs = targetUs > leadUs ? targetUs - leadUs : 0;
+        m_HaveSmoothedBasis = true;
+    }
+    else {
+        resetCadenceSmoothing();
+    }
     return decision;
+}
+
+void VrrTimingController::resetCadenceSmoothing()
+{
+    m_HaveSmoothedBasis = false;
+    m_LastSmoothedBasisUs = 0;
+}
+
+int64_t VrrTimingController::cadenceSmoothingAdjustUs(
+    const CadenceObservation& cadence, bool rebased, uint64_t rawBasisUs,
+    uint64_t playoutDelayUs)
+{
+    const uint64_t gainPerMille = m_Parameters.playoutSmoothingGainPerMille;
+    if (gainPerMille == 0 || gainPerMille >= 1000) {
+        resetCadenceSmoothing();
+        return 0;
+    }
+    if (rebased || cadence.sourceRateChanged || cadence.phaseDiscontinuity ||
+            !cadence.eligible || cadence.intervalUs == 0) {
+        // A new epoch, a material rate change, or too little cadence history
+        // to trust: present on the raw slot and rebuild from here.
+        resetCadenceSmoothing();
+        return 0;
+    }
+    const uint64_t intervalUs = cadence.intervalUs;
+    // The cumulative rate fit is the authority on the source period. The
+    // tracked period only follows short-term drift around it; if the two
+    // disagree by more than a quarter (a rate change the fit has absorbed,
+    // or a bad seed from a startup burst) re-seed from the fit rather than
+    // rejecting every interval as a stall from then on.
+    const uint64_t fittedPeriodUs = std::max<uint64_t>(1, m_SourcePeriodUs);
+    if (m_SmoothedPeriodUs == 0 ||
+            m_SmoothedPeriodUs > fittedPeriodUs + fittedPeriodUs / 4 ||
+            m_SmoothedPeriodUs + fittedPeriodUs / 4 < fittedPeriodUs) {
+        m_SmoothedPeriodUs = fittedPeriodUs;
+    }
+    if (intervalUs > fittedPeriodUs * 5 / 2 ||
+            intervalUs * 2 < fittedPeriodUs) {
+        // A host stall or burst is not cadence. Keep the period estimate,
+        // restart the schedule on this frame's raw slot.
+        resetCadenceSmoothing();
+        return 0;
+    }
+    else {
+        const uint64_t alpha = std::min<uint64_t>(
+            1000, m_Parameters.playoutSmoothingPeriodAlphaPerMille);
+        const int64_t deltaUs = static_cast<int64_t>(intervalUs) -
+            static_cast<int64_t>(m_SmoothedPeriodUs);
+        m_SmoothedPeriodUs = static_cast<uint64_t>(
+            static_cast<int64_t>(m_SmoothedPeriodUs) +
+            deltaUs * static_cast<int64_t>(alpha) / 1000);
+        if (m_SmoothedPeriodUs == 0) {
+            m_SmoothedPeriodUs = 1;
+        }
+    }
+    if (!m_HaveSmoothedBasis) {
+        return 0;
+    }
+    const int64_t predictedUs = static_cast<int64_t>(
+        saturatingAdd(m_LastSmoothedBasisUs, m_SmoothedPeriodUs));
+    const int64_t errorUs = predictedUs - static_cast<int64_t>(rawBasisUs);
+    const int64_t snapUs = static_cast<int64_t>(
+        m_SmoothedPeriodUs * m_Parameters.playoutSmoothingSnapPerMille / 1000);
+    if (errorUs > snapUs || errorUs < -snapUs) {
+        resetCadenceSmoothing();
+        return 0;
+    }
+    int64_t adjustUs = errorUs * static_cast<int64_t>(1000 - gainPerMille) / 1000;
+    adjustUs = std::min(adjustUs, static_cast<int64_t>(
+        m_Parameters.playoutSmoothingMaxLagUs));
+    adjustUs = std::max(adjustUs, -static_cast<int64_t>(playoutDelayUs));
+    return adjustUs;
 }
 
 VrrTimingController::CadenceObservation

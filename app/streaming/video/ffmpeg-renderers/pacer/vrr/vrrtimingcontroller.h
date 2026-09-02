@@ -46,6 +46,10 @@
     X(uint64_t, playout_band_stale_us, playoutBandStaleUs, 120000000) \
     X(uint64_t, playout_stall_exclusion_us, playoutStallExclusionUs, 25000) \
     X(uint64_t, playout_burst_exclusion_per_mille, playoutBurstExclusionPerMille, 0) \
+    X(uint64_t, playout_smoothing_gain_per_mille, playoutSmoothingGainPerMille, 0) \
+    X(uint64_t, playout_smoothing_period_alpha_per_mille, playoutSmoothingPeriodAlphaPerMille, 50) \
+    X(uint64_t, playout_smoothing_max_lag_us, playoutSmoothingMaxLagUs, 8000) \
+    X(uint64_t, playout_smoothing_snap_per_mille, playoutSmoothingSnapPerMille, 1000) \
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
     X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
     X(uint64_t, cold_start_readiness_demand_us, coldStartReadinessDemandUs, 1500) \
@@ -146,6 +150,9 @@ struct VrrTimingDecision {
     // The source playout delay this target was built with: the adaptive
     // per-band delay under timestamp playout, else the fixed parameter.
     uint64_t playoutDelayUs = 0;
+    // Cadence smoothing: how far this target was moved from its raw mapped
+    // slot (positive = later) to keep presented intervals even.
+    int64_t cadenceSmoothingUs = 0;
 
     uint64_t renderStartUs = 0;
     uint64_t targetUs = 0;
@@ -270,6 +277,13 @@ private:
                             bool rebased, int64_t readyOffsetUs,
                             uint64_t nowUs);
     uint64_t effectivePlayoutDelayUs() const;
+    // Cadence smoothing: returns the signed adjustment to add to the raw
+    // mapped slot for this frame, tracking the source period and pulling
+    // toward the raw slot by the configured gain. Resets on discontinuities.
+    int64_t cadenceSmoothingAdjustUs(const CadenceObservation& cadence,
+                                     bool rebased, uint64_t rawBasisUs,
+                                     uint64_t playoutDelayUs);
+    void resetCadenceSmoothing();
     uint64_t playoutDelayStartUs() const;
     uint64_t playoutDelayMinimumUs() const;
     uint64_t playoutDelayMaximumUs() const;
@@ -371,6 +385,11 @@ private:
     uint64_t m_AppliedPlayoutDelayUs = 0;
     uint64_t m_LastDecodeCompleteUs = 0;
     bool m_HaveLastDecodeComplete = false;
+    // Cadence smoothing state: the presented slot the schedule continues
+    // from (target minus lead and safety) and the tracked source period.
+    bool m_HaveSmoothedBasis = false;
+    uint64_t m_LastSmoothedBasisUs = 0;
+    uint64_t m_SmoothedPeriodUs = 0;
 
     std::deque<CadenceSample> m_CadenceSamples;
     std::deque<CadenceSample> m_RateCandidateSamples;

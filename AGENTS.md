@@ -317,11 +317,18 @@ Use the replay summary's p99.5, p99.9, and p99.95 distribution fields for tail
 optimization. Generate `--timeline` CSV only when frame identity, causal
 classification, or a percentile not present in the summary is actually needed.
 
-For the cadence question that matters to the user, "were frames shown at the
-spacing the game produced them", use the sender-spacing fields the replay
-computes in-process (`replay_sender_*`, `original_sender_*`, `stock_sender_*`)
-rather than post-processing a timeline in PowerShell, which takes minutes per
-scenario. A whole delay sweep is one parallel batch:
+For the cadence question that matters to the user, "does it look smooth", use
+the presented-jerk fields the replay computes in-process
+(`replay_presented_jerk_*`, `original_presented_jerk_*`,
+`stock_presented_jerk_*`): the change in presented interval from one pair to
+the next, and the share of pairs over 2 ms. The sender-spacing fields
+(`replay_sender_*` and friends) score fidelity to the host's stamps instead;
+those stamps jitter several milliseconds frame to frame, so a policy can
+score near zero there while half the frames visibly stutter. Report both,
+lead with presented jerk, and never call a capture smooth on the
+sender-spacing fields alone. Do not post-process a timeline in PowerShell for
+this, which takes minutes per scenario. A whole delay sweep is one parallel
+batch:
 
 ```powershell
 .\build\tests-vrr\vrr\release\vrrreplay.exe $trace.FullName `

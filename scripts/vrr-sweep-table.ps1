@@ -21,6 +21,9 @@ foreach ($scenario in $batch.scenarios) {
     if ($null -eq $name -or $name -eq "") { $name = $scenario.name }
     $rows.Add([pscustomobject]@{
         scenario   = $name
+        pjerk_p50  = $s.replay_presented_jerk_p50_us
+        pjerk_p90  = $s.replay_presented_jerk_p90_us
+        pjerk_gt2  = $s.replay_presented_jerk_over_2ms_per_mille
         err_p50    = $s.replay_sender_spacing_error_p50_us
         err_p90    = $s.replay_sender_spacing_error_p90_us
         err_p99    = $s.replay_sender_spacing_error_p99_us
@@ -38,12 +41,14 @@ foreach ($scenario in $batch.scenarios) {
 if ($null -ne $first) {
     $rows.Insert(0, [pscustomobject]@{
         scenario = "stock (present on render)"
+        pjerk_p50 = $first.stock_presented_jerk_p50_us; pjerk_p90 = $first.stock_presented_jerk_p90_us; pjerk_gt2 = $first.stock_presented_jerk_over_2ms_per_mille
         err_p50 = $first.stock_sender_spacing_error_p50_us; err_p90 = $first.stock_sender_spacing_error_p90_us; err_p99 = $first.stock_sender_spacing_error_p99_us
         jerk_p99 = $first.stock_sender_jerk_p99_us; hitches = $first.stock_sender_hitches
         per_sec = [math]::Round([double]$first.stock_sender_hitches_per_second, 2); late = ""
         lat_p50 = ""; lat_p95 = ""; delay_p50 = ""; delay_max = ""; saturated = "" })
     $rows.Insert(1, [pscustomobject]@{
         scenario = "recorded session"
+        pjerk_p50 = $first.original_presented_jerk_p50_us; pjerk_p90 = $first.original_presented_jerk_p90_us; pjerk_gt2 = $first.original_presented_jerk_over_2ms_per_mille
         err_p50 = $first.original_sender_spacing_error_p50_us; err_p90 = $first.original_sender_spacing_error_p90_us; err_p99 = $first.original_sender_spacing_error_p99_us
         jerk_p99 = $first.original_sender_jerk_p99_us; hitches = $first.original_sender_hitches
         per_sec = [math]::Round([double]$first.original_sender_hitches_per_second, 2); late = ""

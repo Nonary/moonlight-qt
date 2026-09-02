@@ -1315,6 +1315,15 @@ struct SenderCadenceTracker {
     uint64_t hitchOther = 0;
     Distribution absoluteSpacingErrorUs;
     Distribution absoluteJerkUs;
+    // Evenness of what was shown, independent of the sender: the change in
+    // presented interval from one pair to the next. This is the quantity the
+    // viewer perceives as stutter; matching a jittery sender scores well on
+    // the fields above and badly here.
+    bool havePresentedInterval = false;
+    uint64_t priorPresentedIntervalUs = 0;
+    uint64_t presentedJerkPairs = 0;
+    uint64_t presentedJerkOverHitch = 0;
+    Distribution presentedJerkUs;
 
     void observe(uint64_t senderUs, uint64_t decodeUs, uint64_t submissionUs,
                  bool lateArrival, bool renderLeadJump,
@@ -1329,6 +1338,19 @@ struct SenderCadenceTracker {
                     arrivalIntervalUs <= kStallIntervalUs) {
                 const uint64_t submissionIntervalUs =
                     submissionUs - priorSubmissionUs;
+                if (havePresentedInterval) {
+                    const uint64_t jerkUs =
+                        submissionIntervalUs > priorPresentedIntervalUs ?
+                            submissionIntervalUs - priorPresentedIntervalUs :
+                            priorPresentedIntervalUs - submissionIntervalUs;
+                    presentedJerkUs.add(jerkUs);
+                    ++presentedJerkPairs;
+                    if (jerkUs > kHitchUs) {
+                        ++presentedJerkOverHitch;
+                    }
+                }
+                havePresentedInterval = true;
+                priorPresentedIntervalUs = submissionIntervalUs;
                 const int64_t residualUs =
                     static_cast<int64_t>(submissionIntervalUs) -
                     static_cast<int64_t>(senderIntervalUs);
@@ -1362,10 +1384,12 @@ struct SenderCadenceTracker {
             }
             else {
                 haveResidual = false;
+                havePresentedInterval = false;
             }
         }
         else {
             haveResidual = false;
+            havePresentedInterval = false;
         }
         havePrior = true;
         priorSenderUs = senderUs;
@@ -2823,6 +2847,13 @@ QJsonObject senderCadenceObject(const SenderCadenceTracker& tracker,
     object["absolute_spacing_error_us"] = distributionObject(
         tracker.absoluteSpacingErrorUs);
     object["absolute_jerk_us"] = distributionObject(tracker.absoluteJerkUs);
+    object["presented_jerk_us"] = distributionObject(tracker.presentedJerkUs);
+    object["presented_jerk_pairs"] =
+        static_cast<qint64>(tracker.presentedJerkPairs);
+    object["presented_jerk_over_2ms_per_mille"] =
+        tracker.presentedJerkPairs != 0 ?
+            static_cast<qint64>(tracker.presentedJerkOverHitch * 1000 /
+                                tracker.presentedJerkPairs) : 0;
     return object;
 }
 
@@ -6750,6 +6781,16 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
                     tracker.absoluteSpacingErrorUs.percentile(99));
             summary[prefix + "sender_jerk_p99_us"] =
                 static_cast<qint64>(tracker.absoluteJerkUs.percentile(99));
+            summary[prefix + "presented_jerk_p50_us"] =
+                static_cast<qint64>(tracker.presentedJerkUs.percentile(50));
+            summary[prefix + "presented_jerk_p90_us"] =
+                static_cast<qint64>(tracker.presentedJerkUs.percentile(90));
+            summary[prefix + "presented_jerk_p99_us"] =
+                static_cast<qint64>(tracker.presentedJerkUs.percentile(99));
+            summary[prefix + "presented_jerk_over_2ms_per_mille"] =
+                tracker.presentedJerkPairs != 0 ?
+                    static_cast<qint64>(tracker.presentedJerkOverHitch * 1000 /
+                                        tracker.presentedJerkPairs) : 0;
         };
         addSenderScalars("replay_", metrics.simulatedSenderCadence,
                          captureDurationUs);
@@ -6947,6 +6988,10 @@ struct TimelineDetails {
     int64_t simulatedReadinessBudgetUs = 0;
     uint64_t simulatedSourceTimeUs = 0;
     uint64_t simulatedPlayoutDelayUs = 0;
+    int64_t simulatedCadenceSmoothingUs = 0;
+    bool simulatedCadenceEligible = false;
+    bool simulatedSourceRateChanged = false;
+    bool simulatedPhaseDiscontinuity = false;
     CadenceSample recordedCadence;
     CadenceSample simulatedCadence;
     int64_t recordedSpacingMarginUs = 0;
@@ -7195,7 +7240,8 @@ bool writeTimelineHeader(QFile& file)
         "recorded_source_period_us,simulated_source_period_us,"
         "simulated_ready_offset_us,simulated_render_lead_us,"
         "simulated_readiness_budget_us,simulated_source_time_us,"
-        "simulated_playout_delay_us,"
+        "simulated_playout_delay_us,simulated_cadence_smoothing_us,"
+        "simulated_cadence_eligible,simulated_source_rate_changed,simulated_phase_discontinuity,"
         "recorded_cadence_valid,simulated_cadence_valid,"
         "recorded_source_elapsed_us,simulated_source_elapsed_us,"
         "recorded_submission_elapsed_us,simulated_submission_elapsed_us,"
@@ -7477,6 +7523,10 @@ bool writeTimelineRow(QFile& file, uint64_t arrivalSequence, int frame,
     append(QByteArray::number(details.simulatedReadinessBudgetUs));
     append(QByteArray::number(details.simulatedSourceTimeUs));
     append(QByteArray::number(details.simulatedPlayoutDelayUs));
+    append(QByteArray::number(details.simulatedCadenceSmoothingUs));
+    append(QByteArray::number(details.simulatedCadenceEligible ? 1 : 0));
+    append(QByteArray::number(details.simulatedSourceRateChanged ? 1 : 0));
+    append(QByteArray::number(details.simulatedPhaseDiscontinuity ? 1 : 0));
     append(QByteArray::number(details.recordedCadence.valid ? 1 : 0));
     append(QByteArray::number(details.simulatedCadence.valid ? 1 : 0));
     append(QByteArray::number(details.recordedCadence.sourceElapsedUs));
@@ -12687,6 +12737,14 @@ int main(int argc, char* argv[])
             simulatedDecision.sourceTimeUs;
         timelineDetails.simulatedPlayoutDelayUs =
             simulatedDecision.playoutDelayUs;
+        timelineDetails.simulatedCadenceSmoothingUs =
+            simulatedDecision.cadenceSmoothingUs;
+        timelineDetails.simulatedCadenceEligible =
+            simulatedDecision.cadenceEligible;
+        timelineDetails.simulatedSourceRateChanged =
+            simulatedDecision.sourceRateChanged;
+        timelineDetails.simulatedPhaseDiscontinuity =
+            simulatedDecision.phaseDiscontinuity;
         timelineDetails.simulatedSourceRateHz = roundedRateForPeriod(
             simulatedDecision.sourcePeriodUs);
         timelineDetails.simulatedLatched =

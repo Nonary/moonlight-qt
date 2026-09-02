@@ -415,6 +415,11 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutDelayPercentilePerMille > 1000) {
         return fail("playout_delay_percentile_per_mille must be in 0..1000");
     }
+    if (value.playoutSmoothingGainPerMille > 1000 ||
+            value.playoutSmoothingPeriodAlphaPerMille > 1000 ||
+            value.playoutSmoothingSnapPerMille > 1000) {
+        return fail("playout_smoothing gain, period alpha and snap must be in 0..1000");
+    }
     if (value.playoutDelayMinimumSamples == 0 ||
             value.playoutDelayReservoirSamples == 0 ||
             value.playoutBandWidthHz == 0 ||
