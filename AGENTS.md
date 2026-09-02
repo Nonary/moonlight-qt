@@ -8,13 +8,41 @@ The gaming build is an unsigned Windows x64 release. The canonical share is:
 \\allytwo\ChaseShare
 ```
 
-Windows also exposes it through this Network Shortcuts entry, but that folder
-only contains a `target.lnk`; do not copy release files into the shortcut
-folder itself:
+**This PC is ALLYTWO.** It is the Moonlight client, the SMB server for every
+share below, and the machine these instructions run on. `\\allytwo\...` paths
+therefore resolve locally; copying to the share is a local copy. The Sunshine
+host is a different machine on the LAN. On disk:
+
+```text
+\\allytwo\ChaseShare  ->  C:\Users\Chase\Network Share   (private drop, release builds, traces)
+\\allytwo\AllyShare   ->  C:\AllyShare                    (open drop, see below)
+```
+
+Windows also exposes ChaseShare through this Network Shortcuts entry, but that
+folder only contains a `target.lnk`; do not copy release files into the
+shortcut folder itself:
 
 ```text
 C:\Users\Chase\AppData\Roaming\Microsoft\Windows\Network Shortcuts\ChaseShare (ALLYTWO (this PC))
 ```
+
+`AllyShare` is readable and writable by anyone on the LAN without an account
+(guest logons, Everyone: Full on the share, Everyone: Modify on NTFS). It
+exists so the Sunshine host can drop its own logs and captures for host-side
+investigations. Never put release builds, `Moonlight.ini`, or anything from the
+user profile in it, and do not make ChaseShare open the same way. The setup
+that created it, with every system change listed so it can be reversed, is
+`C:\Users\Chase\setup-allyshare.ps1`; it runs elevated and requires: the LAN
+network profile Private, File and Printer Sharing on the Private profile, SMB
+server signing/encryption not required, the Guest account enabled and not
+denied network logon. A Windows 11 Pro/Enterprise 24H2 machine connecting to
+it must additionally run, elevated,
+`Set-SmbClientConfiguration -EnableInsecureGuestLogons $true -RequireSecuritySignature $false -Force`.
+
+Client session logs for a stream (received frame rate, host processing
+latency, network loss) are written by Moonlight to
+`%LOCALAPPDATA%\Temp\Moonlight-<epoch>.log` on this PC, not into the portable
+directory.
 
 The live portable installation and distributable ZIP are:
 
@@ -288,6 +316,27 @@ branch-heavy, sequential controller simulation.
 Use the replay summary's p99.5, p99.9, and p99.95 distribution fields for tail
 optimization. Generate `--timeline` CSV only when frame identity, causal
 classification, or a percentile not present in the summary is actually needed.
+
+For the cadence question that matters to the user, "were frames shown at the
+spacing the game produced them", use the sender-spacing fields the replay
+computes in-process (`replay_sender_*`, `original_sender_*`, `stock_sender_*`)
+rather than post-processing a timeline in PowerShell, which takes minutes per
+scenario. A whole delay sweep is one parallel batch:
+
+```powershell
+.\build\tests-vrr\vrr\release\vrrreplay.exe $trace.FullName `
+    --config tests\vrr\configs\playout-delay-sweep-lowlatency.json --jobs 0 `
+    --output .\build\sweep.json
+.\scripts\vrr-sweep-table.ps1 .\build\sweep.json
+```
+
+The `session-policy` row is the production policy the capture would run
+under today. Ignore any scenario the table marks `saturated`: its worker fell
+behind the source cadence and the fixed-admission replay cannot shed frames,
+so its latency is meaningless. Host capture stalls (sender intervals over
+25 ms) are excluded from the hitch count by design; report them separately
+from the trace's RTP timestamps when the user reports visible stutter, because
+they are usually the cause and the pacer cannot fix them.
 
 Keep the untouched baseline and candidate results in separately named files.
 Evaluate cadence residual p95/p99, jerk p95/p99, decode-to-submission mean and
