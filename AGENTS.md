@@ -142,16 +142,45 @@ C:\Users\Chase\sources\.tools\Qt\6.11.1\msvc2022_64\bin
 C:\Users\Chase\sources\.tools\7zip
 ```
 
-Visual Studio 2022 and its x64 C++ tools must be installed. `build-arch.bat`
-locates Visual Studio with `scripts\vswhere.exe` and initializes `vcvarsall`
-itself. Put the Qt and 7-Zip directories on `PATH`, set the custom package
-version, and build:
+Visual Studio 2022 and its x64 C++ tools must be installed. On this machine
+the build tools live under `C:\Users\Chase\sources\.tools\vs-buildtools`,
+where `scripts\vswhere.exe` does not find them, so `build-arch.bat` fails
+with "Cannot run compiler 'cl'" unless `vcvarsall` is initialized first. Put
+the Qt and 7-Zip directories on `PATH`, set the custom package version, and
+build inside the MSVC environment. For a GitHub release the version is the
+tag without the `v`, which names the MSI and ZIP assets:
 
 ```powershell
 $env:Path = "C:\Users\Chase\sources\.tools\Qt\6.11.1\msvc2022_64\bin;C:\Users\Chase\sources\.tools\7zip;$env:Path"
-$env:CI_VERSION = "$(Get-Content .\app\version.txt)-vrr-lite"
-cmd /c .\scripts\build-arch.bat release
+$env:CI_VERSION = "6.1.0-vrr12"   # or "$(Get-Content .\app\version.txt)-vrr-lite" for the share build
+cmd /d /s /c "call C:\Users\Chase\sources\.tools\vs-buildtools\VC\Auxiliary\Build\vcvarsall.bat x64 && scripts\build-arch.bat release"
 ```
+
+The script takes on the order of ten minutes (LTCG) and wipes the deploy
+tree, so the ChaseShare staging steps must be repeated afterwards.
+
+### Publishing a GitHub release
+
+Releases live at `https://github.com/Nonary/moonlight-qt/releases`, tagged
+`v6.1.0-vrrNN`, marked pre-release, with the previous release's body as the
+template (`gh release view v6.1.0-vrrNN --json body`). The GitHub CLI is at
+`C:\Users\Chase\sources\.tools\gh\bin\gh.exe` and is logged in. Create the
+draft first, upload assets as they finish, fill the SHA-256 table from the
+uploaded files, and publish last:
+
+```powershell
+$gh = "C:\Users\Chase\sources\.tools\gh\bin\gh.exe"
+& $gh release create v6.1.0-vrr12 --repo Nonary/moonlight-qt --draft --prerelease --target vrr12 --title "..." --notes-file notes.md
+& $gh release upload v6.1.0-vrr12 --repo Nonary/moonlight-qt .\build\installer-x64-release\MoonlightSetup-x64-6.1.0-vrr12.msi .\build\installer-x64-release\MoonlightPortable-x64-6.1.0-vrr12.zip
+```
+
+The Windows assets are the MSI and the portable ZIP from `build-arch.bat`;
+copy `vrrreplay.exe` and `decode-vrr-trace.py` into the deploy tree and
+recreate the ZIP before uploading so the portable package carries the
+diagnostics, as the release notes promise. The Linux AppImage and Flatpak
+assets are not produced by this repository's Windows tooling; the CI
+workflow builds an AppImage named by commit SHA on every push, and the
+Flatpak comes from outside this repository.
 
 The script cleans and recreates these directories, compiles Moonlight, deploys
 the Qt/runtime dependencies, builds the MSI, and creates the base portable ZIP:
