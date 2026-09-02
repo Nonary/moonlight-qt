@@ -654,7 +654,7 @@ lead. The delay is self-calibrated per source-rate band
 (`controller.playout_delay_adaptive`): each band, the fitted source rate
 divided by `playout_band_width_hz`, keeps a reservoir of frame lateness
 against the mapped sender clock, excluding pairs that span a host stall, and
-targets the `playout_delay_percentile_per_mille` lateness (p99) plus
+targets the `playout_delay_percentile_per_mille` lateness (p99.9) plus
 `playout_delay_margin_us`. A band starts at `playout_delay_start_us` (6 ms),
 rises at most `playout_delay_attack_us` per frame, releases at most
 `playout_delay_release_us` per frame and only after

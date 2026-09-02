@@ -18,15 +18,18 @@ constexpr uint64_t kQ16Half = kQ16One >> 1;
 // absorbs the common case at low latency and 5 ms covers roughly p97.
 // One VRR queue policy. The adaptive calibrator learns the playout delay per
 // source-rate band from the exogenous lateness of arrivals against the mapped
-// sender clock, targeting the p99 of lateness plus a margin within 1 to 8 ms.
-// A new band starts high and releases slowly so startup and regime changes
-// cost latency rather than hitches. The fixed delay below is only used when
-// the calibrator is disabled by replay parameters.
+// sender clock, targeting the p99.9 of lateness plus a margin within 1 to
+// 8 ms. On the 2026-09-01 20:04 capture p99 let one frame in a hundred
+// through as a hitch; p99.9 halved those hitches (13 to 6 in 106 s) for
+// 1.2 ms more median latency, a trade the user judged well worth it. A new
+// band starts high and releases slowly so startup and regime changes cost
+// latency rather than hitches. The fixed delay below is only used when the
+// calibrator is disabled by replay parameters.
 constexpr uint64_t kFixedPlayoutDelayUs = 3000;
 constexpr uint64_t kPlayoutStartUs = 6000;
 constexpr uint64_t kPlayoutMinimumUs = 1000;
 constexpr uint64_t kPlayoutMaximumUs = 8000;
-constexpr uint64_t kPlayoutPercentilePerMille = 990;
+constexpr uint64_t kPlayoutPercentilePerMille = 999;
 constexpr uint64_t kPlayoutBurstExclusionPerMille = 750;
 
 uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)

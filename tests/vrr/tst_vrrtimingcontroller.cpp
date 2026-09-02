@@ -169,13 +169,13 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
                lowLatencyPolicy.playoutDelayStartUs == 6000 &&
                lowLatencyPolicy.playoutDelayMinimumUs == 1000 &&
                lowLatencyPolicy.playoutDelayMaximumUs == 8000 &&
-               lowLatencyPolicy.playoutDelayPercentilePerMille == 990 &&
+               lowLatencyPolicy.playoutDelayPercentilePerMille == 999 &&
                lowLatencyPolicy.pacingLatencyExtraPeriodNumerator == 0 &&
                lowLatencyPolicy.pacingLatencyQueueModeExtra == 0 &&
                lowLatencyPolicy.readinessLowPercentile == 0 &&
                lowLatencyPolicy.readinessLoosePercentile == 80 &&
                lowLatencyPolicy.retainReadinessOnPhaseReset == 0,
-           "sessions must resolve the single adaptive p99 timestamp playout policy");
+           "sessions must resolve the single adaptive p99.9 timestamp playout policy");
     expect(smoothnessPolicy.playoutDelayAdaptive ==
                    lowLatencyPolicy.playoutDelayAdaptive &&
                smoothnessPolicy.playoutDelayStartUs ==
