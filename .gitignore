@@ -7,3 +7,17 @@ build/
 libs/
 config.tests/*/.qmake.stash
 config.tests/*/Makefile
+
+# In-tree qmake output from scripts/build-fast-windows.cmd
+/.qmake.stash
+/Makefile
+/Makefile.Debug
+/Makefile.Release
+/*/.qmake.stash
+/*/Makefile
+/*/Makefile.Debug
+/*/Makefile.Release
+/*/release/
+/*/debug/
+/app/Moonlight_resource.rc
+/app/qml_qmlcache.qrc
