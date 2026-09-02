@@ -174,10 +174,12 @@ $gh = "C:\Users\Chase\sources\.tools\gh\bin\gh.exe"
 & $gh release upload v6.1.0-vrr12 --repo Nonary/moonlight-qt .\build\installer-x64-release\MoonlightSetup-x64-6.1.0-vrr12.msi .\build\installer-x64-release\MoonlightPortable-x64-6.1.0-vrr12.zip
 ```
 
-The Windows assets are the MSI and the portable ZIP from `build-arch.bat`;
-copy `vrrreplay.exe` and `decode-vrr-trace.py` into the deploy tree and
-recreate the ZIP before uploading so the portable package carries the
-diagnostics, as the release notes promise. The Linux AppImage and Flatpak
+The Windows assets are the MSI and the portable ZIP from `build-arch.bat`.
+The script leaves the MSI as `build\build-x64-release\Moonlight.msi`; copy
+it to `build\installer-x64-release\MoonlightSetup-x64-<version>.msi` to
+match the release naming. Copy `vrrreplay.exe` and `decode-vrr-trace.py`
+into the deploy tree and recreate the ZIP before uploading so the portable
+package carries the diagnostics, as the release notes promise. The Linux AppImage and Flatpak
 assets are not produced by this repository's Windows tooling; the CI
 workflow builds an AppImage named by commit SHA on every push, and the
 Flatpak comes from outside this repository.
