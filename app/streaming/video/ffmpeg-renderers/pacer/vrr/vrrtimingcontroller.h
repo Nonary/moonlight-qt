@@ -50,6 +50,18 @@
     X(uint64_t, playout_smoothing_period_alpha_per_mille, playoutSmoothingPeriodAlphaPerMille, 50) \
     X(uint64_t, playout_smoothing_max_lag_us, playoutSmoothingMaxLagUs, 8000) \
     X(uint64_t, playout_smoothing_snap_per_mille, playoutSmoothingSnapPerMille, 1000) \
+    X(uint64_t, playout_metronome_enabled, playoutMetronomeEnabled, 0) \
+    X(uint64_t, playout_delay_start_period_per_mille, playoutDelayStartPeriodPerMille, 0) \
+    X(uint64_t, playout_delay_maximum_period_per_mille, playoutDelayMaximumPeriodPerMille, 0) \
+    X(uint64_t, playout_phase_step_minimum_us, playoutPhaseStepMinimumUs, 30) \
+    X(uint64_t, playout_phase_step_divisor, playoutPhaseStepDivisor, 64) \
+    X(uint64_t, playout_phase_step_period_per_mille, playoutPhaseStepPeriodPerMille, 20) \
+    X(uint64_t, playout_phase_residual_window_frames, playoutPhaseResidualWindowFrames, 256) \
+    X(uint64_t, playout_phase_deadband_us, playoutPhaseDeadbandUs, 100) \
+    X(uint64_t, playout_metronome_period_window_frames, playoutMetronomePeriodWindowFrames, 128) \
+    X(uint64_t, playout_offset_reseed_frames, playoutOffsetReseedFrames, 1) \
+    X(uint64_t, playout_stall_burst_exclusion, playoutStallBurstExclusion, 0) \
+    X(uint64_t, latched_floor_disabled, latchedFloorDisabled, 0) \
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
     X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
     X(uint64_t, cold_start_readiness_demand_us, coldStartReadinessDemandUs, 1500) \
@@ -151,8 +163,15 @@ struct VrrTimingDecision {
     // per-band delay under timestamp playout, else the fixed parameter.
     uint64_t playoutDelayUs = 0;
     // Cadence smoothing: how far this target was moved from its raw mapped
-    // slot (positive = later) to keep presented intervals even.
+    // slot (positive = later) to keep presented intervals even. Under the
+    // metronome this is the schedule's lag behind the mapped sender clock;
+    // a lag of a full source period or more means this frame missed its tick
+    // and is occupying a later one.
     int64_t cadenceSmoothingUs = 0;
+    // Metronome: the frame arrived this many whole source periods after its
+    // tick. Non-zero means a fresher successor, if one is already queued,
+    // should be shown instead.
+    uint64_t missedTicks = 0;
 
     uint64_t renderStartUs = 0;
     uint64_t targetUs = 0;
@@ -235,6 +254,15 @@ private:
         bool hasPreparationDuration = false;
         int64_t readyOffsetUs = 0;
         uint64_t preparationDurationUs = 0;
+        // Metronome: the slot this frame occupies, committed as the schedule
+        // basis only if the frame is actually presented so a dropped frame
+        // frees its tick for the successor.
+        bool hasSmoothedBasis = false;
+        uint64_t smoothedBasisUsQ16 = 0;
+        uint64_t smoothedBasisOrdinal = 0;
+        int64_t phaseDebtUs = 0;
+        int64_t phaseResidualEmaUs = 0;
+        int64_t basisMappingUs = 0;
     };
 
     struct CadenceObservation {
@@ -283,10 +311,23 @@ private:
     int64_t cadenceSmoothingAdjustUs(const CadenceObservation& cadence,
                                      bool rebased, uint64_t rawBasisUs,
                                      uint64_t playoutDelayUs);
+    // Metronome: the schedule advances from the last presented slot by the
+    // fitted source period and corrects phase toward the raw slot by a
+    // bounded step per frame. Returns the lag of that tick behind the raw
+    // slot; a frame that arrived after its tick reports the whole periods
+    // of shortfall in missedTicks and the caller slips it to "now".
+    int64_t metronomeAdjustUs(const CadenceObservation& cadence,
+                              bool rebased, uint64_t rawBasisUs,
+                              uint64_t playoutDelayUs,
+                              uint64_t earliestBasisUs,
+                              uint64_t& missedTicks,
+                              int64_t& remainingDebtUs);
+    bool metronomeEnabled() const;
     void resetCadenceSmoothing();
     uint64_t playoutDelayStartUs() const;
     uint64_t playoutDelayMinimumUs() const;
     uint64_t playoutDelayMaximumUs() const;
+    static uint64_t scaledPerMille(uint64_t value, uint64_t perMille);
 
     void clearTimeline(bool retainLearnedBudgets);
     void initializeTimeline(const PacedFrame& frame);
@@ -389,7 +430,33 @@ private:
     // from (target minus lead and safety) and the tracked source period.
     bool m_HaveSmoothedBasis = false;
     uint64_t m_LastSmoothedBasisUs = 0;
+    uint64_t m_LastSmoothedBasisUsQ16 = 0;
+    uint64_t m_LastSmoothedBasisOrdinal = 0;
+    // Metronome phase state. The debt is how far the grid sits from where
+    // it should be: positive after a late frame presented when ready or a
+    // floor wait, negative when the clock mapping moved later underneath it.
+    // It is paid back at the bounded step. The residual is the slow filtered
+    // difference that remains once the debt is excluded, which tracks clock
+    // drift and fit error without chasing per-frame stamp wobble.
+    int64_t m_PhaseDebtUs = 0;
+    int64_t m_PhaseResidualEmaUs = 0;
+    // The clock mapping (applied offset plus playout delay) the committed
+    // basis was placed against. Known movement of that mapping since then is
+    // owed to the schedule exactly, so neither delay slew nor offset
+    // tracking has to be rediscovered through the residual filter.
+    int64_t m_LastBasisMappingUs = 0;
+    // The metronome's tick period: the cumulative endpoint fit filtered over
+    // many frames before the negotiated-rate floor is applied. Clamping each
+    // noisy fit first biases the mean above the true period, and a tick that
+    // runs a dozen microseconds slow per frame drifts visibly.
+    uint64_t m_MetronomePeriodUsQ16 = 0;
     uint64_t m_SmoothedPeriodUs = 0;
+    // Consecutive frames whose mapped source time sat more than a period in
+    // the future; the offset is re-seeded only once enough agree.
+    unsigned int m_FutureProjectionFrames = 0;
+    // Frames still to exclude from the lateness reservoir after an arrival
+    // stall: the backlog that the stall held up, not the link's jitter.
+    uint64_t m_BurstExclusionFrames = 0;
 
     std::deque<CadenceSample> m_CadenceSamples;
     std::deque<CadenceSample> m_RateCandidateSamples;

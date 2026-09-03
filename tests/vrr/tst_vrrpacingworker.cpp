@@ -223,9 +223,11 @@ void testQueuedStaleFrameYieldsToFreshSuccessor()
 
         worker.submit(frame(2, stale));
         worker.submit(frame(3, fresh));
-        // Frame 2 is now older than its 60 FPS source period while frame 3 is
+        // Frame 2's metronome tick sits one cushion (a little over a 60 FPS
+        // period) after its stamp. Holding the pipeline 70 ms leaves that
+        // tick more than a whole period in the past while frame 3 is
         // available. It is stale content, not a pacing deadline to honor.
-        std::this_thread::sleep_for(std::chrono::milliseconds(35));
+        std::this_thread::sleep_for(std::chrono::milliseconds(70));
         backend.releasePreparation();
 
         expect(backend.waitForPresentCount(2),
@@ -262,9 +264,9 @@ void testSinglePeriodQueueDelayPreservesFluidity()
 
         worker.submit(frame(2, retained));
         worker.submit(frame(3, fresh));
-        // This crosses the 60 FPS source period but remains below the bounded
-        // two-period backlog threshold. The captured production bug dropped
-        // content at this boundary despite a valid future target.
+        // This crosses the 60 FPS source period but frame 2's tick, one
+        // cushion after its stamp, is still ahead. The captured production
+        // bug dropped content at this boundary despite a valid future target.
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         backend.releasePreparation();
 

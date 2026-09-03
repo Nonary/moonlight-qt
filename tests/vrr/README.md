@@ -647,39 +647,76 @@ timeline for that display; controller/cadence results remain available:
 .\vrr\release\vrrreplay.exe capture.vrrtrace --display-hz 120 --stream-fps 116
 ```
 
-There is one VRR queue policy. It is a jitter buffer anchored to the sender
-timestamps (`controller.timestamp_playout_enabled`): every frame targets its
-RTP time mapped into the local clock plus a playout delay plus the render
-lead. The delay is self-calibrated per source-rate band
-(`controller.playout_delay_adaptive`): each band, the fitted source rate
-divided by `playout_band_width_hz`, keeps a reservoir of frame lateness
-against the mapped sender clock, excluding pairs that span a host stall, and
-targets the `playout_delay_percentile_per_mille` lateness (p99.9) plus
-`playout_delay_margin_us`. A band starts at `playout_delay_start_us` (6 ms),
-rises at most `playout_delay_attack_us` per frame, releases at most
+There is one VRR queue policy: a metronome hung off the sender clock
+(`controller.timestamp_playout_enabled` with
+`controller.playout_metronome_enabled`). The sender's RTP time is mapped into
+the local clock, and the presented slot advances from the last presented slot
+by the fitted source period, so neither host stamp wobble nor arrival jitter
+reaches the panel. The tick period is the cumulative endpoint fit filtered
+over `playout_metronome_period_window_frames` before the negotiated-rate
+floor is applied (clamping each noisy fit first biased the mean above the
+true period and the tick drifted). Phase is corrected toward the mapped slot
+by a bounded step: lag the schedule knowingly took on (a late frame presented
+when ready, a floor wait) and known movement of the mapping (offset tracking,
+delay attack or release) are owed exactly and paid at up to
+`playout_phase_step_period_per_mille` of a period per frame; whatever remains
+is a slow filtered residual (`playout_phase_residual_window_frames`, a
+`playout_phase_deadband_us` deadband, `playout_phase_step_minimum_us` steps)
+that follows clock drift without chasing stamp wobble. A frame that arrives
+after its tick presents when ready, since on a VRR panel one interval
+stretched by the shortfall is less visible than a repeated frame, and the
+schedule continues from that slot. `missed_ticks` records whole periods of
+shortfall; the worker drops a frame that missed a tick only when a fresher
+successor is already queued, and otherwise only past a four-period age
+bound. An error beyond `playout_smoothing_snap_per_mille` of a period, a
+material rate change, or a source gap restarts the metronome on the raw
+slot. The former gain smoother remains selectable for older captures with
+`playout_metronome_enabled=0`.
+
+The playout delay is the cushion in front of the tick and is self-calibrated
+per source-rate band (`controller.playout_delay_adaptive`): each band, the
+fitted source rate divided by `playout_band_width_hz`, keeps a reservoir of
+frame lateness against the slot the metronome is trying to reach (the tick
+with its outstanding lag excluded, so a schedule still walking back a late
+frame does not hide lateness from the calibrator), and targets the
+`playout_delay_percentile_per_mille` lateness (p99.9) plus
+`playout_delay_margin_us`. The frame that ends an arrival stall and the
+frames the stall held up behind it (`playout_stall_burst_exclusion`, the gap
+in source periods) are excluded: their lateness is the stall's backlog, not
+the link's jitter. A band starts at the larger of `playout_delay_start_us`
+and `playout_delay_start_period_per_mille` of the source period (1.25
+periods, a little over the cushion stock frame pacing has), rises at most
+`playout_delay_attack_us` per frame, releases at most
 `playout_delay_release_us` per frame and only after
-`playout_delay_release_samples`, and is clamped between 1 and 8 ms. The former
-"smoothness" option, one extra source interval of queue age and one extra
-source period of render-lead budget, was retired: on a render-bound client it
-deepened the standing backlog and saturated the worker without reducing
-hitches. Captures made under it still replay with that budget through
-`additional_queued_frame` and `pacing_latency_queue_mode_extra`, which the
-production policy sets to zero. A band unused for `playout_band_stale_us` re-converges from the
-start value; a cadence change therefore starts high at the discontinuity
-where nobody can see the step. The lateness statistic does not depend on the
-delay chosen, so there is no feedback loop. With `playout_delay_adaptive`
-off, `controller.source_playout_delay_us` is the fixed delay. The applied
-delay is recorded per frame as `playout_delay_us`. The mapping offset is the windowed minimum of
+`playout_delay_release_samples`, and is capped at the larger of
+`playout_delay_maximum_us` and `playout_delay_maximum_period_per_mille` of
+the period. A cap that shrinks with the fitted period is approached at the
+release rate. The former "smoothness" option, one extra source interval of
+queue age and one extra source period of render-lead budget, was retired: on
+a render-bound client it deepened the standing backlog and saturated the
+worker without reducing hitches. Captures made under it still replay with
+that budget through `additional_queued_frame` and
+`pacing_latency_queue_mode_extra`, which the production policy sets to zero.
+A band unused for `playout_band_stale_us` re-converges from the start value.
+With `playout_delay_adaptive` off, `controller.source_playout_delay_us` is
+the fixed delay. The applied delay is recorded per frame as
+`playout_delay_us` and the tick's lag behind the raw slot as
+`cadence_smoothing_us`. The mapping offset is the windowed minimum of
 decode-complete minus RTP time (`playout_offset_window_us`), slewed at most
-`playout_offset_slew_us` per frame so clock drift is followed without moving
-one frame relative to its neighbours. No learned readiness reserve is applied
-or reported, and a late or early frame never re-anchors the clock: a frame
-later than the delay clamps to "now" and the next frame returns to its own
-slot. All resolved values are captured in schema 5, so exact replay and
+`playout_offset_slew_us` per frame. A frame whose mapped source time sits
+more than a period in the future is waited for; only
+`playout_offset_reseed_frames` consecutive such frames re-seed the mapping,
+so one early outlier cannot make every following frame late. Under latched
+presentation the production policy imposes no software spacing floor
+(`latched_floor_disabled`): the flip queue orders those presents, and a
+floor of one display period plus a guard could never sustain a source at the
+refresh rate. No learned readiness reserve is applied or reported. All
+resolved values are captured in the trace parameters, so exact replay and
 candidate sweeps use the production policy without inferring it from the
 queue-mode flag. Note that a `--set` or config scenario is treated as
-customized and does not inherit the session policy: a smoothness sweep must
-set `controller.timestamp_playout_enabled=1` explicitly alongside the delay.
+customized and does not inherit the session policy: a sweep must set
+`controller.timestamp_playout_enabled=1` and
+`controller.playout_metronome_enabled=1` explicitly alongside the delay.
 The adaptive readiness parameters remain available for replaying older
 captures and for explicit experiments.
 

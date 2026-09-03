@@ -23,6 +23,11 @@ constexpr size_t kMaximumQueuedFrames = 3;
 // boundary by even a few hundred microseconds. A second period distinguishes
 // real backlog while the bounded queue remains the hard overload limit.
 constexpr unsigned int kLowLatencyFrameAgePeriods = 2;
+// Metronome playout keeps a cushion of a little over one source period, so
+// a frame is ordinarily a fraction of a period old when it is dequeued. The
+// backlog signal there is a frame that missed its tick by a whole period
+// while a fresher successor already waits; age is only the hard bound.
+constexpr unsigned int kMetronomeFrameAgePeriods = 4;
 // ~64 seconds of rows at 120 FPS. When the writer thread cannot keep up the
 // pacing thread drops rows rather than ever waiting on diagnostics.
 constexpr size_t kMaximumTraceQueueRows = 8192;
@@ -72,7 +77,7 @@ constexpr char kTraceHeader[] =
     "native_raster_after_query_result_valid,native_raster_after_query_result,native_raster_after_query_start_us,native_raster_after_query_end_us,native_raster_after_in_vertical_blank,native_raster_after_scanline,"
     "submission_id_query_result_valid,submission_id_query_result,submission_id_query_start_us,submission_id_query_end_us,frame_stats_query_result_valid,frame_stats_query_result,frame_stats_query_start_us,frame_stats_query_end_us,latch_raw_sync_qpc_valid,latch_raw_sync_qpc_ticks,latch_raw_sync_qpc_frequency_hz,"
     "latch_qpc_correlation_valid,latch_qpc_correlation_reference_ticks,latch_qpc_correlation_reference_time_us,latch_qpc_correlation_span_ticks,"
-    "readiness_phase_us,readiness_demand_us,applied_readiness_reserve_us,render_baseline_us,render_insurance_us,pacing_latency_budget_us,cadence_sample_count,rate_candidate_sample_count,readiness_sample_count,preparation_sample_count,render_scheduler_sample_count,target_scheduler_sample_count,clean_spacing_frames,phase_error_frames,readiness_model_valid,playout_delay_us,cadence_smoothing_us"
+    "readiness_phase_us,readiness_demand_us,applied_readiness_reserve_us,render_baseline_us,render_insurance_us,pacing_latency_budget_us,cadence_sample_count,rate_candidate_sample_count,readiness_sample_count,preparation_sample_count,render_scheduler_sample_count,target_scheduler_sample_count,clean_spacing_frames,phase_error_frames,readiness_model_valid,playout_delay_us,cadence_smoothing_us,missed_ticks"
     VRR_TIMING_PARAMETER_FIELDS(VRR_TRACE_PARAMETER_HEADER)
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
@@ -415,10 +420,14 @@ int VrrPacingWorker::run()
                 frame.decodeCompleteUs() ?
             scheduleNowUs - frame.decodeCompleteUs() : 0;
         telemetry.staleAgeUs = scheduleAgeUs;
+        const bool metronome =
+            m_TimingController->parameters().playoutMetronomeEnabled != 0;
         const uint64_t maximumFrameAgeUs = queueAgeToleranceUs(
-            decision.sourcePeriodUs, kLowLatencyFrameAgePeriods);
-        if (decision.sourcePeriodUs != 0 &&
-            scheduleAgeUs > maximumFrameAgeUs && hasQueuedFrame()) {
+            decision.sourcePeriodUs,
+            metronome ? kMetronomeFrameAgePeriods : kLowLatencyFrameAgePeriods);
+        const bool missedTickBacklog = metronome && decision.missedTicks != 0;
+        if (decision.sourcePeriodUs != 0 && hasQueuedFrame() &&
+            (scheduleAgeUs > maximumFrameAgeUs || missedTickBacklog)) {
             writeTrace(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
                        TraceDisposition::Stale);
             noteDrop();
@@ -483,7 +492,14 @@ int VrrPacingWorker::run()
             writeTrace(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
                        TraceDisposition::Stale);
             noteDrop();
-            m_TimingController->rebase();
+            if (metronome) {
+                // The tick is freed for the successor; the clock mapping is
+                // still valid and a rebase would only restart its warm-up.
+                m_TimingController->noteSubmission(false, false, 0);
+            }
+            else {
+                m_TimingController->rebase();
+            }
             continue;
         }
 
@@ -1417,6 +1433,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addBool(diagnostics.readinessModelValid);
     addUnsigned(decision.playoutDelayUs);
     addSigned(decision.cadenceSmoothingUs);
+    addUnsigned(decision.missedTicks);
 #define VRR_ADD_TRACE_PARAMETER(type, jsonName, memberName, defaultValue) \
     addUnsigned(static_cast<uint64_t>(parameters.memberName));
     VRR_TIMING_PARAMETER_FIELDS(VRR_ADD_TRACE_PARAMETER)
