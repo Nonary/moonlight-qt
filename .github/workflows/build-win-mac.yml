@@ -9,6 +9,12 @@ on:
       ci_version:
         required: true
         type: string
+  workflow_dispatch:
+    inputs:
+      ci_version:
+        description: Version string used for the release artifacts
+        required: true
+        type: string
 
 jobs:
   build:
