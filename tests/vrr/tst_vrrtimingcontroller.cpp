@@ -230,26 +230,30 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
            "only captures made under the retired option keep its extra render budget");
 }
 
-void testSmoothnessTimestampPlayoutHoldsFixedDelay()
+void testTimestampModePreservesUnevenHostIntervals()
 {
-    // 60 FPS on 120 Hz so the display-spacing floor never binds and every
-    // target is decided by the playout schedule alone.
+    // A 60 FPS average with alternating 13.33/20 ms source intervals.
+    // Both fit a 120 Hz display, so a faithful scheduler must preserve
+    // this real source variation while absorbing separate delivery jitter.
     VrrSessionConfig session = config(60, 120);
-    session.allowAdditionalQueuedFrame = true;
+    session.smoothFrameTiming = false;
     VrrTimingParameters policy = vrrTimingParametersForSession(session);
-    // This test covers the fixed-delay mechanism; the calibrator, the
-    // legacy cadence smoother, and the metronome have their own.
+    expect(policy.timestampPlayoutEnabled == 1 &&
+               policy.playoutDelayAdaptive == 1 &&
+               policy.playoutMetronomeEnabled == 0 &&
+               policy.playoutSmoothingGainPerMille == 0,
+           "disabling frame timing smoothing must keep buffering and disable both smoothers");
+    // Hold the buffering delay constant to isolate interval fidelity;
+    // the adaptive calibrator has separate coverage.
     policy.playoutDelayAdaptive = 0;
-    policy.playoutSmoothingGainPerMille = 0;
-    policy.playoutMetronomeEnabled = 0;
     VrrTimingController controller(session, true, policy);
     const uint64_t epochUs = 1000000;
     const uint64_t delayUs = policy.sourcePlayoutDelayUs;
 
     const auto rtpFor = [](int i) {
-        return static_cast<uint32_t>(static_cast<uint64_t>(i) * 90000ULL / 60ULL);
+        return static_cast<uint32_t>((i / 2) * 3000 + (i % 2) * 1200);
     };
-    // Deterministic jitter in [0, 3000) us, all below the 5 ms delay. Every
+    // Deterministic jitter in [0, 3000] us, within the 3 ms delay. Every
     // fiftieth frame arrives with zero jitter so the three-second offset
     // window always contains the true floor and the mapping stays fixed.
     const auto jitterFor = [](int i) {
@@ -308,7 +312,7 @@ void testSmoothnessTimestampPlayoutHoldsFixedDelay()
     expect(reserveReports == 0,
            "timestamp playout must not apply or report a learned readiness reserve");
     expect(controller.timestampPlayoutActive(),
-           "smoothness sessions with RTP timestamps must use timestamp playout");
+           "sessions with smoothing disabled must still use timestamp playout");
     expect(controller.playoutOffsetUs() == static_cast<int64_t>(epochUs),
            "the applied offset must be the earliest arrival in the window");
     expect(decision.targetUs ==
@@ -363,6 +367,39 @@ void testSmoothnessTimestampPlayoutHoldsFixedDelay()
            "the mapping offset must follow sustained drift");
     expect(maximumSpacingErrorUs <= policy.playoutOffsetSlewUs,
            "drift tracking must never move a target by more than the slew per frame");
+}
+
+void testTimestampModeStillBoundsCatchUpBursts()
+{
+    VrrSessionConfig session = config(116, 120);
+    session.smoothFrameTiming = false;
+    VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    policy.playoutDelayAdaptive = 0;
+    VrrTimingController controller(session, false, policy);
+    const uint64_t epochUs = 1000000;
+    const auto present = [&](int number, uint32_t stamp, uint64_t readyUs) {
+        const VrrTimingDecision decision = controller.schedule(
+            frame(number, stamp, true, readyUs), readyUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        return decision;
+    };
+
+    present(1, 0, epochUs);
+    // A 10 ms source interval, with the second frame arriving 8 ms late.
+    const VrrTimingDecision late = present(2, 900, epochUs + 18000);
+    const uint64_t floorUs = controller.earliestSubmissionUs();
+    // The next frame arrives on time and must not catch up in only 5 ms.
+    const VrrTimingDecision next = present(3, 1800, epochUs + 20000);
+    expect(next.targetUs >= floorUs &&
+               next.targetUs >= late.targetUs + controller.displayPeriodUs() +
+                                   controller.guardUs(),
+           "timestamp mode must retain the adaptive presentation spacing guard");
+    expect(next.targetUs > epochUs + 20000 + policy.sourcePlayoutDelayUs,
+           "display limits must override an infeasibly close host timestamp target");
+    expect(next.targetUs == floorUs,
+           "timestamp mode must not add latency beyond the required spacing floor");
+    expect(next.cadenceSmoothingUs == 0 && controller.timestampPlayoutActive(),
+           "protecting a catch-up burst must not re-enable cadence smoothing");
 }
 
 void testCadenceSmoothingEvensJitteredSource()
@@ -2426,7 +2463,8 @@ int main()
     testRtpWrapResetAndFallback();
     testTimingFormulaeAndReserveCap();
     testSourcePlayoutDelayOffsetsProjectedTargets();
-    testSmoothnessTimestampPlayoutHoldsFixedDelay();
+    testTimestampModePreservesUnevenHostIntervals();
+    testTimestampModeStillBoundsCatchUpBursts();
     testCadenceSmoothingEvensJitteredSource();
     testAdaptivePlayoutDelaySlewsAcrossBands();
     testPrepareOnArrivalSpendsTheCushion();

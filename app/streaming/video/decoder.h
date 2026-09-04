@@ -73,6 +73,7 @@ typedef struct _DECODER_PARAMETERS {
     bool enableFramePacing;
     // VRR is an opt-in, session-snapshotted third pacing mode.
     bool enableVrr;
+    bool smoothVrrFrameTiming;
     // Strictly obtained during Session initialization. A value of zero means
     // the session was not qualified for VRR; Pacer must not substitute a
     // legacy 60 Hz fallback when this path is requested.

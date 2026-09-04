@@ -20,6 +20,9 @@ struct VrrSessionConfig {
     // adaptive-refresh floor; zero Hz disables it.
     bool gapFillEnabled = false;
     int gapFillMinimumRefreshHz = 0;
+    // A session preference resolved into the recorded controller parameters.
+    // Both modes retain jitter buffering and display-spacing protection.
+    bool smoothFrameTiming = true;
 };
 
 // A move-only frame record.  Decoder completion is captured while the

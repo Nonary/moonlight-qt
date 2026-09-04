@@ -660,13 +660,42 @@ timeline for that display; controller/cadence results remain available:
 .\vrr\release\vrrreplay.exe capture.vrrtrace --display-hz 120 --stream-fps 116
 ```
 
-There is one VRR queue policy: a metronome hung off the sender clock
-(`controller.timestamp_playout_enabled` with
-`controller.playout_metronome_enabled`). The sender's RTP time is mapped into
+VRR uses adaptive timestamp playout with a **Smooth frame timing** preference
+under the VRR checkbox. It defaults to enabled, preserving the existing policy,
+and is snapshotted for the stream, including decoder resets. The stream CLI
+can override it with `--vrr-smooth-frame-timing` or
+`--no-vrr-smooth-frame-timing` without saving the override.
+
+Disabling smoothing follows mapped RTP intervals more closely. It disables
+both `controller.playout_metronome_enabled` and
+`controller.playout_smoothing_gain_per_mille`; turning off only the metronome
+would leave the production gain smoother active. Adaptive jitter buffering, clock
+tracking, readiness constraints, and refresh-spacing protection remain active.
+Consequently, this mode preserves feasible timestamp variation but does not
+promise exact game presentation timing: the supplied timestamps may reflect
+capture timing, and late frames, display limits, or buffering/clock corrections
+can still change an interval. The deterministic timestamp-mode test preserves
+alternating source intervals under independent delivery jitter and verifies
+that a late-frame catch-up burst still respects the display floor.
+
+The resolved parameters are already recorded in schema-5 traces, so the
+recorded mode is recoverable without a new trace field. An exact baseline
+must still pass before treating a capture as an A/B reference. The replay's
+`session-policy` scenario continues to select the default smoothed policy;
+explicitly set both parameters above to zero to evaluate timestamp-following
+candidates.
+
+With smoothing enabled, production uses the gain smoother: it advances by a
+tracked source period and pulls 20 percent toward the mapped timestamp slot,
+with a 10-percent period EMA and a 6 ms lag cap. The metronome remains disabled.
+
+The retired metronome policy is available for replay with
+`controller.timestamp_playout_enabled` and
+`controller.playout_metronome_enabled`. The sender's RTP time is mapped into
 the local clock, and the presented slot advances from the last presented slot
-by the fitted source period, so neither host stamp wobble nor arrival jitter
-reaches the panel. The tick period is the cumulative endpoint fit filtered
-over `playout_metronome_period_window_frames` before the negotiated-rate
+by the fitted source period to reduce the influence of host stamp wobble and
+arrival jitter on presentation intervals. The tick period is the cumulative
+endpoint fit filtered over `playout_metronome_period_window_frames` before the negotiated-rate
 floor is applied (clamping each noisy fit first biased the mean above the
 true period and the tick drifted). Phase is corrected toward the mapped slot
 by a bounded step: lag the schedule knowingly took on (a late frame presented
@@ -683,8 +712,8 @@ shortfall; the worker drops a frame that missed a tick only when a fresher
 successor is already queued, and otherwise only past a four-period age
 bound. An error beyond `playout_smoothing_snap_per_mille` of a period, a
 material rate change, or a source gap restarts the metronome on the raw
-slot. The former gain smoother remains selectable for older captures with
-`playout_metronome_enabled=0`.
+slot. This metronome policy remains selectable for older captures; production
+uses the gain smoother described above.
 
 The playout delay is the cushion in front of the tick and is self-calibrated
 per source-rate band (`controller.playout_delay_adaptive`): each band, the

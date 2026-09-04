@@ -293,7 +293,8 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
 bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                        bool enablePacing, bool enableVsync,
                        bool enableVrr, int vrrDisplayRefreshHz,
-                       bool enableVrrGapFill, int vrrGapFillMinimumHz)
+                       bool enableVrrGapFill, int vrrGapFillMinimumHz,
+                       bool smoothVrrFrameTiming)
 {
     m_MaxVideoFps = maxVideoFps;
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
@@ -306,6 +307,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         config.streamRateHz = maxVideoFps;
         config.displayRefreshHz = vrrDisplayRefreshHz;
+        config.smoothFrameTiming = smoothVrrFrameTiming;
         // There is one VRR queue policy. The flag remains in the session
         // config only so older captures replay under the policy they ran.
         config.allowAdditionalQueuedFrame = false;
@@ -345,8 +347,9 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                     if (m_VrrWorker->start()) {
                         m_DisplayFps = config.displayRefreshHz;
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "VRR pacing: target %d Hz with %d FPS stream (adaptive timestamp playout)",
-                                    m_DisplayFps, m_MaxVideoFps);
+                                    "VRR pacing: target %d Hz with %d FPS stream (adaptive timestamp playout, frame timing %s)",
+                                    m_DisplayFps, m_MaxVideoFps,
+                                    config.smoothFrameTiming ? "smoothed" : "follows host timestamps");
                         return true;
                     }
 

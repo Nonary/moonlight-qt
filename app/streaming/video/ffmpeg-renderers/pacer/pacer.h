@@ -58,7 +58,8 @@ public:
                     bool enablePacing, bool enableVsync,
                     bool enableVrr, int vrrDisplayRefreshHz,
                     bool enableVrrGapFill = false,
-                    int vrrGapFillMinimumHz = 0);
+                    int vrrGapFillMinimumHz = 0,
+                    bool smoothVrrFrameTiming = true);
 
     void notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info);
 

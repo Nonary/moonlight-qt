@@ -886,6 +886,23 @@ Flickable {
                 }
 
                 CheckBox {
+                    hoverEnabled: true
+                    text: qsTr("Smooth frame timing")
+                    font.pointSize: 12
+                    visible: StreamingPreferences.enableVrr
+                    enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                    checked: StreamingPreferences.smoothVrrFrameTiming
+                    onCheckedChanged: {
+                        StreamingPreferences.smoothVrrFrameTiming = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Smooths variations in host frame timing. Turn off to follow host timestamps more closely. Both modes buffer delivery jitter and respect display limits.")
+                }
+
+                CheckBox {
                     id: enableHdr
                     width: parent.width
                     text: qsTr("Enable HDR")

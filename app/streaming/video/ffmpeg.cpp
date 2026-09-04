@@ -573,7 +573,8 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
                                  params->enableVrr,
                                  params->vrrDisplayRefreshHz,
                                  params->enableVrrGapFill,
-                                 params->vrrGapFillMinimumHz)) {
+                                 params->vrrGapFillMinimumHz,
+                                 params->smoothVrrFrameTiming)) {
             return false;
         }
     }

@@ -117,7 +117,6 @@ VrrTimingParameters vrrTimingParametersForSession(
     // reserve, its per-frame slewing, and every phase re-anchor are off on this
     // path: they each moved the target between frames the source had spaced
     // evenly. Explicit parameters keep older policies replayable.
-    (void) config;
     VrrTimingParameters parameters;
     parameters.timestampPlayoutEnabled = 1;
     parameters.playoutDelayAdaptive = 1;
@@ -154,6 +153,14 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutStallBurstExclusion = 1;
     parameters.latchedFloorDisabled = 1;
     parameters.pacingLatencyQueueModeExtra = 0;
+    if (!config.smoothFrameTiming) {
+        // Preserve the mapped RTP intervals instead of regularizing the
+        // source cadence. Keep the adaptive delay, readiness constraints,
+        // and display-spacing floor in effect. Disable both the production
+        // gain smoother and the replay-compatible metronome.
+        parameters.playoutMetronomeEnabled = 0;
+        parameters.playoutSmoothingGainPerMille = 0;
+    }
     return parameters;
 }
 
