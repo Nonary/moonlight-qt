@@ -96,6 +96,24 @@ jobs:
             bash scripts/generate-dmg.sh Release
           }
 
+      - name: Stage Windows x64 installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item build/build-x64-release/Moonlight.msi `
+            "build/installer-x64-release/MoonlightSetup-x64-$Env:CI_VERSION.msi"
+
+      - name: Upload Windows release packages
+        uses: actions/upload-artifact@v6
+        if: runner.os == 'Windows'
+        with:
+          name: Moonlight-Windows-Release-${{ env.CI_VERSION }}
+          path: |
+            build/installer-x64-release/MoonlightSetup-x64-${{ env.CI_VERSION }}.msi
+            build/installer-x64-release/MoonlightPortable-x64-${{ env.CI_VERSION }}.zip
+          compression-level: 0
+          if-no-files-found: error
+
       - name: Upload Binaries (Windows x64)
         uses: actions/upload-artifact@v6
         if: runner.os == 'Windows'
