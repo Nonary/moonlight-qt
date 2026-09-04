@@ -84,6 +84,7 @@ bool VDPAURenderer::initialize(PDECODER_PARAMETERS params)
     // Avoid initializing VDPAU on this window on the first selection pass if:
     // a) We know we want HDR compatibility
     // b) The user wants to prefer Vulkan
+    // c) Linux VRR requires the Vulkan frontend
     //
     // Using VDPAU may lead to side-effects that break our attempts to create
     // a Vulkan swapchain on this window later.
@@ -91,9 +92,11 @@ bool VDPAURenderer::initialize(PDECODER_PARAMETERS params)
         if (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) {
             return false;
         }
-        else if (qgetenv("PREFER_VULKAN") == "1") {
+        else if (params->enableVrr || qgetenv("PREFER_VULKAN") == "1") {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Deprioritizing Vulkan-incompatible VDPAU renderer due to PREFER_VULKAN=1");
+                        "Deprioritizing Vulkan-incompatible VDPAU renderer due to %s",
+                        params->enableVrr ? "active VRR request" :
+                                            "PREFER_VULKAN=1");
             return false;
         }
     }

@@ -389,6 +389,18 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
 {
     bool glIsSlow;
     bool vulkanIsSlow;
+#ifdef HAVE_LIBPLACEBO_VULKAN
+#if defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN)
+    // Vulkan is the only Linux frontend that implements IVrrFramePresenter.
+    // Treat an active VRR request as an explicit Vulkan preference here so
+    // renderer auto-selection cannot silently choose EGL/DRM/direct output and
+    // leave Pacer to fall back to fixed V-sync. If Vulkan initialization fails,
+    // the existing alternate/direct pass still provides the fixed fallback.
+    const bool preferVulkanForVrr = params->enableVrr;
+#else
+    const bool preferVulkanForVrr = false;
+#endif
+#endif
 
     if (!Utils::getEnvironmentVariableOverride("GL_IS_SLOW", &glIsSlow)) {
 #ifdef GL_IS_SLOW
@@ -415,9 +427,13 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
     if (useAlternateFrontend && m_BackendRenderer->getRendererType() != IFFmpegRenderer::RendererType::Vulkan) {
         if (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) {
 #ifdef HAVE_LIBPLACEBO_VULKAN
-            if (!vulkanIsSlow) {
+            if (!vulkanIsSlow || preferVulkanForVrr) {
                 // The Vulkan renderer can also handle HDR with a supported compositor. We prefer
                 // rendering HDR with Vulkan if possible since it's more fully featured than DRM.
+                if (preferVulkanForVrr) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR requested: preferring Vulkan frontend on Linux");
+                }
                 m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
                 if (initializeRendererInternal(m_FrontendRenderer, params) && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_HDR_SUPPORT)) {
                     return true;
@@ -458,7 +474,11 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
         else
         {
 #ifdef HAVE_LIBPLACEBO_VULKAN
-            if (qgetenv("PREFER_VULKAN") == "1") {
+            if (preferVulkanForVrr || qgetenv("PREFER_VULKAN") == "1") {
+                if (preferVulkanForVrr) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "VRR requested: preferring Vulkan frontend on Linux");
+                }
                 m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
                 if (initializeRendererInternal(m_FrontendRenderer, params)) {
                     return true;
