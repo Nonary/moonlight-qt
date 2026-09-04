@@ -8,10 +8,12 @@ ratepolicy.file = $$PWD/ratepolicy.pro
 pacingworker.file = $$PWD/pacingworker.pro
 replay.file = $$PWD/replay.pro
 replayconfig.file = $$PWD/replayconfig.pro
+queuesim.file = $$PWD/queuesim.pro
 
 SUBDIRS += \
     timingcontroller \
     ratepolicy \
     pacingworker \
     replay \
-    replayconfig
+    replayconfig \
+    queuesim

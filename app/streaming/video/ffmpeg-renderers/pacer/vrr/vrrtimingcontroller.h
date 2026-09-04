@@ -60,6 +60,17 @@
     X(uint64_t, playout_phase_deadband_us, playoutPhaseDeadbandUs, 100) \
     X(uint64_t, playout_metronome_period_window_frames, playoutMetronomePeriodWindowFrames, 128) \
     X(uint64_t, playout_offset_reseed_frames, playoutOffsetReseedFrames, 1) \
+    X(uint64_t, playout_motion_deadband_enabled, playoutMotionDeadbandEnabled, 0) \
+    X(uint64_t, playout_motion_floor_us, playoutMotionFloorUs, 1000) \
+    X(uint64_t, playout_motion_ceiling_period_per_mille, playoutMotionCeilingPeriodPerMille, 750) \
+    X(uint64_t, playout_motion_gain_per_mille, playoutMotionGainPerMille, 1500) \
+    X(unsigned int, playout_motion_percentile, playoutMotionPercentile, 90) \
+    X(size_t, playout_motion_window_frames, playoutMotionWindowFrames, 128) \
+    X(size_t, playout_motion_minimum_samples, playoutMotionMinimumSamples, 16) \
+    X(uint64_t, playout_delay_slew_across_bands, playoutDelaySlewAcrossBands, 0) \
+    X(uint64_t, playout_prepare_on_arrival, playoutPrepareOnArrival, 0) \
+    X(uint64_t, render_start_after_submission_us, renderStartAfterSubmissionUs, 0) \
+    X(uint64_t, render_start_minimum_lead_us, renderStartMinimumLeadUs, 1500) \
     X(uint64_t, playout_stall_burst_exclusion, playoutStallBurstExclusion, 0) \
     X(uint64_t, latched_floor_disabled, latchedFloorDisabled, 0) \
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
@@ -93,6 +104,7 @@
     X(size_t, minimum_cadence_samples, minimumCadenceSamples, 6) \
     X(size_t, maximum_cadence_samples, maximumCadenceSamples, 512) \
     X(size_t, rate_candidate_samples, rateCandidateSamples, 3) \
+    X(uint64_t, rate_candidate_minimum_us, rateCandidateMinimumUs, 0) \
     X(uint64_t, loose_cadence_window_us, looseCadenceWindowUs, 350000) \
     X(uint64_t, tight_cadence_window_us, tightCadenceWindowUs, 1000000) \
     X(uint64_t, major_cadence_ratio_numerator, majorCadenceRatioNumerator, 7) \
@@ -158,6 +170,8 @@ struct VrrTimingDecision {
     uint64_t sourcePeriodUs = 0;
 
     int64_t readyOffsetUs = 0;
+    // How far the display floor pushed the target past the frame's own slot.
+    uint64_t presentationFloorPushUs = 0;
     int64_t readinessBudgetUs = 0;
     // The source playout delay this target was built with: the adaptive
     // per-band delay under timestamp playout, else the fixed parameter.
@@ -323,6 +337,7 @@ private:
                               uint64_t& missedTicks,
                               int64_t& remainingDebtUs);
     bool metronomeEnabled() const;
+    uint64_t motionThresholdUs(uint64_t periodUs) const;
     void resetCadenceSmoothing();
     uint64_t playoutDelayStartUs() const;
     uint64_t playoutDelayMinimumUs() const;
@@ -424,6 +439,7 @@ private:
     unsigned int m_PlayoutBandIndex = 0;
     bool m_PlayoutBandValid = false;
     uint64_t m_AppliedPlayoutDelayUs = 0;
+    bool m_AppliedPlayoutDelayValid = false;
     uint64_t m_LastDecodeCompleteUs = 0;
     bool m_HaveLastDecodeComplete = false;
     // Cadence smoothing state: the presented slot the schedule continues
@@ -451,6 +467,11 @@ private:
     // runs a dozen microseconds slow per frame drifts visibly.
     uint64_t m_MetronomePeriodUsQ16 = 0;
     uint64_t m_SmoothedPeriodUs = 0;
+    // Recent magnitudes of the stamp's deviation from the metronome grid
+    // once known debt is excluded. Their upper percentile is the capture
+    // jitter the grid absorbs; a deviation beyond it is motion timing the
+    // stamp is reporting, and the frame presents on its stamp instead.
+    std::deque<uint64_t> m_MotionResiduals;
     // Consecutive frames whose mapped source time sat more than a period in
     // the future; the offset is re-seeded only once enough agree.
     unsigned int m_FutureProjectionFrames = 0;

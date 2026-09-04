@@ -33,7 +33,11 @@ constexpr uint64_t kFixedPlayoutDelayUs = 3000;
 constexpr uint64_t kPlayoutStartUs = 6000;
 constexpr uint64_t kPlayoutMinimumUs = 1000;
 constexpr uint64_t kPlayoutMaximumUs = 8000;
-constexpr uint64_t kPlayoutPercentilePerMille = 999;
+// The whole reservoir tail: the delay covers the largest lateness seen in
+// the last thousand admitted frames plus the margin, so a late present is
+// something the exclusions below deliberately left out (a host stall and
+// the frames bunched behind it), never ordinary jitter.
+constexpr uint64_t kPlayoutPercentilePerMille = 1000;
 constexpr uint64_t kPlayoutBurstExclusionPerMille = 750;
 // Legacy cadence smoothing, kept so captures made under it replay the same
 // way. Host presentation stamps jitter frame to frame (about +-2 ms at
@@ -58,6 +62,22 @@ constexpr uint64_t kPlayoutSmoothingMaxLagUs = 8000;
 constexpr uint64_t kPlayoutStartPeriodPerMille = 1250;
 constexpr uint64_t kPlayoutMaximumPeriodPerMille = 1250;
 constexpr uint64_t kPlayoutMetronomeSnapPerMille = 3000;
+// A provisional cadence segment after a major departure must span this much
+// sender time before its fit replaces the source rate. Three long stamps
+// used to be enough, so a four-frame host hitch became a 30 Hz source and
+// every rate-dependent term followed it there and back.
+constexpr uint64_t kRateCandidateMinimumUs = 200000;
+// Preparation acquires the next swapchain image, and on a compositor that
+// releases the previous image only when it flips, an acquire that follows
+// the previous present too closely blocks for up to several display periods.
+// Preparation that starts this long after the previous present did not
+// block; the minimum lead keeps enough time for the preparation itself.
+constexpr uint64_t kRenderStartAfterSubmissionUs = 6000;
+constexpr uint64_t kRenderStartMinimumLeadUs = 2500;
+// With the decoder's GPU work synced before preparation, the learned lead
+// collapses to the 0.6 ms render and no longer covers the sporadic 2 to 3 ms
+// renders; the floor keeps that headroom.
+constexpr uint64_t kRenderLeadFloorUs = 3000;
 // Consecutive frames that must map more than a period into the future before
 // the sender clock is considered to have jumped. One early outlier used to
 // re-seed the mapping on itself and make every following frame late.
@@ -115,16 +135,31 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayMaximumUs = kPlayoutMaximumUs;
     parameters.playoutDelayPercentilePerMille = kPlayoutPercentilePerMille;
     parameters.playoutBurstExclusionPerMille = kPlayoutBurstExclusionPerMille;
-    parameters.playoutSmoothingGainPerMille = kPlayoutSmoothingGainPerMille;
+    // The presented interval between two frames is the host's stamp
+    // interval between them: no smoother, grid or deadband moves a frame
+    // off its slot. The delay absorbs jitter and only ever slews. The
+    // cadence smoother and metronome remain reachable through replay
+    // parameters so captures made under them replay the same way.
+    parameters.playoutSmoothingGainPerMille = 0;
     parameters.playoutSmoothingPeriodAlphaPerMille =
         kPlayoutSmoothingPeriodAlphaPerMille;
     parameters.playoutSmoothingMaxLagUs = kPlayoutSmoothingMaxLagUs;
-    parameters.playoutMetronomeEnabled = 1;
+    parameters.playoutMetronomeEnabled = 0;
     parameters.playoutDelayStartPeriodPerMille = kPlayoutStartPeriodPerMille;
     parameters.playoutDelayMaximumPeriodPerMille =
         kPlayoutMaximumPeriodPerMille;
     parameters.playoutSmoothingSnapPerMille = kPlayoutMetronomeSnapPerMille;
     parameters.playoutOffsetReseedFrames = kPlayoutOffsetReseedFrames;
+    parameters.playoutDelaySlewAcrossBands = 1;
+    // Preparing on arrival is replay-only: on the Vulkan desktop path the
+    // preparation blocks in the swapchain when it follows a present too
+    // closely, so the worker sat busy and the next frame aged past the
+    // stale limit.
+    parameters.playoutPrepareOnArrival = 0;
+    parameters.renderStartAfterSubmissionUs = kRenderStartAfterSubmissionUs;
+    parameters.renderStartMinimumLeadUs = kRenderStartMinimumLeadUs;
+    parameters.renderLeadFloorUs = kRenderLeadFloorUs;
+    parameters.rateCandidateMinimumUs = kRateCandidateMinimumUs;
     parameters.playoutStallBurstExclusion = 1;
     parameters.latchedFloorDisabled = 1;
     parameters.pacingLatencyQueueModeExtra = 0;
@@ -214,11 +249,13 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_PlayoutBands.clear();
         m_PlayoutBandValid = false;
         m_AppliedPlayoutDelayUs = 0;
+        m_AppliedPlayoutDelayValid = false;
     }
     m_HaveLastDecodeComplete = false;
     m_LastDecodeCompleteUs = 0;
     resetCadenceSmoothing();
     m_SmoothedPeriodUs = 0;
+    m_MotionResiduals.clear();
     m_FutureProjectionFrames = 0;
     m_BurstExclusionFrames = 0;
     m_HaveTimeline = false;
@@ -544,11 +581,34 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                               m_Parameters.presentationSafetyUs)));
     }
 
+    const uint64_t unflooredTargetUs = targetUs;
     targetUs = std::max(targetUs, earliestSubmissionUs());
+    const uint64_t presentationFloorPushUs = targetUs - unflooredTargetUs;
     const uint64_t totalLeadUs = saturatingAdd(m_RenderLeadUs,
                                                m_RenderWakeLeadUs);
-    const uint64_t renderStartUs = targetUs > totalLeadUs ?
+    uint64_t renderStartUs = targetUs > totalLeadUs ?
         targetUs - totalLeadUs : 0;
+    if (timestampPlayout && m_Parameters.playoutPrepareOnArrival != 0) {
+        // The playout delay already holds the frame for a whole cushion
+        // before its slot; preparing it the moment it arrives spends that
+        // cushion on the renderer too. Only for renderers whose preparation
+        // never blocks on the previous present.
+        const uint64_t arrivalLeadUs = saturatingAdd(totalLeadUs,
+                                                     playoutDelayUs);
+        renderStartUs = targetUs > arrivalLeadUs ?
+            targetUs - arrivalLeadUs : 0;
+    }
+    if (m_Parameters.renderStartAfterSubmissionUs != 0 && m_HaveLastSubmission) {
+        const uint64_t earliestStartUs = saturatingAdd(
+            m_LastSubmissionUs, m_Parameters.renderStartAfterSubmissionUs);
+        const uint64_t latestStartUs =
+            targetUs > m_Parameters.renderStartMinimumLeadUs ?
+                targetUs - m_Parameters.renderStartMinimumLeadUs : 0;
+        if (earliestStartUs > renderStartUs) {
+            renderStartUs = std::min(earliestStartUs,
+                                     std::max(renderStartUs, latestStartUs));
+        }
+    }
 
     VrrTimingDecision decision;
     decision.sourceTimeUs = m_SourceTimeUs;
@@ -561,6 +621,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.missedTicks = missedTicks;
     decision.renderStartUs = renderStartUs;
     decision.targetUs = targetUs;
+    decision.presentationFloorPushUs = presentationFloorPushUs;
     decision.guardUs = m_GuardUs;
     decision.headroomUs = headroomUs();
     decision.timingBudgetUs = timingBudgetUs();
@@ -682,6 +743,25 @@ bool VrrTimingController::metronomeEnabled() const
     return m_Parameters.playoutMetronomeEnabled != 0;
 }
 
+uint64_t VrrTimingController::motionThresholdUs(uint64_t periodUs) const
+{
+    const uint64_t floorUs = m_Parameters.playoutMotionFloorUs;
+    const uint64_t ceilingUs = std::max(
+        floorUs,
+        scaledPerMille(periodUs,
+                       m_Parameters.playoutMotionCeilingPeriodPerMille));
+    if (m_MotionResiduals.size() < m_Parameters.playoutMotionMinimumSamples) {
+        // Until the jitter bound is known, treat every deviation as noise
+        // rather than re-anchoring the grid on a first-frame guess.
+        return ceilingUs;
+    }
+    const uint64_t observedUs = percentile(
+        m_MotionResiduals, m_Parameters.playoutMotionPercentile);
+    return clampUnsigned(
+        scaledPerMille(observedUs, m_Parameters.playoutMotionGainPerMille),
+        floorUs, ceilingUs);
+}
+
 int64_t VrrTimingController::metronomeAdjustUs(
     const CadenceObservation& cadence, bool rebased, uint64_t rawBasisUs,
     uint64_t playoutDelayUs, uint64_t earliestBasisUs,
@@ -730,6 +810,37 @@ int64_t VrrTimingController::metronomeAdjustUs(
         // a stall the drop policy did not fully shed). Re-phase here.
         resetCadenceSmoothing();
         return 0;
+    }
+
+    if (m_Parameters.playoutMotionDeadbandEnabled != 0) {
+        // The stamp's deviation from the grid, excluding lag the schedule
+        // already knows it owes. Beyond the learned jitter bound it is the
+        // host reporting a change in frame timing: present on the stamp and
+        // restart the grid there so the next frames are spaced from it.
+        const int64_t deviationUs = errorUs - m_PhaseDebtUs;
+        const uint64_t deviationMagnitudeUs = static_cast<uint64_t>(
+            deviationUs < 0 ? -deviationUs : deviationUs);
+        const uint64_t thresholdUs = motionThresholdUs(periodUs);
+        if (deviationMagnitudeUs > thresholdUs) {
+            // Not admitted to the jitter bound: a run of real timing changes
+            // (a rate change the fit has yet to absorb) must not widen the
+            // band until the grid treats them as noise. The grid's period
+            // was wrong too, so it restarts on the current fit rather than
+            // on the long filter that was still averaging the old rate.
+            resetCadenceSmoothing();
+            m_MetronomePeriodUsQ16 = m_SourcePeriodUsQ16;
+            const uint64_t rawQ16 = rawBasisUs > maximum / kQ16One ?
+                maximum : rawBasisUs * kQ16One;
+            const uint64_t earliestRawQ16 =
+                earliestBasisUs > maximum / kQ16One ?
+                    maximum : earliestBasisUs * kQ16One;
+            if (rawQ16 < earliestRawQ16) {
+                missedTicks = (earliestRawQ16 - rawQ16) / periodQ16;
+            }
+            return 0;
+        }
+        appendBounded(m_MotionResiduals, deviationMagnitudeUs,
+                      std::max<size_t>(1, m_Parameters.playoutMotionWindowFrames));
     }
 
     const uint64_t stepCeilingUs = std::max(
@@ -1002,8 +1113,13 @@ void VrrTimingController::observeRtpCadence(
 
         appendCadenceSample(m_RateCandidateSamples, current);
         observation.phaseDiscontinuity = true;
+        const uint64_t candidateSpanUs =
+            (m_RateCandidateSamples.back().rtpTicks -
+             m_RateCandidateSamples.front().rtpTicks) *
+            kMicrosecondsPerSecond / kRtpClockRate;
         if (m_RateCandidateSamples.size() >=
-                m_Parameters.rateCandidateSamples) {
+                m_Parameters.rateCandidateSamples &&
+            candidateSpanUs >= m_Parameters.rateCandidateMinimumUs) {
             const uint64_t candidatePeriodQ16 = fittedSourcePeriodQ16(
                 m_RateCandidateSamples);
             if (candidatePeriodQ16 != 0) {
@@ -1865,7 +1981,24 @@ void VrrTimingController::updatePlayoutDelay(
     }
     band.appliedDelayUs = std::max(band.appliedDelayUs,
                                    playoutDelayMinimumUs());
-    m_AppliedPlayoutDelayUs = band.appliedDelayUs;
+    if (m_Parameters.playoutDelaySlewAcrossBands == 0 ||
+            !m_AppliedPlayoutDelayValid) {
+        m_AppliedPlayoutDelayUs = band.appliedDelayUs;
+    }
+    else if (band.appliedDelayUs > m_AppliedPlayoutDelayUs) {
+        // The band's level is the goal; the delay in force walks to it at
+        // the same slew it moves within a band, so a band change never
+        // steps a frame off its slot.
+        m_AppliedPlayoutDelayUs += std::min(
+            band.appliedDelayUs - m_AppliedPlayoutDelayUs,
+            std::max<uint64_t>(1, m_Parameters.playoutDelayAttackUs));
+    }
+    else if (band.appliedDelayUs < m_AppliedPlayoutDelayUs) {
+        m_AppliedPlayoutDelayUs -= std::min(
+            m_AppliedPlayoutDelayUs - band.appliedDelayUs,
+            std::max<uint64_t>(1, m_Parameters.playoutDelayReleaseUs));
+    }
+    m_AppliedPlayoutDelayValid = true;
 }
 
 uint64_t VrrTimingController::rtpTicksToUs(uint64_t ticks)

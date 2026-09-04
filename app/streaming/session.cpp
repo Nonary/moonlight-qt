@@ -301,6 +301,8 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.enableFramePacing = enableFramePacing;
     params.enableVrr = enableVrr;
     params.vrrDisplayRefreshHz = vrrDisplayRefreshHz;
+    params.enableVrrGapFill = StreamingPreferences::get()->enableVrrGapFill;
+    params.vrrGapFillMinimumHz = StreamingPreferences::get()->vrrGapFillMinimumHz;
     params.testOnly = testOnly;
     params.vds = vds;
     params.renderer = renderer;

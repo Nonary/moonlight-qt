@@ -551,7 +551,9 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
                                  params->enableFramePacing || (params->enableVsync && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_FORCE_PACING)),
                                  params->enableVsync,
                                  params->enableVrr,
-                                 params->vrrDisplayRefreshHz)) {
+                                 params->vrrDisplayRefreshHz,
+                                 params->enableVrrGapFill,
+                                 params->vrrGapFillMinimumHz)) {
             return false;
         }
     }
@@ -821,6 +823,7 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.networkDroppedFrames += src.networkDroppedFrames;
     dst.pacerDroppedFrames += src.pacerDroppedFrames;
     dst.vrrPacingDroppedFrames += src.vrrPacingDroppedFrames;
+    dst.vrrGapFillFrames += src.vrrGapFillFrames;
     dst.vrrEligibleFrames += src.vrrEligibleFrames;
     dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
     dst.vrrTargetWaitEntryLateFrames += src.vrrTargetWaitEntryLateFrames;
@@ -929,6 +932,9 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
     m_ActiveWndVideoStats.vrrPacingDroppedFrames +=
         delta(snapshot.vrrPacingDroppedFrames,
               m_LastPacerTelemetry.vrrPacingDroppedFrames);
+    m_ActiveWndVideoStats.vrrGapFillFrames +=
+        delta(snapshot.vrrGapFillFrames,
+              m_LastPacerTelemetry.vrrGapFillFrames);
     m_ActiveWndVideoStats.vrrEligibleFrames +=
         delta(snapshot.vrrEligibleFrames,
               m_LastPacerTelemetry.vrrEligibleFrames);
@@ -1183,10 +1189,11 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
             ret = snprintf(&output[offset],
                            length - offset,
-                           "VRR pacing: %s | Ready on time: %.1f%% | Dropped: %llu | Errors: %llu\n",
+                           "VRR pacing: %s | Ready on time: %.1f%% | Dropped: %llu | Gap fills: %llu | Errors: %llu\n",
                            stats.vrrTelemetryActive ? "Active" : "Inactive",
                            readyOnTimePercent,
                            static_cast<unsigned long long>(stats.vrrPacingDroppedFrames),
+                           static_cast<unsigned long long>(stats.vrrGapFillFrames),
                            static_cast<unsigned long long>(stats.vrrPresentFailedFrames));
         }
         if (ret < 0 || ret >= length - offset) {

@@ -24,6 +24,8 @@
 #define SER_FULLSCREEN "fullscreen"
 #define SER_VSYNC "vsync"
 #define SER_ENABLEVRR "enablevrr"
+#define SER_ENABLEVRRGAPFILL "enablevrrgapfill"
+#define SER_VRRGAPFILLMINHZ "vrrgapfillminhz"
 #define SER_GAMEOPTS "gameopts"
 #define SER_HOSTAUDIO "hostaudio"
 #define SER_MULTICONT "multicontroller"
@@ -136,6 +138,8 @@ void StreamingPreferences::reload()
     autoAdjustBitrate = settings.value(SER_AUTOADJUSTBITRATE, true).toBool();
     enableVsync = settings.value(SER_VSYNC, true).toBool();
     enableVrr = settings.value(SER_ENABLEVRR, false).toBool();
+    enableVrrGapFill = settings.value(SER_ENABLEVRRGAPFILL, false).toBool();
+    vrrGapFillMinimumHz = settings.value(SER_VRRGAPFILLMINHZ, 48).toInt();
     gameOptimizations = settings.value(SER_GAMEOPTS, true).toBool();
     playAudioOnHost = settings.value(SER_HOSTAUDIO, false).toBool();
     multiController = settings.value(SER_MULTICONT, true).toBool();
@@ -337,6 +341,8 @@ void StreamingPreferences::save()
     settings.setValue(SER_AUTOADJUSTBITRATE, autoAdjustBitrate);
     settings.setValue(SER_VSYNC, enableVsync);
     settings.setValue(SER_ENABLEVRR, enableVrr);
+    settings.setValue(SER_ENABLEVRRGAPFILL, enableVrrGapFill);
+    settings.setValue(SER_VRRGAPFILLMINHZ, vrrGapFillMinimumHz);
     settings.setValue(SER_GAMEOPTS, gameOptimizations);
     settings.setValue(SER_HOSTAUDIO, playAudioOnHost);
     settings.setValue(SER_MULTICONT, multiController);

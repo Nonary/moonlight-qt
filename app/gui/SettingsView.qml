@@ -867,6 +867,22 @@ Flickable {
                                         :
                                           qsTr("VRR requires V-Sync. Enable V-Sync to change this setting.")
                     }
+
+                    CheckBox {
+                        hoverEnabled: true
+                        text: qsTr("Fill VRR gaps")
+                        font.pointSize: 12
+                        enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                        checked: StreamingPreferences.enableVrrGapFill
+                        onCheckedChanged: {
+                            StreamingPreferences.enableVrrGapFill = checked
+                        }
+
+                        ToolTip.delay: 1000
+                        ToolTip.timeout: 5000
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("When the host leaves a gap longer than the display's VRR floor (%1 Hz), the last frame is shown again halfway through it so the display never falls back to its own low-framerate compensation. Real frames still present at their host timing.").arg(StreamingPreferences.vrrGapFillMinimumHz)
+                    }
                 }
 
                 CheckBox {

@@ -38,6 +38,12 @@ private slots:
 
 void VrrReplayConfigTest::defaultsRoundTrip()
 {
+    VrrTimingParameters productionParameters;
+    productionParameters.playoutSmoothingSnapPerMille = 3000;
+    QString validationError;
+    QVERIFY2(validateVrrTimingParameters(
+        productionParameters, validationError), qPrintable(validationError));
+
     VrrReplayConfiguration config;
     QString error;
     QVERIFY2(loadVrrReplayConfiguration(

@@ -14,6 +14,10 @@
 extern "C" {
 #include <libavutil/hwcontext_drm.h>
 #include <libavutil/hwcontext_vulkan.h>
+#ifdef HAVE_LIBVA
+#include <libavutil/hwcontext_vaapi.h>
+#include <va/va.h>
+#endif
 }
 
 #include <vector>
@@ -575,16 +579,19 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     // explicitly requested for this session.
     selectPresentationMode(params);
 
-    // Start with a swapchain that is double-buffered for lowest display latency
-    if (!createSwapchain(1)) {
+    // Keep one spare image available while the compositor owns the displayed
+    // and queued images. At rates close to the panel ceiling, a double-buffered
+    // swapchain can otherwise block preparation until after the presentation
+    // target has passed.
+    if (!createSwapchain(2)) {
         return false;
     }
 
     if (m_VrrRequested) {
         if (m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Vulkan VRR backend selected immutable %s swapchain presentation",
-                        vulkanPresentModeName(m_VkPresentMode));
+                        "Vulkan VRR backend selected immutable %s swapchain presentation (depth %d)",
+                        vulkanPresentModeName(m_VkPresentMode), m_SwapchainDepth);
         }
         else {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1249,6 +1256,32 @@ VrrFallbackReason PlVkRenderer::checkSupport() const
         VrrFallbackReason::InitializationFailed;
 }
 
+uint64_t PlVkRenderer::waitForDecode(AVFrame* frame)
+{
+#ifdef HAVE_LIBVA
+    if (frame == nullptr || frame->format != AV_PIX_FMT_VAAPI ||
+            frame->hw_frames_ctx == nullptr) {
+        return 0;
+    }
+    auto hwFrameCtx = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+    if (hwFrameCtx->device_ctx == nullptr ||
+            hwFrameCtx->device_ctx->type != AV_HWDEVICE_TYPE_VAAPI) {
+        return 0;
+    }
+    auto vaDeviceContext = (AVVAAPIDeviceContext*)hwFrameCtx->device_ctx->hwctx;
+    const uint64_t startUs = LiGetMicroseconds();
+    // libplacebo syncs the surface again when it imports the frame; that
+    // second sync returns at once because this one already waited.
+    vaSyncSurface(vaDeviceContext->display,
+                  (VASurfaceID)(uintptr_t)frame->data[3]);
+    const uint64_t endUs = LiGetMicroseconds();
+    return endUs >= startUs ? endUs - startUs : 0;
+#else
+    (void) frame;
+    return 0;
+#endif
+}
+
 VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
                                             uint64_t decodeBoundary)
 {
@@ -1271,9 +1304,16 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
     // generation before acquisition; a concurrent new callback remains set
     // and makes presentFrame() safely abandon this image.
     m_VrrWindowChangePending.exchange(false);
+    const uint64_t syncStartUs = LiGetMicroseconds();
+    result.decodeSyncUs = waitForDecode(frame);
+    const uint64_t acquireStartUs = LiGetMicroseconds();
+    (void) syncStartUs;
     if (!acquireVrrSwapchainFrame()) {
         return result;
     }
+    const uint64_t acquireEndUs = LiGetMicroseconds();
+    result.acquireUs = acquireEndUs >= acquireStartUs ?
+        acquireEndUs - acquireStartUs : 0;
 
     if (m_VrrWindowChangePending.load()) {
         result.cancellationMaySubmit = m_HasPendingSwapchainFrame;
@@ -1284,6 +1324,8 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
     m_VrrRenderSucceeded = false;
     m_VrrRenderTimingActive = false;
     renderFrame(frame);
+    const uint64_t renderEndUs = LiGetMicroseconds();
+    result.renderUs = renderEndUs >= acquireEndUs ? renderEndUs - acquireEndUs : 0;
 
     // pl_render_image() records work for the acquired image. Flush it now so
     // GPU rendering can overlap the worker's target wait, but retain the
@@ -1292,6 +1334,9 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
     if (m_VrrRenderSucceeded && m_Vulkan != nullptr && m_Vulkan->gpu != nullptr) {
         pl_gpu_flush(m_Vulkan->gpu);
     }
+    const uint64_t flushEndUs = LiGetMicroseconds();
+    result.flushUs = flushEndUs >= renderEndUs ? flushEndUs - renderEndUs : 0;
+    result.timingValid = true;
 
     m_VrrPreparingFrame = false;
 

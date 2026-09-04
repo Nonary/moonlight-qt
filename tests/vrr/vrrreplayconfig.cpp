@@ -416,9 +416,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
         return fail("playout_delay_percentile_per_mille must be in 0..1000");
     }
     if (value.playoutSmoothingGainPerMille > 1000 ||
-            value.playoutSmoothingPeriodAlphaPerMille > 1000 ||
-            value.playoutSmoothingSnapPerMille > 1000) {
-        return fail("playout_smoothing gain, period alpha and snap must be in 0..1000");
+            value.playoutSmoothingPeriodAlphaPerMille > 1000) {
+        return fail("playout_smoothing gain and period alpha must be in 0..1000");
     }
     if (value.playoutDelayMinimumSamples == 0 ||
             value.playoutDelayReservoirSamples == 0 ||
@@ -426,11 +425,22 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.playoutStallExclusionUs == 0) {
         return fail("playout delay sample counts, band width and stall exclusion must be non-zero");
     }
+    if (value.playoutMotionDeadbandEnabled > 1 ||
+            value.playoutDelaySlewAcrossBands > 1 ||
+            value.playoutPrepareOnArrival > 1) {
+        return fail("playout_motion_deadband_enabled, playout_delay_slew_across_bands and playout_prepare_on_arrival must be 0 or 1");
+    }
+    if (value.playoutMotionWindowFrames == 0 ||
+            value.playoutMotionMinimumSamples == 0 ||
+            value.playoutMotionCeilingPeriodPerMille > 1000) {
+        return fail("playout motion window and minimum samples must be non-zero and the ceiling in 0..1000 per mille");
+    }
     const unsigned int percents[] = {
         value.materialRateChangePercent, value.renderBaselinePercentile,
         value.preparationPercentile,
         value.schedulerPercentile, value.readinessLowPercentile,
         value.readinessTightPercentile, value.readinessLoosePercentile,
+        value.playoutMotionPercentile,
     };
     for (unsigned int percent : percents) {
         if (percent > 100) return fail("percentiles and percentages must be in 0..100");

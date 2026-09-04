@@ -5,6 +5,10 @@
 
 #include <Limelight.h>
 
+extern "C" {
+#include <libavutil/frame.h>
+}
+
 #include <algorithm>
 #include <limits>
 #include <thread>
@@ -35,6 +39,22 @@ constexpr size_t kMaximumTraceQueueRows = 8192;
 // still turning repeated timestamps and controller state into very small,
 // infrequent physical writes.
 constexpr int kTraceChunkBytes = 256 * 1024;
+// A decode sync shorter than this did not wait on the GPU; the frame keeps
+// the decoder's completion time as its readiness.
+constexpr uint64_t kDecodeSyncNoticeUs = 200;
+// Gap filling. The panel's floor interval minus a margin is the longest
+// presented interval allowed; a proactive repeat is issued this long after
+// the previous present when no frame has arrived, which with the playout
+// cushion leaves the next real frame at least a display period away.
+constexpr uint64_t kGapFillIntervalMarginUs = 800;
+constexpr uint64_t kGapFillProactiveMarginUs = 3500;
+constexpr uint64_t kGapFillPrepareLeadUs = 2500;
+// A frame whose slot the display floor has already pushed more than half a
+// source period, with a fresher frame waiting, is shed rather than shown
+// late: a source above the display rate otherwise builds a backlog that
+// the stale limit sheds all at once.
+constexpr uint64_t kFloorBacklogNumerator = 1;
+constexpr uint64_t kFloorBacklogDenominator = 2;
 // Always preserve at least an hour, including the maximum supported 480 FPS
 // stream cadence. The physical cap takes effect only after that duration, so
 // an unusually incompressible trace remains complete rather than silently
@@ -77,7 +97,9 @@ constexpr char kTraceHeader[] =
     "native_raster_after_query_result_valid,native_raster_after_query_result,native_raster_after_query_start_us,native_raster_after_query_end_us,native_raster_after_in_vertical_blank,native_raster_after_scanline,"
     "submission_id_query_result_valid,submission_id_query_result,submission_id_query_start_us,submission_id_query_end_us,frame_stats_query_result_valid,frame_stats_query_result,frame_stats_query_start_us,frame_stats_query_end_us,latch_raw_sync_qpc_valid,latch_raw_sync_qpc_ticks,latch_raw_sync_qpc_frequency_hz,"
     "latch_qpc_correlation_valid,latch_qpc_correlation_reference_ticks,latch_qpc_correlation_reference_time_us,latch_qpc_correlation_span_ticks,"
-    "readiness_phase_us,readiness_demand_us,applied_readiness_reserve_us,render_baseline_us,render_insurance_us,pacing_latency_budget_us,cadence_sample_count,rate_candidate_sample_count,readiness_sample_count,preparation_sample_count,render_scheduler_sample_count,target_scheduler_sample_count,clean_spacing_frames,phase_error_frames,readiness_model_valid,playout_delay_us,cadence_smoothing_us,missed_ticks"
+    "readiness_phase_us,readiness_demand_us,applied_readiness_reserve_us,render_baseline_us,render_insurance_us,pacing_latency_budget_us,cadence_sample_count,rate_candidate_sample_count,readiness_sample_count,preparation_sample_count,render_scheduler_sample_count,target_scheduler_sample_count,clean_spacing_frames,phase_error_frames,readiness_model_valid,playout_delay_us,cadence_smoothing_us,missed_ticks,"
+    "decode_sync_wait_us,prepare_timing_valid,prepare_decode_sync_us,prepare_acquire_us,prepare_render_us,prepare_flush_us,"
+    "gap_fills_before,gap_fill_last_us"
     VRR_TIMING_PARAMETER_FIELDS(VRR_TRACE_PARAMETER_HEADER)
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
@@ -200,6 +222,9 @@ VrrPacingWorker::~VrrPacingWorker()
         QMutexLocker lock(&m_FrameQueueLock);
         m_Stopping.store(true);
         m_FrameQueueNotEmpty.wakeAll();
+    }
+    if (m_GapFillFrame != nullptr) {
+        av_frame_free(&m_GapFillFrame);
     }
 
     if (m_WorkerThread != nullptr) {
@@ -342,8 +367,21 @@ int VrrPacingWorker::run()
 
         QueuedFrame queuedFrame;
         bool queueDiscontinuity = false;
-        if (!dequeueFrame(queuedFrame, queueDiscontinuity)) {
+        uint64_t gapDeadlineUs = 0;
+        if (gapFillEnabled() && m_TimingController->hasLastSubmission()) {
+            gapDeadlineUs = m_TimingController->lastSubmissionUs() +
+                gapFillMaximumIntervalUs() - kGapFillProactiveMarginUs;
+        }
+        bool gapTimedOut = false;
+        if (!dequeueFrame(queuedFrame, queueDiscontinuity, gapDeadlineUs,
+                          gapTimedOut)) {
             break;
+        }
+        if (gapTimedOut) {
+            // Nothing has arrived and the panel's floor is near: repeat the
+            // last image now. The next real frame is still a cushion away.
+            presentGapFill(LiGetMicroseconds());
+            continue;
         }
         queuedFrame.trace.dequeueUs = LiGetMicroseconds();
         queuedFrame.trace.queueDiscontinuity = queueDiscontinuity;
@@ -396,11 +434,54 @@ int VrrPacingWorker::run()
         // its learned cadence.
         (void) queueDiscontinuity;
 
+        // The CPU reports decode completion before the GPU has finished the
+        // frame. Wait for it here, where the worker would otherwise idle, so
+        // readiness and the lateness the calibrator learns from are real and
+        // the preparation never blocks on the decoder.
+        const uint64_t decodeSyncWaitUs = m_Presenter->waitForDecode(frame.frame());
+        if (decodeSyncWaitUs > kDecodeSyncNoticeUs) {
+            frame.noteGpuReadyUs(LiGetMicroseconds());
+        }
+
         const uint64_t decisionTimeUs = LiGetMicroseconds();
         VrrTimingDecision decision = m_TimingController->schedule(
             frame, decisionTimeUs);
         FrameTelemetry telemetry;
+        telemetry.decodeSyncWaitUs = decodeSyncWaitUs;
         telemetry.decisionTimeUs = decisionTimeUs;
+        if (gapFillEnabled() && m_TimingController->hasLastSubmission() &&
+                decision.targetUs > m_TimingController->lastSubmissionUs()) {
+            // The slot is known a cushion ahead. Split a gap longer than the
+            // panel's floor into equal parts with repeats of the last image;
+            // the real frame keeps its slot.
+            const uint64_t maximumUs = gapFillMaximumIntervalUs();
+            const uint64_t lastUs = m_TimingController->lastSubmissionUs();
+            const uint64_t gapUs = decision.targetUs - lastUs;
+            if (gapUs > maximumUs) {
+                const uint64_t segments = (gapUs + maximumUs - 1) / maximumUs;
+                for (uint64_t i = 1; i < segments && !isStopping(); ++i) {
+                    if (!presentGapFill(lastUs + gapUs * i / segments)) {
+                        break;
+                    }
+                }
+                // Preparation of the real frame keeps clear of the repeat
+                // just as it keeps clear of any present.
+                const VrrTimingParameters& parameters =
+                    m_TimingController->parameters();
+                if (parameters.renderStartAfterSubmissionUs != 0) {
+                    const uint64_t earliestUs =
+                        m_TimingController->lastSubmissionUs() +
+                        parameters.renderStartAfterSubmissionUs;
+                    const uint64_t latestUs =
+                        decision.targetUs > parameters.renderStartMinimumLeadUs ?
+                            decision.targetUs - parameters.renderStartMinimumLeadUs : 0;
+                    if (earliestUs > decision.renderStartUs) {
+                        decision.renderStartUs = std::min(
+                            earliestUs, std::max(decision.renderStartUs, latestUs));
+                    }
+                }
+            }
+        }
         telemetry.decisionEndUs = LiGetMicroseconds();
         telemetry.externalRebaseApplied = externalRebaseApplied;
         telemetry.externalRebaseFlags = externalRebaseFlags;
@@ -426,8 +507,28 @@ int VrrPacingWorker::run()
             decision.sourcePeriodUs,
             metronome ? kMetronomeFrameAgePeriods : kLowLatencyFrameAgePeriods);
         const bool missedTickBacklog = metronome && decision.missedTicks != 0;
+        // The floor has already pushed this slot well past the source's own
+        // spacing and a fresher frame is waiting: shed it now, the way a
+        // mailbox keeps only the newest image, instead of showing it late
+        // and letting the backlog grow.
+        const uint64_t floorPushUs = decision.presentationFloorPushUs;
+        const uint64_t displayPeriodUs =
+            m_TimingController->displayPeriodUs();
+        // A transient late submission can push several following targets onto
+        // the display floor. When the source is slower than the display, that
+        // debt naturally drains through the rate headroom; dropping a frame
+        // here converts a small timing error into a visible motion skip. Only
+        // shed floor-bound frames when the fitted source can actually
+        // oversupply the display. Queue capacity and the age limit remain the
+        // overload bounds for either case.
+        const bool sourceCanOversupplyDisplay = displayPeriodUs != 0 &&
+            decision.sourcePeriodUs <= displayPeriodUs;
+        const bool floorBacklog = sourceCanOversupplyDisplay &&
+            floorPushUs * kFloorBacklogDenominator >
+                decision.sourcePeriodUs * kFloorBacklogNumerator;
         if (decision.sourcePeriodUs != 0 && hasQueuedFrame() &&
-            (scheduleAgeUs > maximumFrameAgeUs || missedTickBacklog)) {
+            (scheduleAgeUs > maximumFrameAgeUs || missedTickBacklog ||
+             floorBacklog)) {
             writeTrace(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
                        TraceDisposition::Stale);
             noteDrop();
@@ -510,6 +611,11 @@ int VrrPacingWorker::run()
         telemetry.preparationDurationUs =
             telemetry.preparationEndUs >= telemetry.preparationStartUs ?
                 telemetry.preparationEndUs - telemetry.preparationStartUs : 0;
+        telemetry.prepareTimingValid = preparation.timingValid;
+        telemetry.prepareDecodeSyncUs = preparation.decodeSyncUs;
+        telemetry.prepareAcquireUs = preparation.acquireUs;
+        telemetry.prepareRenderUs = preparation.renderUs;
+        telemetry.prepareFlushUs = preparation.flushUs;
         m_TimingController->notePreparationDuration(
             telemetry.preparationDurationUs);
 
@@ -779,10 +885,15 @@ int VrrPacingWorker::run()
         if (outputDropped) {
             noteDrop();
         }
+        else if (gapFillEnabled()) {
+            retainGapFillFrame(frame.frame());
+        }
         writeTrace(queuedFrame, decision, feedback, telemetry,
                    outputDropped ?
                        TraceDisposition::OutputDropped :
                        TraceDisposition::Presented);
+        m_GapFillsBeforeFrame = 0;
+        m_GapFillLastUs = 0;
         deferFrame(std::move(frame));
     }
 
@@ -791,12 +902,109 @@ int VrrPacingWorker::run()
     return 0;
 }
 
+bool VrrPacingWorker::gapFillEnabled() const
+{
+    return m_Config.gapFillEnabled && m_Config.gapFillMinimumRefreshHz > 0;
+}
+
+uint64_t VrrPacingWorker::gapFillMaximumIntervalUs() const
+{
+    const uint64_t floorIntervalUs = 1000000ULL /
+        static_cast<uint64_t>(std::max(1, m_Config.gapFillMinimumRefreshHz));
+    return floorIntervalUs > kGapFillIntervalMarginUs ?
+        floorIntervalUs - kGapFillIntervalMarginUs : floorIntervalUs;
+}
+
+void VrrPacingWorker::retainGapFillFrame(const AVFrame* frame)
+{
+    if (frame == nullptr) {
+        return;
+    }
+    if (m_GapFillFrame == nullptr) {
+        m_GapFillFrame = av_frame_alloc();
+        if (m_GapFillFrame == nullptr) {
+            return;
+        }
+    }
+    av_frame_unref(m_GapFillFrame);
+    if (av_frame_ref(m_GapFillFrame, frame) < 0) {
+        av_frame_unref(m_GapFillFrame);
+    }
+}
+
+bool VrrPacingWorker::presentGapFill(uint64_t presentAtUs)
+{
+    if (m_GapFillFrame == nullptr || m_GapFillFrame->buf[0] == nullptr ||
+            presentationSuspended() || isStopping()) {
+        return false;
+    }
+    presentAtUs = std::max(presentAtUs,
+                           m_TimingController->earliestSubmissionUs());
+
+    const uint64_t prepareAtUs = presentAtUs > kGapFillPrepareLeadUs ?
+        presentAtUs - kGapFillPrepareLeadUs : 0;
+    m_TargetWaiter->waitUntil(prepareAtUs);
+    if (presentationSuspended() || isStopping()) {
+        return false;
+    }
+    const VrrPrepareResult preparation =
+        m_Presenter->prepareFrame(m_GapFillFrame, 0);
+    if (!preparation.prepared) {
+        if (preparation.cancellationMaySubmit) {
+            m_Presenter->cancelFrame();
+        }
+        return false;
+    }
+    uint64_t nowUs = LiGetMicroseconds();
+    while (nowUs < presentAtUs) {
+        m_TargetWaiter->waitUntil(presentAtUs);
+        nowUs = LiGetMicroseconds();
+    }
+    if (presentationSuspended() || isStopping()) {
+        m_Presenter->cancelFrame();
+        return false;
+    }
+    VrrPresentRequest request;
+    request.latchedPresentation = false;
+    request.collectDiagnostics = false;
+    const uint64_t startUs = LiGetMicroseconds();
+    const VrrPresentFeedback feedback = m_Presenter->presentAdaptive(request);
+    const uint64_t endUs = LiGetMicroseconds();
+    bool usedPresenterTime = false;
+    const uint64_t boundaryUs = submissionBoundaryUs(
+        feedback, startUs, endUs, usedPresenterTime);
+    m_TimingController->noteSubmission(feedback.presented,
+                                       feedback.cancelled, boundaryUs);
+    if (!feedback.presented || feedback.cancelled) {
+        return false;
+    }
+    ++m_GapFillsBeforeFrame;
+    m_GapFillLastUs = boundaryUs;
+    if (m_Telemetry != nullptr) {
+        m_Telemetry->recordVrrGapFill();
+    }
+    return true;
+}
+
 bool VrrPacingWorker::dequeueFrame(QueuedFrame& frame,
-                                   bool& queueDiscontinuity)
+                                   bool& queueDiscontinuity,
+                                   uint64_t deadlineUs, bool& timedOut)
 {
     QMutexLocker lock(&m_FrameQueueLock);
+    timedOut = false;
     while (!isStopping() && !m_Suspended.load() && m_FrameQueue.empty()) {
-        m_FrameQueueNotEmpty.wait(&m_FrameQueueLock);
+        if (deadlineUs == 0) {
+            m_FrameQueueNotEmpty.wait(&m_FrameQueueLock);
+            continue;
+        }
+        const uint64_t nowUs = LiGetMicroseconds();
+        if (nowUs >= deadlineUs) {
+            timedOut = true;
+            return true;
+        }
+        m_FrameQueueNotEmpty.wait(&m_FrameQueueLock,
+                                  static_cast<unsigned long>(
+                                      (deadlineUs - nowUs + 999) / 1000));
     }
 
     if (isStopping()) {
@@ -1434,6 +1642,14 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(decision.playoutDelayUs);
     addSigned(decision.cadenceSmoothingUs);
     addUnsigned(decision.missedTicks);
+    addUnsigned(telemetry.decodeSyncWaitUs);
+    addBool(telemetry.prepareTimingValid);
+    addUnsigned(telemetry.prepareDecodeSyncUs);
+    addUnsigned(telemetry.prepareAcquireUs);
+    addUnsigned(telemetry.prepareRenderUs);
+    addUnsigned(telemetry.prepareFlushUs);
+    addUnsigned(m_GapFillsBeforeFrame);
+    addUnsigned(m_GapFillLastUs);
 #define VRR_ADD_TRACE_PARAMETER(type, jsonName, memberName, defaultValue) \
     addUnsigned(static_cast<uint64_t>(parameters.memberName));
     VRR_TIMING_PARAMETER_FIELDS(VRR_ADD_TRACE_PARAMETER)

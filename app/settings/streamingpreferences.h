@@ -128,6 +128,8 @@ public:
     Q_PROPERTY(bool autoAdjustBitrate MEMBER autoAdjustBitrate NOTIFY autoAdjustBitrateChanged)
     Q_PROPERTY(bool enableVsync MEMBER enableVsync NOTIFY enableVsyncChanged)
     Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
+    Q_PROPERTY(bool enableVrrGapFill MEMBER enableVrrGapFill NOTIFY enableVrrGapFillChanged)
+    Q_PROPERTY(int vrrGapFillMinimumHz MEMBER vrrGapFillMinimumHz NOTIFY vrrGapFillMinimumHzChanged)
     Q_PROPERTY(bool gameOptimizations MEMBER gameOptimizations NOTIFY gameOptimizationsChanged)
     Q_PROPERTY(bool playAudioOnHost MEMBER playAudioOnHost NOTIFY playAudioOnHostChanged)
     Q_PROPERTY(bool multiController MEMBER multiController NOTIFY multiControllerChanged)
@@ -175,6 +177,11 @@ public:
     bool autoAdjustBitrate;
     bool enableVsync;
     bool enableVrr;
+    // Re-present the last frame inside a host gap longer than the panel's
+    // adaptive-refresh floor, so the panel never engages its own
+    // low-framerate compensation.
+    bool enableVrrGapFill;
+    int vrrGapFillMinimumHz;
     bool gameOptimizations;
     bool playAudioOnHost;
     bool multiController;
@@ -215,6 +222,8 @@ signals:
     void autoAdjustBitrateChanged();
     void enableVsyncChanged();
     void enableVrrChanged();
+    void enableVrrGapFillChanged();
+    void vrrGapFillMinimumHzChanged();
     void gameOptimizationsChanged();
     void playAudioOnHostChanged();
     void multiControllerChanged();

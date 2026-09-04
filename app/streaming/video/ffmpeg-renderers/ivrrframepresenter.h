@@ -279,6 +279,14 @@ struct VrrPrepareResult {
     // Some acquired images (notably Vulkan swapchain frames) can only be
     // abandoned by submitting them. The worker owns any required wait.
     bool cancellationMaySubmit = false;
+    // Where the preparation spent its time, when the backend can split it:
+    // waiting for the decoder's GPU work, acquiring the presentation image,
+    // rendering (including source import), and flushing the GPU queue.
+    bool timingValid = false;
+    uint64_t decodeSyncUs = 0;
+    uint64_t acquireUs = 0;
+    uint64_t renderUs = 0;
+    uint64_t flushUs = 0;
     VrrPresentFeedback feedback;
 };
 
@@ -297,6 +305,15 @@ public:
     // Startup eligibility only. NoFallback means the presenter supports a worker-
     // thread split prepare/present path using its adaptive presentation mode.
     virtual VrrFallbackReason checkSupport() const = 0;
+
+    // Block until the decoder's GPU work for this frame has completed, so
+    // the pacer sees the frame's true readiness and preparation never waits
+    // on the decoder. Returns the microseconds spent waiting; zero when the
+    // backend cannot tell or the frame was already complete.
+    virtual uint64_t waitForDecode(AVFrame*)
+    {
+        return 0;
+    }
 
     // May acquire a swapchain image and submit rendering work, but must not
     // intentionally pace or wait for the worker's presentation target.

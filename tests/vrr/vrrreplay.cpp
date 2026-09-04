@@ -276,6 +276,7 @@ bool validateTraceRowSyntax(const QList<QByteArray>& header,
         "readiness_budget_us",
         "submit_error_us",
         "spacing_margin_us",
+        "cadence_smoothing_us",
         "readiness_phase_us",
         "native_present_result",
         "native_tearing_feature_query_result",
@@ -12629,15 +12630,15 @@ int main(int argc, char* argv[])
                     postSubmissionGapUs < idleLatencyUs;
                 if (workerWasBusy) {
                     metrics.modeledBusyGapUs = postSubmissionGapUs;
-                    if (!metrics.modeledIdleLatencyValid) {
-                        metrics.modeledIdleLatencyUs = idleLatencyUs;
-                        metrics.modeledIdleLatencyValid = true;
+                    occupancyDecisionUs = saturatingAdd(
+                        simulatedPreviousSubmissionUs,
+                        postSubmissionGapUs);
+                    if (metrics.modeledIdleLatencyValid) {
+                        occupancyDecisionUs = std::max(
+                            saturatingAdd(pacerArrivalUs,
+                                          metrics.modeledIdleLatencyUs),
+                            occupancyDecisionUs);
                     }
-                    occupancyDecisionUs = std::max(
-                        saturatingAdd(pacerArrivalUs,
-                                      metrics.modeledIdleLatencyUs),
-                        saturatingAdd(simulatedPreviousSubmissionUs,
-                                      postSubmissionGapUs));
                 }
                 else {
                     metrics.modeledIdleLatencyUs =

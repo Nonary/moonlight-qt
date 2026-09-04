@@ -20,6 +20,19 @@ create an SDL window, decoder, renderer, network connection, or Qt event loop.
 The policy executable is an app-less QtTest binary and only compiles the pure
 FPS policy source.
 
+`vrrqueuesim` complements the fixed-lifecycle replay by sorting every row of
+an expanded trace back into producer-arrival order and replaying the bounded
+worker queue around the real timing controller. It uses the capture's ordered
+preparation and Present-call durations, reports capacity and stale drops, and
+scores source-spacing error, presentation jerk, queue depth, and latency. Use
+it when a candidate changes worker occupancy or would retain frames that the
+recorded run discarded:
+
+```sh
+python scripts/decode-vrr-trace.py capture.vrrtrace capture.csv
+./vrrqueuesim capture.csv --config configs/queue-controller-sweep.json
+```
+
 The timing-controller executable also exercises cumulative RTP cadence
 learning for every integer rate from 30 through 116 FPS on a 120 Hz-quantized
 capture clock, a continuous one-FPS-per-second sweep in both directions,
@@ -684,8 +697,8 @@ frame does not hide lateness from the calibrator), and targets the
 frames the stall held up behind it (`playout_stall_burst_exclusion`, the gap
 in source periods) are excluded: their lateness is the stall's backlog, not
 the link's jitter. A band starts at the larger of `playout_delay_start_us`
-and `playout_delay_start_period_per_mille` of the source period (1.25
-periods, a little over the cushion stock frame pacing has), rises at most
+and `playout_delay_start_period_per_mille` of the source period (two
+periods, so a fresh session is never short of cushion), rises at most
 `playout_delay_attack_us` per frame, releases at most
 `playout_delay_release_us` per frame and only after
 `playout_delay_release_samples`, and is capped at the larger of
@@ -698,6 +711,19 @@ worker without reducing hitches. Captures made under it still replay with
 that budget through `additional_queued_frame` and
 `pacing_latency_queue_mode_extra`, which the production policy sets to zero.
 A band unused for `playout_band_stale_us` re-converges from the start value.
+The production policy sets `playout_band_width_hz` wider than any source
+rate so the whole session shares one reservoir: separate per-band delays
+each opened at the start value and moved the presented slot by their
+difference whenever the fitted rate crossed a band edge. Under the metronome,
+`playout_motion_deadband_enabled` compares each stamp with the grid: a
+deviation inside the learned jitter bound (`playout_motion_percentile` of
+recent in-band deviations scaled by `playout_motion_gain_per_mille`, held
+between `playout_motion_floor_us` and
+`playout_motion_ceiling_period_per_mille` of the period) is absorbed by the
+grid, and a larger one presents on its stamp and restarts the grid there. A
+provisional cadence segment after a major departure must span
+`rate_candidate_minimum_us` of sender time before its fit replaces the source
+rate, so a few long stamps are a hitch rather than a new rate.
 With `playout_delay_adaptive` off, `controller.source_playout_delay_us` is
 the fixed delay. The applied delay is recorded per frame as
 `playout_delay_us` and the tick's lag behind the raw slot as
