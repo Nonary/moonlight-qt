@@ -224,12 +224,12 @@
                     "type": "git",
                     "url": "https://github.com/nonary/moonlight-qt.git",
                     "disable-shallow-clone": true,
-                    "commit": "ffb97f6cc4e6f35296402ff5c879f6d331a4f2d9"
+                    "commit": "35fdcb0e98e0d70a4f620aa47b2d6a6f29d3cf2c"
                 },
                 {
                     "type": "shell",
                     "commands": [
-                        "echo 6.1.0-vrr12 > app/version.txt"
+                        "echo 6.1.0-vrr13 > app/version.txt"
                     ]
                 }
             ]
