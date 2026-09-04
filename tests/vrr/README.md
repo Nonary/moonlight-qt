@@ -1022,21 +1022,22 @@ fields remain the check that the policy is not drifting away from the
 source. `scripts\vrr-sweep-table.ps1` prints both.
 
 The production policy smooths the cadence
-(`controller.playout_smoothing_gain_per_mille`, 150): each target advances
+(`controller.playout_smoothing_gain_per_mille`, 200): each target advances
 from the previous presented slot by a tracked source period (an EMA with
 `playout_smoothing_period_alpha_per_mille`, re-seeded from the cumulative
 rate fit when they disagree by a quarter) and pulls toward the frame's raw
-mapped slot by the gain, so a 5 ms stamp excursion moves the slot 0.75 ms.
+mapped slot by the gain, so a 5 ms stamp excursion moves the slot 1 ms.
 The lag behind the raw slot is capped at `playout_smoothing_max_lag_us`
-(8 ms); a rebase, material rate change, phase discontinuity, host stall or
+(6 ms); a rebase, material rate change, phase discontinuity, host stall or
 burst, or an error over `playout_smoothing_snap_per_mille` of a period snaps
 back to the raw slot. The calibrator sees lateness against the smoothed slot
 so the delay pays for the schedule running ahead of a late stamp. Gain 0
 disables it; `tests\vrr\configs\playout-smoothing-sweep.json` sweeps gain,
-period alpha, lag cap and delay maximum. On the 2026-09-01 captures it cut
-presented pairs with over 2 ms of jerk from 15 to 28 percent down to 1.3 to
-1.8 percent (5 percent on the host-stall capture) for 0.6 to 2.3 ms more
-median decode-to-submission latency and 2.6 to 4.8 ms more at p95.
+period alpha, lag cap and delay maximum. The calibrated period EMA is 100 per
+mille and the adaptive-delay start and cap are 950 per mille of one source
+period. Across the identifiable sustained-gameplay corpus this policy reduced
+presented pairs with over 2 ms of jerk on every trace without saturating the
+worker model.
 `replay_worker_saturated` is set when the worker-occupancy decision model
 shifts the median decision by more than a source period: the candidate keeps
 the single worker busier than the source cadence, the live worker would shed

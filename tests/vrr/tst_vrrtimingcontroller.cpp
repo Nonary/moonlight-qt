@@ -188,11 +188,12 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
                lowLatencyPolicy.renderStartAfterSubmissionUs == 6000 &&
                lowLatencyPolicy.renderStartMinimumLeadUs == 2500 &&
                lowLatencyPolicy.renderLeadFloorUs == 3000 &&
-               lowLatencyPolicy.playoutSmoothingGainPerMille == 0 &&
-               lowLatencyPolicy.playoutSmoothingMaxLagUs == 8000 &&
+               lowLatencyPolicy.playoutSmoothingGainPerMille == 200 &&
+               lowLatencyPolicy.playoutSmoothingPeriodAlphaPerMille == 100 &&
+               lowLatencyPolicy.playoutSmoothingMaxLagUs == 6000 &&
                lowLatencyPolicy.playoutMetronomeEnabled == 0 &&
-               lowLatencyPolicy.playoutDelayStartPeriodPerMille == 1250 &&
-               lowLatencyPolicy.playoutDelayMaximumPeriodPerMille == 1250 &&
+               lowLatencyPolicy.playoutDelayStartPeriodPerMille == 950 &&
+               lowLatencyPolicy.playoutDelayMaximumPeriodPerMille == 950 &&
                lowLatencyPolicy.playoutSmoothingSnapPerMille == 3000 &&
                lowLatencyPolicy.playoutOffsetReseedFrames == 3 &&
                lowLatencyPolicy.playoutBandWidthHz == 20 &&
@@ -206,7 +207,7 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
                lowLatencyPolicy.readinessLowPercentile == 0 &&
                lowLatencyPolicy.readinessLoosePercentile == 80 &&
                lowLatencyPolicy.retainReadinessOnPhaseReset == 0,
-           "sessions must resolve the direct adaptive p99.9 timestamp playout policy");
+           "sessions must resolve the calibrated adaptive timestamp playout policy");
     expect(smoothnessPolicy.playoutDelayAdaptive ==
                    lowLatencyPolicy.playoutDelayAdaptive &&
                smoothnessPolicy.playoutDelayStartUs ==
@@ -946,6 +947,250 @@ void testQuantizedCadenceDoesNotOscillate()
         expect(maximumTimingBudgetUs <= 2000,
                "host-quantized cadence must not create a multi-millisecond readiness reserve");
     }
+}
+
+void testHighRefreshCalibrationBandsHaveNoCadenceCliff()
+{
+    constexpr uint64_t epochUs = 1000000;
+    const int64_t stampJitterUs[] = {
+        0, 700, -500, 900, -800, 400, -200, 600, -600, 200,
+    };
+    struct Sweep {
+        int displayRefreshHz;
+        int minimumSourceRateHz;
+        int maximumSourceRateHz;
+    };
+    // 115..139 covers the reported 120..127 trouble range on a 144 Hz
+    // display and crosses the 120 Hz reservoir edge.  A 240 Hz display lets
+    // us cross every subsequent 20 Hz edge through 220 without asking the
+    // physical 120 Hz development panel to present an impossible cadence.
+    const Sweep sweeps[] = {
+        {144, 115, 139},
+        {240, 115, 227},
+    };
+
+    uint64_t worstP90JerkUs = 0;
+    uint64_t worstDelayStepUs = 0;
+    int worstRateHz = 0;
+    int worstDisplayHz = 0;
+    bool sawUnexpectedReset = false;
+    bool sawWrongBand = false;
+    bool sawBandOscillation = false;
+    bool sawUntrainedBand = false;
+
+    for (const Sweep& sweep : sweeps) {
+        for (int rateHz = sweep.minimumSourceRateHz;
+             rateHz <= sweep.maximumSourceRateHz; ++rateHz) {
+            const VrrSessionConfig session = config(
+                rateHz, sweep.displayRefreshHz);
+            const VrrTimingParameters policy =
+                vrrTimingParametersForSession(session);
+            VrrTimingController controller(session, true, policy);
+            std::vector<uint64_t> jerksUs;
+            uint64_t previousTargetUs = 0;
+            uint64_t previousIntervalUs = 0;
+            uint64_t previousDelayUs = 0;
+            unsigned int steadyBand = 0;
+            bool haveSteadyBand = false;
+            const int warmupFrames = rateHz * 4;
+            const int frameCount = rateHz * 8;
+
+            for (int i = 0; i <= frameCount; ++i) {
+                const int64_t idealStampUs = 10000 +
+                    static_cast<int64_t>(i) * 1000000LL / rateHz;
+                const int64_t jitterUs =
+                    stampJitterUs[i % (sizeof(stampJitterUs) /
+                                        sizeof(stampJitterUs[0]))];
+                const uint32_t timestamp = static_cast<uint32_t>(
+                    (idealStampUs + jitterUs) * 90LL / 1000LL);
+                const uint64_t arrivalJitterUs = i % 97 == 0 ? 0 :
+                    (static_cast<uint64_t>(i) * 1291ULL) % 3001ULL;
+                const uint64_t decodedUs =
+                    decodedTimeForRtp(epochUs, timestamp) + arrivalJitterUs;
+                const VrrTimingDecision decision = controller.schedule(
+                    frame(i, timestamp, true, decodedUs), decodedUs);
+                controller.noteSubmission(true, false, decision.targetUs);
+
+                if (i > warmupFrames &&
+                        (decision.rebased || decision.phaseDiscontinuity ||
+                         decision.sourceRateChanged)) {
+                    sawUnexpectedReset = true;
+                }
+                if (i > warmupFrames) {
+                    if (!haveSteadyBand) {
+                        steadyBand = controller.playoutBandIndex();
+                        haveSteadyBand = true;
+                    }
+                    else if (controller.playoutBandIndex() != steadyBand) {
+                        sawBandOscillation = true;
+                    }
+                }
+                if (i > 0) {
+                    const uint64_t delayStepUs =
+                        decision.playoutDelayUs > previousDelayUs ?
+                            decision.playoutDelayUs - previousDelayUs :
+                            previousDelayUs - decision.playoutDelayUs;
+                    worstDelayStepUs = std::max(worstDelayStepUs,
+                                                delayStepUs);
+                }
+                if (i > warmupFrames && previousTargetUs != 0) {
+                    const uint64_t intervalUs =
+                        decision.targetUs - previousTargetUs;
+                    if (previousIntervalUs != 0) {
+                        jerksUs.push_back(intervalUs > previousIntervalUs ?
+                            intervalUs - previousIntervalUs :
+                            previousIntervalUs - intervalUs);
+                    }
+                    previousIntervalUs = intervalUs;
+                }
+                previousTargetUs = decision.targetUs;
+                previousDelayUs = decision.playoutDelayUs;
+            }
+
+            std::sort(jerksUs.begin(), jerksUs.end());
+            const size_t p90Index = jerksUs.empty() ? 0 :
+                (jerksUs.size() * 90 + 99) / 100 - 1;
+            const uint64_t p90JerkUs = jerksUs.empty() ? 0 :
+                jerksUs[p90Index];
+            if (p90JerkUs > worstP90JerkUs) {
+                worstP90JerkUs = p90JerkUs;
+                worstRateHz = rateHz;
+                worstDisplayHz = sweep.displayRefreshHz;
+            }
+            const unsigned int expectedBand =
+                static_cast<unsigned int>(rateHz) /
+                    std::max<uint64_t>(1, policy.playoutBandWidthHz);
+            const unsigned int actualBand = controller.playoutBandIndex();
+            const uint64_t hysteresisHz = std::max<uint64_t>(
+                1, policy.playoutBandWidthHz / 6);
+            // An exact lower edge may deliberately remain in the lower band
+            // until it clears the hysteresis shoulder. That is the stable
+            // result, not a misclassification or a calibration cliff.
+            const bool heldBelowUpperEdge = expectedBand != 0 &&
+                actualBand + 1 == expectedBand &&
+                static_cast<uint64_t>(rateHz) <
+                    static_cast<uint64_t>(expectedBand) *
+                        policy.playoutBandWidthHz + hysteresisHz;
+            if (actualBand != expectedBand && !heldBelowUpperEdge) {
+                std::fprintf(stderr,
+                             "high-refresh band mismatch: %d/%d Hz settled in %u, nominal %u, learned period=%llu us\n",
+                             rateHz, sweep.displayRefreshHz,
+                             actualBand, expectedBand,
+                             static_cast<unsigned long long>(
+                                 controller.sourcePeriodUs()));
+                sawWrongBand = true;
+            }
+            sawUntrainedBand = sawUntrainedBand ||
+                controller.playoutBandSamples() <
+                    policy.playoutDelayReleaseSamples;
+        }
+    }
+
+    std::fprintf(stderr,
+                 "high-refresh band sweep: worst p90 jerk=%llu us at %d/%d Hz, max delay step=%llu us\n",
+                 static_cast<unsigned long long>(worstP90JerkUs),
+                 worstRateHz, worstDisplayHz,
+                 static_cast<unsigned long long>(worstDelayStepUs));
+    expect(!sawUnexpectedReset,
+           "steady 115..227 FPS sources must not reset or refit after warmup");
+    expect(!sawWrongBand,
+           "every high-refresh source rate must settle in its expected calibration band");
+    expect(!sawBandOscillation,
+           "a steady source near a calibration edge must not oscillate between bands");
+    expect(!sawUntrainedBand,
+           "every high-refresh calibration band must collect enough samples to release its start delay");
+    expect(worstDelayStepUs <= 50,
+           "adaptive delay must not introduce a cadence cliff at any high-refresh band");
+    expect(worstP90JerkUs <= 1000,
+           "production smoothing must keep p90 presented jerk below 1 ms across high-refresh bands");
+}
+
+void testReported120HzBandBoundarySlewsCalibration()
+{
+    struct Result {
+        uint64_t maximumDelayStepUs = 0;
+        bool sawLowerBand = false;
+        bool returnedToUpperBand = false;
+    };
+    const auto run = [](VrrTimingParameters policy) {
+        constexpr uint64_t epochUs = 1000000;
+        VrrTimingController controller(config(127, 144), true, policy);
+        Result result;
+        long double rtpTicks = 9000.0L;
+        uint64_t previousDelayUs = 0;
+        int frameNumber = 0;
+
+        const auto runRate = [&](int rateHz, int frameCount,
+                                 uint64_t arrivalJitterLimitUs) {
+            for (int i = 0; i < frameCount; ++i) {
+                rtpTicks += 90000.0L / static_cast<long double>(rateHz);
+                const uint32_t timestamp = static_cast<uint32_t>(
+                    std::llround(rtpTicks));
+                const uint64_t arrivalJitterUs =
+                    (static_cast<uint64_t>(frameNumber) * 1291ULL) %
+                    (arrivalJitterLimitUs + 1);
+                const uint64_t decodedUs =
+                    decodedTimeForRtp(epochUs, timestamp) + arrivalJitterUs;
+                const VrrTimingDecision decision = controller.schedule(
+                    frame(frameNumber, timestamp, true, decodedUs), decodedUs);
+                controller.noteSubmission(true, false, decision.targetUs);
+                if (frameNumber != 0) {
+                    const uint64_t stepUs =
+                        decision.playoutDelayUs > previousDelayUs ?
+                            decision.playoutDelayUs - previousDelayUs :
+                            previousDelayUs - decision.playoutDelayUs;
+                    result.maximumDelayStepUs = std::max(
+                        result.maximumDelayStepUs, stepUs);
+                }
+                previousDelayUs = decision.playoutDelayUs;
+                ++frameNumber;
+
+                if (controller.playoutBandIndex() == 5) {
+                    result.sawLowerBand = true;
+                }
+                else if (result.sawLowerBand &&
+                         controller.playoutBandIndex() == 6) {
+                    result.returnedToUpperBand = true;
+                }
+            }
+        };
+
+        // Settle below the 120 Hz edge with a clean arrival tail, then move
+        // into the reported 120..127 FPS range with a materially different
+        // tail. The old direct band assignment exposed that difference as a
+        // single-frame timing jump.
+        runRate(116, 1800, 900);
+        runRate(127, 1800, 5000);
+        return result;
+    };
+
+    const VrrTimingParameters production =
+        vrrTimingParametersForSession(config(127, 144));
+    const Result current = run(production);
+
+    VrrTimingParameters vrr12Like = production;
+    vrr12Like.playoutDelaySlewAcrossBands = 0;
+    vrr12Like.rateCandidateMinimumUs = 0;
+    vrr12Like.playoutDelayStartPeriodPerMille = 0;
+    vrr12Like.playoutDelayMaximumPeriodPerMille = 0;
+    vrr12Like.playoutSmoothingGainPerMille = 150;
+    vrr12Like.playoutSmoothingPeriodAlphaPerMille = 50;
+    vrr12Like.playoutSmoothingMaxLagUs = 8000;
+    const Result oldBandApplication = run(vrr12Like);
+
+    std::fprintf(stderr,
+                 "120 Hz calibration edge: current max delay step=%llu us, vrr12-style=%llu us\n",
+                 static_cast<unsigned long long>(current.maximumDelayStepUs),
+                 static_cast<unsigned long long>(
+                     oldBandApplication.maximumDelayStepUs));
+    expect(current.sawLowerBand && current.returnedToUpperBand,
+           "the regression must cross from the lower calibration band into 120..127 FPS");
+    expect(current.maximumDelayStepUs <=
+               std::max(production.playoutDelayAttackUs,
+                        production.playoutDelayReleaseUs),
+           "crossing into 120..127 FPS must slew rather than step the active delay");
+    expect(oldBandApplication.maximumDelayStepUs > 1000,
+           "the vrr12-style direct band assignment must reproduce the old timing cliff");
 }
 
 void testNegotiatedRateCeiling()
@@ -2191,6 +2436,8 @@ int main()
     testSmoothnessLearningWindowTracksCadence();
     testLongRunNearRefreshRtpCadence();
     testQuantizedCadenceDoesNotOscillate();
+    testHighRefreshCalibrationBandsHaveNoCadenceCliff();
+    testReported120HzBandBoundarySlewsCalibration();
     testNegotiatedRateCeiling();
     testSpacingGuardFeedback();
     testNearRefreshRequestsLatchedPresentation();

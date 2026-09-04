@@ -23,12 +23,11 @@ constexpr uint64_t kQ16Half = kQ16One >> 1;
 // through as a hitch; p99.9 halved those hitches (13 to 6 in 106 s) for
 // 1.2 ms more median latency, a trade the user judged well worth it. The
 // absolute bounds below are floors; the session policy scales the start and
-// cap to a little over one source period (kPlayoutStartPeriodPerMille), the
-// cushion stock frame pacing has, so a band starts with stock's tolerance
-// for jitter and only releases below it once its lateness tail proves the
-// link cleaner. Reports of the 8 ms cap were consistent: at 4K the host
-// stamp wobble alone consumed most of it. The fixed delay is only used when
-// the calibrator is disabled by replay parameters.
+// cap to 95 percent of one source period. That was the replay-calibrated knee:
+// it retained almost all of the one-period policy's cadence smoothing while
+// recovering its added latency. Reports of the 8 ms cap were consistent: at
+// 4K the host stamp wobble alone consumed most of it. The fixed delay is only
+// used when the calibrator is disabled by replay parameters.
 constexpr uint64_t kFixedPlayoutDelayUs = 3000;
 constexpr uint64_t kPlayoutStartUs = 6000;
 constexpr uint64_t kPlayoutMinimumUs = 1000;
@@ -39,28 +38,23 @@ constexpr uint64_t kPlayoutMaximumUs = 8000;
 // the frames bunched behind it), never ordinary jitter.
 constexpr uint64_t kPlayoutPercentilePerMille = 1000;
 constexpr uint64_t kPlayoutBurstExclusionPerMille = 750;
-// Legacy cadence smoothing, kept so captures made under it replay the same
-// way. Host presentation stamps jitter frame to frame (about +-2 ms at
-// 1440p and +-5 ms at 4K on the reference rig) even when the game runs at a
-// steady rate, and a VRR display shows every one of those steps. This
-// smoother advanced by a tracked period and pulled toward each frame's raw
-// slot by a gain, which still passed 15 percent of the wobble through and
-// clamped every late frame to "now".
-constexpr uint64_t kPlayoutSmoothingGainPerMille = 150;
-constexpr uint64_t kPlayoutSmoothingPeriodAlphaPerMille = 50;
-constexpr uint64_t kPlayoutSmoothingMaxLagUs = 8000;
-// Metronome playout. The gain smoother above still passed 15 percent of the
-// stamp wobble to the panel and clamped every late frame to "now", which is
-// exactly the interval change a VRR display shows. The metronome instead
-// advances the presented slot by the fitted source period, corrects phase
-// toward the mapped sender clock by a bounded step (a few tens of
-// microseconds, at most two percent of a period), and moves a frame that
-// cannot make its tick to the next tick it can make rather than presenting
-// it early. The cushion is sized like stock frame pacing, a little over one
-// source period, so ordinary jitter never starves the tick; the calibrator
-// releases from there only once the lateness tail proves the link cleaner.
-constexpr uint64_t kPlayoutStartPeriodPerMille = 1250;
-constexpr uint64_t kPlayoutMaximumPeriodPerMille = 1250;
+// Host presentation stamps jitter frame to frame (about +-2 ms at 1440p and
+// +-5 ms at 4K on the reference rig) even when the game runs at a steady
+// rate, and a VRR display shows every one of those steps. Advance by a
+// tracked source period and pull 20 percent toward each raw mapped slot. A
+// ten-percent period EMA follows genuine game-rate motion, while the 6 ms
+// lag cap prevents smoothing debt from turning into excess latency. These
+// values were selected across sustained gameplay traces after excluding
+// desktop/idle regions and sustained source cadence above 120 FPS.
+constexpr uint64_t kPlayoutSmoothingGainPerMille = 200;
+constexpr uint64_t kPlayoutSmoothingPeriodAlphaPerMille = 100;
+constexpr uint64_t kPlayoutSmoothingMaxLagUs = 6000;
+// Retired metronome playout, kept reachable for replay. It advances the
+// presented slot by the fitted source period, corrects phase toward the mapped
+// sender clock by a bounded step, and moves a frame that cannot make its tick
+// to the next tick rather than presenting it early.
+constexpr uint64_t kPlayoutStartPeriodPerMille = 950;
+constexpr uint64_t kPlayoutMaximumPeriodPerMille = 950;
 constexpr uint64_t kPlayoutMetronomeSnapPerMille = 3000;
 // A provisional cadence segment after a major departure must span this much
 // sender time before its fit replaces the source rate. Three long stamps
@@ -119,12 +113,10 @@ void appendBounded(std::deque<T>& values, T value, size_t limit)
 VrrTimingParameters vrrTimingParametersForSession(
     const VrrSessionConfig& config)
 {
-    // Present at sender time plus a learned delay. The readiness reserve, its
-    // per-frame slewing, and every phase re-anchor are off on this path: they
-    // each moved the target between frames the source had spaced evenly,
-    // which was the visible stutter. The projected-clock policy and the
-    // retired smoothness budget remain reachable through explicit parameters
-    // so older captures replay under the policy they ran.
+    // Present on a tracked source cadence plus a learned delay. The readiness
+    // reserve, its per-frame slewing, and every phase re-anchor are off on this
+    // path: they each moved the target between frames the source had spaced
+    // evenly. Explicit parameters keep older policies replayable.
     (void) config;
     VrrTimingParameters parameters;
     parameters.timestampPlayoutEnabled = 1;
@@ -135,12 +127,11 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayMaximumUs = kPlayoutMaximumUs;
     parameters.playoutDelayPercentilePerMille = kPlayoutPercentilePerMille;
     parameters.playoutBurstExclusionPerMille = kPlayoutBurstExclusionPerMille;
-    // The presented interval between two frames is the host's stamp
-    // interval between them: no smoother, grid or deadband moves a frame
-    // off its slot. The delay absorbs jitter and only ever slews. The
-    // cadence smoother and metronome remain reachable through replay
-    // parameters so captures made under them replay the same way.
-    parameters.playoutSmoothingGainPerMille = 0;
+    // Preserve genuine game-rate motion without exposing every short/long
+    // host-stamp pair directly to the VRR panel. This adjusts only local
+    // presentation targets; the received RTP timestamps remain unchanged.
+    parameters.playoutSmoothingGainPerMille =
+        kPlayoutSmoothingGainPerMille;
     parameters.playoutSmoothingPeriodAlphaPerMille =
         kPlayoutSmoothingPeriodAlphaPerMille;
     parameters.playoutSmoothingMaxLagUs = kPlayoutSmoothingMaxLagUs;
