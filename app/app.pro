@@ -35,9 +35,10 @@ DEFINES += QT_DEPRECATED_WARNINGS
 # You can also select to disable deprecated APIs only up to a certain version of Qt.
 DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
+BASE_VERSION = $$cat(version.txt)
 MOONLIGHT_VERSION = $$(CI_VERSION)
 isEmpty(MOONLIGHT_VERSION) {
-    MOONLIGHT_VERSION = $$cat(version.txt)
+    MOONLIGHT_VERSION = $$BASE_VERSION
 }
 
 win32 {
@@ -576,7 +577,7 @@ win32 {
 macx {
     # Create Info.plist in object dir with the correct version string
     system(cp $$PWD/Info.plist $$OUT_PWD/Info.plist)
-    system(sed -i -e 's/VERSION/$$MOONLIGHT_VERSION/g' $$OUT_PWD/Info.plist)
+    system(sed -i -e 's/VERSION/$$BASE_VERSION/g' $$OUT_PWD/Info.plist)
 
     QMAKE_INFO_PLIST = $$OUT_PWD/Info.plist
 
@@ -598,5 +599,5 @@ macx {
     }
 }
 
-VERSION = "$$MOONLIGHT_VERSION"
+VERSION = "$$BASE_VERSION"
 DEFINES += VERSION_STR=\\\"$$MOONLIGHT_VERSION\\\"
