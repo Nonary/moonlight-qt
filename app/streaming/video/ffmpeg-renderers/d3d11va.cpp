@@ -72,6 +72,7 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
 
 D3D11VARenderer::~D3D11VARenderer()
 {
+    if (m_FrameLatencyHandle) CloseHandle(m_FrameLatencyHandle);
     DwmEnableMMCSS(FALSE);
 
     SDL_DestroyMutex(m_ContextLock);
@@ -610,6 +611,11 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     SDL_GetWindowWMInfo(params->window, &info);
     SDL_assert(info.subsystem == SDL_SYSWM_WINDOWS);
 
+    if (params->enableVrr && m_AllowTearing) {
+        swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        swapChainDesc.BufferCount = 3;
+    }
+
     // Always use windowed or borderless windowed mode.. SDL does mode-setting for us in
     // full-screen exclusive mode (SDL_WINDOW_FULLSCREEN), so this actually works out okay.
     ComPtr<IDXGISwapChain1> swapChain;
@@ -739,7 +745,7 @@ bool D3D11VARenderer::prepareDecoderContextInGetFormat(AVCodecContext *context, 
     return true;
 }
 
-void D3D11VARenderer::renderFrame(AVFrame* frame)
+void D3D11VARenderer::drawFrame(AVFrame* frame)
 {
     // Acquire the context lock for rendering to prevent concurrent
     // access from inside FFmpeg's decoding code
@@ -761,22 +767,6 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     // Render overlays on top of the video stream
     for (int i = 0; i < Overlay::OverlayMax; i++) {
         renderOverlay((Overlay::OverlayType)i);
-    }
-
-    UINT flags;
-
-    if (m_AllowTearing) {
-        SDL_assert(!m_DecoderParams.enableVsync);
-
-        // If tearing is allowed, use DXGI_PRESENT_ALLOW_TEARING with syncInterval 0.
-        // It is not valid to use any other syncInterval values in tearing mode.
-        flags = DXGI_PRESENT_ALLOW_TEARING;
-    }
-    else {
-        // Otherwise, we'll submit as fast as possible and DWM will discard excess
-        // frames for us. If frame pacing is also enabled or we're in full-screen,
-        // our Vsync source will keep us in sync with VBlank.
-        flags = 0;
     }
 
     HRESULT hr;
@@ -804,13 +794,18 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         m_LastColorTrc = frame->color_trc;
     }
 
-    // Present according to the decoder parameters
-    hr = m_SwapChain->Present(0, flags);
-
     if (m_DecodeDevice == m_RenderDevice) {
         // Release the context lock
         unlockContext(this);
     }
+}
+
+void D3D11VARenderer::renderFrame(AVFrame* frame)
+{
+    drawFrame(frame);
+    if (m_DecodeDevice == m_RenderDevice) lockContext(this);
+    HRESULT hr = m_SwapChain->Present(0, m_AllowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    if (m_DecodeDevice == m_RenderDevice) unlockContext(this);
 
     if (FAILED(hr)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -823,6 +818,117 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         SDL_PushEvent(&event);
         return;
     }
+}
+
+bool D3D11VARenderer::initializeVrr(Vrr::Config&)
+{
+    if (!m_AllowTearing) return false;
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    if (FAILED(m_SwapChain->GetDesc1(&desc)) || !(desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)) return false;
+    if (FAILED(m_SwapChain->SetMaximumFrameLatency(1))) return false;
+    m_FrameLatencyHandle = m_SwapChain->GetFrameLatencyWaitableObject();
+    if (!m_FrameLatencyHandle) return false;
+    D3D11_QUERY_DESC query{D3D11_QUERY_EVENT, 0};
+    if (FAILED(m_RenderDevice->CreateQuery(&query, &m_RenderComplete))) return false;
+    m_SwapChain.As(&m_SwapChainMedia); // Optional composition mode information.
+    m_Vrr = true;
+    return true;
+}
+
+bool D3D11VARenderer::prepareVrr(AVFrame* frame, const std::atomic<bool>& stopping, Vrr::Preparation& timing)
+{
+    const auto deadline = Vrr::now() + 100 * Vrr::Millisecond;
+    bool acquired = false;
+    while (!stopping.load() && Vrr::now() < deadline) {
+        const auto result = WaitForSingleObject(m_FrameLatencyHandle, 2);
+        if (result == WAIT_OBJECT_0) { acquired = true; break; }
+        if (result == WAIT_FAILED) return false;
+    }
+    if (!acquired) return false;
+    timing.acquired = Vrr::now();
+    drawFrame(frame);
+    if (m_DecodeDevice == m_RenderDevice) lockContext(this);
+    m_RenderDeviceContext->End(m_RenderComplete.Get());
+    m_RenderDeviceContext->Flush();
+    if (m_DecodeDevice == m_RenderDevice) unlockContext(this);
+    timing.commandsSubmitted = Vrr::now();
+    timing.gpuNotReady = timing.acquired;
+    while (!stopping.load() && Vrr::now() < deadline) {
+        BOOL complete = FALSE;
+        if (m_DecodeDevice == m_RenderDevice) lockContext(this);
+        const auto checkedAt = Vrr::now();
+        const HRESULT result = m_RenderDeviceContext->GetData(m_RenderComplete.Get(), &complete, sizeof(complete), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (m_DecodeDevice == m_RenderDevice) unlockContext(this);
+        if (FAILED(result)) return false;
+        if (result == S_OK && complete) { timing.gpuReady = Vrr::now(); return true; }
+        timing.gpuNotReady = checkedAt;
+        // GPU polling does not use the final-deadline yield tail: sleeping here
+        // avoids burning a CPU core while the GPU/decoder is still working.
+        Vrr::waitUntil(Vrr::now() + 100000, stopping, 0);
+    }
+    return false;
+}
+
+bool D3D11VARenderer::presentVrr(uint64_t id, Vrr::Ns& submitted)
+{
+    if (m_DecodeDevice == m_RenderDevice) lockContext(this);
+    submitted = Vrr::now();
+    const HRESULT result = m_SwapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+    if (m_DecodeDevice == m_RenderDevice) unlockContext(this);
+    // DXGI_STATUS_OCCLUDED is not a successfully displayed content update.
+    if (result != S_OK) return false;
+    UINT nativeId = 0;
+    if (SUCCEEDED(m_SwapChain->GetLastPresentCount(&nativeId))) {
+        m_VrrPresents[m_VrrNext] = {nativeId, id};
+        m_VrrNext = (m_VrrNext + 1) % m_VrrPresents.size();
+    }
+    return true;
+}
+
+bool D3D11VARenderer::pollVrr(Vrr::Feedback& f)
+{
+    DXGI_FRAME_STATISTICS statistics{};
+    const HRESULT result = m_SwapChain->GetFrameStatistics(&statistics);
+    if (FAILED(result)) {
+        if (m_VrrDisjoint) return false;
+        m_VrrDisjoint = true;
+        m_VrrPresents = {};
+        m_VrrLastSync = m_VrrLastPresent = m_VrrLastPresentRefresh = 0;
+        m_VrrSyncSequence = 0;
+        f = {}; f.outcome = Vrr::Outcome::Reset; f.observed = Vrr::now();
+        return true;
+    }
+    m_VrrDisjoint = false;
+    if (!statistics.SyncQPCTime.QuadPart ||
+        (statistics.SyncRefreshCount == m_VrrLastSync && statistics.PresentCount == m_VrrLastPresent &&
+         statistics.PresentRefreshCount == m_VrrLastPresentRefresh)) return false;
+    f = {};
+    f.observed = Vrr::now();
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    f.presented = statistics.SyncQPCTime.QuadPart / frequency.QuadPart * Vrr::Second +
+        statistics.SyncQPCTime.QuadPart % frequency.QuadPart * Vrr::Second / frequency.QuadPart;
+    if (m_VrrLastSync) m_VrrSyncSequence += UINT(statistics.SyncRefreshCount - m_VrrLastSync);
+    else m_VrrSyncSequence = statistics.SyncRefreshCount;
+    f.sequence = m_VrrSyncSequence;
+    f.quality = Vrr::Quality::Compositor;
+    f.uncertainty = 1000;
+    f.outcome = Vrr::Outcome::Presented;
+    // Under VRR, extrapolating SyncQPCTime by a nominal refresh period is
+    // invalid. Correlate a frame ONLY if the two refresh counters agree.
+    if (statistics.PresentRefreshCount == statistics.SyncRefreshCount) {
+        for (auto& p : m_VrrPresents) if (p.id && p.nativeId == statistics.PresentCount) {
+            f.id = p.id; p = {}; break;
+        }
+    }
+    if (m_SwapChainMedia) {
+        DXGI_FRAME_STATISTICS_MEDIA media{};
+        if (SUCCEEDED(m_SwapChainMedia->GetFrameStatisticsMedia(&media))) f.flags = uint64_t(media.CompositionMode);
+    }
+    m_VrrLastSync = statistics.SyncRefreshCount;
+    m_VrrLastPresent = statistics.PresentCount;
+    m_VrrLastPresentRefresh = statistics.PresentRefreshCount;
+    return true;
 }
 
 void D3D11VARenderer::renderOverlay(Overlay::OverlayType type)
@@ -1089,14 +1195,13 @@ void D3D11VARenderer::notifyOverlayUpdated(Overlay::OverlayType type)
         return;
     }
 
-    SDL_AtomicLock(&m_OverlayLock);
-    ComPtr<ID3D11Texture2D> oldTexture = std::move(m_OverlayTextures[type]);
-    ComPtr<ID3D11Buffer> oldVertexBuffer = std::move(m_OverlayVertexBuffers[type]);
-    ComPtr<ID3D11ShaderResourceView> oldTextureResourceView = std::move(m_OverlayTextureResourceViews[type]);
-    SDL_AtomicUnlock(&m_OverlayLock);
-
     // If the overlay is disabled, we're done
     if (!overlayEnabled) {
+        SDL_AtomicLock(&m_OverlayLock);
+        auto oldTexture = std::move(m_OverlayTextures[type]);
+        auto oldVertexBuffer = std::move(m_OverlayVertexBuffers[type]);
+        auto oldTextureResourceView = std::move(m_OverlayTextureResourceViews[type]);
+        SDL_AtomicUnlock(&m_OverlayLock);
         SDL_FreeSurface(newSurface);
         return;
     }
@@ -1153,6 +1258,9 @@ void D3D11VARenderer::notifyOverlayUpdated(Overlay::OverlayType type)
     newSurface = nullptr;
 
     SDL_AtomicLock(&m_OverlayLock);
+    auto oldTexture = std::move(m_OverlayTextures[type]);
+    auto oldVertexBuffer = std::move(m_OverlayVertexBuffers[type]);
+    auto oldTextureResourceView = std::move(m_OverlayTextureResourceViews[type]);
     m_OverlayVertexBuffers[type] = std::move(newVertexBuffer);
     m_OverlayTextures[type] = std::move(newTexture);
     m_OverlayTextureResourceViews[type] = std::move(newTextureResourceView);

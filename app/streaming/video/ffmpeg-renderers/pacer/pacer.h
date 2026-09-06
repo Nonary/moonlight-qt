@@ -6,6 +6,10 @@
 #include <QQueue>
 #include <QMutex>
 #include <QWaitCondition>
+#include <memory>
+#include <atomic>
+
+namespace Vrr { class Worker; }
 
 // The maximum number of frames pacer will ever hold is:
 // - 3 frames in the pacing queue
@@ -35,9 +39,12 @@ public:
 
     ~Pacer();
 
-    void submitFrame(AVFrame* frame);
+    void submitFrame(AVFrame* frame, uint64_t receivedUs = 0, uint64_t assembledUs = 0);
 
-    bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing);
+    bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrr = false);
+    void stopVrr();
+    void collectVrrStats();
+    bool isVrr() const { return bool(m_VrrWorker); }
 
     void signalVsync();
 
@@ -67,7 +74,8 @@ private:
     SDL_Thread* m_RenderThread;
     SDL_Thread* m_VsyncThread;
     AVFrame* m_DeferredFreeFrame;
-    bool m_Stopping;
+    std::atomic<bool> m_Stopping;
+    std::unique_ptr<Vrr::Worker> m_VrrWorker;
 
     IVsyncSource* m_VsyncSource;
     IFFmpegRenderer* m_VsyncRenderer;

@@ -1,0 +1,9 @@
+TEMPLATE = app
+TARGET = test-vrr14-vulkan
+CONFIG += console c++17 link_pkgconfig
+CONFIG -= app_bundle qt
+DEFINES -= NDEBUG
+PKGCONFIG += libplacebo vulkan
+INCLUDEPATH += ../../app/streaming/video/ffmpeg-renderers/vrr
+SOURCES += test_vulkan.cpp ../../app/streaming/video/ffmpeg-renderers/vrr/clock.cpp
+LIBS += -lpthread

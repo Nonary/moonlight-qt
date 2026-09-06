@@ -3,6 +3,7 @@
 #include "SDL_compat.h"
 
 #include <array>
+#include "vrr/timing.h"
 
 #include "streaming/video/decoder.h"
 #include "streaming/video/overlaymanager.h"
@@ -160,6 +161,14 @@ public:
     virtual bool initialize(PDECODER_PARAMETERS params) = 0;
     virtual bool prepareDecoderContext(AVCodecContext* context, AVDictionary** options) = 0;
     virtual void renderFrame(AVFrame* frame) = 0;
+
+    // Explicit presentation contract for the VRR worker. Unsupported frontends
+    // must decline, rather than reporting CPU submission as measured scanout.
+    virtual bool initializeVrr(Vrr::Config&) { return false; }
+    virtual bool prepareVrr(AVFrame*, const std::atomic<bool>&, Vrr::Preparation&) { return false; }
+    virtual bool presentVrr(uint64_t, Vrr::Ns&) { return false; }
+    virtual bool pollVrrPreparation(Vrr::Preparation&) { return false; }
+    virtual bool pollVrr(Vrr::Feedback&) { return false; }
 
     enum class InitFailureReason
     {

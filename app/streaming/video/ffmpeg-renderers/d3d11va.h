@@ -26,6 +26,10 @@ public:
     virtual int getRendererAttributes() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
+    bool initializeVrr(Vrr::Config&) override;
+    bool prepareVrr(AVFrame*, const std::atomic<bool>&, Vrr::Preparation&) override;
+    bool presentVrr(uint64_t id, Vrr::Ns& submitted) override;
+    bool pollVrr(Vrr::Feedback&) override;
 
     enum PixelShaders {
         GENERIC_YUV_420,
@@ -35,6 +39,17 @@ public:
     };
 
 private:
+    void drawFrame(AVFrame* frame);
+    bool m_Vrr = false;
+    HANDLE m_FrameLatencyHandle = nullptr;
+    Microsoft::WRL::ComPtr<ID3D11Query> m_RenderComplete;
+    Microsoft::WRL::ComPtr<IDXGISwapChainMedia> m_SwapChainMedia;
+    struct VrrPresent { UINT nativeId = 0; uint64_t id = 0; };
+    std::array<VrrPresent, 32> m_VrrPresents{};
+    size_t m_VrrNext = 0;
+    UINT m_VrrLastSync = 0, m_VrrLastPresent = 0, m_VrrLastPresentRefresh = 0;
+    uint64_t m_VrrSyncSequence = 0;
+    bool m_VrrDisjoint = false;
     static void lockContext(void* lock_ctx);
     static void unlockContext(void* lock_ctx);
 
@@ -111,4 +126,3 @@ private:
 
     AVBufferRef* m_HwDeviceContext;
 };
-

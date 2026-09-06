@@ -1,4 +1,5 @@
 #include "plvk.h"
+#include "vrr/vulkangpu.h"
 
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
@@ -182,6 +183,8 @@ PlVkRenderer::~PlVkRenderer()
 
         pl_renderer_destroy(&m_Renderer);
         pl_swapchain_destroy(&m_Swapchain);
+        m_GpuCompletion.reset();
+        m_OverlayCompletion.reset();
 #ifdef Q_OS_DARWIN
         m_MetalTextureFactory.reset();
 #endif
@@ -494,7 +497,14 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
-    if (params->enableVsync) {
+    if (params->enableVrr &&
+        isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, VK_PRESENT_MODE_MAILBOX_KHR)) {
+        // The controller owns the cadence. Mailbox avoids a FIFO backlog and
+        // requests complete images without opting into tearing.
+        m_VkPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Using Mailbox present mode for adaptive VRR pacing");
+    }
+    else if (params->enableVsync) {
         // FIFO mode improves frame pacing compared with Mailbox, especially for
         // platforms like X11 that lack a VSyncSource implementation for Pacer.
         m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
@@ -898,14 +908,15 @@ void PlVkRenderer::waitToRender()
     }
 
 #ifndef Q_OS_WIN32
-    // With libplacebo's Vulkan backend, all swap_buffers does is wait for queued
-    // presents to finish. This happens to be exactly what we want to do here, since
-    // it lets us wait to select a queued frame for rendering until we know that we
-    // can present without blocking in renderFrame().
+    // This limits GPU work in flight. It does not establish that an image has
+    // been scanned out or that a future presentation cannot block.
     //
     // NB: This seems to cause performance problems with the Windows display stack
     // (particularly on Nvidia) so we will only do this for non-Windows platforms.
-    pl_swapchain_swap_buffers(m_Swapchain);
+    // VRR already completes each rendered image before submission and native
+    // acquisition bounds the available images. Avoid a second global command
+    // retirement wait before starting the next frame's preparation.
+    if (!m_Vrr) pl_swapchain_swap_buffers(m_Swapchain);
 #endif
 
     // Handle the swapchain being resized
@@ -954,21 +965,31 @@ void PlVkRenderer::cleanupRenderContext()
         pl_swapchain_submit_frame(m_Swapchain);
         m_HasPendingSwapchainFrame = false;
     }
+    m_VrrPrepared = false;
+    // Keep imported AVFrames alive until outstanding work has finished, also
+    // when preparation was cancelled before its normal completion wait.
+    if (m_Vrr) m_GpuCompletion->finish();
 }
 
 void PlVkRenderer::renderFrame(AVFrame *frame)
 {
+    drawFrame(frame, false);
+}
+
+bool PlVkRenderer::drawFrame(AVFrame *frame, bool deferPresent)
+{
     pl_frame mappedFrame, targetFrame;
+    bool rendered = false;
 
     // If waitToRender() failed to get the next swapchain frame, skip
     // rendering this frame. It probably means the window is occluded.
     if (!m_HasPendingSwapchainFrame) {
-        return;
+        return false;
     }
 
     if (!mapAvFrameToPlacebo(frame, &mappedFrame)) {
         // This function logs internally
-        return;
+        return false;
     }
 
     // Adjust the swapchain if the colorspace of incoming frames has changed
@@ -992,9 +1013,7 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
 
     // Reserve enough space to avoid allocating under the overlay lock
     pl_overlay_part overlayParts[Overlay::OverlayMax] = {};
-    std::vector<pl_tex> texturesToDestroy;
     std::vector<pl_overlay> overlays;
-    texturesToDestroy.reserve(Overlay::OverlayMax);
     overlays.reserve(Overlay::OverlayMax);
 
     pl_frame_from_swapchain(&targetFrame, &m_SwapchainFrame);
@@ -1004,28 +1023,15 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
     for (int i = 0; i < Overlay::OverlayMax; i++) {
         // If we have a staging overlay, we need to transfer ownership to us
         if (m_Overlays[i].hasStagingOverlay) {
-            if (m_Overlays[i].hasOverlay) {
-                texturesToDestroy.push_back(m_Overlays[i].overlay.tex);
-            }
-
-            // Copy the overlay fields from the staging area
-            m_Overlays[i].overlay = m_Overlays[i].stagingOverlay;
-
-            // We now own the staging overlay
+            // Reuse two textures. Only adopt an upload after completion so a
+            // diagnostic refresh cannot add a GPU dependency to this frame.
+            std::swap(m_Overlays[i].overlay, m_Overlays[i].stagingOverlay);
             m_Overlays[i].hasStagingOverlay = false;
-            SDL_zero(m_Overlays[i].stagingOverlay);
             m_Overlays[i].hasOverlay = true;
         }
 
-        // If we have an overlay but it's been disabled, free the overlay texture
-        if (m_Overlays[i].hasOverlay && !Session::get()->getOverlayManager().isOverlayEnabled((Overlay::OverlayType)i)) {
-            texturesToDestroy.push_back(m_Overlays[i].overlay.tex);
-            SDL_zero(m_Overlays[i].overlay);
-            m_Overlays[i].hasOverlay = false;
-        }
-
         // We have an overlay to draw
-        if (m_Overlays[i].hasOverlay) {
+        if (m_Overlays[i].hasOverlay && Session::get()->getOverlayManager().isOverlayEnabled((Overlay::OverlayType)i)) {
             // Position the overlay
             overlayParts[i].src = { 0, 0, (float)m_Overlays[i].overlay.tex->params.w, (float)m_Overlays[i].overlay.tex->params.h };
             if (i == Overlay::OverlayStatusUpdate) {
@@ -1077,15 +1083,22 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
     // Render the video image and overlays into the swapchain buffer
     targetFrame.num_overlays = (int)overlays.size();
     targetFrame.overlays = overlays.data();
-    if (!pl_render_image(m_Renderer, &mappedFrame, &targetFrame, &pl_render_fast_params)) {
+    rendered = pl_render_image(m_Renderer, &mappedFrame, &targetFrame, &pl_render_fast_params);
+    if (!rendered) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "pl_render_image() failed");
         // NB: We must fallthrough to call pl_swapchain_submit_frame()
     }
 
+    // VRR keeps the acquired image until GPU completion and the final timing
+    // decision. HDR color-space selection, metadata and overlays above are
+    // exactly the same operations as in ordinary presentation.
+    if (deferPresent) goto UnmapExit;
+
     // Submit the frame for display and swap buffers
     m_HasPendingSwapchainFrame = false;
     if (!pl_swapchain_submit_frame(m_Swapchain)) {
+        rendered = false;
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "pl_swapchain_submit_frame() failed");
 
@@ -1124,12 +1137,71 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
 #endif
 
 UnmapExit:
-    // Delete any textures that need to be destroyed
-    for (pl_tex& texture : texturesToDestroy) {
-        pl_tex_destroy(m_Vulkan->gpu, &texture);
-    }
-
     unmapAvFrameFromPlacebo(frame, &mappedFrame);
+    return rendered;
+}
+
+bool PlVkRenderer::initializeVrr(Vrr::Config&)
+{
+#ifdef HAS_WAYLAND
+    auto feedback = std::make_unique<Vrr::WaylandFeedback>();
+    if (!feedback->initialize(m_Window)) return false;
+    auto completion = std::make_unique<Vrr::VulkanCompletion>();
+    if (!completion->initialize(m_Vulkan, true)) return false;
+    m_GpuCompletion = std::move(completion);
+    m_PresentationFeedback = std::move(feedback);
+    m_Vrr = true;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Vulkan VRR: asynchronous image completion and original-deadline presentation feedback; HDR color management retained");
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool PlVkRenderer::prepareVrr(AVFrame* frame, const std::atomic<bool>& stopping, Vrr::Preparation& timing)
+{
+    m_VrrPrepared = false;
+    if (stopping.load()) return false;
+    waitToRender();
+    if (!m_HasPendingSwapchainFrame || stopping.load()) return false;
+    timing.acquired = Vrr::now();
+    const auto earliest = timing.acquired;
+    if (!drawFrame(frame, true)) return false;
+    m_VrrPrepared = m_GpuCompletion->submit(m_SwapchainFrame.fbo, stopping, timing, earliest);
+    return m_VrrPrepared;
+}
+
+bool PlVkRenderer::presentVrr(uint64_t id, Vrr::Ns& submitted)
+{
+    if (!m_VrrPrepared || !m_HasPendingSwapchainFrame) return false;
+#ifdef HAS_WAYLAND
+    m_PresentationFeedback->request(id);
+#else
+    (void)id;
+#endif
+    m_VrrPrepared = false;
+    m_HasPendingSwapchainFrame = false;
+    // libplacebo performs its final layout transition and vkQueuePresentKHR in
+    // this call. Include that small final submission cost in measured compositor
+    // lead; never interpret the return as a presentation timestamp.
+    submitted = Vrr::now();
+    return pl_swapchain_submit_frame(m_Swapchain);
+}
+
+bool PlVkRenderer::pollVrrPreparation(Vrr::Preparation& timing)
+{
+    return m_GpuCompletion && m_GpuCompletion->poll(timing);
+}
+
+bool PlVkRenderer::pollVrr(Vrr::Feedback& feedback)
+{
+#ifdef HAS_WAYLAND
+    return m_PresentationFeedback && m_PresentationFeedback->poll(feedback);
+#else
+    (void)feedback;
+    return false;
+#endif
 }
 
 bool PlVkRenderer::testRenderFrame(AVFrame *frame)
@@ -1176,7 +1248,7 @@ bool PlVkRenderer::testRenderFrame(AVFrame *frame)
 }
 
 // Takes ownership of surface in all cases!
-bool PlVkRenderer::createOverlay(pl_overlay* overlay, SDL_Surface* surface)
+bool PlVkRenderer::createOverlay(pl_overlay* overlay, SDL_Surface* surface, bool waitForGpu)
 {
     // Find a compatible texture format
     SDL_assert(surface->format->format == SDL_PIXELFORMAT_ARGB8888);
@@ -1232,6 +1304,22 @@ bool PlVkRenderer::createOverlay(pl_overlay* overlay, SDL_Surface* surface)
     overlay->coords = PL_OVERLAY_COORDS_DST_FRAME;
     overlay->repr = pl_color_repr_rgb;
     overlay->color = pl_color_space_srgb;
+    overlay->parts = nullptr;
+    overlay->num_parts = 0;
+    pl_gpu_flush(m_Vulkan->gpu);
+    if (waitForGpu) {
+        // The ptr-transfer callback may only acknowledge a host copy on some
+        // fallback paths. Confirm destination-image completion independently.
+        // This wait runs on the overlay worker, while video uses the old texture.
+        if (!m_OverlayCompletion) {
+            auto completion = std::make_unique<Vrr::VulkanCompletion>();
+            if (!completion->initialize(m_Vulkan, true)) return false;
+            m_OverlayCompletion = std::move(completion);
+        }
+        const std::atomic<bool> stopping{false};
+        Vrr::Preparation timing;
+        if (!m_OverlayCompletion->wait(overlay->tex, stopping, timing, Vrr::now())) return false;
+    }
     return true;
 }
 
@@ -1260,7 +1348,7 @@ void PlVkRenderer::notifyOverlayUpdated(Overlay::OverlayType type)
     }
 
     // newSurface is now owned by the texture upload process
-    if (!createOverlay(&m_Overlays[type].stagingOverlay, newSurface)) {
+    if (!createOverlay(&m_Overlays[type].stagingOverlay, newSurface, true)) {
         return;
     }
 

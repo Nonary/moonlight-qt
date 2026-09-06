@@ -130,6 +130,15 @@ void StreamingPreferences::reload()
     unlockBitrate = settings.value(SER_UNLOCK_BITRATE, false).toBool();
     autoAdjustBitrate = settings.value(SER_AUTOADJUSTBITRATE, true).toBool();
     enableVsync = settings.value(SER_VSYNC, true).toBool();
+    enableVrr = settings.value("vrr14", false).toBool();
+    // Carry forward the user's VRR13 cadence choice once. Subsequent changes
+    // in the current UI retain their normal meaning.
+    if (!settings.value("vrr14cadenceMigrated", false).toBool()) {
+        if (settings.contains("smoothvrrframetiming"))
+            settings.setValue("vrr14smooth", settings.value("smoothvrrframetiming"));
+        settings.setValue("vrr14cadenceMigrated", true);
+    }
+    vrrSmoothCadence = settings.value("vrr14smooth", true).toBool();
     gameOptimizations = settings.value(SER_GAMEOPTS, true).toBool();
     playAudioOnHost = settings.value(SER_HOSTAUDIO, false).toBool();
     multiController = settings.value(SER_MULTICONT, true).toBool();
@@ -330,6 +339,8 @@ void StreamingPreferences::save()
     settings.setValue(SER_UNLOCK_BITRATE, unlockBitrate);
     settings.setValue(SER_AUTOADJUSTBITRATE, autoAdjustBitrate);
     settings.setValue(SER_VSYNC, enableVsync);
+    settings.setValue("vrr14", enableVrr);
+    settings.setValue("vrr14smooth", vrrSmoothCadence);
     settings.setValue(SER_GAMEOPTS, gameOptimizations);
     settings.setValue(SER_HOSTAUDIO, playAudioOnHost);
     settings.setValue(SER_MULTICONT, multiController);

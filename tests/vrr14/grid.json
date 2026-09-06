@@ -1,0 +1,6 @@
+{
+  "guard_us": [50, 100, 200],
+  "buffer_max_us": [8000, 16000],
+  "buffer_attack_us": [125, 250],
+  "smooth_cadence": [0, 1]
+}

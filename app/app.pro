@@ -253,7 +253,13 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/genhwaccel.cpp \
         streaming/video/ffmpeg-renderers/sdlvid.cpp \
         streaming/video/ffmpeg-renderers/swframemapper.cpp \
-        streaming/video/ffmpeg-renderers/pacer/pacer.cpp
+        streaming/video/ffmpeg-renderers/pacer/pacer.cpp \
+        streaming/video/ffmpeg-renderers/vrr/timing.cpp \
+        streaming/video/ffmpeg-renderers/vrr/config.cpp \
+        streaming/video/ffmpeg-renderers/vrr/profile.cpp \
+        streaming/video/ffmpeg-renderers/vrr/clock.cpp \
+        streaming/video/ffmpeg-renderers/vrr/trace.cpp \
+        streaming/video/ffmpeg-renderers/vrr/worker.cpp
 
     HEADERS += \
         streaming/video/ffmpeg.h \
@@ -261,7 +267,15 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/genhwaccel.h \
         streaming/video/ffmpeg-renderers/sdlvid.h \
         streaming/video/ffmpeg-renderers/swframemapper.h \
-        streaming/video/ffmpeg-renderers/pacer/pacer.h
+        streaming/video/ffmpeg-renderers/pacer/pacer.h \
+        streaming/video/ffmpeg-renderers/vrr/timing.h \
+        streaming/video/ffmpeg-renderers/vrr/config.h \
+        streaming/video/ffmpeg-renderers/vrr/reserve.h \
+        streaming/video/ffmpeg-renderers/vrr/profile.h \
+        streaming/video/ffmpeg-renderers/vrr/smoothness.h \
+        streaming/video/ffmpeg-renderers/vrr/deadlines.h \
+        streaming/video/ffmpeg-renderers/vrr/trace.h \
+        streaming/video/ffmpeg-renderers/vrr/worker.h
 }
 libva {
     message(VAAPI renderer selected)
@@ -349,7 +363,8 @@ libplacebo {
         streaming/video/ffmpeg-renderers/plvk.cpp \
         streaming/video/ffmpeg-renderers/plvk_c.c
     HEADERS += \
-        streaming/video/ffmpeg-renderers/plvk.h
+        streaming/video/ffmpeg-renderers/plvk.h \
+        streaming/video/ffmpeg-renderers/vrr/vulkangpu.h
 
     macx {
         SOURCES += streaming/video/ffmpeg-renderers/plvk_objc.mm
@@ -445,8 +460,12 @@ wayland {
     message(Wayland extensions enabled)
 
     DEFINES += HAS_WAYLAND
-    SOURCES += streaming/video/ffmpeg-renderers/pacer/waylandvsyncsource.cpp
-    HEADERS += streaming/video/ffmpeg-renderers/pacer/waylandvsyncsource.h
+    SOURCES += streaming/video/ffmpeg-renderers/pacer/waylandvsyncsource.cpp \
+        streaming/video/ffmpeg-renderers/vrr/wayland.cpp \
+        streaming/video/ffmpeg-renderers/protocols/presentation-time-protocol.c
+    HEADERS += streaming/video/ffmpeg-renderers/pacer/waylandvsyncsource.h \
+        streaming/video/ffmpeg-renderers/vrr/wayland.h \
+        streaming/video/ffmpeg-renderers/protocols/presentation-time-client-protocol.h
 }
 
 RESOURCES += \

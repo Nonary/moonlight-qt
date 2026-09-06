@@ -82,6 +82,10 @@ void FFmpegVideoDecoder::setHdrMode(bool enabled)
 
 bool FFmpegVideoDecoder::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
 {
+    // Recreate the session's presentation state on output/size changes. This
+    // avoids racing a resize against a prepared back buffer or retaining phase
+    // and VRR range from the previous output.
+    if (m_Pacer && m_Pacer->isVrr()) return false;
     return m_FrontendRenderer->notifyWindowChanged(info);
 }
 
@@ -280,6 +284,10 @@ void FFmpegVideoDecoder::reset()
 
     delete m_Pacer;
     m_Pacer = nullptr;
+    if (m_CurrentTestMode != TestMode::TestFrameOnly) {
+        addVideoStats(m_ActiveWndVideoStats, m_GlobalVideoStats);
+        SDL_zero(m_ActiveWndVideoStats);
+    }
 
     // This must be called after deleting Pacer because it
     // may be holding AVFrames to free in its destructor.
@@ -498,7 +506,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     if (testMode != TestMode::TestFrameOnly) {
         m_Pacer = new Pacer(m_FrontendRenderer, &m_ActiveWndVideoStats);
         if (!m_Pacer->initialize(params->window, params->frameRate,
-                                 params->enableFramePacing || (params->enableVsync && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_FORCE_PACING)))) {
+                                 params->enableFramePacing || (params->enableVsync && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_FORCE_PACING)), params->enableVrr)) {
             return false;
         }
     }
@@ -766,6 +774,22 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalDecodeTimeUs += src.totalDecodeTimeUs;
     dst.totalPacerTimeUs += src.totalPacerTimeUs;
     dst.totalRenderTimeUs += src.totalRenderTimeUs;
+    if (src.vrrActive) {
+        dst.vrrActive = true;
+        dst.vrrSmoothnessAvailable = src.vrrSmoothnessAvailable;
+        dst.vrrSmoothness = src.vrrSmoothness;
+        dst.vrrFeedbackCoverage = src.vrrFeedbackCoverage;
+        dst.vrrCadenceP99Ms = src.vrrCadenceP99Ms;
+        dst.vrrDeadlineCoverage = src.vrrDeadlineCoverage;
+        dst.vrrDeadlineFeedbackCoverage = src.vrrDeadlineFeedbackCoverage;
+        dst.vrrCalibrationSeconds = src.vrrCalibrationSeconds;
+        dst.vrrCalibrationFrames = src.vrrCalibrationFrames;
+        dst.vrrCalibrationReady = src.vrrCalibrationReady;
+        dst.vrrBufferCoverage = src.vrrBufferCoverage;
+        dst.vrrBufferSeconds = src.vrrBufferSeconds;
+        dst.vrrBufferFrames = src.vrrBufferFrames;
+        dst.vrrBufferOverloaded = src.vrrBufferOverloaded;
+    }
 
     if (dst.minHostProcessingLatency == 0) {
         dst.minHostProcessingLatency = src.minHostProcessingLatency;
@@ -956,16 +980,19 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         ret = snprintf(&output[offset],
                        length - offset,
                        "Frames dropped by your network connection: %.2f%%\n"
-                       "Frames dropped due to network jitter: %.2f%%\n"
+                       "%s: %.2f%%\n"
                        "Average network latency: %s\n"
                        "Average decoding time: %.2f ms\n"
                        "Average frame queue delay: %.2f ms\n"
-                       "Average rendering time (including monitor V-sync latency): %.2f ms\n",
+                       "%s: %.2f ms\n",
                        (float)stats.networkDroppedFrames / stats.totalFrames * 100,
+                       stats.vrrActive ? "Frames dropped by client pacing" : "Frames dropped due to network jitter",
                        (float)stats.pacerDroppedFrames / stats.decodedFrames * 100,
                        rttString,
                        (double)(stats.totalDecodeTimeUs / 1000.0) / stats.decodedFrames,
                        (double)(stats.totalPacerTimeUs / 1000.0) / stats.renderedFrames,
+                       stats.vrrActive ? "Average preparation time (through GPU completion)" :
+                           "Average rendering time (including monitor V-sync latency)",
                        (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames);
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);
@@ -974,12 +1001,39 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
         offset += ret;
     }
+    if (stats.vrrActive && offset < length) {
+        const int ret = stats.vrrSmoothnessAvailable ?
+            snprintf(&output[offset], length - offset,
+                "Presentation cadence error p99: %.2f ms (feedback coverage %.1f%%)\n",
+                stats.vrrCadenceP99Ms, stats.vrrFeedbackCoverage) :
+            snprintf(&output[offset], length - offset,
+                "Presentation cadence: insufficient feedback (coverage %.1f%%)\n", stats.vrrFeedbackCoverage);
+        if (ret < 0 || ret >= length - offset) return;
+        offset += ret;
+        const int bufferRet = stats.vrrBufferOverloaded ?
+            snprintf(&output[offset], length - offset, "Buffer calibration paused: processing overload\n") :
+            stats.vrrBufferFrames ? snprintf(&output[offset], length - offset,
+                "Pipeline buffer coverage (+3 ms): %.3f%% (goal 99.950%%; %.0f s)\n",
+                stats.vrrBufferCoverage, stats.vrrBufferSeconds) :
+            snprintf(&output[offset], length - offset, "Pipeline buffer calibration: warming up\n");
+        if (bufferRet < 0 || bufferRet >= length - offset) return;
+        offset += bufferRet;
+        if (offset < length) {
+            if (stats.vrrCalibrationReady) {
+                snprintf(&output[offset], length - offset,
+                    "Presentation on target (+/-3 ms): %.3f%% (%.0f s, %.1f%% feedback)\n",
+                    stats.vrrDeadlineCoverage, stats.vrrCalibrationSeconds, stats.vrrDeadlineFeedbackCoverage);
+            }
+            else snprintf(&output[offset], length - offset,
+                "Presentation deadline measurement: insufficient feedback\n");
+        }
+    }
 }
 
 void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
 {
     if (stats.renderedFps > 0 || stats.renderedFrames != 0) {
-        char videoStatsStr[512];
+        char videoStatsStr[1024];
         stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr));
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -2023,9 +2077,12 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     // Capture a frame timestamp to measuring pacing delay
                     frame->pkt_dts = LiGetMicroseconds();
 
+                    uint64_t receivedUs = 0, assembledUs = 0;
                     if (!m_FrameInfoQueue.isEmpty()) {
                         // Data buffers in the DU are not valid here!
                         DECODE_UNIT du = m_FrameInfoQueue.dequeue();
+                        receivedUs = du.receiveTimeUs;
+                        assembledUs = du.enqueueTimeUs;
 
                         // Count time in avcodec_send_packet() and avcodec_receive_frame()
                         // as time spent decoding. Also count time spent in the decode unit
@@ -2039,7 +2096,7 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     m_ActiveWndVideoStats.decodedFrames++;
 
                     // Queue the frame for rendering (or render now if pacer is disabled)
-                    m_Pacer->submitFrame(frame);
+                    m_Pacer->submitFrame(frame, receivedUs, assembledUs);
                 }
                 else if (err == AVERROR(EAGAIN)) {
                     VIDEO_FRAME_HANDLE handle;
@@ -2119,6 +2176,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     m_BwTracker.AddBytes(du->fullLength);
 
     // Flip stats windows roughly every second
+    m_Pacer->collectVrrStats();
     if (LiGetMicroseconds() > m_ActiveWndVideoStats.measurementStartUs + 1000000) {
         // Update overlay stats if it's enabled
         if (Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug)) {
@@ -2126,10 +2184,9 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
             addVideoStats(m_LastWndVideoStats, lastTwoWndStats);
             addVideoStats(m_ActiveWndVideoStats, lastTwoWndStats);
 
-            stringifyVideoStats(lastTwoWndStats,
-                                Session::get()->getOverlayManager().getOverlayText(Overlay::OverlayDebug),
-                                Session::get()->getOverlayManager().getOverlayMaxTextLength());
-            Session::get()->getOverlayManager().setOverlayTextUpdated(Overlay::OverlayDebug);
+            char text[1024];
+            stringifyVideoStats(lastTwoWndStats, text, sizeof(text));
+            Session::get()->getOverlayManager().updateOverlayText(Overlay::OverlayDebug, text);
         }
 
         // Accumulate these values into the global stats
@@ -2220,4 +2277,3 @@ void FFmpegVideoDecoder::renderFrameOnMainThread()
 {
     m_Pacer->renderOnMainThread();
 }
-

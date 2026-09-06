@@ -1,5 +1,13 @@
 #include "pacer.h"
 #include "streaming/streamutils.h"
+#include "streaming/session.h"
+#include "../vrr/worker.h"
+#include "../vrr/config.h"
+#include <cmath>
+#include <QCryptographicHash>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QSysInfo>
 
 #ifdef Q_OS_WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -19,6 +27,7 @@
 // must not exceed the number buffer pool size to avoid running the decoder
 // out of available decoding surfaces.
 #define MAX_QUEUED_FRAMES 3
+static_assert(MAX_QUEUED_FRAMES == Vrr::QueueFrames, "VRR queue capacity must match the surface budget");
 static_assert(PACER_MAX_OUTSTANDING_FRAMES == MAX_QUEUED_FRAMES + 2,
               "PACER_MAX_OUTSTANDING_FRAMES and MAX_QUEUED_FRAMES must agree");
 
@@ -45,6 +54,11 @@ Pacer::Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats) :
 
 Pacer::~Pacer()
 {
+    if (m_VrrWorker) {
+        stopVrr();
+        collectVrrStats();
+        return;
+    }
     m_Stopping = true;
 
     // Stop the V-sync thread
@@ -83,6 +97,7 @@ Pacer::~Pacer()
 
 void Pacer::renderOnMainThread()
 {
+    if (m_VrrWorker) return;
     // Ignore this call for renderers that work on a dedicated render thread
     if (m_RenderThread != nullptr) {
         return;
@@ -259,11 +274,67 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
     enqueueFrameForRenderingAndUnlock(m_PacingQueue.dequeue());
 }
 
-bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing)
+bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing, bool enableVrr)
 {
     m_MaxVideoFps = maxVideoFps;
     m_DisplayFps = StreamUtils::getDisplayRefreshRate(window);
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
+
+    if (enableVrr) {
+        Vrr::Config config;
+        config.smoothCadence = StreamingPreferences::get()->vrrSmoothCadence;
+        config.frameInterval = Vrr::Second / std::max(1, maxVideoFps);
+        config.minInterval = Vrr::Second / std::max(1, m_DisplayFps);
+        auto hz = [](const char* name) {
+            bool ok = false;
+            double value = qgetenv(name).toDouble(&ok);
+            return ok && std::isfinite(value) && value >= 1 && value <= 1000 ? value : 0.0;
+        };
+        if (auto maximum = hz("MOONLIGHT_VRR_MAX_HZ")) config.minInterval = Vrr::Ns(std::ceil(Vrr::Second / maximum));
+        if (auto minimum = hz("MOONLIGHT_VRR_MIN_HZ")) config.maxInterval = Vrr::Ns(Vrr::Second / minimum);
+        const auto configPath = qgetenv("MOONLIGHT_VRR_CONFIG");
+        if (!configPath.isEmpty()) {
+            std::string error;
+            if (!Vrr::loadConfig(configPath.toStdString(), config, error)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "VRR configuration rejected: %s", error.c_str());
+                return false;
+            }
+        }
+        if (m_VsyncRenderer->isRenderThreadSupported() && m_VsyncRenderer->initializeVrr(config)) {
+            const int display = SDL_GetWindowDisplayIndex(window);
+            SDL_DisplayMode mode{};
+            if (display >= 0) SDL_GetCurrentDisplayMode(display, &mode);
+            auto prefs = StreamingPreferences::get();
+            // Separate output/mode/backend, decode workload and controller model.
+            // Combined arrival/render timing also depends on host/route and stream workload.
+            // Store only the digest; device/display names are not written to disk.
+            const QJsonArray profile{17,
+                Session::get() ? QJsonArray::fromStringList(Session::get()->timingProfileContext()) : QJsonArray{},
+                QSysInfo::productType(), QSysInfo::kernelVersion(),
+                QString::fromUtf8(SDL_GetCurrentVideoDriver()),
+                QString::fromUtf8(display >= 0 ? SDL_GetDisplayName(display) : "unknown"),
+                QString::fromUtf8(m_VsyncRenderer->getRendererName()), mode.w, mode.h, mode.refresh_rate,
+                prefs->width, prefs->height, prefs->bitrateKbps, prefs->enableHdr, int(prefs->videoCodecConfig),
+                qint64(config.minInterval), qint64(config.maxInterval), config.smoothCadence,
+                qint64(config.maxBuffer), qint64(config.reserveMax),
+                qint64(config.smoothingDelay), qint64(config.cadenceSlew), qint64(config.guard),
+                qint64(config.frameInterval), qint64(config.minBuffer), qint64(config.bufferAttack),
+                qint64(config.bufferRelease), qint64(config.initialRender), int(config.renderPercentile),
+                qint64(config.reserveBoost), qint64(m_RendererAttributes)};
+            const auto key = QCryptographicHash::hash(QJsonDocument(profile).toJson(QJsonDocument::Compact),
+                QCryptographicHash::Sha256).toHex();
+            m_VrrWorker = std::make_unique<Vrr::Worker>(m_VsyncRenderer, config, QString::fromLatin1(key));
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "VRR14: %s; %.3f Hz ceiling, %.3f Hz floor (0 = unknown); %s cadence; memory flight recorder enabled",
+                m_VsyncRenderer->getRendererName(), double(Vrr::Second) / config.minInterval,
+                config.maxInterval ? double(Vrr::Second) / config.maxInterval : 0.0,
+                config.smoothCadence ? "smoothed" : "host");
+            return m_VrrWorker->start();
+        }
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "VRR14 unavailable on %s: native presentation feedback/GPU readiness required; using legacy presentation",
+            m_VsyncRenderer->getRendererName());
+    }
 
     if (enablePacing) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -400,8 +471,9 @@ void Pacer::dropFrameForEnqueue(QQueue<AVFrame*>& queue)
     }
 }
 
-void Pacer::submitFrame(AVFrame* frame)
+void Pacer::submitFrame(AVFrame* frame, uint64_t receivedUs, uint64_t assembledUs)
 {
+    if (m_VrrWorker) { m_VrrWorker->submit(frame, receivedUs, assembledUs); return; }
     // Make sure initialize() has been called
     SDL_assert(m_MaxVideoFps != 0);
 
@@ -416,4 +488,14 @@ void Pacer::submitFrame(AVFrame* frame)
     else {
         enqueueFrameForRenderingAndUnlock(frame);
     }
+}
+
+void Pacer::stopVrr()
+{
+    if (m_VrrWorker) m_VrrWorker->stop();
+}
+
+void Pacer::collectVrrStats()
+{
+    if (m_VrrWorker) m_VrrWorker->collectStats(*m_VideoStats);
 }

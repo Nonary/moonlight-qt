@@ -714,6 +714,10 @@ bool EGLRenderer::setupOverlayRenderingState() {
 
 void EGLRenderer::cleanupRenderContext()
 {
+    if (m_Vrr) {
+        SDL_GL_MakeCurrent(m_Window, m_Context);
+        glFinish();
+    }
     // Detach the context from the render thread so the destructor can attach it
     SDL_GL_MakeCurrent(m_Window, nullptr);
 }
@@ -750,7 +754,7 @@ void EGLRenderer::prepareToRender()
     SDL_GL_MakeCurrent(m_Window, nullptr);
 }
 
-void EGLRenderer::renderFrame(AVFrame* frame)
+bool EGLRenderer::drawFrame(AVFrame* frame)
 {
     EGLImage imgs[EGL_MAX_PLANES];
 
@@ -782,13 +786,13 @@ void EGLRenderer::renderFrame(AVFrame* frame)
             event.type = SDL_RENDER_DEVICE_RESET;
             SDL_PushEvent(&event);
 
-            return;
+            return false;
         }
     }
 
     ssize_t plane_count = m_Backend->exportEGLImages(frame, m_EGLDisplay, imgs);
     if (plane_count < 0)
-        return;
+        return false;
     for (ssize_t i = 0; i < plane_count; ++i) {
         glActiveTexture(GL_TEXTURE0 + i);
         glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_Textures[i]);
@@ -837,7 +841,7 @@ void EGLRenderer::renderFrame(AVFrame* frame)
     glDrawArrays(GL_TRIANGLES, 0, 6);
     m_glBindVertexArrayOES(0);
 
-    if (!m_BlockingSwapBuffers) {
+    if (!m_BlockingSwapBuffers && !m_Vrr) {
         // If we aren't going to wait on the full swap buffers operation,
         // insert a fence now to let us know when the memory backing our
         // video frame is safe for Pacer to free
@@ -858,6 +862,13 @@ void EGLRenderer::renderFrame(AVFrame* frame)
         renderOverlay((Overlay::OverlayType)i, drawableWidth, drawableHeight);
     }
 
+    return true;
+}
+
+void EGLRenderer::renderFrame(AVFrame* frame)
+{
+    if (!drawFrame(frame)) return;
+
     SDL_GL_SwapWindow(m_Window);
 
     if (m_BlockingSwapBuffers) {
@@ -876,6 +887,69 @@ void EGLRenderer::renderFrame(AVFrame* frame)
             }
         }
     }
+}
+
+bool EGLRenderer::initializeVrr(Vrr::Config&)
+{
+#ifdef HAS_WAYLAND
+    if (!m_eglClientWaitSync || !m_eglDestroySync || (!m_eglCreateSync && !m_eglCreateSyncKHR)) return false;
+    auto feedback = std::make_unique<Vrr::WaylandFeedback>();
+    if (!feedback->initialize(m_Window)) return false;
+    m_PresentationFeedback = std::move(feedback);
+    m_Vrr = true;
+    m_BlockingSwapBuffers = false;
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool EGLRenderer::prepareVrr(AVFrame* frame, const std::atomic<bool>& stopping, Vrr::Preparation& timing)
+{
+    // EGL does not expose a separate back-buffer acquisition timestamp.
+    const auto earliest = Vrr::now();
+    if (!drawFrame(frame)) return false;
+    // The fence follows video AND overlays, including imported decoder work.
+    EGLSync sync = m_eglCreateSync ? m_eglCreateSync(m_EGLDisplay, EGL_SYNC_FENCE, nullptr) :
+                                   m_eglCreateSyncKHR(m_EGLDisplay, EGL_SYNC_FENCE, nullptr);
+    if (sync == EGL_NO_SYNC) return false;
+    glFlush();
+    timing.commandsSubmitted = Vrr::now();
+    timing.gpuNotReady = earliest;
+    const auto deadline = Vrr::now() + 100 * Vrr::Millisecond;
+    bool complete = false;
+    while (!stopping.load() && Vrr::now() < deadline) {
+        const auto checkedAt = Vrr::now();
+        const auto status = m_eglClientWaitSync(m_EGLDisplay, sync, 0, 100000);
+        if (status == EGL_CONDITION_SATISFIED) { timing.gpuReady = Vrr::now(); complete = true; break; }
+        if (status == EGL_FALSE) break;
+        timing.gpuNotReady = checkedAt;
+    }
+    m_eglDestroySync(m_EGLDisplay, sync);
+    return complete;
+}
+
+bool EGLRenderer::presentVrr(uint64_t id, Vrr::Ns& submitted)
+{
+#ifdef HAS_WAYLAND
+    m_PresentationFeedback->request(id);
+#else
+    (void)id;
+#endif
+    submitted = Vrr::now();
+    // Own the native swap boundary, including its failure result. Completion is
+    // still established only by the matching presentation feedback event.
+    return eglSwapBuffers(m_EGLDisplay, eglGetCurrentSurface(EGL_DRAW)) == EGL_TRUE;
+}
+
+bool EGLRenderer::pollVrr(Vrr::Feedback& feedback)
+{
+#ifdef HAS_WAYLAND
+    return m_PresentationFeedback && m_PresentationFeedback->poll(feedback);
+#else
+    (void)feedback;
+    return false;
+#endif
 }
 
 bool EGLRenderer::testRenderFrame(AVFrame* frame)

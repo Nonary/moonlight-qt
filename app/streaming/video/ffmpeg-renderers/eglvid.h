@@ -5,6 +5,10 @@
 #define SDL_USE_BUILTIN_OPENGL_DEFINITIONS 1
 #include <SDL_egl.h>
 #include <SDL_opengles2.h>
+#include <memory>
+#ifdef HAS_WAYLAND
+#include "vrr/wayland.h"
+#endif
 
 class EGLRenderer : public IFFmpegRenderer {
 public:
@@ -21,8 +25,17 @@ public:
     virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO) override;
     virtual bool isPixelFormatSupported(int videoFormat, enum AVPixelFormat pixelFormat) override;
     virtual AVPixelFormat getPreferredPixelFormat(int videoFormat) override;
+    bool initializeVrr(Vrr::Config&) override;
+    bool prepareVrr(AVFrame*, const std::atomic<bool>&, Vrr::Preparation&) override;
+    bool presentVrr(uint64_t id, Vrr::Ns& submitted) override;
+    bool pollVrr(Vrr::Feedback&) override;
 
 private:
+    bool drawFrame(AVFrame* frame);
+    bool m_Vrr = false;
+#ifdef HAS_WAYLAND
+    std::unique_ptr<Vrr::WaylandFeedback> m_PresentationFeedback;
+#endif
 
     void renderOverlay(Overlay::OverlayType type, int viewportWidth, int viewportHeight);
     unsigned compileShader(const char* vertexShaderSrc, const char* fragmentShaderSrc);

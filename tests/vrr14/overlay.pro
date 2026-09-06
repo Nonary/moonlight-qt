@@ -1,0 +1,10 @@
+TEMPLATE = app
+TARGET = test-vrr14-overlay
+QT = core
+CONFIG += console c++17 link_pkgconfig
+CONFIG -= app_bundle
+DEFINES -= NDEBUG
+PKGCONFIG += sdl2 SDL2_ttf
+INCLUDEPATH += ../../app ../../app/streaming/video
+SOURCES += test_overlay.cpp ../../app/streaming/video/overlaymanager.cpp ../../app/path.cpp
+LIBS += -lpthread

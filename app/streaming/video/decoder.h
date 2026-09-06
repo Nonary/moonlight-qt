@@ -31,6 +31,20 @@ typedef struct _VIDEO_STATS {
     double renderedFps;                        // high-res
     double videoMegabitsPerSec;                // current video bitrate in Mbps, not including FEC overhead
     uint64_t measurementStartUs;               // microseconds
+    bool vrrActive;
+    bool vrrSmoothnessAvailable;
+    double vrrSmoothness;
+    double vrrFeedbackCoverage;
+    double vrrCadenceP99Ms;
+    double vrrDeadlineCoverage;
+    double vrrDeadlineFeedbackCoverage;
+    double vrrCalibrationSeconds;
+    uint64_t vrrCalibrationFrames;
+    bool vrrCalibrationReady;
+    double vrrBufferCoverage;
+    double vrrBufferSeconds;
+    uint64_t vrrBufferFrames;
+    bool vrrBufferOverloaded;
 } VIDEO_STATS, *PVIDEO_STATS;
 
 typedef struct _DECODER_PARAMETERS {
@@ -44,6 +58,7 @@ typedef struct _DECODER_PARAMETERS {
     int frameRate;
     bool enableVsync;
     bool enableFramePacing;
+    bool enableVrr = false;
     bool testOnly;
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;
 

@@ -9,6 +9,11 @@
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
 #include <libplacebo/vulkan.h>
+#include "vrr/vulkangpu.h"
+
+#ifdef HAS_WAYLAND
+#include "vrr/wayland.h"
+#endif
 
 #ifdef Q_OS_DARWIN
 class MetalVulkanTextureFactory {
@@ -45,6 +50,11 @@ public:
     virtual bool testRenderFrame(AVFrame* frame) override;
     virtual void waitToRender() override;
     virtual void cleanupRenderContext() override;
+    virtual bool initializeVrr(Vrr::Config&) override;
+    virtual bool prepareVrr(AVFrame*, const std::atomic<bool>&, Vrr::Preparation&) override;
+    virtual bool presentVrr(uint64_t, Vrr::Ns&) override;
+    virtual bool pollVrr(Vrr::Feedback&) override;
+    virtual bool pollVrrPreparation(Vrr::Preparation&) override;
     virtual void notifyOverlayUpdated(Overlay::OverlayType) override;
     virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO) override;
     virtual int getRendererAttributes() override;
@@ -63,7 +73,8 @@ private:
     void endRenderTiming();
 
     bool createSwapchain(int depth);
-    bool createOverlay(pl_overlay* overlay, SDL_Surface* surface);
+    bool drawFrame(AVFrame* frame, bool deferPresent);
+    bool createOverlay(pl_overlay* overlay, SDL_Surface* surface, bool waitForGpu = false);
     bool mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
     void unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
     bool populateQueues(int videoFormat);
@@ -114,6 +125,13 @@ private:
     // Pending swapchain state shared between waitToRender(), renderFrame(), and cleanupRenderContext()
     pl_swapchain_frame m_SwapchainFrame = {};
     bool m_HasPendingSwapchainFrame = false;
+    bool m_Vrr = false;
+    bool m_VrrPrepared = false;
+    std::unique_ptr<Vrr::VulkanCompletion> m_GpuCompletion;
+    std::unique_ptr<Vrr::VulkanCompletion> m_OverlayCompletion;
+#ifdef HAS_WAYLAND
+    std::unique_ptr<Vrr::WaylandFeedback> m_PresentationFeedback;
+#endif
 
     // Overlay state
     SDL_SpinLock m_OverlayLock = 0;

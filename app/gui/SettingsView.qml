@@ -820,6 +820,7 @@ Flickable {
                         id: vsyncCheck
                         hoverEnabled: true
                         text: qsTr("V-Sync")
+                        enabled: !StreamingPreferences.enableVrr
                         font.pointSize:  12
                         checked: StreamingPreferences.enableVsync
                         onCheckedChanged: {
@@ -837,7 +838,7 @@ Flickable {
                         hoverEnabled: true
                         text: qsTr("Frame pacing")
                         font.pointSize:  12
-                        enabled: StreamingPreferences.enableVsync
+                        enabled: StreamingPreferences.enableVsync && !StreamingPreferences.enableVrr
                         checked: StreamingPreferences.enableVsync && StreamingPreferences.framePacing
                         onCheckedChanged: {
                             StreamingPreferences.framePacing = checked
@@ -847,6 +848,36 @@ Flickable {
                         ToolTip.visible: hovered
                         ToolTip.text: qsTr("Frame pacing reduces micro-stutter by delaying frames that come in too early")
                     }
+                }
+
+                CheckBox {
+                    id: vrrPacingCheck
+                    width: parent.width
+                    text: qsTr("Adaptive VRR pacing (experimental)")
+                    font.pointSize: 12
+                    visible: Qt.platform.os === "linux" || Qt.platform.os === "windows"
+                    checked: StreamingPreferences.enableVrr
+                    onCheckedChanged: StreamingPreferences.enableVrr = checked
+                    hoverEnabled: true
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Smooths network and decoder jitter using display presentation feedback. Enable adaptive sync for your monitor in system settings.")
+                }
+
+                CheckBox {
+                    id: vrrSmoothCadenceCheck
+                    width: parent.width
+                    text: qsTr("Smooth cadence")
+                    font.pointSize: 12
+                    visible: vrrPacingCheck.visible && StreamingPreferences.enableVrr
+                    checked: StreamingPreferences.vrrSmoothCadence
+                    onCheckedChanged: StreamingPreferences.vrrSmoothCadence = checked
+                    hoverEnabled: true
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Even out short-term changes in the host frame rate, with a small amount of additional buffering. Leave off to preserve the host's frame timing.")
                 }
 
                 CheckBox {

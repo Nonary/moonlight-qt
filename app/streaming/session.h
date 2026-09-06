@@ -121,6 +121,8 @@ public:
         return m_OverlayManager;
     }
 
+    const QStringList& timingProfileContext() const { return m_TimingProfileContext; }
+
     void flushWindowEvents();
 
     void setShouldExit(bool quitHostApp = false);
@@ -250,6 +252,7 @@ private:
     DECODER_RENDERER_CALLBACKS m_VideoCallbacks;
     AUDIO_RENDERER_CALLBACKS m_AudioCallbacks;
     NvComputer* m_Computer;
+    QStringList m_TimingProfileContext;
     NvApp m_App;
     SDL_Window* m_Window;
     IVideoDecoder* m_VideoDecoder;

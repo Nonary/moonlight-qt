@@ -294,6 +294,14 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.window = window;
     params.enableVsync = enableVsync;
     params.enableFramePacing = enableFramePacing;
+    params.enableVrr = !testOnly && StreamingPreferences::get()->enableVrr;
+    if (!testOnly && qEnvironmentVariableIsSet("MOONLIGHT_VRR")) {
+        params.enableVrr = qgetenv("MOONLIGHT_VRR") == "1";
+    }
+    if (params.enableVrr) {
+        params.enableVsync = false;
+        params.enableFramePacing = false;
+    }
     params.testOnly = testOnly;
     params.vds = vds;
     params.renderer = renderer;
@@ -1627,6 +1635,8 @@ bool Session::startConnectionAsync()
         return false;
     }
 
+    // Freeze timing-cache identity before the renderer starts on another thread.
+    m_TimingProfileContext = QStringList{m_Computer->uuid, m_Computer->activeAddress.toString()};
     QByteArray hostnameStr = m_Computer->activeAddress.address().toUtf8();
     QByteArray siAppVersion = m_Computer->appVersion.toUtf8();
 
