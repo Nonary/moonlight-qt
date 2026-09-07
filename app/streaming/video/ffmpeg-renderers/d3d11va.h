@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dxgipresent.h"
 #include "ivrrframepresenter.h"
 #include "renderer.h"
 
@@ -64,7 +65,7 @@ private:
                                 uint64_t decodeBoundary = 0);
     bool initializeVrrPresentReadyFence();
     bool waitForVrrPresentReady();
-    HRESULT presentPreparedFrame(UINT flags);
+    HRESULT presentPreparedFrame(const DxgiPresentParameters& parameters);
     UINT legacyPresentFlags() const;
     void initializeVrrPresentationState(SDL_Window* window,
                                         DXGI_SWAP_CHAIN_DESC1* swapChainDesc);

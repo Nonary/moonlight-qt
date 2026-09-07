@@ -5,7 +5,8 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Source baseline: `be9b4613aa59454af4e07c33a6a8f5321afac6e0`, inspected
+Source baseline: `55fc1286e64cd98eee20269de29a23c91b9ba886` plus the native
+Present-parameter correction, inspected
 2026-09-07; updated for readiness-driven padding, stable smoothness references,
 and preservation of learned preparation lead on 2026-09-07; the subsequent
 game-spacing correction disables production cadence smoothing and caps padding
@@ -13,8 +14,8 @@ at 16 ms. The initial map came from nine Luna Medium specialists, followed by
 targeted source checks and corrections. No live capture, optical measurement,
 build, or test run was part of this documentation investigation. Recheck the
 named functions after changes; comments, diagnostic labels, and old experiments
-can disagree with the active implementation. The D3D11 latch discrepancy below
-is one concrete example.
+can disagree with the active implementation. The historical D3D11 latch mismatch described below
+is one concrete example; the current native boundary now forwards the selected interval.
 
 [AGENTS.md](AGENTS.md) owns machine-specific build, deployment, and capture
 procedures. This document owns the architecture explanation. Keep both current
@@ -322,7 +323,8 @@ The spacing floor is policy-dependent. In production, a frame classified as
 latched can have the software floor disabled. Therefore “every submission is
 at least one display period plus guard apart” is not a universal invariant.
 The worker enforces the floor the controller returns. See the native latch
-discrepancy in section 10 before inferring hardware protection from this choice.
+contract and historical-capture caveat in section 10 before inferring hardware
+protection from this choice.
 
 ### 7.3 Waiting and scheduler accounting
 
@@ -644,7 +646,7 @@ current-session coverage. Display epoch changes invalidate calibration saving.
 Full reset and phase rebase differ: a rebase can preserve learned playout state
 while clearing transient timing predictors.
 
-## 10. Windows D3D11 mechanics and a verified discrepancy
+## 10. Windows D3D11 mechanics and native synchronization
 
 ### 10.1 Eligibility and GPU synchronization
 
@@ -677,42 +679,31 @@ Fence completion proves source texture reads have finished, allowing the
 presenter to report `sourceFrameReusable` before the target wait. CPU poll/event
 brackets bound GPU completion time; they are not an exact hardware timestamp.
 
-### 10.2 Actual Present call versus recorded latch intent
+### 10.2 Native Present parameters and telemetry
 
-**Verified at the source baseline; not fixed by this document:**
+`D3D11VARenderer::presentAdaptive()` creates one `DxgiPresentParameters`
+value from the controller's latch request. The same value supplies native
+telemetry and `presentPreparedFrame()`, which forwards it to DXGI:
 
-`D3D11VARenderer::presentAdaptive()` computes:
+- Latched: `Present(1, 0)`.
+- Adaptive: `Present(0, DXGI_PRESENT_ALLOW_TEARING)`.
+- Legacy: interval zero with the existing `legacyPresentFlags()` value.
 
-```cpp
-const UINT presentSyncInterval = request.latchedPresentation ? 1 : 0;
-const UINT presentFlags = request.latchedPresentation ?
-    0 : DXGI_PRESENT_ALLOW_TEARING;
-```
+The controller can omit its software spacing floor for a latched decision;
+passing interval one to DXGI is therefore part of the renderer contract.
+`tst_dxgipresent` exercises the actual shared call boundary using a fake
+swapchain, including transitions, parameter reporting, and native result
+propagation. Actual display behavior still requires Windows validation.
 
-It records `presentSyncInterval` into native telemetry. However it calls
-`presentPreparedFrame(presentFlags)`, whose native call is:
+Historical builds computed and recorded interval one but hardcoded zero in
+the native helper. Their `latched_present` and native interval fields describe
+intent, not proof that DXGI received interval one. Replay cannot repair that
+old instrumentation or turn historical `confirmed_safe_latched` classifications
+into independent scanout evidence. Check the executable used for each capture.
 
-```cpp
-m_SwapChain->Present(0, flags);
-```
-
-Thus the effective calls are `Present(0, 0)` for a latched request and
-`Present(0, DXGI_PRESENT_ALLOW_TEARING)` for an adaptive request. The requested
-interval 1 is not passed to DXGI. Useful baseline navigation points in
-`d3d11va.cpp` are the helper near line 2276, request/telemetry near line 2428,
-and helper invocation near line 2551.
-
-This establishes an implementation/telemetry mismatch. It does not establish
-the precise optical outcome on a particular compositor/panel. Do not claim
-that the current D3D11 code actually executes `Present(1, 0)`, or treat the
-recorded interval as independent proof of that native call. This matters
-especially because the controller can omit its software floor for a latched
-decision. Any future correction needs native-call/telemetry validation, not
-only controller or replay arithmetic checks.
-
-Legacy presentation also uses this helper. `restoreFixedPresentation()` disables
-VRR and retains the swapchain; the fixed pacing path's timing cannot be inferred
-solely from an assumption that its Present interval is 1.
+`restoreFixedPresentation()` disables VRR and retains the swapchain. The legacy
+software-paced caller still explicitly uses interval zero; this correction does
+not change its pacing mechanism.
 
 ### 10.3 Native evidence limits
 
@@ -960,8 +951,8 @@ When maintaining this document:
   every new diagnostic or model.
 - Revisit exact replay whenever schema, feedback, policy state, or execution
   boundaries change; update both share launchers when their contract changes.
-- Remove or revise the documented latch discrepancy only after source and
-  verification show that it has changed. Do not treat this note as a fix.
+- Keep native Present arguments and telemetry aligned; validate the native call
+  boundary and real Windows behavior before interpreting optical results.
 
 The durable debugging approach is to trace an observed frame through the full
 chain, identify the first boundary that differs from its intended behavior,

@@ -937,7 +937,7 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     // Keep the existing fixed/unpaced behavior intact while sharing the same
     // preparation and final Present helpers used by the opt-in VRR backend.
     bool prepared = prepareFrameForPresent(frame);
-    HRESULT hr = prepared ? presentPreparedFrame(legacyPresentFlags()) : E_FAIL;
+    HRESULT hr = prepared ? presentPreparedFrame({0, legacyPresentFlags()}) : E_FAIL;
 
     if (m_DecodeDevice == m_RenderDevice) {
         // Release the context lock
@@ -2273,13 +2273,14 @@ bool D3D11VARenderer::waitForVrrPresentReady()
     return true;
 }
 
-HRESULT D3D11VARenderer::presentPreparedFrame(UINT flags)
+HRESULT D3D11VARenderer::presentPreparedFrame(
+    const DxgiPresentParameters& parameters)
 {
     if (m_SwapChain == nullptr) {
         return E_FAIL;
     }
 
-    return m_SwapChain->Present(0, flags);
+    return parameters.present(*m_SwapChain.Get());
 }
 
 UINT D3D11VARenderer::legacyPresentFlags() const
@@ -2427,14 +2428,13 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
 
     // The risk decision is per frame. Sync interval 1 holds a risky frame for
     // the next scanout; safe frames retain the immediate VRR presentation path.
-    const UINT presentSyncInterval = request.latchedPresentation ? 1 : 0;
-    const UINT presentFlags = request.latchedPresentation ?
-        0 : DXGI_PRESENT_ALLOW_TEARING;
+    const auto presentParameters = DxgiPresentParameters::adaptive(
+        request.latchedPresentation, DXGI_PRESENT_ALLOW_TEARING);
     feedback.nativeBackendValid = true;
     feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
     feedback.nativePresentParametersValid = true;
-    feedback.nativePresentSyncInterval = presentSyncInterval;
-    feedback.nativePresentFlags = presentFlags;
+    feedback.nativePresentSyncInterval = presentParameters.syncInterval;
+    feedback.nativePresentFlags = presentParameters.flags;
     feedback.nativeVrrStateValid = true;
     feedback.nativeTearingSupported = m_VrrTearingSupported;
     feedback.nativeBorderlessFlipModel = m_VrrBorderlessFlipModel;
@@ -2549,7 +2549,7 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         feedback.nativeRasterBeforePresent = sampleVrrRaster();
     }
     const uint64_t submissionTimeUs = LiGetMicroseconds();
-    HRESULT hr = presentPreparedFrame(presentFlags);
+    HRESULT hr = presentPreparedFrame(presentParameters);
     const uint64_t nativePresentEndUs = LiGetMicroseconds();
     if (request.collectDiagnostics &&
             m_VrrRasterSamplingRequested &&

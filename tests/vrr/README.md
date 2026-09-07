@@ -1,5 +1,11 @@
 # VRR deterministic tests
 
+`tst_dxgipresent` tests the shared D3D11 native-call boundary with a fake
+swapchain, without Windows or Qt dependencies. It verifies synchronized
+`Present(1, 0)`, adaptive `Present(0, ALLOW_TEARING)`, mode transitions, legacy
+interval-zero calls, telemetry parameter agreement, and result propagation.
+It does not replace a Windows renderer build or a live scanout test.
+
 Production preserves the game's relative RTP intervals and caps playout padding
 at 16 ms. Its gain smoother is disabled; historical policies remain replayable.
 For controller accuracy, use `simulation.sender_cadence.spacing_accuracy_percent`
