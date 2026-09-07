@@ -409,6 +409,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutDelayAdaptive > 1) {
         return fail("playout_delay_adaptive must be 0 or 1");
     }
+    if (value.playoutHistoryEnabled > 1 || value.playoutPerFrameLatch > 1) {
+        return fail("playout_history_enabled and playout_per_frame_latch must be 0 or 1");
+    }
     if (value.playoutDelayMinimumUs > value.playoutDelayMaximumUs) {
         return fail("playout_delay_minimum_us must not exceed playout_delay_maximum_us");
     }

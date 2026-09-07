@@ -574,7 +574,11 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
                                  params->vrrDisplayRefreshHz,
                                  params->enableVrrGapFill,
                                  params->vrrGapFillMinimumHz,
-                                 params->smoothVrrFrameTiming)) {
+                                 params->smoothVrrFrameTiming,
+                                 m_FrontendRenderer->getCalibrationIdentity().isEmpty() ? QString() :
+                                 Session::get()->vrrCalibrationContext() + QString("|%1|%2|%3|%4|%5")
+                                     .arg(params->width).arg(params->height).arg(params->videoFormat)
+                                     .arg(m_FrontendRenderer->getCalibrationIdentity()).arg(decoder->name))) {
             return false;
         }
     }
@@ -2340,10 +2344,9 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
             addVideoStats(m_LastWndVideoStats, lastTwoWndStats);
             addVideoStats(m_ActiveWndVideoStats, lastTwoWndStats);
 
-            stringifyVideoStats(lastTwoWndStats,
-                                Session::get()->getOverlayManager().getOverlayText(Overlay::OverlayDebug),
-                                Session::get()->getOverlayManager().getOverlayMaxTextLength());
-            Session::get()->getOverlayManager().setOverlayTextUpdated(Overlay::OverlayDebug);
+            char text[1024];
+            stringifyVideoStats(lastTwoWndStats, text, sizeof(text));
+            Session::get()->getOverlayManager().updateOverlayText(Overlay::OverlayDebug, text);
         }
 
         // Accumulate these values into the global stats

@@ -1,4 +1,6 @@
 #include "pacer.h"
+#include "path.h"
+#include <QCryptographicHash>
 #include "vrrpacingworker.h"
 #include "../ivrrframepresenter.h"
 #include "streaming/streamutils.h"
@@ -294,7 +296,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                        bool enablePacing, bool enableVsync,
                        bool enableVrr, int vrrDisplayRefreshHz,
                        bool enableVrrGapFill, int vrrGapFillMinimumHz,
-                       bool smoothVrrFrameTiming)
+                       bool smoothVrrFrameTiming, const QString& calibrationKey)
 {
     m_MaxVideoFps = maxVideoFps;
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
@@ -305,6 +307,14 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
     if (enableVrr) {
         VrrSessionConfig config;
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
+        if (!calibrationKey.isEmpty()) {
+            const QString display = QString::fromUtf8(SDL_GetDisplayName(SDL_GetWindowDisplayIndex(window)));
+            const auto context = calibrationKey + QString("|%1|%2|%3|%4|%5|%6")
+                .arg(display).arg(maxVideoFps).arg(vrrDisplayRefreshHz)
+                .arg(smoothVrrFrameTiming).arg(enableVrrGapFill).arg(vrrGapFillMinimumHz);
+            config.calibrationKey = QCryptographicHash::hash(context.toUtf8(), QCryptographicHash::Sha256).toHex().toStdString();
+            config.calibrationPath = Path::getCacheFileInfo("vrr13-calibration.json").absoluteFilePath().toStdString();
+        }
         config.streamRateHz = maxVideoFps;
         config.displayRefreshHz = vrrDisplayRefreshHz;
         config.smoothFrameTiming = smoothVrrFrameTiming;

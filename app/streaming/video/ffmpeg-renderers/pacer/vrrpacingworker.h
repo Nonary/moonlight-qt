@@ -196,6 +196,9 @@ private:
     PacerTelemetry* m_Telemetry;
     VrrSessionConfig m_Config;
     bool m_CanLatchPresentation = false;
+    bool m_WorkerStarted = false;
+    std::atomic_bool m_CalibrationInvalidated { false };
+    QByteArray m_InitialPlayoutProfile;
 
     std::unique_ptr<VrrTimingController> m_TimingController;
     std::unique_ptr<VrrTargetWaiter> m_TargetWaiter;

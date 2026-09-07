@@ -17,6 +17,7 @@ extern "C" {
 class D3D11VARenderer : public IFFmpegRenderer, public IVrrFramePresenter
 {
 public:
+    QString getCalibrationIdentity() override;
     D3D11VARenderer(int decoderSelectionPass);
     virtual ~D3D11VARenderer() override;
     virtual bool initialize(PDECODER_PARAMETERS params) override;

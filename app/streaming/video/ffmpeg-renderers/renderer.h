@@ -314,6 +314,8 @@ public:
         return m_Type;
     }
 
+    virtual QString getCalibrationIdentity() { return {}; }
+
     const char *getRendererName() {
         switch (m_Type) {
         default:

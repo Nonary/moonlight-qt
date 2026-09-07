@@ -121,6 +121,8 @@ public:
         return m_OverlayManager;
     }
 
+    QString vrrCalibrationContext() const;
+
     void flushWindowEvents();
 
     void setShouldExit(bool quitHostApp = false);

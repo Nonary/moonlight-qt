@@ -59,7 +59,8 @@ public:
                     bool enableVrr, int vrrDisplayRefreshHz,
                     bool enableVrrGapFill = false,
                     int vrrGapFillMinimumHz = 0,
-                    bool smoothVrrFrameTiming = true);
+                    bool smoothVrrFrameTiming = true,
+                    const QString& calibrationKey = QString());
 
     void notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info);
 

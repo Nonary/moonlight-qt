@@ -1,3 +1,5 @@
+#include "vrr/profile.h"
+#include "vrr/profilecodec.h"
 #include "vrrpacingworker.h"
 
 #include "vrr/vrrtargetwaiter.h"
@@ -20,7 +22,7 @@ namespace {
 // pattern seen near the panel ceiling. Capacity remains bounded and evicts the
 // oldest queued successor under sustained pressure, so it cannot accumulate
 // an unbounded latency backlog.
-constexpr size_t kMaximumQueuedFrames = 3;
+constexpr size_t kMaximumQueuedFrames = VrrMaximumQueuedFrames;
 // One source period of age is normal while the preceding frame traverses the
 // single pacing/presentation worker. Treating that ordinary occupancy as
 // stale caused isolated content skips whenever completion crossed the period
@@ -99,7 +101,7 @@ constexpr char kTraceHeader[] =
     "latch_qpc_correlation_valid,latch_qpc_correlation_reference_ticks,latch_qpc_correlation_reference_time_us,latch_qpc_correlation_span_ticks,"
     "readiness_phase_us,readiness_demand_us,applied_readiness_reserve_us,render_baseline_us,render_insurance_us,pacing_latency_budget_us,cadence_sample_count,rate_candidate_sample_count,readiness_sample_count,preparation_sample_count,render_scheduler_sample_count,target_scheduler_sample_count,clean_spacing_frames,phase_error_frames,readiness_model_valid,playout_delay_us,cadence_smoothing_us,missed_ticks,"
     "decode_sync_wait_us,prepare_timing_valid,prepare_decode_sync_us,prepare_acquire_us,prepare_render_us,prepare_flush_us,"
-    "gap_fills_before,gap_fill_last_us"
+    "gap_fills_before,gap_fill_last_us,original_target_us,playout_initial_profile"
     VRR_TIMING_PARAMETER_FIELDS(VRR_TRACE_PARAMETER_HEADER)
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
@@ -234,6 +236,14 @@ VrrPacingWorker::~VrrPacingWorker()
 
     discardQueuedFrames(false, TraceDisposition::ShutdownDiscard);
     closeTrace();
+    if (m_WorkerStarted && !m_Config.calibrationKey.empty() && !m_CalibrationInvalidated.load()) {
+        // Current DXGI observations do not always carry the presentation instant.
+        // Until native coverage can qualify a run, cache history only, never
+        // promote inferred success into a proven low-latency startup.
+        Vrr13::saveProfile(QString::fromStdString(m_Config.calibrationPath),
+                          QString::fromStdString(m_Config.calibrationKey),
+                          m_TimingController->playoutHistory());
+    }
 }
 
 bool VrrPacingWorker::start()
@@ -242,6 +252,15 @@ bool VrrPacingWorker::start()
         m_Presenter->checkSupport() != VrrFallbackReason::NoFallback) {
         return false;
     }
+
+    if (!m_Config.calibrationKey.empty()) {
+        Vrr13::Reserve prior;
+        if (Vrr13::loadProfile(QString::fromStdString(m_Config.calibrationPath),
+                              QString::fromStdString(m_Config.calibrationKey), prior)) {
+            m_TimingController->loadPlayoutHistory(prior.profile());
+        }
+    }
+    m_InitialPlayoutProfile = encodeVrrPlayoutProfile(m_TimingController->playoutHistory());
 
     // Enable capture before the producer can submit its first frame. Opening
     // from run() left a small startup race that made session replay incomplete.
@@ -256,6 +275,7 @@ bool VrrPacingWorker::start()
         return false;
     }
 
+    m_WorkerStarted = true;
     if (m_Telemetry != nullptr) {
         m_Telemetry->beginVrrSession();
     }
@@ -329,6 +349,7 @@ void VrrPacingWorker::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
     }
 
     const uint32_t flags = info->stateChangeFlags & kVrrWindowStateMask;
+    if (flags & kVrrDisplayEpochStateMask) m_CalibrationInvalidated.store(true);
     if (flags == 0) {
         return;
     }
@@ -617,7 +638,8 @@ int VrrPacingWorker::run()
         telemetry.prepareRenderUs = preparation.renderUs;
         telemetry.prepareFlushUs = preparation.flushUs;
         m_TimingController->notePreparationDuration(
-            telemetry.preparationDurationUs);
+            telemetry.preparationDurationUs,
+            preparation.timingValid ? preparation.acquireUs : 0);
 
         midframeWindowStateFlags =
             consumeWindowStateNotifications();
@@ -1650,6 +1672,9 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(telemetry.prepareFlushUs);
     addUnsigned(m_GapFillsBeforeFrame);
     addUnsigned(m_GapFillLastUs);
+    addUnsigned(decision.originalTargetUs);
+    separator();
+    line.append(m_InitialPlayoutProfile);
 #define VRR_ADD_TRACE_PARAMETER(type, jsonName, memberName, defaultValue) \
     addUnsigned(static_cast<uint64_t>(parameters.memberName));
     VRR_TIMING_PARAMETER_FIELDS(VRR_ADD_TRACE_PARAMETER)

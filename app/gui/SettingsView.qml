@@ -609,10 +609,7 @@ Flickable {
                                 }
                             }
 
-                            // VrrRatePolicy preserves every saved custom value.  An
-                            // exact native refresh is intentionally absent in VRR
-                            // mode, so leave the first valid choice selected if a
-                            // stale external setting reaches this UI.
+                            // Saved custom and native maximum choices remain visible.
                             if (!found) {
                                 currentIndex = model.count > 0 ? 0 : -1
                             }

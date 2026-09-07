@@ -17,3 +17,8 @@ SUBDIRS += \
     replay \
     replayconfig \
     queuesim
+
+overlay.file = $$PWD/overlay.pro
+SUBDIRS += overlay
+profile.file = $$PWD/profile.pro
+SUBDIRS += profile

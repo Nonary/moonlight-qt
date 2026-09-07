@@ -1,3 +1,4 @@
+#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profilecodec.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h"
 #include "vrrreplayconfig.h"
@@ -397,7 +398,14 @@ bool validateTraceRowSyntax(const QList<QByteArray>& header,
         const QByteArray& name = header[i];
         const QByteArray& value = fields[i];
         bool valid = false;
-        if (name == "disposition") {
+        if (name == "playout_initial_profile") {
+            valid = value.size() <= 16384 && !value.isEmpty() &&
+                std::all_of(value.cbegin(), value.cend(), [](char c) {
+                    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                           (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=';
+                });
+        }
+        else if (name == "disposition") {
             valid = dispositions.contains(value);
         }
         else if (name == "tear_classification") {
@@ -9723,7 +9731,8 @@ int main(int argc, char* argv[])
                 nativePresentParametersDeclared ==
                     nativeDxgiPresentAttempt &&
                 (!nativePresentParametersDeclared ||
-                 (nativePresentSyncInterval == 0 &&
+                 ((nativePresentSyncInterval == 0 ||
+                   (rowLatchedPresent && nativePresentSyncInterval == 1)) &&
                   nativePresentFlags == expectedPresentFlags));
             metrics.nativePresentParameterMismatchRows +=
                 nativePresentParametersValid ? 0 : 1;
@@ -11480,6 +11489,21 @@ int main(int argc, char* argv[])
                 capturedConfig, capturedCanLatch, capturedParameters);
             simulatedController = std::make_unique<VrrTimingController>(
                 simulatedConfig, simulatedCanLatch, scenario.controller);
+            const int profileColumn = traceHeader.indexOf("playout_initial_profile");
+            if (capturedParameters.playoutHistoryEnabled && profileColumn < 0) {
+                std::fprintf(stderr, "History capture is missing its starting calibration\n");
+                return 1;
+            }
+            if (profileColumn >= 0) {
+                std::vector<int64_t> profile;
+                if (!decodeVrrPlayoutProfile(fields[profileColumn], profile) ||
+                    !referenceController->loadPlayoutHistory(profile) ||
+                    !simulatedController->loadPlayoutHistory(profile)) {
+                    std::fprintf(stderr, "Invalid starting calibration in capture\n");
+                    return 1;
+                }
+                capturedParameterValues.insert(profileColumn, fields[profileColumn]);
+            }
         }
         else {
             metrics.displayRefreshMismatchRows +=
@@ -12318,6 +12342,10 @@ int main(int argc, char* argv[])
                          rtpTimestamp,
                          unsignedField(fields, columns.rtpValid) != 0,
                          decodeCompleteUs);
+        frame.setDeliveryTimeline(
+            optionalUnsignedField(fields, traceHeader.indexOf("frame_receive_us")),
+            optionalUnsignedField(fields, traceHeader.indexOf("frame_reassembled_us")),
+            optionalUnsignedField(fields, traceHeader.indexOf("decode_submit_us")));
         const bool hasPreparationTelemetry =
             unsignedField(fields, columns.preparationStartUs) != 0 ||
             unsignedField(fields, columns.preparationEndUs) != 0 ||
@@ -12754,6 +12782,12 @@ int main(int argc, char* argv[])
             fields, columns.recordedTargetUs);
         const uint64_t referenceTargetDrift = absoluteValue(
             signedDifference(referenceDecision.targetUs, recordedTargetUs));
+        const int originalColumn = traceHeader.indexOf("original_target_us");
+        if (originalColumn >= 0 && referenceDecision.originalTargetUs !=
+                unsignedField(fields, originalColumn)) {
+            std::fprintf(stderr, "Original deadline diverged on frame %d\n", frameNumber);
+            return 3;
+        }
         metrics.referenceTargetDrift.add(referenceTargetDrift);
         metrics.exactReferenceTargets += referenceTargetDrift == 0 ? 1 : 0;
         metrics.referenceSourceIntervalDrift.add(absoluteValue(
@@ -12991,9 +13025,10 @@ int main(int argc, char* argv[])
                 targetWakeInjection.usedRecordedFinalResidual ? 1 : 0;
 
         if (hasPreparationTelemetry) {
-            referenceController->notePreparationDuration(preparationUs);
-            simulatedController->notePreparationDuration(
-                simulatedPreparationUs);
+            const uint64_t acquire = optionalUnsignedField(fields, traceHeader.indexOf("prepare_timing_valid")) ?
+                optionalUnsignedField(fields, traceHeader.indexOf("prepare_acquire_us")) : 0;
+            referenceController->notePreparationDuration(preparationUs, acquire);
+            simulatedController->notePreparationDuration(simulatedPreparationUs, acquire);
         }
         const bool spacingHadPriorSubmission =
             referenceController->hasLastSubmission();

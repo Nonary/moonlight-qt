@@ -106,6 +106,10 @@ public:
         }
 
         feedback.presented = true;
+        feedback.nativeBackendValid = true;
+        feedback.nativeBackend = VrrNativePresentationBackend::Vulkan;
+        feedback.nativePresentResultValid = true;
+        feedback.nativePresentResult = 0;
         feedback.cancelled = presentCancelled;
         feedback.submissionTimeValid = true;
         feedback.submissionTimeUs = submissionTimeUs;

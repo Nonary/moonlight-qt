@@ -31,16 +31,9 @@ int VrrRatePolicy::vrrRateForRefresh(int refreshHz)
         return 0;
     }
 
-    // Keep this integer-only so the documented floor behavior is stable on
-    // every supported compiler.  floor(r - r^2 / 3600) is not the same as
-    // r - floor(r^2 / 3600) for rates such as 144 Hz.
-    const long long numerator = static_cast<long long>(refreshHz) *
-                                (3600LL - refreshHz);
-    if (numerator <= 0) {
-        return 0;
-    }
-
-    return static_cast<int>(numerator / 3600LL);
+    // The playout buffer absorbs receiver jitter. The presenter decides whether
+    // each frame can flip immediately or must wait for the next scanout.
+    return refreshHz;
 }
 
 int VrrRatePolicy::lowLatencyRateForRefresh(int refreshHz)
@@ -58,18 +51,7 @@ bool VrrRatePolicy::hasAdaptiveHeadroom(int streamRateHz, int displayRefreshHz)
         return false;
     }
 
-    constexpr long long microsecondsPerSecond = 1000000LL;
-    const auto periodForRate = [](int rateHz) {
-        const long long rate = static_cast<long long>(rateHz);
-        return std::max(1LL,
-                        (microsecondsPerSecond + rate / 2) / rate);
-    };
-
-    const long long displayPeriodUs = periodForRate(displayRefreshHz);
-    const long long streamPeriodUs = periodForRate(streamRateHz);
-    const long long guardUs = std::max(100LL,
-                                      std::min(displayPeriodUs / 64, 250LL));
-    return streamPeriodUs > displayPeriodUs + guardUs;
+    return streamRateHz <= displayRefreshHz;
 }
 
 std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& refreshRates,
@@ -97,12 +79,8 @@ std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& re
         }
     }
 
-    // A manually saved custom choice must remain visible.  Native FPS values
-    // are deliberately not reintroduced while VRR is enabled, because that
-    // would undermine the exact-native omission rule.
-    if (savedFps > 0 &&
-            (!vrrEnabled ||
-             std::find(refreshRates.cbegin(), refreshRates.cend(), savedFps) == refreshRates.cend())) {
+    // Preserve manually saved values, including exact native refresh.
+    if (savedFps > 0) {
         addChoice(choices, savedFps, VrrFpsChoiceKind::Custom);
     }
 

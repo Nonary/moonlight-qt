@@ -601,3 +601,5 @@ macx {
 
 VERSION = "$$BASE_VERSION"
 DEFINES += VERSION_STR=\\\"$$MOONLIGHT_VERSION\\\"
+
+SOURCES += $$PWD/streaming/video/ffmpeg-renderers/pacer/vrr/profile.cpp

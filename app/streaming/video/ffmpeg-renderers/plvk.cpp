@@ -264,6 +264,7 @@ PlVkRenderer::~PlVkRenderer()
 #ifdef Q_OS_DARWIN
         m_MetalTextureFactory.reset();
 #endif
+        m_OverlayCompletion.reset();
         pl_vulkan_destroy(&m_Vulkan);
 
         // This surface was created by SDL, so there's no libplacebo API to destroy it
@@ -1506,9 +1507,7 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
 
     // Reserve enough space to avoid allocating under the overlay lock
     pl_overlay_part overlayParts[Overlay::OverlayMax] = {};
-    std::vector<pl_tex> texturesToDestroy;
     std::vector<pl_overlay> overlays;
-    texturesToDestroy.reserve(Overlay::OverlayMax);
     overlays.reserve(Overlay::OverlayMax);
 
     pl_frame_from_swapchain(&targetFrame, &m_SwapchainFrame);
@@ -1518,28 +1517,15 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
     for (int i = 0; i < Overlay::OverlayMax; i++) {
         // If we have a staging overlay, we need to transfer ownership to us
         if (m_Overlays[i].hasStagingOverlay) {
-            if (m_Overlays[i].hasOverlay) {
-                texturesToDestroy.push_back(m_Overlays[i].overlay.tex);
-            }
-
-            // Copy the overlay fields from the staging area
-            m_Overlays[i].overlay = m_Overlays[i].stagingOverlay;
-
-            // We now own the staging overlay
+            // The background upload has completed. Reuse the previous texture
+            // as the next staging image instead of allocating on every refresh.
+            std::swap(m_Overlays[i].overlay, m_Overlays[i].stagingOverlay);
             m_Overlays[i].hasStagingOverlay = false;
-            SDL_zero(m_Overlays[i].stagingOverlay);
             m_Overlays[i].hasOverlay = true;
         }
 
-        // If we have an overlay but it's been disabled, free the overlay texture
-        if (m_Overlays[i].hasOverlay && !Session::get()->getOverlayManager().isOverlayEnabled((Overlay::OverlayType)i)) {
-            texturesToDestroy.push_back(m_Overlays[i].overlay.tex);
-            SDL_zero(m_Overlays[i].overlay);
-            m_Overlays[i].hasOverlay = false;
-        }
-
-        // We have an overlay to draw
-        if (m_Overlays[i].hasOverlay) {
+        if (m_Overlays[i].hasOverlay &&
+            Session::get()->getOverlayManager().isOverlayEnabled((Overlay::OverlayType)i)) {
             // Position the overlay
             overlayParts[i].src = { 0, 0, (float)m_Overlays[i].overlay.tex->params.w, (float)m_Overlays[i].overlay.tex->params.h };
             if (i == Overlay::OverlayStatusUpdate) {
@@ -1655,10 +1641,6 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
 #endif
 
 UnmapExit:
-    // Delete any textures that need to be destroyed
-    for (pl_tex& texture : texturesToDestroy) {
-        pl_tex_destroy(m_Vulkan->gpu, &texture);
-    }
 
     unmapAvFrameFromPlacebo(frame, &mappedFrame);
 }
@@ -1763,6 +1745,8 @@ bool PlVkRenderer::createOverlay(pl_overlay* overlay, SDL_Surface* surface)
     overlay->coords = PL_OVERLAY_COORDS_DST_FRAME;
     overlay->repr = pl_color_repr_rgb;
     overlay->color = pl_color_space_srgb;
+    overlay->parts = nullptr;
+    overlay->num_parts = 0;
     return true;
 }
 
@@ -1794,6 +1778,9 @@ void PlVkRenderer::notifyOverlayUpdated(Overlay::OverlayType type)
     if (!createOverlay(&m_Overlays[type].stagingOverlay, newSurface)) {
         return;
     }
+
+    if (!m_OverlayCompletion) m_OverlayCompletion = std::make_unique<OverlayCompletion>(m_Vulkan);
+    if (!m_OverlayCompletion->wait(m_Overlays[type].stagingOverlay.tex)) return;
 
     // Make this staging overlay visible to the render thread
     SDL_AtomicLock(&m_OverlayLock);
@@ -1912,4 +1899,15 @@ AVPixelFormat PlVkRenderer::getPreferredPixelFormat(int videoFormat)
     else {
         return AV_PIX_FMT_VULKAN;
     }
+}
+
+QString PlVkRenderer::getCalibrationIdentity()
+{
+    if (!m_Vulkan) return {};
+    VkPhysicalDeviceProperties properties{};
+    fn_vkGetPhysicalDeviceProperties(m_Vulkan->phys_device, &properties);
+    return QString("Vulkan|%1|%2|%3|%4")
+        .arg(properties.vendorID).arg(properties.deviceID).arg(properties.driverVersion)
+        .arg(QString::fromLatin1(QByteArray(reinterpret_cast<const char*>(properties.pipelineCacheUUID),
+                                          VK_UUID_SIZE).toHex()));
 }

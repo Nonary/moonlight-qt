@@ -1,6 +1,8 @@
 #pragma once
 
 #include "vrrtypes.h"
+#include "reserve.h"
+#include "workload.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +17,8 @@
 // headroom thresholds; non-zero ratios remain available to replay captures
 // made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
+    X(uint64_t, playout_per_frame_latch, playoutPerFrameLatch, 0) \
+    X(uint64_t, playout_history_enabled, playoutHistoryEnabled, 0) \
     X(uint64_t, maximum_forward_movement_us, maximumForwardMovementUs, 1000000) \
     X(uint64_t, render_lead_floor_us, renderLeadFloorUs, 1000) \
     X(uint64_t, render_lead_ceiling_us, renderLeadCeilingUs, 0) \
@@ -165,6 +169,9 @@ struct VrrTimingDiagnostics {
 // types; the worker translates platform observations into neutral timing
 // feedback.
 struct VrrTimingDecision {
+    // The original smoothed slot, before readiness and display-floor clamps.
+    // Observation only: a late frame must never rewrite its own deadline.
+    uint64_t originalTargetUs = 0;
     uint64_t sourceTimeUs = 0;
     uint64_t sourceIntervalUs = 0;
     uint64_t sourcePeriodUs = 0;
@@ -222,7 +229,8 @@ public:
 
     // Samples affect subsequent frames only. The current presentation target
     // never moves after rendering has begun.
-    void notePreparationDuration(uint64_t preparationDurationUs);
+    void notePreparationDuration(uint64_t preparationDurationUs,
+                                 uint64_t acquisitionWaitUs = 0);
     void noteSchedulerDelays(uint64_t renderDelayUs,
                              uint64_t targetDelayUs,
                              bool targetDelayValid);
@@ -260,6 +268,11 @@ public:
     uint64_t playoutBandSamples() const;
     const VrrTimingParameters& parameters() const;
     VrrTimingDiagnostics diagnostics() const;
+    const Vrr13::Reserve& playoutHistory() const { return m_PlayoutHistory; }
+    bool loadPlayoutHistory(const std::vector<int64_t>& profile) {
+        return !m_HaveTimeline && m_PlayoutHistory.loadProfile(profile);
+    }
+    uint64_t playoutQueueLimitUs() const;
 
 private:
     struct PendingFrame {
@@ -342,6 +355,9 @@ private:
     uint64_t playoutDelayStartUs() const;
     uint64_t playoutDelayMinimumUs() const;
     uint64_t playoutDelayMaximumUs() const;
+    void updatePlayoutHistory(const PacedFrame& frame,
+                              const CadenceObservation& cadence,
+                              bool rebased, int64_t requiredUs);
     static uint64_t scaledPerMille(uint64_t value, uint64_t perMille);
 
     void clearTimeline(bool retainLearnedBudgets);
@@ -436,6 +452,9 @@ private:
     uint64_t m_PlayoutSamplesSeen = 0;
     bool m_TimestampPlayoutActive = false;
     std::map<unsigned int, PlayoutBand> m_PlayoutBands;
+    Vrr13::Reserve m_PlayoutHistory;
+    Vrr13::WorkloadEpisode m_WorkloadEpisode;
+    uint64_t m_LastHistoryArrivalUs = 0;
     unsigned int m_PlayoutBandIndex = 0;
     bool m_PlayoutBandValid = false;
     uint64_t m_AppliedPlayoutDelayUs = 0;

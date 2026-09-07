@@ -44,3 +44,5 @@ unix:!macx {
     CONFIG += link_pkgconfig
     PKGCONFIG += libavutil sdl2
 }
+
+SOURCES += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profile.cpp

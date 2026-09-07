@@ -1,3 +1,5 @@
+#include <QNetworkInterface>
+#include <QSysInfo>
 #include "session.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
@@ -670,7 +672,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
         if (hasStrictRefreshRate && m_PresentationSettings.effectiveVsync &&
                 !hasAdaptiveHeadroom) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "VRR disabled: %d FPS leaves insufficient adaptive-refresh headroom at %d Hz",
+                        "VRR disabled: %d FPS exceeds the display maximum of %d Hz",
                         m_StreamConfig.fps, strictRefreshRate);
         }
         if (hasStrictRefreshRate && m_PresentationSettings.effectiveVsync &&
@@ -2556,4 +2558,22 @@ DispatchDeferredCleanup:
     // When it is complete, it will release our s_ActiveSessionSemaphore
     // reference.
     QThreadPool::globalInstance()->start(new DeferredSessionCleanupTask(this));
+}
+
+QString Session::vrrCalibrationContext() const
+{
+    QStringList networks;
+    for (const auto& iface : QNetworkInterface::allInterfaces()) {
+        if (!(iface.flags() & QNetworkInterface::IsUp) ||
+            !(iface.flags() & QNetworkInterface::IsRunning) ||
+            (iface.flags() & QNetworkInterface::IsLoopBack)) continue;
+        QStringList addresses;
+        for (const auto& entry : iface.addressEntries()) addresses << entry.ip().toString();
+        addresses.sort();
+        networks << iface.hardwareAddress() + ":" + addresses.join(",");
+    }
+    networks.sort();
+    return QString("vrr13-history-1|%1|%2|%3|%4|%5")
+        .arg(m_Computer->uuid).arg(m_App.id).arg(m_StreamConfig.bitrate)
+        .arg(QSysInfo::kernelVersion()).arg(networks.join(";"));
 }

@@ -20,20 +20,17 @@ struct VrrFpsChoice {
 class VrrRatePolicy
 {
 public:
-    // floor(refresh - refresh^2 / 3600)
+    // Native maximum; no artificial below-refresh cap.
     static int vrrRateForRefresh(int refreshHz);
 
     // floor((refresh * 5 / 6) / 5) * 5
     static int lowLatencyRateForRefresh(int refreshHz);
 
-    // Adaptive presentation needs enough time between stream frames for one
-    // display period and the pacer's baseline safety guard. This is a
-    // deterministic session qualification, not a per-frame latching policy.
+    // Accept sources through native refresh. Per-frame presentation enforces
+    // scanout safety; session admission no longer reserves a fixed FPS margin.
     static bool hasAdaptiveHeadroom(int streamRateHz, int displayRefreshHz);
 
-    // Build the complete FPS list for the settings UI.  With VRR enabled,
-    // exact native refresh choices are intentionally left out, while the two
-    // baseline choices and calculated rates remain available.
+    // Build baseline, native maximum, low-latency, and saved custom choices.
     static std::vector<VrrFpsChoice> buildChoices(const std::vector<int>& refreshRates,
                                                    int savedFps,
                                                    bool vrrEnabled);

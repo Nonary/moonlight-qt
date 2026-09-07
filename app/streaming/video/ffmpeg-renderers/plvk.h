@@ -10,6 +10,7 @@
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
 #include <libplacebo/vulkan.h>
+#include "overlaycompletion.h"
 
 #include <atomic>
 
@@ -40,6 +41,7 @@ private:
 
 class PlVkRenderer : public IFFmpegRenderer, public IVrrFramePresenter {
 public:
+    QString getCalibrationIdentity() override;
     PlVkRenderer(AVHWDeviceType hwDeviceType = AV_HWDEVICE_TYPE_NONE, IFFmpegRenderer *backendRenderer = nullptr);
     virtual ~PlVkRenderer() override;
     virtual bool initialize(PDECODER_PARAMETERS params) override;
@@ -150,6 +152,8 @@ private:
     bool m_VrrFramePrepared = false;
     bool m_VrrRenderSucceeded = false;
     bool m_VrrRenderTimingActive = false;
+
+    std::unique_ptr<OverlayCompletion> m_OverlayCompletion;
 
     // Overlay state
     SDL_SpinLock m_OverlayLock = 0;

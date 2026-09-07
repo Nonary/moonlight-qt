@@ -1,5 +1,6 @@
 #include "overlaymanager.h"
 #include "path.h"
+#include <exception>
 
 using namespace Overlay;
 
@@ -7,8 +8,6 @@ OverlayManager::OverlayManager() :
     m_Renderer(nullptr),
     m_FontData(Path::readDataFile("ModeSeven.ttf"))
 {
-    memset(m_Overlays, 0, sizeof(m_Overlays));
-
     m_Overlays[OverlayType::OverlayDebug].color = {0xD0, 0xD0, 0x00, 0xFF};
     m_Overlays[OverlayType::OverlayDebug].fontSize = 20;
 
@@ -26,10 +25,21 @@ OverlayManager::OverlayManager() :
                     TTF_GetError());
         return;
     }
+    m_TtfInitialized = true;
+    try { m_Worker = std::thread(&OverlayManager::run, this); }
+    catch (const std::exception& e) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Overlay worker creation failed: %s", e.what());
+    }
 }
 
 OverlayManager::~OverlayManager()
 {
+    {
+        std::lock_guard<std::mutex> lock(m_StateLock);
+        m_Stopping = true;
+    }
+    m_WorkReady.notify_one();
+    if (m_Worker.joinable()) m_Worker.join();
     for (int i = 0; i < OverlayType::OverlayMax; i++) {
         if (m_Overlays[i].surface != nullptr) {
             SDL_FreeSurface(m_Overlays[i].surface);
@@ -39,7 +49,7 @@ OverlayManager::~OverlayManager()
         }
     }
 
-    TTF_Quit();
+    if (m_TtfInitialized) TTF_Quit();
 
     // For similar reasons to the comment in the constructor, this will usually,
     // but not always, deinitialize TTF. In the cases where Session objects overlap
@@ -50,18 +60,27 @@ OverlayManager::~OverlayManager()
 
 bool OverlayManager::isOverlayEnabled(OverlayType type)
 {
+    std::lock_guard<std::mutex> lock(m_StateLock);
     return m_Overlays[type].enabled;
 }
 
-char* OverlayManager::getOverlayText(OverlayType type)
+std::string OverlayManager::getOverlayText(OverlayType type)
 {
+    std::lock_guard<std::mutex> lock(m_StateLock);
     return m_Overlays[type].text;
 }
 
 void OverlayManager::updateOverlayText(OverlayType type, const char* text)
 {
-    SDL_utf8strlcpy(m_Overlays[type].text, text, sizeof(m_Overlays[0].text));
-    setOverlayTextUpdated(type);
+    {
+        std::lock_guard<std::mutex> lock(m_StateLock);
+        auto& overlay = m_Overlays[type];
+        SDL_utf8strlcpy(overlay.text, text, sizeof(overlay.text));
+        ++overlay.revision;
+        overlay.dirty = overlay.dirty || overlay.enabled;
+        overlay.queued = std::chrono::steady_clock::now();
+    }
+    m_WorkReady.notify_one();
 }
 
 int OverlayManager::getOverlayMaxTextLength()
@@ -76,34 +95,22 @@ int OverlayManager::getOverlayFontSize(OverlayType type)
 
 SDL_Surface* OverlayManager::getUpdatedOverlaySurface(OverlayType type)
 {
-    // If a new surface is available, return it. If not, return nullptr.
-    // Caller must free the surface on success.
     return (SDL_Surface*)SDL_AtomicSetPtr((void**)&m_Overlays[type].surface, nullptr);
-}
-
-void OverlayManager::setOverlayTextUpdated(OverlayType type)
-{
-    // Only update the overlay state if it's enabled. If it's not enabled,
-    // the renderer has already been notified by setOverlayState().
-    if (m_Overlays[type].enabled) {
-        notifyOverlayUpdated(type);
-    }
 }
 
 void OverlayManager::setOverlayState(OverlayType type, bool enabled)
 {
-    bool stateChanged = m_Overlays[type].enabled != enabled;
-
-    m_Overlays[type].enabled = enabled;
-
-    if (stateChanged) {
-        if (!enabled) {
-            // Set the text to empty string on disable
-            m_Overlays[type].text[0] = 0;
-        }
-
-        notifyOverlayUpdated(type);
+    {
+        std::lock_guard<std::mutex> lock(m_StateLock);
+        auto& overlay = m_Overlays[type];
+        if (overlay.enabled == enabled) return;
+        overlay.enabled = enabled;
+        if (!enabled) overlay.text[0] = 0;
+        ++overlay.revision;
+        overlay.dirty = true;
+        overlay.queued = std::chrono::steady_clock::now();
     }
+    m_WorkReady.notify_one();
 }
 
 SDL_Color OverlayManager::getOverlayColor(OverlayType type)
@@ -113,56 +120,82 @@ SDL_Color OverlayManager::getOverlayColor(OverlayType type)
 
 void OverlayManager::setOverlayRenderer(IOverlayRenderer* renderer)
 {
-    m_Renderer = renderer;
+    // Wait for any callback into the previous renderer before allowing its
+    // destruction. An in-progress CPU raster job is invalidated by revision.
+    std::lock_guard<std::mutex> rendererLock(m_RendererLock);
+    {
+        std::lock_guard<std::mutex> stateLock(m_StateLock);
+        m_Renderer = renderer;
+        m_HaveRenderer = renderer != nullptr;
+        for (auto& overlay : m_Overlays) {
+            ++overlay.revision;
+            overlay.dirty = m_HaveRenderer;
+            overlay.queued = std::chrono::steady_clock::now();
+        }
+    }
+    for (int i = 0; i < OverlayMax; ++i) SDL_FreeSurface(getUpdatedOverlaySurface(OverlayType(i)));
+    m_WorkReady.notify_one();
 }
 
-void OverlayManager::notifyOverlayUpdated(OverlayType type)
+void OverlayManager::run()
 {
-    if (m_Renderer == nullptr) {
-        return;
-    }
-
-    // Construct the required font to render the overlay
-    if (m_Overlays[type].font == nullptr) {
-        if (m_FontData.isEmpty()) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "SDL overlay font failed to load");
-            return;
+    using Clock = std::chrono::steady_clock;
+    auto ns = [](Clock::duration d) { return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count(); };
+    unsigned next = 0;
+    for (;;) {
+        OverlayType type;
+        char text[1024];
+        bool enabled;
+        uint64_t revision;
+        Clock::time_point queued;
+        {
+            std::unique_lock<std::mutex> lock(m_StateLock);
+            m_WorkReady.wait(lock, [&] {
+                if (m_Stopping) return true;
+                if (!m_HaveRenderer) return false;
+                for (const auto& overlay : m_Overlays) if (overlay.dirty) return true;
+                return false;
+            });
+            if (m_Stopping) return;
+            // One coalesced request per overlay; rotate to avoid starving status
+            // messages if diagnostic text changes faster than it can be drawn.
+            while (!m_Overlays[next].dirty) next = (next + 1) % OverlayMax;
+            type = OverlayType(next);
+            next = (next + 1) % OverlayMax;
+            auto& overlay = m_Overlays[type];
+            overlay.dirty = false;
+            enabled = overlay.enabled;
+            revision = overlay.revision;
+            queued = overlay.queued;
+            SDL_memcpy(text, overlay.text, sizeof(text));
         }
-
-        // m_FontData must stay around until the font is closed
-        m_Overlays[type].font = TTF_OpenFontRW(SDL_RWFromConstMem(m_FontData.constData(), m_FontData.size()),
-                                               1,
-                                               m_Overlays[type].fontSize);
-        if (m_Overlays[type].font == nullptr) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "TTF_OpenFont() failed: %s",
-                        TTF_GetError());
-
-            // Can't proceed without a font
-            return;
+        const auto started = Clock::now();
+        auto& overlay = m_Overlays[type];
+        SDL_Surface* surface = nullptr;
+        if (enabled && text[0]) {
+            if (!overlay.font && !m_FontData.isEmpty()) {
+                overlay.font = TTF_OpenFontRW(SDL_RWFromConstMem(m_FontData.constData(), m_FontData.size()),
+                                              1, overlay.fontSize);
+            }
+            if (overlay.font) surface = RenderTextOutlinedWrapped(overlay.font, text, overlay.color,
+                                                                  {0, 0, 0, 255}, 4, 1024);
+            if (!surface) continue; // Keep the last successful overlay on failure.
         }
-    }
-
-    // Exchange the old surface with the new one
-    SDL_Surface* oldSurface = (SDL_Surface*)SDL_AtomicSetPtr(
-        (void**)&m_Overlays[type].surface,
-        m_Overlays[type].enabled ?
-            // The _Wrapped variant is required for line breaks to work
-            RenderTextOutlinedWrapped(m_Overlays[type].font,
-                                      m_Overlays[type].text,
-                                      m_Overlays[type].color,
-                                      {0, 0, 0, 255},
-                                      4,
-                                      1024)
-            : nullptr);
-
-    // Notify the renderer
-    m_Renderer->notifyOverlayUpdated(type);
-
-    // Free the old surface
-    if (oldSurface != nullptr) {
-        SDL_FreeSurface(oldSurface);
+        const auto rasterized = Clock::now();
+        std::lock_guard<std::mutex> rendererLock(m_RendererLock);
+        bool publish;
+        {
+            std::lock_guard<std::mutex> stateLock(m_StateLock);
+            publish = !m_Stopping && m_Renderer && overlay.revision == revision;
+            if (publish) surface = (SDL_Surface*)SDL_AtomicSetPtr((void**)&overlay.surface, surface);
+        }
+        SDL_FreeSurface(surface); // Superseded result or previous unconsumed surface.
+        if (publish) {
+            const auto dispatch = Clock::now();
+            m_Renderer->notifyOverlayUpdated(type);
+            m_Renderer->recordOverlayTiming({type, revision, ns(started - queued),
+                                            ns(rasterized - started), ns(Clock::now() - dispatch)});
+        }
     }
 }
 
@@ -207,5 +240,4 @@ SDL_Surface* OverlayManager::RenderTextOutlinedWrapped(TTF_Font* font, const cha
     SDL_FreeSurface(textSurface);
     return outlineSurface;
 }
-
 
