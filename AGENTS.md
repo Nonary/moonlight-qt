@@ -1,5 +1,14 @@
 # Moonlight development notes
 
+## Architecture orientation
+
+At the start of work on streaming, decoding, rendering, VRR, timing, latency,
+or replay, read [architecture.md](architecture.md). It documents the pipeline,
+clock domains, active policy, ownership, diagnostics, and known discrepancies.
+Check its source baseline against current code and update affected sections
+when behavior changes; historical comments and replay defaults are not proof
+of the active production policy.
+
 ## ChaseShare Windows build
 
 The gaming build is an unsigned Windows x64 release. The canonical share is:
