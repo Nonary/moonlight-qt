@@ -32,7 +32,7 @@ bool loadProfile(const QString& path, const QString& key, Reserve& reserve)
         if (!value.isDouble() || value.toDouble() != double(value.toInteger(-1))) return false;
         words.push_back(value.toInteger(-1));
     }
-    Reserve restored;
+    Reserve restored(reserve.version());
     if (!restored.loadProfile(words)) return false;
     restored.age(unsigned(age / 86400));
     reserve = restored;
@@ -70,7 +70,7 @@ bool saveProfile(const QString& path, const QString& key, const Reserve& reserve
         reserve.duration() >= Reserve::Window && reserve.reliable();
     const auto candidate = reserve.successfulBuffer(); // Zero is a valid proven reserve.
     const auto session = QString::number(reserve.sessionStart());
-    Reserve old;
+    Reserve old(reserve.version());
     std::vector<int64_t> oldWords;
     bool integral = true;
     for (const auto& v : oldEntry.value("weights").toArray()) {

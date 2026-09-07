@@ -118,6 +118,9 @@ VrrTimingParameters vrrTimingParametersForSession(
     // path: they each moved the target between frames the source had spaced
     // evenly. Explicit parameters keep older policies replayable.
     VrrTimingParameters parameters;
+    parameters.playoutPredictionEnabled = 1;
+    parameters.playoutSmoothnessFeedbackEnabled = 1;
+    parameters.playoutDelayAttackUs = 500;
     parameters.playoutPerFrameLatch = 1;
     parameters.playoutHistoryEnabled = 1;
     parameters.timestampPlayoutEnabled = 1;
@@ -125,7 +128,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.sourcePlayoutDelayUs = kFixedPlayoutDelayUs;
     parameters.playoutDelayStartUs = kPlayoutStartUs;
     parameters.playoutDelayMinimumUs = kPlayoutMinimumUs;
-    parameters.playoutDelayMaximumUs = kPlayoutMaximumUs;
+    parameters.playoutDelayMaximumUs = 100000;
     parameters.playoutDelayPercentilePerMille = kPlayoutPercentilePerMille;
     parameters.playoutBurstExclusionPerMille = kPlayoutBurstExclusionPerMille;
     // Preserve genuine game-rate motion without exposing every short/long
@@ -138,8 +141,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutSmoothingMaxLagUs = kPlayoutSmoothingMaxLagUs;
     parameters.playoutMetronomeEnabled = 0;
     parameters.playoutDelayStartPeriodPerMille = kPlayoutStartPeriodPerMille;
-    parameters.playoutDelayMaximumPeriodPerMille =
-        kPlayoutMaximumPeriodPerMille;
+    parameters.playoutDelayMaximumPeriodPerMille = 0;
     parameters.playoutSmoothingSnapPerMille = kPlayoutMetronomeSnapPerMille;
     parameters.playoutOffsetReseedFrames = kPlayoutOffsetReseedFrames;
     parameters.playoutDelaySlewAcrossBands = 1;
@@ -244,10 +246,18 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     }
     resetPlayoutOffsets();
     m_WorkloadEpisode.reset();
+    m_ReadinessPrediction.reset();
+    m_PresentationPrediction.reset();
+    m_SubmissionSmoothness.breakSequence();
+    m_NativeSmoothness.breakSequence();
+    m_FeedbackModeValid = false;
     // Learned per-band delays survive a source-phase rebase like the other
     // learned budgets; only a full reset discards them.
     if (!retainLearnedBudgets) {
-        m_PlayoutHistory = Vrr13::Reserve{};
+        m_SubmissionSmoothness.reset();
+        m_NativeSmoothness.reset();
+        m_RequestedPlayoutDelayUs = 0;
+        m_PlayoutHistory = Vrr13::Reserve(m_Parameters.playoutSmoothnessFeedbackEnabled ? 15 : m_Parameters.playoutPredictionEnabled ? 14 : 13);
         m_LastHistoryArrivalUs = 0;
         m_PlayoutBands.clear();
         m_PlayoutBandValid = false;
@@ -401,7 +411,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     int64_t smoothingUs = 0;
     uint64_t missedTicks = 0;
     uint64_t delayBeforeUs = 0;
-    const uint64_t leadUs = saturatingAdd(m_RenderLeadUs,
+    const uint64_t leadUs = saturatingAdd(m_Parameters.playoutPredictionEnabled ? typicalRenderUs() : m_RenderLeadUs,
                                           m_Parameters.presentationSafetyUs);
     if (timestampPlayout) {
         const int64_t offsetUs = signedDifference(frame.decodeCompleteUs(),
@@ -509,18 +519,20 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     const uint64_t playoutDelayUs = timestampPlayout ?
         (metronomeEnabled() ? delayBeforeUs : effectivePlayoutDelayUs()) :
         m_Parameters.sourcePlayoutDelayUs;
+    const uint64_t renderOffsetUs = m_Parameters.playoutPredictionEnabled ? typicalRenderUs() : m_RenderLeadUs;
+    const uint64_t compositorLeadUs = m_Parameters.playoutPredictionEnabled ? m_PresentationPrediction.lead(nowUs) : 0;
     uint64_t targetUs = saturatingAdd(
         addSigned(addSigned(m_SourceTimeUs, m_ReadinessBudgetUs),
                   smoothingUs),
         saturatingAdd(
             playoutDelayUs,
-            saturatingAdd(m_RenderLeadUs,
+            saturatingAdd(renderOffsetUs,
                           m_Parameters.presentationSafetyUs)));
     const uint64_t originalTargetUs = targetUs;
     targetUs = std::max(
         targetUs,
         saturatingAdd(nowUs,
-                      saturatingAdd(m_RenderLeadUs,
+                      saturatingAdd(renderOffsetUs,
                                     m_Parameters.presentationSafetyUs)));
 
     // This is a live, one-slot path. An unconfirmed RTP/frame jump may
@@ -594,6 +606,10 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                                 targetUs < safeAdaptiveUs;
     }
     const uint64_t unflooredTargetUs = targetUs;
+    if (m_Parameters.playoutPredictionEnabled && !m_LatchedPresentation) {
+        const auto scanoutFloor = m_PresentationPrediction.floor(nowUs, m_DisplayPeriodUs, m_GuardUs);
+        targetUs = std::max(targetUs, scanoutFloor > compositorLeadUs ? scanoutFloor - compositorLeadUs : 0);
+    }
     targetUs = std::max(targetUs, earliestSubmissionUs());
     const uint64_t presentationFloorPushUs = targetUs - unflooredTargetUs;
     const uint64_t totalLeadUs = saturatingAdd(m_RenderLeadUs,
@@ -623,6 +639,18 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     }
 
     VrrTimingDecision decision;
+    decision.frameNumber = uint64_t(frame.frameNumber());
+    decision.smoothnessProtectionUs = std::max(m_SubmissionSmoothness.protectionUs(), m_NativeSmoothness.protectionUs());
+    decision.requestedPlayoutDelayUs = m_RequestedPlayoutDelayUs;
+    decision.playoutCapacityLimited = m_RequestedPlayoutDelayUs > playoutDelayMaximumUs();
+    decision.submissionSmoothnessSamples = m_SubmissionSmoothness.samples();
+    decision.submissionSmoothnessMisses = m_SubmissionSmoothness.misses();
+    decision.nativeSmoothnessSamples = m_NativeSmoothness.samples();
+    decision.nativeSmoothnessMisses = m_NativeSmoothness.misses();
+    decision.originalScanoutUs = saturatingAdd(originalTargetUs, compositorLeadUs);
+    decision.predictedScanoutUs = saturatingAdd(targetUs, compositorLeadUs);
+    decision.compositorLeadUs = compositorLeadUs;
+    decision.recoveryHeadroomUs = m_Parameters.playoutPredictionEnabled ? recoveryHeadroomUs() : 0;
     decision.originalTargetUs = originalTargetUs;
     decision.sourceTimeUs = m_SourceTimeUs;
     decision.sourceIntervalUs = cadence.intervalUs;
@@ -698,9 +726,20 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.rebased = rebased;
 
     m_Pending.valid = true;
+    m_Pending.smoothness = smoothnessSample(decision);
+    m_Pending.smoothness.intended = decision.originalTargetUs;
     // Timestamp playout never feeds the learned readiness reserve.
     m_Pending.cadenceEligible = decision.cadenceEligible && !timestampPlayout;
     m_Pending.readyOffsetUs = readyOffsetUs;
+    if (m_Parameters.playoutPredictionEnabled) {
+        const uint64_t stall = std::max(m_Parameters.playoutStallExclusionUs, scaledPerMille(m_SourcePeriodUs, 1500));
+        m_Pending.prediction = {frame.decodeCompleteUs(), m_SourceTimeUs, m_SourcePeriodUs,
+            typicalRenderUs(), playoutDelayUs, recoveryHeadroomUs(), m_Parameters.playoutDelayMarginUs,
+            frame.reassembledUs() && frame.decodeSubmitUs() >= frame.reassembledUs() ? frame.decodeSubmitUs() - frame.reassembledUs() : 0,
+            timestampPlayout && !rebased && cadence.eligible && !cadence.phaseDiscontinuity &&
+            cadence.frameDelta == 1 && cadence.intervalUs <= stall &&
+            cadence.intervalUs >= scaledPerMille(m_SourcePeriodUs, m_Parameters.playoutBurstExclusionPerMille)};
+    }
     m_LastDecodeCompleteUs = frame.decodeCompleteUs();
     m_HaveLastDecodeComplete = true;
     if (timestampPlayout && metronomeEnabled()) {
@@ -732,10 +771,12 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     }
     else if (timestampPlayout &&
             m_Parameters.playoutSmoothingGainPerMille != 0) {
-        // The schedule continues from the slot actually used, including a
-        // late clamp or floor wait, so the frames after a late present stay
-        // evenly spaced from it and the gain walks the lag back gradually.
-        m_LastSmoothedBasisUs = targetUs > leadUs ? targetUs - leadUs : 0;
+        // VRR14 smooths the source schedule independently of readiness. Feeding
+        // a late execution time back into that clock carries delay into later
+        // frames instead of letting the available recovery headroom drain it.
+        // Old captures retain VRR13's execution-anchored smoothing.
+        const uint64_t basis = m_Parameters.playoutPredictionEnabled ? originalTargetUs : targetUs;
+        m_LastSmoothedBasisUs = basis > leadUs ? basis - leadUs : 0;
         m_HaveSmoothedBasis = true;
     }
     else {
@@ -1351,6 +1392,7 @@ void VrrTimingController::noteSchedulerDelays(uint64_t renderDelayUs,
                                               uint64_t targetDelayUs,
                                               bool targetDelayValid)
 {
+    m_Pending.renderSchedulerUs = renderDelayUs;
     appendBounded(m_RenderSchedulerDelays, renderDelayUs,
                   m_Parameters.schedulerLearningSamples);
     if (targetDelayValid) {
@@ -1386,6 +1428,14 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         return;
     }
 
+    if (m_Parameters.playoutSmoothnessFeedbackEnabled) {
+        if (submitted && !cancelled) {
+            auto sample = m_Pending.smoothness;
+            sample.at = submissionUs;
+            m_SubmissionSmoothness.observe(sample, submissionUs);
+        }
+        else m_SubmissionSmoothness.breakSequence();
+    }
     if (submitted) {
         // Cancellation is a reason, not proof that nothing reached the native
         // presentation queue (Vulkan must submit some abandoned images).
@@ -1407,6 +1457,10 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                               readinessLearningSampleLimit());
             }
             if (m_Pending.hasPreparationDuration) {
+                if (m_Parameters.playoutPredictionEnabled) {
+                    m_ReadinessPrediction.observe(m_PlayoutHistory, m_Pending.prediction,
+                        m_Pending.preparationDurationUs, m_Pending.renderSchedulerUs);
+                }
                 appendBounded(m_PreparationDurations,
                               m_Pending.preparationDurationUs,
                               m_Parameters.preparationLearningSamples);
@@ -1417,6 +1471,36 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
     }
 
     m_Pending = PendingFrame {};
+}
+
+Vrr13::SmoothnessFeedback::Sample VrrTimingController::smoothnessSample(const VrrTimingDecision& d)
+{
+    Vrr13::SmoothnessFeedback::Sample sample;
+    sample.frame = d.frameNumber;
+    sample.intended = d.originalScanoutUs;
+    sample.buffer = d.playoutDelayUs;
+    sample.headroom = d.recoveryHeadroomUs;
+    sample.eligible = d.cadenceEligible && !d.rebased && !d.phaseDiscontinuity &&
+        !d.sourceRateChanged && d.sourceIntervalUs <= std::max<uint64_t>(25000, d.sourcePeriodUs * 3 / 2);
+    return sample;
+}
+
+void VrrTimingController::notePresentation(const Vrr13::PresentationObservation& observation)
+{
+    if (!m_Parameters.playoutPredictionEnabled) return;
+    if (!m_Parameters.playoutSmoothnessFeedbackEnabled) {
+        m_PresentationPrediction.observe(observation);
+        return;
+    }
+    if (observation.submitted) {
+        if (m_FeedbackModeValid && m_FeedbackLatched != observation.latched)
+            m_NativeSmoothness.breakSequence();
+        m_FeedbackModeValid = true;
+        m_FeedbackLatched = observation.latched;
+    }
+    m_PresentationPrediction.observe(observation, [this](const Vrr13::SmoothnessFeedback::Sample& sample, uint64_t observed) {
+        m_NativeSmoothness.observe(sample, observed);
+    });
 }
 
 void VrrTimingController::updateLearnedBudgets()
@@ -1607,6 +1691,18 @@ uint64_t VrrTimingController::headroomUs() const
 {
     const uint64_t floorUs = saturatingAdd(m_DisplayPeriodUs, m_GuardUs);
     return m_SourcePeriodUs > floorUs ? m_SourcePeriodUs - floorUs : 0;
+}
+
+uint64_t VrrTimingController::typicalRenderUs() const
+{
+    return m_PreparationDurations.empty() ? m_RenderLeadUs :
+        std::clamp<uint64_t>(percentile(m_PreparationDurations, 50), 100, 100000);
+}
+
+uint64_t VrrTimingController::recoveryHeadroomUs() const
+{
+    const uint64_t occupied = std::max(m_DisplayPeriodUs, typicalRenderUs());
+    return m_SourcePeriodUs > occupied ? m_SourcePeriodUs - occupied : 0;
 }
 
 uint64_t VrrTimingController::scaledDisplayPeriodUs(
@@ -1859,7 +1955,7 @@ uint64_t VrrTimingController::playoutDelayStartUs() const
     }
     if (m_Parameters.playoutHistoryEnabled != 0) {
         // Only cold-start padding scales with display/work cost. Do not subtract
-        // inter-frame recovery headroom from a VRR13 frame's original deadline.
+        // inter-frame headroom here: the learned target credits it exactly once.
         startUs = std::min(startUs, std::max(m_DisplayPeriodUs, m_RenderLeadUs));
     }
     return clampUnsigned(startUs, playoutDelayMinimumUs(),
@@ -2072,7 +2168,7 @@ void VrrTimingController::updatePlayoutHistory(
                                     scaledPerMille(m_SourcePeriodUs, 1500));
     const uint64_t burst = scaledPerMille(m_SourcePeriodUs,
                                          m_Parameters.playoutBurstExclusionPerMille);
-    if (!rebased && cadence.eligible && !cadence.phaseDiscontinuity &&
+    if (!m_Parameters.playoutPredictionEnabled && !rebased && cadence.eligible && !cadence.phaseDiscontinuity &&
         cadence.frameDelta == 1 && cadence.intervalUs >= burst &&
         cadence.intervalUs <= stall) {
         const uint64_t raw = saturatingAdd(uint64_t(std::max<int64_t>(0, requiredUs)),
@@ -2089,17 +2185,27 @@ void VrrTimingController::updatePlayoutHistory(
         m_WorkloadEpisode.observe(m_PlayoutHistory, ns(covered),
             ns(m_AppliedPlayoutDelayUs), ns(at), decoderQueueUs, m_SourcePeriodUs);
     }
-    const uint64_t desired = clampUnsigned(uint64_t(m_PlayoutHistory.target(
-        100000000, int64_t(playoutDelayStartUs()) * 1000) / 1000),
+    uint64_t protection = uint64_t(m_PlayoutHistory.target(
+        100000000, int64_t(playoutDelayStartUs()) * 1000,
+        m_Parameters.playoutPredictionEnabled && !m_Parameters.playoutSmoothnessFeedbackEnabled ? int64_t(recoveryHeadroomUs()) * 1000 : 0) / 1000);
+    if (m_Parameters.playoutSmoothnessFeedbackEnabled) {
+        protection = std::max(protection, std::max(m_SubmissionSmoothness.protectionUs(), m_NativeSmoothness.protectionUs()));
+        protection -= std::min(protection, recoveryHeadroomUs());
+    }
+    m_RequestedPlayoutDelayUs = saturatingAdd(protection,
+        m_Parameters.playoutPredictionEnabled ? m_Parameters.playoutDelayMarginUs : 0);
+    const uint64_t desired = clampUnsigned(m_RequestedPlayoutDelayUs,
         playoutDelayMinimumUs(), playoutDelayMaximumUs());
-    // Preserve VRR13's bounded attack so a new tail never steps the timeline.
+    // Bound attack below the smoothness threshold; production responds faster
+    // than legacy captures while avoiding a single large timeline step.
     // Release uses elapsed wall time at the former 120 FPS rate, with a cap
     // on recovery gaps. Five-minute memory does not imply five-minute startup.
     if (desired > m_AppliedPlayoutDelayUs) {
         m_AppliedPlayoutDelayUs += std::min(desired - m_AppliedPlayoutDelayUs,
                                           m_Parameters.playoutDelayAttackUs);
     }
-    else if (m_PlayoutHistory.canRelease()) {
+    else if (m_PlayoutHistory.canRelease() && (!m_Parameters.playoutSmoothnessFeedbackEnabled ||
+             (m_SubmissionSmoothness.canRelease() && m_NativeSmoothness.canRelease()))) {
         const uint64_t release = scaledPerMille(m_Parameters.playoutDelayReleaseUs,
                                                 elapsed * 120 / 1000);
         m_AppliedPlayoutDelayUs -= std::min(m_AppliedPlayoutDelayUs - desired, release);

@@ -101,7 +101,7 @@ constexpr char kTraceHeader[] =
     "latch_qpc_correlation_valid,latch_qpc_correlation_reference_ticks,latch_qpc_correlation_reference_time_us,latch_qpc_correlation_span_ticks,"
     "readiness_phase_us,readiness_demand_us,applied_readiness_reserve_us,render_baseline_us,render_insurance_us,pacing_latency_budget_us,cadence_sample_count,rate_candidate_sample_count,readiness_sample_count,preparation_sample_count,render_scheduler_sample_count,target_scheduler_sample_count,clean_spacing_frames,phase_error_frames,readiness_model_valid,playout_delay_us,cadence_smoothing_us,missed_ticks,"
     "decode_sync_wait_us,prepare_timing_valid,prepare_decode_sync_us,prepare_acquire_us,prepare_render_us,prepare_flush_us,"
-    "gap_fills_before,gap_fill_last_us,original_target_us,playout_initial_profile"
+    "gap_fills_before,gap_fill_last_us,original_target_us,playout_initial_profile,original_scanout_us,predicted_scanout_us,compositor_lead_us,recovery_headroom_us,smoothness_protection_us,requested_playout_delay_us,submission_smoothness_samples,submission_smoothness_misses,native_smoothness_samples,native_smoothness_misses,playout_capacity_limited"
     VRR_TIMING_PARAMETER_FIELDS(VRR_TRACE_PARAMETER_HEADER)
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
@@ -254,7 +254,7 @@ bool VrrPacingWorker::start()
     }
 
     if (!m_Config.calibrationKey.empty()) {
-        Vrr13::Reserve prior;
+        Vrr13::Reserve prior(m_TimingController->playoutHistory().version());
         if (Vrr13::loadProfile(QString::fromStdString(m_Config.calibrationPath),
                               QString::fromStdString(m_Config.calibrationKey), prior)) {
             m_TimingController->loadPlayoutHistory(prior.profile());
@@ -1206,6 +1206,26 @@ void VrrPacingWorker::recordSubmission(
     m_TimingController->noteSubmission(
         feedback.presented, feedback.cancelled,
         telemetry.submissionBoundaryUs);
+    Vrr13::PresentationObservation observation;
+    observation.smoothness = VrrTimingController::smoothnessSample(decision);
+    observation.submitted = feedback.presented && !feedback.cancelled;
+    observation.idValid = feedback.submissionIdValid;
+    observation.id = feedback.submissionId;
+    observation.submission = telemetry.submissionBoundaryUs;
+    observation.ready = telemetry.preparationEndUs;
+    observation.deadline = decision.originalScanoutUs;
+    observation.latched = decision.latchedPresentation;
+    observation.dxgi = feedback.nativeBackend == VrrNativePresentationBackend::Dxgi;
+    observation.sampleValid = feedback.latchSampleValid &&
+        (!observation.dxgi || (feedback.latchQpcCorrelationValid && feedback.latchRawSyncQpcFrequency));
+    observation.sampleId = feedback.latchSubmissionId;
+    observation.sampleTime = feedback.latchTimeUs;
+    observation.observed = operationEndUs;
+    observation.presentRefresh = feedback.latchPresentRefreshSequence;
+    observation.syncRefresh = feedback.latchRefreshSequence;
+    observation.uncertainty = feedback.latchRawSyncQpcFrequency ?
+        feedback.latchQpcCorrelationSpanTicks * 1000000 / feedback.latchRawSyncQpcFrequency : 0;
+    m_TimingController->notePresentation(observation);
 }
 
 void VrrPacingWorker::deferFrame(PacedFrame&& frame)
@@ -1675,6 +1695,17 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(decision.originalTargetUs);
     separator();
     line.append(m_InitialPlayoutProfile);
+    addUnsigned(decision.originalScanoutUs);
+    addUnsigned(decision.predictedScanoutUs);
+    addUnsigned(decision.compositorLeadUs);
+    addUnsigned(decision.recoveryHeadroomUs);
+    addUnsigned(decision.smoothnessProtectionUs);
+    addUnsigned(decision.requestedPlayoutDelayUs);
+    addUnsigned(decision.submissionSmoothnessSamples);
+    addUnsigned(decision.submissionSmoothnessMisses);
+    addUnsigned(decision.nativeSmoothnessSamples);
+    addUnsigned(decision.nativeSmoothnessMisses);
+    addUnsigned(decision.playoutCapacityLimited);
 #define VRR_ADD_TRACE_PARAMETER(type, jsonName, memberName, defaultValue) \
     addUnsigned(static_cast<uint64_t>(parameters.memberName));
     VRR_TIMING_PARAMETER_FIELDS(VRR_ADD_TRACE_PARAMETER)

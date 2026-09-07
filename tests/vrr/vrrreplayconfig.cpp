@@ -409,8 +409,14 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutDelayAdaptive > 1) {
         return fail("playout_delay_adaptive must be 0 or 1");
     }
-    if (value.playoutHistoryEnabled > 1 || value.playoutPerFrameLatch > 1) {
-        return fail("playout_history_enabled and playout_per_frame_latch must be 0 or 1");
+    if (value.playoutSmoothnessFeedbackEnabled > 1 || value.playoutHistoryEnabled > 1 || value.playoutPerFrameLatch > 1 || value.playoutPredictionEnabled > 1) {
+        return fail("history, prediction, smoothness feedback and per-frame latch flags must be 0 or 1");
+    }
+    if (value.playoutSmoothnessFeedbackEnabled && !value.playoutPredictionEnabled) {
+        return fail("playout_smoothness_feedback_enabled requires playout_prediction_enabled");
+    }
+    if (value.playoutPredictionEnabled && (!value.playoutHistoryEnabled || !value.timestampPlayoutEnabled || !value.playoutDelayAdaptive)) {
+        return fail("playout_prediction_enabled requires adaptive timestamp history playout");
     }
     if (value.playoutDelayMinimumUs > value.playoutDelayMaximumUs) {
         return fail("playout_delay_minimum_us must not exceed playout_delay_maximum_us");

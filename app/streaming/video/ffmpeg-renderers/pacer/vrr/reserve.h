@@ -12,6 +12,9 @@ namespace Vrr13 {
 // to construction, profile IO and checkpoints, never frame observations.
 class Reserve {
 public:
+    explicit Reserve(int version = 13) : m_Version(version) {}
+    int version() const { return m_Version; }
+    int64_t tolerance() const { return m_Version >= 14 ? 3000000 : 0; }
     using Time = int64_t;
     static constexpr Time Second = 1000000000, Window = 300 * Second;
     static constexpr Time Bin = 250000, MissTolerance = 0;
@@ -44,7 +47,8 @@ public:
         // Applied is the full available budget (queue buffer + recovery
         // headroom). Guard also includes non-queued headroom for cache accounting.
         // All valid raw errors enter the histogram, including successes.
-        const bool missed = required > applied && required - applied > MissTolerance;
+        const bool missed = required > applied && (m_Version >= 15 ?
+            required - applied >= tolerance() : required - applied > tolerance());
         required = std::clamp(required, Time(0), Time(Bins - 1) * Bin);
         const size_t bin = size_t((required + Bin - 1) / Bin);
         // Neither the separate guard nor recovery headroom is cached as queue delay.
@@ -96,7 +100,7 @@ public:
     Time target(Time boostLimit, Time frameInterval = Second / 120, Time headroom = 0) const {
         const Time usual = common();
         const Time protection = std::max<Time>(0, usual +
-            (failing() && m_LastAt - m_LastMiss < 2 * Second ? std::clamp(m_Boost - usual, Time(0), boostLimit) : 0) - MissTolerance - std::max<Time>(0, headroom));
+            (failing() && m_LastAt - m_LastMiss < 2 * Second ? std::clamp(m_Boost - usual, Time(0), boostLimit) : 0) - (m_Version == 14 ? tolerance() : 0) - std::max<Time>(0, headroom));
         // A later miss can hold release, but cannot reinstate cold-start padding.
         const Time startup = warmed() ? 0 : m_Trusted ? m_ProvenBuffer : frameInterval;
         return std::max(startup, protection);
@@ -118,12 +122,12 @@ public:
             (quantile(m_Cached) > quantile(m_Weights) ||
              (quantile(m_Cached) == quantile(m_Weights) && cachedEvidence() > m_Total));
         const auto& weights = retain ? m_Cached : m_Weights;
-        std::vector<int64_t> out{13, retain ? m_CachedDuration : duration(), m_Successes, m_ProvenBuffer};
+        std::vector<int64_t> out{m_Version, retain ? m_CachedDuration : duration(), m_Successes, m_ProvenBuffer};
         out.insert(out.end(), weights.begin(), weights.end());
         return out;
     }
     bool loadProfile(const std::vector<int64_t>& words) {
-        if (words.size() != ProfileWords || words[0] != 13 || words[1] < 0 || words[1] > Window || words[2] < 0 || words[2] > 1000 ||
+        if (words.size() != ProfileWords || words[0] != m_Version || words[1] < 0 || words[1] > Window || words[2] < 0 || words[2] > 1000 ||
             words[3] < 0 || words[3] > Time(Bins - 1) * Bin) return false;
         uint64_t total = 0;
         for (size_t i = 4; i < words.size(); ++i) {
@@ -131,7 +135,7 @@ public:
             total += uint64_t(words[i]);
         }
         if (total > MaxSamples) return false;
-        Reserve restored;
+        Reserve restored(m_Version);
         restored.m_CachedDuration = words[1];
         restored.m_Successes = unsigned(words[2]); restored.m_ProvenBuffer = words[3];
         restored.m_Trusted = words[2] >= 3 && words[1] == Window && total > 0;
@@ -143,7 +147,7 @@ public:
         // Unlike a cache, exact replay includes the live bucket expiration times,
         // achieved coverage and transient pressure. Sparse bins keep ordinary
         // captures compact while retaining exact counters for every second.
-        std::vector<int64_t> out{13, m_CachedDuration, m_Successes, m_ProvenBuffer};
+        std::vector<int64_t> out{m_Version, m_CachedDuration, m_Successes, m_ProvenBuffer};
         out.insert(out.end(), m_Cached.begin(), m_Cached.end());
         out.insert(out.end(), {m_FirstAt, m_LastAt, m_LastMiss, m_Boost,
             int64_t(m_Observations), int64_t(m_Total), int64_t(m_WindowMisses), Time(Seconds), m_Trusted});
@@ -156,7 +160,7 @@ public:
     }
     bool restore(const std::vector<int64_t>& words) {
         if (words.size() < ProfileWords + 9 + Seconds * 5 || words.size() > MaxStateWords) return false;
-        Reserve r;
+        Reserve r(m_Version);
         if (!r.loadProfile({words.begin(), words.begin() + ProfileWords})) return false;
         size_t i = ProfileWords;
         r.m_FirstAt = words[i++]; r.m_LastAt = words[i++]; r.m_LastMiss = words[i++]; r.m_Boost = words[i++];
@@ -194,6 +198,7 @@ public:
         return true;
     }
 private:
+    int m_Version;
     bool warmed() const { return m_Total >= 32 && duration() >= 2 * Second; }
     static Time quantile(const std::array<uint64_t, Bins>& weights) {
         uint64_t total = 0, cumulative = 0;

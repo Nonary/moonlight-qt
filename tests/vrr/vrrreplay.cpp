@@ -1625,6 +1625,9 @@ struct RasterEnvelopeMetrics {
 };
 
 struct Metrics {
+    uint64_t feedbackCapacityLimitedFrames = 0;
+    VrrTimingDecision lastFeedbackDecision;
+
     uint64_t delivered = 0;
     uint64_t scheduled = 0;
     uint64_t presentedFrames = 0;
@@ -5457,6 +5460,18 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
 
     QJsonObject simulation;
     simulation["model"] = kReplayModel;
+    QJsonObject smoothnessFeedback;
+    const auto& feedback = metrics.lastFeedbackDecision;
+    smoothnessFeedback["protection_us"] = double(feedback.smoothnessProtectionUs);
+    smoothnessFeedback["requested_buffer_us"] = double(feedback.requestedPlayoutDelayUs);
+    smoothnessFeedback["applied_buffer_us"] = double(feedback.playoutDelayUs);
+    smoothnessFeedback["capacity_limited_frames"] = double(metrics.feedbackCapacityLimitedFrames);
+    smoothnessFeedback["submission_window_samples"] = double(feedback.submissionSmoothnessSamples);
+    smoothnessFeedback["submission_window_misses"] = double(feedback.submissionSmoothnessMisses);
+    smoothnessFeedback["native_window_samples"] = double(feedback.nativeSmoothnessSamples);
+    smoothnessFeedback["native_window_misses"] = double(feedback.nativeSmoothnessMisses);
+    smoothnessFeedback["native_evidence"] = "recorded service latency shifted with candidate submissions; missing intervals are not successes";
+    simulation["smoothness_feedback"] = smoothnessFeedback;
     simulation["display_hz"] = simulatedDisplayHz;
     simulation["stream_fps"] = simulatedStreamFps;
     simulation["additional_queued_frame"] = additionalQueuedFrame;
@@ -11497,11 +11512,14 @@ int main(int argc, char* argv[])
             if (profileColumn >= 0) {
                 std::vector<int64_t> profile;
                 if (!decodeVrrPlayoutProfile(fields[profileColumn], profile) ||
-                    !referenceController->loadPlayoutHistory(profile) ||
-                    !simulatedController->loadPlayoutHistory(profile)) {
+                    !referenceController->loadPlayoutHistory(profile)) {
                     std::fprintf(stderr, "Invalid starting calibration in capture\n");
                     return 1;
                 }
+                // A different policy learns its own error distribution; do not
+                // reinterpret the old smoothed-slot histogram as FIFO readiness.
+                if (referenceController->playoutHistory().version() == simulatedController->playoutHistory().version() &&
+                    !simulatedController->loadPlayoutHistory(profile)) return 1;
                 capturedParameterValues.insert(profileColumn, fields[profileColumn]);
             }
         }
@@ -12789,6 +12807,41 @@ int main(int argc, char* argv[])
             return 3;
         }
         metrics.referenceTargetDrift.add(referenceTargetDrift);
+        if (capturedParameters.playoutPredictionEnabled) {
+            const std::pair<const char*, uint64_t> predictions[] = {
+                {"original_scanout_us", referenceDecision.originalScanoutUs},
+                {"predicted_scanout_us", referenceDecision.predictedScanoutUs},
+                {"compositor_lead_us", referenceDecision.compositorLeadUs},
+                {"recovery_headroom_us", referenceDecision.recoveryHeadroomUs}
+            };
+            for (const auto& prediction : predictions) {
+                const int column = traceHeader.indexOf(prediction.first);
+                if (column < 0 || optionalUnsignedField(fields, column) != prediction.second) {
+                    std::fprintf(stderr, "Prediction drift: %s on frame %d\n", prediction.first, frameNumber);
+                    ++metrics.invalidControllerLifecycleRows;
+                }
+            }
+        }
+        if (capturedParameters.playoutSmoothnessFeedbackEnabled) {
+            const std::pair<const char*, uint64_t> feedback[] = {
+                {"smoothness_protection_us", referenceDecision.smoothnessProtectionUs},
+                {"requested_playout_delay_us", referenceDecision.requestedPlayoutDelayUs},
+                {"submission_smoothness_samples", referenceDecision.submissionSmoothnessSamples},
+                {"submission_smoothness_misses", referenceDecision.submissionSmoothnessMisses},
+                {"native_smoothness_samples", referenceDecision.nativeSmoothnessSamples},
+                {"native_smoothness_misses", referenceDecision.nativeSmoothnessMisses},
+                {"playout_capacity_limited", referenceDecision.playoutCapacityLimited}
+            };
+            for (const auto& value : feedback) {
+                const int column = traceHeader.indexOf(value.first);
+                if (column < 0 || optionalUnsignedField(fields, column) != value.second) {
+                    std::fprintf(stderr, "Smoothness feedback drift: %s on frame %d\n", value.first, frameNumber);
+                    ++metrics.invalidControllerLifecycleRows;
+                }
+            }
+        }
+        metrics.lastFeedbackDecision = simulatedDecision;
+        metrics.feedbackCapacityLimitedFrames += simulatedDecision.playoutCapacityLimited;
         metrics.exactReferenceTargets += referenceTargetDrift == 0 ? 1 : 0;
         metrics.referenceSourceIntervalDrift.add(absoluteValue(
             signedDifference(
@@ -14194,6 +14247,39 @@ int main(int argc, char* argv[])
                                                  simulatedSubmissionUs);
             addReferenceControllerDiagnostics(
                 metrics, referenceController->diagnostics(), fields, columns);
+        }
+
+        if (optionalUnsignedField(fields, columns.presentEndUs) && !staleBeforeRenderLifecycle && !staleAfterRenderLifecycle) {
+            const auto field = [&](const char* name) { return optionalUnsignedField(fields, traceHeader.indexOf(name)); };
+            Vrr13::PresentationObservation observation;
+            observation.smoothness = VrrTimingController::smoothnessSample(referenceDecision);
+            observation.submitted = presented && !cancelled;
+            observation.idValid = field("submission_id_valid") != 0;
+            observation.id = field("submission_id");
+            observation.submission = recordedSubmissionUs;
+            observation.ready = field("prepare_end_us");
+            observation.deadline = referenceDecision.originalScanoutUs;
+            observation.latched = referenceDecision.latchedPresentation;
+            observation.dxgi = field("native_backend") == kNativeBackendDxgi;
+            const uint64_t frequency = field("latch_raw_sync_qpc_frequency_hz");
+            observation.sampleValid = field("latch_valid") &&
+                (!observation.dxgi || (field("latch_qpc_correlation_valid") && frequency));
+            observation.sampleId = field("latch_submission_id");
+            observation.sampleTime = field("latch_time_us");
+            observation.observed = field("present_end_us");
+            observation.presentRefresh = field("latch_present_refresh_seq");
+            observation.syncRefresh = field("latch_sync_refresh_seq");
+            observation.uncertainty = frequency ? field("latch_qpc_correlation_span_ticks") * 1000000 / frequency : 0;
+            referenceController->notePresentation(observation);
+            // Recorded presentation latency is an external service sample, not
+            // proof of the candidate's actual scanout. Move it with its submission.
+            observation.timelineShift = signedDifference(simulatedSubmissionUs, recordedSubmissionUs);
+            observation.latched = simulatedDecision.latchedPresentation;
+            observation.deadline = observation.timelineShift >= 0 ?
+                simulatedDecision.originalScanoutUs - std::min(simulatedDecision.originalScanoutUs, uint64_t(observation.timelineShift)) :
+                simulatedDecision.originalScanoutUs + uint64_t(-observation.timelineShift);
+            observation.smoothness = VrrTimingController::smoothnessSample(simulatedDecision);
+            simulatedController->notePresentation(observation);
         }
 
         if (timelineFile.isOpen() &&

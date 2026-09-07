@@ -728,6 +728,10 @@ void testTraceCapturesEveryDeliveredFrame()
         WINDOW_STATE_CHANGE_INFO minimized {};
         minimized.stateChangeFlags = WINDOW_STATE_CHANGE_MINIMIZED;
         worker.notifyWindowChanged(&minimized);
+        // The fake publishes its present count before the worker writes the
+        // terminal trace. This fixture tests accounting, not intentional trace
+        // loss under producer/writer contention; let the preceding row drain.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         worker.submit(frame(6, lifetimes[5]));
 
         WINDOW_STATE_CHANGE_INFO restored {};
@@ -1263,7 +1267,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     auto cachedConfig = enabledConfig();
     cachedConfig.calibrationPath = traceDirectory.filePath("profile.json").toStdString();
     cachedConfig.calibrationKey = "replay-test";
-    Vrr13::Reserve cachedHistory;
+    Vrr13::Reserve cachedHistory(15);
     for (int i = 0; i < 256; ++i)
         cachedHistory.observe(4000000, 8000000, Vrr13::Reserve::Second + int64_t(i) * 16667000);
     expect(Vrr13::saveProfile(QString::fromStdString(cachedConfig.calibrationPath),
@@ -1292,7 +1296,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     expect(columns.contains("original_target_us") &&
            decodeVrrPlayoutProfile(fields.value(columns.indexOf("playout_initial_profile")), profile),
            "capture must carry its original deadline and complete starting calibration");
-    Vrr13::Reserve restored;
+    Vrr13::Reserve restored(15);
     expect(restored.loadProfile(profile) && restored.common() == 4000000 && restored.evidence() == 0,
            "captured calibration must restore prior history without inventing fresh successes");
     expect(header.contains("frame_receive_us") &&
@@ -1407,7 +1411,16 @@ void exportWarmHistoryReplayFixture()
         const auto start = std::chrono::steady_clock::now();
         for (int i = 0; i < 180; ++i) {
             std::this_thread::sleep_until(start + std::chrono::microseconds(int64_t(i) * 16667));
+            if (i == 120) {
+                expect(backend.waitForPresentCount(120), "feedback fixture must drain before its controlled stall");
+                backend.blockPreparation();
+            }
             worker.submit(frame(i + 1, lifetime[i]));
+            if (i == 120) {
+                expect(backend.waitForPrepareCount(121), "feedback fixture must enter preparation before its controlled stall");
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                backend.releasePreparation();
+            }
         }
         expect(backend.waitForPresentCount(180), "warm-history replay must drain every submitted frame");
     }

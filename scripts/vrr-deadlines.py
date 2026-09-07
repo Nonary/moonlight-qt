@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit VRR13 original deadlines; native feedback is observation only."""
+"""Audit original submission and scanout deadlines without retiming late frames."""
 import argparse
 import csv
 import hashlib
@@ -10,9 +10,11 @@ from pathlib import Path
 import tempfile
 
 
-def audit(lines, tolerance_us=2000):
+def audit(lines, tolerance_us=None):
     header = next(lines).rstrip("\r\n")
     names = header.split(",")
+    if tolerance_us is None:
+        tolerance_us = 3000 if "original_scanout_us" in names else 2000
     if "original_target_us" not in names:
         raise ValueError("capture predates original-deadline diagnostics")
     digest = hashlib.sha256((header + "\n").encode())
@@ -22,6 +24,8 @@ def audit(lines, tolerance_us=2000):
     footer = None
     first_at = last_at = 0
     windows = []
+    feedback = None
+    capacity_limited_frames = 0
     for line in lines:
         line = line.rstrip("\r\n")
         if line.startswith("#vrr_trace_footer,"):
@@ -54,6 +58,12 @@ def audit(lines, tolerance_us=2000):
         if not deadline:
             raise ValueError("scheduled frame has no original deadline")
         decisions += 1
+        if "submission_smoothness_samples" in names:
+            feedback = {key: n(key) for key in (
+                "submission_smoothness_samples", "submission_smoothness_misses",
+                "native_smoothness_samples", "native_smoothness_misses",
+                "smoothness_protection_us", "requested_playout_delay_us", "playout_delay_us")}
+            capacity_limited_frames += n("playout_capacity_limited")
         ready_miss = n("prepare_end_us") > deadline + tolerance_us
         submit_miss = bool(n("presented") and n("submission_boundary_us") > deadline + tolerance_us)
         readiness_misses += ready_miss
@@ -61,7 +71,8 @@ def audit(lines, tolerance_us=2000):
         host_stalls += n("sender_interval_us") > max(25000, n("source_period_us") * 3 // 2)
         windows.append((at, ready_miss, submit_miss))
         if n("presented") and n("submission_id_valid"):
-            submissions[n("submission_id")] = deadline
+            submissions[n("submission_id")] = (n("original_scanout_us") or deadline,
+                                               n("submission_boundary_us"))
         if n("latch_valid") and n("latch_qpc_correlation_valid"):
             # SyncQPCTime is the timestamp of SyncRefreshCount, NOT of the
             # independently numbered PresentRefreshCount. Never extrapolate.
@@ -71,8 +82,13 @@ def audit(lines, tolerance_us=2000):
                 pending[identity] = n("latch_present_refresh_seq")
         for identity, sequence in list(pending.items()):
             if sequence in anchors and identity in submissions:
+                scanout_deadline, submitted_at = submissions[identity]
+                if anchors[sequence] < submitted_at:
+                    continue
                 native_seen += 1
-                native_misses += anchors[sequence] > submissions.pop(identity) + tolerance_us
+                error = anchors[sequence] - scanout_deadline
+                native_misses += (abs(error) if "original_scanout_us" in names else error) > tolerance_us
+                del submissions[identity]
                 del pending[identity]
         # Old unavailable samples stay missing in the coverage denominator.
         for mapping in (submissions, anchors, pending):
@@ -86,7 +102,16 @@ def audit(lines, tolerance_us=2000):
     def window(selected):
         return {"frames": len(selected), "readiness_misses": sum(r for _, r, _ in selected),
                 "submission_misses": sum(s for _, _, s in selected)}
-    return {"complete_capture": complete, "tolerance_us": tolerance_us,
+    if feedback is not None:
+        feedback["capacity_limited_frames"] = capacity_limited_frames
+        feedback["violation_threshold_us"] = 3000
+        feedback["threshold_inclusive"] = True
+        for signal in ("submission", "native"):
+            samples = feedback[signal + "_smoothness_samples"]
+            misses = feedback[signal + "_smoothness_misses"]
+            feedback[signal + "_observed_interval_success_percent"] = 100 * (1 - misses / samples) if samples else None
+        feedback["scope"] = "latest controller window; unavailable native intervals are excluded, not successful"
+    return {"smoothness_feedback": feedback, "complete_capture": complete, "tolerance_us": tolerance_us,
             "rows": rows, "scheduled_frames": decisions, "drops": drops,
             "host_stalls": host_stalls, "readiness_misses": readiness_misses,
             "submission_misses": submission_misses, "native_observed": native_seen,

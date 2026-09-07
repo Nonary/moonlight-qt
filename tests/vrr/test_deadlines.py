@@ -17,6 +17,19 @@ class DeadlineAuditTest(unittest.TestCase):
         digest = hashlib.sha256(text.encode()).hexdigest()
         return iter((text + "#vrr_trace_footer,clean_shutdown=1,rows_dropped=0,write_failed=0,size_capped=0,decoded_sha256=" + digest + "\n").splitlines(True))
 
+    def test_feedback_counters_are_separate_from_deadline_misses(self):
+        row = dict(original_target_us=10000, decision_valid=1, presented=1,
+                   submission_boundary_us=20000, submission_smoothness_samples=2000,
+                   submission_smoothness_misses=1, native_smoothness_samples=0,
+                   native_smoothness_misses=0, playout_capacity_limited=1)
+        result = module.audit(self.capture([row]))
+        self.assertEqual(result["submission_misses"], 1)
+        feedback = result["smoothness_feedback"]
+        self.assertEqual(feedback["submission_observed_interval_success_percent"], 99.95)
+        self.assertIsNone(feedback["native_observed_interval_success_percent"])
+        self.assertEqual(feedback["capacity_limited_frames"], 1)
+        self.assertTrue(feedback["threshold_inclusive"])
+
     def test_original_deadline_and_missing_feedback(self):
         row = dict(original_target_us=10000, target_us=30000, pacer_arrival_us=1000,
                    decision_valid=1, prepare_end_us=25000, presented=1,
@@ -46,6 +59,21 @@ class DeadlineAuditTest(unittest.TestCase):
         lines = list(self.capture([dict(original_target_us=10000, decision_valid=1)]))
         lines[1] = lines[1].replace("10000", "20000")
         self.assertFalse(module.audit(iter(lines))["complete_capture"])
+
+    def test_prediction_uses_scanout_deadline_and_three_ms(self):
+        row = dict(original_target_us=10000, original_scanout_us=15000,
+                   decision_valid=1, presented=1, submission_boundary_us=10000,
+                   submission_id_valid=1, submission_id=1, latch_valid=1,
+                   latch_qpc_correlation_valid=1, latch_submission_id=1,
+                   latch_present_refresh_seq=5, latch_sync_refresh_seq=5,
+                   latch_time_us=18000)
+        result = module.audit(self.capture([row]))
+        self.assertEqual(result["tolerance_us"], 3000)
+        self.assertEqual(result["native_misses"], 0)
+        row["latch_time_us"] = 18001
+        self.assertEqual(module.audit(self.capture([row]))["native_misses"], 1)
+        row["latch_time_us"] = 9000
+        self.assertEqual(module.audit(self.capture([row]))["native_observed"], 0)
 
 
 if __name__ == "__main__":

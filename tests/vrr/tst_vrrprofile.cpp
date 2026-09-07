@@ -13,6 +13,19 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     QTemporaryDir dir;
     assert(dir.isValid());
+    for (int version : {14, 15}) {
+        Vrr13::Reserve predictive(version), restored(version), legacy;
+        for (int i = 0; i < 400; ++i)
+            predictive.observe(8000000, 5000000, 1000000000LL + int64_t(i) * 10000000);
+        const auto path14 = dir.filePath(QString("predictive-%1.json").arg(version));
+        assert(Vrr13::saveProfile(path14, "predictive", predictive, Vrr13::PresentationValidation::Unavailable));
+        assert(Vrr13::loadProfile(path14, "predictive", restored));
+        assert(!Vrr13::loadProfile(path14, "predictive", legacy));
+        std::vector<int64_t> words;
+        assert(decodeVrrPlayoutProfile(encodeVrrPlayoutProfile(predictive), words));
+        assert(restored.loadProfile(words));
+        assert(restored.version() == version && restored.common() == predictive.common());
+    }
     const auto path = dir.filePath("profiles.json");
     Vrr13::Reserve history;
     for (int i = 0; i < 400; ++i)

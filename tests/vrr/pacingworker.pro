@@ -46,3 +46,8 @@ unix:!macx {
 }
 
 SOURCES += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profile.cpp
+
+# Track the header-only feedback models in incremental builds.
+HEADERS += \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h

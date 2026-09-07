@@ -3,6 +3,7 @@
 #include "vrrtypes.h"
 #include "reserve.h"
 #include "workload.h"
+#include "prediction.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,8 @@
 // headroom thresholds; non-zero ratios remain available to replay captures
 // made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
+    X(uint64_t, playout_smoothness_feedback_enabled, playoutSmoothnessFeedbackEnabled, 0) \
+    X(uint64_t, playout_prediction_enabled, playoutPredictionEnabled, 0) \
     X(uint64_t, playout_per_frame_latch, playoutPerFrameLatch, 0) \
     X(uint64_t, playout_history_enabled, playoutHistoryEnabled, 0) \
     X(uint64_t, maximum_forward_movement_us, maximumForwardMovementUs, 1000000) \
@@ -169,6 +172,16 @@ struct VrrTimingDiagnostics {
 // types; the worker translates platform observations into neutral timing
 // feedback.
 struct VrrTimingDecision {
+    uint64_t frameNumber = 0;
+    uint64_t smoothnessProtectionUs = 0;
+    uint64_t requestedPlayoutDelayUs = 0;
+    uint64_t submissionSmoothnessSamples = 0, submissionSmoothnessMisses = 0;
+    uint64_t nativeSmoothnessSamples = 0, nativeSmoothnessMisses = 0;
+    bool playoutCapacityLimited = false;
+    uint64_t originalScanoutUs = 0;
+    uint64_t predictedScanoutUs = 0;
+    uint64_t compositorLeadUs = 0;
+    uint64_t recoveryHeadroomUs = 0;
     // The original smoothed slot, before readiness and display-floor clamps.
     // Observation only: a late frame must never rewrite its own deadline.
     uint64_t originalTargetUs = 0;
@@ -244,6 +257,10 @@ public:
     // lifecycle result. The timing controller has no renderer/native types.
     void noteSubmission(bool submitted, bool cancelled,
                         uint64_t submissionUs);
+    void notePresentation(const Vrr13::PresentationObservation& observation);
+    static Vrr13::SmoothnessFeedback::Sample smoothnessSample(const VrrTimingDecision& decision);
+    uint64_t typicalRenderUs() const;
+    uint64_t recoveryHeadroomUs() const;
 
     uint64_t timingBudgetUs() const;
     int64_t readinessBudgetUs() const;
@@ -276,6 +293,9 @@ public:
 
 private:
     struct PendingFrame {
+        Vrr13::SmoothnessFeedback::Sample smoothness;
+        Vrr13::ReadinessPrediction::Probe prediction;
+        uint64_t renderSchedulerUs = 0;
         bool valid = false;
         bool cadenceEligible = false;
         bool hasPreparationDuration = false;
@@ -454,6 +474,11 @@ private:
     std::map<unsigned int, PlayoutBand> m_PlayoutBands;
     Vrr13::Reserve m_PlayoutHistory;
     Vrr13::WorkloadEpisode m_WorkloadEpisode;
+    Vrr13::ReadinessPrediction m_ReadinessPrediction;
+    Vrr13::PresentationPrediction m_PresentationPrediction;
+    Vrr13::SmoothnessFeedback m_SubmissionSmoothness, m_NativeSmoothness;
+    uint64_t m_RequestedPlayoutDelayUs = 0;
+    bool m_FeedbackModeValid = false, m_FeedbackLatched = false;
     uint64_t m_LastHistoryArrivalUs = 0;
     unsigned int m_PlayoutBandIndex = 0;
     bool m_PlayoutBandValid = false;
