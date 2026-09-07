@@ -1267,7 +1267,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     auto cachedConfig = enabledConfig();
     cachedConfig.calibrationPath = traceDirectory.filePath("profile.json").toStdString();
     cachedConfig.calibrationKey = "replay-test";
-    Vrr13::Reserve cachedHistory(15);
+    Vrr13::Reserve cachedHistory(16);
     for (int i = 0; i < 256; ++i)
         cachedHistory.observe(4000000, 8000000, Vrr13::Reserve::Second + int64_t(i) * 16667000);
     expect(Vrr13::saveProfile(QString::fromStdString(cachedConfig.calibrationPath),
@@ -1296,7 +1296,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     expect(columns.contains("original_target_us") &&
            decodeVrrPlayoutProfile(fields.value(columns.indexOf("playout_initial_profile")), profile),
            "capture must carry its original deadline and complete starting calibration");
-    Vrr13::Reserve restored(15);
+    Vrr13::Reserve restored(16);
     expect(restored.loadProfile(profile) && restored.common() == 4000000 && restored.evidence() == 0,
            "captured calibration must restore prior history without inventing fresh successes");
     expect(header.contains("frame_receive_us") &&

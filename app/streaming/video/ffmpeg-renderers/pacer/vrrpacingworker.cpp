@@ -493,9 +493,13 @@ int VrrPacingWorker::run()
                     const uint64_t earliestUs =
                         m_TimingController->lastSubmissionUs() +
                         parameters.renderStartAfterSubmissionUs;
+                    const uint64_t minimumLeadUs = parameters.renderStartPreserveLearnedLead ?
+                        std::max(parameters.renderStartMinimumLeadUs,
+                                 decision.renderLeadUs + decision.renderWakeLeadUs) :
+                        parameters.renderStartMinimumLeadUs;
                     const uint64_t latestUs =
-                        decision.targetUs > parameters.renderStartMinimumLeadUs ?
-                            decision.targetUs - parameters.renderStartMinimumLeadUs : 0;
+                        decision.targetUs > minimumLeadUs ?
+                            decision.targetUs - minimumLeadUs : 0;
                     if (earliestUs > decision.renderStartUs) {
                         decision.renderStartUs = std::min(
                             earliestUs, std::max(decision.renderStartUs, latestUs));
@@ -1207,7 +1211,7 @@ void VrrPacingWorker::recordSubmission(
         feedback.presented, feedback.cancelled,
         telemetry.submissionBoundaryUs);
     Vrr13::PresentationObservation observation;
-    observation.smoothness = VrrTimingController::smoothnessSample(decision);
+    observation.smoothness = m_TimingController->smoothnessSample(decision);
     observation.submitted = feedback.presented && !feedback.cancelled;
     observation.idValid = feedback.submissionIdValid;
     observation.id = feedback.submissionId;

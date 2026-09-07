@@ -1,5 +1,34 @@
 # VRR deterministic tests
 
+Production preserves the game's relative RTP intervals and caps playout padding
+at 16 ms. Its gain smoother is disabled; historical policies remain replayable.
+For controller accuracy, use `simulation.sender_cadence.spacing_accuracy_percent`
+and `spacing_errors_over_2ms`: both long and short spacing errors count. The
+existing sender/arrival stall exclusions and denominator are unchanged. Raw
+presented jerk also includes game-driven cadence changes and is reported
+separately; it is not the controller's 99.95% acceptance criterion.
+`configs/game-spacing-validation.json` gates the nominal production scenario
+at 99.95%, 16 ms maximum padding, p99 decode-to-submission <= 30 ms and zero
+modeled interval violations. Its injected fault scenarios gate latency and
+interval safety separately; they do not claim 99.95% under post-target faults.
+The all-arrival queue simulator uses the capture's `can_latch_present` capability;
+forcing it off invents software-floor backlog on a latch-capable session.
+
+Production learns playout padding from readiness shortfalls using profile
+version 16. Native/submission interval misses remain measured outcomes and do
+not increase padding or prevent release. Inter-frame recovery time is not
+subtracted from readiness demand before a deadline. The frame queue is unchanged.
+Production preserves learned preparation lead and scores native cadence against
+the original target, independently of changes in predicted compositor latency.
+The captured `playout_readiness_driven_adaptation`, `playout_stable_smoothness_reference`, and
+`render_start_preserve_learned_lead` parameters select these behaviors; missing
+fields default to zero so older schema-5 captures keep their original policy.
+`--require-exact-baseline` selects that captured policy; an ordinary replay or
+the `session-policy` scenario selects the current production policy instead.
+The spacing lifecycle audit accepts a zero correction floor only when the
+reconstructed controller also disables that software floor. It still validates
+the deficit, wait ordering, and any required nonzero floor.
+
 The VRR test tree is opt-in so regular application and package builds do not
 gain test targets. From an out-of-tree build directory, configure it with:
 

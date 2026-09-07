@@ -1318,6 +1318,7 @@ struct SenderCadenceTracker {
     int64_t priorResidualUs = 0;
     uint64_t pairs = 0;
     uint64_t hitches = 0;
+    uint64_t spacingErrorsOverHitch = 0;
     uint64_t hitchLateArrivals = 0;
     uint64_t hitchRenderLeadJumps = 0;
     uint64_t hitchDisplayFloor = 0;
@@ -1366,6 +1367,8 @@ struct SenderCadenceTracker {
                 ++pairs;
                 absoluteSpacingErrorUs.add(static_cast<uint64_t>(
                     residualUs < 0 ? -residualUs : residualUs));
+                spacingErrorsOverHitch += residualUs > static_cast<int64_t>(kHitchUs) ||
+                    residualUs < -static_cast<int64_t>(kHitchUs);
                 if (haveResidual) {
                     const int64_t jerkUs = residualUs - priorResidualUs;
                     absoluteJerkUs.add(static_cast<uint64_t>(
@@ -2846,6 +2849,9 @@ QJsonObject senderCadenceObject(const SenderCadenceTracker& tracker,
     object["hitch_threshold_us"] =
         static_cast<qint64>(SenderCadenceTracker::kHitchUs);
     object["hitches"] = static_cast<qint64>(tracker.hitches);
+    object["spacing_errors_over_2ms"] = static_cast<qint64>(tracker.spacingErrorsOverHitch);
+    object["spacing_accuracy_percent"] = tracker.pairs ?
+        100.0 * (1.0 - double(tracker.spacingErrorsOverHitch) / double(tracker.pairs)) : 0.0;
     object["hitches_per_second"] = durationUs != 0 ?
         static_cast<double>(tracker.hitches) * 1000000.0 /
             static_cast<double>(durationUs) : 0.0;
@@ -11496,7 +11502,13 @@ int main(int argc, char* argv[])
                 simulatedConfig.streamRateHz = streamOverrideFps;
             }
             simulatedCanLatch = capturedCanLatch && !parser.isSet(latchOption);
-            if (!scenario.controllerCustomized) {
+            if (parser.isSet(exactOption)) {
+                // The exact gate verifies the policy that produced the trace.
+                // A normal session-policy replay deliberately uses today's
+                // production defaults, which may differ from older captures.
+                scenario.controller = capturedParameters;
+            }
+            else if (!scenario.controllerCustomized) {
                 scenario.controller = vrrTimingParametersForSession(
                     simulatedConfig);
             }
@@ -14252,7 +14264,7 @@ int main(int argc, char* argv[])
         if (optionalUnsignedField(fields, columns.presentEndUs) && !staleBeforeRenderLifecycle && !staleAfterRenderLifecycle) {
             const auto field = [&](const char* name) { return optionalUnsignedField(fields, traceHeader.indexOf(name)); };
             Vrr13::PresentationObservation observation;
-            observation.smoothness = VrrTimingController::smoothnessSample(referenceDecision);
+            observation.smoothness = referenceController->smoothnessSample(referenceDecision);
             observation.submitted = presented && !cancelled;
             observation.idValid = field("submission_id_valid") != 0;
             observation.id = field("submission_id");
@@ -14278,7 +14290,7 @@ int main(int argc, char* argv[])
             observation.deadline = observation.timelineShift >= 0 ?
                 simulatedDecision.originalScanoutUs - std::min(simulatedDecision.originalScanoutUs, uint64_t(observation.timelineShift)) :
                 simulatedDecision.originalScanoutUs + uint64_t(-observation.timelineShift);
-            observation.smoothness = VrrTimingController::smoothnessSample(simulatedDecision);
+            observation.smoothness = simulatedController->smoothnessSample(simulatedDecision);
             simulatedController->notePresentation(observation);
         }
 

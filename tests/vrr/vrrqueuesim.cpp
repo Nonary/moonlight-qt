@@ -57,6 +57,7 @@ struct Distribution {
 
 struct Capture {
     VrrSessionConfig session;
+    bool canLatchPresentation = false;
     std::vector<InputFrame> frames;
     std::vector<uint64_t> preparationUs;
     std::vector<uint64_t> presentCallUs;
@@ -114,6 +115,7 @@ bool loadCapture(const QString& path, Capture& capture, QString& error)
         capture.frames.push_back(frame);
 
         if (capture.session.displayRefreshHz == 0) {
+            capture.canLatchPresentation = value(fields, columns, "can_latch_present") != 0;
             capture.session.displayRefreshHz = static_cast<int>(
                 value(fields, columns, "display_refresh_hz"));
             capture.session.streamRateHz = static_cast<int>(
@@ -161,7 +163,7 @@ QJsonObject simulate(const Capture& capture, VrrReplayScenario scenario,
     if (!scenario.controllerCustomized) {
         scenario.controller = vrrTimingParametersForSession(capture.session);
     }
-    VrrTimingController controller(capture.session, false, scenario.controller);
+    VrrTimingController controller(capture.session, capture.canLatchPresentation, scenario.controller);
     std::deque<size_t> queue;
     size_t nextArrival = 0;
     size_t serviceOrdinal = 0;
@@ -284,6 +286,7 @@ QJsonObject simulate(const Capture& capture, VrrReplayScenario scenario,
 
     QJsonObject result;
     result["scenario"] = scenario.name;
+    result["can_latch_present"] = capture.canLatchPresentation;
     result["queue_capacity"] = static_cast<qint64>(queueCapacity);
     result["arrivals"] = static_cast<qint64>(capture.frames.size());
     result["presented"] = static_cast<qint64>(presented);

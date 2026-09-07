@@ -1163,9 +1163,11 @@ VrrSpacingLifecycleTimingAudit evaluateVrrSpacingLifecycleTiming(
         correctionWaitStartUs == 0 &&
             correctionWaitEndUs == 0;
     const bool correctedFloorValid = expectedCorrectionWait ?
+        // A latched policy can intentionally disable its software floor.
+        // The worker still records the recheck deficit and a wait at zero;
+        // require the controller's actual floor, including that valid zero.
         spacingCorrectedFloorUs ==
-            earliestSubmissionAfterFeedbackUs &&
-            spacingCorrectedFloorUs != 0 :
+            earliestSubmissionAfterFeedbackUs :
         spacingCorrectedFloorUs == 0;
     const uint64_t finalSpacingBoundaryUs = expectedCorrectionWait ?
         correctionWaitEndUs : spacingRecheckUs;

@@ -13,7 +13,7 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     QTemporaryDir dir;
     assert(dir.isValid());
-    for (int version : {14, 15}) {
+    for (int version : {14, 15, 16}) {
         Vrr13::Reserve predictive(version), restored(version), legacy;
         for (int i = 0; i < 400; ++i)
             predictive.observe(8000000, 5000000, 1000000000LL + int64_t(i) * 10000000);
@@ -25,6 +25,8 @@ int main(int argc, char** argv)
         assert(decodeVrrPlayoutProfile(encodeVrrPlayoutProfile(predictive), words));
         assert(restored.loadProfile(words));
         assert(restored.version() == version && restored.common() == predictive.common());
+        Vrr13::Reserve otherPolicy(version == 16 ? 15 : 16);
+        assert(!otherPolicy.loadProfile(words));
     }
     const auto path = dir.filePath("profiles.json");
     Vrr13::Reserve history;

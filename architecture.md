@@ -6,7 +6,10 @@ It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
 Source baseline: `be9b4613aa59454af4e07c33a6a8f5321afac6e0`, inspected
-2026-09-07. The initial map came from nine Luna Medium specialists, followed by
+2026-09-07; updated for readiness-driven padding, stable smoothness references,
+and preservation of learned preparation lead on 2026-09-07; the subsequent
+game-spacing correction disables production cadence smoothing and caps padding
+at 16 ms. The initial map came from nine Luna Medium specialists, followed by
 targeted source checks and corrections. No live capture, optical measurement,
 build, or test run was part of this documentation investigation. Recheck the
 named functions after changes; comments, diagnostic labels, and old experiments
@@ -371,15 +374,15 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | --- | --- |
 | Delay start seed | 6,000 us, then source/display/work/capacity scaling below |
 | Delay minimum input | 1,000 us, capped by available capacity |
-| Delay maximum input | 100,000 us, capped by available capacity |
+| Delay maximum input | 16,000 us, capped by available capacity |
 | Start-period ratio | 950 per mille of fitted source period |
 | Maximum-period ratio | 0; no additional period-ratio maximum input |
 | Delay attack | At most 500 us per update |
 | Delay release input | 10 us, scaled by elapsed time at a 120 FPS reference rate |
 | Prediction margin | 300 us |
-| Smoothing gain | 200 per mille toward raw mapped timing |
-| Smoothing period EMA | 100 per mille |
-| Positive smoothing lag cap | 6,000 us |
+| Smoothing gain | 0; preserve relative game intervals |
+| Smoothing period EMA | 100 per mille; inactive in production |
+| Positive smoothing lag cap | 6,000 us; inactive in production |
 | Render lead floor | 3,000 us |
 | Preparation-start spacing input | 6,000 us after prior submission |
 | Minimum preparation lead input | 2,500 us |
@@ -425,6 +428,16 @@ timestamp production behavior.
 
 ### 8.3 Cadence smoothing
 
+Production disables the gain smoother. RTP is used for relative frame spacing;
+the local offset only supplies a client-clock origin. An arbitrary RTP epoch
+must not change scheduling. Game-driven interval changes are not client misses.
+Assess controller-added spacing error against relative game intervals, with
+raw presented jerk reported separately rather than used as the acceptance gate.
+Padding absorbs delivery variability without regularizing the game's cadence.
+
+The following smoother remains available for historical replay and explicit
+experiments; it is not the active production policy.
+
 The smoother adjusts local scheduling only; received RTP values stay unchanged.
 Conceptually, with `raw = sourceTime + delayBeforeThisFrame`:
 
@@ -447,7 +460,7 @@ not a later actual execution time. Otherwise one late frame would move later
 frames and turn a temporary miss into persistent added delay. Older replay modes
 retain execution-anchored smoothing and the retired metronome for compatibility.
 
-Disabling smooth frame timing sets smoothing gain to zero. Timestamp playout,
+Both current smooth-frame-timing settings leave smoothing gain at zero. Timestamp playout,
 adaptive delay, readiness constraints, and applicable presentation floors remain.
 
 ### 8.4 Target, render start, and latch request
@@ -489,7 +502,12 @@ the actual renderer implementation, not inferred from the request flag.
 Preparation starts ahead of the target using learned render/scheduler budgets.
 The 6 ms post-submission preparation constraint addresses swapchain acquisition
 that can block when preparation immediately follows a previous present. The
-2.5 ms minimum lead and 3 ms render-lead floor protect rendering opportunity.
+production `render_start_preserve_learned_lead=1` policy lets that constraint
+consume only spare lead: it cannot reduce the learned render plus scheduler
+lead to the legacy 2.5 ms minimum. Longer preparation therefore earns an earlier
+render start, instead of being squeezed into the same narrow window behind a
+larger playout buffer. Gap-fill repeats use the same rule. The 3 ms render-lead
+floor remains subject to the existing source-rate and capacity bounds.
 Preparing immediately at arrival remains an experiment, not production default.
 
 ## 9. Active production learning and bounded delay
@@ -497,7 +515,10 @@ Preparing immediately at arrival remains an experiment, not production default.
 ### 9.1 Readiness prediction
 
 `schedule()` retains a pending probe: decoded time, intended source slot,
-period, typical render cost, applied delay, headroom/guard, and decoder backlog.
+period, typical render cost, applied delay, guard, and decoder backlog.
+The readiness-driven policy uses the scheduled source slot with playout padding
+removed. Production now preserves raw relative game intervals; if a replay
+explicitly enables smoothing, its smoothed slot remains the readiness reference.
 Preparation and scheduler measurements are recorded for future decisions.
 On successful non-cancelled submission, `ReadinessPrediction` models expected
 and actual FIFO service using those measurements, excluding intentional pacing
@@ -514,13 +535,15 @@ the stream.
 ### 9.2 Reserve history and smoothness feedback
 
 With production prediction and smoothness enabled, the readiness history uses
-`Vrr13::Reserve(15)`. Namespace/file version names do not mean the older algorithm
+`Vrr13::Reserve(16)`. Version 16 separates the new readiness evidence from cached
+version-15 evidence, which credited recovery headroom against current readiness.
+Namespace/file version names do not mean the older algorithm
 is active. Reserve uses nanoseconds, 250 us histogram bins, and one-second aging
 buckets over approximately five minutes. Allocation is kept out of ordinary
 frame observation.
 
 The empirical quantile inside Reserve is p99.95 nearest-rank. All valid samples,
-including successes, contribute to the denominator. Version 15 considers a
+including successes, contribute to the denominator. Versions 15 and 16 consider a
 readiness miss when required protection exceeds available protection by at least
 3 ms. A recent miss affects trust and temporary boost rather than being silently
 diluted by a long good history.
@@ -534,7 +557,18 @@ before adaptation.
 There are separate submission and native `SmoothnessFeedback` instances. They
 compare actual adjacent intervals against intended adjacent intervals, use a
 3 ms tolerance and uncertainty checks, and require valid consecutive evidence.
-Stretch charges the current frame; catch-up charges the preceding delayed frame
+Production `playout_stable_smoothness_reference=1` uses `originalTargetUs` as
+the cadence reference for both. Native timing still measures actual presentation,
+but changes in the estimated compositor lead do not change the desired interval.
+`originalScanoutUs` and `predictedScanoutUs` retain their prediction semantics;
+neither is a stable cadence reference when the latency estimator changes.
+All three new policy switches default to zero in the serialization schema, preserving
+exact replay of older captures, and are explicitly enabled by the session resolver.
+Production keeps these smoothness observations as outcome metrics. They do not
+increase padding or block its release: a delay after readiness can move along
+with the target, so adding the current padding to that delay creates a ratchet.
+Legacy replay retains the previous demand calculation:
+stretch charges the current frame; catch-up charges the preceding delayed frame
 using that frame's original buffer/headroom. This prevents delayed feedback
 from repeatedly increasing today's buffer for the same event. Successful
 intervals enter as zero demand; missing or ambiguous observations do not become
@@ -558,16 +592,19 @@ Reserve p99.95 implementation.
 Production update conceptually does:
 
 ```text
-protection = max(readinessHistoryProtection,
-                 submissionSmoothnessProtection,
-                 nativeSmoothnessProtection)
-protection = max(0, protection - recoveryHeadroom)
+protection = readinessHistoryProtection
 requested  = protection + predictionMargin
 desired    = clamp(requested, effectiveMinimum, effectiveMaximum)
 ```
 
+The production `playout_readiness_driven_adaptation=1` policy learns padding
+from modeled readiness shortfalls, independently of native/submission interval
+errors. It does not subtract recovery headroom: spare time after this frame's
+deadline cannot pay for readiness before it, and FIFO prediction already models
+backlog recovery. The old combined feedback law remains available for replay.
+
 It attacks by at most 500 us per update. Release requires the readiness history
-and both applicable smoothness reservoirs to allow it. Release scales the 10 us
+to allow it. Release scales the 10 us
 input by elapsed time at a 120 FPS reference, with elapsed recovery gaps capped
 at 33,333 us. It is not simply 10 us per frame at every FPS.
 
@@ -580,14 +617,14 @@ occupied        = renderLead + presentationSafety
                 + (smoothingEnabled ? maximumSmoothingLag : 0)
 queueDelayLimit = max(0, capacity - occupied)
 effectiveMin    = min(1000 us, queueDelayLimit)
-effectiveMax    = min(100000 us, queueDelayLimit)
+effectiveMax    = min(16000 us, queueDelayLimit)
 ```
 
 The cold start first takes `max(6000 us, 0.95 * sourcePeriod)`, caps that by
 `max(displayPeriod, renderLead)` for history mode, then clamps to effective
 minimum/maximum. Consequently neither “the buffer always starts at 6 ms” nor
-“the maximum is 8 ms” describes current production. The 100 ms input is also
-not a promise that 100 ms can actually be queued.
+"the maximum is 8 ms" describes current production. The 16 ms input is a
+ceiling on padding, independently of the three-frame storage limit.
 
 More protection can improve jitter tolerance while consuming latency and queue
 capacity. If the requested protection exceeds capacity, record the limitation
@@ -836,10 +873,14 @@ senderResidual[i]    = presentedInterval[i] - corresponding RTP interval
 
 Use the replay's in-process `replay_presented_jerk_*`,
 `original_presented_jerk_*`, and `stock_presented_jerk_*` fields, including tail
-values and the share above 2 ms, to lead cadence discussion. Also report
-sender-spacing residuals, but do not call a sequence smooth merely because it
-faithfully reproduces jittery host stamps. The replay metric threshold and the
-controller's 3 ms smoothness-feedback tolerance are different contracts.
+values and the share above 2 ms, when discussing overall visible cadence.
+For the controller-only 99.95% goal, game-driven interval changes are not
+failures: use `simulation.sender_cadence.spacing_accuracy_percent`, which
+counts both signs of spacing error over 2 ms against relative RTP intervals.
+`spacing_errors_over_2ms` and `pairs` expose the exact numerator and denominator.
+Report raw jerk separately without penalizing the controller for the game's
+cadence. This replay metric and the controller's 3 ms smoothness-feedback
+tolerance are different contracts; neither establishes optical display timing.
 
 The replay excludes wide sender/arrival intervals over 25 ms from relevant
 hitch/jerk comparisons. Report excluded source gaps separately and consider

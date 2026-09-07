@@ -1,5 +1,5 @@
 @echo off
-rem Captures the versioned VRR15 smoothness-feedback predictor, headroom credit, and original scanout deadlines.
+rem Captures readiness-driven padding (profile 16), stable cadence, and learned preparation lead; older policies remain exactly replayable.
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%SystemRoot%"
 set "PORTABLE=\\allytwo\ChaseShare\MoonlightPortable-x64-6.1.0-vrr-lite"

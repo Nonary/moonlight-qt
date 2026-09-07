@@ -1341,6 +1341,20 @@ void VrrReplayConfigTest::spacingCorrectionAudit()
 
 void VrrReplayConfigTest::spacingLifecycleTimingAudit()
 {
+    // Latched presentation can disable the software floor while retaining
+    // deficit telemetry and a zero-deadline correction wait.
+    auto latched = evaluateVrrSpacingLifecycleTiming(
+        true, true, 1000, 100, 1050, 0, 0,
+        1050, 1050, 1060, 40, 40, true,
+        0, 1061, 1062, 1063);
+    QVERIFY(latched.relationshipValid);
+    QCOMPARE(latched.expectedRecheckDeficitUs, uint64_t(40));
+    auto missingFloor = evaluateVrrSpacingLifecycleTiming(
+        true, true, 1000, 100, 1050, 0, 1120,
+        1050, 1050, 1060, 40, 40, true,
+        0, 1061, 1120, 1121);
+    QVERIFY(!missingFloor.relationshipValid);
+
     VrrSpacingLifecycleTimingAudit audit =
         evaluateVrrSpacingLifecycleTiming(
             true, false, 0, 100, 1000, 0, 0,

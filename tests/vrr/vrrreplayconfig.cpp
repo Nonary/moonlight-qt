@@ -355,6 +355,11 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
+    if (value.playoutReadinessDrivenAdaptation > 1 ||
+            value.playoutStableSmoothnessReference > 1 ||
+            value.renderStartPreserveLearnedLead > 1) {
+        return fail("readiness adaptation, stable smoothness reference, and learned preparation lead flags must be 0 or 1");
+    }
     if (value.baseGuardDivisor == 0 ||
             value.pacingLatencyExtraPeriodDenominator == 0 ||
             value.majorCadenceRatioDenominator == 0 ||
@@ -414,6 +419,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.playoutSmoothnessFeedbackEnabled && !value.playoutPredictionEnabled) {
         return fail("playout_smoothness_feedback_enabled requires playout_prediction_enabled");
+    }
+    if (value.playoutReadinessDrivenAdaptation && !value.playoutPredictionEnabled) {
+        return fail("playout_readiness_driven_adaptation requires playout_prediction_enabled");
     }
     if (value.playoutPredictionEnabled && (!value.playoutHistoryEnabled || !value.timestampPlayoutEnabled || !value.playoutDelayAdaptive)) {
         return fail("playout_prediction_enabled requires adaptive timestamp history playout");

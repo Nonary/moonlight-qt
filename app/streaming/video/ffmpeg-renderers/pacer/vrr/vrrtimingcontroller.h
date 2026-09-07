@@ -18,6 +18,9 @@
 // headroom thresholds; non-zero ratios remain available to replay captures
 // made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
+    X(uint64_t, playout_readiness_driven_adaptation, playoutReadinessDrivenAdaptation, 0) \
+    X(uint64_t, playout_stable_smoothness_reference, playoutStableSmoothnessReference, 0) \
+    X(uint64_t, render_start_preserve_learned_lead, renderStartPreserveLearnedLead, 0) \
     X(uint64_t, playout_smoothness_feedback_enabled, playoutSmoothnessFeedbackEnabled, 0) \
     X(uint64_t, playout_prediction_enabled, playoutPredictionEnabled, 0) \
     X(uint64_t, playout_per_frame_latch, playoutPerFrameLatch, 0) \
@@ -258,7 +261,7 @@ public:
     void noteSubmission(bool submitted, bool cancelled,
                         uint64_t submissionUs);
     void notePresentation(const Vrr13::PresentationObservation& observation);
-    static Vrr13::SmoothnessFeedback::Sample smoothnessSample(const VrrTimingDecision& decision);
+    Vrr13::SmoothnessFeedback::Sample smoothnessSample(const VrrTimingDecision& decision) const;
     uint64_t typicalRenderUs() const;
     uint64_t recoveryHeadroomUs() const;
 
