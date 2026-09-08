@@ -3197,6 +3197,273 @@ void testNativeHitchGatesPadding()
            "current trace initialization must accept its own versioned profile for exact replay");
 }
 
+void testExperimentalSmoothedNativeHitchReference()
+{
+    const auto session = config(100, 144);
+    const auto production = vrrTimingParametersForSession(session);
+    expect(production.playoutNativeHitchSmoothedReference == 0 &&
+               VrrTimingParameters{}.playoutNativeHitchSmoothedReference == 0,
+           "production and absent capture parameters must retain the raw native hitch reference");
+
+    VrrTimingDecision first;
+    first.frameNumber = 1;
+    first.sourceTimeUs = 1000000;
+    first.sourceIntervalUs = first.sourcePeriodUs = 10000;
+    first.cadenceSmoothingUs = 2000;
+    first.playoutDelayUs = 6000;
+    first.cadenceEligible = true;
+    auto second = first;
+    second.frameNumber = 2;
+    second.sourceTimeUs += 14000;
+    second.sourceIntervalUs = 14000;
+    second.cadenceSmoothingUs = -2000;
+
+    for (uint64_t enabled : {0ULL, 1ULL}) {
+        auto policy = production;
+        policy.playoutNativeHitchSmoothedReference = enabled;
+        VrrTimingController controller(session, true, policy);
+        Vrr13::SmoothnessFeedback feedback;
+        auto a = controller.smoothnessSample(first);
+        auto b = controller.smoothnessSample(second);
+        // Deliberately regularize a 14 ms source interval to 10 ms, with a
+        // constant 6 ms buffer. This is intentional source reshaping, not a
+        // late native presentation that more buffering should try to repair.
+        a.at = 1008000;
+        b.at = 1018000;
+        feedback.observe(a, a.at, true);
+        const auto demand = feedback.observe(b, b.at, true);
+        expect(feedback.samples() == 1 && feedback.misses() == (enabled ? 0 : 1) &&
+                   (demand != 0) == !enabled,
+               "only the experimental smoothed reference must avoid charging deliberate cadence reshaping as a native hitch");
+        expect(a.intended == (enabled ? 1002000 : first.sourceTimeUs) &&
+                   b.intended == (enabled ? 1012000 : second.sourceTimeUs),
+               "the experimental native reference must preserve both signs of the smoothing adjustment");
+    }
+
+    auto experiment = production;
+    experiment.playoutNativeHitchSmoothedReference = 1;
+    VrrTimingController controller(session, true, experiment);
+    auto third = second;
+    third.frameNumber = 3;
+    third.sourceTimeUs += 10000;
+    third.sourceIntervalUs = 10000;
+    for (uint64_t extraDelay : {0ULL, 3000ULL, 3001ULL}) {
+        Vrr13::SmoothnessFeedback feedback;
+        auto a = controller.smoothnessSample(second);
+        auto b = controller.smoothnessSample(third);
+        a.at = a.intended + 6000;
+        b.at = b.intended + 6000 + extraDelay;
+        feedback.observe(a, a.at, true);
+        const auto demand = feedback.observe(b, b.at, true);
+        expect(feedback.samples() == 1 && feedback.misses() == (extraDelay > 3000) &&
+                   (demand != 0) == (extraDelay > 3000),
+               "intentional smoothing must not hide a real native interval error strictly greater than 3 ms");
+    }
+
+    auto boundary = first;
+    boundary.sourceTimeUs = 1;
+    boundary.cadenceSmoothingUs = std::numeric_limits<int64_t>::min();
+    expect(controller.smoothnessSample(boundary).intended == 0,
+           "negative smoothing must saturate at zero instead of wrapping the native deadline");
+    boundary.sourceTimeUs = std::numeric_limits<uint64_t>::max() - 1;
+    boundary.cadenceSmoothingUs = 2;
+    expect(controller.smoothnessSample(boundary).intended == std::numeric_limits<uint64_t>::max(),
+           "positive smoothing must saturate at the maximum native timestamp");
+
+    experiment.playoutNativeHitchAdaptation = 0;
+    VrrTimingController nonNative(session, true, experiment);
+    first.originalTargetUs = 1234000;
+    expect(nonNative.smoothnessSample(first).intended == first.originalTargetUs,
+           "the experimental native reference must not change historical non-native feedback policy");
+}
+
+void testVrr12ProtectionPreset()
+{
+    const auto session = config(138, 144);
+    auto conflicting = vrrTimingParametersForSession(session);
+    expect(conflicting.dxgiVrr12Protection == 0,
+           "vrr12 protection must remain an explicit opt-in");
+    conflicting.playoutPerFrameLatch = 1;
+    conflicting.latchedFloorDisabled = 1;
+    conflicting.playoutSmoothingGainPerMille = 350;
+    conflicting.playoutMetronomeEnabled = 1;
+    conflicting.latchedPresentationHeadroomUs = 1;
+    conflicting.latchedPresentationExitHeadroomUs = 2;
+    conflicting.latchedPresentationBaseGuardExit = 1;
+    conflicting.latchedPresentationHeadroomPeriodNumerator = 3;
+    conflicting.latchedPresentationHeadroomPeriodDenominator = 2;
+    conflicting.latchedPresentationExitHeadroomPeriodNumerator = 4;
+    conflicting.latchedPresentationExitHeadroomPeriodDenominator = 2;
+    conflicting.cadenceStabilityLatchFrames = 0;
+    conflicting.playoutPredictionEnabled = 0;
+    conflicting.playoutPreserveDxgiFeedback = 0;
+    conflicting.playoutDelayMaximumUs = 12000;
+    conflicting.playoutDelayAttackUs = 777;
+
+    const auto disabled = vrrResolvePresentationParameters(conflicting, true);
+    VrrTimingController unchanged(session, true, conflicting);
+#define VRR_EXPECT_UNCHANGED_PARAMETER(type, jsonName, memberName, defaultValue) \
+    expect(disabled.memberName == conflicting.memberName && \
+               unchanged.parameters().memberName == conflicting.memberName, \
+           "flag zero must preserve " #jsonName " exactly");
+    VRR_TIMING_PARAMETER_FIELDS(VRR_EXPECT_UNCHANGED_PARAMETER)
+#undef VRR_EXPECT_UNCHANGED_PARAMETER
+
+    conflicting.dxgiVrr12Protection = 1;
+    VrrTimingController compatible(session, true, conflicting);
+    const auto& effective = compatible.parameters();
+    expect(effective.playoutPerFrameLatch == 0 && effective.latchedFloorDisabled == 0 &&
+               effective.playoutSmoothingGainPerMille == 0 && effective.playoutMetronomeEnabled == 0,
+           "interval-zero protection must atomically restore mode hysteresis and universal spacing without smoothing");
+    expect(effective.latchedPresentationHeadroomUs == 225 &&
+               effective.latchedPresentationExitHeadroomUs == 400 &&
+               effective.cadenceStabilityLatchFrames == 64 &&
+               effective.latchedPresentationBaseGuardExit == 0 &&
+               effective.latchedPresentationHeadroomPeriodNumerator == 0 &&
+               effective.latchedPresentationExitHeadroomPeriodNumerator == 0,
+           "vrr12 protection must require the full absolute hysteresis and instability hold");
+    expect(effective.playoutPredictionEnabled == 1 && effective.playoutPreserveDxgiFeedback == 1 &&
+               effective.playoutNativeHitchAdaptation == conflicting.playoutNativeHitchAdaptation &&
+               effective.playoutDelayMaximumUs == 12000 && effective.playoutDelayAttackUs == 777,
+           "presentation compatibility must retain current feedback and the caller's buffer policy");
+    const auto resolved = vrrResolvePresentationParameters(conflicting, true);
+#define VRR_EXPECT_RESOLVED_PARAMETER(type, jsonName, memberName, defaultValue) \
+    expect(effective.memberName == resolved.memberName, \
+           "constructor and shared resolver must agree on " #jsonName);
+    VRR_TIMING_PARAMETER_FIELDS(VRR_EXPECT_RESOLVED_PARAMETER)
+#undef VRR_EXPECT_RESOLVED_PARAMETER
+
+    const auto immutable = vrrResolvePresentationParameters(conflicting, false);
+    VrrTimingController immutableController(session, false, conflicting);
+#define VRR_EXPECT_IMMUTABLE_PARAMETER(type, jsonName, memberName, defaultValue) \
+    expect(immutable.memberName == conflicting.memberName && \
+               immutableController.parameters().memberName == conflicting.memberName, \
+           "immutable/non-DXGI presentation must not apply the preset to " #jsonName);
+    VRR_TIMING_PARAMETER_FIELDS(VRR_EXPECT_IMMUTABLE_PARAMETER)
+#undef VRR_EXPECT_IMMUTABLE_PARAMETER
+
+    auto nonLatchPolicy = vrrTimingParametersForSession(session);
+    VrrTimingController nonLatchReference(session, false, nonLatchPolicy);
+    nonLatchPolicy.dxgiVrr12Protection = 1;
+    VrrTimingController nonLatchExperiment(session, false, nonLatchPolicy);
+    for (int i = 0; i < 160; ++i) {
+        const uint32_t timestamp = static_cast<uint32_t>(i * 90000ULL / 138);
+        const uint64_t decoded = decodedTimeForRtp(1000000, timestamp);
+        const auto a = nonLatchReference.schedule(frame(i, timestamp, true, decoded), decoded);
+        const auto b = nonLatchExperiment.schedule(frame(i, timestamp, true, decoded), decoded);
+        expect(a.targetUs == b.targetUs && a.originalTargetUs == b.originalTargetUs &&
+                   a.renderStartUs == b.renderStartUs && !a.latchedPresentation && !b.latchedPresentation,
+               "Vulkan/non-latch scheduling must remain unchanged when the DXGI-only flag is supplied");
+        for (auto* controller : {&nonLatchReference, &nonLatchExperiment}) {
+            controller->notePreparationDuration(1000);
+            controller->noteSubmission(true, false, a.targetUs);
+        }
+    }
+}
+
+void testVrr12ProtectionCadenceAndSpacing()
+{
+    for (const auto rates : {std::pair<int, int>{120, 120}, {138, 138}, {144, 144}, {144, 138}}) {
+        const int rate = rates.second;
+        const auto session = config(rates.first, 144);
+        auto policy = vrrTimingParametersForSession(session);
+        policy.dxgiVrr12Protection = 1;
+        // Deliberately retain the conflicting production switches: the
+        // constructor must make this one flag a complete native contract.
+        expect(policy.playoutPerFrameLatch == 1 && policy.latchedFloorDisabled == 1,
+               "compatibility regression must begin from the current production switches");
+        VrrTimingController controller(session, true, policy);
+        uint64_t priorSubmission = 0;
+        const auto submit = [&](int number, uint32_t timestamp) {
+            const uint64_t decoded = decodedTimeForRtp(1000000, timestamp);
+            const uint64_t now = std::max(decoded, priorSubmission + 1);
+            const auto decision = controller.schedule(frame(number, timestamp, true, decoded), now);
+            if (priorSubmission != 0) {
+                const uint64_t floor = priorSubmission + controller.displayPeriodUs() + controller.guardUs();
+                expect(controller.earliestSubmissionUs() == floor && decision.targetUs >= floor,
+                       "protected and adaptive vrr12 submissions must both retain a full display period plus guard");
+            }
+            expect(decision.cadenceSmoothingUs == 0 && decision.missedTicks == 0,
+                   "vrr12 presentation compatibility must not enable cadence smoothing or metronome ticks");
+            controller.notePreparationDuration(1000);
+            // A late native submission must become the next floor's anchor.
+            priorSubmission = decision.targetUs + (number == 90 ? 3000 : 0);
+            controller.noteSubmission(true, false, priorSubmission);
+            expect(controller.earliestSubmissionUs() ==
+                       priorSubmission + controller.displayPeriodUs() + controller.guardUs(),
+                   "the full spacing floor must follow actual late submission time even while protected");
+            return decision;
+        };
+
+        for (int i = 0; i <= 160; ++i) {
+            const auto decision = submit(i, static_cast<uint32_t>(i * 90000ULL / rate));
+            if (i <= 64) {
+                expect(decision.latchedPresentation,
+                       "120/144, 138/144, and 144/144 must all protect startup through the clean cadence hold");
+            }
+            if (i >= 128) {
+                expect(decision.latchedPresentation == (rate != 120),
+                       "120/144 must regain adaptive mode while 138/144 and 144/144 retain near-ceiling protection");
+            }
+        }
+        const uint32_t hitchTimestamp = static_cast<uint32_t>(160 * 90000ULL / rate + 9000);
+        const auto hitch = submit(161, hitchTimestamp);
+        expect(hitch.phaseDiscontinuity && hitch.latchedPresentation,
+               "a source discontinuity must immediately restore protected presentation at every tested rate");
+        for (int i = 1; i <= 64; ++i) {
+            const auto decision = submit(161 + i,
+                hitchTimestamp + static_cast<uint32_t>(i * 90000ULL / rate));
+            expect(decision.latchedPresentation,
+                   "an unstable source must remain protected for the full subsequent clean cadence window");
+        }
+        VrrTimingDecision recovered;
+        for (int i = 65; i <= 192; ++i) {
+            recovered = submit(161 + i,
+                hitchTimestamp + static_cast<uint32_t>(i * 90000ULL / rate));
+        }
+        expect(recovered.latchedPresentation == (rate != 120),
+               "protection must reopen adaptive mode after clean 120/144 recovery and retain near-ceiling protection for 138/144 or 144/144");
+    }
+}
+
+void testVrr12ProtectionRateRecovery()
+{
+    const auto session = config(144, 144);
+    auto policy = vrrTimingParametersForSession(session);
+    policy.dxgiVrr12Protection = 1;
+    VrrTimingController controller(session, true, policy);
+    uint32_t timestamp = 0;
+    uint64_t priorSubmission = 0;
+    int number = 0;
+    const auto runRate = [&](int rate) {
+        const uint32_t start = timestamp;
+        VrrTimingDecision decision;
+        for (int i = 1; i <= 320; ++i) {
+            timestamp = start + static_cast<uint32_t>(i * 90000ULL / rate);
+            const uint64_t decoded = decodedTimeForRtp(1000000, timestamp);
+            decision = controller.schedule(frame(number++, timestamp, true, decoded),
+                std::max(decoded, priorSubmission + 1));
+            controller.notePreparationDuration(1000);
+            priorSubmission = decision.targetUs;
+            controller.noteSubmission(true, false, priorSubmission);
+        }
+        return decision;
+    };
+    expect(runRate(144).latchedPresentation,
+           "a 144 FPS source must begin and remain protected at 144 Hz");
+    expect(runRate(138).latchedPresentation,
+           "a 144 FPS negotiated stream capped to 138 must retain near-ceiling protection");
+    const auto insideHysteresis = runRate(136);
+    expect(insideHysteresis.headroomUs > 225 && insideHysteresis.headroomUs < 400 &&
+               insideHysteresis.latchedPresentation,
+           "returning above the entry margin must not bypass the full 400 us protected-mode exit threshold");
+    const auto unlocked = runRate(120);
+    expect(unlocked.headroomUs >= 400 && !unlocked.latchedPresentation,
+           "a negotiated 144 FPS stream that settles at 120 FPS must recover unlocked adaptive presentation");
+    expect(runRate(138).latchedPresentation,
+           "returning to 138 FPS must restore protection instead of retaining stale adaptive eligibility");
+}
+
 void testProductionPreservesRelativeGameSpacing()
 {
     const auto session = config(120, 120);
@@ -3238,6 +3505,10 @@ int main()
     testDelayedWaylandAndDxgiFeedbackAgree();
     testDxgiFeedbackPolicyAndSelectedModeLead();
     testDelayedDxgiSmoothnessUsesPresentedModeEpoch();
+    testExperimentalSmoothedNativeHitchReference();
+    testVrr12ProtectionPreset();
+    testVrr12ProtectionCadenceAndSpacing();
+    testVrr12ProtectionRateRecovery();
     testProductionPreservesRelativeGameSpacing();
     testReadinessDrivenPadding();
     testStableNativeSmoothnessReference();

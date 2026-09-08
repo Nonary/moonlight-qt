@@ -18,8 +18,10 @@
 // headroom thresholds; non-zero ratios remain available to replay captures
 // made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
+    X(uint64_t, dxgi_vrr12_protection, dxgiVrr12Protection, 0) \
     X(uint64_t, playout_preserve_dxgi_feedback, playoutPreserveDxgiFeedback, 0) \
     X(uint64_t, playout_native_hitch_adaptation, playoutNativeHitchAdaptation, 0) \
+    X(uint64_t, playout_native_hitch_smoothed_reference, playoutNativeHitchSmoothedReference, 0) \
     X(uint64_t, playout_readiness_driven_adaptation, playoutReadinessDrivenAdaptation, 0) \
     X(uint64_t, playout_stable_smoothness_reference, playoutStableSmoothnessReference, 0) \
     X(uint64_t, render_start_preserve_learned_lead, renderStartPreserveLearnedLead, 0) \
@@ -147,6 +149,31 @@ struct VrrTimingParameters {
     VRR_TIMING_PARAMETER_FIELDS(VRR_DECLARE_TIMING_PARAMETER)
 #undef VRR_DECLARE_TIMING_PARAMETER
 };
+
+// The interval-zero protected DXGI path needs its matching spacing and mode
+// policy. Resolve them together so neither a replay override nor a caller can
+// enable protected Present(0, 0) while leaving its software floor disabled.
+// Immutable presentation backends keep their existing policy unchanged.
+inline VrrTimingParameters vrrResolvePresentationParameters(
+    VrrTimingParameters parameters, bool canLatchPresentation)
+{
+    if (!parameters.dxgiVrr12Protection || !canLatchPresentation) return parameters;
+    parameters.playoutPerFrameLatch = 0;
+    parameters.latchedFloorDisabled = 0;
+    parameters.playoutSmoothingGainPerMille = 0;
+    parameters.playoutMetronomeEnabled = 0;
+    parameters.latchedPresentationHeadroomUs = 225;
+    parameters.latchedPresentationExitHeadroomUs = 400;
+    parameters.cadenceStabilityLatchFrames = 64;
+    parameters.latchedPresentationBaseGuardExit = 0;
+    parameters.latchedPresentationHeadroomPeriodNumerator = 0;
+    parameters.latchedPresentationHeadroomPeriodDenominator = 1;
+    parameters.latchedPresentationExitHeadroomPeriodNumerator = 0;
+    parameters.latchedPresentationExitHeadroomPeriodDenominator = 1;
+    parameters.playoutPredictionEnabled = 1;
+    parameters.playoutPreserveDxgiFeedback = 1;
+    return parameters;
+}
 
 // Resolve mode-dependent production policy once for both the live worker and
 // the replay baseline. Candidate replay configs may still override any field.

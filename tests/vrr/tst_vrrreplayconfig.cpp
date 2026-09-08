@@ -2,6 +2,7 @@
 #include "vrrreplaymodel.h"
 
 #include <QJsonDocument>
+#include <QProcess>
 #include <QtTest>
 
 #include <limits>
@@ -14,6 +15,9 @@ private slots:
     void defaultsRoundTrip();
     void nativeHitchPolicyRoundTrip();
     void dxgiFeedbackPolicyRoundTrip();
+    void dxgiVrr12ProtectionRoundTrip();
+    void smoothedHitchReferenceRoundTrip();
+    void divergentDeadlineRetainsSummary();
     void inheritanceAndOverride();
     void controllerSnapshotIsAtomic();
     void rejectsInvalidInput();
@@ -43,6 +47,7 @@ void VrrReplayConfigTest::defaultsRoundTrip()
     VrrTimingParameters productionParameters;
     QCOMPARE(productionParameters.playoutNativeHitchAdaptation, uint64_t(0));
     QCOMPARE(productionParameters.playoutPreserveDxgiFeedback, uint64_t(0));
+    QCOMPARE(productionParameters.dxgiVrr12Protection, uint64_t(0));
     productionParameters.playoutSmoothingSnapPerMille = 3000;
     QString validationError;
     QVERIFY2(validateVrrTimingParameters(
@@ -514,6 +519,257 @@ void VrrReplayConfigTest::dxgiFeedbackPolicyRoundTrip()
              uint64_t(0));
     QVERIFY(vrrReplayParameterNames().contains(
         "controller.playout_preserve_dxgi_feedback"));
+}
+
+void VrrReplayConfigTest::dxgiVrr12ProtectionRoundTrip()
+{
+    QString error;
+    VrrTimingParameters parameters;
+    parameters.playoutHistoryEnabled = 1;
+    parameters.timestampPlayoutEnabled = 1;
+    parameters.playoutDelayAdaptive = 1;
+    for (uint64_t enabled : {0ULL, 1ULL}) {
+        parameters.dxgiVrr12Protection = enabled;
+        const auto snapshot = vrrTimingParametersToJson(parameters);
+        QCOMPARE(snapshot.value("dxgi_vrr12_protection").toInteger(), qint64(enabled));
+        VrrTimingParameters restored;
+        QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error), qPrintable(error));
+        QCOMPARE(vrrTimingParametersToJson(restored), snapshot);
+    }
+    const auto unchanged = vrrTimingParametersToJson(parameters);
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        QJsonObject{{"dxgi_vrr12_protection", 2}}, parameters, error));
+    QCOMPARE(vrrTimingParametersToJson(parameters), unchanged);
+    auto legacySnapshot = unchanged;
+    legacySnapshot.remove("dxgi_vrr12_protection");
+    VrrTimingParameters legacy;
+    QVERIFY2(applyVrrReplayControllerSnapshot(legacySnapshot, legacy, error), qPrintable(error));
+    QCOMPARE(legacy.dxgiVrr12Protection, uint64_t(0));
+    auto root = vrrDefaultReplayConfigurationJson();
+    auto sections = root.value("parameters").toObject();
+    sections["controller"] = legacySnapshot;
+    root["parameters"] = sections;
+    VrrReplayConfiguration config;
+    QVERIFY2(loadVrrReplayConfiguration(QJsonDocument(root).toJson(), config, error), qPrintable(error));
+    QCOMPARE(config.scenarios.front().controller.dxgiVrr12Protection, uint64_t(0));
+    QVERIFY(vrrReplayParameterNames().contains("controller.dxgi_vrr12_protection"));
+    VrrTimingParameters missingPrerequisites;
+    const auto originalDefaults = vrrTimingParametersToJson(missingPrerequisites);
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        QJsonObject{{"dxgi_vrr12_protection", 1}}, missingPrerequisites, error));
+    QVERIFY(error.contains("adaptive timestamp history"));
+    QCOMPARE(vrrTimingParametersToJson(missingPrerequisites), originalDefaults);
+
+    // Backend resolution is atomic and occurs after parsing: conflicting
+    // experimental values cannot leave native interval zero without its floor.
+    parameters.playoutPerFrameLatch = 1;
+    parameters.latchedFloorDisabled = 1;
+    parameters.playoutSmoothingGainPerMille = 200;
+    parameters.playoutMetronomeEnabled = 1;
+    parameters.sourcePlayoutDelayUs = 4321;
+    parameters.playoutDelayMaximumUs = 16000;
+    const auto raw = vrrTimingParametersToJson(parameters);
+    const auto effective = vrrResolvePresentationParameters(parameters, true);
+    QVERIFY2(validateVrrTimingParameters(effective, error), qPrintable(error));
+    QCOMPARE(effective.playoutPerFrameLatch, uint64_t(0));
+    QCOMPARE(effective.latchedFloorDisabled, uint64_t(0));
+    QCOMPARE(effective.playoutSmoothingGainPerMille, uint64_t(0));
+    QCOMPARE(effective.playoutMetronomeEnabled, uint64_t(0));
+    QCOMPARE(effective.latchedPresentationHeadroomUs, uint64_t(225));
+    QCOMPARE(effective.latchedPresentationExitHeadroomUs, uint64_t(400));
+    QCOMPARE(effective.cadenceStabilityLatchFrames, uint64_t(64));
+    QCOMPARE(effective.latchedPresentationBaseGuardExit, uint64_t(0));
+    QCOMPARE(effective.latchedPresentationHeadroomPeriodNumerator, uint64_t(0));
+    QCOMPARE(effective.latchedPresentationExitHeadroomPeriodNumerator, uint64_t(0));
+    QCOMPARE(effective.playoutPredictionEnabled, uint64_t(1));
+    QCOMPARE(effective.playoutPreserveDxgiFeedback, uint64_t(1));
+    QCOMPARE(effective.sourcePlayoutDelayUs, uint64_t(4321));
+    QCOMPARE(effective.playoutDelayMaximumUs, uint64_t(16000));
+    QCOMPARE(vrrTimingParametersToJson(vrrResolvePresentationParameters(effective, true)),
+             vrrTimingParametersToJson(effective));
+    QCOMPARE(vrrTimingParametersToJson(vrrResolvePresentationParameters(parameters, false)), raw);
+    parameters.dxgiVrr12Protection = 0;
+    QCOMPARE(vrrTimingParametersToJson(vrrResolvePresentationParameters(parameters, true)),
+             vrrTimingParametersToJson(parameters));
+}
+
+void VrrReplayConfigTest::smoothedHitchReferenceRoundTrip()
+{
+    QString error;
+    for (uint64_t enabled : {0ULL, 1ULL}) {
+        VrrTimingParameters parameters;
+        parameters.playoutNativeHitchSmoothedReference = enabled;
+        const auto snapshot = vrrTimingParametersToJson(parameters);
+        QCOMPARE(snapshot.value("playout_native_hitch_smoothed_reference").toInteger(),
+                 qint64(enabled));
+        VrrTimingParameters restored;
+        QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error),
+                 qPrintable(error));
+        QCOMPARE(restored.playoutNativeHitchSmoothedReference, enabled);
+    }
+
+    VrrTimingParameters parameters;
+    parameters.playoutNativeHitchSmoothedReference = 1;
+    const auto unchanged = vrrTimingParametersToJson(parameters);
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        QJsonObject{{"playout_native_hitch_smoothed_reference", 2}}, parameters, error));
+    QCOMPARE(vrrTimingParametersToJson(parameters), unchanged);
+
+    auto legacySnapshot = unchanged;
+    legacySnapshot.remove("playout_native_hitch_smoothed_reference");
+    VrrTimingParameters legacy;
+    QVERIFY2(applyVrrReplayControllerSnapshot(legacySnapshot, legacy, error),
+             qPrintable(error));
+    QCOMPARE(legacy.playoutNativeHitchSmoothedReference, uint64_t(0));
+    auto root = vrrDefaultReplayConfigurationJson();
+    auto sections = root.value("parameters").toObject();
+    sections["controller"] = legacySnapshot;
+    root["parameters"] = sections;
+    VrrReplayConfiguration config;
+    QVERIFY2(loadVrrReplayConfiguration(QJsonDocument(root).toJson(), config, error),
+             qPrintable(error));
+    QCOMPARE(config.scenarios.front().controller.playoutNativeHitchSmoothedReference,
+             uint64_t(0));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.playout_native_hitch_smoothed_reference"));
+}
+
+void VrrReplayConfigTest::divergentDeadlineRetainsSummary()
+{
+    QString replayPath = qEnvironmentVariable("MOONLIGHT_VRR_TEST_REPLAY");
+    if (replayPath.isEmpty()) {
+        replayPath = QCoreApplication::applicationDirPath() + "/vrrreplay";
+#ifdef Q_OS_WIN
+        replayPath += ".exe";
+#endif
+    }
+    if (!QFileInfo::exists(replayPath)) {
+        QSKIP("Build sibling vrrreplay or set MOONLIGHT_VRR_TEST_REPLAY for CLI regression coverage");
+    }
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+
+    // A legacy trace with one scheduled frame, an omitted first arrival,
+    // and a deliberately divergent original deadline. This exercises the
+    // real CLI/report path without a platform renderer or a user capture.
+    const QByteArray header =
+        "trace_schema,arrival_sequence,frame,rtp_timestamp,rtp_valid,"
+        "decode_complete_us,pacer_arrival_us,arrival_queue_depth_before,"
+        "queue_accepted,dequeue_us,decision_valid,decision_us,display_refresh_hz,"
+        "stream_rate_hz,can_latch_present,display_period_us,sender_interval_us,"
+        "source_rate_hz,source_time_us,source_period_us,ready_offset_us,"
+        "readiness_budget_us,timing_budget_us,render_lead_us,render_wake_lead_us,"
+        "target_wake_lead_us,guard_us,headroom_us,render_start_us,prepare_start_us,"
+        "prepare_end_us,prepare_us,render_wait_overshoot_us,target_scheduler_delay_us,"
+        "target_scheduler_delay_valid,target_us,submission_boundary_us,present_call_us,"
+        "submit_error_us,submission_spacing_us,had_prior_submission,presented,cancelled,"
+        "disposition,dropped,tear_classification,tear_risk,latch_valid,latch_submission_id,"
+        "latch_present_refresh_seq,latched_present,used_rtp_timestamp,cadence_eligible,"
+        "source_rate_changed,phase_discontinuity,rebased,native_present_call_us,"
+        "gpu_ready_wait_us,original_target_us,controller_call_us,correction_wait_end_us,"
+        "correction_wait_start_us,playout_delay_us,render_scheduler_delay_us,"
+        "render_scheduler_delay_valid,render_wait_entry_us,render_wait_final_us,"
+        "spacing_margin_us,stale_age_us,target_wait_entry_us,target_wait_final_us,"
+        "target_wait_overshoot_us";
+    const QMap<QByteArray, QByteArray> values {
+        {"trace_schema", "3"}, {"arrival_sequence", "2"}, {"frame", "1"},
+        {"rtp_timestamp", "9000"}, {"rtp_valid", "1"},
+        {"decode_complete_us", "100000"}, {"pacer_arrival_us", "100000"},
+        {"queue_accepted", "1"}, {"dequeue_us", "100000"},
+        {"decision_valid", "1"}, {"decision_us", "100000"},
+        {"display_refresh_hz", "120"}, {"stream_rate_hz", "116"},
+        {"can_latch_present", "1"}, {"display_period_us", "8333"},
+        {"sender_interval_us", "8620"}, {"source_rate_hz", "116.009"},
+        {"source_time_us", "100000"}, {"source_period_us", "8620"},
+        {"render_lead_us", "1000"}, {"render_start_us", "107000"},
+        {"prepare_start_us", "107000"}, {"prepare_end_us", "108000"},
+        {"prepare_us", "1000"}, {"target_us", "108000"},
+        {"submission_boundary_us", "108000"}, {"present_call_us", "10"},
+        {"presented", "1"}, {"disposition", "presented"},
+        {"tear_classification", "first_submission_unknown"},
+        {"rebased", "1"}, {"original_target_us", "1"},
+    };
+    QList<QByteArray> fields;
+    for (const QByteArray& column : header.split(',')) {
+        fields.append(values.value(column, "0"));
+    }
+    const QString tracePath = directory.filePath("divergent.csv");
+    QFile trace(tracePath);
+    QVERIFY(trace.open(QIODevice::WriteOnly));
+    const QByteArray contents = header + '\n' + fields.join(',') + '\n';
+    QCOMPARE(trace.write(contents), qint64(contents.size()));
+    trace.close();
+
+    for (int testCase : {0, 1, 2}) {
+        const bool requireExact = testCase == 1;
+        const bool changeNativeContract = testCase == 2;
+        const QString outputPath = directory.filePath(
+            requireExact ? "strict.json" : changeNativeContract ?
+                "native-contract-change.json" : "exploratory.json");
+        QStringList arguments {tracePath, "--output", outputPath};
+        if (requireExact) arguments.append("--require-exact-baseline");
+        if (changeNativeContract) {
+            // A protocol fixture for a contract-changing candidate, not a
+            // synthetic claim about driver service or a panel's tear behavior.
+            arguments << "--set" << "controller.playout_history_enabled=1"
+                      << "--set" << "controller.timestamp_playout_enabled=1"
+                      << "--set" << "controller.playout_delay_adaptive=1"
+                      << "--set" << "controller.dxgi_vrr12_protection=1";
+        }
+        QProcess replay;
+        replay.start(replayPath, arguments);
+        QVERIFY2(replay.waitForStarted(), qPrintable(replay.errorString()));
+        QVERIFY2(replay.waitForFinished(30000), qPrintable(replay.errorString()));
+        const QByteArray errors = replay.readAllStandardError();
+        QCOMPARE(replay.exitStatus(), QProcess::NormalExit);
+        QVERIFY2(replay.exitCode() == (requireExact ? 3 : 0), errors.constData());
+        QVERIFY(errors.contains("Original deadline diverged on frame 1"));
+        QFile output(outputPath);
+        QVERIFY(output.open(QIODevice::ReadOnly));
+        QJsonParseError parseError;
+        const auto summary = QJsonDocument::fromJson(output.readAll(), &parseError).object();
+        QCOMPARE(parseError.error, QJsonParseError::NoError);
+        const auto fidelity = summary.value("fidelity").toObject();
+        QVERIFY(!fidelity.value("baseline_exact").toBool(true));
+        QCOMPARE(fidelity.value("invalid_controller_lifecycle_rows").toInteger(), qint64(1));
+        const auto drift = fidelity.value("reference_original_target_drift_us").toObject();
+        QCOMPARE(drift.value("count").toInteger(), qint64(1));
+        QVERIFY(drift.value("max").toInteger() > 0);
+        QVERIFY(!summary.value("capture").toObject()
+                     .value("recorded_sequence_integrity_valid").toBool(true));
+        const auto simulation = summary.value("simulation").toObject();
+        QCOMPARE(simulation.value("native_presentation_contract_changed").toBool(),
+                 changeNativeContract);
+        QCOMPARE(simulation.value("recorded_native_service_compatible").toBool(),
+                 !changeNativeContract);
+        if (changeNativeContract) {
+            QVERIFY(simulation.value("native_presentation_scope").toString().contains("nonpredictive"));
+            QVERIFY(!summary.value("raster_simulation_ready").toBool(true));
+            const auto controller = simulation.value("resolved_parameters").toObject()
+                                        .value("controller").toObject();
+            QCOMPARE(controller.value("dxgi_vrr12_protection").toInteger(), qint64(1));
+            QCOMPARE(controller.value("latched_floor_disabled").toInteger(-1), qint64(0));
+            QCOMPARE(controller.value("playout_per_frame_latch").toInteger(-1), qint64(0));
+            QCOMPARE(controller.value("playout_smoothing_gain_per_mille").toInteger(-1), qint64(0));
+            const QString comparedOutput = directory.filePath("native-contract-compare.json");
+            const int outputIndex = arguments.indexOf("--output");
+            QVERIFY(outputIndex >= 0);
+            arguments[outputIndex + 1] = comparedOutput;
+            arguments << "--compare" << directory.filePath("exploratory.json");
+            QProcess comparison;
+            comparison.start(replayPath, arguments);
+            QVERIFY2(comparison.waitForStarted(), qPrintable(comparison.errorString()));
+            QVERIFY2(comparison.waitForFinished(30000), qPrintable(comparison.errorString()));
+            QCOMPARE(comparison.exitStatus(), QProcess::NormalExit);
+            QCOMPARE(comparison.exitCode(), 5);
+            QFile compared(comparedOutput);
+            QVERIFY(compared.open(QIODevice::ReadOnly));
+            const auto comparisonSummary = QJsonDocument::fromJson(compared.readAll()).object()
+                                               .value("comparison").toObject();
+            QVERIFY(!comparisonSummary.value("comparable").toBool(true));
+            QVERIFY(!comparisonSummary.value("recorded_native_service_compatible").toBool(true));
+        }
+    }
 }
 
 void VrrReplayConfigTest::rasterEnvelope()
@@ -1785,6 +2041,8 @@ void VrrReplayConfigTest::dxgiCapabilityAudit()
     QVERIFY(!audit.relationshipsValid);
 }
 
-QTEST_APPLESS_MAIN(VrrReplayConfigTest)
+// The CLI regression locates and launches the sibling replay executable.
+// A QCoreApplication supplies its executable path without requiring a GUI.
+QTEST_GUILESS_MAIN(VrrReplayConfigTest)
 
 #include "tst_vrrreplayconfig.moc"

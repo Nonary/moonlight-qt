@@ -355,10 +355,20 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
-    if (value.playoutNativeHitchAdaptation > 1 || value.playoutReadinessDrivenAdaptation > 1 ||
+    if (value.dxgiVrr12Protection > 1) {
+        return fail("DXGI vrr12 protection flag must be 0 or 1");
+    }
+    if (value.dxgiVrr12Protection &&
+            (!value.playoutHistoryEnabled || !value.timestampPlayoutEnabled ||
+             !value.playoutDelayAdaptive)) {
+        return fail("dxgi_vrr12_protection requires adaptive timestamp history playout; start from the current session policy");
+    }
+    if (value.playoutNativeHitchAdaptation > 1 ||
+            value.playoutNativeHitchSmoothedReference > 1 ||
+            value.playoutReadinessDrivenAdaptation > 1 ||
             value.playoutStableSmoothnessReference > 1 ||
             value.renderStartPreserveLearnedLead > 1) {
-        return fail("native hitch adaptation, readiness adaptation, stable smoothness reference, and learned preparation lead flags must be 0 or 1");
+        return fail("native hitch adaptation, smoothed hitch reference, readiness adaptation, stable smoothness reference, and learned preparation lead flags must be 0 or 1");
     }
     if (value.baseGuardDivisor == 0 ||
             value.pacingLatencyExtraPeriodDenominator == 0 ||

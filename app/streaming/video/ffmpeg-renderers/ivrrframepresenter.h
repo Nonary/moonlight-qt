@@ -269,6 +269,10 @@ struct VrrPresentFeedback {
 struct VrrPresentRequest {
     bool latchedPresentation = false;
     bool collectDiagnostics = false;
+    // Opt-in DXGI compatibility contract: protected presents use interval 0
+    // without ALLOW_TEARING, together with the worker's universal spacing
+    // floor and stable mode selection. Other backends ignore this field.
+    bool dxgiVrr12Protection = false;
 };
 
 struct VrrPrepareResult {

@@ -48,6 +48,18 @@ int main()
     // Switch both ways: the latched interval must not be silently replaced by
     // zero, and tearing must never carry over into a synchronized submission.
     submit(DxgiPresentParameters::adaptive(true, allowTearing), 1, 0);
+
+    // Compatibility changes only protected presents; adaptive VRR retains
+    // the tearing flag. Switching either direction must not carry flags over.
+    submit(DxgiPresentParameters::adaptive(true, allowTearing, true), 0, 0);
+    submit(DxgiPresentParameters::adaptive(false, allowTearing, true), 0, allowTearing);
+    submit(DxgiPresentParameters::adaptive(true, allowTearing, true), 0, 0);
+    check(DxgiPresentParameters{0, 0}.protectedPresentation(allowTearing),
+          "interval-zero without tearing must remain a protected presentation");
+    check(!DxgiPresentParameters{0, allowTearing}.protectedPresentation(allowTearing),
+          "adaptive tearing must not be attributed to the protected mode");
+    check(DxgiPresentParameters{1, 0}.protectedPresentation(allowTearing),
+          "ordinary interval-one protection must retain its classification");
     submit(DxgiPresentParameters::adaptive(false, allowTearing), 0, allowTearing);
     submit(DxgiPresentParameters::adaptive(true, allowTearing), 1, 0);
 
@@ -58,6 +70,7 @@ int main()
     // Both errors and non-display success statuses belong to the caller.
     swapChain.result = -1;
     submit(DxgiPresentParameters::adaptive(true, allowTearing), 1, 0);
+    submit(DxgiPresentParameters::adaptive(true, allowTearing, true), 0, 0);
     swapChain.result = 1;
     submit(DxgiPresentParameters::adaptive(false, allowTearing), 0, allowTearing);
     return failures == 0 ? 0 : 1;

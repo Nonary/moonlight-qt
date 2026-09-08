@@ -1,5 +1,57 @@
 # VRR deterministic tests
 
+For a standalone macOS, Linux or Windows build of the existing C++ simulator
+and tests, see [BUILDING-cmake.md](BUILDING-cmake.md). The production controller
+is compiled directly; no Windows display is required for controller replay.
+
+For the opt-in experiment that restores vrr12's conditional tearing protection,
+see [TEARING-REVIEW.md](TEARING-REVIEW.md). It uses protected `Present(0,0)` when
+cadence headroom is tight or unstable and restores adaptive presentation when
+stable headroom recovers. Its native-contract changes cannot be validated by
+reusing the reporter's old driver service times in replay.
+
+To review captured workloads with independent baseline checks and an explicit
+bounded smoothing experiment:
+
+```sh
+python3 scripts/review-vrr-playback.py --replay build/vrr-cmake/vrrreplay --output build/playback-review-1 --stress-config tests/vrr/configs/hybrid-scheduling-stress.json /path/to/capture.vrrtrace
+```
+
+On Visual Studio builds, use `build/vrr-cmake/Release/vrrreplay.exe`. More than
+one capture may be passed, and each gets its own baseline and outputs. The
+output directory must be new. Exit 3 means at least one strict baseline failed;
+the runner still writes exploratory comparisons when replay can produce them.
+Exit 4 means scenario assertions failed, and exit 2 means an execution, input or
+artifact error. Inspect each recorded process exit and scenario status.
+
+The review configs snapshot the vrr15 production parameters explicitly; they
+do not silently inherit the controller struct's historical defaults. They
+compare feedback preservation, old minimum spacing/mode selection, and bounded
+smoothing. The default-zero experiment
+`controller.playout_native_hitch_smoothed_reference=1` compares native intervals
+with the intentionally smoothed source schedule. It prevents smoothing itself
+from demanding extra padding while retaining raw-source residuals as a separate
+metric. Production keeps this flag at zero and smoothing disabled.
+
+The stress candidate uses gain 350/1000 and a 2 ms maximum positive smoothing
+lag, sharing the existing queue-capacity budget. It is compared with the
+unchanged session policy under nominal, decision, preparation, submission and
+scheduler disturbances. Assertions require zero modeled interval violations,
+p99 decode-to-submission at most 30 ms, and padding at most 16 ms. These are
+model safety/latency checks, not a guarantee of smoothness.
+
+Replay retains captured preparation costs and shifts recorded native service
+with candidate submissions. It cannot predict how a different native Present
+contract changes those costs. A saturated scenario's apparently improved jerk
+is not usable evidence. Both raw presented jerk and source-spacing residuals
+must be considered; the former uses CPU submissions as a presentation proxy.
+Sparse native evidence does not certify adaptive presentation or mode handoffs.
+The report therefore never declares a physical display fix proven.
+
+Original-target divergence is retained in the JSON fidelity report rather than
+causing an early exit. The exact-baseline gate still fails for any divergence
+or missing row, even when ordinary exploratory replay finishes successfully.
+
 Linux Vulkan on Wayland now attaches presentation-time feedback to each native
 surface submission and feeds correlated compositor timestamps into the same
 native-hitch padding policy as DXGI. GPU/CPU submission completion is not used

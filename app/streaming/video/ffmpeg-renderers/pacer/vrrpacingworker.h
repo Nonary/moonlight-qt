@@ -185,6 +185,8 @@ private:
     void flushTraceChunk(bool enforceSizeCap = true);
     bool minimumTraceDurationCaptured() const;
     static const char* traceDispositionName(TraceDisposition disposition);
+    bool isProtectedPresentation(const VrrTimingDecision& decision,
+                                 const VrrPresentFeedback& feedback) const;
     const char* tearClassification(const TraceRow& row) const;
 
     IVrrFramePresenter* m_Presenter;

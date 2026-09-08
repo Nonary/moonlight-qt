@@ -16,7 +16,14 @@ at 16 ms. Production now gates buffer growth on matched native presentation
 errors strictly greater than 3 ms and permits release only with 3 ms of
 readiness headroom and recent smooth native evidence. The subsequent DXGI feedback
 correction, inspected 2026-09-08, preserves delayed presentation identities across
-mode changes and separates latency estimates by mode. The initial map came from nine Luna Medium specialists, followed by
+mode changes and separates latency estimates by mode. The subsequent portable
+replay review adds an opt-in smoothed native reference, disabled in production,
+and reports original-target divergence without discarding the fidelity summary.
+The subsequent anti-tearing experiment, based on `15d8500809144f4ee5c8fada2e917d76cb2d70bc`,
+adds an opt-in vrr12 presentation contract with conditional protection; ordinary
+launches retain the vrr15 policy. See [the protection review](tests/vrr/TEARING-REVIEW.md)
+for its rationale, evidence and validation limits.
+The initial map came from nine Luna Medium specialists, followed by
 targeted source checks and corrections. No live capture, optical measurement,
 build, or test run was part of this documentation investigation. Recheck the
 named functions after changes; comments, diagnostic labels, and old experiments
@@ -513,6 +520,16 @@ With `latchedFloorDisabled` and a latched decision it returns zero. This is a
 deliberate reliance on native presentation behavior; it must be checked against
 the actual renderer implementation, not inferred from the request flag.
 
+The opt-in `dxgi_vrr12_protection=1` preset resolves its presentation settings
+together through `vrrResolvePresentationParameters()`. It restores the software
+floor for both modes and selects protection using fitted cadence headroom:
+225 microseconds to enter, 400 microseconds to leave, and a 64-frame clean-cadence
+hold after instability. Adequate stable headroom returns to adaptive presentation;
+the preset does not wait on a native acknowledgment to unlock. Smoothing and
+metronome scheduling stay disabled. Current buffering, preparation readiness
+and GPU ownership remain in force. This is a risk heuristic inherited from
+vrr12, not a calibrated physical scanout boundary.
+
 Preparation starts ahead of the target using learned render/scheduler budgets.
 The 6 ms post-submission preparation constraint addresses swapchain acquisition
 that can block when preparation immediately follows a previous present. The
@@ -725,6 +742,16 @@ telemetry and `presentPreparedFrame()`, which forwards it to DXGI:
 - Adaptive: `Present(0, DXGI_PRESENT_ALLOW_TEARING)`.
 - Legacy: interval zero with the existing `legacyPresentFlags()` value.
 
+With `MOONLIGHT_VRR_V12_PROTECTION=1`, the DXGI worker records
+`dxgi_vrr12_protection=1` and protected calls instead use `Present(0, 0)`.
+Adaptive calls remain `Present(0, DXGI_PRESENT_ALLOW_TEARING)`. This opt-in is
+coupled to the controller's universal spacing floor and stable mode selection;
+it must not be enabled as an isolated native interval change. Native interval
+and flags jointly identify the actual mode in this experiment, because interval
+zero alone no longer identifies an adaptive call. The flag defaults to zero
+for historical replay and is ignored by immutable/non-DXGI backends. Experimental
+calibration uses a separate key and file from ordinary launches.
+
 The controller can omit its software spacing floor for a latched decision;
 passing interval one to DXGI is therefore part of the renderer contract.
 `tst_dxgipresent` exercises the actual shared call boundary using a fake
@@ -863,6 +890,14 @@ parameter recorded differently from the actual API argument. It does not prove
 that a candidate policy would cause the same real host, network, GPU, or panel
 events.
 
+An original-target mismatch is now included in
+`fidelity.reference_original_target_drift_us`, invalid lifecycle accounting,
+and the reference-decision exactness gate. Ordinary replay retains the full
+diagnostic report instead of aborting at that first mismatch. The strict
+`--require-exact-baseline` invocation still returns a nonzero exit code for
+divergent or incomplete captures after writing its evidence. A successful
+ordinary invocation alone does not make an incomplete capture exact.
+
 ### 13.3 Counterfactual model limits
 
 Fixed replay retains recorded frame admission and lifecycle while changing
@@ -876,6 +911,31 @@ queue admission, acquisition behavior, GPU cost, and later occupancy. Fixed
 replay cannot synthesize all those changes. Worker-mode auditing checks candidate
 capacity but does not provide a complete alternate renderer lifecycle or the
 same raster simulation readiness.
+
+In particular, preparation duration remains the captured duration plus explicit
+fault injection. Replay does not model how switching DXGI from `Present(1,0)`
+to `Present(0,0)` changes driver/compositor service, buffer replacement, or GPU
+waits. Restoring old minimum spacing and mode hysteresis in a config is a
+controller experiment under captured service, not an implementation of the old
+native presentation contract. Neither success nor saturation in that experiment
+proves how a native rollback would behave on the reporter's display.
+
+When `dxgi_vrr12_protection` changes relative to a DXGI capture, replay marks
+`native_presentation_contract_changed=true` and
+`recorded_native_service_compatible=false`. Candidate native feedback is suppressed,
+and the review runner refuses to qualify its latency or scanout prediction.
+Such an experiment can test controller arithmetic and native arguments, but
+cannot reuse `Present(1,0)` service timings as proof about `Present(0,0)`.
+
+The experimental `playout_native_hitch_smoothed_reference=1` scores native
+intervals against `sourceTimeUs + cadenceSmoothingUs` with saturating signed
+addition. This prevents intentional cadence smoothing from authorizing extra
+padding. It excludes changing padding and preparation estimates from the
+reference. The default and production value remain zero, retaining raw-source
+scoring and existing capture compatibility. Submission feedback and the
+persisted profile version are unchanged. Always report raw-source residuals
+separately when evaluating this experiment; regularizing a real game interval
+can improve jerk while reducing fidelity to the game's timing.
 
 `worker_saturated` identifies scenarios whose candidate occupancy shift exceeds
 the model's useful cadence range (the implementation uses a median shift over
@@ -984,6 +1044,18 @@ intentional queue protection, submission behavior, and native/display evidence.
 An average FPS counter alone can conceal all of these.
 
 ## 15. Tests, deployment boundaries, and maintenance
+
+The standalone [CMake build](tests/vrr/BUILDING-cmake.md) builds the existing
+controller, worker, replay and deterministic suites on supported desktop
+toolchains without building the Moonlight application. The Python 3
+[playback review runner](scripts/review-vrr-playback.py) uses that C++ replay;
+it does not implement another controller. It records input/binary/config hashes,
+runs an independent strict baseline, and keeps candidate and stress outputs in
+a new directory. It rejects saturated comparisons and unavailable evidence as
+proof. The versioned `hybrid-scheduling-review.json` and
+`hybrid-scheduling-stress.json` configs retain explicit policy snapshots and
+bound padding, latency and modeled interval violations. They are experimental
+comparisons, not a claim of a display-specific fix or a production policy change.
 
 The deterministic suites are
 [tst_vrrtimingcontroller.cpp](tests/vrr/tst_vrrtimingcontroller.cpp),

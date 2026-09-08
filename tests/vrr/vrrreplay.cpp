@@ -1,6 +1,7 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profilecodec.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h"
+#include "../../app/streaming/video/ffmpeg-renderers/dxgipresent.h"
 #include "vrrreplayconfig.h"
 #include "vrrreplaymodel.h"
 
@@ -1726,6 +1727,8 @@ struct Metrics {
     uint64_t submissionTimestampRegressions = 0;
     bool nativeOutcomeTelemetryAvailable = false;
     bool nativePresentContractTelemetryAvailable = false;
+    bool nativePresentationContractChanged = false;
+    uint64_t candidateNativeFeedbackSamplesSuppressed = 0;
     bool nativeDxgiCapabilityTelemetryAvailable = false;
     bool nativeVblankVirtualizationTelemetryAvailable = false;
     bool nativeDisplayTimingTelemetryAvailable = false;
@@ -2197,6 +2200,7 @@ struct Metrics {
     Distribution simulatedSubmissionSpacing;
     Distribution simulatedAbsoluteSubmitError;
     Distribution referenceTargetDrift;
+    Distribution referenceOriginalTargetDrift;
     Distribution referenceSourceIntervalDrift;
     Distribution referenceSourceTimeDrift;
     Distribution referenceSourcePeriodDrift;
@@ -3645,6 +3649,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         };
     const bool referenceDecisionStateExact =
         exactScheduledDistribution(metrics.referenceTargetDrift) &&
+        exactScheduledDistribution(metrics.referenceOriginalTargetDrift) &&
         exactScheduledDistribution(metrics.referenceSourceIntervalDrift) &&
         exactScheduledDistribution(metrics.referenceSourceTimeDrift) &&
         exactScheduledDistribution(metrics.referenceSourcePeriodDrift) &&
@@ -5500,8 +5505,19 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     smoothnessFeedback["submission_window_misses"] = double(feedback.submissionSmoothnessMisses);
     smoothnessFeedback["native_window_samples"] = double(feedback.nativeSmoothnessSamples);
     smoothnessFeedback["native_window_misses"] = double(feedback.nativeSmoothnessMisses);
-    smoothnessFeedback["native_evidence"] = "recorded service latency shifted with candidate submissions; missing intervals are not successes";
+    smoothnessFeedback["native_evidence"] = metrics.nativePresentationContractChanged ?
+        "unavailable: candidate native presentation contract differs from capture; recorded native feedback is not applied to the candidate" :
+        "recorded service latency shifted with candidate submissions; missing intervals are not successes";
+    smoothnessFeedback["recorded_native_samples_suppressed"] =
+        static_cast<qint64>(metrics.candidateNativeFeedbackSamplesSuppressed);
     simulation["smoothness_feedback"] = smoothnessFeedback;
+    simulation["native_presentation_contract_changed"] =
+        metrics.nativePresentationContractChanged;
+    simulation["recorded_native_service_compatible"] =
+        !metrics.nativePresentationContractChanged;
+    simulation["native_presentation_scope"] = metrics.nativePresentationContractChanged ?
+        "nonpredictive controller exercise: CPU execution still uses captured renderer costs, but the changed native Present contract can change queuing, replacement, backpressure and scanout; latency, jerk and raster results cannot establish the candidate's behavior" :
+        "native Present contract matches the captured policy; fixed recorded renderer service remains a model rather than an optical observation";
     simulation["display_hz"] = simulatedDisplayHz;
     simulation["stream_fps"] = simulatedStreamFps;
     simulation["additional_queued_frame"] = additionalQueuedFrame;
@@ -5876,6 +5892,8 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     QJsonObject fidelity;
     fidelity["reference_target_drift_us"] = distributionObject(
         metrics.referenceTargetDrift);
+    fidelity["reference_original_target_drift_us"] = distributionObject(
+        metrics.referenceOriginalTargetDrift);
     fidelity["reference_source_interval_drift_us"] = distributionObject(
         metrics.referenceSourceIntervalDrift);
     fidelity["reference_source_time_drift_us"] = distributionObject(
@@ -5998,7 +6016,8 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
             metrics.exactPresentRefreshCorrelations;
     fidelity["invalid_execution_residuals"] = static_cast<qint64>(
         metrics.invalidExecutionResiduals);
-    fidelity["baseline_exact"] = metrics.traceSchema == 5 &&
+    fidelity["baseline_exact"] = !metrics.nativePresentationContractChanged &&
+        metrics.traceSchema == 5 &&
         arrivalSequenceComplete &&
         semanticIntegrityReady &&
         metrics.displayRefreshMismatchRows == 0 &&
@@ -6324,6 +6343,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.exactPresentRefreshCorrelations >=
             kMinimumExactRasterValidationSamples;
     const bool rasterSimulationReady =
+        !metrics.nativePresentationContractChanged &&
         diagnosticCaptureReady &&
         scenario.mode == "fixed" &&
         rasterProbeOverheadRemovalEvidenceComplete &&
@@ -6379,6 +6399,8 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.counterfactualFreeRunningConversionFailures == 0;
 
     QJsonObject readinessGates;
+    readinessGates["native_presentation_contract_matches_capture"] =
+        !metrics.nativePresentationContractChanged;
     readinessGates["schema_5"] = metrics.traceSchema == 5;
     readinessGates["raster_simulation_mode_fixed"] =
         scenario.mode == "fixed";
@@ -9772,12 +9794,22 @@ int main(int argc, char* argv[])
             }
             const uint64_t expectedPresentFlags = rowLatchedPresent ?
                 0 : kDxgiPresentAllowTearing;
+            const bool capturedVrr12Protection = optionalUnsignedField(
+                fields, traceHeader.indexOf("param_dxgi_vrr12_protection")) == 1;
+            const auto expectedParameters = DxgiPresentParameters::adaptive(
+                rowLatchedPresent, static_cast<unsigned int>(kDxgiPresentAllowTearing),
+                capturedVrr12Protection);
+            const bool nativeIntervalValid = capturedVrr12Protection ?
+                nativePresentSyncInterval == expectedParameters.syncInterval :
+                // Historical traces reported interval one while their native
+                // helper used zero; retain the old accepted telemetry contract.
+                (nativePresentSyncInterval == 0 ||
+                 (rowLatchedPresent && nativePresentSyncInterval == 1));
             const bool nativePresentParametersValid =
                 nativePresentParametersDeclared ==
                     nativeDxgiPresentAttempt &&
                 (!nativePresentParametersDeclared ||
-                 ((nativePresentSyncInterval == 0 ||
-                   (rowLatchedPresent && nativePresentSyncInterval == 1)) &&
+                 (nativeIntervalValid &&
                   nativePresentFlags == expectedPresentFlags));
             metrics.nativePresentParameterMismatchRows +=
                 nativePresentParametersValid ? 0 : 1;
@@ -11536,6 +11568,13 @@ int main(int argc, char* argv[])
                 scenario.controller = vrrTimingParametersForSession(
                     simulatedConfig);
             }
+            // Resolve the indivisible native/software compatibility contract
+            // only after the captured backend's latch capability is known.
+            scenario.controller = vrrResolvePresentationParameters(
+                scenario.controller, simulatedCanLatch);
+            metrics.nativePresentationContractChanged =
+                (capturedCanLatch && capturedParameters.dxgiVrr12Protection != 0) !=
+                (simulatedCanLatch && scenario.controller.dxgiVrr12Protection != 0);
             referenceController = std::make_unique<VrrTimingController>(
                 capturedConfig, capturedCanLatch, capturedParameters);
             simulatedController = std::make_unique<VrrTimingController>(
@@ -11554,7 +11593,10 @@ int main(int argc, char* argv[])
                 }
                 // A different policy learns its own error distribution; do not
                 // reinterpret the old smoothed-slot histogram as FIFO readiness.
-                if (referenceController->playoutHistory().version() == simulatedController->playoutHistory().version() &&
+                // The compatibility renderer uses a separate persisted profile;
+                // a contract-changing candidate must start without the old bank.
+                if (!metrics.nativePresentationContractChanged &&
+                    referenceController->playoutHistory().version() == simulatedController->playoutHistory().version() &&
                     !simulatedController->loadPlayoutHistory(profile)) return 1;
                 capturedParameterValues.insert(profileColumn, fields[profileColumn]);
             }
@@ -12837,10 +12879,18 @@ int main(int argc, char* argv[])
         const uint64_t referenceTargetDrift = absoluteValue(
             signedDifference(referenceDecision.targetUs, recordedTargetUs));
         const int originalColumn = traceHeader.indexOf("original_target_us");
-        if (originalColumn >= 0 && referenceDecision.originalTargetUs !=
-                unsignedField(fields, originalColumn)) {
-            std::fprintf(stderr, "Original deadline diverged on frame %d\n", frameNumber);
-            return 3;
+        if (originalColumn >= 0) {
+            const uint64_t originalTargetDrift = absoluteValue(signedDifference(
+                referenceDecision.originalTargetUs,
+                unsignedField(fields, originalColumn)));
+            metrics.referenceOriginalTargetDrift.add(originalTargetDrift);
+            if (originalTargetDrift != 0) {
+                // Keep the full fidelity report available for incomplete or
+                // divergent captures. The final exact-baseline gate still
+                // rejects the run after its diagnostic summary is written.
+                std::fprintf(stderr, "Original deadline diverged on frame %d\n", frameNumber);
+                ++metrics.invalidControllerLifecycleRows;
+            }
         }
         metrics.referenceTargetDrift.add(referenceTargetDrift);
         if (capturedParameters.playoutPredictionEnabled) {
@@ -14302,7 +14352,13 @@ int main(int argc, char* argv[])
                 observation.dxgi && field("native_backend_valid") &&
                 field("native_present_parameters_valid");
             if (recordedDxgiModeValid) {
-                observation.latched = field("native_present_sync_interval") != 0;
+                const DxgiPresentParameters nativeParameters {
+                    static_cast<unsigned int>(field("native_present_sync_interval")),
+                    static_cast<unsigned int>(field("native_present_flags"))};
+                observation.latched = referenceController->parameters().dxgiVrr12Protection ?
+                    nativeParameters.protectedPresentation(
+                        static_cast<unsigned int>(kDxgiPresentAllowTearing)) :
+                    nativeParameters.syncInterval != 0;
             }
             const bool fixedVulkanMode = traceHeader.contains("presentation_uncertainty_us") &&
                 field("native_backend") == kNativeBackendVulkan;
@@ -14325,6 +14381,7 @@ int main(int argc, char* argv[])
             // if that outcome differed from the request. A changed candidate
             // request instead models the current native boundary's own mode.
             const bool preserveRecordedDxgiMode = recordedDxgiModeValid &&
+                !metrics.nativePresentationContractChanged &&
                 simulatedController->parameters().playoutPreserveDxgiFeedback &&
                 simulatedDecision.latchedPresentation == referenceDecision.latchedPresentation;
             if (!preserveRecordedDxgiMode) {
@@ -14334,7 +14391,15 @@ int main(int argc, char* argv[])
                 simulatedDecision.originalScanoutUs - std::min(simulatedDecision.originalScanoutUs, uint64_t(observation.timelineShift)) :
                 simulatedDecision.originalScanoutUs + uint64_t(-observation.timelineShift);
             observation.smoothness = simulatedController->smoothnessSample(simulatedDecision);
-            simulatedController->notePresentation(observation);
+            if (!metrics.nativePresentationContractChanged) {
+                simulatedController->notePresentation(observation);
+            }
+            else {
+                // A recorded SyncInterval-1 service result cannot be relabeled
+                // as the outcome of a new interval-zero native call (or vice versa).
+                metrics.candidateNativeFeedbackSamplesSuppressed +=
+                    observation.sampleValid ? 1 : 0;
+            }
         }
 
         if (timelineFile.isOpen() &&
@@ -14466,15 +14531,23 @@ int main(int argc, char* argv[])
             incompatibilities.append(
                 "replay mode is absent or different");
         }
+        const bool nativeServiceCompatible =
+            !currentSimulation.value("native_presentation_contract_changed").toBool() &&
+            !baselineSimulation.value("native_presentation_contract_changed").toBool();
+        if (!nativeServiceCompatible) {
+            incompatibilities.append(
+                "native presentation contract differs from capture; recorded renderer service is nonpredictive");
+        }
         comparisonCompatible = traceCompatible && modelCompatible &&
             displayModelCompatible && ratesCompatible &&
-            replayModeCompatible;
+            replayModeCompatible && nativeServiceCompatible;
         deltas["comparable"] = comparisonCompatible;
         deltas["trace_content_match"] = traceCompatible;
         deltas["model_version_match"] = modelCompatible;
         deltas["display_model_match"] = displayModelCompatible;
         deltas["display_and_stream_rates_match"] = ratesCompatible;
         deltas["replay_mode_match"] = replayModeCompatible;
+        deltas["recorded_native_service_compatible"] = nativeServiceCompatible;
         deltas["incompatibilities"] = incompatibilities;
         deltas["baseline_trace_sha256"] = baselineTraceHash;
         deltas["candidate_trace_sha256"] = currentTraceHash;

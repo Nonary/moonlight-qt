@@ -2426,10 +2426,13 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         }
     }
 
-    // The risk decision is per frame. Sync interval 1 holds a risky frame for
-    // the next scanout; safe frames retain the immediate VRR presentation path.
+    // The normal protected path uses interval 1. The opt-in vrr12 contract
+    // uses interval 0 without tearing, paired with stable mode selection and
+    // a universal software spacing floor in the worker. Both choices retain
+    // the same prepared, GPU-ready back buffer and exact native telemetry.
     const auto presentParameters = DxgiPresentParameters::adaptive(
-        request.latchedPresentation, DXGI_PRESENT_ALLOW_TEARING);
+        request.latchedPresentation, DXGI_PRESENT_ALLOW_TEARING,
+        request.dxgiVrr12Protection);
     feedback.nativeBackendValid = true;
     feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
     feedback.nativePresentParametersValid = true;

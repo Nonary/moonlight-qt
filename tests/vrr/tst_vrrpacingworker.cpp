@@ -1,6 +1,7 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profile.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profilecodec.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h"
+#include "../../app/streaming/video/ffmpeg-renderers/dxgipresent.h"
 #include "vrrtestfakes.h"
 
 #include <SDL.h>
@@ -110,6 +111,53 @@ PacedFrame frame(int number, TrackedFrameLifetime& lifetime)
                                  LiGetMicroseconds(),
                                  lifetime);
 }
+
+// Real worker integration around the existing presenter fixture. The optional
+// override lets telemetry disagree with the request so actual native mode
+// attribution, rather than merely copying the request, is tested.
+class DxgiContractPresenter final : public IVrrFramePresenter {
+public:
+    explicit DxgiContractPresenter(bool canLatch = true, bool forceTearing = false) :
+        m_CanLatch(canLatch), m_ForceTearing(forceTearing)
+    {
+        backend.setPresentDelayUs(1000);
+    }
+    bool canLatchAdaptivePresent() const override { return m_CanLatch; }
+    VrrFallbackReason checkSupport() const override { return backend.checkSupport(); }
+    VrrPrepareResult prepareFrame(AVFrame* frame, uint64_t boundary) override
+    {
+        return backend.prepareFrame(frame, boundary);
+    }
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        auto feedback = backend.presentAdaptive(request);
+        if (!m_CanLatch || !feedback.presented) return feedback;
+        const auto parameters = DxgiPresentParameters::adaptive(
+            request.latchedPresentation && !m_ForceTearing, 0x200,
+            request.dxgiVrr12Protection);
+        feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
+        feedback.nativePresentParametersValid = true;
+        feedback.nativePresentSyncInterval = parameters.syncInterval;
+        feedback.nativePresentFlags = parameters.flags;
+        feedback.submissionIdValid = true;
+        feedback.submissionId = ++m_Id;
+        feedback.latchSampleValid = true;
+        feedback.latchSubmissionId = m_Id;
+        feedback.latchTimeUs = feedback.submissionTimeUs + 500;
+        feedback.latchPresentRefreshSequence = m_Id;
+        feedback.latchRefreshSequence = m_Id;
+        feedback.latchQpcCorrelationValid = true;
+        feedback.latchRawSyncQpcFrequency = 1000000;
+        return feedback;
+    }
+    VrrPresentFeedback cancelFrame() override { return backend.cancelFrame(); }
+    void setSuspended(bool suspended) override { backend.setSuspended(suspended); }
+    FakeVrrFramePresenter backend;
+private:
+    bool m_CanLatch;
+    bool m_ForceTearing;
+    uint64_t m_Id = 0;
+};
 
 void testCapabilityRejection()
 {
@@ -1419,6 +1467,120 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
 }
 
+void testVrr12ProtectionPresetAndCalibration()
+{
+    struct Case { const char* environment; bool canLatch; bool enabled; };
+    for (const auto& test : {Case{"0", true, false}, Case{"1", true, true},
+                             Case{"10", true, false}, Case{"1", false, false}}) {
+        resetFakeClock();
+        QTemporaryDir directory;
+        expect(directory.isValid(), "compatibility test needs a temporary directory");
+        const QString tracePath = directory.filePath("compatibility.vrrtrace");
+        SDL_setenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(tracePath).constData(), 1);
+        SDL_setenv("MOONLIGHT_VRR_V12_PROTECTION", test.environment, 1);
+
+        auto config = enabledConfig();
+        config.calibrationPath = directory.filePath("profiles.json").toStdString();
+        config.calibrationKey = "worker-native-contract";
+        const QString normalPath = QString::fromStdString(config.calibrationPath);
+        const QString experimentalPath = normalPath + ".dxgi-vrr12-protection";
+        const QString normalKey = QString::fromStdString(config.calibrationKey);
+        const QString experimentalKey = normalKey + ":dxgi-vrr12-protection";
+        Vrr13::Reserve normal(17), experimental(17);
+        for (int i = 0; i < 256; ++i) {
+            normal.observe(4000000, 8000000, Vrr13::Reserve::Second + int64_t(i) * 16667000);
+            experimental.observe(7000000, 8000000, Vrr13::Reserve::Second + int64_t(i) * 16667000);
+        }
+        expect(Vrr13::saveProfile(normalPath, normalKey, normal) &&
+                   Vrr13::saveProfile(experimentalPath, experimentalKey, experimental),
+               "normal and compatibility calibration fixtures must save separately");
+        QFile normalFile(normalPath);
+        expect(normalFile.open(QIODevice::ReadOnly), "normal calibration must open");
+        const auto normalBefore = normalFile.readAll();
+        normalFile.close();
+
+        DxgiContractPresenter presenter(test.canLatch);
+        PacerTelemetry telemetry;
+        TrackedFrameLifetime lifetime;
+        {
+            VrrPacingWorker worker(&presenter, config, &telemetry);
+            expect(worker.start(), "compatibility worker must start");
+            worker.submit(frame(1, lifetime));
+            expect(presenter.backend.waitForPresentCount(1), "compatibility frame must submit");
+        }
+        const auto requests = presenter.backend.presentRequests();
+        expect(requests.size() == 1 && requests.front().dxgiVrr12Protection == test.enabled,
+               "only exact opt-in on a mutable DXGI presenter may enable compatibility");
+        const auto lines = readExpandedTrace(tracePath).split('\n');
+        const auto columns = lines.value(0).split(',');
+        const auto values = lines.value(1).split(',');
+        const auto field = [&](const char* name) { return values.value(columns.indexOf(name)); };
+        expect(field("param_dxgi_vrr12_protection") == (test.enabled ? "1" : "0") &&
+                   field("param_latched_floor_disabled") == (test.enabled ? "0" : "1") &&
+                   field("param_playout_per_frame_latch") == (test.enabled ? "0" : "1") &&
+                   field("param_playout_smoothing_gain_per_mille") == "0" &&
+                   field("param_playout_preserve_dxgi_feedback") == "1" &&
+                   field("param_playout_delay_maximum_us") == "16000",
+               "trace must record the complete atomic contract without changing buffer bounds");
+        std::vector<int64_t> profile;
+        Vrr13::Reserve restored(17);
+        expect(decodeVrrPlayoutProfile(field("playout_initial_profile"), profile) &&
+                   restored.loadProfile(profile) &&
+                   restored.common() == (test.enabled ? 7000000 : 4000000),
+               "compatibility must load its own file and key, leaving normal calibration isolated");
+        expect(normalFile.open(QIODevice::ReadOnly), "normal calibration must remain readable");
+        expect(normalFile.readAll() == normalBefore,
+               "a compatibility session must not modify the normal calibration file");
+    }
+    SDL_setenv("MOONLIGHT_VRR_V12_PROTECTION", "0", 1);
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+}
+
+void testVrr12ProtectionUsesNativeMode()
+{
+    for (bool forceTearing : {false, true}) {
+        resetFakeClock();
+        QTemporaryDir directory;
+        expect(directory.isValid(), "native-mode test needs a temporary directory");
+        const QString tracePath = directory.filePath("native-mode.vrrtrace");
+        SDL_setenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(tracePath).constData(), 1);
+        SDL_setenv("MOONLIGHT_VRR_V12_PROTECTION", "1", 1);
+        DxgiContractPresenter presenter(true, forceTearing);
+        PacerTelemetry telemetry;
+        TrackedFrameLifetime first, second;
+        {
+            VrrPacingWorker worker(&presenter, enabledConfig(), &telemetry);
+            expect(worker.start(), "native-mode worker must start");
+            worker.submit(frame(1, first));
+            expect(presenter.backend.waitForPresentCount(1), "first native-mode frame must submit");
+            worker.submit(frame(2, second));
+            expect(presenter.backend.waitForPresentCount(2), "second native-mode frame must submit");
+        }
+        const auto requests = presenter.backend.presentRequests();
+        expect(requests.size() == 2 && requests[0].latchedPresentation &&
+                   requests[1].latchedPresentation,
+               "stable startup mode must request protection for both frames");
+        const auto lines = readExpandedTrace(tracePath).split('\n');
+        const auto columns = lines.value(0).split(',');
+        const auto firstValues = lines.value(1).split(',');
+        const auto secondValues = lines.value(2).split(',');
+        const auto firstField = [&](const char* name) {
+            return firstValues.value(columns.indexOf(name));
+        };
+        expect(firstField("native_present_sync_interval") == "0" &&
+                   firstField("native_present_flags") == (forceTearing ? "512" : "0"),
+               "native telemetry must distinguish protected and tearing interval-zero calls");
+        expect(firstField("tear_classification") ==
+                   (forceTearing ? "first_submission_unknown" : "confirmed_safe_latched"),
+               "compatibility tear classification must follow actual native arguments");
+        expect(secondValues.value(columns.indexOf("compositor_lead_us")) ==
+                   (forceTearing ? "0" : "500"),
+               "protected interval-zero feedback must populate only the protected latency bank");
+    }
+    SDL_setenv("MOONLIGHT_VRR_V12_PROTECTION", "0", 1);
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+}
+
 void exportWarmHistoryReplayFixture()
 {
     const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_WARM_TRACE");
@@ -1466,6 +1628,7 @@ extern "C" uint64_t LiGetMicroseconds(void)
 int main()
 {
     SDL_SetMainReady();
+    SDL_setenv("MOONLIGHT_VRR_V12_PROTECTION", "0", 1);
     if (SDL_Init(SDL_INIT_TIMER) != 0) {
         std::fprintf(stderr, "FAIL: SDL_Init: %s\n", SDL_GetError());
         return 1;
@@ -1493,6 +1656,8 @@ int main()
     testSmoothnessTraceCapturesReadinessPolicy();
     testFailedCancellationNativeEvidenceIsTraced();
     testDeepTraceRequestsNativeObservationsWithoutChangingMode();
+    testVrr12ProtectionPresetAndCalibration();
+    testVrr12ProtectionUsesNativeMode();
 
     exportWarmHistoryReplayFixture();
     SDL_Quit();

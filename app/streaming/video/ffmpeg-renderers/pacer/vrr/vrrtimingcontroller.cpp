@@ -184,9 +184,9 @@ VrrTimingController::VrrTimingController(const VrrSessionConfig& config,
                                          bool canLatchPresentation,
                                          const VrrTimingParameters& parameters) :
     m_Config(config),
-    m_Parameters(parameters),
+    m_Parameters(vrrResolvePresentationParameters(parameters, canLatchPresentation)),
     m_CanLatchPresentation(canLatchPresentation),
-    m_PresentationPrediction(parameters.playoutPreserveDxgiFeedback != 0)
+    m_PresentationPrediction(m_Parameters.playoutPreserveDxgiFeedback != 0)
 {
     reset();
 }
@@ -1526,7 +1526,12 @@ Vrr13::SmoothnessFeedback::Sample VrrTimingController::smoothnessSample(const Vr
     if (m_Parameters.playoutNativeHitchAdaptation) {
         // Score client-added spacing against the game's source cadence. Changes
         // in our padding or render estimate must not redefine a smooth result.
-        sample.intended = d.sourceTimeUs;
+        // An explicit replay experiment may regularize source cadence. Score
+        // that intentional adjustment as part of its schedule, without letting
+        // changing padding or render estimates redefine the reference.
+        // Production and older captures retain the raw-source reference.
+        sample.intended = m_Parameters.playoutNativeHitchSmoothedReference ?
+            addSigned(d.sourceTimeUs, d.cadenceSmoothingUs) : d.sourceTimeUs;
     }
     sample.buffer = d.playoutDelayUs;
     sample.headroom = m_Parameters.playoutNativeHitchAdaptation ? 0 : d.recoveryHeadroomUs;

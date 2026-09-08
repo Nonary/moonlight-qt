@@ -1,6 +1,7 @@
 #include "vrr/profile.h"
 #include "vrr/profilecodec.h"
 #include "vrrpacingworker.h"
+#include "../dxgipresent.h"
 
 #include "vrr/vrrtargetwaiter.h"
 #include "vrr/vrrtimingcontroller.h"
@@ -23,6 +24,8 @@ namespace {
 // oldest queued successor under sustained pressure, so it cannot accumulate
 // an unbounded latency backlog.
 constexpr size_t kMaximumQueuedFrames = VrrMaximumQueuedFrames;
+// DXGI_PRESENT_ALLOW_TEARING, kept SDK-independent for worker/replay tests.
+constexpr unsigned int kDxgiPresentAllowTearing = 0x200;
 // One source period of age is normal while the preceding frame traverses the
 // single pacing/presentation worker. Treating that ordinary occupancy as
 // stale caused isolated content skips whenever completion crossed the period
@@ -193,11 +196,30 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
     m_Telemetry(telemetry),
     m_Config(config),
     m_CanLatchPresentation(presenter != nullptr &&
-                           presenter->canLatchAdaptivePresent()),
-    m_TimingController(std::make_unique<VrrTimingController>(
-        config, m_CanLatchPresentation,
-        vrrTimingParametersForSession(config)))
+                           presenter->canLatchAdaptivePresent())
 {
+    auto parameters = vrrTimingParametersForSession(m_Config);
+    const char* protectionEnv = SDL_getenv("MOONLIGHT_VRR_V12_PROTECTION");
+    // D3D11 is the only production presenter supporting per-present latching.
+    // Do not apply its native-contract experiment to immutable Vulkan modes.
+    if (m_CanLatchPresentation && protectionEnv != nullptr &&
+            protectionEnv[0] == '1' && protectionEnv[1] == '\0') {
+        parameters.dxgiVrr12Protection = 1;
+        if (!m_Config.calibrationKey.empty()) {
+            m_Config.calibrationKey += ":dxgi-vrr12-protection";
+        }
+        if (!m_Config.calibrationPath.empty()) {
+            // A separate file also prevents the experiment from evicting
+            // normal profiles from the shared file's 16-entry limit.
+            m_Config.calibrationPath += ".dxgi-vrr12-protection";
+        }
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "VRR vrr12 presentation protection experiment enabled");
+    }
+    // The shared resolver in the constructor applies the compatibility
+    // parameters atomically, and the resolved snapshot is written to traces.
+    m_TimingController = std::make_unique<VrrTimingController>(
+        m_Config, m_CanLatchPresentation, parameters);
     const char* deepTraceEnv = SDL_getenv("MOONLIGHT_VRR_DEEP_TRACE");
     m_DeepTraceEnabled = deepTraceEnv != nullptr && deepTraceEnv[0] == '1';
 
@@ -808,6 +830,8 @@ int VrrPacingWorker::run()
         VrrPresentRequest presentRequest;
         presentRequest.latchedPresentation = decision.latchedPresentation;
         presentRequest.collectDiagnostics = m_DeepTraceEnabled;
+        presentRequest.dxgiVrr12Protection =
+            m_TimingController->parameters().dxgiVrr12Protection != 0;
 
         telemetry.presentStartUs = LiGetMicroseconds();
         VrrPresentFeedback feedback =
@@ -1066,7 +1090,9 @@ void VrrPacingWorker::recordSubmission(
             feedback.nativePresentParametersValid) {
         // Attribute delayed feedback to the native mode this frame used.
         // Legacy captures retain their decision-derived mode for exact replay.
-        observation.latched = feedback.nativePresentSyncInterval != 0;
+        observation.latched = m_TimingController->parameters().dxgiVrr12Protection ?
+            isProtectedPresentation(decision, feedback) :
+            feedback.nativePresentSyncInterval != 0;
     }
     observation.sampleValid = feedback.latchSampleValid &&
         (!observation.dxgi || (feedback.latchQpcCorrelationValid && feedback.latchRawSyncQpcFrequency));
@@ -1352,7 +1378,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addBool(telemetry.spacingCorrected);
     addBool(telemetry.hadPriorSubmission);
     addText(tearClassification(row));
-    addBool(feedback.presented && !decision.latchedPresentation &&
+    addBool(feedback.presented && !isProtectedPresentation(decision, feedback) &&
             telemetry.hadPriorSubmission && telemetry.spacingMarginUs < 0);
     addUnsigned(row.completionQueueDepth);
     addText(traceDispositionName(row.disposition));
@@ -1669,12 +1695,28 @@ const char* VrrPacingWorker::traceDispositionName(
     return "unknown";
 }
 
+bool VrrPacingWorker::isProtectedPresentation(
+    const VrrTimingDecision& decision, const VrrPresentFeedback& feedback) const
+{
+    if (m_TimingController->parameters().dxgiVrr12Protection &&
+            feedback.nativeBackendValid &&
+            feedback.nativeBackend == VrrNativePresentationBackend::Dxgi &&
+            feedback.nativePresentParametersValid) {
+        // Interval-zero/no-tearing is protected in the compatibility contract;
+        // it must not be mixed with the interval-zero/ALLOW_TEARING bank.
+        return DxgiPresentParameters{feedback.nativePresentSyncInterval,
+                                     feedback.nativePresentFlags}
+            .protectedPresentation(kDxgiPresentAllowTearing);
+    }
+    return decision.latchedPresentation;
+}
+
 const char* VrrPacingWorker::tearClassification(const TraceRow& row) const
 {
     if (!row.feedback.presented) {
         return "not_presented";
     }
-    if (row.decision.latchedPresentation && m_CanLatchPresentation) {
+    if (isProtectedPresentation(row.decision, row.feedback) && m_CanLatchPresentation) {
         return "confirmed_safe_latched";
     }
     if (!row.telemetry.hadPriorSubmission) {
