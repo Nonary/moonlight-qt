@@ -61,6 +61,13 @@ captures retain the old interpretation when the new flag is absent.
 This restores a known presentation contract; it does not establish a new
 physical tearing probability estimator or prove the reporter's display is fixed.
 Protection can still have latency or throughput costs near the refresh ceiling.
+Mode selection occurs before GPU preparation. A later GPU, renderer-lock or
+driver delay does not cause a final phase-based protection decision. Therefore
+this experiment selectively protects inferred cadence and refresh-ceiling risk;
+it does not identify every individual call at physical risk of tearing. Treating
+lateness greater than cadence headroom as such a detector would also be unsound:
+headroom is scheduling slack, and a late call may give the previous scanout more
+time while an on-time call can still follow delayed native presentation.
 
 ## Playback evidence and limits
 
