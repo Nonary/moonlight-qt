@@ -8,6 +8,14 @@ SUBDIRS += dxgipresent
 
 incomingtiming.file = $$PWD/incomingtiming.pro
 SUBDIRS += incomingtiming
+linux:packagesExist(vulkan) {
+    vulkantiming.file = $$PWD/vulkantiming.pro
+    SUBDIRS += vulkantiming
+}
+unix:!macx:packagesExist(wayland-server sdl2) {
+    waylandfeedback.file = $$PWD/waylandfeedback.pro
+    SUBDIRS += waylandfeedback
+}
 
 timingcontroller.file = $$PWD/timingcontroller.pro
 ratepolicy.file = $$PWD/ratepolicy.pro

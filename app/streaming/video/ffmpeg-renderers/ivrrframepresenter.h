@@ -189,6 +189,8 @@ struct VrrPresentFeedback {
     bool latchSampleValid = false;
     uint64_t latchSubmissionId = 0;
     uint64_t latchTimeUs = 0;
+    // Clock conversion uncertainty for non-DXGI presentation timestamps.
+    uint64_t presentationUncertaintyUs = 0;
     // DXGI PresentRefreshCount (when available) identifies the v-blank at
     // which this image reached the monitor. It is distinct from the periodic
     // SyncRefreshCount/QPC clock sample below.

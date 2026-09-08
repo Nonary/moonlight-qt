@@ -14297,6 +14297,9 @@ int main(int argc, char* argv[])
             observation.deadline = referenceDecision.originalScanoutUs;
             observation.latched = referenceDecision.latchedPresentation;
             observation.dxgi = field("native_backend") == kNativeBackendDxgi;
+            const bool fixedVulkanMode = traceHeader.contains("presentation_uncertainty_us") &&
+                field("native_backend") == kNativeBackendVulkan;
+            if (fixedVulkanMode) observation.latched = false;
             const uint64_t frequency = field("latch_raw_sync_qpc_frequency_hz");
             observation.sampleValid = field("latch_valid") &&
                 (!observation.dxgi || (field("latch_qpc_correlation_valid") && frequency));
@@ -14305,12 +14308,13 @@ int main(int argc, char* argv[])
             observation.observed = field("present_end_us");
             observation.presentRefresh = field("latch_present_refresh_seq");
             observation.syncRefresh = field("latch_sync_refresh_seq");
-            observation.uncertainty = frequency ? field("latch_qpc_correlation_span_ticks") * 1000000 / frequency : 0;
+            observation.uncertainty = frequency ? field("latch_qpc_correlation_span_ticks") * 1000000 / frequency :
+                field("presentation_uncertainty_us");
             referenceController->notePresentation(observation);
             // Recorded presentation latency is an external service sample, not
             // proof of the candidate's actual scanout. Move it with its submission.
             observation.timelineShift = signedDifference(simulatedSubmissionUs, recordedSubmissionUs);
-            observation.latched = simulatedDecision.latchedPresentation;
+            observation.latched = fixedVulkanMode ? false : simulatedDecision.latchedPresentation;
             observation.deadline = observation.timelineShift >= 0 ?
                 simulatedDecision.originalScanoutUs - std::min(simulatedDecision.originalScanoutUs, uint64_t(observation.timelineShift)) :
                 simulatedDecision.originalScanoutUs + uint64_t(-observation.timelineShift);

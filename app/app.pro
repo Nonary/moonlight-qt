@@ -371,6 +371,10 @@ libplacebo {
         streaming/video/ffmpeg-renderers/plvk_c.c
     HEADERS += \
         streaming/video/ffmpeg-renderers/plvk.h
+    linux {
+        SOURCES += streaming/video/ffmpeg-renderers/vulkantiming.cpp
+        HEADERS += streaming/video/ffmpeg-renderers/vulkantiming.h
+    }
 
     macx {
         SOURCES += streaming/video/ffmpeg-renderers/plvk_objc.mm
@@ -468,6 +472,9 @@ wayland {
 
     DEFINES += HAS_WAYLAND
     SOURCES += streaming/video/ffmpeg-renderers/pacer/waylandvsyncsource.cpp
+    SOURCES += streaming/video/ffmpeg-renderers/waylandfeedback/wayland.cpp \
+               streaming/video/ffmpeg-renderers/protocols/presentation-time-protocol.c
+    HEADERS += streaming/video/ffmpeg-renderers/waylandfeedback/wayland.h
     HEADERS += streaming/video/ffmpeg-renderers/pacer/waylandvsyncsource.h
 }
 !disable-h264bitstream {

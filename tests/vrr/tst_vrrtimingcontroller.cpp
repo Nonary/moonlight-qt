@@ -2985,6 +2985,54 @@ void testReadinessDrivenPadding()
     }
 }
 
+void testDelayedWaylandAndDxgiFeedbackAgree()
+{
+    const auto session = config(60, 120);
+    const auto policy = vrrTimingParametersForSession(session);
+    VrrTimingController linuxController(session, true, policy);
+    VrrTimingController windowsController(session, true, policy);
+    std::array<Vrr13::PresentationObservation, 3> delayed{};
+    uint64_t beforeHitch = 0, maximumAfterHitch = 0;
+    for (uint64_t i = 1; i < 700; ++i) {
+        const uint64_t source = decodedTimeForRtp(1000000, uint32_t(i * 1500));
+        const auto linuxDecision = linuxController.schedule(frame(i, uint32_t(i * 1500), true, source), source);
+        const auto windowsDecision = windowsController.schedule(frame(i, uint32_t(i * 1500), true, source), source);
+        expect(linuxDecision.playoutDelayUs == windowsDecision.playoutDelayUs &&
+               linuxDecision.nativeSmoothnessSamples == windowsDecision.nativeSmoothnessSamples,
+               "delayed Wayland timestamps and matched DXGI refresh timestamps must drive the same padding");
+        linuxController.notePreparationDuration(1000);
+        windowsController.notePreparationDuration(1000);
+        linuxController.noteSubmission(true, false, linuxDecision.targetUs);
+        windowsController.noteSubmission(true, false, windowsDecision.targetUs);
+        Vrr13::PresentationObservation current;
+        current.smoothness = linuxController.smoothnessSample(linuxDecision);
+        current.submitted = current.idValid = true;
+        current.id = i;
+        current.submission = linuxDecision.targetUs;
+        current.ready = source + 1000;
+        current.deadline = linuxDecision.originalScanoutUs;
+        current.observed = linuxDecision.targetUs + 100;
+        current.uncertainty = 10;
+        // Real feedback arrives three submissions later, with IDs belonging to
+        // that older image, not to the frame currently being submitted.
+        const auto older = delayed[i % delayed.size()];
+        if (older.id) {
+            current.sampleValid = true;
+            current.sampleId = older.id;
+            current.sampleTime = older.submission + 2000 + (older.id == 300 ? 6000 : 0);
+            current.presentRefresh = current.syncRefresh = older.id;
+        }
+        delayed[i % delayed.size()] = current;
+        linuxController.notePresentation(current);
+        current.dxgi = true;
+        windowsController.notePresentation(current);
+        if (i == 299) beforeHitch = linuxDecision.playoutDelayUs;
+        if (i > 303) maximumAfterHitch = std::max(maximumAfterHitch, linuxDecision.playoutDelayUs);
+    }
+    expect(maximumAfterHitch > beforeHitch,
+           "delayed compositor feedback must actually enable native-hitch buffer growth");
+}
+
 void testNativeHitchGatesPadding()
 {
     for (uint64_t error : {2999ULL, 3000ULL, 3001ULL}) {
@@ -3101,6 +3149,7 @@ void testProductionPreservesRelativeGameSpacing()
 int main()
 {
     testNativeHitchGatesPadding();
+    testDelayedWaylandAndDxgiFeedbackAgree();
     testProductionPreservesRelativeGameSpacing();
     testReadinessDrivenPadding();
     testStableNativeSmoothnessReference();
