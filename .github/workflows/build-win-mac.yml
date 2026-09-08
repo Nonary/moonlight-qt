@@ -104,7 +104,7 @@ jobs:
           if ($tests.Count -lt 8) { throw "Missing VRR test executables" }
           foreach ($test in $tests) {
             if ($test.Name -eq 'tst_overlay.exe') {
-              & $test.FullName $deploy
+              & $test.FullName (Resolve-Path app).Path
             } else {
               & $test.FullName
             }
