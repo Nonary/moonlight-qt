@@ -103,7 +103,11 @@ jobs:
           $tests = Get-ChildItem build/tests-vrr/vrr/release/tst_*.exe
           if ($tests.Count -lt 8) { throw "Missing VRR test executables" }
           foreach ($test in $tests) {
-            & $test.FullName
+            if ($test.Name -eq 'tst_overlay.exe') {
+              & $test.FullName $deploy
+            } else {
+              & $test.FullName
+            }
             if ($LASTEXITCODE -ne 0) { throw "$($test.Name) failed: $LASTEXITCODE" }
           }
           Copy-Item build/tests-vrr/vrr/release/vrrreplay.exe $deploy
