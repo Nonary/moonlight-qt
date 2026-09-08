@@ -15,6 +15,9 @@ typedef struct _VIDEO_STATS {
     uint32_t totalFrames;
     uint32_t networkDroppedFrames;
     uint32_t pacerDroppedFrames;
+    // Adjacent host interval comparisons, independent of client delivery time.
+    uint64_t incomingSmoothnessSamples;
+    uint64_t incomingUnevenSamples;
     // Pacer telemetry is merged into decoder-owned windows from coherent
     // cumulative snapshots. These remain zero on non-VRR pacing paths.
     bool vrrTelemetryActive;

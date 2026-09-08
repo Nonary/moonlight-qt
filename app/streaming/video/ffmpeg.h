@@ -6,6 +6,7 @@
 
 #include "../bandwidth.h"
 #include "decoder.h"
+#include "incomingframetiming.h"
 #include "ffmpeg-renderers/renderer.h"
 #include "ffmpeg-renderers/pacer/pacer.h"
 
@@ -128,6 +129,7 @@ private:
     int m_FramesOut;
 
     int m_LastFrameNumber;
+    IncomingFrameTiming m_IncomingFrameTiming;
     int m_StreamFps;
     int m_OriginalVideoWidth;
     int m_OriginalVideoHeight;

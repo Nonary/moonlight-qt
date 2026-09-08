@@ -6,6 +6,9 @@ CONFIG += ordered
 dxgipresent.file = $$PWD/dxgipresent.pro
 SUBDIRS += dxgipresent
 
+incomingtiming.file = $$PWD/incomingtiming.pro
+SUBDIRS += incomingtiming
+
 timingcontroller.file = $$PWD/timingcontroller.pro
 ratepolicy.file = $$PWD/ratepolicy.pro
 pacingworker.file = $$PWD/pacingworker.pro

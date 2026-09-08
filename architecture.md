@@ -6,7 +6,8 @@ It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
 Source baseline: `e63bbd45242f51cb07490f093ee39a009f10ba96` plus the confirmed-native-hitch
-adaptation correction and removal of gap fill and reduced-rate VRR recommendations, inspected
+adaptation correction and removal of gap fill and reduced-rate VRR recommendations
+(committed as `e0e7993d`), plus the incoming host smoothness overlay, inspected
 2026-09-07; updated for readiness-driven padding, stable smoothness references,
 and preservation of learned preparation lead on 2026-09-07; the subsequent
 game-spacing correction disables production cadence smoothing and caps padding
@@ -857,6 +858,23 @@ geometry, and probe brackets. It can compare modeled VRR-following and
 free-running scenarios. `optical_tear_confirmation_available` remains false.
 
 ## 14. Metrics and a useful investigation method
+
+The overlay's `Incoming smoothness (host)` is the percentage of adjacent source
+interval comparisons whose change is at most 3 ms (270 raw RTP ticks). It uses
+three consecutive frame identities at decode-unit ingress, before decoding and
+pacing, with no local arrival timestamps or fallback presentation timestamps.
+Stable 30 FPS content is smooth; a rate transition can affect one comparison.
+Long source stalls count on entry and recovery. Missing/duplicate/out-of-order
+frames, repeated/invalid timestamps, and timestamp resets break the comparison
+chain; unsigned deltas support normal RTP and frame-number wrap. Missing
+coverage displays `N/A`, not 100%. Counts merge over the overlay's approximately
+two-second window while the interval history survives window boundaries.
+This identifies uneven host-supplied timing, which includes capture behavior;
+it cannot isolate the game engine or detect repeated image content from timing
+alone. It is independent of the native-confirmed client hitch metric and does
+not change buffer adaptation. `Client ready on time` remains a preparation
+deadline percentage, not a visible-smoothness measurement. The overlay no longer
+shows `Errors`; internal failed-presentation diagnostics remain available.
 
 Visible smoothness and source-timestamp fidelity answer different questions:
 

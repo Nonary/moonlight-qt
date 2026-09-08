@@ -845,6 +845,8 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalFrames += src.totalFrames;
     dst.networkDroppedFrames += src.networkDroppedFrames;
     dst.pacerDroppedFrames += src.pacerDroppedFrames;
+    dst.incomingSmoothnessSamples += src.incomingSmoothnessSamples;
+    dst.incomingUnevenSamples += src.incomingUnevenSamples;
     dst.vrrPacingDroppedFrames += src.vrrPacingDroppedFrames;
     dst.vrrEligibleFrames += src.vrrEligibleFrames;
     dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
@@ -1189,6 +1191,23 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         offset += ret;
     }
 
+    if (stats.incomingSmoothnessSamples != 0) {
+        const double smoothPercent = 100.0 *
+            static_cast<double>(stats.incomingSmoothnessSamples - stats.incomingUnevenSamples) /
+            static_cast<double>(stats.incomingSmoothnessSamples);
+        ret = snprintf(&output[offset], length - offset,
+                       "Incoming smoothness (host): %.2f%%\n", smoothPercent);
+    }
+    else {
+        ret = snprintf(&output[offset], length - offset,
+                       "Incoming smoothness (host): N/A\n");
+    }
+    if (ret < 0 || ret >= length - offset) {
+        SDL_assert(false);
+        return;
+    }
+    offset += ret;
+
     if (stats.vrrTelemetryActive || stats.vrrEligibleFrames != 0 ||
             stats.vrrPacingDroppedFrames != 0 ||
             stats.vrrPresentFailedFrames != 0 ||
@@ -1208,11 +1227,10 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
             ret = snprintf(&output[offset],
                            length - offset,
-                           "VRR pacing: %s | Ready on time: %.1f%% | Dropped: %llu | Errors: %llu\n",
+                           "VRR pacing: %s | Client ready on time: %.1f%% | Dropped: %llu\n",
                            stats.vrrTelemetryActive ? "Active" : "Inactive",
                            readyOnTimePercent,
-                           static_cast<unsigned long long>(stats.vrrPacingDroppedFrames),
-                           static_cast<unsigned long long>(stats.vrrPresentFailedFrames));
+                           static_cast<unsigned long long>(stats.vrrPacingDroppedFrames));
         }
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);
@@ -2349,6 +2367,17 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
         SDL_memcpy(&m_LastWndVideoStats, &m_ActiveWndVideoStats, sizeof(m_ActiveWndVideoStats));
         SDL_zero(m_ActiveWndVideoStats);
         m_ActiveWndVideoStats.measurementStartUs = LiGetMicroseconds();
+    }
+
+    // Observe before decoding or pacing can shed a frame. Preserve the interval
+    // history across stats windows, but accumulate each comparison only once.
+    const auto incoming = m_IncomingFrameTiming.observe(
+        static_cast<uint32_t>(du->frameNumber), du->rtpTimestamp);
+    if (incoming != IncomingFrameTiming::Sample::Unavailable) {
+        ++m_ActiveWndVideoStats.incomingSmoothnessSamples;
+        if (incoming == IncomingFrameTiming::Sample::Uneven) {
+            ++m_ActiveWndVideoStats.incomingUnevenSamples;
+        }
     }
 
     if (du->frameHostProcessingLatency != 0) {
