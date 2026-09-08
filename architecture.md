@@ -8,7 +8,7 @@ it does not establish that a particular deployed executable matches the source.
 Source baseline: `e63bbd45242f51cb07490f093ee39a009f10ba96` plus the confirmed-native-hitch
 adaptation correction and removal of gap fill and reduced-rate VRR recommendations
 (committed as `e0e7993d`), plus the incoming host smoothness overlay (`6db3919d`)
-and its continuous frame-interval variation correction, inspected
+and its rolling 30-interval variance correction, inspected
 2026-09-07; updated for readiness-driven padding, stable smoothness references,
 and preservation of learned preparation lead on 2026-09-07; the subsequent
 game-spacing correction disables production cadence smoothing and caps padding
@@ -860,26 +860,31 @@ free-running scenarios. `optical_tear_confirmation_available` remains false.
 
 ## 14. Metrics and a useful investigation method
 
-The overlay's `Incoming smoothness (host)` is a continuous cadence consistency
-score, not the percentage of intervals passing a hitch threshold. For each pair
-of consecutive source intervals, accumulate `change = abs(current - previous)`
-and `reference = max(current, previous)` in raw RTP ticks. The displayed score
-is `100 * (1 - sum(change) / sum(reference))`, equivalently the ratio of summed
-shorter intervals to summed longer intervals. Every change contributes its
-magnitude, including sub-3-ms variation; larger/longer disturbances carry more
-weight. Alternating 8/9, 8/12, and 8/16 ms intervals score 88.89%, 66.67%, and
-50%. This is a defined timing consistency score, not a calibrated perceptual
-probability. Stable 30 FPS and stable 120 FPS both score 100%.
+The overlay's `Incoming smoothness (host)` uses the last 30 valid source frame
+intervals. Compute their population variance around their own mean, rather
+than an expected interval derived from the requested FPS. For standard deviation
+`sigma` in milliseconds, the score is `100 / (1 + (sigma / 6)^4)`. This soft curve
+assigns almost no penalty to small variation: 1, 2, and 3 ms standard deviations
+score 99.92%, 98.78%, and 94.12%. The 6 ms knee is a UI heuristic, not a measured
+perceptual threshold or a probability of noticing stutter. It is deliberately
+independent of the controller's 3 ms native hitch threshold.
 
-It uses three consecutive frame identities at decode-unit ingress, before
-decoding and pacing, with no local arrival timestamps or fallback presentation
-timestamps. Rate transitions affect the comparison at the change; long source
-stalls count on entry and recovery without exclusion or clipping. Missing,
-duplicate, or out-of-order frames and repeated/backwards timestamps break the
-comparison chain; unsigned deltas support normal RTP and frame-number wrap.
-Missing coverage displays `N/A`, not 100%. The two integer sums merge over the
-overlay's approximately two-second window, then the ratio is calculated once;
-interval history survives window boundaries.
+Stable 30, 50, 60, or 120 FPS all score 100%. A 60-to-50 FPS step remains above
+99.4% even while the window contains both rates, and settles to 100% after 30
+new intervals. Larger cadence changes can temporarily lower the score while
+both rates are in the window; timestamp data alone cannot establish intent.
+Source stalls are included and age out after 30 subsequent intervals.
+
+Measure raw host RTP intervals at decode-unit ingress before decoding and
+pacing, with no local arrival timestamps or fallback presentation timestamps.
+Missing, duplicate, or out-of-order frames and repeated/backwards timestamps
+clear the window; normal RTP and frame-number wrap remain valid. Require 30
+complete intervals (31 consecutive frames) before displaying a percentage;
+otherwise display `N/A`. The tracker owns the window across overlay refreshes.
+Stats aggregation selects the newest sequence-tagged snapshot, including a
+newer unavailable result, instead of widening the window or averaging scores.
+The existing roughly one-second overlay refresh cadence is unchanged; the
+session-end log likewise shows the final window, not a whole-session percentage.
 This identifies uneven host-supplied timing, which includes capture behavior;
 it cannot isolate the game engine or detect repeated image content from timing
 alone. It is independent of the native-confirmed client hitch metric and does

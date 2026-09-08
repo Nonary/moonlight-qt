@@ -845,8 +845,14 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalFrames += src.totalFrames;
     dst.networkDroppedFrames += src.networkDroppedFrames;
     dst.pacerDroppedFrames += src.pacerDroppedFrames;
-    dst.incomingIntervalChangeTicks += src.incomingIntervalChangeTicks;
-    dst.incomingIntervalReferenceTicks += src.incomingIntervalReferenceTicks;
+    // Keep the latest 30-interval snapshot instead of widening its window when
+    // merging the one-second overlay windows or whole-session log statistics.
+    // A newer unavailable snapshot must also replace older valid evidence.
+    if (src.incomingTimingSequence > dst.incomingTimingSequence) {
+        dst.incomingTimingSequence = src.incomingTimingSequence;
+        dst.incomingTimingVarianceTicksSquared = src.incomingTimingVarianceTicksSquared;
+        dst.incomingTimingValid = src.incomingTimingValid;
+    }
     dst.vrrPacingDroppedFrames += src.vrrPacingDroppedFrames;
     dst.vrrEligibleFrames += src.vrrEligibleFrames;
     dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
@@ -1191,9 +1197,9 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         offset += ret;
     }
 
-    if (stats.incomingIntervalReferenceTicks != 0) {
+    if (stats.incomingTimingValid) {
         const double smoothPercent = IncomingFrameTiming::smoothnessPercent(
-            stats.incomingIntervalChangeTicks, stats.incomingIntervalReferenceTicks);
+            stats.incomingTimingVarianceTicksSquared);
         ret = snprintf(&output[offset], length - offset,
                        "Incoming smoothness (host): %.2f%%\n", smoothPercent);
     }
@@ -2368,12 +2374,13 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
         m_ActiveWndVideoStats.measurementStartUs = LiGetMicroseconds();
     }
 
-    // Observe before decoding or pacing can shed a frame. Preserve the interval
-    // history across stats windows, but accumulate each comparison only once.
+    // Observe before decoding or pacing can shed a frame. The measurement owns
+    // its 30-interval window independently of the overlay's refresh interval.
     const auto incoming = m_IncomingFrameTiming.observe(
         static_cast<uint32_t>(du->frameNumber), du->rtpTimestamp);
-    m_ActiveWndVideoStats.incomingIntervalChangeTicks += incoming.changeTicks;
-    m_ActiveWndVideoStats.incomingIntervalReferenceTicks += incoming.referenceTicks;
+    m_ActiveWndVideoStats.incomingTimingSequence = incoming.sequence;
+    m_ActiveWndVideoStats.incomingTimingVarianceTicksSquared = incoming.varianceTicksSquared;
+    m_ActiveWndVideoStats.incomingTimingValid = incoming.valid;
 
     if (du->frameHostProcessingLatency != 0) {
         if (m_ActiveWndVideoStats.minHostProcessingLatency != 0) {

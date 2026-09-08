@@ -1,11 +1,11 @@
 # VRR deterministic tests
 
-`tst_incomingframetiming` checks the overlay's continuous host cadence score:
-`100 * (1 - sum(abs(currentInterval - previousInterval)) / sum(max(currentInterval, previousInterval)))`.
-It covers exact values, increasing disturbance magnitude/frequency, sub-3-ms
-changes, long stalls, stable 120/60/30/29.97 FPS, additive window aggregation,
-loss, duplicate frames, timestamp resets/wrap, and absent timing.
-This diagnostic does not change the pacing controller or buffer policy.
+`tst_incomingframetiming` checks the overlay's last-30-interval population
+variance and soft score `100 / (1 + (standardDeviationMs / 6)^4)`. It covers
+low jitter remaining essentially smooth, increasing variance and stall count,
+stable 120/60/50/30/29.97 FPS, 60-to-50 transitions, exact window expiry,
+large-stall numerical stability, missing frames, timestamp resets/wrap, and
+unavailable coverage. This diagnostic does not change the controller or buffer.
 
 `tst_dxgipresent` tests the shared D3D11 native-call boundary with a fake
 swapchain, without Windows or Qt dependencies. It verifies synchronized
