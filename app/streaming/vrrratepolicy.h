@@ -8,7 +8,6 @@
 enum class VrrFpsChoiceKind {
     Fixed,
     Vrr,
-    LowLatencyVrr,
     Custom,
 };
 
@@ -23,14 +22,11 @@ public:
     // Native maximum; no artificial below-refresh cap.
     static int vrrRateForRefresh(int refreshHz);
 
-    // floor((refresh * 5 / 6) / 5) * 5
-    static int lowLatencyRateForRefresh(int refreshHz);
-
     // Accept sources through native refresh. Per-frame presentation enforces
     // scanout safety; session admission no longer reserves a fixed FPS margin.
     static bool hasAdaptiveHeadroom(int streamRateHz, int displayRefreshHz);
 
-    // Build baseline, native maximum, low-latency, and saved custom choices.
+    // Build baseline, native maximum, and saved custom choices.
     static std::vector<VrrFpsChoice> buildChoices(const std::vector<int>& refreshRates,
                                                    int savedFps,
                                                    bool vrrEnabled);

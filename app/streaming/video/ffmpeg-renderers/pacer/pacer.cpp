@@ -295,7 +295,6 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
 bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                        bool enablePacing, bool enableVsync,
                        bool enableVrr, int vrrDisplayRefreshHz,
-                       bool enableVrrGapFill, int vrrGapFillMinimumHz,
                        bool smoothVrrFrameTiming, const QString& calibrationKey)
 {
     m_MaxVideoFps = maxVideoFps;
@@ -309,9 +308,9 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         if (!calibrationKey.isEmpty()) {
             const QString display = QString::fromUtf8(SDL_GetDisplayName(SDL_GetWindowDisplayIndex(window)));
-            const auto context = calibrationKey + QString("|%1|%2|%3|%4|%5|%6")
+            const auto context = calibrationKey + QString("|%1|%2|%3|%4")
                 .arg(display).arg(maxVideoFps).arg(vrrDisplayRefreshHz)
-                .arg(smoothVrrFrameTiming).arg(enableVrrGapFill).arg(vrrGapFillMinimumHz);
+                .arg(smoothVrrFrameTiming);
             config.calibrationKey = QCryptographicHash::hash(context.toUtf8(), QCryptographicHash::Sha256).toHex().toStdString();
             config.calibrationPath = Path::getCacheFileInfo("vrr13-calibration.json").absoluteFilePath().toStdString();
         }
@@ -321,8 +320,6 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
         // There is one VRR queue policy. The flag remains in the session
         // config only so older captures replay under the policy they ran.
         config.allowAdditionalQueuedFrame = false;
-        config.gapFillEnabled = enableVrrGapFill && vrrGapFillMinimumHz > 0;
-        config.gapFillMinimumRefreshHz = vrrGapFillMinimumHz;
 
         if (!enableVsync) {
             fallbackReason = VrrFallbackReason::IneffectiveVsync;

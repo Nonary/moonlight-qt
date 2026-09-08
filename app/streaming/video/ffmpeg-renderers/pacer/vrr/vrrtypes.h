@@ -21,10 +21,6 @@ struct VrrSessionConfig {
     int displayRefreshHz = 0;
     int streamRateHz = 0;
     bool allowAdditionalQueuedFrame = false;
-    // Re-present the last frame inside a gap longer than the panel's
-    // adaptive-refresh floor; zero Hz disables it.
-    bool gapFillEnabled = false;
-    int gapFillMinimumRefreshHz = 0;
     // A session preference resolved into the recorded controller parameters.
     // Both modes retain jitter buffering and display-spacing protection.
     bool smoothFrameTiming = true;

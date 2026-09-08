@@ -18,6 +18,7 @@
 // headroom thresholds; non-zero ratios remain available to replay captures
 // made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
+    X(uint64_t, playout_native_hitch_adaptation, playoutNativeHitchAdaptation, 0) \
     X(uint64_t, playout_readiness_driven_adaptation, playoutReadinessDrivenAdaptation, 0) \
     X(uint64_t, playout_stable_smoothness_reference, playoutStableSmoothnessReference, 0) \
     X(uint64_t, render_start_preserve_learned_lead, renderStartPreserveLearnedLead, 0) \

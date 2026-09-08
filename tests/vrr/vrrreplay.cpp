@@ -1319,6 +1319,10 @@ struct SenderCadenceTracker {
     uint64_t pairs = 0;
     uint64_t hitches = 0;
     uint64_t spacingErrorsOverHitch = 0;
+    uint64_t clientSpacingPairs = 0;
+    uint64_t clientSpacingErrorsOver3ms = 0;
+    uint64_t sourceStallPairs = 0;
+    Distribution clientSpacingErrorUs;
     uint64_t hitchLateArrivals = 0;
     uint64_t hitchRenderLeadJumps = 0;
     uint64_t hitchDisplayFloor = 0;
@@ -1344,6 +1348,20 @@ struct SenderCadenceTracker {
                 submissionUs >= priorSubmissionUs) {
             const uint64_t senderIntervalUs = senderUs - priorSenderUs;
             const uint64_t arrivalIntervalUs = decodeUs - priorDecodeUs;
+            if (senderIntervalUs <= kStallIntervalUs) {
+                // The user's 3 ms client-error goal must include network and
+                // decode stalls. Only a gap on the source clock is excluded;
+                // a long local arrival gap cannot excuse a client hitch.
+                const uint64_t actual = submissionUs - priorSubmissionUs;
+                const uint64_t error = actual > senderIntervalUs ?
+                    actual - senderIntervalUs : senderIntervalUs - actual;
+                ++clientSpacingPairs;
+                clientSpacingErrorsOver3ms += error > 3000;
+                clientSpacingErrorUs.add(error);
+            }
+            else {
+                ++sourceStallPairs;
+            }
             if (senderIntervalUs <= kStallIntervalUs &&
                     arrivalIntervalUs <= kStallIntervalUs) {
                 const uint64_t submissionIntervalUs =
@@ -2852,6 +2870,12 @@ QJsonObject senderCadenceObject(const SenderCadenceTracker& tracker,
     object["spacing_errors_over_2ms"] = static_cast<qint64>(tracker.spacingErrorsOverHitch);
     object["spacing_accuracy_percent"] = tracker.pairs ?
         100.0 * (1.0 - double(tracker.spacingErrorsOverHitch) / double(tracker.pairs)) : 0.0;
+    object["client_spacing_pairs"] = static_cast<qint64>(tracker.clientSpacingPairs);
+    object["client_spacing_errors_over_3ms"] = static_cast<qint64>(tracker.clientSpacingErrorsOver3ms);
+    object["client_spacing_accuracy_percent"] = tracker.clientSpacingPairs ?
+        100.0 * (1.0 - double(tracker.clientSpacingErrorsOver3ms) / double(tracker.clientSpacingPairs)) : 0.0;
+    object["client_spacing_error_us"] = distributionObject(tracker.clientSpacingErrorUs);
+    object["source_stall_pairs"] = static_cast<qint64>(tracker.sourceStallPairs);
     object["hitches_per_second"] = durationUs != 0 ?
         static_cast<double>(tracker.hitches) * 1000000.0 /
             static_cast<double>(durationUs) : 0.0;

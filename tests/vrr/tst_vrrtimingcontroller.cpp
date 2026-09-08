@@ -37,6 +37,7 @@ VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
 {
     auto policy = vrrTimingParametersForSession(session);
     policy.playoutReadinessDrivenAdaptation = 0;
+    policy.playoutNativeHitchAdaptation = 0;
     policy.playoutStableSmoothnessReference = 0;
     policy.renderStartPreserveLearnedLead = 0;
     policy.playoutPredictionEnabled = 0;
@@ -2791,6 +2792,7 @@ void testSmoothnessFeedback()
     const auto session = config(60, 120);
     auto policy = vrrTimingParametersForSession(session);
     // Preserve the historical feedback law for exact replay regression coverage.
+    policy.playoutNativeHitchAdaptation = 0;
     policy.playoutReadinessDrivenAdaptation = 0;
     VrrTimingController controller(session, true, policy);
     uint64_t before = 0, after = 0, lateMisses = 0, samples = 0;
@@ -2844,6 +2846,7 @@ void testStableNativeSmoothnessReference()
     auto policy = vrrTimingParametersForSession(session);
     auto legacyPolicy = policy;
     legacyPolicy.playoutStableSmoothnessReference = 0;
+    legacyPolicy.playoutNativeHitchAdaptation = 0;
     VrrTimingController current(session, true, policy);
     VrrTimingController legacy(session, true, legacyPolicy);
     Vrr13::SmoothnessFeedback stable, moving;
@@ -2857,6 +2860,8 @@ void testStableNativeSmoothnessReference()
     a.playoutDelayUs = b.playoutDelayUs = 16000;
     a.originalTargetUs = a.originalScanoutUs = 1000000;
     b.originalTargetUs = 1008698;
+    a.sourceTimeUs = a.originalTargetUs;
+    b.sourceTimeUs = b.originalTargetUs;
     b.originalScanoutUs = b.originalTargetUs + 4974;
     for (auto* controller : {&current, &legacy}) {
         auto first = controller->smoothnessSample(a);
@@ -2927,6 +2932,7 @@ void testReadinessDrivenPadding()
         for (uint64_t cap : {8000ULL, 16000ULL}) {
             const auto session = config(60, 120);
             auto policy = vrrTimingParametersForSession(session);
+            policy.playoutNativeHitchAdaptation = 0;
             policy.playoutDelayMaximumUs = cap;
             VrrTimingController controller(session, true, policy);
             uint64_t previousActual = 0, previousIntended = 0;
@@ -2979,6 +2985,84 @@ void testReadinessDrivenPadding()
     }
 }
 
+void testNativeHitchGatesPadding()
+{
+    for (uint64_t error : {2999ULL, 3000ULL, 3001ULL}) {
+        Vrr13::SmoothnessFeedback feedback;
+        feedback.observe({1, 1000000, 1000000, 6000, 0, 0, true}, 1000000, true);
+        const auto demand = feedback.observe(
+            {2, 1016667 + error, 1016667, 6000, 0, 0, true}, 1025000, true);
+        expect((demand != 0) == (error > 3000),
+               "native growth must require strictly more than 3 ms of client-added interval error");
+    }
+    Vrr13::SmoothnessFeedback gameCadence;
+    uint64_t intended = 1000000;
+    for (uint64_t i = 1; i < 100; ++i) {
+        intended += i % 2 ? 8333 : 16667;
+        expect(gameCadence.observe({i, intended + 10000, intended, 6000, 0, 0, true},
+                                   intended + 10000, true) == 0,
+               "game cadence changes and constant latency must not count as client hitches");
+    }
+    Vrr13::SmoothnessFeedback uncertain;
+    uncertain.observe({1, 1000000, 1000000, 6000, 0, 100, true}, 1000000, true);
+    expect(uncertain.observe({2, 1019867, 1016667, 6000, 0, 100, true}, 1020000, true) == 0 &&
+           uncertain.samples() == 0,
+           "a native error whose uncertainty reaches 3 ms cannot confirm a hitch");
+    const auto session = config(60, 120);
+    const auto policy = vrrTimingParametersForSession(session);
+    expect(policy.playoutNativeHitchAdaptation == 1,
+           "production must require confirmed native hitches for buffer growth");
+    for (int scenario : {0, 1, 2, 3}) {
+        VrrTimingController controller(session, true, policy);
+        uint64_t initial = 0, beforeHitch = 0, maximumAfterHitch = 0, finalDelay = 0;
+        for (int i = 0; i < 1500; ++i) {
+            const uint64_t source = decodedTimeForRtp(1000000, uint32_t(i * 1500));
+            const uint64_t decoded = source + (scenario == 1 && i % 10 == 9 ? 12000 :
+                                               scenario == 3 && i % 10 == 9 ? 2000 : 0);
+            const auto d = controller.schedule(frame(i, uint32_t(i * 1500), true, decoded), decoded);
+            if (!i) initial = d.playoutDelayUs;
+            if (i == 299) beforeHitch = d.playoutDelayUs;
+            controller.notePreparationDuration(scenario == 1 && i % 10 == 9 ? 12000 : 1000);
+            // CPU submission jitter alone is not proof of displayed jitter.
+            const auto submitted = d.targetUs + (scenario == 0 && i % 10 == 9 ? 5000 : 0);
+            controller.noteSubmission(true, false, submitted);
+            if (scenario >= 2) {
+                Vrr13::PresentationObservation o;
+                o.smoothness = controller.smoothnessSample(d);
+                o.submitted = o.idValid = o.sampleValid = true;
+                o.id = o.sampleId = uint64_t(i + 1);
+                o.submission = submitted; o.ready = decoded + 1000;
+                o.sampleTime = submitted + 2000 + (scenario == 2 && i == 300 ? 6000 : 0);
+                o.observed = o.sampleTime; o.deadline = d.originalScanoutUs;
+                o.latched = d.latchedPresentation;
+                controller.notePresentation(o);
+            }
+            if (scenario < 2 || scenario == 3)
+                expect(d.playoutDelayUs <= initial,
+                       "readiness estimates and CPU jitter cannot authorize buffer growth");
+            if (i > 300) maximumAfterHitch = std::max(maximumAfterHitch, d.playoutDelayUs);
+            finalDelay = d.playoutDelayUs;
+        }
+        if (scenario < 2)
+            expect(finalDelay == initial, "missing native evidence must not authorize growth or release");
+        if (scenario == 2)
+            expect(maximumAfterHitch > beforeHitch + 2000,
+                   "a confirmed native interval hitch must authorize bounded buffer growth");
+        if (scenario == 3)
+            expect(finalDelay >= 5000 && finalDelay < initial,
+                   "smooth native presentation may release padding but must retain 3 ms above readiness demand");
+    }
+    Vrr13::Reserve previous(16);
+    for (int i = 0; i < 300; ++i)
+        previous.observe(15000000, 16000000, Vrr13::Reserve::Second + int64_t(i) * 16667000);
+    VrrTimingController controller(session, true, policy);
+    expect(!controller.loadPlayoutHistory(previous.profile()),
+           "a readiness-only calibration must not authorize startup buffer growth");
+    const auto initialProfile = controller.playoutHistory().profile();
+    expect(controller.loadPlayoutHistory(initialProfile),
+           "current trace initialization must accept its own versioned profile for exact replay");
+}
+
 void testProductionPreservesRelativeGameSpacing()
 {
     const auto session = config(120, 120);
@@ -3016,6 +3100,7 @@ void testProductionPreservesRelativeGameSpacing()
 
 int main()
 {
+    testNativeHitchGatesPadding();
     testProductionPreservesRelativeGameSpacing();
     testReadinessDrivenPadding();
     testStableNativeSmoothnessReference();

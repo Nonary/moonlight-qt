@@ -156,12 +156,7 @@ private:
     static int traceThreadProc(void* context);
 
     int run();
-    bool dequeueFrame(QueuedFrame& frame, bool& queueDiscontinuity,
-                      uint64_t deadlineUs, bool& timedOut);
-    bool gapFillEnabled() const;
-    uint64_t gapFillMaximumIntervalUs() const;
-    bool presentGapFill(uint64_t presentAtUs);
-    void retainGapFillFrame(const AVFrame* frame);
+    bool dequeueFrame(QueuedFrame& frame, bool& queueDiscontinuity);
     bool hasQueuedFrame();
     void discardQueuedFrames(bool countDrops,
                              TraceDisposition disposition);
@@ -209,9 +204,6 @@ private:
     std::atomic_size_t m_FrameQueueDepth { 0 };
     PacedFrame m_DeferredFrame;
     // The last presented image, re-presented inside a host gap.
-    AVFrame* m_GapFillFrame = nullptr;
-    uint64_t m_GapFillsBeforeFrame = 0;
-    uint64_t m_GapFillLastUs = 0;
     SDL_Thread* m_WorkerThread = nullptr;
     std::atomic_bool m_Stopping { false };
     std::atomic_bool m_Suspended { false };

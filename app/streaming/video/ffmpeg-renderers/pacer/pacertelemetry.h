@@ -22,7 +22,6 @@ struct PacerTelemetrySnapshot {
 
     bool vrrActive = false;
     uint64_t vrrPacingDroppedFrames = 0;
-    uint64_t vrrGapFillFrames = 0;
     uint64_t vrrEligibleFrames = 0;
     uint64_t vrrPrepareLateFrames = 0;
     uint64_t vrrTargetWaitEntryLateFrames = 0;
@@ -105,13 +104,6 @@ public:
         m_Snapshot.totalPacerTimeUs += pacerTimeUs;
         m_Snapshot.totalRenderTimeUs += renderTimeUs;
         ++m_Snapshot.renderedFrames;
-        touchLocked();
-    }
-
-    void recordVrrGapFill()
-    {
-        QMutexLocker lock(&m_Lock);
-        ++m_Snapshot.vrrGapFillFrames;
         touchLocked();
     }
 

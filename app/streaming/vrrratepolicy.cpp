@@ -36,15 +36,6 @@ int VrrRatePolicy::vrrRateForRefresh(int refreshHz)
     return refreshHz;
 }
 
-int VrrRatePolicy::lowLatencyRateForRefresh(int refreshHz)
-{
-    if (!isUsableRefreshRate(refreshHz)) {
-        return 0;
-    }
-
-    return (refreshHz / 6) * 5;
-}
-
 bool VrrRatePolicy::hasAdaptiveHeadroom(int streamRateHz, int displayRefreshHz)
 {
     if (streamRateHz <= 0 || displayRefreshHz <= 0) {
@@ -72,7 +63,6 @@ std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& re
 
         if (vrrEnabled) {
             addChoice(choices, vrrRateForRefresh(refreshHz), VrrFpsChoiceKind::Vrr);
-            addChoice(choices, lowLatencyRateForRefresh(refreshHz), VrrFpsChoiceKind::LowLatencyVrr);
         }
         else {
             addChoice(choices, refreshHz, VrrFpsChoiceKind::Fixed);

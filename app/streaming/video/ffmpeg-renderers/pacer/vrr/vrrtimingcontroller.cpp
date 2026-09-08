@@ -118,6 +118,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     // path: they each moved the target between frames the source had spaced
     // evenly. Explicit parameters keep older policies replayable.
     VrrTimingParameters parameters;
+    parameters.playoutNativeHitchAdaptation = 1;
     parameters.playoutReadinessDrivenAdaptation = 1;
     parameters.playoutStableSmoothnessReference = 1;
     parameters.renderStartPreserveLearnedLead = 1;
@@ -261,7 +262,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_SubmissionSmoothness.reset();
         m_NativeSmoothness.reset();
         m_RequestedPlayoutDelayUs = 0;
-        m_PlayoutHistory = Vrr13::Reserve(m_Parameters.playoutReadinessDrivenAdaptation ? 16 :
+        m_PlayoutHistory = Vrr13::Reserve(m_Parameters.playoutNativeHitchAdaptation ? 17 :
+            m_Parameters.playoutReadinessDrivenAdaptation ? 16 :
             m_Parameters.playoutSmoothnessFeedbackEnabled ? 15 : m_Parameters.playoutPredictionEnabled ? 14 : 13);
         m_LastHistoryArrivalUs = 0;
         m_PlayoutBands.clear();
@@ -650,7 +652,9 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
 
     VrrTimingDecision decision;
     decision.frameNumber = uint64_t(frame.frameNumber());
-    decision.smoothnessProtectionUs = std::max(m_SubmissionSmoothness.protectionUs(), m_NativeSmoothness.protectionUs());
+    decision.smoothnessProtectionUs = m_Parameters.playoutNativeHitchAdaptation ?
+        m_NativeSmoothness.protectionUs() :
+        std::max(m_SubmissionSmoothness.protectionUs(), m_NativeSmoothness.protectionUs());
     decision.requestedPlayoutDelayUs = m_RequestedPlayoutDelayUs;
     decision.playoutCapacityLimited = m_RequestedPlayoutDelayUs > playoutDelayMaximumUs();
     decision.submissionSmoothnessSamples = m_SubmissionSmoothness.samples();
@@ -1503,8 +1507,13 @@ Vrr13::SmoothnessFeedback::Sample VrrTimingController::smoothnessSample(const Vr
     // Keep the old reference available for exact replay of existing captures.
     sample.intended = m_Parameters.playoutStableSmoothnessReference ?
         d.originalTargetUs : d.originalScanoutUs;
+    if (m_Parameters.playoutNativeHitchAdaptation) {
+        // Score client-added spacing against the game's source cadence. Changes
+        // in our padding or render estimate must not redefine a smooth result.
+        sample.intended = d.sourceTimeUs;
+    }
     sample.buffer = d.playoutDelayUs;
-    sample.headroom = d.recoveryHeadroomUs;
+    sample.headroom = m_Parameters.playoutNativeHitchAdaptation ? 0 : d.recoveryHeadroomUs;
     sample.eligible = d.cadenceEligible && !d.rebased && !d.phaseDiscontinuity &&
         !d.sourceRateChanged && d.sourceIntervalUs <= std::max<uint64_t>(25000, d.sourcePeriodUs * 3 / 2);
     return sample;
@@ -1524,7 +1533,14 @@ void VrrTimingController::notePresentation(const Vrr13::PresentationObservation&
         m_FeedbackLatched = observation.latched;
     }
     m_PresentationPrediction.observe(observation, [this](const Vrr13::SmoothnessFeedback::Sample& sample, uint64_t observed) {
-        m_NativeSmoothness.observe(sample, observed);
+        const uint64_t demand = m_NativeSmoothness.observe(sample, observed,
+                                                         m_Parameters.playoutNativeHitchAdaptation != 0);
+        if (m_Parameters.playoutNativeHitchAdaptation && demand != 0) {
+            // Only a new, matched native interval miss authorizes growth.
+            // Demand belongs to the delayed frame's original padding, so a
+            // catch-up sample cannot repeatedly charge today's larger buffer.
+            m_RequestedPlayoutDelayUs = std::max(m_RequestedPlayoutDelayUs, demand);
+        }
     });
 }
 
@@ -2185,6 +2201,38 @@ void VrrTimingController::updatePlayoutHistory(
     }
     m_PlayoutBandValid = true;
     m_PlayoutBandIndex = 0; // One distribution, shared across source rates.
+
+    if (m_Parameters.playoutNativeHitchAdaptation) {
+        // Readiness may veto release, but only a new native hitch may request
+        // growth. Leave 3 ms above measured readiness when releasing padding.
+        const uint64_t releaseFloor = saturatingAdd(
+            uint64_t(m_PlayoutHistory.common() / 1000), 3000);
+        // A demand beyond storage capacity must not pin release forever or
+        // resurrect growth later when capacity becomes available again.
+        m_RequestedPlayoutDelayUs = std::min(m_RequestedPlayoutDelayUs,
+                                            playoutDelayMaximumUs());
+        if (m_RequestedPlayoutDelayUs <= m_AppliedPlayoutDelayUs) {
+            m_RequestedPlayoutDelayUs = std::min(m_AppliedPlayoutDelayUs,
+                                               releaseFloor);
+        }
+        const uint64_t desired = clampUnsigned(m_RequestedPlayoutDelayUs,
+            playoutDelayMinimumUs(), playoutDelayMaximumUs());
+        if (desired > m_AppliedPlayoutDelayUs) {
+            m_AppliedPlayoutDelayUs += std::min(desired - m_AppliedPlayoutDelayUs,
+                                              m_Parameters.playoutDelayAttackUs);
+        }
+        else if (m_NativeSmoothness.samples() &&
+                 std::abs(signedDifference(at, m_NativeSmoothness.lastObservedUs())) <= 100000 &&
+                 m_NativeSmoothness.canRelease() &&
+                 m_PlayoutHistory.canRelease()) {
+            const uint64_t release = scaledPerMille(m_Parameters.playoutDelayReleaseUs,
+                                                    elapsed * 120 / 1000);
+            m_AppliedPlayoutDelayUs -= std::min(m_AppliedPlayoutDelayUs - desired, release);
+        }
+        // Storage safety still applies when the source rate or work changes.
+        m_AppliedPlayoutDelayUs = std::min(m_AppliedPlayoutDelayUs, playoutDelayMaximumUs());
+        return;
+    }
 
     // Classify stalls on the sender's clock. A long receive/decode gap with
     // steady RTP is receiver jitter and must not be discarded as a host stall.

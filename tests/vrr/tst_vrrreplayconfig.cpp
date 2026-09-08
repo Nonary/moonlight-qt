@@ -12,6 +12,7 @@ class VrrReplayConfigTest : public QObject
 
 private slots:
     void defaultsRoundTrip();
+    void nativeHitchPolicyRoundTrip();
     void inheritanceAndOverride();
     void controllerSnapshotIsAtomic();
     void rejectsInvalidInput();
@@ -39,6 +40,7 @@ private slots:
 void VrrReplayConfigTest::defaultsRoundTrip()
 {
     VrrTimingParameters productionParameters;
+    QCOMPARE(productionParameters.playoutNativeHitchAdaptation, uint64_t(0));
     productionParameters.playoutSmoothingSnapPerMille = 3000;
     QString validationError;
     QVERIFY2(validateVrrTimingParameters(
@@ -448,6 +450,26 @@ void VrrReplayConfigTest::controllerSnapshotIsAtomic()
              uint64_t(3));
     QCOMPARE(parameters.latchedPresentationExitHeadroomPeriodNumerator,
              uint64_t(13));
+}
+
+void VrrReplayConfigTest::nativeHitchPolicyRoundTrip()
+{
+    VrrTimingParameters parameters;
+    parameters.playoutReadinessDrivenAdaptation = 1;
+    parameters.playoutSmoothnessFeedbackEnabled = 1;
+    parameters.playoutPredictionEnabled = 1;
+    parameters.playoutHistoryEnabled = 1;
+    parameters.timestampPlayoutEnabled = 1;
+    parameters.playoutDelayAdaptive = 1;
+    QString error;
+    QJsonObject snapshot{{"playout_native_hitch_adaptation", 1}};
+    QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, parameters, error), qPrintable(error));
+    QCOMPARE(parameters.playoutNativeHitchAdaptation, uint64_t(1));
+    snapshot["playout_native_hitch_adaptation"] = 2;
+    QVERIFY(!applyVrrReplayControllerSnapshot(snapshot, parameters, error));
+    QCOMPARE(parameters.playoutNativeHitchAdaptation, uint64_t(1));
+    parameters.playoutSmoothnessFeedbackEnabled = 0;
+    QVERIFY(!validateVrrTimingParameters(parameters, error));
 }
 
 void VrrReplayConfigTest::rasterEnvelope()

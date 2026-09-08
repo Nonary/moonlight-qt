@@ -5,12 +5,14 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Source baseline: `55fc1286e64cd98eee20269de29a23c91b9ba886` plus the native
-Present-parameter correction, inspected
+Source baseline: `e63bbd45242f51cb07490f093ee39a009f10ba96` plus the confirmed-native-hitch
+adaptation correction and removal of gap fill and reduced-rate VRR recommendations, inspected
 2026-09-07; updated for readiness-driven padding, stable smoothness references,
 and preservation of learned preparation lead on 2026-09-07; the subsequent
 game-spacing correction disables production cadence smoothing and caps padding
-at 16 ms. The initial map came from nine Luna Medium specialists, followed by
+at 16 ms. Production now gates buffer growth on matched native presentation
+errors strictly greater than 3 ms and permits release only with 3 ms of
+readiness headroom and recent smooth native evidence. The initial map came from nine Luna Medium specialists, followed by
 targeted source checks and corrections. No live capture, optical measurement,
 build, or test run was part of this documentation investigation. Recheck the
 named functions after changes; comments, diagnostic labels, and old experiments
@@ -110,13 +112,13 @@ the live path records and which parts replay holds fixed.
 
 `StreamingPreferences` persists ordinary settings through `QSettings`.
 At the inspected revision, V-sync defaults on, VRR defaults off, smooth VRR
-timing defaults on, and gap fill defaults off with a stored 48 Hz floor.
+timing defaults on.
 Legacy frame pacing defaults off. The default requested stream is 720p60.
 These are defaults, not evidence of the user's current saved settings.
 
 The FPS picker is advisory. Fixed 30 and 60 FPS remain available. When V-sync
 and VRR are requested, usable display refresh rates contribute native VRR FPS
-choices and low-latency choices computed as `floor(refresh / 6) * 5`.
+choices. Reduced-rate Low Latency VRR recommendations have been removed.
 A saved custom FPS remains selectable. Toggling VRR does not rewrite saved FPS;
 `m_StreamConfig.fps` receives the requested preference.
 
@@ -134,7 +136,7 @@ A saved custom FPS remains selectable. Toggling VRR does not rewrite saved FPS;
 
 The renderer must subsequently support the mode. The Pacer constructs
 `VrrSessionConfig`, fixes `allowAdditionalQueuedFrame=false`, passes smoothing
-and optional gap-fill settings, checks presenter support, and starts the worker.
+settings, checks presenter support, and starts the worker.
 Unsupported presentation or failed worker initialization falls back to the
 legacy path. A UI checkbox alone cannot establish DXGI capability, active
 adaptive presentation, or that the physical panel is varying refresh.
@@ -316,8 +318,7 @@ resetting the codec merely because an image was not presented.
 9. Consume final lifecycle notifications immediately before the native operation.
 10. Call `presentAdaptive()`, capture result and timing, and record submission
     and native feedback for later decisions.
-11. Trace the outcome and retain/defer frame ownership as required, including
-    the last image used by optional gap fill.
+11. Trace the outcome and retain/defer frame ownership as required by the presenter.
 
 The spacing floor is policy-dependent. In production, a frame classified as
 latched can have the software floor disabled. Therefore “every submission is
@@ -508,7 +509,7 @@ production `render_start_preserve_learned_lead=1` policy lets that constraint
 consume only spare lead: it cannot reduce the learned render plus scheduler
 lead to the legacy 2.5 ms minimum. Longer preparation therefore earns an earlier
 render start, instead of being squeezed into the same narrow window behind a
-larger playout buffer. Gap-fill repeats use the same rule. The 3 ms render-lead
+larger playout buffer. The 3 ms render-lead
 floor remains subject to the existing source-rate and capacity bounds.
 Preparing immediately at arrival remains an experiment, not production default.
 
@@ -537,8 +538,9 @@ the stream.
 ### 9.2 Reserve history and smoothness feedback
 
 With production prediction and smoothness enabled, the readiness history uses
-`Vrr13::Reserve(16)`. Version 16 separates the new readiness evidence from cached
-version-15 evidence, which credited recovery headroom against current readiness.
+`Vrr13::Reserve(17)`. Version 17 isolates release-floor evidence for the
+native-hitch policy from earlier readiness-driven calibration. Readiness history
+can veto shrinking but cannot independently increase padding.
 Namespace/file version names do not mean the older algorithm
 is active. Reserve uses nanoseconds, 250 us histogram bins, and one-second aging
 buckets over approximately five minutes. Allocation is kept out of ordinary
@@ -559,22 +561,23 @@ before adaptation.
 There are separate submission and native `SmoothnessFeedback` instances. They
 compare actual adjacent intervals against intended adjacent intervals, use a
 3 ms tolerance and uncertainty checks, and require valid consecutive evidence.
-Production `playout_stable_smoothness_reference=1` uses `originalTargetUs` as
-the cadence reference for both. Native timing still measures actual presentation,
-but changes in the estimated compositor lead do not change the desired interval.
-`originalScanoutUs` and `predictedScanoutUs` retain their prediction semantics;
-neither is a stable cadence reference when the latency estimator changes.
-All three new policy switches default to zero in the serialization schema, preserving
-exact replay of older captures, and are explicitly enabled by the session resolver.
-Production keeps these smoothness observations as outcome metrics. They do not
-increase padding or block its release: a delay after readiness can move along
-with the target, so adding the current padding to that delay creates a ratchet.
-Legacy replay retains the previous demand calculation:
-stretch charges the current frame; catch-up charges the preceding delayed frame
-using that frame's original buffer/headroom. This prevents delayed feedback
-from repeatedly increasing today's buffer for the same event. Successful
-intervals enter as zero demand; missing or ambiguous observations do not become
-manufactured successes.
+Production `playout_native_hitch_adaptation=1` scores native intervals against
+`sourceTimeUs`, preserving relative game cadence while excluding changes in
+our own padding, rendering estimate, or compositor prediction from the desired
+interval. A native interval error must be strictly greater than 3 ms even after
+subtracting timing uncertainty to authorize growth. Errors at or below 3 ms,
+CPU submission errors without native confirmation, and readiness estimates
+cannot request more padding. Source-rate transitions and host stalls retain
+the existing eligibility exclusions. Native confirmation is OS timing evidence,
+not optical proof of a perceived hitch.
+
+Stretch charges the current frame; catch-up charges the preceding delayed frame
+using that frame's original padding. Each newly confirmed miss supplies demand
+once; historical histogram tails cannot repeatedly authorize growth. Missing,
+out-of-order, ambiguous, or unmatched native feedback cannot manufacture a miss.
+Legacy policies retain their inclusive threshold, original target/scanout
+references, and readiness/combined-feedback adaptation for exact replay.
+The new parameter defaults to zero when absent from older captures.
 
 `PresentationPrediction` accepts matched present identity and native timing
 anchors. DXGI refresh identity must be matched before interpreting a time as
@@ -591,24 +594,25 @@ legacy/replay behavior. In that branch 1000 per mille means p100, 999 means
 p99.9, and 995 means p99.5. Those values must not be confused with the active
 Reserve p99.95 implementation.
 
-Production update conceptually does:
+Production updates padding as follows:
 
-```text
-protection = readinessHistoryProtection
-requested  = protection + predictionMargin
-desired    = clamp(requested, effectiveMinimum, effectiveMaximum)
-```
+- A new confirmed native hitch requests protection based on the delayed frame's
+  padding plus its interval error beyond the 3 ms tolerance. Requests slew upward
+  by at most 500 us per update and remain bounded by capacity and the 16 ms cap.
+- Without a pending hitch request, padding can shrink toward readiness p99.95
+  plus 3,000 us. A higher readiness estimate only stops release; it cannot grow
+  the buffer. Readiness history includes preparation and scheduler work but
+  excludes deliberate waiting.
+- Release requires warmed readiness history, smooth native evidence allowing
+  release, and a native observation within 100 ms of the current decode time.
+  Missing feedback does not authorize continued release. The existing 10 us
+  release input scales by elapsed time at a 120 FPS reference, capped at
+  33,333 us of elapsed recovery time per update.
+- Capacity remains a hard safety bound; when insufficient, the requested
+  headroom cannot be guaranteed. A capacity-clipped request cannot pin the
+  buffer indefinitely or resurrect growth after capacity recovers.
 
-The production `playout_readiness_driven_adaptation=1` policy learns padding
-from modeled readiness shortfalls, independently of native/submission interval
-errors. It does not subtract recovery headroom: spare time after this frame's
-deadline cannot pay for readiness before it, and FIFO prediction already models
-backlog recovery. The old combined feedback law remains available for replay.
-
-It attacks by at most 500 us per update. Release requires the readiness history
-to allow it. Release scales the 10 us
-input by elapsed time at a 120 FPS reference, with elapsed recovery gaps capped
-at 33,333 us. It is not simply 10 us per frame at every FPS.
+The legacy readiness and combined-feedback laws remain available for replay.
 
 Queue capacity is an independent hard bound:
 
@@ -635,11 +639,13 @@ rather than presenting the capped policy as able to absorb all observed work.
 ### 9.4 Persisted calibration
 
 `vrr13-calibration.json` lives under the cache path. The profile key includes
-display identity, stream FPS, display refresh, smoothing/gap-fill settings,
+display identity, stream FPS, display refresh, smoothing settings,
 and session context. Profiles expire after 14 days; saves require at least
 240 observations, use locking/atomic replacement, and cap storage at 16 profiles.
 
-Reserve loads a histogram as prior evidence, ages it, and replaces its mass
+The native-hitch policy accepts version-17 readiness histograms only as
+release-floor evidence; they do not authorize startup growth. Older calibration
+versions are rejected. Reserve ages the prior and replaces its mass
 with live evidence over time. Short interrupted runs preserve a more protective
 prior instead of automatically erasing it. Cached evidence is not proof of
 current-session coverage. Display epoch changes invalidate calibration saving.
@@ -726,7 +732,7 @@ Software timing, tearing permission, and modeled active-scanout exposure do not
 confirm an optical tear or its absence. External display measurement is needed
 for that claim.
 
-## 11. Other presentation paths and optional gap fill
+## 11. Other presentation paths
 
 The shared presenter interface separates support checks, decode-boundary
 capture/readiness, preparation, adaptive presentation, cancellation, and feedback.
@@ -741,13 +747,11 @@ control and environment choices are separate from the client scheduler's
 ability to supply trustworthy presentation feedback. Wayland display/modeset
 constraints likewise differ from Windows.
 
-Gap fill is explicitly optional. When enabled with a positive floor, the worker
-retains the last image and re-presents it through long gaps. The repeat interval
-is based on the floor period minus 800 us. For a known future real-frame target,
-the worker can distribute repeats across the gap while preserving that target.
-Repeats request unlatched presentation. They maintain display activity but do
-not create new game content or fix a host capture stall. Default-off behavior
-must not be confused with an always-active low-frame-rate compensation scheme.
+The worker presents only newly received frames and waits for queue activity
+when empty. It no longer retains and re-presents the last image to fill gaps.
+Display-side low-frame-rate compensation remains the display's responsibility.
+Historical `gap_fills_before` and `gap_fill_last_us` CSV columns remain reserved
+and zero-valued to preserve trace compatibility.
 
 ## 12. Audio, input, and end-to-end latency
 
@@ -866,19 +870,28 @@ Use the replay's in-process `replay_presented_jerk_*`,
 `original_presented_jerk_*`, and `stock_presented_jerk_*` fields, including tail
 values and the share above 2 ms, when discussing overall visible cadence.
 For the controller-only 99.95% goal, game-driven interval changes are not
-failures: use `simulation.sender_cadence.spacing_accuracy_percent`, which
-counts both signs of spacing error over 2 ms against relative RTP intervals.
-`spacing_errors_over_2ms` and `pairs` expose the exact numerator and denominator.
-Report raw jerk separately without penalizing the controller for the game's
-cadence. This replay metric and the controller's 3 ms smoothness-feedback
-tolerance are different contracts; neither establishes optical display timing.
+failures. The new `simulation.sender_cadence.client_spacing_accuracy_percent`
+uses a strict error greater than 3 ms; `client_spacing_errors_over_3ms` and
+`client_spacing_pairs` expose the exact numerator and denominator. It excludes
+source intervals over 25 ms, counts them separately as `source_stall_pairs`,
+and does not exclude long local arrival gaps when RTP is steady. The older
+`spacing_accuracy_percent` and 2 ms fields retain their historical contract,
+including their sender/arrival exclusions, for comparison.
 
-The replay excludes wide sender/arrival intervals over 25 ms from relevant
-hitch/jerk comparisons. Report excluded source gaps separately and consider
-nominal content cadence when interpreting them. The active learning paths have
-their own eligibility and overload rules; do not replace those with the blanket
-claim that every long local decode gap is a host stall. Steady RTP with delayed
-local readiness points to a different boundary than a long sender interval.
+These replay spacing fields use submission timing as a presentation proxy;
+they are not the native-confirmed evidence that authorizes buffer growth.
+Report `smoothness_feedback.native_window_samples` and `native_window_misses`
+separately. Sparse or missing native observations cannot establish 99.95%
+visible smoothness, even when the observed miss count is zero. Counterfactual
+native timing retains recorded service latency shifted with candidate submissions.
+Raw presented jerk also includes the game's cadence and must be reported without
+attributing all such motion to the client.
+
+Desktop/idle captures are not gameplay tuning evidence. Confirm that the latest
+capture contains the workload being optimized before selecting a latency versus
+smoothness tradeoff. Keep source stalls, pre-arrival delivery gaps, decoder work,
+and post-submission blocking separate when interpreting a sweep. A growing buffer
+cannot necessarily fix a delay that moves with the submission target.
 
 For an actual capture investigation:
 

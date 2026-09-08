@@ -355,10 +355,10 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
-    if (value.playoutReadinessDrivenAdaptation > 1 ||
+    if (value.playoutNativeHitchAdaptation > 1 || value.playoutReadinessDrivenAdaptation > 1 ||
             value.playoutStableSmoothnessReference > 1 ||
             value.renderStartPreserveLearnedLead > 1) {
-        return fail("readiness adaptation, stable smoothness reference, and learned preparation lead flags must be 0 or 1");
+        return fail("native hitch adaptation, readiness adaptation, stable smoothness reference, and learned preparation lead flags must be 0 or 1");
     }
     if (value.baseGuardDivisor == 0 ||
             value.pacingLatencyExtraPeriodDenominator == 0 ||
@@ -422,6 +422,10 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.playoutReadinessDrivenAdaptation && !value.playoutPredictionEnabled) {
         return fail("playout_readiness_driven_adaptation requires playout_prediction_enabled");
+    }
+    if (value.playoutNativeHitchAdaptation &&
+            (!value.playoutSmoothnessFeedbackEnabled || !value.playoutReadinessDrivenAdaptation)) {
+        return fail("playout_native_hitch_adaptation requires smoothness feedback and readiness prediction");
     }
     if (value.playoutPredictionEnabled && (!value.playoutHistoryEnabled || !value.timestampPlayoutEnabled || !value.playoutDelayAdaptive)) {
         return fail("playout_prediction_enabled requires adaptive timestamp history playout");

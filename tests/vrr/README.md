@@ -6,6 +6,10 @@ swapchain, without Windows or Qt dependencies. It verifies synchronized
 interval-zero calls, telemetry parameter agreement, and result propagation.
 It does not replace a Windows renderer build or a live scanout test.
 
+The FPS picker offers native VRR rates and preserves saved custom values; the
+reduced-rate Low Latency VRR recommendation has been removed. The worker no
+longer generates gap-fill repeats when new frames are unavailable.
+
 Production preserves the game's relative RTP intervals and caps playout padding
 at 16 ms. Its gain smoother is disabled; historical policies remain replayable.
 For controller accuracy, use `simulation.sender_cadence.spacing_accuracy_percent`
@@ -20,20 +24,35 @@ interval safety separately; they do not claim 99.95% under post-target faults.
 The all-arrival queue simulator uses the capture's `can_latch_present` capability;
 forcing it off invents software-floor backlog on a latch-capable session.
 
-Production learns playout padding from readiness shortfalls using profile
-version 16. Native/submission interval misses remain measured outcomes and do
-not increase padding or prevent release. Inter-frame recovery time is not
-subtracted from readiness demand before a deadline. The frame queue is unchanged.
-Production preserves learned preparation lead and scores native cadence against
-the original target, independently of changes in predicted compositor latency.
-The captured `playout_readiness_driven_adaptation`, `playout_stable_smoothness_reference`, and
-`render_start_preserve_learned_lead` parameters select these behaviors; missing
-fields default to zero so older schema-5 captures keep their original policy.
+Production increases padding only after matched native presentation timing
+confirms a client-added interval error strictly greater than 3 ms. Errors at
+or below 3 ms, readiness estimates, and CPU-only submission errors cannot grow
+padding. Native cadence is compared with the mapped source clock, so genuine
+game cadence changes are not client hitches. Missing or ambiguous native timing
+is unavailable evidence, not a success or failure.
+
+Padding may shrink gradually with recent smooth native evidence, retaining
+3 ms above the readiness p99.95 estimate. A rising readiness estimate can stop
+release but cannot authorize growth. Version-17 profiles isolate this release
+floor from older calibration. The frame queue and 16 ms padding cap are unchanged.
+The captured `playout_native_hitch_adaptation` flag selects this policy; when
+absent it defaults to zero for exact replay of older captures. Existing readiness,
+stable-reference, and preparation-lead flags retain their historical semantics.
 `--require-exact-baseline` selects that captured policy; an ordinary replay or
 the `session-policy` scenario selects the current production policy instead.
 The spacing lifecycle audit accepts a zero correction floor only when the
 reconstructed controller also disables that software floor. It still validates
 the deficit, wait ordering, and any required nonzero floor.
+
+For a 3 ms sweep, report `simulation.sender_cadence.client_spacing_pairs`,
+`client_spacing_errors_over_3ms`, `client_spacing_accuracy_percent`, and
+`client_spacing_error_us`. These additive fields preserve the older 2 ms metrics.
+They exclude source gaps over 25 ms (reported as `source_stall_pairs`) but include
+long network/decode arrival gaps. They score submission timing, not confirmed
+native display intervals; report native sample/miss coverage separately before
+making a 99.95% visible-smoothness claim. Use gameplay captures for gameplay
+optimization, not desktop/idle sessions. Hold publication if a requested latency
+and smoothness target has not been established.
 
 The VRR test tree is opt-in so regular application and package builds do not
 gain test targets. From an out-of-tree build directory, configure it with:
