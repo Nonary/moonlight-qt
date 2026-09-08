@@ -1,9 +1,10 @@
 # VRR deterministic tests
 
-`tst_incomingframetiming` checks the overlay's host smoothness measurement:
-adjacent RTP interval changes strictly over 3 ms count as uneven. Stable
-120/60/30/29.97 FPS, the exact threshold, long source stalls, cadence changes,
-frame loss, duplicates, timestamp resets/wrap, and absent timing are covered.
+`tst_incomingframetiming` checks the overlay's continuous host cadence score:
+`100 * (1 - sum(abs(currentInterval - previousInterval)) / sum(max(currentInterval, previousInterval)))`.
+It covers exact values, increasing disturbance magnitude/frequency, sub-3-ms
+changes, long stalls, stable 120/60/30/29.97 FPS, additive window aggregation,
+loss, duplicate frames, timestamp resets/wrap, and absent timing.
 This diagnostic does not change the pacing controller or buffer policy.
 
 `tst_dxgipresent` tests the shared D3D11 native-call boundary with a fake

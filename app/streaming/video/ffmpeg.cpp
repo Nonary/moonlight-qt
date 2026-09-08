@@ -845,8 +845,8 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalFrames += src.totalFrames;
     dst.networkDroppedFrames += src.networkDroppedFrames;
     dst.pacerDroppedFrames += src.pacerDroppedFrames;
-    dst.incomingSmoothnessSamples += src.incomingSmoothnessSamples;
-    dst.incomingUnevenSamples += src.incomingUnevenSamples;
+    dst.incomingIntervalChangeTicks += src.incomingIntervalChangeTicks;
+    dst.incomingIntervalReferenceTicks += src.incomingIntervalReferenceTicks;
     dst.vrrPacingDroppedFrames += src.vrrPacingDroppedFrames;
     dst.vrrEligibleFrames += src.vrrEligibleFrames;
     dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
@@ -1191,10 +1191,9 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         offset += ret;
     }
 
-    if (stats.incomingSmoothnessSamples != 0) {
-        const double smoothPercent = 100.0 *
-            static_cast<double>(stats.incomingSmoothnessSamples - stats.incomingUnevenSamples) /
-            static_cast<double>(stats.incomingSmoothnessSamples);
+    if (stats.incomingIntervalReferenceTicks != 0) {
+        const double smoothPercent = IncomingFrameTiming::smoothnessPercent(
+            stats.incomingIntervalChangeTicks, stats.incomingIntervalReferenceTicks);
         ret = snprintf(&output[offset], length - offset,
                        "Incoming smoothness (host): %.2f%%\n", smoothPercent);
     }
@@ -2373,12 +2372,8 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     // history across stats windows, but accumulate each comparison only once.
     const auto incoming = m_IncomingFrameTiming.observe(
         static_cast<uint32_t>(du->frameNumber), du->rtpTimestamp);
-    if (incoming != IncomingFrameTiming::Sample::Unavailable) {
-        ++m_ActiveWndVideoStats.incomingSmoothnessSamples;
-        if (incoming == IncomingFrameTiming::Sample::Uneven) {
-            ++m_ActiveWndVideoStats.incomingUnevenSamples;
-        }
-    }
+    m_ActiveWndVideoStats.incomingIntervalChangeTicks += incoming.changeTicks;
+    m_ActiveWndVideoStats.incomingIntervalReferenceTicks += incoming.referenceTicks;
 
     if (du->frameHostProcessingLatency != 0) {
         if (m_ActiveWndVideoStats.minHostProcessingLatency != 0) {

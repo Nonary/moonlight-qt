@@ -7,7 +7,8 @@ it does not establish that a particular deployed executable matches the source.
 
 Source baseline: `e63bbd45242f51cb07490f093ee39a009f10ba96` plus the confirmed-native-hitch
 adaptation correction and removal of gap fill and reduced-rate VRR recommendations
-(committed as `e0e7993d`), plus the incoming host smoothness overlay, inspected
+(committed as `e0e7993d`), plus the incoming host smoothness overlay (`6db3919d`)
+and its continuous frame-interval variation correction, inspected
 2026-09-07; updated for readiness-driven padding, stable smoothness references,
 and preservation of learned preparation lead on 2026-09-07; the subsequent
 game-spacing correction disables production cadence smoothing and caps padding
@@ -859,16 +860,26 @@ free-running scenarios. `optical_tear_confirmation_available` remains false.
 
 ## 14. Metrics and a useful investigation method
 
-The overlay's `Incoming smoothness (host)` is the percentage of adjacent source
-interval comparisons whose change is at most 3 ms (270 raw RTP ticks). It uses
-three consecutive frame identities at decode-unit ingress, before decoding and
-pacing, with no local arrival timestamps or fallback presentation timestamps.
-Stable 30 FPS content is smooth; a rate transition can affect one comparison.
-Long source stalls count on entry and recovery. Missing/duplicate/out-of-order
-frames, repeated/invalid timestamps, and timestamp resets break the comparison
-chain; unsigned deltas support normal RTP and frame-number wrap. Missing
-coverage displays `N/A`, not 100%. Counts merge over the overlay's approximately
-two-second window while the interval history survives window boundaries.
+The overlay's `Incoming smoothness (host)` is a continuous cadence consistency
+score, not the percentage of intervals passing a hitch threshold. For each pair
+of consecutive source intervals, accumulate `change = abs(current - previous)`
+and `reference = max(current, previous)` in raw RTP ticks. The displayed score
+is `100 * (1 - sum(change) / sum(reference))`, equivalently the ratio of summed
+shorter intervals to summed longer intervals. Every change contributes its
+magnitude, including sub-3-ms variation; larger/longer disturbances carry more
+weight. Alternating 8/9, 8/12, and 8/16 ms intervals score 88.89%, 66.67%, and
+50%. This is a defined timing consistency score, not a calibrated perceptual
+probability. Stable 30 FPS and stable 120 FPS both score 100%.
+
+It uses three consecutive frame identities at decode-unit ingress, before
+decoding and pacing, with no local arrival timestamps or fallback presentation
+timestamps. Rate transitions affect the comparison at the change; long source
+stalls count on entry and recovery without exclusion or clipping. Missing,
+duplicate, or out-of-order frames and repeated/backwards timestamps break the
+comparison chain; unsigned deltas support normal RTP and frame-number wrap.
+Missing coverage displays `N/A`, not 100%. The two integer sums merge over the
+overlay's approximately two-second window, then the ratio is calculated once;
+interval history survives window boundaries.
 This identifies uneven host-supplied timing, which includes capture behavior;
 it cannot isolate the game engine or detect repeated image content from timing
 alone. It is independent of the native-confirmed client hitch metric and does

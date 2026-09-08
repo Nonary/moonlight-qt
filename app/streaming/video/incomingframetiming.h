@@ -7,7 +7,19 @@
 class IncomingFrameTiming
 {
 public:
-    enum class Sample { Unavailable, Smooth, Uneven };
+    struct Sample {
+        uint32_t changeTicks = 0;
+        uint32_t referenceTicks = 0; // Zero means unavailable.
+    };
+
+    // Ratio of shared interval duration to the longer duration, accumulated
+    // across the window. Every change contributes its magnitude, without a
+    // hitch threshold or per-sample rounding. Longer stalls carry more weight.
+    static double smoothnessPercent(uint64_t changeTicks, uint64_t referenceTicks)
+    {
+        return referenceTicks == 0 ? 0.0 :
+            100.0 * (1.0 - double(changeTicks) / double(referenceTicks));
+    }
 
     Sample observe(uint32_t frameNumber, uint32_t rtpTimestamp)
     {
@@ -21,21 +33,21 @@ public:
         // absent/repeated timestamps, and backwards timestamps break the chain.
         if (!adjacent || interval == 0 || interval >= 0x80000000U) {
             m_HaveInterval = false;
-            return Sample::Unavailable;
+            return {};
         }
 
         const uint32_t previousInterval = m_PreviousInterval;
         m_PreviousInterval = interval;
         if (!m_HaveInterval) {
             m_HaveInterval = true;
-            return Sample::Unavailable;
+            return {};
         }
 
         const uint32_t change = interval > previousInterval ?
             interval - previousInterval : previousInterval - interval;
-        // 270 ticks at 90 kHz is exactly 3 ms. A stable low frame rate is
-        // smooth; long source stalls are included, without a 25 ms exclusion.
-        return change > 270 ? Sample::Uneven : Sample::Smooth;
+        // Comparing adjacent intervals preserves steady low FPS. Normalizing
+        // by their maximum keeps the aggregate score within 0..100% naturally.
+        return {change, interval > previousInterval ? interval : previousInterval};
     }
 
 private:
