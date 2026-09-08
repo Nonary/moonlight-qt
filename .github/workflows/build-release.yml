@@ -69,7 +69,7 @@ jobs:
           PY
       - name: Build Flatpak
         run: |
-          flatpak run org.flatpak.Builder --user --force-clean --sandbox \
+          dbus-run-session -- flatpak run org.flatpak.Builder --user --force-clean --sandbox \
             --install-deps-from=flathub --repo=flatpak-repo flatpak-build \
             packaging/flatpak/com.moonlight_stream.Moonlight.json
           flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
