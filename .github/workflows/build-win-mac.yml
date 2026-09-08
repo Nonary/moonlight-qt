@@ -94,7 +94,8 @@ jobs:
         env:
           QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
 
-      - name: Test and package VRR diagnostics (Windows x64)
+      - name: Test VRR diagnostics (Windows x64)
+        timeout-minutes: 5
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -103,24 +104,46 @@ jobs:
           $tests = Get-ChildItem build/tests-vrr/vrr/release/tst_*.exe
           if ($tests.Count -lt 8) { throw "Missing VRR test executables" }
           foreach ($test in $tests) {
+            Write-Host "Running $($test.Name)"
             if ($test.Name -eq 'tst_overlay.exe') {
               & $test.FullName (Resolve-Path app).Path
+            } elseif ($test.Name -in @('tst_vrrratepolicy.exe', 'tst_vrrreplayconfig.exe')) {
+              & $test.FullName -o '-,txt'
             } else {
               & $test.FullName
             }
             if ($LASTEXITCODE -ne 0) { throw "$($test.Name) failed: $LASTEXITCODE" }
+            Write-Host "Passed $($test.Name)"
           }
+        env:
+          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
+
+      - name: Stage and smoke-test VRR replay (Windows x64)
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        shell: pwsh
+        env:
+          QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES: '1'
+        run: |
+          $deploy = (Resolve-Path build/deploy-x64-release).Path
           Copy-Item build/tests-vrr/vrr/release/vrrreplay.exe $deploy
           Copy-Item scripts/decode-vrr-trace.py $deploy
-          & "$deploy/vrrreplay.exe" --help
-          if ($LASTEXITCODE -ne 0) { throw "Packaged replay smoke test failed" }
+          & "$deploy/vrrreplay.exe" --help > build/vrrreplay-help.txt
+          if ($LASTEXITCODE -ne 0 -or (Get-Item build/vrrreplay-help.txt).Length -eq 0) {
+            throw "Packaged replay smoke test failed"
+          }
+          Get-Content build/vrrreplay-help.txt
+
+      - name: Recreate Windows portable ZIP with diagnostics
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $deploy = (Resolve-Path build/deploy-x64-release).Path
           if (!(Test-Path "$deploy/portable.dat.inactive") -or (Test-Path "$deploy/portable.dat")) {
             throw "Incorrect portable settings marker"
           }
           Compress-Archive -Path "$deploy/*" -CompressionLevel Optimal -Force `
             -DestinationPath "build/installer-x64-release/MoonlightPortable-x64-$env:CI_VERSION.zip"
-        env:
-          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
 
       - name: Build ARM64 binaries (Windows)
         if: runner.os == 'Windows'
