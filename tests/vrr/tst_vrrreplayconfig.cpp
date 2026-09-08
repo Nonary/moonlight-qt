@@ -13,6 +13,7 @@ class VrrReplayConfigTest : public QObject
 private slots:
     void defaultsRoundTrip();
     void nativeHitchPolicyRoundTrip();
+    void dxgiFeedbackPolicyRoundTrip();
     void inheritanceAndOverride();
     void controllerSnapshotIsAtomic();
     void rejectsInvalidInput();
@@ -41,6 +42,7 @@ void VrrReplayConfigTest::defaultsRoundTrip()
 {
     VrrTimingParameters productionParameters;
     QCOMPARE(productionParameters.playoutNativeHitchAdaptation, uint64_t(0));
+    QCOMPARE(productionParameters.playoutPreserveDxgiFeedback, uint64_t(0));
     productionParameters.playoutSmoothingSnapPerMille = 3000;
     QString validationError;
     QVERIFY2(validateVrrTimingParameters(
@@ -470,6 +472,48 @@ void VrrReplayConfigTest::nativeHitchPolicyRoundTrip()
     QCOMPARE(parameters.playoutNativeHitchAdaptation, uint64_t(1));
     parameters.playoutSmoothnessFeedbackEnabled = 0;
     QVERIFY(!validateVrrTimingParameters(parameters, error));
+}
+
+void VrrReplayConfigTest::dxgiFeedbackPolicyRoundTrip()
+{
+    QString error;
+    for (uint64_t enabled : {0ULL, 1ULL}) {
+        VrrTimingParameters parameters;
+        parameters.playoutPreserveDxgiFeedback = enabled;
+        const auto snapshot = vrrTimingParametersToJson(parameters);
+        QCOMPARE(snapshot.value("playout_preserve_dxgi_feedback").toInteger(),
+                 qint64(enabled));
+        VrrTimingParameters restored;
+        QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error),
+                 qPrintable(error));
+        QCOMPARE(restored.playoutPreserveDxgiFeedback, enabled);
+    }
+
+    VrrTimingParameters parameters;
+    parameters.playoutPreserveDxgiFeedback = 1;
+    const auto unchanged = vrrTimingParametersToJson(parameters);
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        QJsonObject{{"playout_preserve_dxgi_feedback", 2}}, parameters, error));
+    QCOMPARE(vrrTimingParametersToJson(parameters), unchanged);
+
+    // Older snapshots/configs omit the field and retain the legacy policy.
+    auto legacySnapshot = unchanged;
+    legacySnapshot.remove("playout_preserve_dxgi_feedback");
+    VrrTimingParameters legacy;
+    QVERIFY2(applyVrrReplayControllerSnapshot(legacySnapshot, legacy, error),
+             qPrintable(error));
+    QCOMPARE(legacy.playoutPreserveDxgiFeedback, uint64_t(0));
+    auto root = vrrDefaultReplayConfigurationJson();
+    auto sections = root.value("parameters").toObject();
+    sections["controller"] = legacySnapshot;
+    root["parameters"] = sections;
+    VrrReplayConfiguration config;
+    QVERIFY2(loadVrrReplayConfiguration(QJsonDocument(root).toJson(), config, error),
+             qPrintable(error));
+    QCOMPARE(config.scenarios.front().controller.playoutPreserveDxgiFeedback,
+             uint64_t(0));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.playout_preserve_dxgi_feedback"));
 }
 
 void VrrReplayConfigTest::rasterEnvelope()

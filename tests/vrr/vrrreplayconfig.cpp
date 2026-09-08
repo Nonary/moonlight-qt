@@ -414,8 +414,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutDelayAdaptive > 1) {
         return fail("playout_delay_adaptive must be 0 or 1");
     }
-    if (value.playoutSmoothnessFeedbackEnabled > 1 || value.playoutHistoryEnabled > 1 || value.playoutPerFrameLatch > 1 || value.playoutPredictionEnabled > 1) {
-        return fail("history, prediction, smoothness feedback and per-frame latch flags must be 0 or 1");
+    if (value.playoutSmoothnessFeedbackEnabled > 1 || value.playoutHistoryEnabled > 1 || value.playoutPerFrameLatch > 1 || value.playoutPredictionEnabled > 1 || value.playoutPreserveDxgiFeedback > 1) {
+        return fail("history, prediction, smoothness feedback, DXGI feedback preservation and per-frame latch flags must be 0 or 1");
     }
     if (value.playoutSmoothnessFeedbackEnabled && !value.playoutPredictionEnabled) {
         return fail("playout_smoothness_feedback_enabled requires playout_prediction_enabled");

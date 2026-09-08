@@ -45,6 +45,34 @@ swapchain, without Windows or Qt dependencies. It verifies synchronized
 interval-zero calls, telemetry parameter agreement, and result propagation.
 It does not replace a Windows renderer build or a live scanout test.
 
+Production `controller.playout_preserve_dxgi_feedback=1` preserves pending DXGI
+present IDs and refresh anchors when native presentation mode changes. Latency
+samples and freshness remain separate for each mode, and the controller selects
+the lead for the mode it has just chosen. Native interval/flag telemetry supplies
+mode attribution when valid; otherwise the prior requested-mode fallback remains.
+Matched samples retain their submission's mode epoch: delayed adjacent samples
+within an epoch remain eligible after a newer submission switches mode, while
+cross-epoch pairs cannot grow padding. Late older matches cannot rewind the
+smoothness sequence. Real lifecycle and clock resets still clear the state.
+
+The flag defaults to zero when absent, preserving old captures' feedback-reset
+behavior under `--require-exact-baseline`. The new path applies only to DXGI;
+Vulkan feedback and the persisted calibration profile version are unchanged.
+The correction does not change native Present arguments, waits, or source-spacing
+policy, but recovered observations can alter the predicted floor and learned
+padding. Deterministic coverage of this feedback contract does not establish a
+display-specific tearing fix.
+
+`tst_vrrpresentationfeedback` covers delayed identity matching across mode
+changes, independent mode latency and freshness, cancelled observations,
+matched-frame epochs, uncertainty, resets, and bounded history. It has no Qt,
+SDL, or Windows dependency and can also be built directly:
+
+```sh
+c++ -std=c++17 tests/vrr/tst_vrrpresentationfeedback.cpp -o /tmp/tst_vrrpresentationfeedback
+/tmp/tst_vrrpresentationfeedback
+```
+
 The FPS picker offers native VRR rates and preserves saved custom values; the
 reduced-rate Low Latency VRR recommendation has been removed. The worker no
 longer generates gap-fill repeats when new frames are unavailable.
@@ -100,6 +128,8 @@ gain test targets. From an out-of-tree build directory, configure it with:
 & C:\Users\Chase\sources\.tools\Qt\6.11.1\msvc2022_64\bin\qmake.exe `
     ..\tests\tests.pro CONFIG+=tests
 nmake
+.\vrr\release\tst_vrrpresentationfeedback.exe
+.\vrr\release\tst_dxgipresent.exe
 .\vrr\release\tst_vrrtimingcontroller.exe
 .\vrr\release\tst_vrrratepolicy.exe
 .\vrr\release\tst_vrrpacingworker.exe

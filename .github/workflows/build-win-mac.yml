@@ -102,7 +102,15 @@ jobs:
           $deploy = (Resolve-Path build/deploy-x64-release).Path
           $env:Path = "$deploy;$env:QT_PATH;$env:Path"
           $tests = Get-ChildItem build/tests-vrr/vrr/release/tst_*.exe
-          if ($tests.Count -lt 8) { throw "Missing VRR test executables" }
+          $requiredTests = @(
+            'tst_dxgipresent.exe', 'tst_incomingframetiming.exe', 'tst_overlay.exe',
+            'tst_vrrpacingworker.exe', 'tst_vrrpresentationfeedback.exe',
+            'tst_vrrprofile.exe', 'tst_vrrratepolicy.exe',
+            'tst_vrrreplayconfig.exe', 'tst_vrrtimingcontroller.exe'
+          )
+          foreach ($requiredTest in $requiredTests) {
+            if ($tests.Name -notcontains $requiredTest) { throw "Missing VRR test executable: $requiredTest" }
+          }
           foreach ($test in $tests) {
             Write-Host "Running $($test.Name)"
             if ($test.Name -eq 'tst_overlay.exe') {

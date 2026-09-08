@@ -18,6 +18,7 @@
 // headroom thresholds; non-zero ratios remain available to replay captures
 // made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
+    X(uint64_t, playout_preserve_dxgi_feedback, playoutPreserveDxgiFeedback, 0) \
     X(uint64_t, playout_native_hitch_adaptation, playoutNativeHitchAdaptation, 0) \
     X(uint64_t, playout_readiness_driven_adaptation, playoutReadinessDrivenAdaptation, 0) \
     X(uint64_t, playout_stable_smoothness_reference, playoutStableSmoothnessReference, 0) \
@@ -399,6 +400,7 @@ private:
     bool acceptSourcePeriodQ16(uint64_t periodUsQ16);
     void anchorSourceTime(uint64_t sourceTimeUs);
     void updateLearnedBudgets();
+    void updateCadenceLatch(bool cadenceUnstable);
     void updateReadinessModel();
     void applyReadinessBudget(bool acquireReserve,
                               bool immediateAcquisition = false);

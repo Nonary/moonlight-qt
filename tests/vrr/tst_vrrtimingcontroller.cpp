@@ -41,6 +41,7 @@ VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
     policy.playoutStableSmoothnessReference = 0;
     policy.renderStartPreserveLearnedLead = 0;
     policy.playoutPredictionEnabled = 0;
+    policy.playoutPreserveDxgiFeedback = 0;
     policy.playoutSmoothnessFeedbackEnabled = 0;
     policy.playoutSmoothingGainPerMille = session.smoothFrameTiming ? 200 : 0;
     policy.playoutDelayMaximumUs = 8000;
@@ -3033,6 +3034,91 @@ void testDelayedWaylandAndDxgiFeedbackAgree()
            "delayed compositor feedback must actually enable native-hitch buffer growth");
 }
 
+void testDxgiFeedbackPolicyAndSelectedModeLead()
+{
+    const auto session = config(100, 144);
+    auto policy = vrrTimingParametersForSession(session);
+    expect(policy.playoutPreserveDxgiFeedback == 1 &&
+               VrrTimingParameters{}.playoutPreserveDxgiFeedback == 0 &&
+               legacyPlayoutParameters(session).playoutPreserveDxgiFeedback == 0,
+           "production must opt into preserved DXGI feedback while absent fields and legacy fixtures retain historical behavior");
+    // Hold padding constant so mode-specific native service is the only
+    // changing prediction. Native observations deliberately exercise the
+    // feedback contract independently of the earlier requested latch mode.
+    policy.playoutDelayMinimumUs = policy.playoutDelayMaximumUs;
+    VrrTimingController controller(session, true, policy);
+    Vrr13::PresentationObservation previous;
+    for (uint64_t i = 1; i <= 5; ++i) {
+        const uint64_t source = 1000000 + (i - 1) * 10000;
+        const auto decision = controller.schedule(
+            frame(int(i), uint32_t((i - 1) * 900), true, source),
+            std::max(source, previous.observed));
+        if (i == 5) {
+            expect(!decision.latchedPresentation && decision.compositorLeadUs == 600,
+                   "the first adaptive decision after latched native submissions must use the adaptive lead, not the last submitted mode's lead");
+        }
+        controller.noteSubmission(true, false, decision.targetUs);
+        Vrr13::PresentationObservation current;
+        current.submitted = current.idValid = current.dxgi = true;
+        current.id = i;
+        current.submission = current.ready = decision.targetUs;
+        current.deadline = decision.targetUs;
+        current.observed = decision.targetUs + 100;
+        current.latched = i == 3 || i == 4;
+        if (previous.id) {
+            current.sampleValid = true;
+            current.sampleId = previous.id;
+            current.sampleTime = previous.submission + (previous.latched ? 4000 : 600);
+            current.presentRefresh = current.syncRefresh = previous.id;
+        }
+        controller.notePresentation(current);
+        previous = current;
+    }
+}
+
+void testDelayedDxgiSmoothnessUsesPresentedModeEpoch()
+{
+    for (uint64_t preserve : {0ULL, 1ULL}) {
+        const auto session = config(100, 144);
+        auto policy = vrrTimingParametersForSession(session);
+        policy.playoutPreserveDxgiFeedback = preserve;
+        policy.playoutDelayMinimumUs = policy.playoutDelayMaximumUs;
+        VrrTimingController controller(session, true, policy);
+        Vrr13::PresentationObservation previous;
+        for (uint64_t i = 1; i <= 6; ++i) {
+            const uint64_t source = 1000000 + (i - 1) * 10000;
+            const auto decision = controller.schedule(
+                frame(int(i), uint32_t((i - 1) * 900), true, source),
+                std::max(source, previous.observed));
+            if (i == 6) {
+                expect(decision.nativeSmoothnessSamples == (preserve ? 2 : 1) &&
+                           decision.nativeSmoothnessMisses == 0,
+                       "delayed same-mode pairs must survive newer mode changes without learning a false hitch across the native mode boundary; legacy replay must retain its lost pair");
+                break;
+            }
+            controller.noteSubmission(true, false, decision.targetUs);
+            Vrr13::PresentationObservation current;
+            current.smoothness = {i, 0, source, 6000, 0, 0, true};
+            current.submitted = current.idValid = current.dxgi = true;
+            current.id = i;
+            current.submission = current.ready = decision.targetUs;
+            current.deadline = decision.targetUs;
+            current.observed = decision.targetUs + 100;
+            current.latched = i <= 2;
+            if (previous.id) {
+                current.sampleValid = true;
+                current.sampleId = previous.id;
+                // Each mode has smooth 10 ms intervals. The 5 ms service
+                // change between them must not be learned as buffer demand.
+                current.sampleTime = previous.submission + (previous.latched ? 1000 : 6000);
+                current.presentRefresh = current.syncRefresh = previous.id;
+            }
+            controller.notePresentation(current);
+            previous = current;
+        }
+    }
+}
+
 void testNativeHitchGatesPadding()
 {
     for (uint64_t error : {2999ULL, 3000ULL, 3001ULL}) {
@@ -3150,6 +3236,8 @@ int main()
 {
     testNativeHitchGatesPadding();
     testDelayedWaylandAndDxgiFeedbackAgree();
+    testDxgiFeedbackPolicyAndSelectedModeLead();
+    testDelayedDxgiSmoothnessUsesPresentedModeEpoch();
     testProductionPreservesRelativeGameSpacing();
     testReadinessDrivenPadding();
     testStableNativeSmoothnessReference();

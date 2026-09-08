@@ -6,6 +6,9 @@ CONFIG += ordered
 dxgipresent.file = $$PWD/dxgipresent.pro
 SUBDIRS += dxgipresent
 
+presentationfeedback.file = $$PWD/presentationfeedback.pro
+SUBDIRS += presentationfeedback
+
 incomingtiming.file = $$PWD/incomingtiming.pro
 SUBDIRS += incomingtiming
 linux:packagesExist(vulkan) {

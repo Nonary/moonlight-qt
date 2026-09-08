@@ -1061,6 +1061,13 @@ void VrrPacingWorker::recordSubmission(
     observation.latched = feedback.nativeBackend == VrrNativePresentationBackend::Vulkan ?
         false : decision.latchedPresentation;
     observation.dxgi = feedback.nativeBackend == VrrNativePresentationBackend::Dxgi;
+    if (m_TimingController->parameters().playoutPreserveDxgiFeedback &&
+            observation.dxgi && feedback.nativeBackendValid &&
+            feedback.nativePresentParametersValid) {
+        // Attribute delayed feedback to the native mode this frame used.
+        // Legacy captures retain their decision-derived mode for exact replay.
+        observation.latched = feedback.nativePresentSyncInterval != 0;
+    }
     observation.sampleValid = feedback.latchSampleValid &&
         (!observation.dxgi || (feedback.latchQpcCorrelationValid && feedback.latchRawSyncQpcFrequency));
     observation.sampleId = feedback.latchSubmissionId;

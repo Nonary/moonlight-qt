@@ -12,10 +12,14 @@ public:
         uint64_t frame = 0, at = 0, intended = 0;
         uint64_t buffer = 0, headroom = 0, uncertainty = 0;
         bool eligible = false;
+        // Reconstructed from the matched frame's submitted mode. Zero keeps
+        // historical/non-DXGI samples in their existing single sequence.
+        uint64_t presentationEpoch = 0;
     };
     // Return demand only for a newly confirmed interval miss. Consumers that
     // gate adaptation on events must not replay an old histogram tail.
     uint64_t observe(const Sample& s, uint64_t observed, bool strictThreshold = false) {
+        if (s.presentationEpoch && m_HavePrevious && s.frame <= m_Previous.frame) return 0;
         if (!s.eligible || !s.at || !s.intended || observed < s.at) {
             breakSequence();
             return 0;
@@ -23,6 +27,7 @@ public:
         if (m_HavePrevious && s.frame <= m_Previous.frame) return 0;
         const auto previous = m_Previous;
         const bool adjacent = m_HavePrevious && s.frame == previous.frame + 1 &&
+            s.presentationEpoch == previous.presentationEpoch &&
             s.at > previous.at && s.intended > previous.intended &&
             s.at - previous.at < 1000000 && s.intended - previous.intended < 1000000;
         m_Previous = s; m_HavePrevious = true;

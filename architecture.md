@@ -14,7 +14,9 @@ and preservation of learned preparation lead on 2026-09-07; the subsequent
 game-spacing correction disables production cadence smoothing and caps padding
 at 16 ms. Production now gates buffer growth on matched native presentation
 errors strictly greater than 3 ms and permits release only with 3 ms of
-readiness headroom and recent smooth native evidence. The initial map came from nine Luna Medium specialists, followed by
+readiness headroom and recent smooth native evidence. The subsequent DXGI feedback
+correction, inspected 2026-09-08, preserves delayed presentation identities across
+mode changes and separates latency estimates by mode. The initial map came from nine Luna Medium specialists, followed by
 targeted source checks and corrections. No live capture, optical measurement,
 build, or test run was part of this documentation investigation. Recheck the
 named functions after changes; comments, diagnostic labels, and old experiments
@@ -372,7 +374,9 @@ schema default is insufficient evidence of the current session policy.
 
 At the inspected baseline the resolver enables timestamp playout, prediction,
 shared history, smoothness feedback, adaptive delay, and per-frame latch
-requests. It disables the retired metronome and prepare-on-arrival experiment.
+requests. It also enables `playout_preserve_dxgi_feedback`; the schema default
+is zero to reproduce captures made before this feedback correction. It disables
+the retired metronome and prepare-on-arrival experiment.
 It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 
 | Production input | Value / meaning |
@@ -496,6 +500,11 @@ adaptive presentation-prediction floor. Unlatched predicted presentation can
 raise the target using a fresh scanout observation: it converts that scanout
 floor back to a submission floor by subtracting the learned compositor lead,
 bounded at zero. Thus it does not directly equate submission with scanout.
+With the DXGI feedback correction active, the lead is selected for the newly
+chosen presentation mode, including the first frame after a mode change. The
+most recent matched refresh anchor remains shared across modes. These are
+software predictions, not a guarantee that the physical panel has finished
+scanning when the next native call occurs.
 Then
 `earliestSubmissionUs()` provides another lower bound.
 
@@ -587,6 +596,25 @@ that frame's presentation. Stale, future, or too-uncertain observations are
 ignored. The inspected implementation bounds sample age at 100 ms and native
 uncertainty at 500 us, learns a rolling median ready-to-presentation lead, and
 uses fresh matched observations for its floor. Missing feedback remains missing.
+
+Production `playout_preserve_dxgi_feedback=1` changes DXGI feedback ownership:
+pending present identities and refresh anchors survive a presentation-mode
+change, while each mode has its own latency samples and freshness. Valid native
+Present parameters supply the mode attribution; unavailable parameters retain
+the existing requested-mode fallback. A matched frame carries its submission's
+mode epoch into native smoothness feedback. Consecutive frames from that epoch
+can still be compared when a newer submission has already changed mode, but
+intervals across mode epochs cannot authorize padding growth. An older or
+duplicate matched frame cannot rewind the accepted smoothness sequence.
+Actual lifecycle and clock resets still clear this state.
+
+The new path applies only to DXGI. Vulkan feedback keeps its existing fixed-mode
+semantics. A missing or zero flag preserves the historical mode-change reset
+behavior for exact replay; this change does not alter the persisted calibration
+profile version. Waits, native Present arguments, and source-spacing policy
+retain their contracts. Recovered evidence can nevertheless change the predicted
+floor or learned padding. This correction does not establish an optical tearing
+fix or restore the older cadence smoother.
 
 ### 9.3 Delay update and capacity formulas
 

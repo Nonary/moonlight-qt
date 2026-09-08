@@ -14297,6 +14297,13 @@ int main(int argc, char* argv[])
             observation.deadline = referenceDecision.originalScanoutUs;
             observation.latched = referenceDecision.latchedPresentation;
             observation.dxgi = field("native_backend") == kNativeBackendDxgi;
+            const bool recordedDxgiModeValid =
+                referenceController->parameters().playoutPreserveDxgiFeedback &&
+                observation.dxgi && field("native_backend_valid") &&
+                field("native_present_parameters_valid");
+            if (recordedDxgiModeValid) {
+                observation.latched = field("native_present_sync_interval") != 0;
+            }
             const bool fixedVulkanMode = traceHeader.contains("presentation_uncertainty_us") &&
                 field("native_backend") == kNativeBackendVulkan;
             if (fixedVulkanMode) observation.latched = false;
@@ -14314,7 +14321,15 @@ int main(int argc, char* argv[])
             // Recorded presentation latency is an external service sample, not
             // proof of the candidate's actual scanout. Move it with its submission.
             observation.timelineShift = signedDifference(simulatedSubmissionUs, recordedSubmissionUs);
-            observation.latched = fixedVulkanMode ? false : simulatedDecision.latchedPresentation;
+            // An unchanged request retains its recorded native outcome, even
+            // if that outcome differed from the request. A changed candidate
+            // request instead models the current native boundary's own mode.
+            const bool preserveRecordedDxgiMode = recordedDxgiModeValid &&
+                simulatedController->parameters().playoutPreserveDxgiFeedback &&
+                simulatedDecision.latchedPresentation == referenceDecision.latchedPresentation;
+            if (!preserveRecordedDxgiMode) {
+                observation.latched = fixedVulkanMode ? false : simulatedDecision.latchedPresentation;
+            }
             observation.deadline = observation.timelineShift >= 0 ?
                 simulatedDecision.originalScanoutUs - std::min(simulatedDecision.originalScanoutUs, uint64_t(observation.timelineShift)) :
                 simulatedDecision.originalScanoutUs + uint64_t(-observation.timelineShift);

@@ -118,6 +118,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     // path: they each moved the target between frames the source had spaced
     // evenly. Explicit parameters keep older policies replayable.
     VrrTimingParameters parameters;
+    parameters.playoutPreserveDxgiFeedback = 1;
     parameters.playoutNativeHitchAdaptation = 1;
     parameters.playoutReadinessDrivenAdaptation = 1;
     parameters.playoutStableSmoothnessReference = 1;
@@ -184,7 +185,8 @@ VrrTimingController::VrrTimingController(const VrrSessionConfig& config,
                                          const VrrTimingParameters& parameters) :
     m_Config(config),
     m_Parameters(parameters),
-    m_CanLatchPresentation(canLatchPresentation)
+    m_CanLatchPresentation(canLatchPresentation),
+    m_PresentationPrediction(parameters.playoutPreserveDxgiFeedback != 0)
 {
     reset();
 }
@@ -527,7 +529,9 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         (metronomeEnabled() ? delayBeforeUs : effectivePlayoutDelayUs()) :
         m_Parameters.sourcePlayoutDelayUs;
     const uint64_t renderOffsetUs = m_Parameters.playoutPredictionEnabled ? typicalRenderUs() : m_RenderLeadUs;
-    const uint64_t compositorLeadUs = m_Parameters.playoutPredictionEnabled ? m_PresentationPrediction.lead(nowUs) : 0;
+    const bool preserveDxgiFeedback = m_PresentationPrediction.preservesDxgiFeedback();
+    uint64_t compositorLeadUs = m_Parameters.playoutPredictionEnabled && !preserveDxgiFeedback ?
+        m_PresentationPrediction.lead(nowUs) : 0;
     uint64_t targetUs = saturatingAdd(
         addSigned(addSigned(m_SourceTimeUs, m_ReadinessBudgetUs),
                   smoothingUs),
@@ -612,6 +616,15 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         m_LatchedPresentation = m_CanLatchPresentation && m_HaveLastSubmission &&
                                 targetUs < safeAdaptiveUs;
     }
+    const bool cadenceUnstable = rebased || !cadence.eligible ||
+        cadence.sourceRateChanged || cadence.phaseDiscontinuity;
+    if (preserveDxgiFeedback) {
+        // Choose this frame's mode before selecting its service estimate.
+        // A synchronized frame's latency must not lead an adaptive handoff.
+        updateCadenceLatch(cadenceUnstable);
+        compositorLeadUs = m_Parameters.playoutPredictionEnabled ?
+            m_PresentationPrediction.lead(nowUs, m_LatchedPresentation) : 0;
+    }
     const uint64_t unflooredTargetUs = targetUs;
     if (m_Parameters.playoutPredictionEnabled && !m_LatchedPresentation) {
         const auto scanoutFloor = m_PresentationPrediction.floor(nowUs, m_DisplayPeriodUs, m_GuardUs);
@@ -683,55 +696,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.renderLeadUs = m_RenderLeadUs;
     decision.renderWakeLeadUs = m_RenderWakeLeadUs;
     decision.targetWakeLeadUs = m_TargetWakeLeadUs;
-    const uint64_t learnedHeadroomUs = decision.headroomUs;
-    const bool cadenceUnstable = rebased || !cadence.eligible ||
-        cadence.sourceRateChanged || cadence.phaseDiscontinuity;
-    bool cadenceLatchActive = false;
-    if (m_Parameters.cadenceStabilityLatchFrames != 0) {
-        if (cadenceUnstable) {
-            // Immediate tearing presents are only safe after the source phase
-            // has remained coherent. A source hitch followed by a decoder
-            // burst can otherwise queue several adaptive presents into one
-            // scanout interval, overwriting frames and producing a visible
-            // fluidity break even though the display has ample rate headroom.
-            m_CadenceStabilityLatchFramesRemaining =
-                m_Parameters.cadenceStabilityLatchFrames;
-            cadenceLatchActive = true;
-        }
-        else if (m_CadenceStabilityLatchFramesRemaining != 0) {
-            cadenceLatchActive = true;
-            --m_CadenceStabilityLatchFramesRemaining;
-        }
-    }
-    if (m_Parameters.playoutPerFrameLatch != 0) {
-        // Selected before applying the software floor above. Native latching
-        // carries the frame to the next scanout only when this slot needs it.
-    }
-    else if (!m_CanLatchPresentation) {
-        m_LatchedPresentation = false;
-    }
-    else if (cadenceLatchActive) {
-        m_LatchedPresentation = true;
-    }
-    else if (m_LatchedPresentation) {
-        // Production requires the full exit threshold so small guard or
-        // cadence fluctuations cannot bounce a borderline stream between
-        // adaptive and latched presentation. The base-guard shortcut remains
-        // parameterized only to reproduce captures made under the legacy
-        // absolute/scaled latch policies.
-        if (learnedHeadroomUs >=
-                latchedPresentationExitHeadroomUs() ||
-            (m_Parameters.latchedPresentationBaseGuardExit != 0 &&
-             m_GuardUs == m_BaseGuardUs &&
-             learnedHeadroomUs >=
-                latchedPresentationHeadroomUs())) {
-            m_LatchedPresentation = false;
-        }
-    }
-    else if (learnedHeadroomUs <
-             latchedPresentationHeadroomUs()) {
-        m_LatchedPresentation = true;
-    }
+    if (!preserveDxgiFeedback) updateCadenceLatch(cadenceUnstable);
     decision.latchedPresentation = m_LatchedPresentation;
     decision.usedRtpTimestamp = cadence.usedRtpTimestamp;
     decision.cadenceEligible = !rebased && cadence.eligible;
@@ -806,6 +771,57 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         resetCadenceSmoothing();
     }
     return decision;
+}
+
+void VrrTimingController::updateCadenceLatch(bool cadenceUnstable)
+{
+    const uint64_t learnedHeadroomUs = headroomUs();
+    bool cadenceLatchActive = false;
+    if (m_Parameters.cadenceStabilityLatchFrames != 0) {
+        if (cadenceUnstable) {
+            // Immediate tearing presents are only safe after the source phase
+            // has remained coherent. A source hitch followed by a decoder
+            // burst can otherwise queue several adaptive presents into one
+            // scanout interval, overwriting frames and producing a visible
+            // fluidity break even though the display has ample rate headroom.
+            m_CadenceStabilityLatchFramesRemaining =
+                m_Parameters.cadenceStabilityLatchFrames;
+            cadenceLatchActive = true;
+        }
+        else if (m_CadenceStabilityLatchFramesRemaining != 0) {
+            cadenceLatchActive = true;
+            --m_CadenceStabilityLatchFramesRemaining;
+        }
+    }
+    if (m_Parameters.playoutPerFrameLatch != 0) {
+        // Selected before applying the software floor above. Native latching
+        // carries the frame to the next scanout only when this slot needs it.
+    }
+    else if (!m_CanLatchPresentation) {
+        m_LatchedPresentation = false;
+    }
+    else if (cadenceLatchActive) {
+        m_LatchedPresentation = true;
+    }
+    else if (m_LatchedPresentation) {
+        // Production requires the full exit threshold so small guard or
+        // cadence fluctuations cannot bounce a borderline stream between
+        // adaptive and latched presentation. The base-guard shortcut remains
+        // parameterized only to reproduce captures made under the legacy
+        // absolute/scaled latch policies.
+        if (learnedHeadroomUs >=
+                latchedPresentationExitHeadroomUs() ||
+            (m_Parameters.latchedPresentationBaseGuardExit != 0 &&
+             m_GuardUs == m_BaseGuardUs &&
+             learnedHeadroomUs >=
+                latchedPresentationHeadroomUs())) {
+            m_LatchedPresentation = false;
+        }
+    }
+    else if (learnedHeadroomUs <
+             latchedPresentationHeadroomUs()) {
+        m_LatchedPresentation = true;
+    }
 }
 
 void VrrTimingController::resetCadenceSmoothing()
@@ -1526,7 +1542,11 @@ void VrrTimingController::notePresentation(const Vrr13::PresentationObservation&
         m_PresentationPrediction.observe(observation);
         return;
     }
-    if (observation.submitted) {
+    if (observation.submitted &&
+            !(m_Parameters.playoutPreserveDxgiFeedback && observation.dxgi)) {
+        // Historical/non-DXGI behavior breaks at submission time. The new
+        // DXGI path carries the matched frame's epoch through the predictor,
+        // so delayed old-mode feedback cannot erase a newer valid sequence.
         if (m_FeedbackModeValid && m_FeedbackLatched != observation.latched)
             m_NativeSmoothness.breakSequence();
         m_FeedbackModeValid = true;

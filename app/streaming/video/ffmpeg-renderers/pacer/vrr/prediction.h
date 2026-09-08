@@ -65,45 +65,88 @@ struct PresentationObservation {
 // the timestamp of the PresentCount accompanying it. Missing evidence stays missing.
 class PresentationPrediction {
 public:
+    explicit PresentationPrediction(bool preserveDxgiFeedback = false) :
+        m_PreserveDxgiFeedback(preserveDxgiFeedback) {}
+
+    bool preservesDxgiFeedback() const { return m_DxgiModeHistory; }
+
     void observe(const PresentationObservation& o) {
         observe(o, [](const SmoothnessFeedback::Sample&, uint64_t) {});
     }
     template<class Observer>
     void observe(const PresentationObservation& o, Observer&& onPresentation) {
-        if (o.submitted && o.idValid) {
-            if (m_HaveMode && o.latched != m_Latched) reset();
+        // A cancelled frame carries no backend identity or presentation evidence.
+        if (!o.submitted && !o.sampleValid) return;
+        const bool preserve = m_PreserveDxgiFeedback && o.dxgi;
+        if (m_HaveMode && preserve != m_DxgiModeHistory) reset();
+        m_DxgiModeHistory = preserve;
+        if (o.submitted && (o.idValid || preserve)) {
+            if (m_HaveMode && o.latched != m_Latched) {
+                if (preserve) ++m_ModeEpoch;
+                else reset();
+            }
+            else if (!m_HaveMode && preserve) m_ModeEpoch = 1;
             m_HaveMode = true; m_Latched = o.latched;
-            m_Pending[m_Next++ % m_Pending.size()] = {o.id, o.submission, o.ready, o.deadline, 0, o.timelineShift, o.smoothness};
+            // Even an unidentifiable submission changes the mode epoch, but
+            // it cannot create an identity that later statistics may match.
+            if (o.idValid) {
+                m_Pending[m_Next++ % m_Pending.size()] = {
+                    o.id, o.submission, o.ready, o.deadline, 0,
+                    o.timelineShift, o.smoothness, o.latched,
+                    preserve ? m_ModeEpoch : 0, 0};
+            }
         }
         if (!o.sampleValid || !o.sampleTime || o.sampleTime > o.observed ||
             o.observed - o.sampleTime > 100000 || o.uncertainty > 500) return;
         if (o.dxgi) {
-            m_Anchors[m_NextAnchor++ % m_Anchors.size()] = {o.syncRefresh, o.sampleTime};
-            for (auto& p : m_Pending) if (p.at && p.id == o.sampleId) p.refresh = o.presentRefresh;
+            m_Anchors[m_NextAnchor++ % m_Anchors.size()] = {
+                o.syncRefresh, o.sampleTime, o.uncertainty};
+            for (auto& p : m_Pending) if (p.at && p.id == o.sampleId) {
+                p.refresh = o.presentRefresh;
+                p.refreshUncertainty = o.uncertainty;
+            }
         }
         for (size_t i = 0; i < m_Pending.size(); ++i) {
             auto& p = m_Pending[(m_Next + i) % m_Pending.size()];
             if (!p.at) continue;
             uint64_t presented = 0;
+            uint64_t uncertainty = o.uncertainty;
             if (o.dxgi && p.refresh) {
-                for (const auto& a : m_Anchors) if (a.sequence == p.refresh) presented = a.at;
+                for (const auto& a : m_Anchors) if (a.sequence == p.refresh) {
+                    presented = a.at;
+                    if (preserve) uncertainty = std::max(a.uncertainty, p.refreshUncertainty);
+                }
             }
             else if (!o.dxgi && p.id == o.sampleId) presented = o.sampleTime;
             const auto ready = std::max(p.at, p.ready);
             if (presented && presented >= ready && presented <= o.observed &&
                 o.observed - presented <= 100000 && presented - ready <= 100000) {
-                m_Latencies[m_NextLatency++ % m_Latencies.size()] = presented - ready;
-                m_Count = std::min(m_Count + 1, m_Latencies.size());
                 const auto shifted = [](uint64_t time, int64_t shift) {
                     return shift >= 0 ? time + uint64_t(shift) : time - std::min(time, uint64_t(-shift));
                 };
-                m_LastScanout = std::max(m_LastScanout, shifted(presented, p.shift));
-                m_Observed = shifted(o.observed, o.timelineShift);
+                const auto scanout = shifted(presented, p.shift);
+                const auto observed = shifted(o.observed, o.timelineShift);
+                if (preserve) {
+                    auto& bank = m_ModeLatencies[p.latched ? 1 : 0];
+                    if (bank.scanout && observed >= bank.scanout && observed - bank.scanout > 100000)
+                        bank = {};
+                    bank.values[bank.next++ % bank.values.size()] = presented - ready;
+                    bank.count = std::min(bank.count + 1, bank.values.size());
+                    bank.scanout = std::max(bank.scanout, scanout);
+                    bank.observed = std::max(bank.observed, observed);
+                }
+                else {
+                    m_Latencies[m_NextLatency++ % m_Latencies.size()] = presented - ready;
+                    m_Count = std::min(m_Count + 1, m_Latencies.size());
+                }
+                m_LastScanout = std::max(m_LastScanout, scanout);
+                m_Observed = preserve ? std::max(m_Observed, observed) : observed;
                 ++m_Measured;
                 m_Misses += presented > p.deadline ? presented - p.deadline > 3000 : p.deadline - presented > 3000;
                 auto sample = p.smoothness;
-                sample.at = shifted(presented, p.shift);
-                sample.uncertainty = o.uncertainty;
+                sample.at = scanout;
+                sample.uncertainty = uncertainty;
+                sample.presentationEpoch = preserve ? p.modeEpoch : 0;
                 onPresentation(sample, m_Observed);
                 p = {};
             }
@@ -111,6 +154,16 @@ public:
         }
     }
     uint64_t lead(uint64_t now) const {
+        return lead(now, m_Latched);
+    }
+    uint64_t lead(uint64_t now, bool latched) const {
+        if (m_DxgiModeHistory) {
+            const auto& bank = m_ModeLatencies[latched ? 1 : 0];
+            if (!bank.count || !fresh(now, bank.scanout, bank.observed)) return 0;
+            auto values = bank.values;
+            std::sort(values.begin(), values.begin() + bank.count);
+            return values[(bank.count - 1) / 2];
+        }
         if (!fresh(now) || !m_Count) return 0;
         auto values = m_Latencies;
         std::sort(values.begin(), values.begin() + m_Count);
@@ -121,19 +174,37 @@ public:
     }
     uint64_t measured() const { return m_Measured; }
     uint64_t misses() const { return m_Misses; }
-    void reset() { *this = PresentationPrediction{}; }
+    void reset() { *this = PresentationPrediction{m_PreserveDxgiFeedback}; }
 private:
+    static bool fresh(uint64_t now, uint64_t scanout, uint64_t observed) {
+        return scanout && now >= scanout && now - scanout <= 100000 &&
+            now >= observed && now - observed <= 100000;
+    }
     bool fresh(uint64_t now) const {
         return m_LastScanout && now >= m_LastScanout && now - m_LastScanout <= 100000 &&
             now >= m_Observed && now - m_Observed <= 100000;
     }
-    struct Pending { uint64_t id = 0, at = 0, ready = 0, deadline = 0, refresh = 0; int64_t shift = 0; SmoothnessFeedback::Sample smoothness; };
-    struct Anchor { uint64_t sequence = 0, at = 0; };
+    struct Pending {
+        uint64_t id = 0, at = 0, ready = 0, deadline = 0, refresh = 0;
+        int64_t shift = 0;
+        SmoothnessFeedback::Sample smoothness;
+        bool latched = false;
+        uint64_t modeEpoch = 0, refreshUncertainty = 0;
+    };
+    struct Anchor { uint64_t sequence = 0, at = 0, uncertainty = 0; };
+    struct LatencyBank {
+        std::array<uint64_t, 128> values{};
+        size_t next = 0, count = 0;
+        uint64_t scanout = 0, observed = 0;
+    };
     std::array<Pending, 128> m_Pending{};
     std::array<Anchor, 128> m_Anchors{};
     std::array<uint64_t, 128> m_Latencies{};
+    std::array<LatencyBank, 2> m_ModeLatencies{};
     size_t m_Next = 0, m_NextAnchor = 0, m_NextLatency = 0, m_Count = 0;
     uint64_t m_LastScanout = 0, m_Observed = 0, m_Measured = 0, m_Misses = 0;
     bool m_HaveMode = false, m_Latched = false;
+    bool m_PreserveDxgiFeedback = false, m_DxgiModeHistory = false;
+    uint64_t m_ModeEpoch = 0;
 };
 }
