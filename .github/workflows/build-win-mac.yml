@@ -78,6 +78,46 @@ jobs:
         env:
           QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
 
+      - name: Build VRR diagnostics (Windows x64)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`scripts\vswhere.exe -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+          set "PATH=%QT_PATH%;%PATH%"
+          mkdir build\tests-vrr
+          cd build\tests-vrr
+          qmake ..\..\tests\tests.pro CONFIG+=tests CONFIG+=release
+          if errorlevel 1 exit /b 1
+          nmake
+          if errorlevel 1 exit /b 1
+        env:
+          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
+
+      - name: Test and package VRR diagnostics (Windows x64)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $deploy = (Resolve-Path build/deploy-x64-release).Path
+          $env:Path = "$deploy;$env:QT_PATH;$env:Path"
+          $tests = Get-ChildItem build/tests-vrr/vrr/release/tst_*.exe
+          if ($tests.Count -lt 8) { throw "Missing VRR test executables" }
+          foreach ($test in $tests) {
+            & $test.FullName
+            if ($LASTEXITCODE -ne 0) { throw "$($test.Name) failed: $LASTEXITCODE" }
+          }
+          Copy-Item build/tests-vrr/vrr/release/vrrreplay.exe $deploy
+          Copy-Item scripts/decode-vrr-trace.py $deploy
+          & "$deploy/vrrreplay.exe" --help
+          if ($LASTEXITCODE -ne 0) { throw "Packaged replay smoke test failed" }
+          if (!(Test-Path "$deploy/portable.dat.inactive") -or (Test-Path "$deploy/portable.dat")) {
+            throw "Incorrect portable settings marker"
+          }
+          Compress-Archive -Path "$deploy/*" -CompressionLevel Optimal -Force `
+            -DestinationPath "build/installer-x64-release/MoonlightPortable-x64-$env:CI_VERSION.zip"
+        env:
+          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
+
       - name: Build ARM64 binaries (Windows)
         if: runner.os == 'Windows'
         shell: cmd
