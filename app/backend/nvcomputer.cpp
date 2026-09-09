@@ -1,4 +1,5 @@
 #include "nvcomputer.h"
+#include "framelimitercapabilities.h"
 #include "nvapp.h"
 #include "settings/compatfetcher.h"
 
@@ -162,6 +163,12 @@ NvComputer::NvComputer(NvHTTP& http, QString serverInfo)
     else {
         this->maxLumaPixelsHEVC = 0;
     }
+
+    const auto limiter = FrameLimiterCapabilities::fromServerInfo(serverInfo);
+    this->frameLimiterSupported = limiter.supported;
+    this->frameLimiterEnabled = limiter.enabled;
+    this->virtualDisplayFrameLimiterEnabled = limiter.virtualDisplayEnabled;
+    this->frameLimiterFpsLimitMilliHz = limiter.fpsLimitMilliHz;
 
     this->displayModes = NvHTTP::getDisplayModeList(serverInfo);
     std::stable_sort(this->displayModes.begin(), this->displayModes.end(),
@@ -560,6 +567,10 @@ bool NvComputer::update(const NvComputer& that)
     ASSIGN_IF_CHANGED(externalPort);
     ASSIGN_IF_CHANGED(pairState);
     ASSIGN_IF_CHANGED(serverCodecModeSupport);
+    ASSIGN_IF_CHANGED(frameLimiterSupported);
+    ASSIGN_IF_CHANGED(frameLimiterEnabled);
+    ASSIGN_IF_CHANGED(virtualDisplayFrameLimiterEnabled);
+    ASSIGN_IF_CHANGED(frameLimiterFpsLimitMilliHz);
     ASSIGN_IF_CHANGED(currentGameId);
     ASSIGN_IF_CHANGED(activeAddress);
     ASSIGN_IF_CHANGED(state);

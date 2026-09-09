@@ -20,6 +20,11 @@ build, or test run was part of this documentation investigation. Recheck the
 named functions after changes; comments, diagnostic labels, and old experiments
 can disagree with the active implementation. The historical D3D11 latch mismatch described below
 is one concrete example; the current native boundary now forwards the selected interval.
+Updated on 2026-09-08: the dropdown again offers the original below-refresh
+VRR recommendation and Low-latency VRR choice. Production uses
+`playout_adaptive_only=1`: neither source-rate thresholds nor late frames
+switch adaptive presentation to V-Sync. Historical latching policies remain
+available for replay, with the new field defaulting to zero for old captures.
 
 [AGENTS.md](AGENTS.md) owns machine-specific build, deployment, and capture
 procedures. This document owns the architecture explanation. Keep both current
@@ -119,8 +124,11 @@ Legacy frame pacing defaults off. The default requested stream is 720p60.
 These are defaults, not evidence of the user's current saved settings.
 
 The FPS picker is advisory. Fixed 30 and 60 FPS remain available. When V-sync
-and VRR are requested, usable display refresh rates contribute native VRR FPS
-choices. Reduced-rate Low Latency VRR recommendations have been removed.
+and VRR are requested, usable display refresh rates contribute VRR choices at
+`floor(refresh - refresh^2 / 3600)` and Low-latency VRR choices at
+`floor(refresh / 6) * 5`, restoring the original dropdown calculations
+(116 and 100 FPS at 120 Hz; 138 and 120 FPS at 144 Hz). Native rates remain
+available with VRR disabled or as saved custom values.
 A saved custom FPS remains selectable. Toggling VRR does not rewrite saved FPS;
 `m_StreamConfig.fps` receives the requested preference.
 
@@ -143,7 +151,34 @@ Unsupported presentation or failed worker initialization falls back to the
 legacy path. A UI checkbox alone cannot establish DXGI capability, active
 adaptive presentation, or that the physical panel is varying refresh.
 
-### 3.2 What the host is told
+### 3.2 Host frame-limiter discovery
+
+Vibeshine advertises optional `/serverinfo` fields `FrameLimiterSupported`,
+`FrameLimiterEnabled`, `VirtualDisplayFrameLimiterEnabled` (integer booleans),
+and
+`FrameLimiterFpsLimitMilliHz` (zero follows stream FPS). The protocol is
+brand-independent and can also be implemented by Vibepollo. Missing flags
+mean no advertised integration; capabilities are ephemeral and refreshed on
+host polling, including clearing them after downgrading a host.
+
+`FrameLimiterEnabled` reports limiting for the configured host display path:
+either the manual limiter is enabled with an applicable provider, or virtual
+display mode is selected and automatic virtual-display limiting is enabled.
+Windows does not require the manual checkbox for the automatic path. Linux
+also requires a selected Linux limiter provider. The separate virtual-display
+flag reports automatic policy availability, not activation on physical outputs.
+These are configuration reports, not per-game proof of provider availability,
+successful application, or app/client display overrides.
+
+With VRR and configuration warnings enabled, the game list shows one inline
+note when integration is absent, limiting is disabled, or an enabled limiter's
+FPS override differs from Moonlight. Automatic virtual-display limiting counts
+as enabled for the configured virtual-display path and suppresses the warning.
+Only hosts without integration get installation guidance; integrated hosts get
+limiter configuration guidance. Game V-Sync is not advertised as an alternative.
+No new launch toasts or in-stream notifications are generated.
+
+### 3.3 What the host is told
 
 Session setup fills `STREAM_CONFIGURATION` with FPS, dimensions, bitrate,
 colorspace/range, encryption, codec capabilities, and other connection choices.
@@ -489,15 +524,25 @@ qualifying projections, so one early timestamp does not shift the entire stream.
 A late frame can clamp to the present execution opportunity while the next
 frame retains its own source slot.
 
-For a backend that supports per-frame latching, production tests the planned
-target against `lastSubmission + displayPeriod + guard`. A target earlier than
-that boundary requests latching. This decision occurs before applying the
-adaptive presentation-prediction floor. Unlatched predicted presentation can
-raise the target using a fresh scanout observation: it converts that scanout
-floor back to a submission floor by subtracting the learned compositor lead,
-bounded at zero. Thus it does not directly equate submission with scanout.
-Then
-`earliestSubmissionUs()` provides another lower bound.
+Production sets `playout_adaptive_only=1` and disables both source-rate and
+per-frame latch selection. Initialization, timeline resets, and every scheduling
+path keep `latchedPresentation=false`, including native-rate sources and late
+CPU/GPU work. D3D11 therefore requests `Present(0, DXGI_PRESENT_ALLOW_TEARING)`;
+Vulkan keeps its adaptive swapchain mode. The existing adaptive software floors
+remain active. Sources above sustainable display throughput may shed frames;
+this policy does not promise tear-free output or full-rate delivery at the ceiling.
+
+Historical replay parameters can still select `Present(1, 0)` or FIFO. With
+`playout_adaptive_only=0`, `playout_rate_protection_enabled` uses the shared
+`floor(refreshHz - refreshHz * refreshHz / 3600)` cutoff; the older per-frame
+rule compares the target with `lastSubmission + displayPeriod + guard`.
+The adaptive-only field takes precedence when combined with either old mode.
+The new field defaults to zero when absent so old captures retain their policy.
+
+Unlatched predicted presentation can raise the target using a fresh scanout
+observation, converting that floor back to submission time by subtracting
+learned compositor lead, bounded at zero. `earliestSubmissionUs()` supplies
+another lower bound.
 
 Normally that earliest submission is `lastSubmission + displayPeriod + guard`.
 With `latchedFloorDisabled` and a latched decision it returns zero. This is a

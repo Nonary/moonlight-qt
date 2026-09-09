@@ -414,6 +414,12 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutDelayAdaptive > 1) {
         return fail("playout_delay_adaptive must be 0 or 1");
     }
+    if (value.playoutAdaptiveOnly > 1) {
+        return fail("playout_adaptive_only must be 0 or 1");
+    }
+    if (value.playoutRateProtectionEnabled > 1) {
+        return fail("playout_rate_protection_enabled must be 0 or 1");
+    }
     if (value.playoutSmoothnessFeedbackEnabled > 1 || value.playoutHistoryEnabled > 1 || value.playoutPerFrameLatch > 1 || value.playoutPredictionEnabled > 1) {
         return fail("history, prediction, smoothness feedback and per-frame latch flags must be 0 or 1");
     }

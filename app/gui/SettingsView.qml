@@ -572,6 +572,8 @@ Flickable {
                             switch (choice.kind) {
                             case "vrr":
                                 return qsTr("VRR (%1 FPS)").arg(choice.video_fps)
+                            case "low-latency-vrr":
+                                return qsTr("Low-latency VRR (%1 FPS)").arg(choice.video_fps)
                             case "custom":
                                 return qsTr("Custom (%1 FPS)").arg(choice.video_fps)
                             default:
@@ -858,7 +860,7 @@ Flickable {
                         ToolTip.timeout: 5000
                         ToolTip.visible: hovered
                         ToolTip.text: enabled ?
-                                          qsTr("VRR uses paced adaptive presentation with best-effort tear avoidance. Sessions without enough refresh-rate headroom use fixed V-Sync. Borderless fullscreen is used while VRR is active.")
+                                          qsTr("VRR uses adaptive presentation in borderless fullscreen. For smooth results, choose a below-refresh FPS and limit the game to the same FPS using host integration or a game/driver frame limiter.")
                                         :
                                           qsTr("VRR requires V-Sync. Enable V-Sync to change this setting.")
                     }

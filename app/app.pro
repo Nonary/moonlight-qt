@@ -224,6 +224,7 @@ HEADERS += \
     backend/computerseeker.h \
     backend/identitymanager.h \
     backend/nvcomputer.h \
+    backend/framelimitercapabilities.h \
     backend/nvhttp.h \
     backend/nvpairingmanager.h \
     backend/computermanager.h \

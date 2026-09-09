@@ -401,6 +401,9 @@ QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRate
         case VrrFpsChoiceKind::Vrr:
             item.insert("kind", "vrr");
             break;
+        case VrrFpsChoiceKind::LowLatencyVrr:
+            item.insert("kind", "low-latency-vrr");
+            break;
         case VrrFpsChoiceKind::Custom:
             item.insert("kind", "custom");
             break;

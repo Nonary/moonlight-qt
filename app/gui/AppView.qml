@@ -2,6 +2,7 @@ import QtQuick 2.9
 import QtQuick.Controls 2.2
 import QtQuick.Controls.Material 2.2
 
+import StreamingPreferences 1.0
 import AppModel 1.0
 import ComputerManager 1.0
 import SdlGamepadKeyNavigation 1.0
@@ -63,9 +64,32 @@ CenteredGridView {
 
     function createModel()
     {
-        var model = Qt.createQmlObject('import AppModel 1.0; AppModel {}', parent, '')
+        var model = Qt.createQmlObject('import StreamingPreferences 1.0
+import AppModel 1.0; AppModel {}', parent, '')
         model.initialize(ComputerManager, computerIndex, showHiddenGames)
         return model
+    }
+
+    // A single inline note, never a launch popup or in-stream overlay.
+    header: Label {
+        width: appGrid.width - appGrid.leftMargin - appGrid.rightMargin
+        visible: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr &&
+                 StreamingPreferences.configurationWarnings &&
+                 (!appModel.frameLimiterSupported || !appModel.frameLimiterEnabled ||
+                  (appModel.frameLimiterFpsLimit > 0 &&
+                   appModel.frameLimiterFpsLimit !== StreamingPreferences.fps))
+        height: visible ? implicitHeight + 16 : 0
+        wrapMode: Text.WordWrap
+        font.pointSize: 10
+        text: {
+            var fps = StreamingPreferences.fps
+            if (!appModel.frameLimiterSupported)
+                return qsTr("For smooth VRR, limit the game to %1 FPS to match Moonlight. Install Vibeshine/Vibepollo for automatic frame limiting, or set a game/driver limiter. Unmatched rates can cause stutter.").arg(fps)
+            if (appModel.frameLimiterEnabled &&
+                appModel.frameLimiterFpsLimit > 0 && appModel.frameLimiterFpsLimit !== fps)
+                return qsTr("For smooth VRR, change the host's frame limit from %1 to %2 FPS to match Moonlight, or let it follow the stream FPS.").arg(appModel.frameLimiterFpsLimit).arg(fps)
+            return qsTr("For smooth VRR, enable frame limiting in your host settings or set a game/driver limiter to %1 FPS to match Moonlight. Unmatched rates can cause stutter.").arg(fps)
+        }
     }
 
     model: appModel

@@ -13,6 +13,8 @@ class VrrReplayConfigTest : public QObject
 private slots:
     void defaultsRoundTrip();
     void nativeHitchPolicyRoundTrip();
+    void rateProtectionPolicyRoundTrip();
+    void adaptiveOnlyPolicyRoundTrip();
     void inheritanceAndOverride();
     void controllerSnapshotIsAtomic();
     void rejectsInvalidInput();
@@ -470,6 +472,35 @@ void VrrReplayConfigTest::nativeHitchPolicyRoundTrip()
     QCOMPARE(parameters.playoutNativeHitchAdaptation, uint64_t(1));
     parameters.playoutSmoothnessFeedbackEnabled = 0;
     QVERIFY(!validateVrrTimingParameters(parameters, error));
+}
+
+void VrrReplayConfigTest::adaptiveOnlyPolicyRoundTrip()
+{
+    VrrTimingParameters parameters;
+    QCOMPARE(parameters.playoutAdaptiveOnly, uint64_t(0));
+    QString error;
+    QJsonObject snapshot{{"playout_adaptive_only", 1}};
+    QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, parameters, error), qPrintable(error));
+    QCOMPARE(parameters.playoutAdaptiveOnly, uint64_t(1));
+    snapshot["playout_adaptive_only"] = 2;
+    QVERIFY(!applyVrrReplayControllerSnapshot(snapshot, parameters, error));
+    QVERIFY(error.contains("playout_adaptive_only"));
+    QCOMPARE(parameters.playoutAdaptiveOnly, uint64_t(1));
+}
+
+void VrrReplayConfigTest::rateProtectionPolicyRoundTrip()
+{
+    VrrTimingParameters parameters;
+    // Captures from before rate protection retain their recorded latch rule.
+    QCOMPARE(parameters.playoutRateProtectionEnabled, uint64_t(0));
+    QString error;
+    QJsonObject snapshot{{"playout_rate_protection_enabled", 1}};
+    QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, parameters, error), qPrintable(error));
+    QCOMPARE(parameters.playoutRateProtectionEnabled, uint64_t(1));
+    snapshot["playout_rate_protection_enabled"] = 2;
+    QVERIFY(!applyVrrReplayControllerSnapshot(snapshot, parameters, error));
+    QVERIFY(error.contains("playout_rate_protection_enabled"));
+    QCOMPARE(parameters.playoutRateProtectionEnabled, uint64_t(1));
 }
 
 void VrrReplayConfigTest::rasterEnvelope()

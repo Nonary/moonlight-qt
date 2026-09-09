@@ -31,9 +31,17 @@ int VrrRatePolicy::vrrRateForRefresh(int refreshHz)
         return 0;
     }
 
-    // The playout buffer absorbs receiver jitter. The presenter decides whether
-    // each frame can flip immediately or must wait for the next scanout.
-    return refreshHz;
+    // Use the original below-refresh recommendation and integer rounding.
+    return protectedRateForRefresh(refreshHz);
+}
+
+int VrrRatePolicy::lowLatencyRateForRefresh(int refreshHz)
+{
+    if (!isUsableRefreshRate(refreshHz)) {
+        return 0;
+    }
+
+    return (refreshHz / 6) * 5;
 }
 
 bool VrrRatePolicy::hasAdaptiveHeadroom(int streamRateHz, int displayRefreshHz)
@@ -63,6 +71,7 @@ std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& re
 
         if (vrrEnabled) {
             addChoice(choices, vrrRateForRefresh(refreshHz), VrrFpsChoiceKind::Vrr);
+            addChoice(choices, lowLatencyRateForRefresh(refreshHz), VrrFpsChoiceKind::LowLatencyVrr);
         }
         else {
             addChoice(choices, refreshHz, VrrFpsChoiceKind::Fixed);

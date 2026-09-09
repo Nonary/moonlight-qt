@@ -10,6 +10,7 @@ incomingtiming.file = $$PWD/incomingtiming.pro
 SUBDIRS += incomingtiming
 
 timingcontroller.file = $$PWD/timingcontroller.pro
+framelimitercapabilities.file = $$PWD/framelimitercapabilities.pro
 ratepolicy.file = $$PWD/ratepolicy.pro
 pacingworker.file = $$PWD/pacingworker.pro
 replay.file = $$PWD/replay.pro
@@ -19,6 +20,7 @@ queuesim.file = $$PWD/queuesim.pro
 SUBDIRS += \
     timingcontroller \
     ratepolicy \
+    framelimitercapabilities \
     pacingworker \
     replay \
     replayconfig \

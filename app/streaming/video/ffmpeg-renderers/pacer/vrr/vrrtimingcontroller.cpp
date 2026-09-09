@@ -1,4 +1,5 @@
 #include "vrrtimingcontroller.h"
+#include "../../../../vrrratepolicy.h"
 
 #include <algorithm>
 #include <limits>
@@ -125,7 +126,9 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutPredictionEnabled = 1;
     parameters.playoutSmoothnessFeedbackEnabled = 1;
     parameters.playoutDelayAttackUs = 500;
-    parameters.playoutPerFrameLatch = 1;
+    parameters.playoutAdaptiveOnly = 1;
+    parameters.playoutPerFrameLatch = 0;
+    parameters.playoutRateProtectionEnabled = 0;
     parameters.playoutHistoryEnabled = 1;
     parameters.timestampPlayoutEnabled = 1;
     parameters.playoutDelayAdaptive = 1;
@@ -229,7 +232,9 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_SourcePeriodUs = std::max<uint64_t>(
         1, roundedQ16(m_SourcePeriodUsQ16));
     m_MetronomePeriodUsQ16 = m_ConfiguredStreamPeriodQ16;
-    m_LatchedPresentation = m_CanLatchPresentation && m_SourcePeriodUs <
+    m_LatchedPresentation = m_Parameters.playoutAdaptiveOnly ? false :
+        m_Parameters.playoutRateProtectionEnabled ?
+        rateProtectedPresentation() : m_CanLatchPresentation && m_SourcePeriodUs <
         saturatingAdd(m_DisplayPeriodUs,
                       latchedPresentationHeadroomUs());
     m_ReadinessBudgetUs = 0;
@@ -604,7 +609,16 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                               m_Parameters.presentationSafetyUs)));
     }
 
-    if (m_Parameters.playoutPerFrameLatch != 0) {
+    if (m_Parameters.playoutAdaptiveOnly != 0) {
+        m_LatchedPresentation = false;
+    }
+    else if (m_Parameters.playoutRateProtectionEnabled != 0) {
+        // Stay protected throughout the near-refresh source-rate range,
+        // including the first frame. Late CPU/GPU work must not briefly
+        // switch this range back to an immediate tearing present.
+        m_LatchedPresentation = rateProtectedPresentation();
+    }
+    else if (m_Parameters.playoutPerFrameLatch != 0) {
         // Judge this frame's planned submission, not a fitted-FPS band or a
         // multi-frame cooldown after jitter. The buffer already protects cadence.
         const uint64_t safeAdaptiveUs = saturatingAdd(m_LastSubmissionUs,
@@ -703,7 +717,11 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             --m_CadenceStabilityLatchFramesRemaining;
         }
     }
-    if (m_Parameters.playoutPerFrameLatch != 0) {
+    if (m_Parameters.playoutAdaptiveOnly != 0) {
+        m_LatchedPresentation = false;
+    }
+    else if (m_Parameters.playoutRateProtectionEnabled != 0 ||
+            m_Parameters.playoutPerFrameLatch != 0) {
         // Selected before applying the software floor above. Native latching
         // carries the frame to the next scanout only when this slot needs it.
     }
@@ -1757,6 +1775,16 @@ uint64_t VrrTimingController::scaledDisplayPeriodUs(
         return maximum;
     }
     return m_DisplayPeriodUs * numerator / denominator;
+}
+
+bool VrrTimingController::rateProtectedPresentation() const
+{
+    const int cutoffHz = VrrRatePolicy::protectedRateForRefresh(m_Config.displayRefreshHz);
+    // Compare at the controller's microsecond resolution so RTP quantization
+    // around an exact integer cutoff does not toggle presentation modes.
+    // The configured rate seeds this period until the source fit is available.
+    return m_CanLatchPresentation && cutoffHz > 0 &&
+        m_SourcePeriodUs <= periodForRate(cutoffHz, 0);
 }
 
 uint64_t VrrTimingController::latchedPresentationHeadroomUs() const

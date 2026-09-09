@@ -7,6 +7,27 @@ AppModel::AppModel(QObject *parent)
             this, &AppModel::handleBoxArtLoaded);
 }
 
+bool AppModel::frameLimiterSupported() const { return m_FrameLimiterSupported; }
+bool AppModel::frameLimiterEnabled() const { return m_FrameLimiterEnabled; }
+bool AppModel::virtualDisplayFrameLimiterEnabled() const { return m_VirtualDisplayFrameLimiterEnabled; }
+double AppModel::frameLimiterFpsLimit() const { return m_FrameLimiterFpsLimit; }
+
+void AppModel::updateFrameLimiterCapabilities()
+{
+    // Snapshot discovery state; QML getters use only this GUI-thread cache.
+    QReadLocker locker(&m_Computer->lock);
+    const bool changed = m_FrameLimiterSupported != m_Computer->frameLimiterSupported ||
+        m_FrameLimiterEnabled != m_Computer->frameLimiterEnabled ||
+        m_VirtualDisplayFrameLimiterEnabled != m_Computer->virtualDisplayFrameLimiterEnabled ||
+        m_FrameLimiterFpsLimit != m_Computer->frameLimiterFpsLimitMilliHz / 1000.0;
+    m_FrameLimiterSupported = m_Computer->frameLimiterSupported;
+    m_FrameLimiterEnabled = m_Computer->frameLimiterEnabled;
+    m_VirtualDisplayFrameLimiterEnabled = m_Computer->virtualDisplayFrameLimiterEnabled;
+    m_FrameLimiterFpsLimit = m_Computer->frameLimiterFpsLimitMilliHz / 1000.0;
+    locker.unlock();
+    if (changed) emit frameLimiterChanged();
+}
+
 void AppModel::initialize(ComputerManager* computerManager, int computerIndex, bool showHiddenGames)
 {
     m_ComputerManager = computerManager;
@@ -19,6 +40,7 @@ void AppModel::initialize(ComputerManager* computerManager, int computerIndex, b
     m_ShowHiddenGames = showHiddenGames;
 
     updateAppList(m_Computer->appList);
+    updateFrameLimiterCapabilities();
 }
 
 int AppModel::getRunningAppId()
@@ -256,6 +278,8 @@ void AppModel::handleComputerStateChanged(NvComputer* computer)
     if (computer != m_Computer) {
         return;
     }
+
+    updateFrameLimiterCapabilities();
 
     // If the computer has gone offline or we've been unpaired,
     // signal the UI so we can go back to the PC view.

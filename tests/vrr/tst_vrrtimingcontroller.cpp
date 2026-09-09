@@ -36,6 +36,9 @@ VrrSessionConfig config(int streamRateHz = 60, int displayRefreshHz = 120)
 VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
 {
     auto policy = vrrTimingParametersForSession(session);
+    policy.playoutAdaptiveOnly = 0;
+    policy.playoutPerFrameLatch = 1;
+    policy.playoutRateProtectionEnabled = 0;
     policy.playoutReadinessDrivenAdaptation = 0;
     policy.playoutNativeHitchAdaptation = 0;
     policy.playoutStableSmoothnessReference = 0;
@@ -2518,6 +2521,97 @@ void testPerFrameLatchAtNativeMaximum()
     }
 }
 
+void testProductionRemainsAdaptive()
+{
+    for (int refresh : {60, 120, 144, 240}) {
+        const auto session = config(refresh, refresh);
+        const auto policy = vrrTimingParametersForSession(session);
+        expect(policy.playoutAdaptiveOnly == 1, "production must remain adaptive");
+        VrrTimingController controller(session, true, policy);
+        uint64_t ticks = 0;
+        uint64_t prior = 0;
+        for (int i = 0; i < 900; ++i) {
+            const int rate = i < 300 ? refresh : i < 600 ? refresh - 5 : refresh;
+            ticks += 90000 / rate;
+            const auto arrival = 1000000 + ticks * 1000 / 90;
+            const auto d = controller.schedule(frame(i, uint32_t(ticks), true, arrival),
+                                               std::max(arrival, prior));
+            expect(!d.latchedPresentation, "rate changes and late work must not enable V-Sync");
+            if (prior) expect(d.targetUs >= prior + controller.displayPeriodUs(),
+                              "adaptive production must retain the software spacing floor");
+            prior = d.targetUs + (i % 31 == 0 ? 4000 : 0);
+            controller.noteSubmission(true, false, prior);
+            if (i % 47 == 0) controller.noteSpacingDeficit(200);
+        }
+    }
+}
+
+void testSourceRateProtection()
+{
+    struct Display { int refreshHz; int cutoffHz; };
+    for (const auto display : {Display{60, 59}, Display{120, 116},
+                              Display{144, 138}, Display{165, 157},
+                              Display{240, 224}, Display{360, 324}}) {
+        for (double sourceRate : {display.cutoffHz - 0.25, double(display.cutoffHz),
+                                  display.cutoffHz + 0.25, double(display.refreshHz)}) {
+            for (bool canLatch : {false, true}) {
+                // Negotiate native maximum but learn the actual game rate.
+                const auto session = config(display.refreshHz, display.refreshHz);
+                auto policy = vrrTimingParametersForSession(session);
+                policy.playoutAdaptiveOnly = 0;
+                policy.playoutRateProtectionEnabled = 1;
+                expect(policy.playoutRateProtectionEnabled == 1,
+                       "historical source-rate protection remains replayable");
+                VrrTimingController controller(session, canLatch, policy);
+                for (int i = 0; i < 600; ++i) {
+                    const auto rtp = uint32_t(std::llround(i * 90000.0 / sourceRate));
+                    const auto arrival = 1000000 + uint64_t(rtp) * 1000 / 90 + (i % 9) * 30;
+                    const auto prior = controller.lastSubmissionUs();
+                    const auto now = std::max(arrival, prior);
+                    const auto d = controller.schedule(frame(i, rtp, true, arrival), now);
+                    if (i == 0) {
+                        expect(d.latchedPresentation == canLatch,
+                               "native-rate startup must protect the first frame");
+                    }
+                    if (i > 200) {
+                        expect(d.latchedPresentation == (canLatch && sourceRate >= display.cutoffHz),
+                               "the fitted source rate must select protection inclusively at the old suggested cutoff");
+                    }
+                    if (prior && !d.latchedPresentation) {
+                        expect(d.targetUs >= prior + controller.displayPeriodUs() + d.guardUs,
+                               "adaptive presents must keep the software spacing floor");
+                    }
+                    // Late CPU/GPU completion and guard changes cannot change
+                    // the selected mode while the source stays in this range.
+                    controller.noteSubmission(true, false, d.targetUs + (i % 31 == 0 ? 2000 : 0));
+                    if (i % 47 == 0) controller.noteSpacingDeficit(200);
+                }
+            }
+        }
+    }
+
+    const auto session = config(120, 120);
+    auto policy = vrrTimingParametersForSession(session);
+    policy.playoutAdaptiveOnly = 0;
+    policy.playoutRateProtectionEnabled = 1;
+    VrrTimingController controller(session, true, policy);
+    double ticks = 0;
+    int number = 0;
+    for (int rate : {110, 119, 110}) {
+        for (int i = 0; i < 600; ++i, ++number) {
+            ticks += 90000.0 / rate;
+            const auto rtp = uint32_t(std::llround(ticks));
+            const auto at = 1000000 + uint64_t(rtp) * 1000 / 90;
+            const auto d = controller.schedule(frame(number, rtp, true, at), at);
+            if (i > 300) {
+                expect(d.latchedPresentation == (rate >= 116),
+                       "source rate changes must enter protection and return to adaptive presentation");
+            }
+            controller.noteSubmission(true, false, d.targetUs);
+        }
+    }
+}
+
 void testProcessingEpisodeClassification()
 {
     using R = Vrr13::Reserve;
@@ -3109,6 +3203,8 @@ int main()
     testVrr14Prediction();
     testProcessingEpisodeClassification();
     testPerFrameLatchAtNativeMaximum();
+    testProductionRemainsAdaptive();
+    testSourceRateProtection();
     testRollingPlayoutHistory();
     testHistoryPreservesVrr13Scheduling();
     testHistoryLearningAndQueueCapacity();

@@ -25,6 +25,8 @@
     X(uint64_t, playout_smoothness_feedback_enabled, playoutSmoothnessFeedbackEnabled, 0) \
     X(uint64_t, playout_prediction_enabled, playoutPredictionEnabled, 0) \
     X(uint64_t, playout_per_frame_latch, playoutPerFrameLatch, 0) \
+    X(uint64_t, playout_adaptive_only, playoutAdaptiveOnly, 0) \
+    X(uint64_t, playout_rate_protection_enabled, playoutRateProtectionEnabled, 0) \
     X(uint64_t, playout_history_enabled, playoutHistoryEnabled, 0) \
     X(uint64_t, maximum_forward_movement_us, maximumForwardMovementUs, 1000000) \
     X(uint64_t, render_lead_floor_us, renderLeadFloorUs, 1000) \
@@ -417,6 +419,7 @@ private:
     uint64_t readinessCeilingUs() const;
     uint64_t guardCeilingUs() const;
     uint64_t latchedPresentationHeadroomUs() const;
+    bool rateProtectedPresentation() const;
     uint64_t latchedPresentationExitHeadroomUs() const;
     uint64_t scaledDisplayPeriodUs(uint64_t numerator,
                                    uint64_t denominator) const;

@@ -1153,3 +1153,12 @@ To include these targets in a top-level developer build, the integration
 project should add `tests` to its `SUBDIRS` only inside
 `contains(CONFIG, tests)`. That wiring is intentionally outside this test-only
 directory.
+
+
+### Adaptive-only production presentation
+
+Production sets `playout_adaptive_only=1` and no longer switches to synchronized
+presentation near refresh or during jitter. Adaptive software spacing floors
+remain in force. Old per-frame and source-rate latching parameters remain for
+replay; missing `playout_adaptive_only` defaults to zero. The controller suite
+covers adaptive mode at startup, across rate changes, and under late submissions.
