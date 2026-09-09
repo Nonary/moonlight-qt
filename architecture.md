@@ -797,6 +797,8 @@ successes nor cause a fallback to readiness-driven buffer growth. Padding retain
 the existing initial/learned policy and safety bounds; its native-feedback-based
 learning waits for valid display evidence. An event-based timing provider is
 needed for a measured adaptive-display cadence percentage.
+Linux Wayland presentation feedback and Gamescope actual-present timestamps
+are explicitly marked as display events and remain eligible for measurement.
 
 `MOONLIGHT_VRR_ALIGN=1` enables observation-only raster probes around Present.
 DisplayConfig signal geometry and QPC correlation support phase modeling.

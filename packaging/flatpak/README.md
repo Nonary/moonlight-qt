@@ -41,3 +41,14 @@ flatpak install --user --reinstall \
 The bundle installs as `com.moonlight_stream.Moonlight` on branch `master`.
 The regular Flathub build uses branch `stable`; recreate a stale Steam shortcut
 after installation so Gaming Mode launches the intended user build.
+
+## GitHub release builds
+
+The `Build release artifacts` workflow builds Windows, macOS, AppImage, and
+Flatpak packages on GitHub runners. Push a `release/<version>` branch (for
+example `release/6.1.0-vrr14`), or dispatch the workflow with `ci_version`.
+The Flatpak job replaces the historical application pin and version in its
+working manifest with the workflow's exact commit and release version, while
+preserving dependency pins and the Gamescope patch. It verifies the exported
+manifest before uploading the bundle. Windows packaging runs the deterministic
+VRR tests and includes the replay and trace decoder in the portable ZIP.

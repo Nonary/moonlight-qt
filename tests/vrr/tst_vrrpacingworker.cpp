@@ -1318,6 +1318,9 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     const QByteArray row = lines.value(1);
     const QList<QByteArray> columns = header.split(',');
     const QList<QByteArray> fields = row.split(',');
+    expect(columns.contains("presentation_uncertainty_us") &&
+           fields.value(columns.indexOf("presentation_uncertainty_us")) == "0",
+           "trace must preserve non-DXGI clock uncertainty, defaulting to zero for legacy presenters");
     std::vector<int64_t> profile;
     expect(columns.contains("original_target_us") &&
            decodeVrrPlayoutProfile(fields.value(columns.indexOf("playout_initial_profile")), profile),

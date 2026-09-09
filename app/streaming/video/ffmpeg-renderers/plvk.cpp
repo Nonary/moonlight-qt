@@ -236,6 +236,13 @@ PlVkRenderer::~PlVkRenderer()
     // started libplacebo frame owns an internal swapchain mutex, so release it
     // before any of the Vulkan objects below are destroyed.
     cancelVrrFrame();
+#ifdef Q_OS_LINUX
+    m_GamescopeTiming.reset();
+#endif
+
+#ifdef HAS_WAYLAND
+    m_PresentationFeedback.reset();
+#endif
 
     // The render context must have been cleaned up by now.
     SDL_assert(!m_HasPendingSwapchainFrame);
@@ -455,6 +462,24 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
         vkParams.extra_queues = VK_QUEUE_FLAG_BITS_MAX_ENUM;
     }
 
+    std::vector<const char*> optionalExtensions;
+    for (int i = 0; i < vkParams.num_opt_extensions; ++i)
+        optionalExtensions.push_back(vkParams.opt_extensions[i]);
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 26, 100)
+    if (m_HwDeviceType == AV_HWDEVICE_TYPE_VULKAN)
+        av_free((void*)vkParams.opt_extensions);
+#endif
+#ifdef Q_OS_LINUX
+    const bool gamescopeTiming = decoderParams->enableVrr && isGamescopeWsiPresentation(SDL_GetCurrentVideoDriver()) &&
+        isExtensionSupportedByPhysicalDevice(device, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+    if (gamescopeTiming) {
+        optionalExtensions.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+        vkParams.get_proc_addr = VulkanTiming::bridge(vkParams.get_proc_addr);
+    }
+#endif
+    vkParams.opt_extensions = optionalExtensions.data();
+    vkParams.num_opt_extensions = int(optionalExtensions.size());
+
     {
         // Don't let Qt take DRM master from us during pl_vulkan_create()
         DrmMasterLocker locker;
@@ -462,16 +487,26 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
         m_Vulkan = pl_vulkan_create(m_Log, &vkParams);
     }
 
-#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 26, 100)
-    av_free((void*)vkParams.opt_extensions);
-#endif
-
     if (m_Vulkan == nullptr) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "pl_vulkan_create() failed for '%s'",
                      deviceProps->deviceName);
         return false;
     }
+
+#ifdef Q_OS_LINUX
+    if (gamescopeTiming) {
+        bool enabled = false;
+        for (int i = 0; i < m_Vulkan->num_extensions; ++i)
+            enabled |= !SDL_strcmp(m_Vulkan->extensions[i], VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+        auto timing = std::make_unique<VulkanTiming>();
+        if (enabled && timing->initialize(m_Vulkan->device)) {
+            m_GamescopeTiming = std::move(timing);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Vulkan VRR: Gamescope WSI presentation timing enabled for adaptive buffering");
+        }
+    }
+#endif
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Vulkan rendering device chosen: %s",
@@ -603,6 +638,21 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     }
 
     m_Renderer = pl_renderer_create(m_Log, m_Vulkan->gpu);
+#ifdef HAS_WAYLAND
+    if (m_VrrRequested && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
+        auto feedback = std::make_unique<Vrr13::WaylandFeedback>();
+#ifdef Q_OS_LINUX
+        if (m_GamescopeTiming) feedback.reset();
+#endif
+        if (feedback && feedback->initialize(m_Window)) {
+            m_PresentationFeedback = std::move(feedback);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Vulkan VRR: Wayland presentation feedback enabled for adaptive buffering");
+        }
+        else if (feedback) SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                         "Vulkan VRR: presentation feedback unavailable; native-hitch buffer adaptation inactive");
+    }
+#endif
     if (m_Renderer == nullptr) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "pl_renderer_create() failed");
@@ -835,6 +885,12 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
 
 bool PlVkRenderer::createSwapchain(int depth)
 {
+#ifdef Q_OS_LINUX
+    if (m_GamescopeTiming) m_GamescopeTiming->reset();
+#endif
+#ifdef HAS_WAYLAND
+    if (m_PresentationFeedback) m_PresentationFeedback->clear();
+#endif
     // libplacebo requires every successful start_frame() to be balanced by a
     // submit before replacing its swapchain. Normally this is already false;
     // retaining the guard makes resize and device-reset paths safe too.
@@ -1294,7 +1350,15 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
     // A size/display callback arrives on the main thread. Clear the current
     // generation before acquisition; a concurrent new callback remains set
     // and makes presentFrame() safely abandon this image.
-    m_VrrWindowChangePending.exchange(false);
+    const bool windowChanged = m_VrrWindowChangePending.exchange(false);
+#ifdef Q_OS_LINUX
+    if (windowChanged && m_GamescopeTiming) m_GamescopeTiming->reset();
+#endif
+#ifdef HAS_WAYLAND
+    if (windowChanged && m_PresentationFeedback) m_PresentationFeedback->clear();
+#else
+    (void) windowChanged;
+#endif
     const uint64_t syncStartUs = LiGetMicroseconds();
     result.decodeSyncUs = waitForDecode(frame);
     const uint64_t acquireStartUs = LiGetMicroseconds();
@@ -1364,6 +1428,15 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest&)
     }
 
     m_VrrFramePrepared = false;
+    const uint64_t presentationId = ++m_PresentationId;
+#ifdef Q_OS_LINUX
+    if (m_GamescopeTiming) m_GamescopeTiming->begin(presentationId);
+#endif
+#ifdef HAS_WAYLAND
+    // Attach the request to the next native surface commit, never an empty
+    // commit or a CPU completion event. Only this worker presents this surface.
+    if (m_PresentationFeedback) m_PresentationFeedback->request(presentationId);
+#endif
     const uint64_t submissionTimeUs = LiGetMicroseconds();
     const bool submitted = submitPendingSwapchainFrame();
 
@@ -1374,6 +1447,9 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest&)
     // libplacebo exposes a boolean submit result here rather than VkResult.
     feedback.nativePresentResult = submitted ? 0 : -1;
     if (!submitted) {
+#ifdef HAS_WAYLAND
+        if (m_PresentationFeedback) m_PresentationFeedback->clear();
+#endif
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "pl_swapchain_submit_frame() failed on Vulkan VRR path");
         queueRenderDeviceReset();
@@ -1384,6 +1460,46 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest&)
     feedback.presented = true;
     feedback.submissionTimeValid = true;
     feedback.submissionTimeUs = submissionTimeUs;
+#ifdef Q_OS_LINUX
+    if (m_GamescopeTiming) {
+        m_GamescopeTiming->finish(feedback);
+        if (feedback.latchSampleValid && !m_LoggedPresentationFeedback) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Vulkan VRR: received Gamescope WSI presentation timestamp (clock uncertainty %llu us)",
+                        static_cast<unsigned long long>(feedback.presentationUncertaintyUs));
+            m_LoggedPresentationFeedback = true;
+        }
+    }
+#endif
+#ifdef HAS_WAYLAND
+    if (m_PresentationFeedback) {
+        feedback.submissionIdValid = true;
+        feedback.submissionId = presentationId;
+        Vrr13::Feedback sample;
+        // Return the oldest usable completion; subsequent submissions drain
+        // delayed feedback in order without collapsing intervals.
+        while (m_PresentationFeedback->poll(sample)) {
+            if (sample.outcome != Vrr13::Outcome::Presented ||
+                sample.presented <= 0 || sample.presented > sample.observed ||
+                sample.observed - sample.presented > 100 * Vrr13::Millisecond ||
+                sample.uncertainty > 500000) continue;
+            feedback.latchSampleValid = true;
+            feedback.latchTimeKind = Vrr13::PresentationTimeKind::DisplayEvent;
+            feedback.latchSubmissionId = sample.id;
+            feedback.latchTimeUs = uint64_t(sample.presented / 1000);
+            feedback.presentationUncertaintyUs = uint64_t((sample.uncertainty + 999) / 1000);
+            if (!m_LoggedPresentationFeedback) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Vulkan VRR: received Wayland presentation timestamp (clock uncertainty %llu us)",
+                            static_cast<unsigned long long>(feedback.presentationUncertaintyUs));
+                m_LoggedPresentationFeedback = true;
+            }
+            break;
+        }
+    }
+#else
+    (void) presentationId;
+#endif
     return feedback;
 }
 
@@ -1427,6 +1543,12 @@ VrrPresentFeedback PlVkRenderer::cancelFrame()
 
 void PlVkRenderer::setSuspended(bool suspended)
 {
+#ifdef Q_OS_LINUX
+    if (m_GamescopeTiming) m_GamescopeTiming->reset();
+#endif
+#ifdef HAS_WAYLAND
+    if (m_PresentationFeedback) m_PresentationFeedback->clear();
+#endif
     m_VrrSuspended = suspended;
     if (!suspended) {
         // Re-run resize/start-frame after restoration without changing the

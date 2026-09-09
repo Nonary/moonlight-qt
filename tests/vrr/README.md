@@ -1,5 +1,37 @@
 # VRR deterministic tests
 
+Linux Vulkan on Wayland now attaches presentation-time feedback to each native
+surface submission and feeds correlated compositor timestamps into the same
+native-hitch padding policy as DXGI. GPU/CPU submission completion is not used
+as a substitute. The Vulkan swapchain's fixed mode does not change when the
+controller requests a per-frame DXGI latch mode. Clock uncertainty is recorded
+in the optional schema-5 `presentation_uncertainty_us` trace column and replayed.
+Gaming Mode retains its X11/HDR Gamescope WSI path. On that path, the Vulkan
+proc-address bridge tags libplacebo's native presents with IDs and obtains actual
+presentation times through Gamescope's `VK_GOOGLE_display_timing` implementation.
+It preserves the original extension chain, semaphore waits, present results, and
+HDR swapchain. Desired presentation time remains zero, so the observer does not
+introduce a second scheduler. Gamescope timestamps are converted from monotonic
+time into the worker clock, with bounded uncertainty. Unknown IDs, stale results,
+failed presents, and the first sample after swapchain resets cannot establish a
+cadence interval. Regular X11 without the Gamescope WSI layer is still unsupported.
+Missing platform timing support leaves native-hitch adaptation unavailable and
+produces a startup warning.
+
+`tst_vulkantiming` tests this dispatch bridge with fake Vulkan entry points,
+including delayed completion IDs, clock conversion, swapchain errors, unchanged
+presentation arguments, unrelated devices, and device teardown. Build it with
+the other VRR tests when Vulkan headers are available. It does not replace a
+Gaming Mode/HDR session test against the installed Gamescope layer.
+
+`tst_waylandfeedback` uses a private in-process Wayland server, without a real
+window or GPU. It checks commit association, IDs, timestamp conversion, VRR's
+zero refresh interval, discarded frames, reset cleanup, bounded pending objects,
+timeouts, and unsupported clocks. It is built when wayland-server and SDL2 are
+available. The timing-controller suite compares delayed Wayland and DXGI feedback
+and requires identical padding and sample counts plus actual hitch-driven growth.
+These checks do not replace validation during a real compositor streaming session.
+
 `tst_incomingframetiming` checks the overlay's last-30-interval population
 variance and soft score `100 / (1 + (standardDeviationMs / 6)^4)`. It covers
 low jitter remaining essentially smooth, increasing variance and stall count,
