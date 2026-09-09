@@ -1,0 +1,93 @@
+name: Build release artifacts
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - 'release/**'
+  workflow_dispatch:
+    inputs:
+      ci_version:
+        description: Release version without the leading v
+        required: true
+        type: string
+
+jobs:
+  setup:
+    runs-on: ubuntu-22.04
+    outputs:
+      ci_version: ${{ steps.version.outputs.ci_version }}
+    steps:
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.ci_version }}
+        run: |
+          version="${INPUT_VERSION:-${GITHUB_REF_NAME#release/}}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-vrr[0-9]+$ ]]
+          echo "ci_version=$version" >> "$GITHUB_OUTPUT"
+
+  windows-macos:
+    needs: setup
+    uses: ./.github/workflows/build-win-mac.yml
+    with:
+      ci_version: ${{ needs.setup.outputs.ci_version }}
+
+  appimage:
+    needs: setup
+    uses: ./.github/workflows/build-appimage.yml
+    with:
+      ci_version: ${{ needs.setup.outputs.ci_version }}
+
+  flatpak:
+    needs: setup
+    runs-on: ubuntu-22.04
+    env:
+      CI_VERSION: ${{ needs.setup.outputs.ci_version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install Flatpak build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.flatpak.Builder org.kde.Sdk//6.10 org.kde.Platform//6.10
+      - name: Pin manifest to release source and version
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path('packaging/flatpak/com.moonlight_stream.Moonlight.json')
+          manifest = json.loads(path.read_text())
+          module = next(m for m in manifest['modules'] if m['name'] == 'moonlight')
+          module['sources'][0]['commit'] = os.environ['GITHUB_SHA']
+          module['sources'][1]['commands'] = ['echo ' + os.environ['CI_VERSION'] + ' > app/version.txt']
+          path.write_text(json.dumps(manifest, indent=4) + '\n')
+          PY
+      - name: Build Flatpak
+        run: |
+          dbus-run-session -- flatpak run org.flatpak.Builder --user --force-clean --sandbox \
+            --install-deps-from=flathub --repo=flatpak-repo flatpak-build \
+            packaging/flatpak/com.moonlight_stream.Moonlight.json
+          flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
+            flatpak-repo "Moonlight-VRR-$CI_VERSION-linux-x86_64.flatpak" \
+            com.moonlight_stream.Moonlight master
+      - name: Verify exported source and Gamescope patch
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          manifest = json.loads(Path('flatpak-build/files/manifest.json').read_text())
+          modules = {m['name']: m for m in manifest['modules']}
+          assert modules['moonlight']['sources'][0]['commit'] == os.environ['GITHUB_SHA']
+          assert any(s['type'] == 'patch' and 'libplacebo-disable-internally-synchronized-queues.patch' in s['path'] for s in modules['libplacebo']['sources'])
+          PY
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Moonlight-Flatpak-${{ env.CI_VERSION }}
+          path: Moonlight-VRR-${{ env.CI_VERSION }}-linux-x86_64.flatpak
+          compression-level: 0
+          if-no-files-found: error

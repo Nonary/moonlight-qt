@@ -14,6 +14,14 @@
 
 #include <atomic>
 
+#ifdef Q_OS_LINUX
+#include "vulkantiming.h"
+#endif
+
+#ifdef HAS_WAYLAND
+#include "waylandfeedback/wayland.h"
+#endif
+
 #ifdef Q_OS_DARWIN
 class MetalVulkanTextureFactory {
 public:
@@ -152,6 +160,14 @@ private:
     bool m_VrrFramePrepared = false;
     bool m_VrrRenderSucceeded = false;
     bool m_VrrRenderTimingActive = false;
+    uint64_t m_PresentationId = 0;
+    bool m_LoggedPresentationFeedback = false;
+#ifdef Q_OS_LINUX
+    std::unique_ptr<VulkanTiming> m_GamescopeTiming;
+#endif
+#ifdef HAS_WAYLAND
+    std::unique_ptr<Vrr13::WaylandFeedback> m_PresentationFeedback;
+#endif
 
     std::unique_ptr<OverlayCompletion> m_OverlayCompletion;
 
