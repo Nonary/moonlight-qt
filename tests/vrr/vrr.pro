@@ -6,6 +6,11 @@ CONFIG += ordered
 dxgipresent.file = $$PWD/dxgipresent.pro
 SUBDIRS += dxgipresent
 
+unix:!macx:packagesExist(libplacebo) {
+    plvkpresentation.file = $$PWD/plvkpresentation.pro
+    SUBDIRS += plvkpresentation
+}
+
 incomingtiming.file = $$PWD/incomingtiming.pro
 SUBDIRS += incomingtiming
 

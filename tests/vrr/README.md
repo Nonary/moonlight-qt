@@ -13,6 +13,12 @@ swapchain, without Windows or Qt dependencies. It verifies synchronized
 interval-zero calls, telemetry parameter agreement, and result propagation.
 It does not replace a Windows renderer build or a live scanout test.
 
+On Linux, `tst_plvkpresentation` checks surface-mode selection. The Gamescope
+regression case exposes FIFO and Mailbox without Immediate and requires Mailbox.
+It also covers the FIFO-only WSI compatibility path, unsupported backends, and
+preservation of ordinary Wayland and X11/KMSDRM choices. The test cannot prove
+which mode an affected device exposes or whether Gamescope displays each frame.
+
 The FPS picker offers native VRR rates and preserves saved custom values; the
 reduced-rate Low Latency VRR recommendation has been removed. The worker no
 longer generates gap-fill repeats when new frames are unavailable.

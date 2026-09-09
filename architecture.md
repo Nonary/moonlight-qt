@@ -25,6 +25,10 @@ VRR recommendation and Low-latency VRR choice. Production uses
 `playout_adaptive_only=1`: neither source-rate thresholds nor late frames
 switch adaptive presentation to V-Sync. Historical latching policies remain
 available for replay, with the new field defaulting to zero for old captures.
+Updated on 2026-09-09: Gamescope VRR presentation now checks for Mailbox after
+Immediate and before the existing WSI FIFO compatibility fallback. This fixes
+a missing adaptive-mode choice; affected SteamOS hardware has not yet validated
+it as a remedy for the performance-overlay-dependent stutter.
 
 Updated on 2026-09-09: production requires verified display-event timing for
 native feedback and client cadence reporting. DXGI refresh references are
@@ -811,13 +815,25 @@ capture/readiness, preparation, adaptive presentation, cancellation, and feedbac
 Its implementations can have different acquisition and cancellation semantics.
 Do not transfer D3D11 fence or Present assumptions directly to Vulkan.
 
-On Linux the VRR request prefers the Vulkan frontend, the relevant adaptive
-presenter implementation. Vulkan presentation modes are generally selected with
-the swapchain rather than switched per frame like the D3D11 request interface
-intends. Unsupported combinations fall back to fixed pacing. DRM VRR property
-control and environment choices are separate from the client scheduler's
-ability to supply trustworthy presentation feedback. Wayland display/modeset
-constraints likewise differ from Windows.
+On Linux the VRR request prefers the Vulkan frontend. The adaptive mode is
+selected for the surface at startup: Mailbox on ordinary Wayland, Immediate
+on X11/KMSDRM, and Immediate then Mailbox on Gamescope, according to exposed
+surface capabilities.
+
+Gamescope WSI's FIFO compatibility exception is used only when neither Immediate
+nor Mailbox is exposed. Although the WSI layer sends Mailbox to the underlying
+driver, it forwards the application's original present mode to Gamescope, which
+implements FIFO commit scheduling itself. Selecting Mailbox explicitly avoids
+that FIFO policy. Steam's frame limiter can still override a request to FIFO.
+Native presentation here remains compositor-owned, and submission success is
+not physical scanout feedback. See [SteamOS VRR investigation](docs/steamos-vrr.md)
+for source evidence and the reversible composition test for
+performance-overlay-dependent stutter.
+
+Unsupported combinations fall back to fixed pacing. DRM VRR property control
+and environment choices are separate from the client scheduler's ability to
+supply trustworthy presentation feedback. Wayland display/modeset constraints
+likewise differ from Windows.
 
 The worker presents only newly received frames and waits for queue activity
 when empty. It no longer retains and re-presents the last image to fill gaps.

@@ -1,4 +1,5 @@
 #include "plvk.h"
+#include "plvkpresentation.h"
 
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
@@ -98,11 +99,10 @@ bool isGamescopePresentation(const char* videoDriver)
 
 bool isGamescopeWsiPresentation(const char* videoDriver)
 {
-    // The Gamescope WSI layer presents through its own Mailbox driver
-    // swapchain even when the application-facing mode is FIFO. vrr8 relied on
-    // that behavior: Moonlight paced the FIFO requests while Gamescope owned
-    // the physical adaptive scanout. Restrict the exception to an explicitly
-    // enabled WSI layer so ordinary X11 FIFO cannot be mistaken for VRR.
+    // Retain the vrr8 FIFO compatibility path only with an explicitly enabled
+    // Gamescope WSI layer. The layer's Mailbox driver swapchain does not bypass
+    // Gamescope's scheduling of the application's original FIFO requests.
+    // Prefer an exposed adaptive mode before using this exception.
     const char* enabled = SDL_getenv("ENABLE_GAMESCOPE_WSI");
     return isGamescopePresentation(videoDriver) && enabled != nullptr &&
            SDL_strcmp(enabled, "1") == 0;
@@ -799,40 +799,30 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
 
     const char* videoDriver = SDL_GetCurrentVideoDriver();
     const bool gamescopeWsi = isGamescopeWsiPresentation(videoDriver);
-    if (isWaylandPresentation(videoDriver)) {
-        // Wayland uses Mailbox when the surface reports it. Do not use
-        // Immediate as a substitute: the selection is intentionally fixed at
-        // creation and FIFO is the safe fallback for this compositor path.
-        if (isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device,
-                                                   VK_PRESENT_MODE_MAILBOX_KHR)) {
-            m_VkPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-            m_VrrFallbackReason = VrrFallbackReason::NoFallback;
-            return;
-        }
+    PlVkVrrSurface surface = PlVkVrrSurface::Unsupported;
+    if (isGamescopePresentation(videoDriver)) {
+        surface = PlVkVrrSurface::Gamescope;
+    }
+    else if (isWaylandPresentation(videoDriver)) {
+        surface = PlVkVrrSurface::Wayland;
     }
     else if (isImmediatePresentation(videoDriver)) {
-        // X11, Gamescope, and KMSDRM use Immediate when it is exposed by the
-        // selected Vulkan surface. This only describes queue behavior; it
-        // makes no claim about display adaptive-sync state.
-        if (isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device,
-                                                   VK_PRESENT_MODE_IMMEDIATE_KHR)) {
-            m_VkPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-            m_VrrFallbackReason = VrrFallbackReason::NoFallback;
-            return;
-        }
-
-        // Gamescope WSI intentionally does not expose Immediate on current
-        // SteamOS. The known-good vrr8 Linux path kept cadence pacing active
-        // with an application-facing FIFO swapchain here; the WSI layer maps
-        // it onto Gamescope's non-blocking driver swapchain. Falling back to
-        // Moonlight's fixed-vsync worker instead pins the OSD near 120 Hz.
-        if (gamescopeWsi) {
-            m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
-            m_VrrFallbackReason = VrrFallbackReason::NoFallback;
+        surface = PlVkVrrSurface::Immediate;
+    }
+    const auto mode = selectPlVkVrrPresentMode(surface, gamescopeWsi,
+        [this](VkPresentModeKHR candidate) {
+            return isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, candidate);
+        });
+    if (mode) {
+        m_VkPresentMode = *mode;
+        m_VrrFallbackReason = VrrFallbackReason::NoFallback;
+        if (surface == PlVkVrrSurface::Gamescope) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Gamescope WSI uses FIFO application presentation; retaining adaptive VRR pacing");
-            return;
+                        "Gamescope VRR selected %s application presentation (WSI requested: %s); "
+                        "display timing remains compositor-controlled",
+                        vulkanPresentModeName(*mode), gamescopeWsi ? "yes" : "no");
         }
+        return;
     }
 
     // A FIFO fallback is deliberately not passed to the VRR worker: it would
