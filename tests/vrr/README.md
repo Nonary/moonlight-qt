@@ -46,7 +46,8 @@ interval-zero calls, telemetry parameter agreement, and result propagation.
 It does not replace a Windows renderer build or a live scanout test.
 
 On Linux, `tst_plvkpresentation` checks surface-mode selection. The Gamescope
-regression case exposes FIFO and Mailbox without Immediate and requires Mailbox.
+regression case exposes FIFO and Mailbox without Immediate and requires Mailbox
+with the experiment enabled, or the prior WSI FIFO mode with it disabled.
 It also covers the FIFO-only WSI compatibility path, unsupported backends, and
 preservation of ordinary Wayland and X11/KMSDRM choices. The test cannot prove
 which mode an affected device exposes or whether Gamescope displays each frame.

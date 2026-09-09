@@ -25,10 +25,13 @@ VRR recommendation and Low-latency VRR choice. Production uses
 `playout_adaptive_only=1`: neither source-rate thresholds nor late frames
 switch adaptive presentation to V-Sync. Historical latching policies remain
 available for replay, with the new field defaulting to zero for old captures.
-Updated on 2026-09-09: Gamescope VRR presentation now checks for Mailbox after
-Immediate and before the existing WSI FIFO compatibility fallback. This fixes
-a missing adaptive-mode choice; affected SteamOS hardware has not yet validated
-it as a remedy for the performance-overlay-dependent stutter.
+Updated on 2026-09-09: the Linux-only "Test SteamOS VRR fix (experimental)"
+checkbox makes Gamescope Mailbox selection an opt-in A/B test, default off.
+The persisted `gamescopemailbox` preference is snapshotted at session startup
+and passed through decoder parameters. Reconnect after changing it. Enabled,
+it checks Mailbox after Immediate and before the existing WSI FIFO fallback;
+disabled, it restores the previous Immediate/WSI FIFO selection. Affected
+SteamOS hardware has not yet validated it as a remedy for overlay-dependent stutter.
 
 Updated on 2026-09-09: production requires verified display-event timing for
 native feedback and client cadence reporting. DXGI refresh references are
@@ -819,11 +822,11 @@ Do not transfer D3D11 fence or Present assumptions directly to Vulkan.
 
 On Linux the VRR request prefers the Vulkan frontend. The adaptive mode is
 selected for the surface at startup: Mailbox on ordinary Wayland, Immediate
-on X11/KMSDRM, and Immediate then Mailbox on Gamescope, according to exposed
-surface capabilities.
+on X11/KMSDRM, and Immediate on Gamescope. Gamescope additionally tries Mailbox
+when the SteamOS experiment is enabled, according to exposed surface capabilities.
 
-Gamescope WSI's FIFO compatibility exception is used only when neither Immediate
-nor Mailbox is exposed. Although the WSI layer sends Mailbox to the underlying
+Gamescope WSI's FIFO compatibility exception is used when Immediate is unavailable
+and the Mailbox experiment is disabled or Mailbox is unavailable. Although the WSI layer sends Mailbox to the underlying
 driver, it forwards the application's original present mode to Gamescope, which
 implements FIFO commit scheduling itself. Selecting Mailbox explicitly avoids
 that FIFO policy. Steam's frame limiter can still override a request to FIFO.

@@ -193,7 +193,8 @@ private:
                        int frameRate, bool enableVsync, bool enableFramePacing,
                        bool testOnly, IVideoDecoder*& chosenDecoder,
                        bool enableVrr = false, int vrrDisplayRefreshHz = 0,
-                       bool* effectiveVrr = nullptr, bool smoothVrrFrameTiming = true);
+                       bool* effectiveVrr = nullptr, bool smoothVrrFrameTiming = true,
+                       bool gamescopeMailbox = false);
 
     static
     void clStageStarting(int stage);
@@ -252,6 +253,7 @@ private:
         bool effectiveVsync = false;
         bool enableFramePacing = false;
         bool enableVrr = false;
+        bool gamescopeMailbox = false;
         bool smoothVrrFrameTiming = true;
         int refreshRate = 0;
         StreamingPreferences::WindowMode effectiveWindowMode = StreamingPreferences::WM_WINDOWED;

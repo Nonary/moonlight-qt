@@ -9,9 +9,10 @@ int failures = 0;
 
 void check(PlVkVrrSurface surface, bool wsi,
            std::initializer_list<VkPresentModeKHR> available,
-           std::optional<VkPresentModeKHR> expected, const char* description)
+           std::optional<VkPresentModeKHR> expected, const char* description,
+           bool gamescopeMailbox = true)
 {
-    const auto selected = selectPlVkVrrPresentMode(surface, wsi,
+    const auto selected = selectPlVkVrrPresentMode(surface, wsi, gamescopeMailbox,
         [&](VkPresentModeKHR mode) {
             return std::find(available.begin(), available.end(), mode) != available.end();
         });
@@ -29,6 +30,15 @@ int main()
     constexpr auto fifo = VK_PRESENT_MODE_FIFO_KHR;
     constexpr auto mailbox = VK_PRESENT_MODE_MAILBOX_KHR;
     constexpr auto immediate = VK_PRESENT_MODE_IMMEDIATE_KHR;
+
+    check(Surface::Gamescope, true, {fifo, mailbox}, fifo,
+          "unchecked experiment restores Gamescope WSI FIFO", false);
+    check(Surface::Gamescope, false, {fifo, mailbox}, std::nullopt,
+          "unchecked experiment preserves non-WSI fallback", false);
+    check(Surface::Gamescope, true, {fifo, mailbox, immediate}, immediate,
+          "unchecked experiment preserves Immediate priority", false);
+    check(Surface::Wayland, false, {fifo, mailbox}, mailbox,
+          "unchecked experiment does not affect ordinary Wayland", false);
 
     // Regression: Mesa Wayland surfaces may expose FIFO and Mailbox without
     // Immediate. Selecting FIFO here hands paced video to another scheduler.

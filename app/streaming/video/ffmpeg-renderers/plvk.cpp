@@ -859,7 +859,7 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
     else if (isImmediatePresentation(videoDriver)) {
         surface = PlVkVrrSurface::Immediate;
     }
-    const auto mode = selectPlVkVrrPresentMode(surface, gamescopeWsi,
+    const auto mode = selectPlVkVrrPresentMode(surface, gamescopeWsi, params->gamescopeMailbox,
         [this](VkPresentModeKHR candidate) {
             return isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, candidate);
         });
@@ -868,9 +868,10 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
         m_VrrFallbackReason = VrrFallbackReason::NoFallback;
         if (surface == PlVkVrrSurface::Gamescope) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Gamescope VRR selected %s application presentation (WSI requested: %s); "
+                        "Gamescope VRR selected %s application presentation (WSI requested: %s; Mailbox experiment: %s); "
                         "display timing remains compositor-controlled",
-                        vulkanPresentModeName(*mode), gamescopeWsi ? "yes" : "no");
+                        vulkanPresentModeName(*mode), gamescopeWsi ? "yes" : "no",
+                        params->gamescopeMailbox ? "on" : "off");
         }
         return;
     }

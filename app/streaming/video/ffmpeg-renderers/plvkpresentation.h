@@ -16,7 +16,8 @@ enum class PlVkVrrSurface
 // predicate must query the actual Vulkan surface, including any WSI layer.
 template<typename SupportsMode>
 std::optional<VkPresentModeKHR> selectPlVkVrrPresentMode(
-    PlVkVrrSurface surface, bool gamescopeWsi, SupportsMode supportsMode)
+    PlVkVrrSurface surface, bool gamescopeWsi, bool gamescopeMailbox,
+    SupportsMode supportsMode)
 {
     if (surface == PlVkVrrSurface::Wayland) {
         if (supportsMode(VK_PRESENT_MODE_MAILBOX_KHR)) {
@@ -31,13 +32,14 @@ std::optional<VkPresentModeKHR> selectPlVkVrrPresentMode(
             // Gamescope commonly exposes Mailbox without Immediate. Its WSI
             // layer sends Mailbox to the driver even for a FIFO request, but
             // forwards the application's original mode to the compositor.
-            // Request Mailbox explicitly to avoid its FIFO commit scheduling
+            // Opt in to Mailbox to avoid its FIFO commit scheduling
             // after Moonlight has already paced the frame.
-            if (supportsMode(VK_PRESENT_MODE_MAILBOX_KHR)) {
+            if (gamescopeMailbox && supportsMode(VK_PRESENT_MODE_MAILBOX_KHR)) {
                 return VK_PRESENT_MODE_MAILBOX_KHR;
             }
-            // Retain the existing WSI compatibility path when only FIFO is
-            // available. Ordinary desktop FIFO must not qualify as adaptive.
+            // Retain the existing WSI compatibility path when the experiment
+            // is disabled or Mailbox is unavailable. Ordinary desktop FIFO
+            // must not qualify as adaptive.
             if (gamescopeWsi) {
                 return VK_PRESENT_MODE_FIFO_KHR;
             }

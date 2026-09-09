@@ -284,7 +284,8 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             int frameRate, bool enableVsync, bool enableFramePacing,
                             bool testOnly, IVideoDecoder*& chosenDecoder,
                             bool enableVrr, int vrrDisplayRefreshHz,
-                            [[maybe_unused]] bool* effectiveVrr, bool smoothVrrFrameTiming)
+                            [[maybe_unused]] bool* effectiveVrr, bool smoothVrrFrameTiming,
+                            bool gamescopeMailbox)
 {
     DECODER_PARAMETERS params = {};
 
@@ -302,6 +303,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.enableVsync = enableVsync;
     params.enableFramePacing = enableFramePacing;
     params.enableVrr = enableVrr;
+    params.gamescopeMailbox = gamescopeMailbox;
     params.smoothVrrFrameTiming = smoothVrrFrameTiming;
     params.vrrDisplayRefreshHz = vrrDisplayRefreshHz;
     params.testOnly = testOnly;
@@ -653,6 +655,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
     m_PresentationSettings.enableFramePacing = m_PresentationSettings.effectiveVsync &&
                                                m_Preferences->framePacing;
     m_PresentationSettings.enableVrr = false;
+    m_PresentationSettings.gamescopeMailbox = m_Preferences->gamescopeMailbox;
     m_PresentationSettings.smoothVrrFrameTiming = m_Preferences->smoothVrrFrameTiming;
 
     if (requestedVrr) {
@@ -2396,7 +2399,8 @@ void Session::exec()
                                m_PresentationSettings.enableVrr,
                                m_PresentationSettings.refreshRate,
                                &m_PresentationSettings.enableVrr,
-                               m_PresentationSettings.smoothVrrFrameTiming)) {
+                               m_PresentationSettings.smoothVrrFrameTiming,
+                               m_PresentationSettings.gamescopeMailbox)) {
                 SDL_UnlockMutex(m_DecoderLock);
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "Failed to recreate decoder after reset");

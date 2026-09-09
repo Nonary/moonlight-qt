@@ -884,6 +884,21 @@ Flickable {
                 }
 
                 CheckBox {
+                    hoverEnabled: true
+                    text: qsTr("Test SteamOS VRR fix (experimental)")
+                    font.pointSize: 12
+                    visible: Qt.platform.os === "linux" && StreamingPreferences.enableVrr
+                    enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                    checked: StreamingPreferences.gamescopeMailbox
+                    onCheckedChanged: StreamingPreferences.gamescopeMailbox = checked
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Tests an alternative presentation mode in SteamOS Gaming Mode (Gamescope) that may reduce stutter. Uncheck to compare with the previous behavior. Reconnect the stream after changing this setting.")
+                }
+
+                CheckBox {
                     id: enableHdr
                     width: parent.width
                     text: qsTr("Enable HDR")

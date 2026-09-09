@@ -10,7 +10,7 @@ and a reversible workaround procedure, not confirmation of the reported cause.
 
 Linux VRR prefers Vulkan even for 8-bit SDR. Previously, Gamescope surfaces
 without Immediate support went straight to the WSI FIFO compatibility path;
-Mailbox was never queried. The selector now tries Immediate, then Mailbox,
+Mailbox was never queried. With the experiment enabled, the selector tries Immediate, then Mailbox,
 and retains FIFO only for the existing Gamescope WSI exception when neither
 adaptive mode is exposed. Ordinary Wayland and X11/KMSDRM selection is unchanged.
 
@@ -87,6 +87,20 @@ as `composite_force`; the [DRM backend](https://github.com/ValveSoftware/gamesco
 uses it to require full composition. The [control utility](https://github.com/ValveSoftware/gamescope/blob/b385948cce5858e69d18e48c43c6baabdf258b85/src/Apps/gamescopectl.cpp#L77-L88)
 documents the socket selection in code. Availability depends on the installed
 Gamescope build.
+
+## Checkbox A/B test
+
+On Linux, enable VRR to reveal **Test SteamOS VRR fix (experimental)** in
+Settings. It defaults to unchecked and is saved between launches. Reconnect
+the stream after each change; the setting is captured when the session starts.
+
+- Unchecked (A): previous Gamescope selection, Immediate then the WSI FIFO fallback.
+- Checked (B): Immediate then Mailbox, then the WSI FIFO fallback.
+
+Compare the same moving scene with the Steam performance overlay off and the
+same limiter settings. The session log records the experiment state and actual
+selected mode. If both runs select Immediate or FIFO, the checkbox did not
+change the presentation mode. Ordinary desktop Wayland and X11 are unaffected.
 
 ## Determine which remedy works
 
