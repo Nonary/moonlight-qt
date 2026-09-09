@@ -2665,6 +2665,7 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
     }
     if (syncQpcTranslated) {
         feedback.latchSampleValid = true;
+        feedback.latchTimeKind = Vrr13::PresentationTimeKind::RefreshReference;
         // Retain the schema-5 field name for compatibility. Its DXGI
         // semantics are the SyncRefreshCount clock sample documented above.
         feedback.latchTimeUs = syncSampleTimeUs;

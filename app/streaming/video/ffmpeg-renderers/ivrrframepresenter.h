@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "pacer/vrr/presentationtiming.h"
 
 struct AVFrame;
 
@@ -187,6 +188,7 @@ struct VrrPresentFeedback {
     uint64_t submissionIdQueryStartUs = 0;
     uint64_t submissionIdQueryEndUs = 0;
     bool latchSampleValid = false;
+    Vrr13::PresentationTimeKind latchTimeKind = Vrr13::PresentationTimeKind::Unavailable;
     uint64_t latchSubmissionId = 0;
     uint64_t latchTimeUs = 0;
     // DXGI PresentRefreshCount (when available) identifies the v-blank at

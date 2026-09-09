@@ -856,6 +856,8 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.vrrPacingDroppedFrames += src.vrrPacingDroppedFrames;
     dst.vrrEligibleFrames += src.vrrEligibleFrames;
     dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
+    dst.vrrCadenceIntervals += src.vrrCadenceIntervals;
+    dst.vrrCadenceHitches += src.vrrCadenceHitches;
     dst.vrrTargetWaitEntryLateFrames += src.vrrTargetWaitEntryLateFrames;
     dst.vrrPresentFailedFrames += src.vrrPresentFailedFrames;
     dst.vrrPresentCancelledFrames += src.vrrPresentCancelledFrames;
@@ -968,6 +970,10 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
     m_ActiveWndVideoStats.vrrPrepareLateFrames +=
         delta(snapshot.vrrPrepareLateFrames,
               m_LastPacerTelemetry.vrrPrepareLateFrames);
+    m_ActiveWndVideoStats.vrrCadenceIntervals +=
+        delta(snapshot.vrrCadenceIntervals, m_LastPacerTelemetry.vrrCadenceIntervals);
+    m_ActiveWndVideoStats.vrrCadenceHitches +=
+        delta(snapshot.vrrCadenceHitches, m_LastPacerTelemetry.vrrCadenceHitches);
     m_ActiveWndVideoStats.vrrTargetWaitEntryLateFrames +=
         delta(snapshot.vrrTargetWaitEntryLateFrames,
               m_LastPacerTelemetry.vrrTargetWaitEntryLateFrames);
@@ -1224,17 +1230,25 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                            stats.vrrTelemetryActive ? "Active" : "Inactive");
         }
         else {
-            const uint64_t lateFrames = qMin(stats.vrrPrepareLateFrames,
-                                             stats.vrrEligibleFrames);
-            const double readyOnTimePercent =
-                static_cast<double>(stats.vrrEligibleFrames - lateFrames) *
-                100.0 / static_cast<double>(stats.vrrEligibleFrames);
+            char cadence[112];
+            if (stats.vrrCadenceIntervals != 0) {
+                const uint64_t hitches = qMin(stats.vrrCadenceHitches, stats.vrrCadenceIntervals);
+                const double smoothPercent = 100.0 *
+                    static_cast<double>(stats.vrrCadenceIntervals - hitches) / stats.vrrCadenceIntervals;
+                const double coveragePercent = qMin(100.0, 100.0 *
+                    static_cast<double>(stats.vrrCadenceIntervals) / stats.vrrEligibleFrames);
+                snprintf(cadence, sizeof(cadence), "%.1f%% | Measured: %.1f%% | Hitches (>3 ms): %llu",
+                         smoothPercent, coveragePercent, static_cast<unsigned long long>(hitches));
+            }
+            else {
+                snprintf(cadence, sizeof(cadence), "N/A (display timing unavailable)");
+            }
 
             ret = snprintf(&output[offset],
                            length - offset,
-                           "VRR pacing: %s | Client ready on time: %.1f%% | Dropped: %llu\n",
+                           "VRR pacing: %s | Client cadence: %s | Dropped: %llu\n",
                            stats.vrrTelemetryActive ? "Active" : "Inactive",
-                           readyOnTimePercent,
+                           cadence,
                            static_cast<unsigned long long>(stats.vrrPacingDroppedFrames));
         }
         if (ret < 0 || ret >= length - offset) {

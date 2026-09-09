@@ -37,6 +37,7 @@ public:
                 error + uncertainty >= ToleranceUs && error < ToleranceUs + uncertainty)) return 0;
         const bool missed = strictThreshold ? error > ToleranceUs + uncertainty :
                                              error >= ToleranceUs + uncertainty;
+        ++m_ObservedIntervals;
         // Stretch: the current frame needs protection. Catch-up: attribute it
         // to the preceding late frame, using that frame's original buffer and
         // headroom. Delayed feedback must not repeatedly add to today's buffer.
@@ -56,6 +57,7 @@ public:
     uint64_t samples() const { return m_Demand.validationFrames(); }
     uint64_t lastObservedUs() const { return m_LastObserved; }
     uint64_t misses() const { return m_Demand.misses(); }
+    uint64_t observedIntervals() const { return m_ObservedIntervals; }
     bool canRelease() const { return !samples() || m_Demand.canRelease(); }
     void breakSequence() { m_HavePrevious = false; }
     void reset() { *this = SmoothnessFeedback{}; }
@@ -64,6 +66,7 @@ private:
     Reserve m_Demand; // Zero-tolerance demand histogram, independent of readiness profiles.
     Sample m_Previous;
     uint64_t m_LastObserved = 0;
+    uint64_t m_ObservedIntervals = 0;
     bool m_HavePrevious = false;
 };
 }

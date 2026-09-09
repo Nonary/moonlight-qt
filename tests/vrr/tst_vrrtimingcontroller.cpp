@@ -2759,23 +2759,24 @@ void testVrr14Prediction()
 
     Vrr13::PresentationPrediction presentation;
     Vrr13::PresentationObservation o;
+    o.timeKind = Vrr13::PresentationTimeKind::RefreshReference;
     o.submitted = o.idValid = o.sampleValid = o.dxgi = true;
     o.id = o.sampleId = 1; o.submission = 1000000; o.ready = 999000;
     o.deadline = 1004000; o.observed = 1005000; o.sampleTime = 1002000;
     o.presentRefresh = 11; o.syncRefresh = 10;
-    presentation.observe(o);
+    presentation.observe(o, false);
     expect(presentation.measured() == 0, "unrelated DXGI sync timestamps must not teach presentation latency");
     o.submitted = false; o.syncRefresh = 11; o.sampleTime = 1004000;
-    presentation.observe(o);
+    presentation.observe(o, false);
     expect(presentation.measured() == 1 && presentation.lead(1005000) == 4000,
-           "matching refresh identity must learn compositor lead");
+           "historical replay retains refresh-derived compositor lead");
     expect(presentation.misses() == 0 && presentation.floor(1005000, 8333, 100) == 1012433,
            "original scanout deadline and physical display spacing are independent measurements");
     expect(presentation.lead(1200000) == 0 && presentation.floor(1200000, 8333, 100) == 0,
            "stale native feedback must stop controlling predictions");
     presentation.reset();
     o.submitted = true; o.submission = 1006000; o.sampleTime = 1004000;
-    presentation.observe(o);
+    presentation.observe(o, false);
     expect(presentation.measured() == 0, "even equal refresh counters cannot timestamp a present that happened afterward");
 
     uint64_t delays[2]{};
@@ -2826,6 +2827,7 @@ void testVrr14Prediction()
             controller.notePreparationDuration(i == 15 ? 6000 : 1000);
             controller.noteSubmission(true, false, d.targetUs);
             Vrr13::PresentationObservation sample;
+            sample.timeKind = Vrr13::PresentationTimeKind::DisplayEvent;
             sample.submitted = sample.idValid = sample.sampleValid = true;
             sample.id = sample.sampleId = uint64_t(i + 1);
             sample.submission = sample.ready = d.targetUs;
@@ -2835,6 +2837,71 @@ void testVrr14Prediction()
         }
         expect(controller.typicalRenderUs() == 1000 && controller.renderLeadUs() > controller.typicalRenderUs(),
                "one render tail must increase preparation lead without becoming the normal playout offset");
+    }
+}
+
+void testRefreshReferencesAreNotDisplayEvents()
+{
+    using namespace Vrr13;
+    PresentationPrediction prediction;
+    PresentationObservation first;
+    first.submitted = first.idValid = first.sampleValid = first.dxgi = true;
+    first.timeKind = PresentationTimeKind::RefreshReference;
+    first.id = first.sampleId = 29;
+    first.submission = first.ready = 895965;
+    first.sampleTime = 902785;
+    first.observed = 903325;
+    first.presentRefresh = first.syncRefresh = 260933;
+    first.deadline = 902785;
+    prediction.observe(first);
+    expect(prediction.measured() == 0 && prediction.lead(first.observed) == 0,
+           "even a causal equal-refresh reference cannot certify a display event");
+
+    auto second = first;
+    second.id = second.sampleId = 30;
+    second.submission = second.ready = 903178;
+    second.observed = 910213;
+    prediction.observe(second);
+    expect(prediction.measured() == 0,
+           "a newer present sharing the old refresh reference must remain unmeasured");
+
+    // Delayed exact events remain usable for both DXGI and other backends.
+    second.submitted = false;
+    second.timeKind = PresentationTimeKind::DisplayEvent;
+    second.sampleTime = 905178;
+    prediction.observe(second);
+    expect(prediction.measured() == 1 && prediction.lead(second.observed) == 2000,
+           "an explicit display event matches the retained submission directly");
+    prediction.observe(second);
+    expect(prediction.measured() == 1, "duplicate display events cannot inflate coverage");
+
+    const auto session = config(100, 120);
+    const auto policy = vrrTimingParametersForSession(session);
+    expect(policy.playoutRequireDisplayEvents == 1,
+           "production must require real display events");
+    VrrTimingController control(session, true, policy);
+    VrrTimingController referenceOnly(session, true, policy);
+    for (int i = 1; i <= 120; ++i) {
+        const auto at = uint64_t(1000000 + i * 10000);
+        const auto a = control.schedule(frame(i, i * 900, true, at), at);
+        const auto b = referenceOnly.schedule(frame(i, i * 900, true, at), at);
+        expect(a.targetUs == b.targetUs && a.playoutDelayUs == b.playoutDelayUs &&
+                   b.compositorLeadUs == 0 && b.nativeSmoothnessSamples == 0 &&
+                   referenceOnly.nativeCadenceIntervals() == 0 && referenceOnly.nativeCadenceHitches() == 0,
+               "refresh references must not change latency learning or buffer adaptation");
+        control.noteSubmission(true, false, a.targetUs);
+        referenceOnly.noteSubmission(true, false, b.targetUs);
+        PresentationObservation observation;
+        observation.timeKind = PresentationTimeKind::RefreshReference;
+        observation.dxgi = observation.submitted = observation.idValid = observation.sampleValid = true;
+        observation.smoothness = referenceOnly.smoothnessSample(b);
+        observation.id = observation.sampleId = uint64_t(i);
+        observation.submission = observation.ready = b.targetUs;
+        observation.sampleTime = b.targetUs + (i % 2 ? 1000 : 7000);
+        observation.observed = observation.sampleTime;
+        observation.presentRefresh = observation.syncRefresh = uint64_t(i);
+        observation.deadline = b.originalScanoutUs;
+        referenceOnly.notePresentation(observation);
     }
 }
 
@@ -2917,6 +2984,7 @@ void testSmoothnessFeedback()
         native.notePreparationDuration(1000);
         native.noteSubmission(true, false, d.targetUs);
         Vrr13::PresentationObservation o;
+        o.timeKind = Vrr13::PresentationTimeKind::DisplayEvent;
         o.smoothness = native.smoothnessSample(d);
         o.submitted = o.idValid = o.sampleValid = true;
         o.id = o.sampleId = uint64_t(i + 1);
@@ -2929,6 +2997,8 @@ void testSmoothnessFeedback()
             nativeProtection = d.smoothnessProtectionUs;
             expect(d.nativeSmoothnessSamples > 40 && d.nativeSmoothnessMisses > 0,
                    "matched native presentation intervals must feed back into the live controller");
+            expect(native.nativeCadenceIntervals() > 40 && native.nativeCadenceHitches() > 0,
+                   "explicit display events must also publish cadence reporting counters");
         }
     }
     expect(nativeProtection > 0, "native-only misses must create protection demand");
@@ -2977,6 +3047,7 @@ void testStableNativeSmoothnessReference()
         current.notePreparationDuration(1000);
         current.noteSubmission(true, false, d.targetUs);
         Vrr13::PresentationObservation o;
+        o.timeKind = Vrr13::PresentationTimeKind::DisplayEvent;
         o.smoothness = current.smoothnessSample(d);
         o.submitted = o.idValid = o.sampleValid = true;
         o.id = o.sampleId = uint64_t(i + 1);
@@ -3043,6 +3114,7 @@ void testReadinessDrivenPadding()
                 controller.notePreparationDuration(work);
                 controller.noteSubmission(true, false, submitted);
                 Vrr13::PresentationObservation o;
+                o.timeKind = Vrr13::PresentationTimeKind::DisplayEvent;
                 o.smoothness = controller.smoothnessSample(d);
                 o.submitted = o.idValid = o.sampleValid = true;
                 o.id = o.sampleId = uint64_t(i + 1);
@@ -3122,6 +3194,7 @@ void testNativeHitchGatesPadding()
             controller.noteSubmission(true, false, submitted);
             if (scenario >= 2) {
                 Vrr13::PresentationObservation o;
+                o.timeKind = Vrr13::PresentationTimeKind::DisplayEvent;
                 o.smoothness = controller.smoothnessSample(d);
                 o.submitted = o.idValid = o.sampleValid = true;
                 o.id = o.sampleId = uint64_t(i + 1);
@@ -3200,6 +3273,7 @@ int main()
     testStableNativeSmoothnessReference();
     testPreparationKeepsLearnedLead();
     testSmoothnessFeedback();
+    testRefreshReferencesAreNotDisplayEvents();
     testVrr14Prediction();
     testProcessingEpisodeClassification();
     testPerFrameLatchAtNativeMaximum();

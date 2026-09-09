@@ -319,6 +319,8 @@ void testTelemetrySnapshotsRemainCumulative()
             sample.renderTimeUs = i * 2;
             sample.prepareLate = (i % 2) == 0;
             sample.preparationLatenessUs = i;
+            sample.cadenceIntervals = i / 2;
+            sample.cadenceHitches = i / 128;
             sample.submitErrorUs = static_cast<int64_t>(i) - 450;
             sample.spacingCorrected = (i % 8) == 0;
             sample.presented = true;
@@ -348,10 +350,15 @@ void testTelemetrySnapshotsRemainCumulative()
 
     VrrTelemetrySample delayedSubmission;
     delayedSubmission.decisionTimeUs = frameCount + 1;
+    delayedSubmission.cadenceIntervals = frameCount / 2;
+    delayedSubmission.cadenceHitches = frameCount / 128;
     delayedSubmission.targetWaitEntryLate = true;
     telemetry.recordVrrFrame(delayedSubmission);
 
     const PacerTelemetrySnapshot finalSnapshot = telemetryStats(telemetry);
+    expect(finalSnapshot.vrrCadenceIntervals == frameCount / 2 &&
+               finalSnapshot.vrrCadenceHitches == frameCount / 128,
+           "publishing cumulative cadence snapshots must not count them repeatedly");
     expect(monotonic,
            "telemetry snapshots must not regress while another thread publishes");
     expect(finalSnapshot.vrrActive &&

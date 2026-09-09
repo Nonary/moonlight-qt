@@ -18,6 +18,7 @@
 // headroom thresholds; non-zero ratios remain available to replay captures
 // made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
+    X(uint64_t, playout_require_display_events, playoutRequireDisplayEvents, 0) \
     X(uint64_t, playout_native_hitch_adaptation, playoutNativeHitchAdaptation, 0) \
     X(uint64_t, playout_readiness_driven_adaptation, playoutReadinessDrivenAdaptation, 0) \
     X(uint64_t, playout_stable_smoothness_reference, playoutStableSmoothnessReference, 0) \
@@ -264,6 +265,8 @@ public:
     void noteSubmission(bool submitted, bool cancelled,
                         uint64_t submissionUs);
     void notePresentation(const Vrr13::PresentationObservation& observation);
+    uint64_t nativeCadenceIntervals() const { return m_NativeCadenceIntervals; }
+    uint64_t nativeCadenceHitches() const { return m_NativeCadenceHitches; }
     Vrr13::SmoothnessFeedback::Sample smoothnessSample(const VrrTimingDecision& decision) const;
     uint64_t typicalRenderUs() const;
     uint64_t recoveryHeadroomUs() const;
@@ -484,6 +487,9 @@ private:
     Vrr13::ReadinessPrediction m_ReadinessPrediction;
     Vrr13::PresentationPrediction m_PresentationPrediction;
     Vrr13::SmoothnessFeedback m_SubmissionSmoothness, m_NativeSmoothness;
+    // Lifetime counters for decoder-owned reporting windows. These do not
+    // expire with the controller's rolling adaptation histogram.
+    uint64_t m_NativeCadenceIntervals = 0, m_NativeCadenceHitches = 0;
     uint64_t m_RequestedPlayoutDelayUs = 0;
     bool m_FeedbackModeValid = false, m_FeedbackLatched = false;
     uint64_t m_LastHistoryArrivalUs = 0;

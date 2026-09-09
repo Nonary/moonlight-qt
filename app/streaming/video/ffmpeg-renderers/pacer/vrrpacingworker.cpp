@@ -73,7 +73,7 @@ constexpr char kTraceHeader[] =
     "target_wait_initial_us,target_wait_active_budget_us,target_wait_coarse_sleep_count,target_wait_coarse_requested_total_us,target_wait_coarse_requested_wake_us,target_wait_coarse_return_us,target_wait_coarse_clock_stalled,target_wait_active_entered,target_wait_active_start_us,target_wait_active_limit_us,target_wait_active_yield_count,target_wait_active_clock_stalled,target_wait_active_yield_limit_reached,"
     "present_start_us,submission_boundary_us,presenter_submission_time_valid,presenter_submission_time_us,presenter_submission_time_used,present_end_us,present_call_us,submit_error_us,submission_spacing_us,"
     "spacing_margin_us,spacing_deficit_us,spacing_guard_feedback_us,spacing_corrected,had_prior_submission,tear_classification,tear_risk,completion_queue_depth,disposition,dropped,presented,cancelled,"
-    "submission_id_valid,submission_id,latch_valid,latch_submission_id,latch_time_us,latch_present_refresh_seq,latch_sync_refresh_seq,latched_present,"
+    "submission_id_valid,submission_id,latch_valid,latch_submission_id,latch_time_us,latch_time_kind,latch_present_refresh_seq,latch_sync_refresh_seq,latched_present,"
     "used_rtp_timestamp,cadence_eligible,source_rate_changed,phase_discontinuity,rebased,external_rebase_applied,external_rebase_flags,midframe_window_state_flags,deep_trace,"
     "native_present_timing_valid,native_present_start_us,native_present_end_us,native_present_call_us,"
     "present_count_before_valid,present_count_before,frame_stats_before_valid,frame_stats_before_present_count,frame_stats_before_time_us,frame_stats_before_present_refresh_seq,frame_stats_before_sync_refresh_seq,"
@@ -828,6 +828,8 @@ int VrrPacingWorker::run()
             sample.renderTimeUs = telemetry.preparationDurationUs +
                 telemetry.presentDurationUs;
             sample.prepareLate = telemetry.preparationEndUs > decision.targetUs;
+            sample.cadenceIntervals = m_TimingController->nativeCadenceIntervals();
+            sample.cadenceHitches = m_TimingController->nativeCadenceHitches();
             sample.preparationLatenessUs = sample.prepareLate ?
                 telemetry.preparationEndUs - decision.targetUs : 0;
             sample.targetWaitEntryLate = !sample.prepareLate &&
@@ -1062,6 +1064,7 @@ void VrrPacingWorker::recordSubmission(
         (!observation.dxgi || (feedback.latchQpcCorrelationValid && feedback.latchRawSyncQpcFrequency));
     observation.sampleId = feedback.latchSubmissionId;
     observation.sampleTime = feedback.latchTimeUs;
+    observation.timeKind = feedback.latchTimeKind;
     observation.observed = operationEndUs;
     observation.presentRefresh = feedback.latchPresentRefreshSequence;
     observation.syncRefresh = feedback.latchRefreshSequence;
@@ -1353,6 +1356,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addBool(feedback.latchSampleValid);
     addUnsigned(feedback.latchSubmissionId);
     addUnsigned(feedback.latchTimeUs);
+    addUnsigned(static_cast<uint64_t>(feedback.latchTimeKind));
     addUnsigned(feedback.latchPresentRefreshSequence);
     addUnsigned(feedback.latchRefreshSequence);
     addBool(decision.latchedPresentation);

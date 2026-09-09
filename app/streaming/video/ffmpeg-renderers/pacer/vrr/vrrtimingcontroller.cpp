@@ -120,6 +120,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     // evenly. Explicit parameters keep older policies replayable.
     VrrTimingParameters parameters;
     parameters.playoutNativeHitchAdaptation = 1;
+    parameters.playoutRequireDisplayEvents = 1;
     parameters.playoutReadinessDrivenAdaptation = 1;
     parameters.playoutStableSmoothnessReference = 1;
     parameters.renderStartPreserveLearnedLead = 1;
@@ -1541,7 +1542,8 @@ void VrrTimingController::notePresentation(const Vrr13::PresentationObservation&
 {
     if (!m_Parameters.playoutPredictionEnabled) return;
     if (!m_Parameters.playoutSmoothnessFeedbackEnabled) {
-        m_PresentationPrediction.observe(observation);
+        m_PresentationPrediction.observe(observation,
+            m_Parameters.playoutRequireDisplayEvents != 0);
         return;
     }
     if (observation.submitted) {
@@ -1550,16 +1552,23 @@ void VrrTimingController::notePresentation(const Vrr13::PresentationObservation&
         m_FeedbackModeValid = true;
         m_FeedbackLatched = observation.latched;
     }
-    m_PresentationPrediction.observe(observation, [this](const Vrr13::SmoothnessFeedback::Sample& sample, uint64_t observed) {
+    m_PresentationPrediction.observe(observation, [this, &observation](const Vrr13::SmoothnessFeedback::Sample& sample, uint64_t observed) {
+        const auto intervalsBefore = m_NativeSmoothness.observedIntervals();
         const uint64_t demand = m_NativeSmoothness.observe(sample, observed,
-                                                         m_Parameters.playoutNativeHitchAdaptation != 0);
+            observation.timeKind == Vrr13::PresentationTimeKind::DisplayEvent ||
+            m_Parameters.playoutNativeHitchAdaptation != 0);
+        if (observation.timeKind == Vrr13::PresentationTimeKind::DisplayEvent &&
+                m_NativeSmoothness.observedIntervals() > intervalsBefore) {
+            ++m_NativeCadenceIntervals;
+            m_NativeCadenceHitches += demand != 0;
+        }
         if (m_Parameters.playoutNativeHitchAdaptation && demand != 0) {
             // Only a new, matched native interval miss authorizes growth.
             // Demand belongs to the delayed frame's original padding, so a
             // catch-up sample cannot repeatedly charge today's larger buffer.
             m_RequestedPlayoutDelayUs = std::max(m_RequestedPlayoutDelayUs, demand);
         }
-    });
+    }, m_Parameters.playoutRequireDisplayEvents != 0);
 }
 
 void VrrTimingController::updateLearnedBudgets()

@@ -1162,3 +1162,12 @@ presentation near refresh or during jitter. Adaptive software spacing floors
 remain in force. Old per-frame and source-rate latching parameters remain for
 replay; missing `playout_adaptive_only` defaults to zero. The controller suite
 covers adaptive mode at startup, across rate changes, and under late submissions.
+
+Display timing evidence is explicit: `latch_time_kind` is 0 (unavailable),
+1 (refresh reference), or 2 (display event). Production enables
+`controller.playout_require_display_events=1`; DXGI refresh references cannot
+supply latency learning, native hitch adaptation, or the client cadence overlay.
+Old captures omit that controller field and retain zero for exact historical
+replay. A historical exact match does not validate refresh-reference timestamps
+as actual display events. Regression tests cover the shared refresh timestamp
+from the Windows-host capture and genuine delayed display events separately.

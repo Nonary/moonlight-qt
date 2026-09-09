@@ -26,6 +26,10 @@ VRR recommendation and Low-latency VRR choice. Production uses
 switch adaptive presentation to V-Sync. Historical latching policies remain
 available for replay, with the new field defaulting to zero for old captures.
 
+Updated on 2026-09-09: production requires verified display-event timing for
+native feedback and client cadence reporting. DXGI refresh references are
+excluded; without a display-event provider, the cadence field reports `N/A`.
+
 [AGENTS.md](AGENTS.md) owns machine-specific build, deployment, and capture
 procedures. This document owns the architecture explanation. Keep both current
 when changing their respective contracts.
@@ -626,9 +630,10 @@ Legacy policies retain their inclusive threshold, original target/scanout
 references, and readiness/combined-feedback adaptation for exact replay.
 The new parameter defaults to zero when absent from older captures.
 
-`PresentationPrediction` accepts matched present identity and native timing
-anchors. DXGI refresh identity must be matched before interpreting a time as
-that frame's presentation. Stale, future, or too-uncertain observations are
+`PresentationPrediction` requires explicit display-event timestamps in production
+and matches them to submitted present IDs. DXGI refresh references remain usable
+only by the legacy replay policy; matching their refresh identity does not turn
+them into display events. Stale, future, or too-uncertain observations are
 ignored. The inspected implementation bounds sample age at 100 ms and native
 uncertainty at 500 us, learns a rolling median ready-to-presentation lead, and
 uses fresh matched observations for its floor. Missing feedback remains missing.
@@ -768,6 +773,26 @@ than proof of monitor delivery.
 `PresentRefreshCount` and `SyncRefreshCount` are different identities;
 `SyncQPCTime` timestamps the sync observation and is not automatically the
 presentation timestamp of the accompanying present ID.
+
+Production requires `playout_require_display_events=1`. Presentation feedback
+explicitly distinguishes unavailable timestamps, refresh references, and display
+events. DXGI `GetFrameStatistics()` is marked as a refresh reference and cannot
+teach compositor latency, authorize buffer growth/release, or create a measured
+cadence sample, even when its refresh IDs match and its timestamp follows
+submission. The Windows-host vrr14/vrr15 captures and the Ally GTA capture
+demonstrate why: different present IDs can share an identical raw `SyncQPCTime`,
+including frames submitted after that reference. A reference is not the frame's
+image-change instant. The old inference remains available only through explicit
+historical replay parameters; missing `playout_require_display_events` defaults
+to zero to preserve old exact baselines. New schema-5 traces additionally record
+`latch_time_kind` (0 unavailable, 1 refresh reference, 2 display event).
+
+The current DXGI statistics provider supplies no verified display events, so
+client cadence reports unavailable. Missing measurements neither count as
+successes nor cause a fallback to readiness-driven buffer growth. Padding retains
+the existing initial/learned policy and safety bounds; its native-feedback-based
+learning waits for valid display evidence. An event-based timing provider is
+needed for a measured adaptive-display cadence percentage.
 
 `MOONLIGHT_VRR_ALIGN=1` enables observation-only raster probes around Present.
 DisplayConfig signal geometry and QPC correlation support phase modeling.
@@ -933,9 +958,18 @@ session-end log likewise shows the final window, not a whole-session percentage.
 This identifies uneven host-supplied timing, which includes capture behavior;
 it cannot isolate the game engine or detect repeated image content from timing
 alone. It is independent of the native-confirmed client hitch metric and does
-not change buffer adaptation. `Client ready on time` remains a preparation
-deadline percentage, not a visible-smoothness measurement. The overlay no longer
-shows `Errors`; internal failed-presentation diagnostics remain available.
+not change buffer adaptation. The old `Client ready on time` overlay counted
+preparation deadline misses with zero tolerance and has been replaced by
+`Client cadence`. The new percentage counts only eligible, consecutive, verified
+display intervals whose client-added spacing error does not exceed 3 ms after
+uncertainty handling. It also shows measured coverage relative to the window's
+submitted-frame count and the measured hitch count, with drops separate. No
+verified intervals in the reporting window yields `N/A (display timing
+unavailable)`, never 100%. Cumulative cadence counters are differenced into the
+decoder's existing reporting windows; they are not the controller's expiring
+five-minute adaptation histogram. Preparation lateness remains internal
+diagnostic telemetry. The overlay no longer shows `Errors`; internal
+failed-presentation diagnostics remain available.
 
 Visible smoothness and source-timestamp fidelity answer different questions:
 

@@ -13,6 +13,7 @@ class VrrReplayConfigTest : public QObject
 private slots:
     void defaultsRoundTrip();
     void nativeHitchPolicyRoundTrip();
+    void displayEventPolicyRoundTrip();
     void rateProtectionPolicyRoundTrip();
     void adaptiveOnlyPolicyRoundTrip();
     void inheritanceAndOverride();
@@ -486,6 +487,19 @@ void VrrReplayConfigTest::adaptiveOnlyPolicyRoundTrip()
     QVERIFY(!applyVrrReplayControllerSnapshot(snapshot, parameters, error));
     QVERIFY(error.contains("playout_adaptive_only"));
     QCOMPARE(parameters.playoutAdaptiveOnly, uint64_t(1));
+}
+
+void VrrReplayConfigTest::displayEventPolicyRoundTrip()
+{
+    VrrTimingParameters parameters;
+    QCOMPARE(parameters.playoutRequireDisplayEvents, uint64_t(0));
+    QString error;
+    QJsonObject snapshot{{"playout_require_display_events", 1}};
+    QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, parameters, error), qPrintable(error));
+    QCOMPARE(parameters.playoutRequireDisplayEvents, uint64_t(1));
+    snapshot["playout_require_display_events"] = 2;
+    QVERIFY(!applyVrrReplayControllerSnapshot(snapshot, parameters, error));
+    QCOMPARE(parameters.playoutRequireDisplayEvents, uint64_t(1));
 }
 
 void VrrReplayConfigTest::rateProtectionPolicyRoundTrip()

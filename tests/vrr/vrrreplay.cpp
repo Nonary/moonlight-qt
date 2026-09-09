@@ -14302,6 +14302,7 @@ int main(int argc, char* argv[])
                 (!observation.dxgi || (field("latch_qpc_correlation_valid") && frequency));
             observation.sampleId = field("latch_submission_id");
             observation.sampleTime = field("latch_time_us");
+            observation.timeKind = static_cast<Vrr13::PresentationTimeKind>(field("latch_time_kind"));
             observation.observed = field("present_end_us");
             observation.presentRefresh = field("latch_present_refresh_seq");
             observation.syncRefresh = field("latch_sync_refresh_seq");

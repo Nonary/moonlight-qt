@@ -1,6 +1,7 @@
 #pragma once
 #include "reserve.h"
 #include "smoothnessfeedback.h"
+#include "presentationtiming.h"
 #include <array>
 
 namespace Vrr13 {
@@ -53,6 +54,7 @@ private:
 
 struct PresentationObservation {
     SmoothnessFeedback::Sample smoothness;
+    PresentationTimeKind timeKind = PresentationTimeKind::Unavailable;
     bool submitted = false, idValid = false, sampleValid = false, dxgi = false;
     bool latched = false;
     uint64_t id = 0, submission = 0, ready = 0, deadline = 0;
@@ -65,19 +67,26 @@ struct PresentationObservation {
 // the timestamp of the PresentCount accompanying it. Missing evidence stays missing.
 class PresentationPrediction {
 public:
-    void observe(const PresentationObservation& o) {
-        observe(o, [](const SmoothnessFeedback::Sample&, uint64_t) {});
+    void observe(const PresentationObservation& o, bool requireDisplayEvents = true) {
+        observe(o, [](const SmoothnessFeedback::Sample&, uint64_t) {}, requireDisplayEvents);
     }
     template<class Observer>
-    void observe(const PresentationObservation& o, Observer&& onPresentation) {
+    void observe(const PresentationObservation& o, Observer&& onPresentation,
+                 bool requireDisplayEvents = true) {
         if (o.submitted && o.idValid) {
             if (m_HaveMode && o.latched != m_Latched) reset();
             m_HaveMode = true; m_Latched = o.latched;
             m_Pending[m_Next++ % m_Pending.size()] = {o.id, o.submission, o.ready, o.deadline, 0, o.timelineShift, o.smoothness};
         }
-        if (!o.sampleValid || !o.sampleTime || o.sampleTime > o.observed ||
+        // Preserve submissions for delayed display events, but never promote
+        // a refresh reference to a display instant in the live policy. The
+        // legacy path is explicit and exists only to reproduce old captures.
+        if ((requireDisplayEvents && o.timeKind != PresentationTimeKind::DisplayEvent) ||
+            !o.sampleValid || !o.sampleTime || o.sampleTime > o.observed ||
             o.observed - o.sampleTime > 100000 || o.uncertainty > 500) return;
-        if (o.dxgi) {
+        const bool useRefreshReference = o.dxgi &&
+            o.timeKind != PresentationTimeKind::DisplayEvent;
+        if (useRefreshReference) {
             m_Anchors[m_NextAnchor++ % m_Anchors.size()] = {o.syncRefresh, o.sampleTime};
             for (auto& p : m_Pending) if (p.at && p.id == o.sampleId) p.refresh = o.presentRefresh;
         }
@@ -85,10 +94,10 @@ public:
             auto& p = m_Pending[(m_Next + i) % m_Pending.size()];
             if (!p.at) continue;
             uint64_t presented = 0;
-            if (o.dxgi && p.refresh) {
+            if (useRefreshReference && p.refresh) {
                 for (const auto& a : m_Anchors) if (a.sequence == p.refresh) presented = a.at;
             }
-            else if (!o.dxgi && p.id == o.sampleId) presented = o.sampleTime;
+            else if (!useRefreshReference && p.id == o.sampleId) presented = o.sampleTime;
             const auto ready = std::max(p.at, p.ready);
             if (presented && presented >= ready && presented <= o.observed &&
                 o.observed - presented <= 100000 && presented - ready <= 100000) {
