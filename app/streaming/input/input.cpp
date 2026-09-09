@@ -206,10 +206,7 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
 SdlInputHandler::~SdlInputHandler()
 {
     for (int i = 0; i < MAX_GAMEPADS; i++) {
-        if (m_GamepadState[i].mouseEmulationTimer != 0) {
-            Session::get()->notifyMouseEmulationMode(false);
-            SDL_RemoveTimer(m_GamepadState[i].mouseEmulationTimer);
-        }
+        stopGamepadMouseEmulation(&m_GamepadState[i]);
 #if !SDL_VERSION_ATLEAST(2, 0, 9)
         if (m_GamepadState[i].haptic != nullptr) {
             SDL_HapticClose(m_GamepadState[i].haptic);

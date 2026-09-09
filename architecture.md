@@ -831,6 +831,12 @@ See [InputStream.c](moonlight-common-c/moonlight-common-c/src/InputStream.c) and
 a 1 ms interval; the stream event loop normally sleeps 1 ms when idle, with
 platform differences. Input does not wait for the next video target to be sent.
 
+Controller mouse emulation tracks the mouse buttons it actually injected.
+Disabling emulation, removing a controller, or destroying the input handler
+releases those buttons before discarding their state. Overlapping emulated
+presses from multiple controllers share the host button until the final owner
+releases it. This avoids leaving a drag held after a controller disappears.
+
 The inspected paths show no client mechanism that makes audio playout follow
 VRR targets or makes VRR follow the audio device clock. Added video protection
 therefore must not be assumed to produce a corresponding audio delay.

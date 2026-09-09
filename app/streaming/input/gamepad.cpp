@@ -252,6 +252,44 @@ void SdlInputHandler::handleControllerAxisEvent(SDL_ControllerAxisEvent* event)
     }
 }
 
+void SdlInputHandler::sendGamepadMouseButton(GamepadState* state, uint8_t button, bool pressed)
+{
+    const uint8_t mask = uint8_t(1u << button);
+    if (bool(state->mouseButtonsDown & mask) == pressed) {
+        return;
+    }
+    if (pressed) {
+        state->mouseButtonsDown |= mask;
+    }
+    else {
+        state->mouseButtonsDown &= uint8_t(~mask);
+    }
+
+    // Several controllers may emulate the same mouse button. Only the first
+    // press and final release should change the shared host mouse state.
+    for (const auto& other : m_GamepadState) {
+        if (&other != state && (other.mouseButtonsDown & mask)) {
+            return;
+        }
+    }
+    LiSendMouseButtonEvent(pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, button);
+}
+
+void SdlInputHandler::stopGamepadMouseEmulation(GamepadState* state)
+{
+    if (state->mouseEmulationTimer != 0) {
+        SDL_RemoveTimer(state->mouseEmulationTimer);
+        state->mouseEmulationTimer = 0;
+        Session::get()->notifyMouseEmulationMode(false);
+    }
+
+    // A held click may never receive its controller-button-up after a mode
+    // switch, disconnect or suspend. Release exactly the clicks we injected.
+    for (uint8_t button = BUTTON_LEFT; button <= BUTTON_X2; button++) {
+        sendGamepadMouseButton(state, button, false);
+    }
+}
+
 void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* event)
 {
     if (event->button >= SDL_arraysize(k_ButtonMap)) {
@@ -291,19 +329,19 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
         }
         else if (state->mouseEmulationTimer != 0) {
             if (event->button == SDL_CONTROLLER_BUTTON_A) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
+                sendGamepadMouseButton(state, BUTTON_LEFT, true);
             }
             else if (event->button == SDL_CONTROLLER_BUTTON_B) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_RIGHT);
+                sendGamepadMouseButton(state, BUTTON_RIGHT, true);
             }
             else if (event->button == SDL_CONTROLLER_BUTTON_X) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_MIDDLE);
+                sendGamepadMouseButton(state, BUTTON_MIDDLE, true);
             }
             else if (event->button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_X1);
+                sendGamepadMouseButton(state, BUTTON_X1, true);
             }
             else if (event->button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_X2);
+                sendGamepadMouseButton(state, BUTTON_X2, true);
             }
             else if (event->button == SDL_CONTROLLER_BUTTON_DPAD_UP) {
                 LiSendScrollEvent(1);
@@ -325,12 +363,10 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
         if (event->button == SDL_CONTROLLER_BUTTON_START) {
             if (SDL_GetTicks() - state->lastStartDownTime > MOUSE_EMULATION_LONG_PRESS_TIME) {
                 if (state->mouseEmulationTimer != 0) {
-                    SDL_RemoveTimer(state->mouseEmulationTimer);
-                    state->mouseEmulationTimer = 0;
+                    stopGamepadMouseEmulation(state);
 
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                                 "Mouse emulation deactivated");
-                    Session::get()->notifyMouseEmulationMode(false);
                 }
                 else if (m_GamepadMouse) {
                     // Send the start button up event to the host, since we won't do it below
@@ -346,19 +382,19 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
         }
         else if (state->mouseEmulationTimer != 0) {
             if (event->button == SDL_CONTROLLER_BUTTON_A) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+                sendGamepadMouseButton(state, BUTTON_LEFT, false);
             }
             else if (event->button == SDL_CONTROLLER_BUTTON_B) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+                sendGamepadMouseButton(state, BUTTON_RIGHT, false);
             }
             else if (event->button == SDL_CONTROLLER_BUTTON_X) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MIDDLE);
+                sendGamepadMouseButton(state, BUTTON_MIDDLE, false);
             }
             else if (event->button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_X1);
+                sendGamepadMouseButton(state, BUTTON_X1, false);
             }
             else if (event->button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_X2);
+                sendGamepadMouseButton(state, BUTTON_X2, false);
             }
         }
     }
@@ -728,10 +764,7 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
     else if (event->type == SDL_CONTROLLERDEVICEREMOVED) {
         state = findStateForGamepad(event->which);
         if (state != NULL) {
-            if (state->mouseEmulationTimer != 0) {
-                Session::get()->notifyMouseEmulationMode(false);
-                SDL_RemoveTimer(state->mouseEmulationTimer);
-            }
+            stopGamepadMouseEmulation(state);
 
             SDL_GameControllerClose(state->controller);
 

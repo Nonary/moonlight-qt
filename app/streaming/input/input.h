@@ -17,6 +17,7 @@ struct GamepadState {
 #endif
 
     SDL_TimerID mouseEmulationTimer;
+    uint8_t mouseButtonsDown;
     uint32_t lastStartDownTime;
 
     bool clickpadButtonEmulationEnabled;
@@ -175,6 +176,10 @@ private:
     findStateForGamepad(SDL_JoystickID id);
 
     void sendGamepadState(GamepadState* state);
+
+    void sendGamepadMouseButton(GamepadState* state, uint8_t button, bool pressed);
+
+    void stopGamepadMouseEmulation(GamepadState* state);
 
     void sendGamepadBatteryState(GamepadState* state, SDL_JoystickPowerLevel level);
 
