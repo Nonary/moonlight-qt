@@ -128,8 +128,8 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutPredictionEnabled = 1;
     parameters.playoutSmoothnessFeedbackEnabled = 1;
     parameters.playoutDelayAttackUs = 500;
-    parameters.playoutAdaptiveOnly = 1;
-    parameters.playoutPerFrameLatch = 0;
+    parameters.playoutAdaptiveOnly = 0;
+    parameters.playoutPerFrameLatch = 1;
     parameters.playoutRateProtectionEnabled = 0;
     parameters.playoutHistoryEnabled = 1;
     parameters.timestampPlayoutEnabled = 1;

@@ -3,20 +3,23 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
-using QueryInterruptTime = void (WINAPI*)(ULONGLONG*);
-
-QueryInterruptTime interruptClock()
+uint64_t presentationTime100ns()
 {
-    static const auto query = reinterpret_cast<QueryInterruptTime>(
-        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "QueryInterruptTimePrecise"));
-    return query;
+    static const uint64_t frequency = [] {
+        LARGE_INTEGER value;
+        return QueryPerformanceFrequency(&value) && value.QuadPart > 0 ?
+            static_cast<uint64_t>(value.QuadPart) : uint64_t(0);
+    }();
+    LARGE_INTEGER now;
+    return QueryPerformanceCounter(&now) && now.QuadPart > 0 ?
+        PresentationClockSample::qpcTo100ns(static_cast<uint64_t>(now.QuadPart), frequency) : 0;
 }
 }
 
 bool D3D11CompositionPresenter::runtimeSupported()
 {
     static const bool supported = [] {
-        if (!interruptClock()) return false;
+        if (!presentationTime100ns()) return false;
         // RtlGetVersion is independent of application-manifest version shims.
         using GetVersion = LONG (WINAPI*)(OSVERSIONINFOW*);
         const auto getVersion = reinterpret_cast<GetVersion>(
@@ -81,6 +84,7 @@ void D3D11CompositionPresenter::reset()
     m_NextBuffer = 0;
     m_LastDisplayedId = 0;
     m_ComposedFrames = m_IndependentFrames = 0;
+    m_RejectedDisplayFrames = 0;
 }
 
 HRESULT D3D11CompositionPresenter::initialize(ID3D11Device* device, HWND window,
@@ -175,6 +179,12 @@ HRESULT D3D11CompositionPresenter::resize(UINT width, UINT height, DXGI_FORMAT f
     }
     const HRESULT hr = m_Manager->CancelPresentsFrom(1);
     if (FAILED(hr)) return hr;
+    // SetBuffer does not establish a sampling area. An unset source rectangle
+    // produces successful presents with no visible content. Update it on every
+    // resize as well as initial allocation so the whole rendered image is shown.
+    const RECT sourceRect = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+    const HRESULT layoutResult = m_Surface->SetSourceRect(&sourceRect);
+    if (FAILED(layoutResult)) return layoutResult;
     m_Buffers = std::move(buffers);
     cancel();
     m_NextBuffer = 0;
@@ -217,8 +227,8 @@ HRESULT D3D11CompositionPresenter::present(uint64_t& id)
     if (FAILED(hr)) return hr;
     // Pacing and GPU readiness are already complete. Do not add a source
     // period, wait for a statistics event, or prequeue a future target here.
-    SystemInterruptTime now = {};
-    interruptClock()(&now.value);
+    SystemInterruptTime now = {presentationTime100ns()};
+    if (!now.value) return E_FAIL;
     hr = m_Manager->SetTargetTime(now);
     if (FAILED(hr)) return hr;
     const uint64_t nextId = m_Manager->GetNextPresentId();
@@ -241,6 +251,7 @@ bool D3D11CompositionPresenter::pollDisplayedFrame(uint64_t (*clockUs)(), Displa
             continue;
         }
         if (statistics->GetKind() != PresentStatisticsKind_IndependentFlipFrame) continue;
+        ++m_IndependentFrames;
         ComPtr<IIndependentFlipFramePresentStatistics> displayed;
         if (FAILED(statistics.As(&displayed))) continue;
         const auto adapter = displayed->GetOutputAdapterLUID();
@@ -249,14 +260,12 @@ bool D3D11CompositionPresenter::pollDisplayedFrame(uint64_t (*clockUs)(), Displa
                 displayed->GetContentTag() != reinterpret_cast<UINT_PTR>(this) ||
                 displayed->GetPresentId() <= m_LastDisplayedId) continue;
         const auto beforeUs = clockUs();
-        uint64_t interruptTime = 0;
-        interruptClock()(&interruptTime);
+        const uint64_t referenceTime = presentationTime100ns();
         const auto afterUs = clockUs();
         const auto clock = PresentationClockSample::translate(
-            displayed->GetDisplayedTime().value, interruptTime, beforeUs, afterUs);
-        if (!clock.timeUs) continue;
+            displayed->GetDisplayedTime().value, referenceTime, beforeUs, afterUs);
+        if (!clock.timeUs) { ++m_RejectedDisplayFrames; continue; }
         m_LastDisplayedId = displayed->GetPresentId();
-        ++m_IndependentFrames;
         frame = {m_LastDisplayedId, clock};
         return true;
     }

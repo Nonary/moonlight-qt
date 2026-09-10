@@ -34,6 +34,7 @@ public:
     bool pollDisplayedFrame(uint64_t (*clockUs)(), DisplayedFrame& frame);
     uint64_t composedFrames() const { return m_ComposedFrames; }
     uint64_t independentFrames() const { return m_IndependentFrames; }
+    uint64_t rejectedDisplayFrames() const { return m_RejectedDisplayFrames; }
 
 private:
     struct Buffer {
@@ -60,4 +61,5 @@ private:
     uint64_t m_LastDisplayedId = 0;
     uint64_t m_ComposedFrames = 0;
     uint64_t m_IndependentFrames = 0;
+    uint64_t m_RejectedDisplayFrames = 0;
 };

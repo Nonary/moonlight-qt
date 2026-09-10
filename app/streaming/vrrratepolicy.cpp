@@ -64,6 +64,14 @@ std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& re
     addChoice(choices, 30, VrrFpsChoiceKind::Fixed);
     addChoice(choices, 60, VrrFpsChoiceKind::Fixed);
 
+    // Native refresh remains a normal choice with VRR enabled. Insert all
+    // native rates first so another display's recommendation cannot relabel one.
+    for (const int refreshHz : refreshRates) {
+        if (isUsableRefreshRate(refreshHz)) {
+            addChoice(choices, refreshHz, VrrFpsChoiceKind::Fixed);
+        }
+    }
+
     for (const int refreshHz : refreshRates) {
         if (!isUsableRefreshRate(refreshHz)) {
             continue;
@@ -73,12 +81,9 @@ std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& re
             addChoice(choices, vrrRateForRefresh(refreshHz), VrrFpsChoiceKind::Vrr);
             addChoice(choices, lowLatencyRateForRefresh(refreshHz), VrrFpsChoiceKind::LowLatencyVrr);
         }
-        else {
-            addChoice(choices, refreshHz, VrrFpsChoiceKind::Fixed);
-        }
     }
 
-    // Preserve manually saved values, including exact native refresh.
+    // Preserve manually saved values outside the built-in choices.
     if (savedFps > 0) {
         addChoice(choices, savedFps, VrrFpsChoiceKind::Custom);
     }

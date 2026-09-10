@@ -64,7 +64,7 @@ void VrrRatePolicyTest::vrrChoicesRestoreHeadroom()
 {
     const std::vector<VrrFpsChoice> choices = VrrRatePolicy::buildChoices({120}, 90, true);
 
-    QCOMPARE(static_cast<int>(choices.size()), 5);
+    QCOMPARE(static_cast<int>(choices.size()), 6);
     QCOMPARE(choices[0].fps, 30);
     QCOMPARE(choices[0].kind, VrrFpsChoiceKind::Fixed);
     QCOMPARE(choices[1].fps, 60);
@@ -75,15 +75,19 @@ void VrrRatePolicyTest::vrrChoicesRestoreHeadroom()
     QCOMPARE(choices[3].kind, VrrFpsChoiceKind::LowLatencyVrr);
     QCOMPARE(choices[4].fps, 116);
     QCOMPARE(choices[4].kind, VrrFpsChoiceKind::Vrr);
+    QCOMPARE(choices[5].fps, 120);
+    QCOMPARE(choices[5].kind, VrrFpsChoiceKind::Fixed);
 
     // Multiple displays and duplicate modes must not duplicate choices.
-    const auto multiple = VrrRatePolicy::buildChoices({0, 1, 60, 120, 120, 144}, 116, true);
-    const std::vector<int> expected = {30, 50, 59, 60, 100, 116, 120, 138};
+    const auto multiple = VrrRatePolicy::buildChoices({0, 1, 60, 144, 120, 120}, 116, true);
+    const std::vector<int> expected = {30, 50, 59, 60, 100, 116, 120, 138, 144};
     QCOMPARE(multiple.size(), expected.size());
     for (size_t i = 0; i < expected.size(); ++i) {
         QCOMPARE(multiple[i].fps, expected[i]);
     }
     QCOMPARE(multiple[3].kind, VrrFpsChoiceKind::Fixed);
+    QCOMPARE(multiple[6].kind, VrrFpsChoiceKind::Fixed);
+    QCOMPARE(multiple[8].kind, VrrFpsChoiceKind::Fixed);
 
 }
 
@@ -111,7 +115,8 @@ void VrrRatePolicyTest::savedChoicesRemainSelectable()
             if (choice.fps == saved) {
                 ++matches;
                 QCOMPARE(choice.kind, saved == 100 ? VrrFpsChoiceKind::LowLatencyVrr :
-                         saved == 116 ? VrrFpsChoiceKind::Vrr : VrrFpsChoiceKind::Custom);
+                         saved == 116 ? VrrFpsChoiceKind::Vrr :
+                         saved == 120 ? VrrFpsChoiceKind::Fixed : VrrFpsChoiceKind::Custom);
             }
         }
         QCOMPARE(matches, 1);

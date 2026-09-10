@@ -2509,11 +2509,12 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
             feedback.presentationUncertaintyUs = displayed.clock.uncertaintyUs;
         }
         if (!m_CompositionModeLogged && (m_CompositionPresenter.independentFrames() ||
-                                        m_CompositionPresenter.composedFrames())) {
+                                        m_CompositionPresenter.composedFrames() >= 120)) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Windows presentation timing observed: %llu independent-flip frames, %llu composed frames",
+                        "Windows presentation timing observed: %llu independent-flip events, %llu composed events, %llu rejected timestamps (QPC clock)",
                         static_cast<unsigned long long>(m_CompositionPresenter.independentFrames()),
-                        static_cast<unsigned long long>(m_CompositionPresenter.composedFrames()));
+                        static_cast<unsigned long long>(m_CompositionPresenter.composedFrames()),
+                        static_cast<unsigned long long>(m_CompositionPresenter.rejectedDisplayFrames()));
             m_CompositionModeLogged = true;
         }
         releasePreparedVrrFrame();

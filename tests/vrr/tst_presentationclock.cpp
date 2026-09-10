@@ -27,6 +27,23 @@ int main()
     expect(!PresentationClockSample::translate(90000, 100000, 10, 14).timeUs,
            "samples before the worker clock epoch cannot underflow");
     const auto max = std::numeric_limits<uint64_t>::max();
+    expect(PresentationClockSample::qpcTo100ns(12345678, 10000000) == 12345678,
+           "10 MHz QPC already uses 100 ns units");
+    expect(PresentationClockSample::qpcTo100ns(30000000, 24000000) == 12500000,
+           "non-10 MHz QPC must be scaled, not treated as 100 ns ticks");
+    expect(PresentationClockSample::qpcTo100ns(max, 10000000) == max,
+           "scaling large QPC values must not multiply the full counter");
+    expect(!PresentationClockSample::qpcTo100ns(1, 0) &&
+           !PresentationClockSample::qpcTo100ns(max, 1),
+           "invalid frequency or unrepresentable time must fail closed");
+    // Reproduces the observed 20 ms QPC/interrupt-clock epoch difference:
+    // a displayed event 8 ms ago appeared 12 ms in the future with the old clock.
+    const auto qpcNow = PresentationClockSample::qpcTo100ns(30000000, 24000000);
+    const auto verified = PresentationClockSample::translate(qpcNow - 80000, qpcNow, 50000, 50004);
+    expect(verified.timeUs == 42002,
+           "display time must correlate to the presentation QPC clock");
+    expect(!PresentationClockSample::translate(qpcNow - 80000, qpcNow - 200000, 50000, 50004).timeUs,
+           "using the interrupt-clock epoch reproduces the rejected display event");
     const auto large = PresentationClockSample::translate(max - 10000, max, max - 4, max);
     expect(large.timeUs == max - 1002, "large counter values do not overflow");
     return failures ? 1 : 0;

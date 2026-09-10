@@ -46,7 +46,7 @@ swapchain, without Windows or Qt dependencies. It verifies synchronized
 interval-zero calls, telemetry parameter agreement, and result propagation.
 It does not replace a Windows renderer build or a live scanout test.
 
-`tst_presentationclock` checks the composition API's interrupt-time conversion,
+`tst_presentationclock` checks QPC scaling and the composition API's clock correlation,
 including uncertainty, stale/future events, clock reversals, and integer bounds.
 Windows builds additionally produce `compositionprobe.exe`, a manual fullscreen
 probe that opens a window only with `--run`. It shares the production presenter
@@ -56,6 +56,21 @@ intervals, and buffer availability. For example:
 ```powershell
 .\vrr\release\compositionprobe.exe --run --fps 116 --seconds 10 --output composition-probe.json
 ```
+
+Use `compositionprobe --check` for a noninteractive runtime/driver and
+8-bit/10-bit buffer initialization check. It uses a hidden window and the
+production presenter, catching API-resolution failures without claiming scanout
+coverage. The presentation clock uses QPC scaled by its actual frequency,
+avoiding the interrupt-clock export dependency and the observed epoch mismatch.
+Regression coverage includes a 20 ms mismatch that previously made valid display
+timestamps appear future-dated; that number is a test fixture, not a correction.
+The hardware probe reports raw independent events and rejected timestamps separately.
+This setup check cannot validate visible output. Changes to surface setup must
+also exercise `--run` and inspect the displayed test image. The missing-source-
+rectangle regression passed initialization but produced zero display statistics;
+explicitly setting the full buffer rectangle restores visible content. A run
+with composition events but no independent-flip events still fails the timing
+coverage gate and must not be reported as passing that gate.
 
 It requires Windows 11 build 22000.194 or newer and driver support for independent
 flip. A successful run requires at least 90% steady-state measurement coverage
@@ -1220,13 +1235,16 @@ project should add `tests` to its `SUBDIRS` only inside
 directory.
 
 
-### Adaptive-only production presentation
+### Per-frame production presentation protection
 
-Production sets `playout_adaptive_only=1` and no longer switches to synchronized
-presentation near refresh or during jitter. Adaptive software spacing floors
-remain in force. Old per-frame and source-rate latching parameters remain for
-replay; missing `playout_adaptive_only` defaults to zero. The controller suite
-covers adaptive mode at startup, across rate changes, and under late submissions.
+Production sets `playout_adaptive_only=0` and `playout_per_frame_latch=1`.
+Slots closer than a display period plus guard use native protection when the
+presenter supports it, removing the software floor for that slot. DXGI can
+alternate synchronized and tearing presents; composition provides native
+ordering without DXGI flags. The controller suite checks bounded latency at
+120 FPS / 120 Hz, recovery from late submissions, and return to adaptive mode
+with source-rate headroom. Explicit adaptive-only and rate-protection policies
+remain covered for historical replay.
 
 Display timing evidence is explicit: `latch_time_kind` is 0 (unavailable),
 1 (refresh reference), or 2 (display event). Production enables

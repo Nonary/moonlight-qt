@@ -2522,12 +2522,12 @@ void testPerFrameLatchAtNativeMaximum()
     }
 }
 
-void testProductionRemainsAdaptive()
+void testExplicitAdaptiveOnlyPolicy()
 {
     for (int refresh : {60, 120, 144, 240}) {
         const auto session = config(refresh, refresh);
-        const auto policy = vrrTimingParametersForSession(session);
-        expect(policy.playoutAdaptiveOnly == 1, "production must remain adaptive");
+        auto policy = vrrTimingParametersForSession(session);
+        policy.playoutAdaptiveOnly = 1;
         VrrTimingController controller(session, true, policy);
         uint64_t ticks = 0;
         uint64_t prior = 0;
@@ -2545,6 +2545,43 @@ void testProductionRemainsAdaptive()
             if (i % 47 == 0) controller.noteSpacingDeficit(200);
         }
     }
+}
+
+void testProductionAdaptiveProtectionRecoversWithoutDrift()
+{
+    const auto session = config(120, 120);
+    const auto policy = vrrTimingParametersForSession(session);
+    expect(policy.playoutAdaptiveOnly == 0 && policy.playoutPerFrameLatch == 1 &&
+           policy.playoutRateProtectionEnabled == 0,
+           "production must choose protection for each slot, not force a rate band");
+    VrrTimingController controller(session, true, policy);
+    uint64_t ticks = 0, prior = 0;
+    unsigned protectedAtCeiling = 0, adaptiveWithHeadroom = 0;
+    for (int i = 0; i < 1800; ++i) {
+        const int rate = i < 600 || i >= 1200 ? 120 : 100;
+        ticks += 90000 / rate;
+        const uint64_t arrival = 1000000 + ticks * 1000 / 90;
+        const auto decision = controller.schedule(frame(i, uint32_t(ticks), true, arrival),
+                                                  std::max(arrival, prior));
+        if (decision.latchedPresentation) {
+            expect(controller.earliestSubmissionUs() == 0,
+                   "native protection must remove the unsustainable software floor");
+            if (i > 1300) ++protectedAtCeiling;
+        }
+        else {
+            if (prior) expect(decision.targetUs >= controller.earliestSubmissionUs(),
+                              "tearing submissions must retain their spacing protection");
+            if (i > 700 && i < 1100) ++adaptiveWithHeadroom;
+        }
+        expect(decision.targetUs < arrival + 25000,
+               "120 FPS and temporary execution stalls must not accumulate pacing latency");
+        // A late submission must recover on subsequent source slots rather
+        // than pushing every later frame by a display period plus guard.
+        prior = decision.targetUs + (i % 113 == 0 ? 4000 : 0);
+        controller.noteSubmission(true, false, prior);
+    }
+    expect(protectedAtCeiling > 400, "native-rate slots must use protection");
+    expect(adaptiveWithHeadroom > 300, "source slowdown must return to adaptive presentation");
 }
 
 void testSourceRateProtection()
@@ -3390,7 +3427,8 @@ int main()
     testVrr14Prediction();
     testProcessingEpisodeClassification();
     testPerFrameLatchAtNativeMaximum();
-    testProductionRemainsAdaptive();
+    testExplicitAdaptiveOnlyPolicy();
+    testProductionAdaptiveProtectionRecoversWithoutDrift();
     testSourceRateProtection();
     testRollingPlayoutHistory();
     testHistoryPreservesVrr13Scheduling();

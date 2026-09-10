@@ -48,6 +48,37 @@ VRR behavior, HDR, and fullscreen transitions still need hardware validation.
 procedures. This document owns the architecture explanation. Keep both current
 when changing their respective contracts.
 
+Updated on 2026-09-09 after `5e759232`: the precise interrupt clock is resolved
+through the realtime API set. On this machine kernel32 has no direct export,
+which falsely rejected composition despite driver support. Hidden-window setup
+now succeeds for both 8-bit and 10-bit presentation buffers. Production restores
+per-frame native protection (`playout_adaptive_only=0`, `playout_per_frame_latch=1`)
+to avoid accumulating a display-period-plus-guard delay at 120 FPS / 120 Hz.
+Composition can honor protected slots through its native ordering, so it now
+advertises that capability as DXGI does. Hardware setup is verified; gameplay
+display-event coverage and physical presentation still require a fresh session.
+
+The follow-up black-screen correction explicitly sets the presentation surface's
+source rectangle to the allocated buffer dimensions in `resize()`, including
+initial setup. A successful `SetBuffer`/`Present` did not establish that area:
+the unconfigured surface produced no composition or independent-flip events.
+The on-screen probe reproduced zero events before the correction and hundreds
+of composition events afterward; a screen capture confirms its image is visible.
+Independent-flip coverage remains unverified in this desktop/overlay environment.
+The hidden `--check` validates initialization only and cannot gate visible output.
+
+The subsequent timing correction replaces the interrupt-clock reference with
+QPC scaled to 100 ns using `QueryPerformanceFrequency`. Raw independent-flip
+events were present, but their timestamps were rejected as future because the
+interrupt-clock epoch was about 20 ms behind QPC on this machine. The old
+independent-frame counter counted only accepted timestamps, concealing the cause.
+Both target time and feedback now use the same QPC-derived domain; every feedback
+sample is freshly correlated to the worker clock. No fixed offset is applied.
+Diagnostics count raw independent events separately from rejected timestamps.
+A hardware probe with this correction measured 464 of 465 steady-state submissions
+and 3.85 ms p99 submission-to-display latency at 116 FPS / 120 Hz. This is native
+OS evidence, not optical validation or a full gameplay latency measurement.
+
 ## 1. Fundamental model
 
 Moonlight is the client. The host captures and encodes video, sends compressed
@@ -146,7 +177,9 @@ and VRR are requested, usable display refresh rates contribute VRR choices at
 `floor(refresh - refresh^2 / 3600)` and Low-latency VRR choices at
 `floor(refresh / 6) * 5`, restoring the original dropdown calculations
 (116 and 100 FPS at 120 Hz; 138 and 120 FPS at 144 Hz). Native rates remain
-available with VRR disabled or as saved custom values.
+available as ordinary choices with VRR enabled or disabled. Native choices take
+precedence when another display's calculated recommendation matches them, and
+a saved maximum-refresh selection stays selected when VRR is toggled.
 A saved custom FPS remains selectable. Toggling VRR does not rewrite saved FPS;
 `m_StreamConfig.fps` receives the requested preference.
 
@@ -188,13 +221,9 @@ flag reports automatic policy availability, not activation on physical outputs.
 These are configuration reports, not per-game proof of provider availability,
 successful application, or app/client display overrides.
 
-With VRR and configuration warnings enabled, the game list shows one inline
-note when integration is absent, limiting is disabled, or an enabled limiter's
-FPS override differs from Moonlight. Automatic virtual-display limiting counts
-as enabled for the configured virtual-display path and suppresses the warning.
-Only hosts without integration get installation guidance; integrated hosts get
-limiter configuration guidance. Game V-Sync is not advertised as an alternative.
-No new launch toasts or in-stream notifications are generated.
+The game list no longer displays a frame-limiter warning. Capability discovery
+remains available internally. Settings describe full-refresh streaming and the
+optional lower-rate VRR choices without requiring a host limiter.
 
 ### 3.3 What the host is told
 
@@ -542,20 +571,21 @@ qualifying projections, so one early timestamp does not shift the entire stream.
 A late frame can clamp to the present execution opportunity while the next
 frame retains its own source slot.
 
-Production sets `playout_adaptive_only=1` and disables both source-rate and
-per-frame latch selection. Initialization, timeline resets, and every scheduling
-path keep `latchedPresentation=false`, including native-rate sources and late
-CPU/GPU work. D3D11 therefore requests `Present(0, DXGI_PRESENT_ALLOW_TEARING)`;
-Vulkan keeps its adaptive swapchain mode. The existing adaptive software floors
-remain active. Sources above sustainable display throughput may shed frames;
-this policy does not promise tear-free output or full-rate delivery at the ceiling.
+Production sets `playout_adaptive_only=0`, `playout_per_frame_latch=1`, and
+`playout_rate_protection_enabled=0`. Before applying software spacing floors,
+each target is compared with `lastSubmission + displayPeriod + guard`. If it
+falls earlier and the presenter supports native protection, that slot is latched
+and its software floor is disabled. Otherwise the adaptive floor applies.
+DXGI uses `Present(1, 0)` for protected slots and
+`Present(0, DXGI_PRESENT_ALLOW_TEARING)` with headroom. Composition already
+provides native ordering; its protection capability likewise permits a slot
+without the extra CPU floor. It does not expose DXGI tearing flags.
 
-Historical replay parameters can still select `Present(1, 0)` or FIFO. With
-`playout_adaptive_only=0`, `playout_rate_protection_enabled` uses the shared
-`floor(refreshHz - refreshHz * refreshHz / 3600)` cutoff; the older per-frame
-rule compares the target with `lastSubmission + displayPeriod + guard`.
-The adaptive-only field takes precedence when combined with either old mode.
-The new field defaults to zero when absent so old captures retain their policy.
+This allows source-rate changes and recovery from late work without permanently
+carrying a refresh-plus-guard delay into every subsequent frame. The explicit
+adaptive-only policy remains replayable and takes precedence over latch flags.
+Historical rate protection uses the shared below-refresh recommendation cutoff.
+Backends without native protection retain their software spacing floors.
 
 Unlatched predicted presentation can raise the target using a fresh scanout
 observation, converting that floor back to submission time by subtracting
@@ -834,23 +864,28 @@ and requires `IsPresentationSupportedWithIndependentFlip()`. OS version alone
 is insufficient. The render device uses BGRA support and disables internal
 threading optimizations as required by this API; an unsupported device retries
 with the original DXGI device flags. Setup failure retains the DXGI path.
+System-relative presentation time is QPC scaled to 100 ns with the actual QPC
+frequency. It no longer depends on resolving an interrupt-clock export or assumes
+that the interrupt-clock epoch equals the presentation clock's epoch.
 
 `D3D11CompositionPresenter` owns five displayable textures, a presentation
 manager/surface, and a DirectComposition visual bound to the streaming window.
+Initial allocation and each resize explicitly set the surface source rectangle
+to the full buffer; omitting this leaves successful submissions with no image.
 The same shaders, overlays, colorspace, GPU-ready fence, and pacing deadline
 are used. Buffer acquisition checks availability without waiting. Submission
-cancels older pending presents and targets the current interrupt time, with
+cancels older pending presents and targets the current QPC-derived presentation time, with
 no added source period or wait for a presentation event. `ForceVSyncInterrupt`
 requests prompt statistics even with hardware flip queues. Buffer storage
 is not a queue-depth target; OS/driver scheduling still needs measurement.
 
 Only independent-flip statistics with the matching surface tag, output adapter,
-source ID, and increasing present ID become display events. Their 100 ns system
-interrupt timestamps are translated through a fresh bracket on the worker
+source ID, and increasing present ID become display events. Their 100 ns system-relative
+timestamps are correlated with scaled QPC through a fresh bracket on the worker
 clock, with bounded age and uncertainty. Composition statistics do not become
 display events. The backend is trace value 3; DXGI flags, query results, and raw
-QPC fields remain unset. The controller retains its adaptive software floor
-because this presenter does not advertise DXGI latch switching. Resize replaces
+QPC fields remain unset. Native ordering lets the controller omit the software
+floor for a protected slot, as on DXGI, without claiming DXGI flag switching. Resize replaces
 buffers; display changes recreate the renderer and its output identity.
 
 `compositionprobe --run` is an optional fullscreen Windows hardware diagnostic
@@ -1026,14 +1061,14 @@ it cannot isolate the game engine or detect repeated image content from timing
 alone. It is independent of the native-confirmed client hitch metric and does
 not change buffer adaptation. The old `Client ready on time` overlay counted
 preparation deadline misses with zero tolerance and has been replaced by
-`Client cadence`. The new percentage counts only eligible, consecutive, verified
+`Smoothness` on the VRR pacing line. The percentage prefers eligible, consecutive, verified
 display intervals whose client-added spacing error does not exceed 3 ms after
-uncertainty handling. It also shows measured coverage relative to the window's
-submitted-frame count and the measured hitch count, with drops separate. No
-verified intervals in the reporting window selects the separate submission
-counters and labels the result `estimated from submissions`. With neither
-kind of interval, it shows `N/A (waiting for timing samples)`. Estimates never
-inflate measured coverage. Cumulative cadence counters are differenced into the
+uncertainty handling. Hitches and drops appear on a separate compact line.
+No verified intervals in the reporting window selects the separate submission
+counters. The overlay displays the best available score without source or
+coverage labels; with neither kind of interval, smoothness and hitches show
+`N/A`. Native and estimated counters remain distinct internally.
+Cumulative cadence counters are differenced into the
 decoder's existing reporting windows; they are not the controller's expiring
 five-minute adaptation histogram. Preparation lateness remains internal
 diagnostic telemetry. The overlay no longer shows `Errors`; internal

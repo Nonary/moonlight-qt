@@ -28,7 +28,9 @@ public:
     virtual void renderFrame(AVFrame* frame) override;
     virtual IVrrFramePresenter* getVrrFramePresenter() override;
 
-    virtual bool canLatchAdaptivePresent() const override { return !m_CompositionPresenter.active(); }
+    // DXGI can switch to interval one; composition always provides native
+    // presentation ordering. Both can honor a protected slot without a CPU floor.
+    virtual bool canLatchAdaptivePresent() const override { return true; }
     virtual VrrFallbackReason checkSupport() const override;
     virtual uint64_t captureDecodeBoundary() override;
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,

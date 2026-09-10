@@ -38,20 +38,22 @@ uint64_t percentile(std::vector<uint64_t> values, size_t percent)
 // --help is noninteractive; --run is required to open a window.
 int wmain(int argc, wchar_t** argv)
 {
-    bool run = false;
+    bool run = false, check = false;
     unsigned fps = 116, seconds = 10;
     const wchar_t* output = L"composition-probe.json";
     for (int i = 1; i < argc; ++i) {
         if (!wcscmp(argv[i], L"--run")) run = true;
+        else if (!wcscmp(argv[i], L"--check")) check = true;
         else if (!wcscmp(argv[i], L"--fps") && i + 1 < argc) fps = wcstoul(argv[++i], nullptr, 10);
         else if (!wcscmp(argv[i], L"--seconds") && i + 1 < argc) seconds = wcstoul(argv[++i], nullptr, 10);
         else if (!wcscmp(argv[i], L"--output") && i + 1 < argc) output = argv[++i];
         else if (wcscmp(argv[i], L"--help")) { std::fprintf(stderr, "Unknown or incomplete option\n"); return 1; }
     }
-    if (!run) {
+    if (!run && !check) {
         std::puts("compositionprobe --run [--fps 116] [--seconds 10] [--output result.json]\n"
                   "Manual Windows 11 fullscreen presentation test. Escape ends the test.\n"
                   "Reports independent-flip timing and latency; does not prove optical VRR or tear freedom.");
+        std::puts("compositionprobe --check: verify runtime, driver, and buffer setup without showing a window.");
         return 0;
     }
     if (fps < 30 || fps > 360 || seconds < 3 || seconds > 60) return 1;
@@ -70,7 +72,7 @@ int wmain(int argc, wchar_t** argv)
         WS_POPUP, monitor.rcMonitor.left, monitor.rcMonitor.top, width, height,
         nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
-    ShowWindow(window, SW_SHOW);
+    if (run) ShowWindow(window, SW_SHOW);
 
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -84,6 +86,22 @@ int wmain(int argc, wchar_t** argv)
     if (SUCCEEDED(hr)) hr = context.As(&context4);
     if (SUCCEEDED(hr)) hr = device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
     if (FAILED(hr)) { std::fprintf(stderr, "D3D11 setup failed: %08lx\n", static_cast<unsigned long>(hr)); return 1; }
+
+    if (check && !run) {
+        std::printf("Runtime supported: %d; device supports independent flip: %d\n",
+                    D3D11CompositionPresenter::runtimeSupported(),
+                    D3D11CompositionPresenter::deviceSupported(device.Get()));
+        bool passed = true;
+        for (const auto format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM}) {
+            D3D11CompositionPresenter presenter;
+            hr = presenter.initialize(device.Get(), window, width, height, format, {}, 0);
+            std::printf("Presentation setup, format %u: %08lx\n", unsigned(format),
+                        static_cast<unsigned long>(hr));
+            passed = passed && SUCCEEDED(hr);
+        }
+        DestroyWindow(window);
+        return passed ? 0 : 1;
+    }
 
     // Resolve the active path for the primary monitor, not an assumed source 0.
     UINT pathCount = 0, modeCount = 0;
@@ -180,6 +198,7 @@ int wmain(int argc, wchar_t** argv)
         std::fprintf(report,
             "{\n  \"submitted\": %llu, \"steady_submitted\": %llu, \"measured\": %llu,\n"
             "  \"independent_flip_frames\": %llu, \"composed_frames\": %llu, \"unavailable_buffers\": %llu,\n"
+            "  \"rejected_display_timestamps\": %llu,\n"
             "  \"display_period_us\": %llu, \"submit_to_display_p50_us\": %llu, \"submit_to_display_p95_us\": %llu, \"submit_to_display_p99_us\": %llu,\n"
             "  \"display_interval_p50_us\": %llu, \"display_interval_p99_us\": %llu,\n"
             "  \"coverage_at_least_90_percent\": %s, \"p99_service_below_one_refresh\": %s,\n"
@@ -187,6 +206,7 @@ int wmain(int argc, wchar_t** argv)
             static_cast<unsigned long long>(submitted), static_cast<unsigned long long>(measuredSubmissions),
             static_cast<unsigned long long>(latencies.size()), static_cast<unsigned long long>(presenter.independentFrames()),
             static_cast<unsigned long long>(presenter.composedFrames()), static_cast<unsigned long long>(unavailable),
+            static_cast<unsigned long long>(presenter.rejectedDisplayFrames()),
             static_cast<unsigned long long>(refreshUs), static_cast<unsigned long long>(percentile(latencies, 50)),
             static_cast<unsigned long long>(percentile(latencies, 95)), static_cast<unsigned long long>(percentile(latencies, 99)),
             static_cast<unsigned long long>(percentile(intervals, 50)), static_cast<unsigned long long>(percentile(intervals, 99)),

@@ -860,7 +860,7 @@ Flickable {
                         ToolTip.timeout: 5000
                         ToolTip.visible: hovered
                         ToolTip.text: enabled ?
-                                          qsTr("VRR uses adaptive presentation in borderless fullscreen. For smooth results, choose a below-refresh FPS and limit the game to the same FPS using host integration or a game/driver frame limiter.")
+                                          qsTr("VRR uses adaptive presentation in borderless fullscreen. Choose your display's full refresh rate, or a lower VRR option for more headroom or lower latency.")
                                         :
                                           qsTr("VRR requires V-Sync. Enable V-Sync to change this setting.")
                     }

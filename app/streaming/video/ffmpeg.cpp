@@ -1236,32 +1236,34 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                            stats.vrrTelemetryActive ? "Active" : "Inactive");
         }
         else {
-            char cadence[112];
-            if (stats.vrrCadenceIntervals != 0) {
-                const uint64_t hitches = qMin(stats.vrrCadenceHitches, stats.vrrCadenceIntervals);
+            // Prefer verified display timing; use submissions only when the
+            // reporting window has no native intervals. Coverage is diagnostic
+            // information, not another smoothness score.
+            const bool nativeTiming = stats.vrrCadenceIntervals != 0;
+            const uint64_t intervals = nativeTiming ? stats.vrrCadenceIntervals :
+                stats.vrrEstimatedCadenceIntervals;
+            const uint64_t hitches = qMin(intervals, nativeTiming ? stats.vrrCadenceHitches :
+                stats.vrrEstimatedCadenceHitches);
+            char cadence[24];
+            char hitchCount[24];
+            if (intervals != 0) {
                 const double smoothPercent = 100.0 *
-                    static_cast<double>(stats.vrrCadenceIntervals - hitches) / stats.vrrCadenceIntervals;
-                const double coveragePercent = qMin(100.0, 100.0 *
-                    static_cast<double>(stats.vrrCadenceIntervals) / stats.vrrEligibleFrames);
-                snprintf(cadence, sizeof(cadence), "%.1f%% | Measured: %.1f%% | Hitches (>3 ms): %llu",
-                         smoothPercent, coveragePercent, static_cast<unsigned long long>(hitches));
-            }
-            else if (stats.vrrEstimatedCadenceIntervals != 0) {
-                const uint64_t hitches = qMin(stats.vrrEstimatedCadenceHitches, stats.vrrEstimatedCadenceIntervals);
-                const double percent = 100.0 *
-                    static_cast<double>(stats.vrrEstimatedCadenceIntervals - hitches) / stats.vrrEstimatedCadenceIntervals;
-                snprintf(cadence, sizeof(cadence), "%.1f%% (estimated from submissions) | Hitches (>3 ms): %llu",
-                         percent, static_cast<unsigned long long>(hitches));
+                    static_cast<double>(intervals - hitches) / intervals;
+                snprintf(cadence, sizeof(cadence), "%.1f%%", smoothPercent);
+                snprintf(hitchCount, sizeof(hitchCount), "%llu", static_cast<unsigned long long>(hitches));
             }
             else {
-                snprintf(cadence, sizeof(cadence), "N/A (waiting for timing samples)");
+                snprintf(cadence, sizeof(cadence), "N/A");
+                snprintf(hitchCount, sizeof(hitchCount), "N/A");
             }
 
             ret = snprintf(&output[offset],
                            length - offset,
-                           "VRR pacing: %s | Client cadence: %s | Dropped: %llu\n",
+                           "VRR pacing: %s | Smoothness: %s\n"
+                           "Hitches (>3 ms): %s | Dropped: %llu\n",
                            stats.vrrTelemetryActive ? "Active" : "Inactive",
                            cadence,
+                           hitchCount,
                            static_cast<unsigned long long>(stats.vrrPacingDroppedFrames));
         }
         if (ret < 0 || ret >= length - offset) {
