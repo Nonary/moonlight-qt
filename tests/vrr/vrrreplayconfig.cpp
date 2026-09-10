@@ -355,11 +355,12 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
-    if (value.playoutSubmissionEstimateFallback > 1 || value.playoutRequireDisplayEvents > 1 ||
+    if (value.playoutPredictionOnly > 1 || value.playoutSubmissionEstimateFallback > 1 ||
+            value.playoutRequireDisplayEvents > 1 ||
             value.playoutNativeHitchAdaptation > 1 || value.playoutReadinessDrivenAdaptation > 1 ||
             value.playoutStableSmoothnessReference > 1 ||
             value.renderStartPreserveLearnedLead > 1) {
-        return fail("display event requirement, native hitch adaptation, readiness adaptation, stable smoothness reference, and learned preparation lead flags must be 0 or 1");
+        return fail("prediction-only, display event requirement, native hitch adaptation, readiness adaptation, stable smoothness reference, and learned preparation lead flags must be 0 or 1");
     }
     if (value.baseGuardDivisor == 0 ||
             value.pacingLatencyExtraPeriodDenominator == 0 ||
@@ -439,6 +440,10 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.playoutReadinessDrivenAdaptation && !value.playoutPredictionEnabled) {
         return fail("playout_readiness_driven_adaptation requires playout_prediction_enabled");
+    }
+    if (value.playoutPredictionOnly &&
+            (!value.playoutReadinessDrivenAdaptation || value.playoutNativeHitchAdaptation)) {
+        return fail("playout_prediction_only requires readiness adaptation without native hitch adaptation");
     }
     if (value.playoutNativeHitchAdaptation &&
             (!value.playoutSmoothnessFeedbackEnabled || !value.playoutReadinessDrivenAdaptation)) {

@@ -21,6 +21,7 @@
     X(uint64_t, latency_fix_enabled, latencyFixEnabled, 0) \
     X(uint64_t, latency_fix_all_rates, latencyFixAllRates, 0) \
     X(uint64_t, latency_fix_delay_period_per_mille, latencyFixDelayPeriodPerMille, 500) \
+    X(uint64_t, playout_prediction_only, playoutPredictionOnly, 0) \
     X(uint64_t, playout_require_display_events, playoutRequireDisplayEvents, 0) \
     X(uint64_t, playout_submission_estimate_fallback, playoutSubmissionEstimateFallback, 0) \
     X(uint64_t, playout_native_hitch_adaptation, playoutNativeHitchAdaptation, 0) \

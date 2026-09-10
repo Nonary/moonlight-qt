@@ -1,9 +1,9 @@
 # VRR deterministic tests
 
 Linux Vulkan on Wayland now attaches presentation-time feedback to each native
-surface submission and feeds correlated compositor timestamps into the same
-native-hitch padding policy as DXGI. GPU/CPU submission completion is not used
-as a substitute. The Vulkan swapchain's fixed mode does not change when the
+surface submission and records correlated compositor timestamps for native
+cadence diagnostics, as DXGI/composition do. Production buffer adaptation uses
+readiness prediction independently of these observations. The Vulkan swapchain's fixed mode does not change when the
 controller requests a per-frame DXGI latch mode. Clock uncertainty is recorded
 in the optional schema-5 `presentation_uncertainty_us` trace column and replayed.
 Gaming Mode retains its X11/HDR Gamescope WSI path. On that path, the Vulkan
@@ -17,7 +17,8 @@ failed presents, and the first sample after swapchain resets cannot establish a
 cadence interval. Regular X11 without the Gamescope WSI layer is still unsupported.
 Missing platform timing support leaves native display measurement unavailable
 and produces a startup warning. Production then uses labeled submission
-estimates for cadence and bounded padding adaptation.
+estimates for diagnostic cadence reporting. Readiness prediction independently
+controls padding in both directions.
 
 `tst_vulkantiming` tests this dispatch bridge with fake Vulkan entry points,
 including delayed completion IDs, clock conversion, swapchain errors, unchanged
@@ -30,7 +31,7 @@ window or GPU. It checks commit association, IDs, timestamp conversion, VRR's
 zero refresh interval, discarded frames, reset cleanup, bounded pending objects,
 timeouts, and unsupported clocks. It is built when wayland-server and SDL2 are
 available. The timing-controller suite compares delayed Wayland and DXGI feedback
-and requires identical padding and sample counts plus actual hitch-driven growth.
+and requires identical padding and sample counts without display-hitch-driven growth.
 These checks do not replace validation during a real compositor streaming session.
 
 `tst_incomingframetiming` checks the overlay's last-30-interval population
@@ -105,26 +106,25 @@ interval safety separately; they do not claim 99.95% under post-target faults.
 The all-arrival queue simulator uses the capture's `can_latch_present` capability;
 forcing it off invents software-floor backlog on a latch-capable session.
 
-Production prefers matched native presentation timing for client-added interval
-errors strictly greater than 3 ms. `playout_submission_estimate_fallback=1`
-restores submission-based adaptation when no accepted native interval has
-arrived within 100 ms. Estimates use the same strict threshold and 16 ms cap,
-have separate overlay counters, and never teach native display latency. Fresh
-native intervals take priority. Native cadence is compared with the mapped
-source clock, so genuine game cadence changes are not client hitches. Missing
-or ambiguous native timing cannot manufacture a verified success or failure.
-The controller suite covers estimate-only growth, separate counters, measured
-timing taking priority, and historical display-only behavior.
+Production sets `playout_prediction_only=1`: readiness prediction controls both
+growth and release, independently of display feedback. Required protection is
+readiness p99.95 plus any recent readiness-miss boost, with 3 ms of headroom.
+Growth is bounded at 500 us per update; gradual release requires warmed readiness
+history, not native confirmation. The existing five-minute readiness window
+still ages burst history and cached samples. Intentional pacing, acquisition
+waits and post-submission display delay do not become more readiness demand.
 
-Padding may shrink gradually with recent smooth native evidence (or submission
-evidence while the fallback is active), retaining
-3 ms above the readiness p99.95 estimate. A rising readiness estimate can stop
-release but cannot authorize growth. Version-17 profiles isolate this release
-floor from older calibration. The frame queue and 16 ms padding cap are unchanged.
-The captured `playout_native_hitch_adaptation` flag selects this policy; when
-absent it defaults to zero for exact replay of older captures. The new
-`playout_submission_estimate_fallback` also defaults to zero when absent. Existing readiness,
-stable-reference, and preparation-lead flags retain their historical semantics.
+Display observations cannot change compositor lead or the scanout floor in
+this policy. They remain optional trace/cadence diagnostics, with absent display
+events reported as unavailable or through separately labeled submission
+estimates. The selected latency preset still limits the allowed padding. Version-18
+profiles prevent old native-hitch
+calibration from holding the new buffer high. The three-frame queue and 16 ms
+padding cap are unchanged. Missing `playout_prediction_only` defaults to zero;
+the historical native-hitch and combined-feedback policies remain replayable.
+Controller regressions cover growth and later release without display events,
+delivery/render/scheduler faults, startup without double-counted protection,
+latency/spacing bounds, and identical scheduling despite display-only hitches.
 `--require-exact-baseline` selects that captured policy; an ordinary replay or
 the `session-policy` scenario selects the current production policy instead.
 The spacing lifecycle audit accepts a zero correction floor only when the
@@ -1253,6 +1253,8 @@ supply latency learning, native hitch adaptation, or measured client cadence.
 Submission estimates supply a separately labeled cadence percentage while
 verified events are unavailable. Windows composition records backend value 3
 and independent-flip display events, without populating DXGI-specific fields.
+Production scheduling and buffer adaptation ignore both display events and
+submission-interval estimates; readiness prediction is their only feedback.
 Old captures omit that controller field and retain zero for exact historical
 replay. A historical exact match does not validate refresh-reference timestamps
 as actual display events. Regression tests cover the shared refresh timestamp

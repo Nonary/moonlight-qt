@@ -15,6 +15,7 @@ private slots:
     void nativeHitchPolicyRoundTrip();
     void displayEventPolicyRoundTrip();
     void submissionEstimatePolicyRoundTrip();
+    void predictionOnlyPolicyRoundTrip();
     void rateProtectionPolicyRoundTrip();
     void adaptiveOnlyPolicyRoundTrip();
     void latencyFixPolicyRoundTrip();
@@ -475,6 +476,32 @@ void VrrReplayConfigTest::nativeHitchPolicyRoundTrip()
     QCOMPARE(parameters.playoutNativeHitchAdaptation, uint64_t(1));
     parameters.playoutSmoothnessFeedbackEnabled = 0;
     QVERIFY(!validateVrrTimingParameters(parameters, error));
+}
+
+void VrrReplayConfigTest::predictionOnlyPolicyRoundTrip()
+{
+    VrrTimingParameters defaults;
+    QCOMPARE(defaults.playoutPredictionOnly, uint64_t(0));
+    auto parameters = defaults;
+    parameters.playoutPredictionOnly = 1;
+    parameters.playoutReadinessDrivenAdaptation = 1;
+    parameters.playoutPredictionEnabled = 1;
+    parameters.playoutHistoryEnabled = 1;
+    parameters.timestampPlayoutEnabled = 1;
+    parameters.playoutDelayAdaptive = 1;
+    parameters.playoutDelayMarginUs = 3000;
+    QString error;
+    QVERIFY2(validateVrrTimingParameters(parameters, error), qPrintable(error));
+    QCOMPARE(parameters.playoutPredictionOnly, uint64_t(1));
+    QCOMPARE(parameters.playoutNativeHitchAdaptation, uint64_t(0));
+    const auto snapshot = vrrTimingParametersToJson(parameters);
+    QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, defaults, error), qPrintable(error));
+    QCOMPARE(defaults.playoutPredictionOnly, uint64_t(1));
+    QCOMPARE(defaults.playoutDelayMarginUs, uint64_t(3000));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_prediction_only", 2}}, defaults, error));
+    QCOMPARE(defaults.playoutPredictionOnly, uint64_t(1));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_native_hitch_adaptation", 1}}, defaults, error));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_readiness_driven_adaptation", 0}}, defaults, error));
 }
 
 void VrrReplayConfigTest::adaptiveOnlyPolicyRoundTrip()

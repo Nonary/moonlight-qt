@@ -13,7 +13,7 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     QTemporaryDir dir;
     assert(dir.isValid());
-    for (int version : {14, 15, 16, 17}) {
+    for (int version : {14, 15, 16, 17, 18}) {
         Vrr13::Reserve predictive(version), restored(version), legacy;
         for (int i = 0; i < 400; ++i)
             predictive.observe(8000000, 5000000, 1000000000LL + int64_t(i) * 10000000);

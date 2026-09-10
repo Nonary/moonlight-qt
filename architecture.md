@@ -5,18 +5,13 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Source baseline: `e63bbd45242f51cb07490f093ee39a009f10ba96` plus the confirmed-native-hitch
-adaptation correction and removal of gap fill and reduced-rate VRR recommendations
-(committed as `e0e7993d`), plus the incoming host smoothness overlay (`6db3919d`)
-and its rolling 30-interval variance correction, inspected
-2026-09-07; updated for readiness-driven padding, stable smoothness references,
-and preservation of learned preparation lead on 2026-09-07; the subsequent
-game-spacing correction disables production cadence smoothing and caps padding
-at 16 ms. Production prefers matched native presentation errors strictly
-greater than 3 ms for buffer growth, with submission estimates as a fallback
-when display timing is unavailable. Release targets 3 ms of readiness headroom,
-subject to the selected timing allowance, and requires recent smooth evidence
-from the active timing source. The initial map came from nine Luna Medium specialists, followed by
+Source baseline: `20fa2bc49cadfc50b32afefb155ff8a7ff833e41` plus prediction-only
+buffer adaptation, inspected 2026-09-10. Production uses readiness prediction
+for both growth and release, targeting 3 ms of headroom within the three-frame
+queue, 16 ms cap and selected timing allowance. Display feedback is optional diagnostic evidence;
+it cannot change deadlines or authorize/veto padding changes. Historical
+native-hitch and combined-feedback policies remain available for exact replay.
+The initial map came from nine Luna Medium specialists, followed by
 targeted source checks and corrections. No live capture, optical measurement,
 build, or test run was part of this documentation investigation. Recheck the
 named functions after changes; comments, diagnostic labels, and old experiments
@@ -53,7 +48,7 @@ for all 12,799 submissions despite 2,654 logical latch transitions. This is a
 renderer contract mismatch, not evidence that changing latch hysteresis will
 remove the reported judder. `MOONLIGHT_VRR_COMPOSITION=1` opts into the existing
 composition backend for diagnostic comparison, snapshotted at renderer setup.
-DXGI uses the existing submission-estimate feedback fallback; its refresh
+DXGI retains submission-estimate cadence diagnostics; its refresh
 references are not verified frame display events. Calibration identities now
 include the active presenter so their readiness histories cannot cross-seed.
 The capture lost one row and failed exact replay. Exploratory replay favored
@@ -113,6 +108,9 @@ near-refresh cutoff (116 FPS at 120 Hz) and exits below 114 FPS. Rejected excess
 demand is clipped on exit so a near-ceiling miss cannot reappear as padding
 solely because the cadence leaves that band; fresh lower-rate misses can acquire
 ordinary protection. Historical enabled profiles used `|latency-fix=1`.
+
+Since 2026-09-10, native and estimated cadence remain diagnostics only.
+Readiness prediction controls buffer changes independently of either source.
 
 [AGENTS.md](AGENTS.md) owns machine-specific build, deployment, and capture
 procedures. This document owns the architecture explanation. Keep both current
@@ -526,9 +524,12 @@ Its initializer values preserve older behaviors for replay and tests.
 `vrrTimingParametersForSession()` overrides them for production. A comment or
 schema default is insufficient evidence of the current session policy.
 
-At the inspected baseline the resolver enables timestamp playout, prediction,
-shared history, smoothness feedback, adaptive delay, and per-frame latch
-requests. It disables the retired metronome and prepare-on-arrival experiment.
+The resolver enables timestamp playout, prediction-only adaptation, shared
+readiness history and adaptive delay. Native-hitch adaptation is disabled.
+The current latency presets and per-frame native latch requests are preserved.
+Display and submission smoothness feedback remain optional diagnostics.
+Historical feedback policies remain selectable for exact replay.
+It disables the retired metronome and prepare-on-arrival experiment.
 It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 
 | Production input | Value / meaning |
@@ -540,7 +541,7 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | Maximum-period ratio | 0; no additional period-ratio maximum input |
 | Delay attack | At most 500 us per update |
 | Delay release input | 10 us, scaled by elapsed time at a 120 FPS reference rate |
-| Prediction margin | 300 us |
+| Prediction margin | 3,000 us above estimated readiness demand |
 | Smoothing gain | 0; preserve relative game intervals |
 | Smoothing period EMA | 100 per mille; inactive in production |
 | Positive smoothing lag cap | 6,000 us; inactive in production |
@@ -666,10 +667,13 @@ adaptive-only policy remains replayable and takes precedence over latch flags.
 Historical rate protection uses the shared below-refresh recommendation cutoff.
 Backends without native protection retain their software spacing floors.
 
-Unlatched predicted presentation can raise the target using a fresh scanout
-observation, converting that floor back to submission time by subtracting
-learned compositor lead, bounded at zero. `earliestSubmissionUs()` supplies
-another lower bound.
+Prediction-only production ignores the presentation model's compositor lead
+and scanout floor. Deadlines use the mapped source cadence, readiness protection
+and measured local work/scheduler budgets. `earliestSubmissionUs()` supplies
+the local submission-spacing floor. The existing `predicted_scanout_us` trace
+field equals the submission target in this policy; it is not a calibrated
+measurement of physical scanout. Historical policies can still learn a
+compositor lead and scanout floor from native observations.
 
 Normally that earliest submission is `lastSubmission + displayPeriod + guard`.
 With `latchedFloorDisabled` and a latched decision it returns zero. This is a
@@ -711,10 +715,10 @@ the stream.
 
 ### 9.2 Reserve history and smoothness feedback
 
-With production prediction and smoothness enabled, the readiness history uses
-`Vrr13::Reserve(17)`. Version 17 isolates release-floor evidence for the
-native-hitch policy from earlier readiness-driven calibration. Readiness history
-can veto shrinking but cannot independently increase padding.
+Production readiness history uses `Vrr13::Reserve(18)`. Version 18 isolates
+prediction-only calibration from native-hitch release floors and older combined
+feedback estimates. Readiness history controls both increasing and decreasing
+padding; native and CPU submission interval errors do not become buffer demand.
 Namespace/file version names do not mean the older algorithm
 is active. Reserve uses nanoseconds, 250 us histogram bins, and one-second aging
 buckets over approximately five minutes. Allocation is kept out of ordinary
@@ -732,24 +736,17 @@ stronger reliability condition involving longer history and at most 0.05%
 misses. Five-minute retention does not mean every startup waits five minutes
 before adaptation.
 
-There are separate submission and native `SmoothnessFeedback` instances. They
-compare actual adjacent intervals against intended adjacent intervals, use a
-3 ms tolerance and uncertainty checks, and require valid consecutive evidence.
-Production `playout_native_hitch_adaptation=1` scores native intervals against
-`sourceTimeUs`, preserving relative game cadence while excluding changes in
-our own padding, rendering estimate, or compositor prediction from the desired
-interval. A native interval error must be strictly greater than 3 ms even after
-subtracting timing uncertainty to authorize growth. Errors at or below 3 ms
-and readiness estimates cannot request more padding. When no accepted native
-interval has arrived within 100 ms, `playout_submission_estimate_fallback=1`
-uses submission interval errors with the same strict threshold and buffer cap.
-Estimates have separate cadence counters and cannot teach compositor latency.
-Fresh native evidence takes priority over estimates. The fallback flag defaults
-to zero for old captures, preserving display-only replay. Source-rate transitions and host stalls retain
-the existing eligibility exclusions. Native confirmation is OS timing evidence,
-not optical proof of a perceived hitch.
+There are separate submission and native `SmoothnessFeedback` instances for
+diagnostics. Native intervals are compared against `sourceTimeUs`, preserving
+relative game cadence while excluding changes in padding, render estimates and
+compositor prediction from the desired interval. A measured cadence error must
+exceed 3 ms after uncertainty handling to count as a hitch. Source-rate
+transitions and host stalls retain the existing eligibility exclusions. These
+observations never request or block prediction-only buffer changes. Native
+confirmation is OS timing evidence, not optical proof of a perceived hitch.
 
-Stretch charges the current frame; catch-up charges the preceding delayed frame
+In the historical native-hitch policy, stretch charges the current frame;
+catch-up charges the preceding delayed frame
 using that frame's original padding. Each newly confirmed miss supplies demand
 once; historical histogram tails cannot repeatedly authorize growth. Missing,
 out-of-order, ambiguous, or unmatched native feedback cannot manufacture a miss.
@@ -757,13 +754,14 @@ Legacy policies retain their inclusive threshold, original target/scanout
 references, and readiness/combined-feedback adaptation for exact replay.
 The new parameter defaults to zero when absent from older captures.
 
-`PresentationPrediction` requires explicit display-event timestamps in production
-and matches them to submitted present IDs. DXGI refresh references remain usable
+`PresentationPrediction` requires explicit display-event timestamps for production
+cadence diagnostics and matches them to submitted present IDs. DXGI refresh references remain usable
 only by the legacy replay policy; matching their refresh identity does not turn
 them into display events. Stale, future, or too-uncertain observations are
 ignored. The inspected implementation bounds sample age at 100 ms and native
 uncertainty at 500 us, learns a rolling median ready-to-presentation lead, and
-uses fresh matched observations for its floor. Missing feedback remains missing.
+uses fresh matched observations for its floor in historical policies only.
+Production ignores both the lead and floor. Missing feedback remains missing.
 
 ### 9.3 Delay update and capacity formulas
 
@@ -773,28 +771,25 @@ legacy/replay behavior. In that branch 1000 per mille means p100, 999 means
 p99.9, and 995 means p99.5. Those values must not be confused with the active
 Reserve p99.95 implementation.
 
-Production updates padding as follows:
+Production sets `playout_prediction_only=1` and updates padding as follows:
 
-- A new native hitch (or submission estimate when native timing is unavailable)
-  requests protection based on the delayed frame's
-  padding plus its interval error beyond the 3 ms tolerance. Requests slew upward
-  by at most 500 us per update and remain bounded by capacity, the 16 ms cap,
-  and the selected timing allowance. Balanced permits up to half a display
-  period of extra padding; Lowest latency permits none.
-- Without a pending hitch request, padding can shrink toward readiness p99.95
-  plus 3,000 us, subject to the selected allowance. A higher readiness estimate
-  only stops release; it cannot grow
-  the buffer. Readiness history includes preparation and scheduler work but
-  excludes deliberate waiting.
-- Release requires warmed readiness history, smooth evidence allowing release,
-  and an observation from the active timing source within 100 ms of the current
-  decode time. Without native timing, the estimate fallback uses submission
-  history. Missing evidence from both sources does not authorize release. The existing 10 us
-  release input scales by elapsed time at a 120 FPS reference, capped at
-  33,333 us of elapsed recovery time per update.
-- Capacity remains a hard safety bound; when insufficient, the requested
-  headroom cannot be guaranteed. A capacity-clipped request cannot pin the
-  buffer indefinitely or resurrect growth after capacity recovers.
+- Required protection is readiness p99.95 plus any recent readiness-miss boost,
+  then 3,000 us of headroom. The model includes delivery variation, FIFO render
+  work and render scheduler delays, excluding intentional pacing, swapchain
+  acquisition waits and post-submission display latency.
+- Padding grows toward that requirement by at most 500 us per update. It does
+  not wait for a displayed hitch. Existing protection is compared with the
+  requirement, rather than added to the next demand. The cold-start seed is
+  applied once and is not added again when calculating headroom.
+- Padding shrinks toward the same requirement after readiness history warms
+  (32 samples and 2 seconds) and any readiness miss has been absent for 2 seconds.
+  No display sample is required. The 10 us release input scales by elapsed time
+  at a 120 FPS reference, capped at 33,333 us of elapsed recovery per update.
+- Readiness tails still age out over the existing five-minute window; a brief
+  clean period does not immediately erase a recent burst or valid cached tail.
+- Capacity, the 16 ms cap and the selected timing allowance remain hard bounds
+  in both directions. Balanced allows up to half a display period; Lowest
+  allows no extra padding. These bounds can prevent the full 3 ms headroom.
 
 The legacy readiness and combined-feedback laws remain available for replay.
 
@@ -835,9 +830,10 @@ latency add distinct timing-mode suffixes; Smoothest keeps the ordinary key.
 Profiles expire after 14 days; saves require at least
 240 observations, use locking/atomic replacement, and cap storage at 16 profiles.
 
-The native-hitch policy accepts version-17 readiness histograms only as
-release-floor evidence; they do not authorize startup growth. Older calibration
-versions are rejected. Reserve ages the prior and replaces its mass
+Prediction-only production accepts version-18 readiness histograms; versions
+from native-hitch and earlier policies are rejected. Its requested protection
+uses the readiness distribution and recent boost, not a display-validated
+"proven buffer". Reserve ages the prior and replaces its mass
 with live evidence over time. Short interrupted runs preserve a more protective
 prior instead of automatically erasing it. Cached evidence is not proof of
 current-session coverage. Display epoch changes invalidate calibration saving.
@@ -914,7 +910,7 @@ than proof of monitor delivery.
 `SyncQPCTime` timestamps the sync observation and is not automatically the
 presentation timestamp of the accompanying present ID.
 
-Production requires `playout_require_display_events=1`. Presentation feedback
+Production cadence diagnostics require `playout_require_display_events=1`. Presentation feedback
 explicitly distinguishes unavailable timestamps, refresh references, and display
 events. DXGI `GetFrameStatistics()` is marked as a refresh reference and cannot
 teach compositor latency, authorize buffer growth/release, or create a measured
@@ -928,8 +924,8 @@ to zero to preserve old exact baselines. New schema-5 traces additionally record
 `latch_time_kind` (0 unavailable, 1 refresh reference, 2 display event).
 
 The DXGI statistics provider supplies no verified display events. Unsupported
-Windows systems therefore use submission estimates for cadence and bounded
-padding adaptation. Composition-frame statistics also lack a verified frame
+Windows systems therefore use submission estimates for diagnostic cadence reporting.
+Readiness prediction independently adapts padding in both directions. Composition-frame statistics also lack a verified frame
 display instant, so the same estimator covers periods without independent-flip
 events. The overlay labels this lower-confidence timing as estimated; it does
 not claim native display coverage or learn display-service latency from it.
@@ -1199,9 +1195,9 @@ and does not exclude long local arrival gaps when RTP is steady. The older
 `spacing_accuracy_percent` and 2 ms fields retain their historical contract,
 including their sender/arrival exclusions, for comparison.
 
-These replay spacing fields use submission timing as a presentation proxy;
-they are not native display evidence. Production uses submission estimates
-for bounded adaptation only while verified display timing is unavailable.
+These replay spacing fields use submission timing as a presentation proxy.
+Neither these metrics nor native confirmation authorizes buffer growth in the
+prediction-only policy; readiness prediction controls padding.
 Report `smoothness_feedback.native_window_samples` and `native_window_misses`
 separately. Sparse or missing native observations cannot establish 99.95%
 visible smoothness, even when the observed miss count is zero. Counterfactual

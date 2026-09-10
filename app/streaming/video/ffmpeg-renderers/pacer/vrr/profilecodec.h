@@ -26,7 +26,7 @@ inline bool decodeVrrPlayoutProfile(const QByteArray& encoded, std::vector<int64
         if (!value.isDouble() || value.toDouble() != double(integer)) return false;
         words.push_back(integer);
     }
-    if (words.empty() || (words[0] != 13 && words[0] != 14 && words[0] != 15 && words[0] != 16 && words[0] != 17)) return false;
+    if (words.empty() || (words[0] != 13 && words[0] != 14 && words[0] != 15 && words[0] != 16 && words[0] != 17 && words[0] != 18)) return false;
     Vrr13::Reserve validation{int(words[0])};
     return validation.loadProfile(words);
 }

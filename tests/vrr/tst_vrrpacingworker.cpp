@@ -1520,7 +1520,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     auto cachedConfig = enabledConfig();
     cachedConfig.calibrationPath = traceDirectory.filePath("profile.json").toStdString();
     cachedConfig.calibrationKey = "replay-test";
-    Vrr13::Reserve cachedHistory(17);
+    Vrr13::Reserve cachedHistory(18);
     for (int i = 0; i < 256; ++i)
         cachedHistory.observe(4000000, 8000000, Vrr13::Reserve::Second + int64_t(i) * 16667000);
     expect(Vrr13::saveProfile(QString::fromStdString(cachedConfig.calibrationPath),
@@ -1552,11 +1552,12 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     expect(columns.contains("original_target_us") &&
            decodeVrrPlayoutProfile(fields.value(columns.indexOf("playout_initial_profile")), profile),
            "capture must carry its original deadline and complete starting calibration");
-    Vrr13::Reserve restored(17);
+    Vrr13::Reserve restored(18);
     expect(restored.loadProfile(profile) && restored.common() == 4000000 && restored.evidence() == 0,
            "captured calibration must restore prior history without inventing fresh successes");
-    expect(fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "1",
-           "capture must identify the native-hitch policy for exact replay");
+    expect(fields.value(columns.indexOf("param_playout_prediction_only")) == "1" &&
+               fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "0",
+           "capture must identify prediction-only adaptation for exact replay");
     expect(header.contains("frame_receive_us") &&
                header.contains("frame_reassembled_us") &&
                header.contains("decode_submit_us") &&

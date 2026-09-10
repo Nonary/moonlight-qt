@@ -126,7 +126,10 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.latencyFixEnabled = config.latencyFix || latencyMode != 0 ? 1 : 0;
     parameters.latencyFixAllRates = latencyMode != 0 ? 1 : 0;
     parameters.latencyFixDelayPeriodPerMille = latencyMode == 2 ? 0 : 500;
-    parameters.playoutNativeHitchAdaptation = 1;
+    parameters.playoutPredictionOnly = 1;
+    parameters.playoutNativeHitchAdaptation = 0;
+    // Display observations are optional diagnostics. They never steer the
+    // production schedule or authorize either direction of buffer adaptation.
     parameters.playoutRequireDisplayEvents = 1;
     parameters.playoutSubmissionEstimateFallback = 1;
     parameters.playoutReadinessDrivenAdaptation = 1;
@@ -134,6 +137,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.renderStartPreserveLearnedLead = 1;
     parameters.playoutPredictionEnabled = 1;
     parameters.playoutSmoothnessFeedbackEnabled = 1;
+    parameters.playoutDelayMarginUs = 3000;
     parameters.playoutDelayAttackUs = 500;
     parameters.playoutAdaptiveOnly = 0;
     parameters.playoutPerFrameLatch = 1;
@@ -278,7 +282,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_SubmissionSmoothness.reset();
         m_NativeSmoothness.reset();
         m_RequestedPlayoutDelayUs = 0;
-        m_PlayoutHistory = Vrr13::Reserve(m_Parameters.playoutNativeHitchAdaptation ? 17 :
+        m_PlayoutHistory = Vrr13::Reserve(m_Parameters.playoutPredictionOnly ? 18 :
+            m_Parameters.playoutNativeHitchAdaptation ? 17 :
             m_Parameters.playoutReadinessDrivenAdaptation ? 16 :
             m_Parameters.playoutSmoothnessFeedbackEnabled ? 15 : m_Parameters.playoutPredictionEnabled ? 14 : 13);
         m_LastHistoryArrivalUs = 0;
@@ -547,7 +552,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     const uint64_t playoutDelayUs = m_LatencyFixActive ?
         std::min(proposedPlayoutDelayUs, latencyFixDelayLimitUs()) : proposedPlayoutDelayUs;
     const uint64_t renderOffsetUs = m_Parameters.playoutPredictionEnabled ? typicalRenderUs() : m_RenderLeadUs;
-    const uint64_t compositorLeadUs = m_Parameters.playoutPredictionEnabled ? m_PresentationPrediction.lead(nowUs) : 0;
+    const uint64_t compositorLeadUs = m_Parameters.playoutPredictionEnabled &&
+        !m_Parameters.playoutPredictionOnly ? m_PresentationPrediction.lead(nowUs) : 0;
     uint64_t targetUs = saturatingAdd(
         addSigned(addSigned(m_SourceTimeUs, m_ReadinessBudgetUs),
                   smoothingUs),
@@ -642,7 +648,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                                 targetUs < safeAdaptiveUs;
     }
     const uint64_t unflooredTargetUs = targetUs;
-    if (m_Parameters.playoutPredictionEnabled && !m_LatchedPresentation) {
+    if (m_Parameters.playoutPredictionEnabled && !m_Parameters.playoutPredictionOnly &&
+        !m_LatchedPresentation) {
         const auto scanoutFloor = m_PresentationPrediction.floor(nowUs, m_DisplayPeriodUs, m_GuardUs);
         targetUs = std::max(targetUs, scanoutFloor > compositorLeadUs ? scanoutFloor - compositorLeadUs : 0);
     }
@@ -1499,7 +1506,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 // proxy. Never mix it into the verified display counters or
                 // teach native service latency from it. It may guide padding
                 // only while verified native feedback is unavailable.
-                if (demand && !hasRecentNativeFeedback(submissionUs))
+                if (demand && !m_Parameters.playoutPredictionOnly &&
+                        !hasRecentNativeFeedback(submissionUs))
                     m_RequestedPlayoutDelayUs = std::max(m_RequestedPlayoutDelayUs, demand);
             }
         }
@@ -1553,7 +1561,7 @@ Vrr13::SmoothnessFeedback::Sample VrrTimingController::smoothnessSample(const Vr
     // Keep the old reference available for exact replay of existing captures.
     sample.intended = m_Parameters.playoutStableSmoothnessReference ?
         d.originalTargetUs : d.originalScanoutUs;
-    if (m_Parameters.playoutNativeHitchAdaptation) {
+    if (m_Parameters.playoutNativeHitchAdaptation || m_Parameters.playoutPredictionOnly) {
         // Score client-added spacing against the game's source cadence. Changes
         // in our padding or render estimate must not redefine a smooth result.
         sample.intended = d.sourceTimeUs;
@@ -1579,6 +1587,9 @@ const Vrr13::SmoothnessFeedback& VrrTimingController::activeSmoothnessFeedback(u
 
 void VrrTimingController::notePresentation(const Vrr13::PresentationObservation& observation)
 {
+    // Prediction-only production retains native cadence as diagnostic evidence.
+    // schedule() ignores this model's lead/floor and updatePlayoutHistory()
+    // uses readiness alone; missing or delayed feedback cannot change timing.
     if (!m_Parameters.playoutPredictionEnabled) return;
     if (!m_Parameters.playoutSmoothnessFeedbackEnabled) {
         m_PresentationPrediction.observe(observation,
@@ -2309,6 +2320,31 @@ void VrrTimingController::updatePlayoutHistory(
     }
     m_PlayoutBandValid = true;
     m_PlayoutBandIndex = 0; // One distribution, shared across source rates.
+
+    if (m_Parameters.playoutPredictionOnly) {
+        // Predict the required protection from delivery, FIFO work and
+        // scheduler observations. Count existing padding once: neither our
+        // intentional waits nor post-submission display delay is more work.
+        const uint64_t protection = uint64_t(
+            (m_PlayoutHistory.common() + m_PlayoutHistory.boost()) / 1000);
+        m_RequestedPlayoutDelayUs = saturatingAdd(protection,
+                                                m_Parameters.playoutDelayMarginUs);
+        const uint64_t desired = clampUnsigned(m_RequestedPlayoutDelayUs,
+            playoutDelayMinimumUs(), playoutDelayMaximumUs());
+        if (desired > m_AppliedPlayoutDelayUs) {
+            m_AppliedPlayoutDelayUs += std::min(desired - m_AppliedPlayoutDelayUs,
+                                              m_Parameters.playoutDelayAttackUs);
+        }
+        else if (m_PlayoutHistory.canRelease()) {
+            const uint64_t release = scaledPerMille(m_Parameters.playoutDelayReleaseUs,
+                                                    elapsed * 120 / 1000);
+            m_AppliedPlayoutDelayUs -= std::min(m_AppliedPlayoutDelayUs - desired, release);
+        }
+        // The cold-start seed is already applied above, not extra protection
+        // to add to the margin. Capacity remains a hard bound through rebases.
+        m_AppliedPlayoutDelayUs = std::min(m_AppliedPlayoutDelayUs, playoutDelayMaximumUs());
+        return;
+    }
 
     if (m_Parameters.playoutNativeHitchAdaptation) {
         // Readiness may veto release. Growth requires a new native hitch or
