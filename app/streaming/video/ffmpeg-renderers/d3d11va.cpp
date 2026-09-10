@@ -448,7 +448,7 @@ Exit:
 bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapterNotFound)
 {
     const D3D_FEATURE_LEVEL supportedFeatureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
-    const bool tryComposition = m_DecoderParams.enableVrr && D3D11CompositionPresenter::runtimeSupported();
+    const bool tryComposition = m_CompositionRequested && D3D11CompositionPresenter::runtimeSupported();
     bool success = false;
     ComPtr<IDXGIAdapter1> adapter;
     DXGI_ADAPTER_DESC1 adapterDesc;
@@ -668,6 +668,11 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     HRESULT hr;
 
     m_DecoderParams = *params;
+    // The composition API supplies display events, but it does not implement
+    // the controller's per-frame tearing/synchronized presentation choice.
+    // Keep it available for capture comparisons without replacing DXGI VRR.
+    m_CompositionRequested = params->enableVrr &&
+        qgetenv("MOONLIGHT_VRR_COMPOSITION") == "1";
 
     if (qgetenv("D3D11VA_ENABLED") == "0") {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -841,7 +846,7 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     // of the capability evidence and must be settled before VRR starts.
     refreshVrrDisplayState();
 
-    if (m_DecoderParams.enableVrr &&
+    if (m_CompositionRequested &&
             m_VrrFallbackReason == VrrFallbackReason::NoFallback && m_VrrDisplayTiming.pathValid) {
         LUID adapter = {};
         adapter.LowPart = static_cast<DWORD>(m_VrrDisplayTiming.sourceAdapterLuid);
@@ -857,8 +862,10 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
 
     if (m_DecoderParams.enableVrr && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "D3D11 VRR backend enabled: refresh=%d Hz",
-                    m_DecoderParams.vrrDisplayRefreshHz);
+                    "D3D11 VRR backend enabled: refresh=%d Hz, presentation=%s",
+                    m_DecoderParams.vrrDisplayRefreshHz,
+                    m_CompositionPresenter.active() ? "composition diagnostic (native ordering)" :
+                        "DXGI (per-frame tearing/synchronized, estimated timing)");
     }
 
     {
@@ -3441,7 +3448,10 @@ QString D3D11VARenderer::getCalibrationIdentity()
     if (!m_RenderDevice || FAILED(m_RenderDevice.As(&device)) ||
         FAILED(device->GetAdapter(&adapter)) || FAILED(adapter->GetDesc(&desc)) ||
         FAILED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver))) return {};
-    return QString("D3D11|%1|%2|%3|%4|%5|%6")
+    // Buffer acquisition and native service differ between these presenters.
+    // Do not seed DXGI readiness from a composition capture, or vice versa.
+    return QString("D3D11|%1|%2|%3|%4|%5|%6|%7")
         .arg(desc.VendorId).arg(desc.DeviceId).arg(desc.SubSysId).arg(desc.Revision)
-        .arg(driver.QuadPart).arg(m_DecodeDevice == m_RenderDevice);
+        .arg(driver.QuadPart).arg(m_DecodeDevice == m_RenderDevice)
+        .arg(m_CompositionPresenter.active() ? "composition" : "dxgi");
 }

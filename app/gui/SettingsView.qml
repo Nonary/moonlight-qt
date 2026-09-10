@@ -848,7 +848,7 @@ Flickable {
 
                     CheckBox {
                         hoverEnabled: true
-                        text: qsTr("Enable VRR")
+                        text: qsTr("VRR")
                         font.pointSize: 12
                         enabled: StreamingPreferences.enableVsync
                         checked: StreamingPreferences.enableVrr
@@ -864,23 +864,6 @@ Flickable {
                                         :
                                           qsTr("VRR requires V-Sync. Enable V-Sync to change this setting.")
                     }
-                }
-
-                CheckBox {
-                    hoverEnabled: true
-                    text: qsTr("Smooth frame timing")
-                    font.pointSize: 12
-                    visible: StreamingPreferences.enableVrr
-                    enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
-                    checked: StreamingPreferences.smoothVrrFrameTiming
-                    onCheckedChanged: {
-                        StreamingPreferences.smoothVrrFrameTiming = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 10000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Smooths variations in host frame timing. Turn off to follow host timestamps more closely. Both modes buffer delivery jitter and respect display limits.")
                 }
 
                 CheckBox {

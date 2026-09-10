@@ -59,6 +59,7 @@ private:
     static void unlockContext(void* lock_ctx);
 
     bool setupRenderingResources();
+    bool m_CompositionRequested = false;
     D3D11CompositionPresenter m_CompositionPresenter;
     uint64_t m_CompositionPresentId = 0;
     bool m_CompositionModeLogged = false;

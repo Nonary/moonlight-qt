@@ -34,7 +34,7 @@ it checks Mailbox after Immediate and before the existing WSI FIFO fallback;
 disabled, it restores the previous Immediate/WSI FIFO selection. Affected
 SteamOS hardware has not yet validated it as a remedy for overlay-dependent stutter.
 
-Updated on 2026-09-09, based on `b60fa11a`: Windows VRR automatically uses
+Historical update on 2026-09-09, based on `b60fa11a`: Windows VRR automatically used
 the composition presentation API on Windows 11 build 22000.194 or newer when
 the driver supports independent flip. Present IDs and independent-flip display
 events provide native feedback. Unsupported systems retain DXGI presentation.
@@ -43,6 +43,22 @@ padding and supply a clearly labeled estimated client cadence. DXGI refresh
 references remain excluded from verified measurements. No checkbox is needed.
 The helper adds no refresh wait or future-frame target; actual Ally latency,
 VRR behavior, HDR, and fullscreen transitions still need hardware validation.
+
+Current Windows presenter policy, updated on 2026-09-09 after `a5500a26`:
+VRR defaults to the DXGI swapchain so the per-frame latch decision actually
+selects synchronized or tearing-permitted presentation. Composition's native
+ordering does not implement that switch; the 22:27 capture used composition
+for all 12,799 submissions despite 2,654 logical latch transitions. This is a
+renderer contract mismatch, not evidence that changing latch hysteresis will
+remove the reported judder. `MOONLIGHT_VRR_COMPOSITION=1` opts into the existing
+composition backend for diagnostic comparison, snapshotted at renderer setup.
+DXGI uses the existing submission-estimate feedback fallback; its refresh
+references are not verified frame display events. Calibration identities now
+include the active presenter so their readiness histories cannot cross-seed.
+The capture lost one row and failed exact replay. Exploratory replay favored
+retaining the current per-frame controller over rate protection or adaptive-only
+spacing, but cannot model a change of native backend or prove a visual remedy.
+A fresh gameplay capture is required for that comparison.
 
 [AGENTS.md](AGENTS.md) owns machine-specific build, deployment, and capture
 procedures. This document owns the architecture explanation. Keep both current
@@ -547,8 +563,12 @@ not a later actual execution time. Otherwise one late frame would move later
 frames and turn a temporary miss into persistent added delay. Older replay modes
 retain execution-anchored smoothing and the retired metronome for compatibility.
 
-Both current smooth-frame-timing settings leave smoothing gain at zero. Timestamp playout,
-adaptive delay, readiness constraints, and applicable presentation floors remain.
+The settings UI exposes a single checkbox labeled `VRR`; the separate
+`Smooth frame timing` option was removed on 2026-09-09 because both values
+already leave production smoothing gain at zero. The persisted preference and
+internal session field remain for compatibility with existing settings and
+calibration identities. Timestamp playout, adaptive delay, readiness constraints,
+and applicable presentation floors remain.
 
 ### 8.4 Target, render start, and latch request
 
@@ -577,7 +597,7 @@ each target is compared with `lastSubmission + displayPeriod + guard`. If it
 falls earlier and the presenter supports native protection, that slot is latched
 and its software floor is disabled. Otherwise the adaptive floor applies.
 DXGI uses `Present(1, 0)` for protected slots and
-`Present(0, DXGI_PRESENT_ALLOW_TEARING)` with headroom. Composition already
+`Present(0, DXGI_PRESENT_ALLOW_TEARING)` with headroom. Diagnostic composition already
 provides native ordering; its protection capability likewise permits a slot
 without the extra CPU floor. It does not expose DXGI tearing flags.
 
@@ -856,7 +876,12 @@ Software timing, tearing permission, and modeled active-scanout exposure do not
 confirm an optical tear or its absence. External display measurement is needed
 for that claim.
 
-### 10.4 Automatic composition presentation
+### 10.4 Diagnostic composition presentation
+
+DXGI is the Windows VRR default. Only `MOONLIGHT_VRR_COMPOSITION=1` enables
+composition device flags and attempts to initialize the composition presenter.
+The value is captured during renderer initialization, so a stream reconnect is
+required. Startup logs identify the actual presenter, including setup fallback.
 
 The renderer checks the actual OS version using `RtlGetVersion` (including
 revision 194 on build 22000), loads `CreatePresentationFactory` dynamically,
