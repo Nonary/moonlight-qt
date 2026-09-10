@@ -24,6 +24,11 @@ struct VrrSessionConfig {
     // A session preference resolved into the recorded controller parameters.
     // Both modes retain jitter buffering and display-spacing protection.
     bool smoothFrameTiming = true;
+    // Historical near-ceiling checkbox, retained for old tests and captures.
+    bool latencyFix = false;
+    // 0: Smoothest, 1: Balanced, 2: Lowest latency, across all VRR rates.
+    // Zero preserves the historical default for replay and explicit test configs.
+    int latencyMode = 0;
     std::string calibrationKey;
     std::string calibrationPath;
 };

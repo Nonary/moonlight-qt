@@ -576,7 +576,8 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
                                  m_FrontendRenderer->getCalibrationIdentity().isEmpty() ? QString() :
                                  Session::get()->vrrCalibrationContext() + QString("|%1|%2|%3|%4|%5")
                                      .arg(params->width).arg(params->height).arg(params->videoFormat)
-                                     .arg(m_FrontendRenderer->getCalibrationIdentity()).arg(decoder->name))) {
+                                     .arg(m_FrontendRenderer->getCalibrationIdentity()).arg(decoder->name),
+                                 params->vrrLatencyMode)) {
             return false;
         }
     }

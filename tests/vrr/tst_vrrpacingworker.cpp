@@ -1,5 +1,6 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profile.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profilecodec.h"
+#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h"
 #include "vrrtestfakes.h"
 
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -21,6 +23,8 @@ namespace {
 
 std::chrono::steady_clock::time_point g_TestClockOrigin =
     std::chrono::steady_clock::now();
+std::atomic_uint64_t g_FrozenTestClockUs { 0 };
+std::atomic_int64_t g_TestClockOffsetUs { 0 };
 int failures = 0;
 
 void expect(bool condition, const char* message)
@@ -34,7 +38,38 @@ void expect(bool condition, const char* message)
 void resetFakeClock()
 {
     g_TestClockOrigin = std::chrono::steady_clock::now();
+    g_FrozenTestClockUs.store(0);
+    g_TestClockOffsetUs.store(0);
 }
+
+// The worker has real threads and waits. Freeze only while presenter gates
+// establish the queue under test, so stale-age boundaries do not depend on
+// whether the test machine was descheduled for another few milliseconds.
+class FrozenTestClock {
+public:
+    FrozenTestClock()
+    {
+        g_FrozenTestClockUs.store(std::max<uint64_t>(LiGetMicroseconds(), 1));
+    }
+
+    ~FrozenTestClock() { resume(); }
+
+    void advance(uint64_t durationUs)
+    {
+        g_FrozenTestClockUs.fetch_add(durationUs);
+    }
+
+    void resume()
+    {
+        const uint64_t frozenUs = g_FrozenTestClockUs.load();
+        if (frozenUs == 0) return;
+        const int64_t elapsedUs =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - g_TestClockOrigin).count();
+        g_TestClockOffsetUs.store(static_cast<int64_t>(frozenUs) - elapsedUs);
+        g_FrozenTestClockUs.store(0);
+    }
+};
 
 bool waitFor(const std::function<bool()>& predicate,
              std::chrono::milliseconds timeout = std::chrono::milliseconds(2000))
@@ -302,6 +337,198 @@ void testSinglePeriodQueueDelayPreservesFluidity()
         expect(telemetryStats(telemetry).vrrPacingDroppedFrames == 0,
                "ordinary pipeline occupancy must not manufacture a pacing drop");
     }
+}
+
+void testLatencyFixDropBoundaries()
+{
+    VrrTimingDecision decision;
+    decision.sourcePeriodUs = 8333;
+    decision.targetUs = 50000;
+    expect(!VrrFrameDropPolicy::beforeRender(decision, 8333, 8333, false, true),
+           "latency fix must retain a frame exactly one source period old");
+    expect(VrrFrameDropPolicy::beforeRender(decision, 8333, 8334, false, true),
+           "latency fix may replace an older frame when a successor exists");
+    expect(!VrrFrameDropPolicy::beforeRender(decision, 8333, 12500, false, false),
+           "ordinary VRR must retain its two-period age tolerance");
+    expect(VrrFrameDropPolicy::afterRenderWait(decision, 10000, 18334, false, true),
+           "latency fix must count queue age even when the target is still ahead");
+    expect(!VrrFrameDropPolicy::afterRenderWait(decision, 10000, 18333, false, true),
+           "post-wait replacement must also preserve the exact one-period boundary");
+    expect(!VrrFrameDropPolicy::afterRenderWait(decision, 10000, 18334, false, false),
+           "ordinary post-wait policy must retain its target-relative horizon");
+
+    decision.sourcePeriodUs = 9000;
+    decision.presentationFloorPushUs = 4500;
+    expect(!VrrFrameDropPolicy::beforeRender(decision, 8333, 0, false, true),
+           "half-period floor debt is not sufficient for replacement");
+    ++decision.presentationFloorPushUs;
+    expect(VrrFrameDropPolicy::beforeRender(decision, 8333, 0, false, true),
+           "active latency fix may shed material floor debt below exact refresh");
+    expect(!VrrFrameDropPolicy::beforeRender(decision, 8333, 0, false, false),
+           "ordinary below-refresh playback must keep its natural debt recovery");
+
+    decision.sourcePeriodUs = std::numeric_limits<uint64_t>::max();
+    expect(VrrFrameDropPolicy::maximumAgeUs(decision, false, false) ==
+               std::numeric_limits<uint64_t>::max(),
+           "age tolerance multiplication must saturate instead of wrapping");
+}
+
+void runLatencyFixQueuedRecovery(int streamRateHz, bool enabled,
+                                bool fresherSuccessor,
+                                unsigned int agePerMille = 1500,
+                                bool advanceClockBeforeArrival = false,
+                                int latencyMode = 0)
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.setCanLatch(true);
+    backend.blockPreparation();
+    backend.setPreparationLimit(1);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime first;
+    TrackedFrameLifetime queued;
+    TrackedFrameLifetime fresh;
+    VrrSessionConfig config = enabledConfig();
+    config.streamRateHz = streamRateHz;
+    config.latencyFix = enabled;
+    config.latencyMode = latencyMode;
+    const bool reducedDelay = latencyMode == 1 || latencyMode == 2 ||
+        (enabled && streamRateHz >= 116);
+    const bool replaceQueued = reducedDelay &&
+        fresherSuccessor && agePerMille > 1000;
+    auto makeFrame = [streamRateHz](int number, TrackedFrameLifetime& lifetime) {
+        return makeTrackedPacedFrame(number,
+            static_cast<uint32_t>((number - 1) * 90000 / streamRateHz),
+            LiGetMicroseconds(), lifetime);
+    };
+
+    {
+        VrrPacingWorker worker(&backend, config, &telemetry);
+        expect(worker.start(), "latency-fix queue worker must start");
+        worker.submit(makeFrame(1, first));
+        const bool entered = backend.waitForPrepareCount(1);
+        expect(entered, "first frame must enter the controlled preparation gate");
+        if (!entered) {
+            backend.setPreparationLimit(std::numeric_limits<size_t>::max());
+            backend.releasePreparation();
+            return;
+        }
+
+        FrozenTestClock clock;
+        if (advanceClockBeforeArrival) clock.advance(100000);
+        worker.submit(makeFrame(2, queued));
+        if (fresherSuccessor) worker.submit(makeFrame(3, fresh));
+        // Queue age, rather than time since process startup, controls the
+        // replacement. Wall time spent in the gates cannot change it.
+        clock.advance((1000000ULL / streamRateHz) * agePerMille / 1000);
+        backend.releasePreparation();
+        expect(backend.waitForPrepareCount(2),
+               "a retained successor must reach preparation after the first present");
+        const std::vector<int> prepared = backend.preparedFrames();
+        expect(prepared.size() == 2 && prepared[0] == 1 &&
+                   prepared[1] == (replaceQueued ? 3 : 2),
+               "the selected latency policy must control stale replacement before preparation");
+        expect(telemetryStats(telemetry).vrrPacingDroppedFrames ==
+                   (replaceQueued ? 1U : 0U),
+               "queue recovery must count exactly the expected optional replacement");
+        if (replaceQueued) {
+            expect(queued.releases.load() == 1,
+                   "the skipped decoded image must be released before preparing its successor");
+        }
+        clock.resume();
+        backend.setPreparationLimit(std::numeric_limits<size_t>::max());
+        const size_t expectedPresents = fresherSuccessor && !replaceQueued ? 3 : 2;
+        expect(backend.waitForPresentCount(expectedPresents),
+               "every retained image must drain after the preparation gate opens");
+        const std::vector<int> expected = replaceQueued ? std::vector<int>{1, 3} :
+            fresherSuccessor ? std::vector<int>{1, 2, 3} : std::vector<int>{1, 2};
+        expect(backend.presentedFrames() == expected,
+               "optional latest-frame replacement must preserve retained frame order");
+    }
+    expect(first.releases.load() == 1 && queued.releases.load() == 1 &&
+               fresh.releases.load() == (fresherSuccessor ? 1U : 0U),
+           "presented and skipped decoded images must each be released exactly once");
+}
+
+void testLatencyFixQueuedRecovery()
+{
+    runLatencyFixQueuedRecovery(120, true, true);
+    runLatencyFixQueuedRecovery(116, true, true);
+    runLatencyFixQueuedRecovery(120, false, true);
+    runLatencyFixQueuedRecovery(110, true, true);
+    runLatencyFixQueuedRecovery(120, true, false);
+
+    const QByteArray priorTracePath = qgetenv("MOONLIGHT_VRR_TRACE");
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+    // Admission time must exist even without diagnostics. Advancing the
+    // application clock first exposes an accidental zero age origin while
+    // the actual queued frame is only half a source interval old.
+    runLatencyFixQueuedRecovery(120, true, true, 500, true);
+    SDL_setenv("MOONLIGHT_VRR_TRACE", priorTracePath.constData(), 1);
+}
+
+void testLatencyPresetsQueuedRecovery()
+{
+    for (int rate : {60, 100, 110}) {
+        for (int mode : {0, 1, 2}) {
+            // The two reduced-delay presets must replace stale queued work
+            // below the old near-refresh band; Smoothest retains that frame.
+            runLatencyFixQueuedRecovery(rate, false, true, 1500, false, mode);
+            // Even Lowest latency must keep the only available image.
+            runLatencyFixQueuedRecovery(rate, false, false, 1500, false, mode);
+        }
+    }
+    for (int mode : {1, 2}) {
+        runLatencyFixQueuedRecovery(100, false, true, 500, true, mode);
+    }
+}
+
+void testLatencyFixQueueAgeIncludesDecodeWait()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.setCanLatch(true);
+    backend.blockDecodeFrame(2);
+    backend.setPreparationLimit(1);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime first;
+    TrackedFrameLifetime delayed;
+    TrackedFrameLifetime fresh;
+    VrrSessionConfig config = enabledConfig();
+    config.streamRateHz = 120;
+    config.latencyFix = true;
+    auto makeFrame = [](int number, TrackedFrameLifetime& lifetime) {
+        return makeTrackedPacedFrame(number, (number - 1) * 750,
+                                      LiGetMicroseconds(), lifetime);
+    };
+    {
+        VrrPacingWorker worker(&backend, config, &telemetry);
+        expect(worker.start(), "decode-wait latency-fix worker must start");
+        worker.submit(makeFrame(1, first));
+        expect(backend.waitForPresentCount(1), "first image must present before the decode gate");
+        FrozenTestClock clock;
+        worker.submit(makeFrame(2, delayed));
+        expect(backend.waitForDecodeWaitCount(1),
+               "second image must enter the controlled GPU-readiness wait");
+        clock.advance(12500);
+        worker.submit(makeFrame(3, fresh));
+        backend.releaseDecode();
+        expect(backend.waitForPrepareCount(2),
+               "fresh image must reach preparation after delayed decode readiness");
+        expect(backend.preparedFrames() == std::vector<int>({1, 3}),
+               "updating GPU readiness must not erase stale transport-queue age");
+        expect(telemetryStats(telemetry).vrrPacingDroppedFrames == 1 &&
+                   delayed.releases.load() == 1,
+               "a decode-wait replacement must release and count only the stale image");
+        clock.resume();
+        backend.setPreparationLimit(std::numeric_limits<size_t>::max());
+        expect(backend.waitForPresentCount(2), "fresh image must present after decode-wait recovery");
+        expect(backend.presentedFrames() == std::vector<int>({1, 3}),
+               "decode-wait recovery must retain presentation order");
+    }
+    expect(first.releases.load() == 1 && delayed.releases.load() == 1 &&
+               fresh.releases.load() == 1,
+           "decode-wait recovery must release every source surface exactly once");
 }
 
 void testTelemetrySnapshotsRemainCumulative()
@@ -1465,9 +1692,12 @@ void exportWarmHistoryReplayFixture()
 // equivalent steady-clock epoch so it needs no network or streaming runtime.
 extern "C" uint64_t LiGetMicroseconds(void)
 {
-    return static_cast<uint64_t>(
+    const uint64_t frozenUs = g_FrozenTestClockUs.load();
+    if (frozenUs != 0) return frozenUs;
+    const int64_t elapsedUs =
         std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - g_TestClockOrigin).count());
+            std::chrono::steady_clock::now() - g_TestClockOrigin).count();
+    return static_cast<uint64_t>(elapsedUs + g_TestClockOffsetUs.load());
 }
 
 int main()
@@ -1484,6 +1714,10 @@ int main()
     testLatePreparedFramePresentsImmediately();
     testQueuedStaleFrameYieldsToFreshSuccessor();
     testSinglePeriodQueueDelayPreservesFluidity();
+    testLatencyFixDropBoundaries();
+    testLatencyFixQueuedRecovery();
+    testLatencyPresetsQueuedRecovery();
+    testLatencyFixQueueAgeIncludesDecodeWait();
     testTelemetrySnapshotsRemainCumulative();
     testSuspendDiscardAndFreshFrame();
     testDeferredSurfaceLifetime();

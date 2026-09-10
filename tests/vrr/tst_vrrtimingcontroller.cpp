@@ -4,6 +4,7 @@
 
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
+#include "../../app/streaming/vrrratepolicy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -3413,8 +3414,363 @@ void testProductionPreservesRelativeGameSpacing()
     }
 }
 
+void testLatencyFixModeSelection()
+{
+    expect(!VrrSessionConfig{}.latencyFix &&
+               VrrTimingParameters{}.latencyFixEnabled == 0,
+           "latency fix must remain opt-in for sessions and historical replay parameters");
+    for (int rate : {100, 120}) {
+        const auto ordinarySession = config(rate, 120);
+        auto selectedSession = ordinarySession;
+        selectedSession.latencyFix = true;
+        const auto ordinaryPolicy = vrrTimingParametersForSession(ordinarySession);
+        const auto selectedPolicy = vrrTimingParametersForSession(selectedSession);
+        expect(ordinaryPolicy.latencyFixEnabled == 0 &&
+                   selectedPolicy.latencyFixEnabled == 1,
+               "the snapshotted checkbox must resolve into the recorded controller parameters");
+        VrrTimingController ordinary(ordinarySession, true, ordinaryPolicy);
+        VrrTimingController selected(selectedSession, true, selectedPolicy);
+        // A recorded parameter snapshot takes precedence over today's setting.
+        VrrTimingController recorded(selectedSession, true, ordinaryPolicy);
+        const uint64_t limit = selected.displayPeriodUs() / 2;
+        expect(selected.latencyFixActive() == (rate == 120),
+               "cold start must use the negotiated rate to select the near-refresh mode");
+        expect(!recorded.latencyFixActive(),
+               "an older unchecked parameter snapshot must not inherit the current checkbox");
+        for (int i = 0; i < 360; ++i) {
+            const auto rtp = uint32_t(std::llround(i * 90000.0 / rate));
+            const auto decoded = decodedTimeForRtp(1000000, rtp) + (i % 7) * 50;
+            const auto a = ordinary.schedule(frame(i, rtp, true, decoded), decoded);
+            const auto b = selected.schedule(frame(i, rtp, true, decoded), decoded);
+            const auto c = recorded.schedule(frame(i, rtp, true, decoded), decoded);
+            if (i == 0 && rate == 120) {
+                expect(b.playoutDelayUs <= limit && a.playoutDelayUs > limit,
+                       "near-refresh startup must cap intentional padding at half a display period");
+            }
+            expect(a.targetUs == c.targetUs && a.renderStartUs == c.renderStartUs &&
+                       a.playoutDelayUs == c.playoutDelayUs &&
+                       a.latchedPresentation == c.latchedPresentation,
+                   "recorded unchecked policy must reproduce ordinary scheduling exactly");
+            if (rate == 100) {
+                expect(!selected.latencyFixActive() && a.targetUs == b.targetUs &&
+                           a.originalTargetUs == b.originalTargetUs &&
+                           a.renderStartUs == b.renderStartUs &&
+                           a.playoutDelayUs == b.playoutDelayUs &&
+                           a.latchedPresentation == b.latchedPresentation,
+                       "selecting latency fix must leave 100 FPS scheduling unchanged");
+            }
+            else {
+                expect(b.playoutDelayUs <= limit,
+                       "near-refresh padding must remain within the selected delay budget");
+            }
+            ordinary.notePreparationDuration(1000);
+            selected.notePreparationDuration(1000);
+            recorded.notePreparationDuration(1000);
+            ordinary.noteSubmission(true, false, a.targetUs);
+            selected.noteSubmission(true, false, b.targetUs);
+            recorded.noteSubmission(true, false, c.targetUs);
+        }
+    }
+
+    struct Boundary { int refresh; int enter; };
+    for (const auto boundary : {Boundary{60, 59}, Boundary{120, 116},
+                               Boundary{144, 138}, Boundary{240, 224},
+                               Boundary{360, 324}}) {
+        expect(VrrRatePolicy::protectedRateForRefresh(boundary.refresh) == boundary.enter,
+               "latency fix must share the refresh-scaled near-ceiling cutoff");
+        for (int rate : {boundary.enter - 1, boundary.enter, boundary.refresh}) {
+            auto session = config(rate, boundary.refresh);
+            session.latencyFix = true;
+            VrrTimingController controller(session, true, vrrTimingParametersForSession(session));
+            expect(controller.latencyFixActive() == (rate >= boundary.enter),
+                   "near-ceiling entry must scale with refresh and include its cutoff");
+            if (controller.latencyFixActive()) {
+                const auto first = controller.schedule(frame(1, 0, true, 1000000), 1000000);
+                expect(first.playoutDelayUs <= controller.displayPeriodUs() / 2,
+                       "high-refresh padding must scale down with the display period");
+            }
+        }
+    }
+}
+
+void testLatencyFixFittedRateHysteresis()
+{
+    auto session = config(120, 120);
+    session.latencyFix = true;
+    VrrTimingController controller(session, true, vrrTimingParametersForSession(session));
+    struct Segment { int rate; bool active; };
+    double ticks = 0;
+    int number = 0;
+    int transitions = 0;
+    bool previousActive = controller.latencyFixActive();
+    for (const auto segment : {Segment{110, false}, Segment{115, false},
+                              Segment{117, true}, Segment{115, true},
+                              Segment{113, false}, Segment{115, false},
+                              Segment{117, true}}) {
+        for (int i = 0; i < 600; ++i, ++number) {
+            ticks += 90000.0 / segment.rate;
+            const auto rtp = uint32_t(std::llround(ticks));
+            const auto decoded = decodedTimeForRtp(1000000, rtp);
+            const auto prior = controller.lastSubmissionUs();
+            const auto decision = controller.schedule(
+                frame(number, rtp, true, decoded), std::max(decoded, prior));
+            if (controller.latencyFixActive() != previousActive) {
+                ++transitions;
+                expect(!decision.rebased && !decision.phaseDiscontinuity &&
+                           controller.hasLastSubmission() && controller.lastSubmissionUs() == prior &&
+                           controller.diagnostics().cadenceSamples > 0,
+                       "a latency-mode transition must retain timeline, cadence and prior submission state");
+            }
+            if (i > 300) {
+                expect(controller.latencyFixActive() == segment.active,
+                       "fitted cadence must enter at 116, retain either state at 115, and exit below 114 FPS");
+            }
+            if (controller.latencyFixActive()) {
+                expect(decision.playoutDelayUs <= controller.displayPeriodUs() / 2,
+                       "rate-band entry must apply the low-delay budget immediately");
+            }
+            previousActive = controller.latencyFixActive();
+            controller.notePreparationDuration(1000);
+            controller.noteSubmission(true, false, decision.targetUs);
+        }
+    }
+    expect(transitions == 4,
+           "hysteresis must make one transition at each genuine band crossing without oscillation");
+}
+
+void testLatencyFixNativeHitchesStayBounded()
+{
+    const auto ordinarySession = config(120, 120);
+    auto selectedSession = ordinarySession;
+    selectedSession.latencyFix = true;
+    VrrTimingController ordinary(ordinarySession, true, vrrTimingParametersForSession(ordinarySession));
+    VrrTimingController selected(selectedSession, true, vrrTimingParametersForSession(selectedSession));
+    const uint64_t limit = selected.displayPeriodUs() / 2;
+    uint64_t ordinaryBeforeHitches = 0;
+    uint64_t ordinaryMaximum = 0;
+    uint64_t selectedHitches = 0;
+    double ticks = 0;
+    bool exited = false;
+    for (int i = 0; i < 1200; ++i) {
+        ticks += 90000.0 / (i < 600 ? 120 : 113);
+        const auto rtp = uint32_t(std::llround(ticks));
+        const auto decoded = decodedTimeForRtp(1000000, rtp);
+        for (auto* controller : {&ordinary, &selected}) {
+            const auto decision = controller->schedule(
+                frame(i, rtp, true, decoded), std::max(decoded, controller->lastSubmissionUs()));
+            if (controller == &ordinary) {
+                if (i == 199) ordinaryBeforeHitches = decision.playoutDelayUs;
+                if (i > 200 && i < 600)
+                    ordinaryMaximum = std::max(ordinaryMaximum, decision.playoutDelayUs);
+            }
+            else {
+                expect(decision.playoutDelayUs <= limit,
+                       "confirmed near-ceiling hitches must not expand padding beyond the latency-fix budget");
+                if (!controller->latencyFixActive()) {
+                    exited = true;
+                    expect(decision.requestedPlayoutDelayUs <= limit,
+                           "leaving the near-ceiling band must not revive rejected hitch demand");
+                }
+            }
+            controller->notePreparationDuration(1000);
+            controller->noteSubmission(true, false, decision.targetUs);
+            Vrr13::PresentationObservation observation;
+            observation.timeKind = Vrr13::PresentationTimeKind::DisplayEvent;
+            observation.smoothness = controller->smoothnessSample(decision);
+            observation.submitted = observation.idValid = observation.sampleValid = true;
+            observation.id = observation.sampleId = uint64_t(i + 1);
+            observation.submission = decision.targetUs;
+            observation.ready = decoded + 1000;
+            // A stable service delay with a confirmed, occasional 6 ms hitch.
+            // Keep the observation's native mode constant to isolate padding.
+            const uint64_t hitch = i >= 200 && i < 600 && i % 10 == 9 ? 6000 : 0;
+            observation.sampleTime = observation.smoothness.intended + 20000 + hitch;
+            observation.observed = observation.sampleTime;
+            observation.deadline = decision.originalScanoutUs;
+            controller->notePresentation(observation);
+            if (controller == &selected && i == 599)
+                selectedHitches = controller->nativeCadenceHitches();
+        }
+    }
+    expect(ordinaryMaximum > ordinaryBeforeHitches + 1000,
+           "the native-hitch fixture must grow the ordinary policy's padding");
+    expect(selectedHitches > 20,
+           "latency fix must keep reporting confirmed native hitches it chooses not to buffer");
+    expect(exited && !selected.latencyFixActive(),
+           "the hitch fixture must actually leave the near-ceiling band");
+}
+
+void testLatencyFixBufferlessLateFrameSafety()
+{
+    auto session = config(120, 120);
+    session.latencyFix = true;
+    auto policy = vrrTimingParametersForSession(session);
+    policy.latencyFixDelayPeriodPerMille = 0;
+    for (bool canLatch : {false, true}) {
+        VrrTimingController controller(session, canLatch, policy);
+        for (int i = 0; i < 360; ++i) {
+            const auto rtp = uint32_t(i * 750);
+            const auto decoded = decodedTimeForRtp(1000000, rtp) + (i == 180 ? 18000 : 0);
+            const auto now = std::max(decoded, controller.lastSubmissionUs());
+            const auto decision = controller.schedule(frame(i, rtp, i != 181, decoded), now);
+            expect(controller.latencyFixActive() && decision.playoutDelayUs == 0,
+                   "zero delay must override startup, late-frame and invalid-RTP fallback padding");
+            expect(controller.playoutDelayUs() == 0,
+                   "delay telemetry must agree with the active fallback limit");
+            expect(decision.targetUs >= now && decision.targetUs >= controller.earliestSubmissionUs(),
+                   "a lone late frame must remain presentable without violating readiness or the active native spacing floor");
+            if (i > 0 && !decision.latchedPresentation) {
+                expect(decision.targetUs >= controller.lastSubmissionUs() +
+                           controller.displayPeriodUs() + decision.guardUs,
+                       "bufferless adaptive presentation must retain its scanout safety floor");
+            }
+            controller.notePreparationDuration(1000);
+            controller.noteSubmission(true, false, decision.targetUs);
+        }
+    }
+}
+
+void testLatencyPresetsAcrossSourceAndDisplayRates()
+{
+    expect(VrrSessionConfig{}.latencyMode == 0 &&
+               VrrTimingParameters{}.latencyFixAllRates == 0,
+           "historical session and replay defaults must retain Smoothest and the legacy rate band");
+    struct Rates { int source; int display; };
+    for (const auto rates : {Rates{40, 120}, Rates{60, 120}, Rates{100, 120},
+                             Rates{120, 120}, Rates{60, 60}, Rates{120, 240}}) {
+        const auto ordinarySession = config(rates.source, rates.display);
+        const auto ordinaryPolicy = vrrTimingParametersForSession(ordinarySession);
+        expect(ordinaryPolicy.latencyFixEnabled == 0 && ordinaryPolicy.latencyFixAllRates == 0,
+               "Smoothest must preserve the pre-preset adaptive-buffer policy");
+        for (int mode : {1, 2}) {
+            auto session = ordinarySession;
+            session.latencyMode = mode;
+            const auto policy = vrrTimingParametersForSession(session);
+            expect(policy.latencyFixEnabled == 1 && policy.latencyFixAllRates == 1 &&
+                       policy.latencyFixDelayPeriodPerMille == (mode == 1 ? 500 : 0),
+                   "Balanced and Lowest must resolve to replayable all-rate delay budgets");
+            for (bool canLatch : {false, true}) {
+                VrrTimingController selected(session, canLatch, policy);
+                VrrTimingController ordinary(ordinarySession, canLatch, ordinaryPolicy);
+                // Replay parameters, including an old disabled snapshot, win
+                // over the user's current preference.
+                VrrTimingController recorded(session, canLatch, ordinaryPolicy);
+                const uint64_t limit = mode == 1 ? selected.displayPeriodUs() / 2 : 0;
+                expect(selected.latencyFixActive() && !recorded.latencyFixActive(),
+                       "all-rate presets must activate at cold start without altering old snapshots");
+                for (int i = 0; i < 240; ++i) {
+                    const auto rtp = uint32_t(std::llround(i * 90000.0 / rates.source));
+                    const auto decoded = decodedTimeForRtp(1000000, rtp) +
+                        (i == 120 ? 18000 : (i % 7) * 50);
+                    const bool validRtp = i != 121 && i != 122;
+                    const auto a = ordinary.schedule(frame(i, rtp, validRtp, decoded),
+                        std::max(decoded, ordinary.lastSubmissionUs()));
+                    const auto b = recorded.schedule(frame(i, rtp, validRtp, decoded),
+                        std::max(decoded, recorded.lastSubmissionUs()));
+                    expect(a.targetUs == b.targetUs && a.originalTargetUs == b.originalTargetUs &&
+                               a.renderStartUs == b.renderStartUs &&
+                               a.playoutDelayUs == b.playoutDelayUs &&
+                               a.requestedPlayoutDelayUs == b.requestedPlayoutDelayUs &&
+                               a.latchedPresentation == b.latchedPresentation,
+                           "Smoothest and its recorded policy must retain identical decisions through late and invalid-RTP frames");
+                    const auto now = std::max(decoded, selected.lastSubmissionUs());
+                    const auto decision = selected.schedule(frame(i, rtp, validRtp, decoded), now);
+                    expect(selected.latencyFixActive() && decision.playoutDelayUs <= limit &&
+                               selected.playoutDelayUs() <= limit,
+                           "startup, late-frame and invalid-RTP padding must obey the display-based budget at every source rate");
+                    if (mode == 2) {
+                        expect(decision.playoutDelayUs == 0,
+                               "Lowest must add no intentional cushion even during timestamp fallback");
+                    }
+                    expect(decision.targetUs >= now &&
+                               decision.targetUs >= selected.earliestSubmissionUs(),
+                           "reduced padding must retain readiness and native presentation deadlines");
+                    if (i > 0 && !decision.latchedPresentation) {
+                        expect(decision.targetUs >= selected.lastSubmissionUs() +
+                                   selected.displayPeriodUs() + decision.guardUs,
+                               "all-rate presets must preserve the adaptive scanout safety floor");
+                    }
+                    ordinary.notePreparationDuration(1000);
+                    recorded.notePreparationDuration(1000);
+                    selected.notePreparationDuration(1000);
+                    ordinary.noteSubmission(true, false, a.targetUs);
+                    recorded.noteSubmission(true, false, b.targetUs);
+                    selected.noteSubmission(true, false, decision.targetUs);
+                }
+            }
+        }
+    }
+}
+
+void testLatencyPresetsBoundHitchesThroughCadenceChanges()
+{
+    for (int mode : {1, 2}) {
+        const auto ordinarySession = config(100, 120);
+        auto selectedSession = ordinarySession;
+        selectedSession.latencyMode = mode;
+        VrrTimingController ordinary(ordinarySession, true, vrrTimingParametersForSession(ordinarySession));
+        VrrTimingController selected(selectedSession, true, vrrTimingParametersForSession(selectedSession));
+        const uint64_t limit = mode == 1 ? selected.displayPeriodUs() / 2 : 0;
+        uint64_t ordinaryBeforeHitches = 0;
+        uint64_t ordinaryMaximum = 0;
+        double ticks = 0;
+        int number = 0;
+        for (int rate : {100, 120, 60, 40, 117, 113}) {
+            for (int i = 0; i < 600; ++i, ++number) {
+                ticks += 90000.0 / rate;
+                const auto rtp = uint32_t(std::llround(ticks));
+                const auto decoded = decodedTimeForRtp(1000000, rtp);
+                for (auto* controller : {&ordinary, &selected}) {
+                    const auto priorSubmission = controller->lastSubmissionUs();
+                    const auto decision = controller->schedule(frame(number, rtp, true, decoded),
+                        std::max(decoded, priorSubmission));
+                    if (controller == &ordinary && number < 600) {
+                        if (number == 199) ordinaryBeforeHitches = decision.playoutDelayUs;
+                        if (number > 200)
+                            ordinaryMaximum = std::max(ordinaryMaximum, decision.playoutDelayUs);
+                    }
+                    if (controller == &selected) {
+                        expect(controller->latencyFixActive() && decision.playoutDelayUs <= limit,
+                               "native hitches and cadence steps must not revive the old rate band or exceed the preset cushion");
+                        expect(controller->lastSubmissionUs() == priorSubmission,
+                               "a source-rate step must retain the prior submission boundary");
+                        if (number > 0) {
+                            expect(!decision.rebased && !decision.phaseDiscontinuity,
+                                   "ordinary source-rate changes must retain the timing epoch in reduced-delay presets");
+                        }
+                    }
+                    controller->notePreparationDuration(1000);
+                    controller->noteSubmission(true, false, decision.targetUs);
+                    Vrr13::PresentationObservation observation;
+                    observation.timeKind = Vrr13::PresentationTimeKind::DisplayEvent;
+                    observation.smoothness = controller->smoothnessSample(decision);
+                    observation.submitted = observation.idValid = observation.sampleValid = true;
+                    observation.id = observation.sampleId = uint64_t(number + 1);
+                    observation.submission = decision.targetUs;
+                    observation.ready = decoded + 1000;
+                    const uint64_t hitch = number >= 200 && number % 10 == 9 ? 6000 : 0;
+                    observation.sampleTime = observation.smoothness.intended + 20000 + hitch;
+                    observation.observed = observation.sampleTime;
+                    observation.deadline = decision.originalScanoutUs;
+                    controller->notePresentation(observation);
+                }
+            }
+        }
+        expect(ordinaryMaximum > ordinaryBeforeHitches + 1000,
+               "the below-ceiling native-hitch fixture must demonstrably grow Smoothest's buffer");
+        expect(selected.nativeCadenceHitches() > 20,
+               "reduced-delay presets must continue reporting the hitches they choose not to buffer");
+    }
+}
+
 int main()
 {
+    testLatencyFixModeSelection();
+    testLatencyFixFittedRateHysteresis();
+    testLatencyFixNativeHitchesStayBounded();
+    testLatencyFixBufferlessLateFrameSafety();
+    testLatencyPresetsAcrossSourceAndDisplayRates();
+    testLatencyPresetsBoundHitchesThroughCadenceChanges();
     testSubmissionEstimateFallback();
     testNativeHitchGatesPadding();
     testDelayedDisplayEventsAgreeAcrossBackends();

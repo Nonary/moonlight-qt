@@ -14,8 +14,9 @@ and preservation of learned preparation lead on 2026-09-07; the subsequent
 game-spacing correction disables production cadence smoothing and caps padding
 at 16 ms. Production prefers matched native presentation errors strictly
 greater than 3 ms for buffer growth, with submission estimates as a fallback
-when display timing is unavailable. Release retains 3 ms of readiness headroom
-and requires recent smooth evidence from the active timing source. The initial map came from nine Luna Medium specialists, followed by
+when display timing is unavailable. Release targets 3 ms of readiness headroom,
+subject to the selected timing allowance, and requires recent smooth evidence
+from the active timing source. The initial map came from nine Luna Medium specialists, followed by
 targeted source checks and corrections. No live capture, optical measurement,
 build, or test run was part of this documentation investigation. Recheck the
 named functions after changes; comments, diagnostic labels, and old experiments
@@ -59,6 +60,59 @@ The capture lost one row and failed exact replay. Exploratory replay favored
 retaining the current per-frame controller over rate protection or adaptive-only
 spacing, but cannot model a change of native backend or prove a visual remedy.
 A fresh gameplay capture is required for that comparison.
+
+Current VRR timing choices (after `db596431`, 2026-09-09): the `VRR timing`
+selector offers Lowest latency, Balanced, and Smoothest throughout the VRR
+frame-rate range. `vrrlatencymode` persists IDs 2, 1, and 0 respectively.
+Balanced is the new-user default. A saved mode takes precedence; otherwise an
+existing `vrrlatencyfix=true` migrates to Balanced and `false` to Smoothest.
+The selection is snapshotted through session, decoder, and pacer setup, so
+reconnect after changing it. Fixed-refresh pacing is independent of this setting.
+
+| Timing choice | Adaptive extra playout allowance | Stale-work allowance with a successor |
+| --- | --- | --- |
+| Lowest latency (2) | Zero extra padding | One fitted source period |
+| Balanced (1, default) | Up to half a display period, about 4.17 ms at 120 Hz | One fitted source period |
+| Smoothest (0) | Existing learned protection, up to 16 ms and queue capacity | Two fitted source periods |
+
+The allowance bounds extra padding, not total latency or native queue depth.
+Source-clock mapping, rendering/readiness learning, per-frame latch decisions,
+and applicable display-spacing safeguards remain active in every choice.
+Consistent padding reserves time for uneven delivery or preparation so a late
+frame can still reach its intended slot. Less padding offers faster response
+but can expose more late or skipped frames; more padding can absorb more of
+that variation. It does not regularize game-driven frame intervals. Stable
+delivery may look the same across choices, and no universal percentage of lost
+smoothness follows from the selected allowance.
+
+`VrrSessionConfig::latencyMode` resolves to the trace/replay parameters
+`latency_fix_enabled`, `latency_fix_all_rates`, and
+`latency_fix_delay_period_per_mille`. Balanced and Lowest latency set the first
+two fields to one and choose 500 or zero per mille respectively. Smoothest
+leaves the limiter disabled. The new `latency_fix_all_rates` field defaults to
+zero for historical capture compatibility; the internal session mode also
+defaults to zero for historical tests and replay, independently of the UI's
+Balanced default. Balanced and Lowest latency append `|latency-mode=1` or
+`|latency-mode=2` before calibration-key hashing, while Smoothest retains the
+ordinary key.
+
+`VrrFrameDropPolicy` is shared by the real worker and all-arrival queue
+simulation. Both lower-latency choices permit replacing work older than one
+fitted source period when a newer queued successor exists. Age starts at pacer
+admission so GPU decode waiting cannot erase it, and is checked again after
+waiting to render, before spending GPU work. Smoothest retains the two-period
+allowance and target-relative second check. The sole available frame is never
+discarded by this policy. Local skips preserve the source clock and last
+submission. These choices do not impose an FPS cap or change the native presenter.
+
+Historical Latency fix checkbox (after `db596431`): `vrrlatencyfix` defaulted
+off and applied the half-display-period allowance only near the refresh ceiling.
+`VrrSessionConfig::latencyFix` remains for old tests and captures. With
+`latency_fix_all_rates=0`, the fitted cadence still enters at the shared
+near-refresh cutoff (116 FPS at 120 Hz) and exits below 114 FPS. Rejected excess
+demand is clipped on exit so a near-ceiling miss cannot reappear as padding
+solely because the cadence leaves that band; fresh lower-rate misses can acquire
+ordinary protection. Historical enabled profiles used `|latency-fix=1`.
 
 [AGENTS.md](AGENTS.md) owns machine-specific build, deployment, and capture
 procedures. This document owns the architecture explanation. Keep both current
@@ -183,8 +237,10 @@ the live path records and which parts replay holds fixed.
 ### 3.1 Preferences are not proof of an active mode
 
 `StreamingPreferences` persists ordinary settings through `QSettings`.
-At the inspected revision, V-sync defaults on, VRR defaults off, smooth VRR
-timing defaults on.
+At the inspected revision, V-sync defaults on and VRR defaults off. The VRR
+timing selector defaults to Balanced for new users, with the saved-checkbox
+migration described above. The retired smooth-frame-timing preference still
+defaults on internally and does not enable production cadence smoothing.
 Legacy frame pacing defaults off. The default requested stream is 720p60.
 These are defaults, not evidence of the user's current saved settings.
 
@@ -397,7 +453,9 @@ reject frames; a full queue evicts the oldest waiting frame, marks a discontinui
 and admits the new frame. Trace/counter work occurs outside the queue lock.
 
 The worker also sheds stale work when a fresher queued successor exists and
-age/backlog/missed-tick criteria apply. A lone late frame may still be shown.
+age/backlog/missed-tick criteria apply. Balanced and Lowest latency use a
+one-source-period age allowance throughout VRR; Smoothest retains two periods.
+A lone late frame may still be shown.
 This differs from throwing away compressed reference frames and does not require
 resetting the codec merely because an image was not presented.
 
@@ -476,8 +534,8 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | Production input | Value / meaning |
 | --- | --- |
 | Delay start seed | 6,000 us, then source/display/work/capacity scaling below |
-| Delay minimum input | 1,000 us, capped by available capacity |
-| Delay maximum input | 16,000 us, capped by available capacity |
+| Delay minimum input | 1,000 us, capped by available capacity and the selected timing allowance |
+| Delay maximum input | 16,000 us, capped by available capacity; Balanced additionally limits to half a display period, Lowest latency to zero |
 | Start-period ratio | 950 per mille of fitted source period |
 | Maximum-period ratio | 0; no additional period-ratio maximum input |
 | Delay attack | At most 500 us per update |
@@ -563,7 +621,8 @@ not a later actual execution time. Otherwise one late frame would move later
 frames and turn a temporary miss into persistent added delay. Older replay modes
 retain execution-anchored smoothing and the retired metronome for compatibility.
 
-The settings UI exposes a single checkbox labeled `VRR`; the separate
+The settings UI exposes a checkbox labeled `VRR` and the three-choice
+`VRR timing` selector for buffering and stale-work policy. The separate
 `Smooth frame timing` option was removed on 2026-09-09 because both values
 already leave production smoothing gain at zero. The persisted preference and
 internal session field remain for compatibility with existing settings and
@@ -719,9 +778,12 @@ Production updates padding as follows:
 - A new native hitch (or submission estimate when native timing is unavailable)
   requests protection based on the delayed frame's
   padding plus its interval error beyond the 3 ms tolerance. Requests slew upward
-  by at most 500 us per update and remain bounded by capacity and the 16 ms cap.
+  by at most 500 us per update and remain bounded by capacity, the 16 ms cap,
+  and the selected timing allowance. Balanced permits up to half a display
+  period of extra padding; Lowest latency permits none.
 - Without a pending hitch request, padding can shrink toward readiness p99.95
-  plus 3,000 us. A higher readiness estimate only stops release; it cannot grow
+  plus 3,000 us, subject to the selected allowance. A higher readiness estimate
+  only stops release; it cannot grow
   the buffer. Readiness history includes preparation and scheduler work but
   excludes deliberate waiting.
 - Release requires warmed readiness history, smooth evidence allowing release,
@@ -744,15 +806,21 @@ capacity        = 3 * period
 occupied        = renderLead + presentationSafety
                 + (smoothingEnabled ? maximumSmoothingLag : 0)
 queueDelayLimit = max(0, capacity - occupied)
-effectiveMin    = min(1000 us, queueDelayLimit)
-effectiveMax    = min(16000 us, queueDelayLimit)
+modeAllowance   = Smoothest: no extra bound
+                | Balanced: displayPeriod * 500 / 1000
+                | Lowest latency: 0
+effectiveMin    = min(1000 us, queueDelayLimit, modeAllowance)
+effectiveMax    = min(16000 us, queueDelayLimit, modeAllowance)
 ```
 
 The cold start first takes `max(6000 us, 0.95 * sourcePeriod)`, caps that by
 `max(displayPeriod, renderLead)` for history mode, then clamps to effective
 minimum/maximum. Consequently neither “the buffer always starts at 6 ms” nor
 "the maximum is 8 ms" describes current production. The 16 ms input is a
-ceiling on padding, independently of the three-frame storage limit.
+ceiling on padding, independently of the three-frame storage limit; the selected
+timing allowance can lower it. Zero extra padding retains target construction,
+rendering opportunity and applicable native/CPU floors, so it is not a promise
+of zero decode-to-submission delay or total latency.
 
 More protection can improve jitter tolerance while consuming latency and queue
 capacity. If the requested protection exceeds capacity, record the limitation
@@ -762,7 +830,9 @@ rather than presenting the capped policy as able to absorb all observed work.
 
 `vrr13-calibration.json` lives under the cache path. The profile key includes
 display identity, stream FPS, display refresh, smoothing settings,
-and session context. Profiles expire after 14 days; saves require at least
+and session context, including the active native presenter. Balanced and Lowest
+latency add distinct timing-mode suffixes; Smoothest keeps the ordinary key.
+Profiles expire after 14 days; saves require at least
 240 observations, use locking/atomic replacement, and cap storage at 16 profiles.
 
 The native-hitch policy accepts version-17 readiness histograms only as
@@ -1044,6 +1114,16 @@ queue admission, acquisition behavior, GPU cost, and later occupancy. Fixed
 replay cannot synthesize all those changes. Worker-mode auditing checks candidate
 capacity but does not provide a complete alternate renderer lifecycle or the
 same raster simulation readiness.
+
+For timing-preset or historical latency-fix admission changes, use the actual
+worker's deterministic backlog tests and `vrrqueuesim`'s all-arrival event
+simulation. The latter shares
+the production stale policy but reuses captured service samples in sequence;
+it does not reproduce counterfactual native blocking, decoding backpressure or
+physical scanout. Its raw presented jerk, source-spacing residual, drop clusters
+and latency distributions are distinct metrics. Unsupported display-only
+injections are rejected. Do not treat fixed replay's unchanged admission or
+its `stock_*` row as an actual fixed-refresh session.
 
 `worker_saturated` identifies scenarios whose candidate occupancy shift exceeds
 the model's useful cadence range (the implementation uses a median shift over

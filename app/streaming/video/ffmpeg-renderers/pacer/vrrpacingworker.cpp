@@ -4,6 +4,7 @@
 
 #include "vrr/vrrtargetwaiter.h"
 #include "vrr/vrrtimingcontroller.h"
+#include "vrr/vrrframedroppolicy.h"
 
 #include <Limelight.h>
 
@@ -23,17 +24,6 @@ namespace {
 // oldest queued successor under sustained pressure, so it cannot accumulate
 // an unbounded latency backlog.
 constexpr size_t kMaximumQueuedFrames = VrrMaximumQueuedFrames;
-// One source period of age is normal while the preceding frame traverses the
-// single pacing/presentation worker. Treating that ordinary occupancy as
-// stale caused isolated content skips whenever completion crossed the period
-// boundary by even a few hundred microseconds. A second period distinguishes
-// real backlog while the bounded queue remains the hard overload limit.
-constexpr unsigned int kLowLatencyFrameAgePeriods = 2;
-// Metronome playout keeps a cushion of a little over one source period, so
-// a frame is ordinarily a fraction of a period old when it is dequeued. The
-// backlog signal there is a frame that missed its tick by a whole period
-// while a fresher successor already waits; age is only the hard bound.
-constexpr unsigned int kMetronomeFrameAgePeriods = 4;
 // ~64 seconds of rows at 120 FPS. When the writer thread cannot keep up the
 // pacing thread drops rows rather than ever waiting on diagnostics.
 constexpr size_t kMaximumTraceQueueRows = 8192;
@@ -44,12 +34,6 @@ constexpr int kTraceChunkBytes = 256 * 1024;
 // A decode sync shorter than this did not wait on the GPU; the frame keeps
 // the decoder's completion time as its readiness.
 constexpr uint64_t kDecodeSyncNoticeUs = 200;
-// A frame whose slot the display floor has already pushed more than half a
-// source period, with a fresher frame waiting, is shed rather than shown
-// late: a source above the display rate otherwise builds a backlog that
-// the stale limit sheds all at once.
-constexpr uint64_t kFloorBacklogNumerator = 1;
-constexpr uint64_t kFloorBacklogDenominator = 2;
 // Always preserve at least an hour, including the maximum supported 480 FPS
 // stream cadence. The physical cap takes effect only after that duration, so
 // an unusually incompressible trace remains complete rather than silently
@@ -129,17 +113,6 @@ int64_t signedDifference(uint64_t left, uint64_t right)
 uint64_t positiveDifference(uint64_t actualUs, uint64_t targetUs)
 {
     return actualUs > targetUs ? actualUs - targetUs : 0;
-}
-
-uint64_t queueAgeToleranceUs(uint64_t sourcePeriodUs,
-                             unsigned int framePeriods)
-{
-    if (framePeriods != 0 &&
-            sourcePeriodUs > std::numeric_limits<uint64_t>::max() /
-                framePeriods) {
-        return std::numeric_limits<uint64_t>::max();
-    }
-    return sourcePeriodUs * framePeriods;
 }
 
 uint64_t saturatingAdd(uint64_t left, uint64_t right)
@@ -286,8 +259,9 @@ void VrrPacingWorker::submit(PacedFrame&& frame)
 
     QueuedFrame incoming;
     incoming.frame = std::move(frame);
+    // Admission age is pacing state even when no diagnostic capture is open.
+    incoming.trace.arrivalUs = LiGetMicroseconds();
     if (m_TraceAcceptingRows.load()) {
-        incoming.trace.arrivalUs = LiGetMicroseconds();
         incoming.trace.arrivalSequence =
             m_TraceArrivalSequence.fetch_add(1) + 1;
     }
@@ -468,32 +442,14 @@ int VrrPacingWorker::run()
         telemetry.staleAgeUs = scheduleAgeUs;
         const bool metronome =
             m_TimingController->parameters().playoutMetronomeEnabled != 0;
-        const uint64_t maximumFrameAgeUs = queueAgeToleranceUs(
-            decision.sourcePeriodUs,
-            metronome ? kMetronomeFrameAgePeriods : kLowLatencyFrameAgePeriods);
-        const bool missedTickBacklog = metronome && decision.missedTicks != 0;
-        // The floor has already pushed this slot well past the source's own
-        // spacing and a fresher frame is waiting: shed it now, the way a
-        // mailbox keeps only the newest image, instead of showing it late
-        // and letting the backlog grow.
-        const uint64_t floorPushUs = decision.presentationFloorPushUs;
-        const uint64_t displayPeriodUs =
-            m_TimingController->displayPeriodUs();
-        // A transient late submission can push several following targets onto
-        // the display floor. When the source is slower than the display, that
-        // debt naturally drains through the rate headroom; dropping a frame
-        // here converts a small timing error into a visible motion skip. Only
-        // shed floor-bound frames when the fitted source can actually
-        // oversupply the display. Queue capacity and the age limit remain the
-        // overload bounds for either case.
-        const bool sourceCanOversupplyDisplay = displayPeriodUs != 0 &&
-            decision.sourcePeriodUs <= displayPeriodUs;
-        const bool floorBacklog = sourceCanOversupplyDisplay &&
-            floorPushUs * kFloorBacklogDenominator >
-                decision.sourcePeriodUs * kFloorBacklogNumerator;
-        if (decision.sourcePeriodUs != 0 && hasQueuedFrame() &&
-            (scheduleAgeUs > maximumFrameAgeUs || missedTickBacklog ||
-             floorBacklog)) {
+        const bool latencyFix = m_TimingController->latencyFixActive();
+        // The optional near-ceiling policy measures transport occupancy from
+        // admission. GPU readiness may move decodeCompleteUs forward above;
+        // it must not erase time that this image already spent queued.
+        const uint64_t ageOriginUs = latencyFix ? queuedFrame.trace.arrivalUs : frame.decodeCompleteUs();
+        const uint64_t ageUs = positiveDifference(scheduleNowUs, ageOriginUs);
+        if (hasQueuedFrame() && VrrFrameDropPolicy::beforeRender(
+                decision, m_TimingController->displayPeriodUs(), ageUs, metronome, latencyFix)) {
             writeTrace(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
                        TraceDisposition::Stale);
             noteDrop();
@@ -549,16 +505,12 @@ int VrrPacingWorker::run()
         // start. Leave the surface unprepared and let the next iteration start
         // fresh rather than rendering an avoidably old image.
         uint64_t nowUs = LiGetMicroseconds();
-        const uint64_t staleHorizonAfterWaitUs = maximumFrameAgeUs;
-        const uint64_t staleTargetUs = saturatingAdd(
-            decision.targetUs, staleHorizonAfterWaitUs);
-        if (staleHorizonAfterWaitUs != 0 &&
-            nowUs > staleTargetUs &&
-            hasQueuedFrame()) {
+        if (hasQueuedFrame() && VrrFrameDropPolicy::afterRenderWait(
+                decision, ageOriginUs, nowUs, metronome, latencyFix)) {
             writeTrace(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
                        TraceDisposition::Stale);
             noteDrop();
-            if (metronome) {
+            if (metronome || latencyFix) {
                 // The tick is freed for the successor; the clock mapping is
                 // still valid and a rebase would only restart its warm-up.
                 m_TimingController->noteSubmission(false, false, 0);

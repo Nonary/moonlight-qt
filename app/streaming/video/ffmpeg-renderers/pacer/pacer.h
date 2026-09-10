@@ -58,7 +58,8 @@ public:
                     bool enablePacing, bool enableVsync,
                     bool enableVrr, int vrrDisplayRefreshHz,
                     bool smoothVrrFrameTiming = true,
-                    const QString& calibrationKey = QString());
+                    const QString& calibrationKey = QString(),
+                    int vrrLatencyMode = 0);
 
     void notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info);
 

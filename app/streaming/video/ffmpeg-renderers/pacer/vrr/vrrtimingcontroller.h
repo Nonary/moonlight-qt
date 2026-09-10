@@ -18,6 +18,9 @@
 // headroom thresholds; non-zero ratios remain available to replay captures
 // made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
+    X(uint64_t, latency_fix_enabled, latencyFixEnabled, 0) \
+    X(uint64_t, latency_fix_all_rates, latencyFixAllRates, 0) \
+    X(uint64_t, latency_fix_delay_period_per_mille, latencyFixDelayPeriodPerMille, 500) \
     X(uint64_t, playout_require_display_events, playoutRequireDisplayEvents, 0) \
     X(uint64_t, playout_submission_estimate_fallback, playoutSubmissionEstimateFallback, 0) \
     X(uint64_t, playout_native_hitch_adaptation, playoutNativeHitchAdaptation, 0) \
@@ -302,8 +305,12 @@ public:
         return !m_HaveTimeline && m_PlayoutHistory.loadProfile(profile);
     }
     uint64_t playoutQueueLimitUs() const;
+    bool latencyFixActive() const { return m_LatencyFixActive; }
 
 private:
+    void updateLatencyFixState();
+    uint64_t latencyFixDelayLimitUs() const;
+    bool m_LatencyFixActive = false;
     struct PendingFrame {
         Vrr13::SmoothnessFeedback::Sample smoothness;
         Vrr13::ReadinessPrediction::Probe prediction;

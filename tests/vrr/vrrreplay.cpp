@@ -11530,6 +11530,10 @@ int main(int argc, char* argv[])
                     return 1;
                 }
             }
+            capturedConfig.latencyFix = capturedParameters.latencyFixEnabled != 0 &&
+                capturedParameters.latencyFixAllRates == 0;
+            capturedConfig.latencyMode = capturedParameters.latencyFixAllRates != 0 ?
+                (capturedParameters.latencyFixDelayPeriodPerMille == 0 ? 2 : 1) : 0;
             simulatedConfig = capturedConfig;
             if (parser.isSet(displayOption)) {
                 simulatedConfig.displayRefreshHz = displayOverrideHz;
@@ -11545,6 +11549,12 @@ int main(int argc, char* argv[])
                 scenario.controller = capturedParameters;
             }
             else if (!scenario.controllerCustomized) {
+                // Current preferences migrate the enabled legacy checkbox to
+                // Balanced; exact/reference replay retains the recorded policy.
+                if (simulatedConfig.latencyFix && simulatedConfig.latencyMode == 0) {
+                    simulatedConfig.latencyFix = false;
+                    simulatedConfig.latencyMode = 1;
+                }
                 scenario.controller = vrrTimingParametersForSession(
                     simulatedConfig);
             }
@@ -11566,7 +11576,10 @@ int main(int argc, char* argv[])
                 }
                 // A different policy learns its own error distribution; do not
                 // reinterpret the old smoothed-slot histogram as FIFO readiness.
-                if (referenceController->playoutHistory().version() == simulatedController->playoutHistory().version() &&
+                if (capturedParameters.latencyFixEnabled == scenario.controller.latencyFixEnabled &&
+                    capturedParameters.latencyFixAllRates == scenario.controller.latencyFixAllRates &&
+                    capturedParameters.latencyFixDelayPeriodPerMille == scenario.controller.latencyFixDelayPeriodPerMille &&
+                    referenceController->playoutHistory().version() == simulatedController->playoutHistory().version() &&
                     !simulatedController->loadPlayoutHistory(profile)) return 1;
                 capturedParameterValues.insert(profileColumn, fields[profileColumn]);
             }
@@ -14278,8 +14291,16 @@ int main(int argc, char* argv[])
             addReferenceControllerDiagnostics(
                 metrics, referenceController->diagnostics(), fields, columns);
             if (staleAfterRenderLifecycle) {
-                referenceController->rebase();
-                simulatedController->rebase();
+                if (referenceController->latencyFixActive() ||
+                    referenceController->parameters().playoutMetronomeEnabled)
+                    referenceController->noteSubmission(false, false, 0);
+                else
+                    referenceController->rebase();
+                if (simulatedController->latencyFixActive() ||
+                    simulatedController->parameters().playoutMetronomeEnabled)
+                    simulatedController->noteSubmission(false, false, 0);
+                else
+                    simulatedController->rebase();
             }
             else {
                 referenceController->noteSubmission(

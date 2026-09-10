@@ -285,7 +285,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             bool testOnly, IVideoDecoder*& chosenDecoder,
                             bool enableVrr, int vrrDisplayRefreshHz,
                             [[maybe_unused]] bool* effectiveVrr, bool smoothVrrFrameTiming,
-                            bool gamescopeMailbox)
+                            bool gamescopeMailbox, int vrrLatencyMode)
 {
     DECODER_PARAMETERS params = {};
 
@@ -303,6 +303,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.enableVsync = enableVsync;
     params.enableFramePacing = enableFramePacing;
     params.enableVrr = enableVrr;
+    params.vrrLatencyMode = vrrLatencyMode;
     params.gamescopeMailbox = gamescopeMailbox;
     params.smoothVrrFrameTiming = smoothVrrFrameTiming;
     params.vrrDisplayRefreshHz = vrrDisplayRefreshHz;
@@ -655,6 +656,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
     m_PresentationSettings.enableFramePacing = m_PresentationSettings.effectiveVsync &&
                                                m_Preferences->framePacing;
     m_PresentationSettings.enableVrr = false;
+    m_PresentationSettings.vrrLatencyMode = m_Preferences->vrrLatencyMode;
     m_PresentationSettings.gamescopeMailbox = m_Preferences->gamescopeMailbox;
     m_PresentationSettings.smoothVrrFrameTiming = m_Preferences->smoothVrrFrameTiming;
 
@@ -2400,7 +2402,8 @@ void Session::exec()
                                m_PresentationSettings.refreshRate,
                                &m_PresentationSettings.enableVrr,
                                m_PresentationSettings.smoothVrrFrameTiming,
-                               m_PresentationSettings.gamescopeMailbox)) {
+                               m_PresentationSettings.gamescopeMailbox,
+                               m_PresentationSettings.vrrLatencyMode)) {
                 SDL_UnlockMutex(m_DecoderLock);
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "Failed to recreate decoder after reset");

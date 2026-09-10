@@ -284,6 +284,7 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h
 }
 libva {

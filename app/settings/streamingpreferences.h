@@ -45,6 +45,15 @@ public:
     };
     Q_ENUM(VideoDecoderSelection)
 
+    // Persisted IDs also identify the VRR controller's timing profile.
+    enum VrrLatencyMode
+    {
+        VLM_SMOOTHEST = 0,
+        VLM_BALANCED = 1,
+        VLM_LOWEST_LATENCY = 2
+    };
+    Q_ENUM(VrrLatencyMode)
+
     // Mac only (for now)
     enum RendererSelection
     {
@@ -128,6 +137,7 @@ public:
     Q_PROPERTY(bool autoAdjustBitrate MEMBER autoAdjustBitrate NOTIFY autoAdjustBitrateChanged)
     Q_PROPERTY(bool enableVsync MEMBER enableVsync NOTIFY enableVsyncChanged)
     Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
+    Q_PROPERTY(int vrrLatencyMode MEMBER vrrLatencyMode NOTIFY vrrLatencyModeChanged)
     Q_PROPERTY(bool gamescopeMailbox MEMBER gamescopeMailbox NOTIFY gamescopeMailboxChanged)
     Q_PROPERTY(bool smoothVrrFrameTiming MEMBER smoothVrrFrameTiming NOTIFY smoothVrrFrameTimingChanged)
     Q_PROPERTY(bool gameOptimizations MEMBER gameOptimizations NOTIFY gameOptimizationsChanged)
@@ -177,6 +187,7 @@ public:
     bool autoAdjustBitrate;
     bool enableVsync;
     bool enableVrr;
+    int vrrLatencyMode;
     bool gamescopeMailbox;
     // Re-present the last frame inside a host gap longer than the panel's
     // adaptive-refresh floor, so the panel never engages its own
@@ -222,6 +233,7 @@ signals:
     void autoAdjustBitrateChanged();
     void enableVsyncChanged();
     void enableVrrChanged();
+    void vrrLatencyModeChanged();
     void gamescopeMailboxChanged();
     void smoothVrrFrameTimingChanged();
     void gameOptimizationsChanged();

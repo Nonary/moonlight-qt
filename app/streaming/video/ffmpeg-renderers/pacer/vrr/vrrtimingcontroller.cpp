@@ -119,6 +119,13 @@ VrrTimingParameters vrrTimingParametersForSession(
     // path: they each moved the target between frames the source had spaced
     // evenly. Explicit parameters keep older policies replayable.
     VrrTimingParameters parameters;
+    // Mode zero preserves Smoothest and the historical near-ceiling option.
+    // Captured parameters retain their own defaults for exact replay.
+    const int latencyMode = config.latencyMode >= 0 && config.latencyMode <= 2 ?
+        config.latencyMode : 1;
+    parameters.latencyFixEnabled = config.latencyFix || latencyMode != 0 ? 1 : 0;
+    parameters.latencyFixAllRates = latencyMode != 0 ? 1 : 0;
+    parameters.latencyFixDelayPeriodPerMille = latencyMode == 2 ? 0 : 500;
     parameters.playoutNativeHitchAdaptation = 1;
     parameters.playoutRequireDisplayEvents = 1;
     parameters.playoutSubmissionEstimateFallback = 1;
@@ -233,6 +240,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_SourcePeriodUsQ16 = m_ConfiguredStreamPeriodQ16;
     m_SourcePeriodUs = std::max<uint64_t>(
         1, roundedQ16(m_SourcePeriodUsQ16));
+    m_LatencyFixActive = false;
+    updateLatencyFixState();
     m_MetronomePeriodUsQ16 = m_ConfiguredStreamPeriodQ16;
     m_LatchedPresentation = m_Parameters.playoutAdaptiveOnly ? false :
         m_Parameters.playoutRateProtectionEnabled ?
@@ -409,6 +418,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         }
     }
 
+    updateLatencyFixState();
+
     // Timestamp playout: the target is the sender timestamp mapped into the
     // local clock plus one constant delay. The mapping offset is the windowed
     // minimum of decode-complete minus RTP time, slewed a few microseconds per
@@ -530,9 +541,11 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     // slot was mapped; applying the calibrator's newer value here would put
     // its slew on the presented interval. It reaches the schedule through
     // the next frame's raw slot instead.
-    const uint64_t playoutDelayUs = timestampPlayout ?
+    const uint64_t proposedPlayoutDelayUs = timestampPlayout ?
         (metronomeEnabled() ? delayBeforeUs : effectivePlayoutDelayUs()) :
         m_Parameters.sourcePlayoutDelayUs;
+    const uint64_t playoutDelayUs = m_LatencyFixActive ?
+        std::min(proposedPlayoutDelayUs, latencyFixDelayLimitUs()) : proposedPlayoutDelayUs;
     const uint64_t renderOffsetUs = m_Parameters.playoutPredictionEnabled ? typicalRenderUs() : m_RenderLeadUs;
     const uint64_t compositorLeadUs = m_Parameters.playoutPredictionEnabled ? m_PresentationPrediction.lead(nowUs) : 0;
     uint64_t targetUs = saturatingAdd(
@@ -1972,8 +1985,9 @@ int64_t VrrTimingController::observePlayoutOffset(uint64_t decodeCompleteUs,
 
 uint64_t VrrTimingController::playoutDelayUs() const
 {
-    return m_TimestampPlayoutActive ? effectivePlayoutDelayUs() :
-                                      m_Parameters.sourcePlayoutDelayUs;
+    const uint64_t delayUs = m_TimestampPlayoutActive ? effectivePlayoutDelayUs() :
+                                                      m_Parameters.sourcePlayoutDelayUs;
+    return m_LatencyFixActive ? std::min(delayUs, latencyFixDelayLimitUs()) : delayUs;
 }
 
 unsigned int VrrTimingController::playoutBandIndex() const
@@ -1995,14 +2009,18 @@ uint64_t VrrTimingController::effectivePlayoutDelayUs() const
 {
     if (m_Parameters.playoutDelayAdaptive != 0) {
         // Before the first band opens, the delay the band will open with.
-        return m_PlayoutBandValid ? m_AppliedPlayoutDelayUs :
-                                    playoutDelayStartUs();
+        const uint64_t delayUs = m_PlayoutBandValid ? m_AppliedPlayoutDelayUs :
+                                                    playoutDelayStartUs();
+        return m_LatencyFixActive ? std::min(delayUs, latencyFixDelayLimitUs()) : delayUs;
     }
     return m_Parameters.sourcePlayoutDelayUs;
 }
 
 uint64_t VrrTimingController::playoutDelayMinimumUs() const
 {
+    if (m_LatencyFixActive)
+        return std::min({m_Parameters.playoutDelayMinimumUs,
+                         playoutQueueLimitUs(), latencyFixDelayLimitUs()});
     if (m_Parameters.playoutHistoryEnabled != 0)
         return std::min(m_Parameters.playoutDelayMinimumUs, playoutQueueLimitUs());
     return m_Parameters.playoutDelayMinimumUs;
@@ -2030,8 +2048,35 @@ uint64_t VrrTimingController::playoutDelayMaximumUs() const
             scaledPerMille(m_SourcePeriodUs,
                            m_Parameters.playoutDelayMaximumPeriodPerMille));
     }
+    if (m_LatencyFixActive) maximumUs = std::min(maximumUs, latencyFixDelayLimitUs());
     return m_Parameters.playoutHistoryEnabled != 0 ?
         std::min(maximumUs, playoutQueueLimitUs()) : maximumUs;
+}
+
+uint64_t VrrTimingController::latencyFixDelayLimitUs() const
+{
+    return scaledPerMille(m_DisplayPeriodUs, m_Parameters.latencyFixDelayPeriodPerMille);
+}
+
+void VrrTimingController::updateLatencyFixState()
+{
+    const int enterHz = VrrRatePolicy::protectedRateForRefresh(m_Config.displayRefreshHz);
+    // Reuse the near-ceiling boundary (116 at 120 Hz). Leave only once half
+    // that headroom again is available (114 Hz), so small fitted-rate changes
+    // cannot repeatedly compress and refill the buffer.
+    const int exitHz = std::max(1, enterHz -
+        std::max(1, (m_Config.displayRefreshHz - enterHz) / 2));
+    const bool active = m_Parameters.latencyFixEnabled != 0 &&
+        m_Config.displayRefreshHz > 0 && m_SourcePeriodUs > 0 &&
+        (m_Parameters.latencyFixAllRates != 0 ||
+         (enterHz > 0 && m_SourcePeriodUs <= periodForRate(m_LatencyFixActive ? exitHz : enterHz, 0)));
+    if (m_LatencyFixActive && !active) {
+        // Do not resurrect a near-ceiling hitch's rejected padding demand
+        // when the source leaves this mode. Fresh lower-rate misses can still
+        // acquire protection through the ordinary feedback path.
+        m_RequestedPlayoutDelayUs = std::min(m_RequestedPlayoutDelayUs, latencyFixDelayLimitUs());
+    }
+    m_LatencyFixActive = active;
 }
 
 uint64_t VrrTimingController::playoutQueueLimitUs() const

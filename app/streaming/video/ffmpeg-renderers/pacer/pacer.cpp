@@ -295,7 +295,8 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
 bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                        bool enablePacing, bool enableVsync,
                        bool enableVrr, int vrrDisplayRefreshHz,
-                       bool smoothVrrFrameTiming, const QString& calibrationKey)
+                       bool smoothVrrFrameTiming, const QString& calibrationKey,
+                       int vrrLatencyMode)
 {
     m_MaxVideoFps = maxVideoFps;
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
@@ -305,20 +306,24 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
     // rejection continues through the original fixed path below.
     if (enableVrr) {
         VrrSessionConfig config;
+        config.latencyMode = vrrLatencyMode >= 0 && vrrLatencyMode <= 2 ? vrrLatencyMode : 1;
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         if (!calibrationKey.isEmpty()) {
             const QString display = QString::fromUtf8(SDL_GetDisplayName(SDL_GetWindowDisplayIndex(window)));
-            const auto context = calibrationKey + QString("|%1|%2|%3|%4")
+            auto context = calibrationKey + QString("|%1|%2|%3|%4")
                 .arg(display).arg(maxVideoFps).arg(vrrDisplayRefreshHz)
                 .arg(smoothVrrFrameTiming);
+            if (config.latencyMode != 0) {
+                context += QStringLiteral("|latency-mode=%1").arg(config.latencyMode);
+            }
             config.calibrationKey = QCryptographicHash::hash(context.toUtf8(), QCryptographicHash::Sha256).toHex().toStdString();
             config.calibrationPath = Path::getCacheFileInfo("vrr13-calibration.json").absoluteFilePath().toStdString();
         }
         config.streamRateHz = maxVideoFps;
         config.displayRefreshHz = vrrDisplayRefreshHz;
         config.smoothFrameTiming = smoothVrrFrameTiming;
-        // There is one VRR queue policy. The flag remains in the session
-        // config only so older captures replay under the policy they ran.
+        // The retired extra-queue flag remains only for historical replay;
+        // the timing profile controls delay and stale-frame replacement.
         config.allowAdditionalQueuedFrame = false;
 
         if (!enableVsync) {
@@ -354,9 +359,11 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                     if (m_VrrWorker->start()) {
                         m_DisplayFps = config.displayRefreshHz;
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "VRR pacing: target %d Hz with %d FPS stream (adaptive timestamp playout, frame timing %s)",
+                                    "VRR pacing: target %d Hz with %d FPS stream (adaptive timestamp playout, frame timing %s, timing profile %s)",
                                     m_DisplayFps, m_MaxVideoFps,
-                                    config.smoothFrameTiming ? "smoothed" : "follows host timestamps");
+                                    config.smoothFrameTiming ? "smoothed" : "follows host timestamps",
+                                    config.latencyMode == 2 ? "lowest latency" :
+                                    config.latencyMode == 1 ? "balanced" : "smoothest");
                         return true;
                     }
 

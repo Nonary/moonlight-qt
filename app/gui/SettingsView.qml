@@ -866,6 +866,71 @@ Flickable {
                     }
                 }
 
+                Column {
+                    width: parent.width
+                    spacing: 5
+                    visible: StreamingPreferences.enableVrr
+                    enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+
+                    Label {
+                        width: parent.width
+                        text: qsTr("VRR timing")
+                        font.pointSize: 12
+                        wrapMode: Text.Wrap
+                    }
+
+                    AutoResizingComboBox {
+                        id: vrrLatencyModeComboBox
+                        textRole: "text"
+                        model: ListModel {
+                            id: vrrLatencyModeListModel
+                            ListElement {
+                                text: qsTr("Lowest latency")
+                                val: StreamingPreferences.VLM_LOWEST_LATENCY
+                            }
+                            ListElement {
+                                text: qsTr("Balanced")
+                                val: StreamingPreferences.VLM_BALANCED
+                            }
+                            ListElement {
+                                text: qsTr("Smoothest")
+                                val: StreamingPreferences.VLM_SMOOTHEST
+                            }
+                        }
+                        currentIndex: {
+                            for (var i = 0; i < vrrLatencyModeListModel.count; i++) {
+                                if (vrrLatencyModeListModel.get(i).val === StreamingPreferences.vrrLatencyMode) {
+                                    return i
+                                }
+                            }
+                            return 1
+                        }
+                        onActivated: {
+                            StreamingPreferences.vrrLatencyMode = vrrLatencyModeListModel.get(currentIndex).val
+                        }
+                        Component.onCompleted: {
+                            recalculateWidth()
+                            languageChanged.connect(recalculateWidth)
+                        }
+                    }
+
+                    Label {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        text: StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_LOWEST_LATENCY ?
+                                  qsTr("Minimizes added delay. Uneven delivery can cause more stutter or skipped frames.") :
+                              StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_SMOOTHEST ?
+                                  qsTr("Buffers more delivery variation for steadier motion, with more input delay.") :
+                                  qsTr("Keeps a small timing reserve for responsive controls and steadier motion.")
+                    }
+
+                    Label {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        text: qsTr("Applies at all VRR frame rates. Reconnect the stream after changing this setting.")
+                    }
+                }
+
                 CheckBox {
                     hoverEnabled: true
                     text: qsTr("Test SteamOS VRR fix (experimental)")

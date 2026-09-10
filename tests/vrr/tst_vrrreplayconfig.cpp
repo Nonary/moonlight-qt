@@ -17,6 +17,7 @@ private slots:
     void submissionEstimatePolicyRoundTrip();
     void rateProtectionPolicyRoundTrip();
     void adaptiveOnlyPolicyRoundTrip();
+    void latencyFixPolicyRoundTrip();
     void inheritanceAndOverride();
     void controllerSnapshotIsAtomic();
     void rejectsInvalidInput();
@@ -488,6 +489,84 @@ void VrrReplayConfigTest::adaptiveOnlyPolicyRoundTrip()
     QVERIFY(!applyVrrReplayControllerSnapshot(snapshot, parameters, error));
     QVERIFY(error.contains("playout_adaptive_only"));
     QCOMPARE(parameters.playoutAdaptiveOnly, uint64_t(1));
+}
+
+void VrrReplayConfigTest::latencyFixPolicyRoundTrip()
+{
+    VrrReplayConfiguration historical;
+    QString error;
+    QVERIFY2(loadVrrReplayConfiguration(
+        R"({"config_schema":1,"scenarios":[{"name":"historical"}]})",
+        historical, error), qPrintable(error));
+    QCOMPARE(historical.scenarios.front().controller.latencyFixEnabled, uint64_t(0));
+    QCOMPARE(historical.scenarios.front().controller.latencyFixAllRates, uint64_t(0));
+    QCOMPARE(historical.scenarios.front().controller.latencyFixDelayPeriodPerMille, uint64_t(500));
+    QVERIFY(vrrReplayParameterNames().contains("controller.latency_fix_enabled"));
+    QVERIFY(vrrReplayParameterNames().contains("controller.latency_fix_all_rates"));
+    QVERIFY(vrrReplayParameterNames().contains("controller.latency_fix_delay_period_per_mille"));
+
+    VrrTimingParameters policy;
+    policy.latencyFixEnabled = 1;
+    policy.timestampPlayoutEnabled = 1;
+    policy.playoutDelayAdaptive = 1;
+    policy.playoutHistoryEnabled = 1;
+    for (uint64_t allRates : {0ULL, 1ULL}) {
+        policy.latencyFixAllRates = allRates;
+        for (uint64_t ratio : {0ULL, 500ULL, 1000ULL}) {
+            policy.latencyFixDelayPeriodPerMille = ratio;
+            const auto snapshot = vrrTimingParametersToJson(policy);
+            VrrTimingParameters restored;
+            QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error), qPrintable(error));
+            QCOMPARE(restored.latencyFixEnabled, uint64_t(1));
+            QCOMPARE(restored.latencyFixAllRates, allRates);
+            QCOMPARE(restored.latencyFixDelayPeriodPerMille, ratio);
+            QCOMPARE(vrrTimingParametersToJson(restored), snapshot);
+
+            const QJsonObject configJson{
+                {"config_schema", 1},
+                {"parameters", QJsonObject{{"controller", snapshot}}},
+                {"scenarios", QJsonArray{QJsonObject{{"name", "latency-fix"}}}}
+            };
+            VrrReplayConfiguration reloaded;
+            QVERIFY2(loadVrrReplayConfiguration(QJsonDocument(configJson).toJson(),
+                                               reloaded, error), qPrintable(error));
+            QCOMPARE(vrrTimingParametersToJson(reloaded.scenarios.front().controller), snapshot);
+        }
+    }
+
+    policy.latencyFixDelayPeriodPerMille = 500;
+    for (const auto invalid : {QJsonObject{{"latency_fix_enabled", 2}},
+                               QJsonObject{{"latency_fix_all_rates", 2}},
+                               QJsonObject{{"latency_fix_enabled", 0}},
+                               QJsonObject{{"latency_fix_delay_period_per_mille", 1001}}}) {
+        const auto before = vrrTimingParametersToJson(policy);
+        QVERIFY(!applyVrrReplayControllerSnapshot(invalid, policy, error));
+        QVERIFY(error.contains("latency_fix"));
+        QCOMPARE(vrrTimingParametersToJson(policy), before);
+    }
+
+    // Exercise each dependency independently without unrelated production
+    // feedback options masking the reason for rejecting the configuration.
+    VrrTimingParameters minimal;
+    minimal.latencyFixEnabled = 1;
+    minimal.timestampPlayoutEnabled = 1;
+    minimal.playoutDelayAdaptive = 1;
+    minimal.playoutHistoryEnabled = 1;
+    QVERIFY2(validateVrrTimingParameters(minimal, error), qPrintable(error));
+    for (auto member : {&VrrTimingParameters::timestampPlayoutEnabled,
+                        &VrrTimingParameters::playoutDelayAdaptive,
+                        &VrrTimingParameters::playoutHistoryEnabled}) {
+        auto invalid = minimal;
+        invalid.*member = 0;
+        QVERIFY(!validateVrrTimingParameters(invalid, error));
+        QVERIFY(error.contains("latency_fix_enabled requires"));
+    }
+
+    minimal.latencyFixAllRates = 1;
+    QVERIFY2(validateVrrTimingParameters(minimal, error), qPrintable(error));
+    minimal.latencyFixEnabled = 0;
+    QVERIFY(!validateVrrTimingParameters(minimal, error));
+    QVERIFY(error.contains("latency_fix_all_rates requires"));
 }
 
 void VrrReplayConfigTest::displayEventPolicyRoundTrip()

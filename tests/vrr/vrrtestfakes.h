@@ -17,12 +17,36 @@ extern "C" {
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 class FakeVrrFramePresenter final : public IVrrFramePresenter {
 public:
+    bool canLatchAdaptivePresent() const override
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        return m_CanLatch;
+    }
+
+    uint64_t waitForDecode(AVFrame* frame) override
+    {
+        std::unique_lock<std::mutex> lock(m_Mutex);
+        const int number = frame == nullptr ? -1 : static_cast<int>(
+            reinterpret_cast<intptr_t>(frame->opaque));
+        if (number < 0 || number != m_BlockedDecodeFrame) {
+            return 0;
+        }
+        const uint64_t startUs = LiGetMicroseconds();
+        ++m_DecodeWaitCount;
+        m_Condition.notify_all();
+        while (m_BlockedDecodeFrame == number) {
+            m_Condition.wait(lock);
+        }
+        return LiGetMicroseconds() - startUs;
+    }
+
     VrrFallbackReason checkSupport() const override
     {
         std::lock_guard<std::mutex> lock(m_Mutex);
@@ -45,10 +69,12 @@ public:
         m_PreparedDecodeBoundaries.push_back(decodeBoundary);
         m_PreparedFrameNumber = frame == nullptr ? -1 : static_cast<int>(
             reinterpret_cast<intptr_t>(frame->opaque));
+        m_PreparedFrames.push_back(m_PreparedFrameNumber);
         ++m_PrepareCount;
         m_Condition.notify_all();
 
-        while (m_BlockPreparation && !m_ReleasePreparation) {
+        while ((m_BlockPreparation && !m_ReleasePreparation) ||
+               m_PrepareCount > m_PreparationLimit) {
             m_Condition.wait(lock);
         }
 
@@ -167,6 +193,32 @@ public:
         m_Support = support;
     }
 
+    void setCanLatch(bool canLatch)
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        m_CanLatch = canLatch;
+    }
+
+    void blockDecodeFrame(int number)
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        m_BlockedDecodeFrame = number;
+    }
+
+    void releaseDecode()
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        m_BlockedDecodeFrame = -1;
+        m_Condition.notify_all();
+    }
+
+    void setPreparationLimit(size_t count)
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        m_PreparationLimit = count;
+        m_Condition.notify_all();
+    }
+
     void setCancelSubmits(bool enabled)
     {
         std::lock_guard<std::mutex> lock(m_Mutex);
@@ -240,6 +292,14 @@ public:
         });
     }
 
+    bool waitForDecodeWaitCount(size_t count)
+    {
+        std::unique_lock<std::mutex> lock(m_Mutex);
+        return m_Condition.wait_for(lock, std::chrono::milliseconds(2000), [&] {
+            return m_DecodeWaitCount >= count;
+        });
+    }
+
     bool waitForPresentCount(size_t count,
                              std::chrono::milliseconds timeout =
                                  std::chrono::milliseconds(2000))
@@ -290,6 +350,12 @@ public:
         return m_PresentedFrames;
     }
 
+    std::vector<int> preparedFrames() const
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        return m_PreparedFrames;
+    }
+
     std::vector<uint64_t> presentCallTimesUs() const
     {
         std::lock_guard<std::mutex> lock(m_Mutex);
@@ -324,6 +390,7 @@ private:
     mutable std::mutex m_Mutex;
     std::condition_variable m_Condition;
     VrrFallbackReason m_Support = VrrFallbackReason::NoFallback;
+    bool m_CanLatch = false;
     bool m_PreparationSucceeds = true;
     bool m_CancellationMaySubmit = false;
     bool m_SourceFrameReusable = false;
@@ -334,6 +401,9 @@ private:
     uint64_t m_PreSubmissionDelayUs = 0;
     uint64_t m_PresentDelayUs = 0;
     uint64_t m_DecodeBoundary = 0;
+    int m_BlockedDecodeFrame = -1;
+    size_t m_DecodeWaitCount = 0;
+    size_t m_PreparationLimit = std::numeric_limits<size_t>::max();
     size_t m_PrepareCount = 0;
     size_t m_PresentCount = 0;
     size_t m_CancelCount = 0;
@@ -342,6 +412,7 @@ private:
     size_t m_DecodeBoundaryCaptureCount = 0;
     AVFrame* m_PreparedFrame = nullptr;
     int m_PreparedFrameNumber = -1;
+    std::vector<int> m_PreparedFrames;
     std::vector<int> m_PresentedFrames;
     std::vector<VrrPresentRequest> m_PresentRequests;
     std::vector<uint64_t> m_PreparedDecodeBoundaries;

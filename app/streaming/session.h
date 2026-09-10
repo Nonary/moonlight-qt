@@ -194,7 +194,7 @@ private:
                        bool testOnly, IVideoDecoder*& chosenDecoder,
                        bool enableVrr = false, int vrrDisplayRefreshHz = 0,
                        bool* effectiveVrr = nullptr, bool smoothVrrFrameTiming = true,
-                       bool gamescopeMailbox = false);
+                       bool gamescopeMailbox = false, int vrrLatencyMode = 0);
 
     static
     void clStageStarting(int stage);
@@ -253,6 +253,7 @@ private:
         bool effectiveVsync = false;
         bool enableFramePacing = false;
         bool enableVrr = false;
+        int vrrLatencyMode = 0;
         bool gamescopeMailbox = false;
         bool smoothVrrFrameTiming = true;
         int refreshRate = 0;
