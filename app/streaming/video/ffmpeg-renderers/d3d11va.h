@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dxgipresent.h"
+#include "d3d11composition.h"
 #include "ivrrframepresenter.h"
 #include "renderer.h"
 
@@ -27,7 +28,7 @@ public:
     virtual void renderFrame(AVFrame* frame) override;
     virtual IVrrFramePresenter* getVrrFramePresenter() override;
 
-    virtual bool canLatchAdaptivePresent() const override { return true; }
+    virtual bool canLatchAdaptivePresent() const override { return !m_CompositionPresenter.active(); }
     virtual VrrFallbackReason checkSupport() const override;
     virtual uint64_t captureDecodeBoundary() override;
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
@@ -56,6 +57,9 @@ private:
     static void unlockContext(void* lock_ctx);
 
     bool setupRenderingResources();
+    D3D11CompositionPresenter m_CompositionPresenter;
+    uint64_t m_CompositionPresentId = 0;
+    bool m_CompositionModeLogged = false;
     std::vector<DXGI_FORMAT> getVideoTextureSRVFormats();
     bool setupFrameRenderingResources(AVHWFramesContext* framesContext);
     bool setupSwapchainDependentResources();

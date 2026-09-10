@@ -310,6 +310,7 @@ D3D11VARenderer::~D3D11VARenderer()
     }
 
     m_RenderTargetView.Reset();
+    m_CompositionPresenter.reset();
     m_SwapChain.Reset();
 
     m_RenderSharedTextureArray.Reset();
@@ -447,6 +448,7 @@ Exit:
 bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapterNotFound)
 {
     const D3D_FEATURE_LEVEL supportedFeatureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    const bool tryComposition = m_DecoderParams.enableVrr && D3D11CompositionPresenter::runtimeSupported();
     bool success = false;
     ComPtr<IDXGIAdapter1> adapter;
     DXGI_ADAPTER_DESC1 adapterDesc;
@@ -496,6 +498,8 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
                            D3D_DRIVER_TYPE_UNKNOWN,
                            nullptr,
                            D3D11_CREATE_DEVICE_VIDEO_SUPPORT
+                               | (tryComposition ? D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                                  D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS : 0)
                                | (m_DebugLayer ? D3D11_CREATE_DEVICE_DEBUG : 0),
                            supportedFeatureLevels,
                            ARRAYSIZE(supportedFeatureLevels),
@@ -503,6 +507,16 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
                            &device,
                            &featureLevel,
                            &deviceContext);
+    if (tryComposition && (FAILED(hr) || !D3D11CompositionPresenter::deviceSupported(device.Get()))) {
+        // A Windows 11 version alone does not establish driver support. The
+        // legacy device should retain its normal driver threading policy.
+        deviceContext.Reset();
+        device.Reset();
+        hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                              D3D11_CREATE_DEVICE_VIDEO_SUPPORT | (m_DebugLayer ? D3D11_CREATE_DEVICE_DEBUG : 0),
+                              supportedFeatureLevels, ARRAYSIZE(supportedFeatureLevels), D3D11_SDK_VERSION,
+                              &device, &featureLevel, &deviceContext);
+    }
     if (FAILED(hr)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "D3D11CreateDevice() failed: %x",
@@ -826,6 +840,20 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     // descriptor. Driver/runtime normalization and fullscreen state are part
     // of the capability evidence and must be settled before VRR starts.
     refreshVrrDisplayState();
+
+    if (m_DecoderParams.enableVrr &&
+            m_VrrFallbackReason == VrrFallbackReason::NoFallback && m_VrrDisplayTiming.pathValid) {
+        LUID adapter = {};
+        adapter.LowPart = static_cast<DWORD>(m_VrrDisplayTiming.sourceAdapterLuid);
+        adapter.HighPart = static_cast<LONG>(m_VrrDisplayTiming.sourceAdapterLuid >> 32);
+        const HRESULT compositionResult = m_CompositionPresenter.initialize(
+            m_RenderDevice.Get(), info.info.win.window, swapChainDesc.Width, swapChainDesc.Height,
+            swapChainDesc.Format, adapter, m_VrrDisplayTiming.sourceId);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Windows presentation timing: %s (result: %x)",
+                    SUCCEEDED(compositionResult) ? "composition manager active" : "DXGI estimate fallback",
+                    compositionResult);
+    }
 
     if (m_DecoderParams.enableVrr && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1400,6 +1428,11 @@ bool D3D11VARenderer::createOverlayVertexBuffer(Overlay::OverlayType type, int w
 bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
 {
     if (stateInfo->stateChangeFlags & WINDOW_STATE_CHANGE_DISPLAY) {
+        if (m_CompositionPresenter.active()) {
+            // Recreate the manager for the new output. Its statistics identity
+            // and directly displayable allocations belong to the old output.
+            return false;
+        }
         int adapterIndex, outputIndex;
         if (!SDL_DXGIGetOutputInfo(stateInfo->displayIndex,
                                    &adapterIndex, &outputIndex)) {
@@ -1483,6 +1516,14 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
                          hr);
             unlockContext(this);
             return false;
+        }
+
+        if (m_CompositionPresenter.active()) {
+            hr = m_CompositionPresenter.resize(stateInfo->width, stateInfo->height, swapchainDesc.Format);
+            if (FAILED(hr)) {
+                unlockContext(this);
+                return false;
+            }
         }
 
         // Reset swapchain-dependent resources (RTV, viewport, etc)
@@ -2001,6 +2042,7 @@ VrrFallbackReason D3D11VARenderer::evaluateVrrEligibility(
 
 void D3D11VARenderer::releasePreparedVrrFrame()
 {
+    m_CompositionPresenter.cancel();
     // Present() unbinds the render target itself.  A cancellation does not,
     // so explicitly remove the context's reference to the back buffer before
     // a resize/device reset can tear it down.
@@ -2086,6 +2128,16 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame,
         return false;
     }
 
+    if (m_CompositionPresenter.active()) {
+        ComPtr<ID3D11RenderTargetView> view;
+        const HRESULT acquireResult = m_CompositionPresenter.acquire(&view);
+        if (acquireResult != S_OK) {
+            if (FAILED(acquireResult)) queueRenderDeviceReset();
+            return false;
+        }
+        m_RenderTargetView = view;
+    }
+
     // Clear the back buffer.
     const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     m_RenderDeviceContext->ClearRenderTargetView(m_RenderTargetView.Get(), clearColor);
@@ -2104,7 +2156,9 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame,
     if (frame->color_trc != m_LastColorTrc) {
         HRESULT hr;
         if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
-            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+            hr = m_CompositionPresenter.active() ?
+                m_CompositionPresenter.setColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) :
+                m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
             if (FAILED(hr)) {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) failed: %x",
@@ -2112,7 +2166,9 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame,
             }
         }
         else {
-            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+            hr = m_CompositionPresenter.active() ?
+                m_CompositionPresenter.setColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) :
+                m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
             if (FAILED(hr)) {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) failed: %x",
@@ -2280,6 +2336,9 @@ HRESULT D3D11VARenderer::presentPreparedFrame(
         return E_FAIL;
     }
 
+    if (m_CompositionPresenter.active()) {
+        return m_CompositionPresenter.present(m_CompositionPresentId);
+    }
     return parameters.present(*m_SwapChain.Get());
 }
 
@@ -2424,6 +2483,42 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
             feedback.frameStatsBeforeRefreshSequence =
                 m_VrrPriorFrameStatsRefreshSequence;
         }
+    }
+
+    if (m_CompositionPresenter.active()) {
+        feedback.nativeBackendValid = true;
+        feedback.nativeBackend = VrrNativePresentationBackend::Composition;
+        feedback.nativePresentTimingValid = true;
+        feedback.nativePresentStartUs = LiGetMicroseconds();
+        const HRESULT hr = m_CompositionPresenter.present(m_CompositionPresentId);
+        feedback.nativePresentEndUs = LiGetMicroseconds();
+        feedback.nativePresentResultValid = true;
+        feedback.nativePresentResult = static_cast<int64_t>(hr);
+        feedback.presented = hr == S_OK;
+        feedback.cancelled = !feedback.presented;
+        feedback.submissionTimeValid = feedback.presented;
+        feedback.submissionTimeUs = feedback.presented ? feedback.nativePresentStartUs : 0;
+        feedback.submissionIdValid = feedback.presented;
+        feedback.submissionId = feedback.presented ? m_CompositionPresentId : 0;
+        D3D11CompositionPresenter::DisplayedFrame displayed;
+        if (m_CompositionPresenter.pollDisplayedFrame(LiGetMicroseconds, displayed)) {
+            feedback.latchSampleValid = true;
+            feedback.latchTimeKind = Vrr13::PresentationTimeKind::DisplayEvent;
+            feedback.latchSubmissionId = displayed.id;
+            feedback.latchTimeUs = displayed.clock.timeUs;
+            feedback.presentationUncertaintyUs = displayed.clock.uncertaintyUs;
+        }
+        if (!m_CompositionModeLogged && (m_CompositionPresenter.independentFrames() ||
+                                        m_CompositionPresenter.composedFrames())) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Windows presentation timing observed: %llu independent-flip frames, %llu composed frames",
+                        static_cast<unsigned long long>(m_CompositionPresenter.independentFrames()),
+                        static_cast<unsigned long long>(m_CompositionPresenter.composedFrames()));
+            m_CompositionModeLogged = true;
+        }
+        releasePreparedVrrFrame();
+        if (FAILED(hr)) queueRenderDeviceReset();
+        return feedback;
     }
 
     // The risk decision is per frame. Sync interval 1 holds a risky frame for
@@ -2711,6 +2806,14 @@ bool D3D11VARenderer::restoreFixedPresentation(VrrFallbackReason reason)
     // not a requirement for every Present, so the existing swapchain safely
     // supports the legacy fixed path with Present(0, 0).  Do not recreate it.
     cancelFrame();
+    if (m_CompositionPresenter.active()) {
+        m_CompositionPresenter.reset();
+        m_RenderTargetView.Reset();
+        if (!setupSwapchainDependentResources()) {
+            return false;
+        }
+        m_LastColorTrc = AVCOL_TRC_UNSPECIFIED;
+    }
     m_VrrSuspended = false;
     m_DecoderParams.enableVrr = false;
     m_VrrFallbackReason = reason == VrrFallbackReason::NoFallback ?

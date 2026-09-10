@@ -56,7 +56,7 @@ win32 {
     }
 
     INCLUDEPATH += $$PWD/../libs/windows/include
-    LIBS += ws2_32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib
+    LIBS += dcomp.lib advapi32.lib ws2_32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib
 }
 macx:!disable-prebuilts {
     !exists($$PWD/../libs/mac) {
@@ -425,11 +425,14 @@ win32:!winrt {
     SOURCES += \
         streaming/video/ffmpeg-renderers/dxva2.cpp \
         streaming/video/ffmpeg-renderers/d3d11va.cpp \
+        streaming/video/ffmpeg-renderers/d3d11composition.cpp \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.cpp
 
     HEADERS += \
         streaming/video/ffmpeg-renderers/dxva2.h \
         streaming/video/ffmpeg-renderers/d3d11va.h \
+        streaming/video/ffmpeg-renderers/d3d11composition.h \
+        streaming/video/ffmpeg-renderers/presentationclock.h \
         streaming/video/ffmpeg-renderers/dxgipresent.h \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.h
 }

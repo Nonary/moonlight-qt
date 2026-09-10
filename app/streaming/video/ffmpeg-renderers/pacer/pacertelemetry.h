@@ -26,6 +26,8 @@ struct PacerTelemetrySnapshot {
     uint64_t vrrPrepareLateFrames = 0;
     uint64_t vrrCadenceIntervals = 0;
     uint64_t vrrCadenceHitches = 0;
+    uint64_t vrrEstimatedCadenceIntervals = 0;
+    uint64_t vrrEstimatedCadenceHitches = 0;
     uint64_t vrrTargetWaitEntryLateFrames = 0;
     uint64_t vrrPresentFailedFrames = 0;
     uint64_t vrrPresentCancelledFrames = 0;
@@ -60,6 +62,8 @@ struct VrrTelemetrySample {
     // Cumulative verified display-interval counters from the controller.
     uint64_t cadenceIntervals = 0;
     uint64_t cadenceHitches = 0;
+    uint64_t estimatedCadenceIntervals = 0;
+    uint64_t estimatedCadenceHitches = 0;
     int64_t submitErrorUs = 0;
 
     bool prepareLate = false;
@@ -134,6 +138,8 @@ public:
         ++m_Snapshot.vrrEligibleFrames;
         m_Snapshot.vrrCadenceIntervals = sample.cadenceIntervals;
         m_Snapshot.vrrCadenceHitches = sample.cadenceHitches;
+        m_Snapshot.vrrEstimatedCadenceIntervals = sample.estimatedCadenceIntervals;
+        m_Snapshot.vrrEstimatedCadenceHitches = sample.estimatedCadenceHitches;
         m_Snapshot.totalPacerTimeUs += sample.pacerTimeUs;
         m_Snapshot.totalRenderTimeUs += sample.renderTimeUs;
         if (sample.prepareLate) {

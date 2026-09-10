@@ -41,6 +41,7 @@ VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
     policy.playoutRateProtectionEnabled = 0;
     policy.playoutReadinessDrivenAdaptation = 0;
     policy.playoutNativeHitchAdaptation = 0;
+    policy.playoutSubmissionEstimateFallback = 0;
     policy.playoutStableSmoothnessReference = 0;
     policy.renderStartPreserveLearnedLead = 0;
     policy.playoutPredictionEnabled = 0;
@@ -3224,9 +3225,11 @@ void testNativeHitchGatesPadding()
            uncertain.samples() == 0,
            "a native error whose uncertainty reaches 3 ms cannot confirm a hitch");
     const auto session = config(60, 120);
-    const auto policy = vrrTimingParametersForSession(session);
+    auto policy = vrrTimingParametersForSession(session);
     expect(policy.playoutNativeHitchAdaptation == 1,
-           "production must require confirmed native hitches for buffer growth");
+           "production must prefer native interval evidence for buffer growth");
+    // Preserve the earlier display-only policy as an explicit replay fixture.
+    policy.playoutSubmissionEstimateFallback = 0;
     for (int scenario : {0, 1, 2, 3}) {
         VrrTimingController controller(session, true, policy);
         uint64_t initial = 0, beforeHitch = 0, maximumAfterHitch = 0, finalDelay = 0;
@@ -3279,6 +3282,65 @@ void testNativeHitchGatesPadding()
            "current trace initialization must accept its own versioned profile for exact replay");
 }
 
+void testSubmissionEstimateFallback()
+{
+    const auto session = config(60, 120);
+    expect(vrrTimingParametersForSession(session).playoutSubmissionEstimateFallback == 1 &&
+               VrrTimingParameters{}.playoutSubmissionEstimateFallback == 0,
+           "new sessions must enable estimates while old captures retain their recorded policy");
+    for (bool nativeAvailable : {false, true}) {
+        auto exactPolicy = vrrTimingParametersForSession(session);
+        exactPolicy.playoutSubmissionEstimateFallback = 0;
+        VrrTimingController exact(session, true, exactPolicy);
+        VrrTimingController fallback(session, true, vrrTimingParametersForSession(session));
+        uint64_t beforeHitch = 0, maximumAfterHitch = 0;
+        for (int i = 0; i < 1200; ++i) {
+            const auto source = decodedTimeForRtp(1000000, uint32_t(i * 1500));
+            const auto a = exact.schedule(frame(i, uint32_t(i * 1500), true, source), source);
+            const auto b = fallback.schedule(frame(i, uint32_t(i * 1500), true, source), source);
+            if (nativeAvailable)
+                expect(a.targetUs == b.targetUs && a.playoutDelayUs == b.playoutDelayUs,
+                       "fresh display events must take priority over submission estimates");
+            if (i == 299) beforeHitch = b.playoutDelayUs;
+            if (i > 300) maximumAfterHitch = std::max(maximumAfterHitch, b.playoutDelayUs);
+            expect(b.playoutDelayUs <= 16000,
+                   "estimated fallback must retain the production latency budget");
+            for (auto* controller : {&exact, &fallback}) {
+                const auto& d = controller == &exact ? a : b;
+                const auto submitted = d.targetUs + (i >= 300 && i % 10 == 9 ? 5000 : 0);
+                controller->notePreparationDuration(1000);
+                controller->noteSubmission(true, false, submitted);
+                if (nativeAvailable) {
+                    Vrr13::PresentationObservation observation;
+                    observation.timeKind = Vrr13::PresentationTimeKind::DisplayEvent;
+                    observation.smoothness = controller->smoothnessSample(d);
+                    observation.submitted = observation.idValid = observation.sampleValid = true;
+                    observation.id = observation.sampleId = uint64_t(i + 1);
+                    observation.submission = observation.ready = submitted;
+                    // The display remains smooth despite variable submission
+                    // lead. CPU jitter must not overrule this measured result.
+                    observation.sampleTime = observation.smoothness.intended + 20000;
+                    observation.observed = observation.sampleTime;
+                    observation.deadline = d.originalScanoutUs;
+                    observation.latched = d.latchedPresentation;
+                    controller->notePresentation(observation);
+                }
+            }
+        }
+        expect(fallback.estimatedCadenceIntervals() > 1000 && fallback.estimatedCadenceHitches() > 0,
+               "submission estimates must publish separate cadence and hitch counts");
+        if (nativeAvailable)
+            expect(fallback.nativeCadenceIntervals() > 1000 && fallback.nativeCadenceHitches() == 0,
+                   "estimated hitches must not contaminate verified smooth display counters");
+        else {
+            expect(fallback.nativeCadenceIntervals() == 0 && fallback.nativeCadenceHitches() == 0,
+                   "estimated submissions must never be labeled measured display events");
+            expect(maximumAfterHitch > beforeHitch,
+                   "submission hitches must restore bounded adaptation without native display timing");
+        }
+    }
+}
+
 void testProductionPreservesRelativeGameSpacing()
 {
     const auto session = config(120, 120);
@@ -3316,6 +3378,7 @@ void testProductionPreservesRelativeGameSpacing()
 
 int main()
 {
+    testSubmissionEstimateFallback();
     testNativeHitchGatesPadding();
     testDelayedDisplayEventsAgreeAcrossBackends();
     testProductionPreservesRelativeGameSpacing();

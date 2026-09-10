@@ -44,6 +44,7 @@ constexpr uint64_t kCapturedWorkerQueueCapacity = 3;
 constexpr uint64_t kDxgiPresentAllowTearing = 0x00000200ULL;
 constexpr uint64_t kNativeBackendDxgi = 1;
 constexpr uint64_t kNativeBackendVulkan = 2;
+constexpr uint64_t kNativeBackendComposition = 3;
 constexpr uint64_t kSdlWindowFullscreenDesktop = 0x00001001ULL;
 constexpr uint64_t kDisplayConfigPathActive = 0x00000001ULL;
 constexpr uint64_t kDisplayConfigPathBoostRefreshRate = 0x00000010ULL;
@@ -9551,7 +9552,8 @@ int main(int argc, char* argv[])
         if (metrics.nativeOutcomeTelemetryAvailable) {
             const bool nativeBackendKnown =
                 nativeBackend == kNativeBackendDxgi ||
-                nativeBackend == kNativeBackendVulkan;
+                nativeBackend == kNativeBackendVulkan ||
+                nativeBackend == kNativeBackendComposition;
             const bool nativeDxgiPresentAttempt =
                 nativeBackendDeclared &&
                 nativeBackend == kNativeBackendDxgi;
@@ -9624,6 +9626,16 @@ int main(int argc, char* argv[])
                      (rawSyncQpcDeclared &&
                       (!metrics.qpcCorrelationTelemetryAvailable ||
                        qpcCorrelationDeclared)));
+            }
+            else if (nativeBackendDeclared && nativeBackend == kNativeBackendComposition) {
+                // The presentation manager has its own present IDs and verified
+                // display events. None of the DXGI query or flag fields apply.
+                nativeOutcomeRelationshipValid = nativeOutcomeRelationshipValid &&
+                    normalPresentAttempt && (presented == submissionIdValid) &&
+                    !submissionIdQueryResultDeclared && !frameStatsQueryResultDeclared &&
+                    !rawSyncQpcDeclared && !qpcCorrelationDeclared &&
+                    (!latchSampleValid ||
+                     optionalUnsignedField(fields, traceHeader.indexOf("latch_time_kind")) == 2);
             }
             else if (nativeVulkanPresentAttempt) {
                 // Vulkan may submit an acquired image while cancelling it.
@@ -14297,9 +14309,10 @@ int main(int argc, char* argv[])
             observation.deadline = referenceDecision.originalScanoutUs;
             observation.latched = referenceDecision.latchedPresentation;
             observation.dxgi = field("native_backend") == kNativeBackendDxgi;
-            const bool fixedVulkanMode = traceHeader.contains("presentation_uncertainty_us") &&
-                field("native_backend") == kNativeBackendVulkan;
-            if (fixedVulkanMode) observation.latched = false;
+            const bool fixedPresentationMode = traceHeader.contains("presentation_uncertainty_us") &&
+                (field("native_backend") == kNativeBackendVulkan ||
+                 field("native_backend") == kNativeBackendComposition);
+            if (fixedPresentationMode) observation.latched = false;
             const uint64_t frequency = field("latch_raw_sync_qpc_frequency_hz");
             observation.sampleValid = field("latch_valid") &&
                 (!observation.dxgi || (field("latch_qpc_correlation_valid") && frequency));
@@ -14315,7 +14328,7 @@ int main(int argc, char* argv[])
             // Recorded presentation latency is an external service sample, not
             // proof of the candidate's actual scanout. Move it with its submission.
             observation.timelineShift = signedDifference(simulatedSubmissionUs, recordedSubmissionUs);
-            observation.latched = fixedVulkanMode ? false : simulatedDecision.latchedPresentation;
+            observation.latched = fixedPresentationMode ? false : simulatedDecision.latchedPresentation;
             observation.deadline = observation.timelineShift >= 0 ?
                 simulatedDecision.originalScanoutUs - std::min(simulatedDecision.originalScanoutUs, uint64_t(observation.timelineShift)) :
                 simulatedDecision.originalScanoutUs + uint64_t(-observation.timelineShift);

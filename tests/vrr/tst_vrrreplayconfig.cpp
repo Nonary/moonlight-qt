@@ -14,6 +14,7 @@ private slots:
     void defaultsRoundTrip();
     void nativeHitchPolicyRoundTrip();
     void displayEventPolicyRoundTrip();
+    void submissionEstimatePolicyRoundTrip();
     void rateProtectionPolicyRoundTrip();
     void adaptiveOnlyPolicyRoundTrip();
     void inheritanceAndOverride();
@@ -500,6 +501,23 @@ void VrrReplayConfigTest::displayEventPolicyRoundTrip()
     snapshot["playout_require_display_events"] = 2;
     QVERIFY(!applyVrrReplayControllerSnapshot(snapshot, parameters, error));
     QCOMPARE(parameters.playoutRequireDisplayEvents, uint64_t(1));
+}
+
+void VrrReplayConfigTest::submissionEstimatePolicyRoundTrip()
+{
+    VrrReplayConfiguration config;
+    QString error;
+    QVERIFY2(loadVrrReplayConfiguration(
+        R"({"config_schema":1,"scenarios":[{"name":"historical"}]})",
+        config, error), qPrintable(error));
+    QCOMPARE(config.scenarios.front().controller.playoutSubmissionEstimateFallback, uint64_t(0));
+    QVERIFY2(loadVrrReplayConfiguration(
+        R"({"config_schema":1,"parameters":{"controller":{"playout_submission_estimate_fallback":1}},"scenarios":[{"name":"fallback"}]})",
+        config, error), qPrintable(error));
+    QCOMPARE(config.scenarios.front().controller.playoutSubmissionEstimateFallback, uint64_t(1));
+    QVERIFY(!loadVrrReplayConfiguration(
+        R"({"config_schema":1,"parameters":{"controller":{"playout_submission_estimate_fallback":2}},"scenarios":[{"name":"invalid"}]})",
+        config, error));
 }
 
 void VrrReplayConfigTest::rateProtectionPolicyRoundTrip()

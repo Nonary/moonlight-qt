@@ -12,9 +12,10 @@ and its rolling 30-interval variance correction, inspected
 2026-09-07; updated for readiness-driven padding, stable smoothness references,
 and preservation of learned preparation lead on 2026-09-07; the subsequent
 game-spacing correction disables production cadence smoothing and caps padding
-at 16 ms. Production now gates buffer growth on matched native presentation
-errors strictly greater than 3 ms and permits release only with 3 ms of
-readiness headroom and recent smooth native evidence. The initial map came from nine Luna Medium specialists, followed by
+at 16 ms. Production prefers matched native presentation errors strictly
+greater than 3 ms for buffer growth, with submission estimates as a fallback
+when display timing is unavailable. Release retains 3 ms of readiness headroom
+and requires recent smooth evidence from the active timing source. The initial map came from nine Luna Medium specialists, followed by
 targeted source checks and corrections. No live capture, optical measurement,
 build, or test run was part of this documentation investigation. Recheck the
 named functions after changes; comments, diagnostic labels, and old experiments
@@ -33,9 +34,15 @@ it checks Mailbox after Immediate and before the existing WSI FIFO fallback;
 disabled, it restores the previous Immediate/WSI FIFO selection. Affected
 SteamOS hardware has not yet validated it as a remedy for overlay-dependent stutter.
 
-Updated on 2026-09-09: production requires verified display-event timing for
-native feedback and client cadence reporting. DXGI refresh references are
-excluded; without a display-event provider, the cadence field reports `N/A`.
+Updated on 2026-09-09, based on `b60fa11a`: Windows VRR automatically uses
+the composition presentation API on Windows 11 build 22000.194 or newer when
+the driver supports independent flip. Present IDs and independent-flip display
+events provide native feedback. Unsupported systems retain DXGI presentation.
+Without recent verified display events, submission intervals guide bounded
+padding and supply a clearly labeled estimated client cadence. DXGI refresh
+references remain excluded from verified measurements. No checkbox is needed.
+The helper adds no refresh wait or future-frame target; actual Ally latency,
+VRR behavior, HDR, and fullscreen transitions still need hardware validation.
 
 [AGENTS.md](AGENTS.md) owns machine-specific build, deployment, and capture
 procedures. This document owns the architecture explanation. Keep both current
@@ -115,7 +122,7 @@ directory contains the common library.
 | Timing policy | [vrrtimingcontroller.cpp](app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.cpp), [vrrtimingcontroller.h](app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h) |
 | Active learning models | [prediction.h](app/streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h), [reserve.h](app/streaming/video/ffmpeg-renderers/pacer/vrr/reserve.h), [smoothnessfeedback.h](app/streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h) |
 | Calibration persistence | [profile.cpp](app/streaming/video/ffmpeg-renderers/pacer/vrr/profile.cpp) |
-| Windows native presentation | [d3d11va.cpp](app/streaming/video/ffmpeg-renderers/d3d11va.cpp) |
+| Windows native presentation | [d3d11va.cpp](app/streaming/video/ffmpeg-renderers/d3d11va.cpp), [d3d11composition.cpp](app/streaming/video/ffmpeg-renderers/d3d11composition.cpp) |
 | Replay and its contract | [vrrreplay.cpp](tests/vrr/vrrreplay.cpp), [VRR test README](tests/vrr/README.md) |
 | Statistics | [decoder.h](app/streaming/video/decoder.h): `VIDEO_STATS`; overlay formatting in `ffmpeg.cpp` |
 
@@ -623,9 +630,13 @@ Production `playout_native_hitch_adaptation=1` scores native intervals against
 `sourceTimeUs`, preserving relative game cadence while excluding changes in
 our own padding, rendering estimate, or compositor prediction from the desired
 interval. A native interval error must be strictly greater than 3 ms even after
-subtracting timing uncertainty to authorize growth. Errors at or below 3 ms,
-CPU submission errors without native confirmation, and readiness estimates
-cannot request more padding. Source-rate transitions and host stalls retain
+subtracting timing uncertainty to authorize growth. Errors at or below 3 ms
+and readiness estimates cannot request more padding. When no accepted native
+interval has arrived within 100 ms, `playout_submission_estimate_fallback=1`
+uses submission interval errors with the same strict threshold and buffer cap.
+Estimates have separate cadence counters and cannot teach compositor latency.
+Fresh native evidence takes priority over estimates. The fallback flag defaults
+to zero for old captures, preserving display-only replay. Source-rate transitions and host stalls retain
 the existing eligibility exclusions. Native confirmation is OS timing evidence,
 not optical proof of a perceived hitch.
 
@@ -655,16 +666,18 @@ Reserve p99.95 implementation.
 
 Production updates padding as follows:
 
-- A new confirmed native hitch requests protection based on the delayed frame's
+- A new native hitch (or submission estimate when native timing is unavailable)
+  requests protection based on the delayed frame's
   padding plus its interval error beyond the 3 ms tolerance. Requests slew upward
   by at most 500 us per update and remain bounded by capacity and the 16 ms cap.
 - Without a pending hitch request, padding can shrink toward readiness p99.95
   plus 3,000 us. A higher readiness estimate only stops release; it cannot grow
   the buffer. Readiness history includes preparation and scheduler work but
   excludes deliberate waiting.
-- Release requires warmed readiness history, smooth native evidence allowing
-  release, and a native observation within 100 ms of the current decode time.
-  Missing feedback does not authorize continued release. The existing 10 us
+- Release requires warmed readiness history, smooth evidence allowing release,
+  and an observation from the active timing source within 100 ms of the current
+  decode time. Without native timing, the estimate fallback uses submission
+  history. Missing evidence from both sources does not authorize release. The existing 10 us
   release input scales by elapsed time at a 120 FPS reference, capped at
   33,333 us of elapsed recovery time per update.
 - Capacity remains a hard safety bound; when insufficient, the requested
@@ -746,8 +759,8 @@ brackets bound GPU completion time; they are not an exact hardware timestamp.
 
 ### 10.2 Native Present parameters and telemetry
 
-`D3D11VARenderer::presentAdaptive()` creates one `DxgiPresentParameters`
-value from the controller's latch request. The same value supplies native
+On the DXGI path, `D3D11VARenderer::presentAdaptive()` creates one
+`DxgiPresentParameters` value from the controller's latch request. The same value supplies native
 telemetry and `presentPreparedFrame()`, which forwards it to DXGI:
 
 - Latched: `Present(1, 0)`.
@@ -794,12 +807,12 @@ historical replay parameters; missing `playout_require_display_events` defaults
 to zero to preserve old exact baselines. New schema-5 traces additionally record
 `latch_time_kind` (0 unavailable, 1 refresh reference, 2 display event).
 
-The current DXGI statistics provider supplies no verified display events, so
-client cadence reports unavailable. Missing measurements neither count as
-successes nor cause a fallback to readiness-driven buffer growth. Padding retains
-the existing initial/learned policy and safety bounds; its native-feedback-based
-learning waits for valid display evidence. An event-based timing provider is
-needed for a measured adaptive-display cadence percentage.
+The DXGI statistics provider supplies no verified display events. Unsupported
+Windows systems therefore use submission estimates for cadence and bounded
+padding adaptation. Composition-frame statistics also lack a verified frame
+display instant, so the same estimator covers periods without independent-flip
+events. The overlay labels this lower-confidence timing as estimated; it does
+not claim native display coverage or learn display-service latency from it.
 Linux Wayland presentation feedback and Gamescope actual-present timestamps
 are explicitly marked as display events and remain eligible for measurement.
 
@@ -812,6 +825,38 @@ must not be silently treated as an exact calibration match.
 Software timing, tearing permission, and modeled active-scanout exposure do not
 confirm an optical tear or its absence. External display measurement is needed
 for that claim.
+
+### 10.4 Automatic composition presentation
+
+The renderer checks the actual OS version using `RtlGetVersion` (including
+revision 194 on build 22000), loads `CreatePresentationFactory` dynamically,
+and requires `IsPresentationSupportedWithIndependentFlip()`. OS version alone
+is insufficient. The render device uses BGRA support and disables internal
+threading optimizations as required by this API; an unsupported device retries
+with the original DXGI device flags. Setup failure retains the DXGI path.
+
+`D3D11CompositionPresenter` owns five displayable textures, a presentation
+manager/surface, and a DirectComposition visual bound to the streaming window.
+The same shaders, overlays, colorspace, GPU-ready fence, and pacing deadline
+are used. Buffer acquisition checks availability without waiting. Submission
+cancels older pending presents and targets the current interrupt time, with
+no added source period or wait for a presentation event. `ForceVSyncInterrupt`
+requests prompt statistics even with hardware flip queues. Buffer storage
+is not a queue-depth target; OS/driver scheduling still needs measurement.
+
+Only independent-flip statistics with the matching surface tag, output adapter,
+source ID, and increasing present ID become display events. Their 100 ns system
+interrupt timestamps are translated through a fresh bracket on the worker
+clock, with bounded age and uncertainty. Composition statistics do not become
+display events. The backend is trace value 3; DXGI flags, query results, and raw
+QPC fields remain unset. The controller retains its adaptive software floor
+because this presenter does not advertise DXGI latch switching. Resize replaces
+buffers; display changes recreate the renderer and its output identity.
+
+`compositionprobe --run` is an optional fullscreen Windows hardware diagnostic
+for independent-flip coverage and submission-to-display latency. It does not
+prove optical VRR, tear freedom, or end-to-end latency. No live hardware result
+is claimed by the platform-neutral tests or cross-compilation.
 
 ## 11. Other presentation paths
 
@@ -985,8 +1030,10 @@ preparation deadline misses with zero tolerance and has been replaced by
 display intervals whose client-added spacing error does not exceed 3 ms after
 uncertainty handling. It also shows measured coverage relative to the window's
 submitted-frame count and the measured hitch count, with drops separate. No
-verified intervals in the reporting window yields `N/A (display timing
-unavailable)`, never 100%. Cumulative cadence counters are differenced into the
+verified intervals in the reporting window selects the separate submission
+counters and labels the result `estimated from submissions`. With neither
+kind of interval, it shows `N/A (waiting for timing samples)`. Estimates never
+inflate measured coverage. Cumulative cadence counters are differenced into the
 decoder's existing reporting windows; they are not the controller's expiring
 five-minute adaptation histogram. Preparation lateness remains internal
 diagnostic telemetry. The overlay no longer shows `Errors`; internal
@@ -1013,7 +1060,8 @@ and does not exclude long local arrival gaps when RTP is steady. The older
 including their sender/arrival exclusions, for comparison.
 
 These replay spacing fields use submission timing as a presentation proxy;
-they are not the native-confirmed evidence that authorizes buffer growth.
+they are not native display evidence. Production uses submission estimates
+for bounded adaptation only while verified display timing is unavailable.
 Report `smoothness_feedback.native_window_samples` and `native_window_misses`
 separately. Sparse or missing native observations cannot establish 99.95%
 visible smoothness, even when the observed miss count is zero. Counterfactual

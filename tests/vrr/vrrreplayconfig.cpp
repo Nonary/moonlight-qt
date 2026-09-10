@@ -355,7 +355,7 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
-    if (value.playoutRequireDisplayEvents > 1 ||
+    if (value.playoutSubmissionEstimateFallback > 1 || value.playoutRequireDisplayEvents > 1 ||
             value.playoutNativeHitchAdaptation > 1 || value.playoutReadinessDrivenAdaptation > 1 ||
             value.playoutStableSmoothnessReference > 1 ||
             value.renderStartPreserveLearnedLead > 1) {

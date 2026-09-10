@@ -121,6 +121,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     VrrTimingParameters parameters;
     parameters.playoutNativeHitchAdaptation = 1;
     parameters.playoutRequireDisplayEvents = 1;
+    parameters.playoutSubmissionEstimateFallback = 1;
     parameters.playoutReadinessDrivenAdaptation = 1;
     parameters.playoutStableSmoothnessReference = 1;
     parameters.renderStartPreserveLearnedLead = 1;
@@ -668,7 +669,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     VrrTimingDecision decision;
     decision.frameNumber = uint64_t(frame.frameNumber());
     decision.smoothnessProtectionUs = m_Parameters.playoutNativeHitchAdaptation ?
-        m_NativeSmoothness.protectionUs() :
+        activeSmoothnessFeedback(nowUs).protectionUs() :
         std::max(m_SubmissionSmoothness.protectionUs(), m_NativeSmoothness.protectionUs());
     decision.requestedPlayoutDelayUs = m_RequestedPlayoutDelayUs;
     decision.playoutCapacityLimited = m_RequestedPlayoutDelayUs > playoutDelayMaximumUs();
@@ -1474,7 +1475,20 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         if (submitted && !cancelled) {
             auto sample = m_Pending.smoothness;
             sample.at = submissionUs;
-            m_SubmissionSmoothness.observe(sample, submissionUs);
+            const auto before = m_SubmissionSmoothness.observedIntervals();
+            const uint64_t demand = m_SubmissionSmoothness.observe(sample, submissionUs,
+                m_Parameters.playoutSubmissionEstimateFallback != 0);
+            if (m_Parameters.playoutSubmissionEstimateFallback &&
+                    m_SubmissionSmoothness.observedIntervals() > before) {
+                ++m_EstimatedCadenceIntervals;
+                m_EstimatedCadenceHitches += demand != 0;
+                // A submission timestamp is a lower-confidence presentation
+                // proxy. Never mix it into the verified display counters or
+                // teach native service latency from it. It may guide padding
+                // only while verified native feedback is unavailable.
+                if (demand && !hasRecentNativeFeedback(submissionUs))
+                    m_RequestedPlayoutDelayUs = std::max(m_RequestedPlayoutDelayUs, demand);
+            }
         }
         else m_SubmissionSmoothness.breakSequence();
     }
@@ -1536,6 +1550,18 @@ Vrr13::SmoothnessFeedback::Sample VrrTimingController::smoothnessSample(const Vr
     sample.eligible = d.cadenceEligible && !d.rebased && !d.phaseDiscontinuity &&
         !d.sourceRateChanged && d.sourceIntervalUs <= std::max<uint64_t>(25000, d.sourcePeriodUs * 3 / 2);
     return sample;
+}
+
+bool VrrTimingController::hasRecentNativeFeedback(uint64_t now) const
+{
+    return m_NativeSmoothness.samples() &&
+        std::abs(signedDifference(now, m_NativeSmoothness.lastObservedUs())) <= 100000;
+}
+
+const Vrr13::SmoothnessFeedback& VrrTimingController::activeSmoothnessFeedback(uint64_t now) const
+{
+    return m_Parameters.playoutSubmissionEstimateFallback && !hasRecentNativeFeedback(now) ?
+        m_SubmissionSmoothness : m_NativeSmoothness;
 }
 
 void VrrTimingController::notePresentation(const Vrr13::PresentationObservation& observation)
@@ -2240,8 +2266,9 @@ void VrrTimingController::updatePlayoutHistory(
     m_PlayoutBandIndex = 0; // One distribution, shared across source rates.
 
     if (m_Parameters.playoutNativeHitchAdaptation) {
-        // Readiness may veto release, but only a new native hitch may request
-        // growth. Leave 3 ms above measured readiness when releasing padding.
+        // Readiness may veto release. Growth requires a new native hitch or
+        // an enabled submission estimate while native timing is unavailable.
+        // Leave 3 ms above measured readiness when releasing padding.
         const uint64_t releaseFloor = saturatingAdd(
             uint64_t(m_PlayoutHistory.common() / 1000), 3000);
         // A demand beyond storage capacity must not pin release forever or
@@ -2258,9 +2285,9 @@ void VrrTimingController::updatePlayoutHistory(
             m_AppliedPlayoutDelayUs += std::min(desired - m_AppliedPlayoutDelayUs,
                                               m_Parameters.playoutDelayAttackUs);
         }
-        else if (m_NativeSmoothness.samples() &&
-                 std::abs(signedDifference(at, m_NativeSmoothness.lastObservedUs())) <= 100000 &&
-                 m_NativeSmoothness.canRelease() &&
+        else if (activeSmoothnessFeedback(at).samples() &&
+                 std::abs(signedDifference(at, activeSmoothnessFeedback(at).lastObservedUs())) <= 100000 &&
+                 activeSmoothnessFeedback(at).canRelease() &&
                  m_PlayoutHistory.canRelease()) {
             const uint64_t release = scaledPerMille(m_Parameters.playoutDelayReleaseUs,
                                                     elapsed * 120 / 1000);

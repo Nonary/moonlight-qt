@@ -24,6 +24,7 @@ enum class VrrNativePresentationBackend : uint8_t {
     Unknown,
     Dxgi,
     Vulkan,
+    Composition,
 };
 
 // Observation-only D3DKMT raster sample bracketed on the Moonlight clock.

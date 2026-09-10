@@ -858,6 +858,8 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
     dst.vrrCadenceIntervals += src.vrrCadenceIntervals;
     dst.vrrCadenceHitches += src.vrrCadenceHitches;
+    dst.vrrEstimatedCadenceIntervals += src.vrrEstimatedCadenceIntervals;
+    dst.vrrEstimatedCadenceHitches += src.vrrEstimatedCadenceHitches;
     dst.vrrTargetWaitEntryLateFrames += src.vrrTargetWaitEntryLateFrames;
     dst.vrrPresentFailedFrames += src.vrrPresentFailedFrames;
     dst.vrrPresentCancelledFrames += src.vrrPresentCancelledFrames;
@@ -974,6 +976,10 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
         delta(snapshot.vrrCadenceIntervals, m_LastPacerTelemetry.vrrCadenceIntervals);
     m_ActiveWndVideoStats.vrrCadenceHitches +=
         delta(snapshot.vrrCadenceHitches, m_LastPacerTelemetry.vrrCadenceHitches);
+    m_ActiveWndVideoStats.vrrEstimatedCadenceIntervals +=
+        delta(snapshot.vrrEstimatedCadenceIntervals, m_LastPacerTelemetry.vrrEstimatedCadenceIntervals);
+    m_ActiveWndVideoStats.vrrEstimatedCadenceHitches +=
+        delta(snapshot.vrrEstimatedCadenceHitches, m_LastPacerTelemetry.vrrEstimatedCadenceHitches);
     m_ActiveWndVideoStats.vrrTargetWaitEntryLateFrames +=
         delta(snapshot.vrrTargetWaitEntryLateFrames,
               m_LastPacerTelemetry.vrrTargetWaitEntryLateFrames);
@@ -1240,8 +1246,15 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 snprintf(cadence, sizeof(cadence), "%.1f%% | Measured: %.1f%% | Hitches (>3 ms): %llu",
                          smoothPercent, coveragePercent, static_cast<unsigned long long>(hitches));
             }
+            else if (stats.vrrEstimatedCadenceIntervals != 0) {
+                const uint64_t hitches = qMin(stats.vrrEstimatedCadenceHitches, stats.vrrEstimatedCadenceIntervals);
+                const double percent = 100.0 *
+                    static_cast<double>(stats.vrrEstimatedCadenceIntervals - hitches) / stats.vrrEstimatedCadenceIntervals;
+                snprintf(cadence, sizeof(cadence), "%.1f%% (estimated from submissions) | Hitches (>3 ms): %llu",
+                         percent, static_cast<unsigned long long>(hitches));
+            }
             else {
-                snprintf(cadence, sizeof(cadence), "N/A (display timing unavailable)");
+                snprintf(cadence, sizeof(cadence), "N/A (waiting for timing samples)");
             }
 
             ret = snprintf(&output[offset],

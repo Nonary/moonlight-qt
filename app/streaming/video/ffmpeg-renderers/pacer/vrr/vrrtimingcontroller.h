@@ -19,6 +19,7 @@
 // made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
     X(uint64_t, playout_require_display_events, playoutRequireDisplayEvents, 0) \
+    X(uint64_t, playout_submission_estimate_fallback, playoutSubmissionEstimateFallback, 0) \
     X(uint64_t, playout_native_hitch_adaptation, playoutNativeHitchAdaptation, 0) \
     X(uint64_t, playout_readiness_driven_adaptation, playoutReadinessDrivenAdaptation, 0) \
     X(uint64_t, playout_stable_smoothness_reference, playoutStableSmoothnessReference, 0) \
@@ -266,6 +267,8 @@ public:
                         uint64_t submissionUs);
     void notePresentation(const Vrr13::PresentationObservation& observation);
     uint64_t nativeCadenceIntervals() const { return m_NativeCadenceIntervals; }
+    uint64_t estimatedCadenceIntervals() const { return m_EstimatedCadenceIntervals; }
+    uint64_t estimatedCadenceHitches() const { return m_EstimatedCadenceHitches; }
     uint64_t nativeCadenceHitches() const { return m_NativeCadenceHitches; }
     Vrr13::SmoothnessFeedback::Sample smoothnessSample(const VrrTimingDecision& decision) const;
     uint64_t typicalRenderUs() const;
@@ -490,6 +493,9 @@ private:
     // Lifetime counters for decoder-owned reporting windows. These do not
     // expire with the controller's rolling adaptation histogram.
     uint64_t m_NativeCadenceIntervals = 0, m_NativeCadenceHitches = 0;
+    uint64_t m_EstimatedCadenceIntervals = 0, m_EstimatedCadenceHitches = 0;
+    bool hasRecentNativeFeedback(uint64_t now) const;
+    const Vrr13::SmoothnessFeedback& activeSmoothnessFeedback(uint64_t now) const;
     uint64_t m_RequestedPlayoutDelayUs = 0;
     bool m_FeedbackModeValid = false, m_FeedbackLatched = false;
     uint64_t m_LastHistoryArrivalUs = 0;

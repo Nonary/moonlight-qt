@@ -15,8 +15,9 @@ introduce a second scheduler. Gamescope timestamps are converted from monotonic
 time into the worker clock, with bounded uncertainty. Unknown IDs, stale results,
 failed presents, and the first sample after swapchain resets cannot establish a
 cadence interval. Regular X11 without the Gamescope WSI layer is still unsupported.
-Missing platform timing support leaves native-hitch adaptation unavailable and
-produces a startup warning.
+Missing platform timing support leaves native display measurement unavailable
+and produces a startup warning. Production then uses labeled submission
+estimates for cadence and bounded padding adaptation.
 
 `tst_vulkantiming` tests this dispatch bridge with fake Vulkan entry points,
 including delayed completion IDs, clock conversion, swapchain errors, unchanged
@@ -45,6 +46,25 @@ swapchain, without Windows or Qt dependencies. It verifies synchronized
 interval-zero calls, telemetry parameter agreement, and result propagation.
 It does not replace a Windows renderer build or a live scanout test.
 
+`tst_presentationclock` checks the composition API's interrupt-time conversion,
+including uncertainty, stale/future events, clock reversals, and integer bounds.
+Windows builds additionally produce `compositionprobe.exe`, a manual fullscreen
+probe that opens a window only with `--run`. It shares the production presenter
+and reports independent-flip coverage, submission-to-display latency, display
+intervals, and buffer availability. For example:
+
+```powershell
+.\vrr\release\compositionprobe.exe --run --fps 116 --seconds 10 --output composition-probe.json
+```
+
+It requires Windows 11 build 22000.194 or newer and driver support for independent
+flip. A successful run requires at least 90% steady-state measurement coverage
+and p99 submission-to-display below one refresh; it does not prove optical VRR,
+tear freedom, or absence of added end-to-end latency in the full application.
+The application selects this API automatically after checking OS and driver
+support, retaining DXGI presentation on unsupported systems or setup failure.
+Neither the helper nor the probe deliberately queues an extra frame period.
+
 On Linux, `tst_plvkpresentation` checks surface-mode selection. The Gamescope
 regression case exposes FIFO and Mailbox without Immediate and requires Mailbox
 with the experiment enabled, or the prior WSI FIFO mode with it disabled.
@@ -70,19 +90,25 @@ interval safety separately; they do not claim 99.95% under post-target faults.
 The all-arrival queue simulator uses the capture's `can_latch_present` capability;
 forcing it off invents software-floor backlog on a latch-capable session.
 
-Production increases padding only after matched native presentation timing
-confirms a client-added interval error strictly greater than 3 ms. Errors at
-or below 3 ms, readiness estimates, and CPU-only submission errors cannot grow
-padding. Native cadence is compared with the mapped source clock, so genuine
-game cadence changes are not client hitches. Missing or ambiguous native timing
-is unavailable evidence, not a success or failure.
+Production prefers matched native presentation timing for client-added interval
+errors strictly greater than 3 ms. `playout_submission_estimate_fallback=1`
+restores submission-based adaptation when no accepted native interval has
+arrived within 100 ms. Estimates use the same strict threshold and 16 ms cap,
+have separate overlay counters, and never teach native display latency. Fresh
+native intervals take priority. Native cadence is compared with the mapped
+source clock, so genuine game cadence changes are not client hitches. Missing
+or ambiguous native timing cannot manufacture a verified success or failure.
+The controller suite covers estimate-only growth, separate counters, measured
+timing taking priority, and historical display-only behavior.
 
-Padding may shrink gradually with recent smooth native evidence, retaining
+Padding may shrink gradually with recent smooth native evidence (or submission
+evidence while the fallback is active), retaining
 3 ms above the readiness p99.95 estimate. A rising readiness estimate can stop
 release but cannot authorize growth. Version-17 profiles isolate this release
 floor from older calibration. The frame queue and 16 ms padding cap are unchanged.
 The captured `playout_native_hitch_adaptation` flag selects this policy; when
-absent it defaults to zero for exact replay of older captures. Existing readiness,
+absent it defaults to zero for exact replay of older captures. The new
+`playout_submission_estimate_fallback` also defaults to zero when absent. Existing readiness,
 stable-reference, and preparation-lead flags retain their historical semantics.
 `--require-exact-baseline` selects that captured policy; an ordinary replay or
 the `session-policy` scenario selects the current production policy instead.
@@ -1205,7 +1231,10 @@ covers adaptive mode at startup, across rate changes, and under late submissions
 Display timing evidence is explicit: `latch_time_kind` is 0 (unavailable),
 1 (refresh reference), or 2 (display event). Production enables
 `controller.playout_require_display_events=1`; DXGI refresh references cannot
-supply latency learning, native hitch adaptation, or the client cadence overlay.
+supply latency learning, native hitch adaptation, or measured client cadence.
+Submission estimates supply a separately labeled cadence percentage while
+verified events are unavailable. Windows composition records backend value 3
+and independent-flip display events, without populating DXGI-specific fields.
 Old captures omit that controller field and retain zero for exact historical
 replay. A historical exact match does not validate refresh-reference timestamps
 as actual display events. Regression tests cover the shared refresh timestamp

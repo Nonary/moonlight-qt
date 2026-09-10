@@ -6,6 +6,14 @@ CONFIG += ordered
 dxgipresent.file = $$PWD/dxgipresent.pro
 SUBDIRS += dxgipresent
 
+presentationclock.file = $$PWD/presentationclock.pro
+SUBDIRS += presentationclock
+
+win32 {
+    compositionprobe.file = $$PWD/compositionprobe.pro
+    SUBDIRS += compositionprobe
+}
+
 unix:!macx:packagesExist(libplacebo) {
     plvkpresentation.file = $$PWD/plvkpresentation.pro
     SUBDIRS += plvkpresentation

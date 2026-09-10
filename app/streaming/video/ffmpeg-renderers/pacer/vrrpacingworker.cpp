@@ -830,6 +830,8 @@ int VrrPacingWorker::run()
             sample.prepareLate = telemetry.preparationEndUs > decision.targetUs;
             sample.cadenceIntervals = m_TimingController->nativeCadenceIntervals();
             sample.cadenceHitches = m_TimingController->nativeCadenceHitches();
+            sample.estimatedCadenceIntervals = m_TimingController->estimatedCadenceIntervals();
+            sample.estimatedCadenceHitches = m_TimingController->estimatedCadenceHitches();
             sample.preparationLatenessUs = sample.prepareLate ?
                 telemetry.preparationEndUs - decision.targetUs : 0;
             sample.targetWaitEntryLate = !sample.prepareLate &&
@@ -1058,9 +1060,10 @@ void VrrPacingWorker::recordSubmission(
     observation.submission = telemetry.submissionBoundaryUs;
     observation.ready = telemetry.preparationEndUs;
     observation.deadline = decision.originalScanoutUs;
-    // Vulkan cannot change its swapchain mode per frame. A requested DXGI
-    // latch transition must not reset the Vulkan feedback matching history.
-    observation.latched = feedback.nativeBackend == VrrNativePresentationBackend::Vulkan ?
+    // Vulkan and composition do not select DXGI latch modes. A requested
+    // latch transition must not reset their feedback matching history.
+    observation.latched = (feedback.nativeBackend == VrrNativePresentationBackend::Vulkan ||
+                           feedback.nativeBackend == VrrNativePresentationBackend::Composition) ?
         false : decision.latchedPresentation;
     observation.dxgi = feedback.nativeBackend == VrrNativePresentationBackend::Dxgi;
     observation.sampleValid = feedback.latchSampleValid &&

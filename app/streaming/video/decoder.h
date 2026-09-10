@@ -27,6 +27,8 @@ typedef struct _VIDEO_STATS {
     uint64_t vrrPrepareLateFrames;
     uint64_t vrrCadenceIntervals;
     uint64_t vrrCadenceHitches;
+    uint64_t vrrEstimatedCadenceIntervals;
+    uint64_t vrrEstimatedCadenceHitches;
     uint64_t vrrTargetWaitEntryLateFrames;
     uint64_t vrrPresentFailedFrames;
     uint64_t vrrPresentCancelledFrames;
