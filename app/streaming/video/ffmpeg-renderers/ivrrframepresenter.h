@@ -267,8 +267,9 @@ struct VrrPresentFeedback {
 // source cadence leaves too little adaptive-refresh headroom for safe
 // immediate flips, the controller asks for a latched (non-tearing) present:
 // at near-refresh rates the cadence cost of latching is a few repeated frames
-// per second while immediate flips tear. Backends whose presentation mode is
-// immutable after swapchain creation may ignore the preference.
+// per second while immediate flips tear. The same request is supplied before
+// preparation so swapchain-based backends can select the mode before acquiring
+// an image. Backends must advertise latch support only when they honor it.
 struct VrrPresentRequest {
     bool latchedPresentation = false;
     bool collectDiagnostics = false;
@@ -300,8 +301,8 @@ public:
     virtual ~IVrrFramePresenter() = default;
 
     // Some adaptive backends can select a fixed-vsync latch for an individual
-    // present. Vulkan WSI modes are immutable for the swapchain lifetime, so
-    // cadence-following Mailbox/Immediate implementations leave this false.
+    // present. A Vulkan backend may instead recreate its swapchain before
+    // preparation; it must not replace an already acquired image to do so.
     virtual bool canLatchAdaptivePresent() const
     {
         return false;
@@ -333,6 +334,16 @@ public:
 
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
                                           uint64_t decodeBoundary) = 0;
+
+    // Mode selection belongs inside the measured preparation interval, before
+    // image acquisition. Backends that select at Present keep the existing
+    // two-argument preparation path.
+    virtual VrrPrepareResult prepareFrame(AVFrame* frame,
+                                          uint64_t decodeBoundary,
+                                          const VrrPresentRequest&)
+    {
+        return prepareFrame(frame, decodeBoundary);
+    }
 
     // Presents the prepared image using the backend's adaptive presentation
     // path without intentionally waiting.

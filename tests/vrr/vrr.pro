@@ -17,6 +17,8 @@ win32 {
 unix:!macx:packagesExist(libplacebo) {
     plvkpresentation.file = $$PWD/plvkpresentation.pro
     SUBDIRS += plvkpresentation
+    plvkswapchain.file = $$PWD/plvkswapchain.pro
+    SUBDIRS += plvkswapchain
 }
 
 incomingtiming.file = $$PWD/incomingtiming.pro

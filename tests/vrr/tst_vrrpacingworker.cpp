@@ -158,6 +158,48 @@ void testCapabilityRejection()
            "worker must reject an unsupported VRR presentation backend");
 }
 
+void testPresentationRequestSelectedBeforePreparation()
+{
+    for (int mode : {0, 1, 2}) {
+        for (int rate : {60, 115, 116, 120}) {
+            resetFakeClock();
+            FakeVrrFramePresenter backend;
+            backend.setCanLatch(true);
+            backend.blockPreparation();
+            PacerTelemetry telemetry;
+            TrackedFrameLifetime lifetime;
+            auto config = enabledConfig();
+            config.streamRateHz = rate;
+            config.latencyMode = mode;
+            {
+                VrrPacingWorker worker(&backend, config, &telemetry);
+                expect(worker.start(), "worker must start for swapchain mode selection");
+                worker.submit(frame(1, lifetime));
+                expect(backend.waitForPrepareCount(1), "preparation must receive the mode before acquiring an image");
+                const auto prepared = backend.prepareRequests();
+                expect(prepared.size() == 1 && !prepared[0].latchedPresentation,
+                       "the first frame must remain adaptive at every rate before preparation");
+                expect(backend.presentRequests().empty(), "selection must precede native presentation");
+                // A slow recreation must not change the request at Present.
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                backend.releasePreparation();
+                expect(backend.waitForPresentCount(1), "a late recreation must still present the prepared frame");
+                const auto presented = backend.presentRequests();
+                expect(presented.size() == 1 && !prepared.empty() &&
+                       presented[0].latchedPresentation == prepared[0].latchedPresentation &&
+                       presented[0].collectDiagnostics == prepared[0].collectDiagnostics,
+                       "preparation and presentation must receive the same mode after a delay");
+                expect(waitFor([&telemetry] { return telemetryStats(telemetry).vrrPrepareLateFrames != 0; }),
+                       "swapchain preparation delays must remain accounted for in timing telemetry");
+                expect(telemetryStats(telemetry).vrrCadenceIntervals == 0 &&
+                           telemetryStats(telemetry).vrrCadenceHitches == 0,
+                       "preparation lateness cannot manufacture measured cadence or hitches");
+            }
+            expect(lifetime.releases.load() == 1, "mode preparation must release its decoder frame exactly once");
+        }
+    }
+}
+
 void testEmptyQueueDoesNotRepeatFrames()
 {
     resetFakeClock();
@@ -1710,6 +1752,7 @@ int main()
     }
 
     testCapabilityRejection();
+    testPresentationRequestSelectedBeforePreparation();
     testEmptyQueueDoesNotRepeatFrames();
     testQueueCapacityAndDrops();
     testLatePreparedFramePresentsImmediately();

@@ -60,6 +60,16 @@ public:
         return m_DecodeBoundary;
     }
 
+    VrrPrepareResult prepareFrame(AVFrame* frame, uint64_t decodeBoundary,
+                                  const VrrPresentRequest& request) override
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_Mutex);
+            m_PrepareRequests.push_back(request);
+        }
+        return prepareFrame(frame, decodeBoundary);
+    }
+
     VrrPrepareResult prepareFrame(AVFrame* frame,
                                   uint64_t decodeBoundary) override
     {
@@ -374,6 +384,12 @@ public:
         return m_PresentRequests;
     }
 
+    std::vector<VrrPresentRequest> prepareRequests() const
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        return m_PrepareRequests;
+    }
+
     size_t decodeBoundaryCaptureCount() const
     {
         std::lock_guard<std::mutex> lock(m_Mutex);
@@ -415,6 +431,7 @@ private:
     std::vector<int> m_PreparedFrames;
     std::vector<int> m_PresentedFrames;
     std::vector<VrrPresentRequest> m_PresentRequests;
+    std::vector<VrrPresentRequest> m_PrepareRequests;
     std::vector<uint64_t> m_PreparedDecodeBoundaries;
     std::vector<uint64_t> m_PresentCallTimesUs;
     std::vector<uint64_t> m_PresentReturnTimesUs;

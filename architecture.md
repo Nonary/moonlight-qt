@@ -5,8 +5,10 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Source baseline: `20fa2bc49cadfc50b32afefb155ff8a7ff833e41` plus prediction-only
-buffer adaptation, inspected 2026-09-10. Production uses readiness prediction
+Source baseline: `b1655095` plus the local Vulkan preparation/swapchain changes,
+inspected 2026-09-10. The main `vrr13` checkout was fast-forwarded to this
+commit before reconciling those changes; the latency presets remain active.
+Production uses readiness prediction
 for both growth and release, targeting 3 ms of headroom within the three-frame
 queue, 16 ms cap and selected timing allowance. Display feedback is optional diagnostic evidence;
 it cannot change deadlines or authorize/veto padding changes. Historical
@@ -56,7 +58,7 @@ retaining the current per-frame controller over rate protection or adaptive-only
 spacing, but cannot model a change of native backend or prove a visual remedy.
 A fresh gameplay capture is required for that comparison.
 
-Current VRR timing choices (after `db596431`, 2026-09-09): the `VRR timing`
+Current VRR timing choices (after `20fa2bc4`, 2026-09-09): the `VRR timing`
 selector offers Lowest latency, Balanced, and Smoothest throughout the VRR
 frame-rate range. `vrrlatencymode` persists IDs 2, 1, and 0 respectively.
 Balanced is the new-user default. A saved mode takes precedence; otherwise an
@@ -465,8 +467,11 @@ resetting the codec merely because an image was not presented.
    latch request, and diagnostics using the current monotonic time.
 4. Apply stale replacement policy when newer work is available.
 5. Wait until render start, then recheck window/display epoch and lifecycle.
-6. Call `prepareFrameForPresent()` with the captured decode dependency. Rendering
-   and image acquisition belong here; intentional target waiting does not.
+6. Call the presenter's `prepareFrame()` with the captured decode dependency
+   and the selected `VrrPresentRequest`. Mode changes, rendering, and image
+   acquisition belong inside this measured preparation interval; intentional
+   target waiting does not. D3D11 keeps its mode selection at Present; Linux
+   Vulkan may recreate the swapchain before acquiring the image.
 7. Handle preparation failure/cancellation. If the presenter reports
    `sourceFrameReusable`, release the decoder surface before the target wait.
 8. Wait for the target, then enforce the controller's currently applicable
@@ -996,20 +1001,35 @@ selected for the surface at startup: Mailbox on ordinary Wayland, Immediate
 on X11/KMSDRM, and Immediate on Gamescope. Gamescope additionally tries Mailbox
 when the SteamOS experiment is enabled, according to exposed surface capabilities.
 
+The selected adaptive mode is retained separately from the active swapchain.
+Immediate/Mailbox Linux paths advertise latch support and honor the controller's
+per-frame request by selecting FIFO for a latched frame and restoring the saved
+adaptive mode for an unlatched frame. This uses the current per-frame policy,
+not the historical fitted-rate cutoff. It does not change the latency preset.
+
+The worker passes the same request to preparation and presentation. Recreation
+occurs before image acquisition, with no prepared or acquired image outstanding.
+It preserves swapchain depth and the cached colorspace/HDR hint, and clears the
+old swapchain's presentation feedback. Recreation/acquisition are measured as
+acquisition time; intentional waits are not learned as additional buffer demand.
+Failure requests renderer recovery. Presentation never recreates a prepared chain.
+A FIFO-only compatibility path does not advertise switchable latch support.
+Repeated changes of the per-frame request can recreate the swapchain repeatedly;
+deterministic tests do not establish the runtime cost or visual result on hardware.
+
 Gamescope WSI's FIFO compatibility exception is used when Immediate is unavailable
 and the Mailbox experiment is disabled or Mailbox is unavailable. Although the WSI layer sends Mailbox to the underlying
 driver, it forwards the application's original present mode to Gamescope, which
 implements FIFO commit scheduling itself. Selecting Mailbox explicitly avoids
-that FIFO policy. Steam's frame limiter can still override a request to FIFO.
-Native presentation here remains compositor-owned, and submission success is
-not physical scanout feedback. See [SteamOS VRR investigation](docs/steamos-vrr.md)
-for source evidence and the reversible composition test for
-performance-overlay-dependent stutter.
-
-Unsupported combinations fall back to fixed pacing. DRM VRR property control
-and environment choices are separate from the client scheduler's ability to
-supply trustworthy presentation feedback. Wayland display/modeset constraints
-likewise differ from Windows.
+that FIFO policy; recreating the same FIFO mode cannot change it. Steam's frame
+limiter can still override a request to FIFO. Native presentation here remains
+compositor-owned, and submission success is not physical scanout feedback.
+See [SteamOS VRR investigation](docs/steamos-vrr.md) for source evidence and the
+reversible composition test for performance-overlay-dependent stutter.
+Unsupported renderer combinations
+fall back to fixed pacing. Windows Vulkan remains rejected and the macOS path
+does not gain on-demand mode switching. DRM VRR properties, compositor policy,
+and physical scanout evidence remain separate from the client's mode request.
 
 The worker presents only newly received frames and waits for queue activity
 when empty. It no longer retains and re-presents the last image to fill gaps.

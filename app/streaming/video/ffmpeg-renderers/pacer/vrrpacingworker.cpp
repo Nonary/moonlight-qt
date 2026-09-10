@@ -521,9 +521,14 @@ int VrrPacingWorker::run()
             continue;
         }
 
+        VrrPresentRequest presentRequest;
+        presentRequest.latchedPresentation = decision.latchedPresentation;
+        presentRequest.collectDiagnostics = m_DeepTraceEnabled;
+
         telemetry.preparationStartUs = LiGetMicroseconds();
         const VrrPrepareResult preparation =
-            m_Presenter->prepareFrame(frame.frame(), frame.decodeBoundary());
+            m_Presenter->prepareFrame(frame.frame(), frame.decodeBoundary(),
+                                     presentRequest);
         telemetry.preparationEndUs = LiGetMicroseconds();
         telemetry.preparationDurationUs =
             telemetry.preparationEndUs >= telemetry.preparationStartUs ?
@@ -756,10 +761,6 @@ int VrrPacingWorker::run()
             telemetry.renderWaitOvershootUs,
             targetWait.schedulerDelayUs,
             targetWait.schedulerDelayValid);
-
-        VrrPresentRequest presentRequest;
-        presentRequest.latchedPresentation = decision.latchedPresentation;
-        presentRequest.collectDiagnostics = m_DeepTraceEnabled;
 
         telemetry.presentStartUs = LiGetMicroseconds();
         VrrPresentFeedback feedback =

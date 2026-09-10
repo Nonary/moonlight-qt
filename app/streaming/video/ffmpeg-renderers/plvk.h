@@ -57,9 +57,13 @@ public:
     virtual void renderFrame(AVFrame* frame) override;
     virtual IVrrFramePresenter* getVrrFramePresenter() override;
     virtual VrrFallbackReason checkSupport() const override;
+    virtual bool canLatchAdaptivePresent() const override;
     virtual uint64_t waitForDecode(AVFrame* frame) override;
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
                                           uint64_t decodeBoundary) override;
+    virtual VrrPrepareResult prepareFrame(AVFrame* frame,
+                                          uint64_t decodeBoundary,
+                                          const VrrPresentRequest& request) override;
     virtual VrrPresentFeedback presentAdaptive(
         const VrrPresentRequest& request) override;
     virtual VrrPresentFeedback cancelFrame() override;
@@ -94,6 +98,7 @@ private:
     void queueRenderDeviceReset();
 
     bool createSwapchain(int depth);
+    bool selectVrrPresentMode(bool latchedPresentation);
     bool createOverlay(pl_overlay* overlay, SDL_Surface* surface);
     bool mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
     void unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
@@ -131,6 +136,7 @@ private:
     VkSurfaceKHR m_VkSurface = VK_NULL_HANDLE;
     int m_SwapchainDepth = 0;
     VkPresentModeKHR m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR m_VrrAdaptivePresentMode = VK_PRESENT_MODE_FIFO_KHR;
     pl_vulkan m_Vulkan = nullptr;
     pl_swapchain m_Swapchain = nullptr;
     pl_renderer m_Renderer = nullptr;

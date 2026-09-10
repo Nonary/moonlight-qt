@@ -374,7 +374,8 @@ libplacebo {
         streaming/video/ffmpeg-renderers/plvk_c.c
     HEADERS += \
         streaming/video/ffmpeg-renderers/plvk.h \
-        streaming/video/ffmpeg-renderers/plvkpresentation.h
+        streaming/video/ffmpeg-renderers/plvkpresentation.h \
+        streaming/video/ffmpeg-renderers/plvkswapchain.h
     linux {
         SOURCES += streaming/video/ffmpeg-renderers/vulkantiming.cpp
         HEADERS += streaming/video/ffmpeg-renderers/vulkantiming.h

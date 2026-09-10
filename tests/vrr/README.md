@@ -88,6 +88,24 @@ It also covers the FIFO-only WSI compatibility path, unsupported backends, and
 preservation of ordinary Wayland and X11/KMSDRM choices. The test cannot prove
 which mode an affected device exposes or whether Gamescope displays each frame.
 
+On Linux, `tst_plvkswapchain` exercises the shared libplacebo replacement
+boundary with fake native operations. It covers pending-image rejection,
+destroy/create ordering, FIFO/Immediate/Mailbox creation parameters, retained
+depth and HDR metadata, and creation failure. It is built when libplacebo
+development files are available. The worker tests also verify that the same
+protection request reaches preparation before acquisition and reaches Present
+unchanged after a slow preparation. These checks do not establish compositor
+or physical scanout behavior.
+
+Linux Vulkan recreates its Immediate/Mailbox chain as FIFO when the current
+per-frame controller requests latching, then restores the saved adaptive mode
+for an unlatched request. Mode changes happen during measured preparation,
+with no image acquired, and preserve the colorspace hint. The Gamescope WSI
+FIFO compatibility path retains its compositor-owned behavior and software
+spacing floor. Gamescope Mailbox selection still requires the existing opt-in
+experiment. The latency presets continue to bound padding independently of
+native mode selection.
+
 The FPS picker offers native VRR rates and preserves saved custom values; the
 reduced-rate Low Latency VRR recommendation has been removed. The worker no
 longer generates gap-fill repeats when new frames are unavailable.
