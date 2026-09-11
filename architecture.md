@@ -938,8 +938,8 @@ The DXGI statistics provider supplies no verified display events. Unsupported
 Windows systems therefore use submission estimates for diagnostic cadence reporting.
 Readiness prediction independently adapts padding in both directions. Composition-frame statistics also lack a verified frame
 display instant, so the same estimator covers periods without independent-flip
-events. The overlay labels this lower-confidence timing as estimated; it does
-not claim native display coverage or learn display-service latency from it.
+events. This lower-confidence timing remains internal telemetry; it does not
+claim native display coverage or learn display-service latency from it.
 Linux Wayland presentation feedback and Gamescope actual-present timestamps
 are explicitly marked as display events and remain eligible for measurement.
 
@@ -1181,20 +1181,15 @@ session-end log likewise shows the final window, not a whole-session percentage.
 This identifies uneven host-supplied timing, which includes capture behavior;
 it cannot isolate the game engine or detect repeated image content from timing
 alone. It is independent of the native-confirmed client hitch metric and does
-not change buffer adaptation. The old `Client ready on time` overlay counted
-preparation deadline misses with zero tolerance and has been replaced by
-`Smoothness` on the VRR pacing line. The percentage prefers eligible, consecutive, verified
-display intervals whose client-added spacing error does not exceed 3 ms after
-uncertainty handling. Hitches and drops appear on a separate compact line.
-No verified intervals in the reporting window selects the separate submission
-counters. The overlay displays the best available score without source or
-coverage labels; with neither kind of interval, smoothness and hitches show
-`N/A`. Native and estimated counters remain distinct internally.
-Cumulative cadence counters are differenced into the
-decoder's existing reporting windows; they are not the controller's expiring
-five-minute adaptation histogram. Preparation lateness remains internal
-diagnostic telemetry. The overlay no longer shows `Errors`; internal
-failed-presentation diagnostics remain available.
+not change buffer adaptation.
+
+The stats overlay and session summary restore the compact vrr14 format:
+`VRR pacing: Active | Client ready on time: ... | Dropped: ...`.
+Client readiness is the percentage of eligible frames without a preparation
+deadline miss (late counts clamped to eligible frames). It is a readiness
+measurement, not a visible-smoothness score. With no eligible frames, the line
+shows the starting state. Cadence and failed-presentation counters remain
+internal diagnostics; the extra smoothness and hitch rows are omitted.
 
 Visible smoothness and source-timestamp fidelity answer different questions:
 
