@@ -3396,6 +3396,69 @@ void testSubmissionEstimateFallback()
     }
 }
 
+void testReadinessHitchAttribution()
+{
+    using Feedback = Vrr13::ReadinessFeedback;
+    Feedback feedback;
+    feedback.observe({1, 10000, 10000, 9000, 1000, true}, 2000);
+    auto r = feedback.observe({2, 23000, 23000, 22000, 1000, true}, 2000);
+    expect(r.interval && !r.demand, "host interval changes alone must not grow padding");
+    r = feedback.observe({3, 33000, 39000, 32000, 1000, true}, 2000);
+    expect(r.interval && !r.demand, "native blocking with timely readiness must not grow padding");
+    feedback.reset();
+    feedback.observe({1, 10000, 15000, 15000, 1000, true}, 2000);
+    r = feedback.observe({2, 20000, 25000, 25000, 1000, true}, 2000);
+    expect(r.interval && !r.demand, "constant readiness offset with even output must not grow padding");
+    feedback.reset();
+    feedback.observe({1, 10000, 10000, 9000, 1000, true}, 2000);
+    r = feedback.observe({2, 20000, 25000, 25000, 1000, true}, 2000);
+    expect(r.interval && r.demand == 4000, "a readiness-caused miss must request only its excess over tolerance");
+    r = feedback.observe({3, 30000, 30000, 29000, 4000, true}, 2000);
+    expect(r.interval && r.demand == 4000, "catch-up must not charge a changed buffer twice");
+    r = feedback.observe({5, 50000, 55000, 55000, 4000, true}, 2000);
+    expect(!r.interval, "dropped frames must break attribution");
+    feedback.observe({6, 60000, 60000, 60000, 4000, false}, 2000);
+    r = feedback.observe({7, 70000, 77000, 77000, 4000, true}, 2000);
+    expect(!r.interval, "ineligible work must break attribution");
+}
+
+void testReadinessHitchBufferAdaptation()
+{
+    auto session = config(60, 120);
+    expect(vrrTimingParametersForSession(session).playoutReadinessHitchThresholdUs == 0,
+           "Windows/default session must retain prediction-only growth");
+    session.readinessHitchFeedback = true;
+    const auto policy = vrrTimingParametersForSession(session);
+    expect(policy.playoutReadinessHitchThresholdUs == 2000,
+           "Linux session must require a readiness-attributed output miss");
+    VrrTimingController controller(session, true, policy);
+    Vrr13::Reserve oldHistory(18);
+    expect(!controller.loadPlayoutHistory(oldHistory.profile()),
+           "Linux event-demand history must reject old predictive calibration");
+    Vrr13::Reserve cached(19);
+    for (int i = 0; i < 300; ++i) cached.observe(16000000, 0, int64_t(i + 1) * 16667000);
+    expect(controller.loadPlayoutHistory(cached.profile()), "matching history must remain replayable");
+    uint64_t last = 0, initial = 0, clean = 0, peak = 0, finalDelay = 0;
+    for (int i = 0; i < 20600; ++i) {
+        const auto source = decodedTimeForRtp(1000000, uint32_t(i * 1500));
+        const bool fault = i >= 600 && i < 1200 && i % 10 == 9;
+        const auto decoded = source + (fault ? 9000 : 0);
+        const auto now = std::max(decoded, last);
+        const auto d = controller.schedule(frame(i, uint32_t(i * 1500), true, decoded), now);
+        controller.notePreparationDuration(1000);
+        last = std::max(d.targetUs, std::max(now, d.renderStartUs) + 1000);
+        controller.noteSubmission(true, false, last);
+        if (!i) initial = d.playoutDelayUs;
+        if (i < 600) expect(d.playoutDelayUs <= initial, "cached demand alone must not grow the cold-start buffer");
+        if (i == 599) clean = d.playoutDelayUs;
+        if (i >= 600) peak = std::max(peak, d.playoutDelayUs);
+        finalDelay = d.playoutDelayUs;
+        expect(d.playoutDelayUs <= 16000, "attributed growth must retain the hard cap");
+    }
+    expect(peak > clean, "observed readiness-caused output misses must earn additional buffering");
+    expect(finalDelay < peak, "expired event demands must release increased buffering");
+}
+
 void testPredictionOnlyBufferAdaptation()
 {
     const auto session = config(60, 120);
@@ -3446,6 +3509,35 @@ void testPredictionOnlyBufferAdaptation()
         expect(controller.nativeCadenceIntervals() == 0,
                "bidirectional predictive adaptation must work with no display-event coverage");
     }
+    // Low-rate desktop delivery must not expand protection past 16 ms.
+    for (int fps : {20, 30, 60}) {
+        auto desktopSession = config(fps, 120);
+        const auto desktopPolicy = vrrTimingParametersForSession(desktopSession);
+        VrrTimingController desktop(desktopSession, true, desktopPolicy);
+        auto expandingPolicy = desktopPolicy;
+        expandingPolicy.playoutDelayMaximumPeriodPerMille = 2000;
+        VrrTimingController expanding(desktopSession, true, expandingPolicy);
+        uint64_t maximumDelay = 0, historicalMaximum = 0;
+        for (int i = 0; i < 1800; ++i) {
+            const uint32_t rtp = uint32_t(i * (90000 / fps));
+            const uint64_t decoded = decodedTimeForRtp(1000000, rtp);
+            const auto d = desktop.schedule(frame(i, rtp, true, decoded), decoded);
+            maximumDelay = std::max(maximumDelay, d.playoutDelayUs);
+            const uint64_t work = i % 10 == 9 ? 24000 : 1000;
+            const auto old = expanding.schedule(frame(i, rtp, true, decoded), decoded);
+            historicalMaximum = std::max(historicalMaximum, old.playoutDelayUs);
+            expanding.notePreparationDuration(work);
+            expanding.noteSubmission(true, false, std::max(old.targetUs, decoded + work));
+            desktop.notePreparationDuration(work);
+            desktop.noteSubmission(true, false, std::max(d.targetUs, decoded + work));
+        }
+        std::printf("slow source %d FPS: expanding peak %llu us, bounded peak %llu us\n", fps,
+                    (unsigned long long)historicalMaximum, (unsigned long long)maximumDelay);
+        expect(historicalMaximum > 16000,
+               "regression workload must reproduce the previous expanding buffer");
+        expect(maximumDelay <= 16000,
+               "slow source cadence must never expand the absolute buffer ceiling");
+    }
 
     // Display-only errors can be logged but cannot steer any timing decision.
     VrrTimingController control(session, true, policy), feedback(session, true, policy);
@@ -3492,9 +3584,9 @@ void testProductionPreservesRelativeGameSpacing()
     const auto session = config(120, 120);
     auto policy = vrrTimingParametersForSession(session);
     expect(policy.playoutDelayMaximumUs == 16000 &&
-               policy.playoutDelayMaximumPeriodPerMille == 2000 &&
+               policy.playoutDelayMaximumPeriodPerMille == 0 &&
                policy.playoutDelayCapSourcePeriodPerMille == 2000,
-           "production Smoothest must expose a two-source-frame buffer cap");
+           "production Smoothest must bound its two-source-frame allowance by 16 ms");
     // Hold padding constant to isolate the spacing contract from adaptation.
     policy.playoutDelayMaximumPeriodPerMille = 0;
     policy.playoutDelayCapSourcePeriodPerMille = 0;
@@ -3894,6 +3986,8 @@ int main()
     testLatencyPresetsAcrossSourceAndDisplayRates();
     testLatencyPresetsBoundHitchesThroughCadenceChanges();
     testSubmissionEstimateFallback();
+    testReadinessHitchAttribution();
+    testReadinessHitchBufferAdaptation();
     testPredictionOnlyBufferAdaptation();
     testNativeHitchGatesPadding();
     testDelayedDisplayEventsAgreeAcrossBackends();

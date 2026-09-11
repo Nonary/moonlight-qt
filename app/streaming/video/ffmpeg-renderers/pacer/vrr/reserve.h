@@ -14,7 +14,7 @@ class Reserve {
 public:
     explicit Reserve(int version = 13) : m_Version(version) {}
     int version() const { return m_Version; }
-    int64_t tolerance() const { return m_Version >= 14 ? 3000000 : 0; }
+    int64_t tolerance() const { return m_Version >= 14 && m_Version != 19 ? 3000000 : 0; }
     using Time = int64_t;
     static constexpr Time Second = 1000000000, Window = 300 * Second;
     static constexpr Time Bin = 250000, MissTolerance = 0;

@@ -306,6 +306,9 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
     // rejection continues through the original fixed path below.
     if (enableVrr) {
         VrrSessionConfig config;
+#ifdef Q_OS_LINUX
+        config.readinessHitchFeedback = true;
+#endif
         config.latencyMode = vrrLatencyMode >= 0 && vrrLatencyMode <= 2 ? vrrLatencyMode : 1;
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         if (!calibrationKey.isEmpty()) {

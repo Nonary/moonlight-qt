@@ -448,6 +448,10 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             (!value.playoutReadinessDrivenAdaptation || value.playoutNativeHitchAdaptation)) {
         return fail("playout_prediction_only requires readiness adaptation without native hitch adaptation");
     }
+    if (value.playoutReadinessHitchThresholdUs &&
+            (!value.playoutPredictionOnly || value.playoutReadinessHitchThresholdUs > 10000)) {
+        return fail("playout_readiness_hitch_threshold_us requires prediction-only playout and must be in 1..10000");
+    }
     if (value.playoutNativeHitchAdaptation &&
             (!value.playoutSmoothnessFeedbackEnabled || !value.playoutReadinessDrivenAdaptation)) {
         return fail("playout_native_hitch_adaptation requires smoothness feedback and readiness prediction");

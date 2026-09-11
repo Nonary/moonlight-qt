@@ -11535,6 +11535,10 @@ int main(int argc, char* argv[])
             capturedConfig.latencyMode = capturedParameters.latencyFixAllRates != 0 ?
                 (capturedParameters.latencyFixDelayPeriodPerMille == 0 ? 2 : 1) : 0;
             simulatedConfig = capturedConfig;
+            // Choose the captured backend's current policy, independent of the
+            // platform running replay. Exact replay still uses recorded parameters.
+            simulatedConfig.readinessHitchFeedback =
+                nativeBackendDeclared && nativeBackend == kNativeBackendVulkan;
             if (parser.isSet(displayOption)) {
                 simulatedConfig.displayRefreshHz = displayOverrideHz;
             }

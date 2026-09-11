@@ -129,6 +129,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayCapSourcePeriodPerMille = config.latencyFix ? 0 :
         latencyMode == 2 ? 500 : latencyMode == 1 ? 1000 : 2000;
     parameters.playoutPredictionOnly = 1;
+    parameters.playoutReadinessHitchThresholdUs = config.readinessHitchFeedback ? 2000 : 0;
     parameters.playoutNativeHitchAdaptation = 0;
     // Display observations are optional diagnostics. They never steer the
     // production schedule or authorize either direction of buffer adaptation.
@@ -164,9 +165,10 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutSmoothingMaxLagUs = kPlayoutSmoothingMaxLagUs;
     parameters.playoutMetronomeEnabled = 0;
     parameters.playoutDelayStartPeriodPerMille = kPlayoutStartPeriodPerMille;
-    // Keep the learner's input ceiling at least as large as the Smoothest
-    // preset; the selected source-frame cap applies after this maximum.
-    parameters.playoutDelayMaximumPeriodPerMille = 2000;
+    // A slower desktop/source must not expand the absolute 16 ms ceiling.
+    // Source-relative preset caps still impose their smaller limit. Captured
+    // parameters retain the historical expanding limit for exact replay.
+    parameters.playoutDelayMaximumPeriodPerMille = 0;
     parameters.playoutSmoothingSnapPerMille = kPlayoutMetronomeSnapPerMille;
     parameters.playoutOffsetReseedFrames = kPlayoutOffsetReseedFrames;
     parameters.playoutDelaySlewAcrossBands = 1;
@@ -276,6 +278,7 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     resetPlayoutOffsets();
     m_WorkloadEpisode.reset();
     m_ReadinessPrediction.reset();
+    m_ReadinessFeedback.reset();
     m_PresentationPrediction.reset();
     m_SubmissionSmoothness.breakSequence();
     m_NativeSmoothness.breakSequence();
@@ -286,7 +289,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_SubmissionSmoothness.reset();
         m_NativeSmoothness.reset();
         m_RequestedPlayoutDelayUs = 0;
-        m_PlayoutHistory = Vrr13::Reserve(m_Parameters.playoutPredictionOnly ? 18 :
+        m_PlayoutHistory = Vrr13::Reserve(m_Parameters.playoutReadinessHitchThresholdUs ? 19 :
+            m_Parameters.playoutPredictionOnly ? 18 :
             m_Parameters.playoutNativeHitchAdaptation ? 17 :
             m_Parameters.playoutReadinessDrivenAdaptation ? 16 :
             m_Parameters.playoutSmoothnessFeedbackEnabled ? 15 : m_Parameters.playoutPredictionEnabled ? 14 : 13);
@@ -1495,6 +1499,32 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         return;
     }
 
+    if (m_Parameters.playoutReadinessHitchThresholdUs) {
+        const auto& p = m_Pending.prediction;
+        const auto work = saturatingAdd(m_Pending.preparationDurationUs,
+                                       m_Pending.renderSchedulerUs);
+        // Reconstruct readiness without our intentional render/target waits,
+        // swapchain acquisition or post-submit blocking. Overload/backpressure
+        // and discontinuities cannot be cured by storing more frames.
+        const auto result = m_ReadinessFeedback.observe({
+            m_Pending.smoothness.frame, m_Pending.smoothness.intended,
+            submissionUs, saturatingAdd(p.decoded, work), p.applied,
+            submitted && !cancelled && m_Pending.hasPreparationDuration &&
+                m_Pending.smoothness.eligible && p.eligible &&
+                work <= p.period && p.decoderQueue <= p.period},
+            m_Parameters.playoutReadinessHitchThresholdUs);
+        if (result.interval) {
+            const auto ns = [](uint64_t us) {
+                return int64_t(std::min<uint64_t>(us, INT64_MAX / 1000)) * 1000;
+            };
+            m_PlayoutHistory.observe(ns(result.demand), ns(p.applied), ns(submissionUs));
+            if (result.demand) {
+                m_RequestedPlayoutDelayUs = std::max(m_RequestedPlayoutDelayUs,
+                    std::min(result.demand, playoutDelayMaximumUs()));
+            }
+        }
+    }
+
     if (m_Parameters.playoutSmoothnessFeedbackEnabled) {
         if (submitted && !cancelled) {
             auto sample = m_Pending.smoothness;
@@ -1538,7 +1568,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                               readinessLearningSampleLimit());
             }
             if (m_Pending.hasPreparationDuration) {
-                if (m_Parameters.playoutPredictionEnabled) {
+                if (m_Parameters.playoutPredictionEnabled &&
+                    !m_Parameters.playoutReadinessHitchThresholdUs) {
                     m_ReadinessPrediction.observe(m_PlayoutHistory, m_Pending.prediction,
                         m_Pending.preparationDurationUs, m_Pending.renderSchedulerUs);
                 }
@@ -2342,8 +2373,17 @@ void VrrTimingController::updatePlayoutHistory(
         // intentional waits nor post-submission display delay is more work.
         const uint64_t protection = uint64_t(
             (m_PlayoutHistory.common() + m_PlayoutHistory.boost()) / 1000);
-        m_RequestedPlayoutDelayUs = saturatingAdd(protection,
-                                                m_Parameters.playoutDelayMarginUs);
+        if (m_Parameters.playoutReadinessHitchThresholdUs) {
+            // History may retain/release a level, but only a fresh attributable
+            // output hitch can raise it. In particular, cache loading cannot
+            // authorize growth. Tolerance was already applied at the event;
+            // do not add another fixed readiness margin.
+            m_RequestedPlayoutDelayUs = std::min(m_RequestedPlayoutDelayUs, protection);
+        }
+        else {
+            m_RequestedPlayoutDelayUs = saturatingAdd(protection,
+                                                    m_Parameters.playoutDelayMarginUs);
+        }
         const uint64_t desired = clampUnsigned(m_RequestedPlayoutDelayUs,
             playoutDelayMinimumUs(), playoutDelayMaximumUs());
         if (desired > m_AppliedPlayoutDelayUs) {

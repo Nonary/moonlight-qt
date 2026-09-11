@@ -1311,3 +1311,30 @@ chain, identify the first boundary that differs from its intended behavior,
 and check how that difference propagates into subsequent frames and feedback.
 That keeps host stalls, local overload, scheduling policy, native behavior,
 and measurement limitations from being conflated.
+
+
+### Buffer-lag correction, 2026-09-10
+
+This update supersedes the expanding maximum and prediction-only Linux growth
+policy described above. The absolute playout maximum is now 16 ms; a lower
+source rate cannot expand it. Source-relative preset limits can still reduce it.
+
+Linux enables `readinessHitchFeedback`, recorded as
+`playout_readiness_hitch_threshold_us=2000`. Consecutive eligible submissions
+must have a spacing error attributable to decode/preparation readiness beyond
+the intended target before buffering can grow. Demand uses the delayed frame's
+existing buffer plus the smaller of readiness lateness and spacing error, minus
+2 ms. Catch-up uses the earlier frame's buffer, avoiding duplicate charges.
+Host jitter, native blocking, or cached predictions alone cannot authorize growth.
+Work or decoder backpressure beyond a source period breaks eligibility.
+
+Version-19 reserve history retains/releases demand but cannot raise a cold-start
+request by itself. It rejects old prediction profiles and does not add a second
+3 ms margin. Existing attack/release and capacity bounds remain. Windows retains
+its predictive growth rule. The new parameter defaults to zero for historical
+traces; replay recognizes version-19 profiles and selects the current Linux rule
+for declared Vulkan captures. Submission attribution is not physical scanout proof.
+
+Controller, profile round-trip, replay configuration, and low-rate cap regressions
+cover this policy. Live Desktop Mode evidence showed buffering releasing rather
+than remaining at the cap; Windows-level visual parity remains unverified.

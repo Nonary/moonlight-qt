@@ -490,6 +490,7 @@ void VrrReplayConfigTest::predictionOnlyPolicyRoundTrip()
     parameters.timestampPlayoutEnabled = 1;
     parameters.playoutDelayAdaptive = 1;
     parameters.playoutDelayMarginUs = 3000;
+    parameters.playoutReadinessHitchThresholdUs = 2000;
     QString error;
     QVERIFY2(validateVrrTimingParameters(parameters, error), qPrintable(error));
     QCOMPARE(parameters.playoutPredictionOnly, uint64_t(1));
@@ -498,6 +499,9 @@ void VrrReplayConfigTest::predictionOnlyPolicyRoundTrip()
     QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, defaults, error), qPrintable(error));
     QCOMPARE(defaults.playoutPredictionOnly, uint64_t(1));
     QCOMPARE(defaults.playoutDelayMarginUs, uint64_t(3000));
+    QCOMPARE(defaults.playoutReadinessHitchThresholdUs, uint64_t(2000));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_readiness_hitch_threshold_us", 10001}}, defaults, error));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_prediction_only", 0}}, defaults, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_prediction_only", 2}}, defaults, error));
     QCOMPARE(defaults.playoutPredictionOnly, uint64_t(1));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_native_hitch_adaptation", 1}}, defaults, error));

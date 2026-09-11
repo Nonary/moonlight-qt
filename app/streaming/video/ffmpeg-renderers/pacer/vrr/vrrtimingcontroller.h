@@ -4,6 +4,7 @@
 #include "reserve.h"
 #include "workload.h"
 #include "prediction.h"
+#include "readinessfeedback.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,7 @@
     X(uint64_t, latency_fix_delay_period_per_mille, latencyFixDelayPeriodPerMille, 500) \
     X(uint64_t, playout_delay_cap_source_period_per_mille, playoutDelayCapSourcePeriodPerMille, 0) \
     X(uint64_t, playout_prediction_only, playoutPredictionOnly, 0) \
+    X(uint64_t, playout_readiness_hitch_threshold_us, playoutReadinessHitchThresholdUs, 0) \
     X(uint64_t, playout_require_display_events, playoutRequireDisplayEvents, 0) \
     X(uint64_t, playout_submission_estimate_fallback, playoutSubmissionEstimateFallback, 0) \
     X(uint64_t, playout_native_hitch_adaptation, playoutNativeHitchAdaptation, 0) \
@@ -498,6 +500,7 @@ private:
     Vrr13::Reserve m_PlayoutHistory;
     Vrr13::WorkloadEpisode m_WorkloadEpisode;
     Vrr13::ReadinessPrediction m_ReadinessPrediction;
+    Vrr13::ReadinessFeedback m_ReadinessFeedback;
     Vrr13::PresentationPrediction m_PresentationPrediction;
     Vrr13::SmoothnessFeedback m_SubmissionSmoothness, m_NativeSmoothness;
     // Lifetime counters for decoder-owned reporting windows. These do not
