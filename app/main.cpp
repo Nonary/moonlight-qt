@@ -1,4 +1,5 @@
 #include <QGuiApplication>
+#include "streaming/video/amddecodepolicy.h"
 #include <QStyleHints>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -487,6 +488,20 @@ int main(int argc, char *argv[])
     SDL_LogSetOutputFunction(sdlLogToDiskHandler, nullptr);
 #endif
     qInstallMessageHandler(qtLogToDiskHandler);
+
+#if defined(Q_OS_LINUX) && defined(HAVE_LIBVA)
+    // Mesa snapshots driver options when its screen is first created, which
+    // may happen in Qt/SDL before VAAPI decoder probing. Request low-latency
+    // VCN decode here, before any graphics initialization. This changes only
+    // this process; it neither modifies system power policy nor skips fences.
+    if (qgetenv("MOONLIGHT_AMD_LOW_LATENCY_DECODE") != "0") {
+        const QByteArray flags = qEnvironmentVariableIsSet("AMD_DEBUG") ?
+            qgetenv("AMD_DEBUG") : qgetenv("R600_DEBUG");
+        qputenv("AMD_DEBUG", withAmdLowLatencyDecode(flags));
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "AMD VAAPI: requested Mesa low-latency decode (driver support required)");
+    }
+#endif
 #ifdef HAVE_FFMPEG
     av_log_set_callback(ffmpegLogToDiskHandler);
 #endif

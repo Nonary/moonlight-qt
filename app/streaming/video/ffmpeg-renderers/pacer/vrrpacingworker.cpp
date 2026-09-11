@@ -7,6 +7,9 @@
 #include "vrr/vrrframedroppolicy.h"
 
 #include <Limelight.h>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -80,6 +83,8 @@ constexpr char kTraceHeader[] =
     "decode_sync_wait_us,prepare_timing_valid,prepare_decode_sync_us,prepare_acquire_us,prepare_render_us,prepare_flush_us,"
     "gap_fills_before,gap_fill_last_us,original_target_us,playout_initial_profile,original_scanout_us,predicted_scanout_us,compositor_lead_us,recovery_headroom_us,smoothness_protection_us,requested_playout_delay_us,submission_smoothness_samples,submission_smoothness_misses,native_smoothness_samples,native_smoothness_misses,playout_capacity_limited,presentation_uncertainty_us"
     VRR_TIMING_PARAMETER_FIELDS(VRR_TRACE_PARAMETER_HEADER)
+    ",decoder_output_us,session_latency_mode,session_readiness_hitch_feedback,calibration_loaded,initial_cached_samples,history_version,history_state_valid,history_samples,history_misses,history_duration_us,history_can_release"
+    ",session_latency_oscillation,latency_test_phase"
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
 constexpr uint32_t kVrrWindowStateMask =
@@ -220,10 +225,17 @@ bool VrrPacingWorker::start()
         Vrr13::Reserve prior(m_TimingController->playoutHistory().version());
         if (Vrr13::loadProfile(QString::fromStdString(m_Config.calibrationPath),
                               QString::fromStdString(m_Config.calibrationKey), prior)) {
-            m_TimingController->loadPlayoutHistory(prior.profile());
+            m_CalibrationLoaded = m_TimingController->loadPlayoutHistory(prior.profile());
         }
     }
     m_InitialPlayoutProfile = encodeVrrPlayoutProfile(m_TimingController->playoutHistory());
+    m_InitialCachedSamples = m_TimingController->playoutHistory().cachedEvidence();
+    m_HistoryVersion = m_TimingController->playoutHistory().version();
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "VRR capture policy: latency_mode=%d readiness_hitch_feedback=%d history_version=%d calibration_loaded=%d cached_samples=%llu",
+                m_Config.latencyMode, int(m_Config.readinessHitchFeedback),
+                m_HistoryVersion, int(m_CalibrationLoaded),
+                static_cast<unsigned long long>(m_InitialCachedSamples));
 
     // Enable capture before the producer can submit its first frame. Opening
     // from run() left a small startup race that made session replay incomplete.
@@ -444,9 +456,11 @@ int VrrPacingWorker::run()
             m_TimingController->parameters().playoutMetronomeEnabled != 0;
         const bool latencyFix = m_TimingController->latencyFixActive();
         // The optional near-ceiling policy measures transport occupancy from
-        // admission. GPU readiness may move decodeCompleteUs forward above;
-        // it must not erase time that this image already spent queued.
-        const uint64_t ageOriginUs = latencyFix ? queuedFrame.trace.arrivalUs : frame.decodeCompleteUs();
+        // admission. Other modes retain their existing GPU-readiness origin
+        // for stale-work policy; reporting always uses immutable decoder
+        // output below.
+        const uint64_t ageOriginUs = latencyFix ?
+            queuedFrame.trace.arrivalUs : frame.decodeCompleteUs();
         const uint64_t ageUs = positiveDifference(scheduleNowUs, ageOriginUs);
         if (hasQueuedFrame() && VrrFrameDropPolicy::beforeRender(
                 decision, m_TimingController->displayPeriodUs(), ageUs, metronome, latencyFix)) {
@@ -774,11 +788,17 @@ int VrrPacingWorker::run()
                          telemetry);
         if (m_Telemetry != nullptr) {
             VrrTelemetrySample sample;
+            sample.queueResidenceUs = positiveDifference(queuedFrame.trace.dequeueUs,
+                                                         queuedFrame.trace.arrivalUs);
+            sample.decodeWaitUs = telemetry.decodeSyncWaitUs;
+            sample.bufferUs = decision.playoutDelayUs;
+            sample.submissionUs = telemetry.submissionBoundaryUs;
+            sample.motionDiscontinuity = decision.rebased || externalRebaseApplied;
             sample.decisionTimeUs = decisionTimeUs;
-            sample.pacerTimeUs =
-                telemetry.preparationStartUs >= frame.decodeCompleteUs() ?
-                    telemetry.preparationStartUs - frame.decodeCompleteUs() : 0;
-            sample.renderTimeUs = telemetry.preparationDurationUs +
+            sample.clientProcessingTimeUs =
+                telemetry.presentEndUs >= frame.decoderOutputUs() ?
+                    telemetry.presentEndUs - frame.decoderOutputUs() : 0;
+            sample.renderingTimeUs = telemetry.preparationDurationUs +
                 telemetry.presentDurationUs;
             sample.prepareLate = telemetry.preparationEndUs > decision.targetUs;
             sample.cadenceIntervals = m_TimingController->nativeCadenceIntervals();
@@ -1088,6 +1108,8 @@ void VrrPacingWorker::writeTrace(const QueuedFrame& queuedFrame,
     row.rtpTimestamp = frame.rtpTimestamp();
     row.timestampValid = frame.timestampValid();
     row.decodeCompleteUs = frame.decodeCompleteUs();
+    row.decoderOutputUs = frame.decoderOutputUs();
+    row.latencyMode = m_Config.latencyMode;
     row.receiveUs = frame.receiveUs();
     row.reassembledUs = frame.reassembledUs();
     row.decodeSubmitUs = frame.decodeSubmitUs();
@@ -1100,6 +1122,15 @@ void VrrPacingWorker::writeTrace(const QueuedFrame& queuedFrame,
     // rows deliberately carry zero/unavailable controller diagnostics.
     row.diagnostics = decisionValid ?
         m_TimingController->diagnostics() : VrrTimingDiagnostics {};
+    if (decisionValid) {
+        // Only scalar reads on the controller-owning thread. Do not calculate
+        // histogram quantiles or serialize calibration on the delivery path.
+        const auto& history = m_TimingController->playoutHistory();
+        row.historySamples = history.evidence();
+        row.historyMisses = history.misses();
+        row.historyDurationUs = static_cast<uint64_t>(history.duration() / 1000);
+        row.historyCanRelease = history.canRelease();
+    }
     row.feedback = feedback;
     row.telemetry = telemetry;
     row.completionQueueDepth =
@@ -1156,7 +1187,11 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
                                       row.input.arrivalUs);
     const VrrTimingDecision& decision = row.decision;
     const VrrTimingDiagnostics& diagnostics = row.diagnostics;
-    const VrrTimingParameters& parameters = m_TimingController->parameters();
+    // The writer must never read mutable controller parameters. Reconstruct
+    // this row's policy from immutable session settings and its captured mode.
+    auto traceConfig = m_Config;
+    traceConfig.latencyMode = row.latencyMode;
+    const VrrTimingParameters parameters = vrrTimingParametersForSession(traceConfig);
     const VrrPresentFeedback& feedback = row.feedback;
     const FrameTelemetry& telemetry = row.telemetry;
     const uint64_t nativePresentDurationUs =
@@ -1518,6 +1553,19 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(static_cast<uint64_t>(parameters.memberName));
     VRR_TIMING_PARAMETER_FIELDS(VRR_ADD_TRACE_PARAMETER)
 #undef VRR_ADD_TRACE_PARAMETER
+    addUnsigned(row.decoderOutputUs);
+    addSigned(row.latencyMode);
+    addUnsigned(m_Config.readinessHitchFeedback);
+    addUnsigned(m_CalibrationLoaded);
+    addUnsigned(m_InitialCachedSamples);
+    addSigned(m_HistoryVersion);
+    addUnsigned(row.decisionValid);
+    addUnsigned(row.historySamples);
+    addUnsigned(row.historyMisses);
+    addUnsigned(row.historyDurationUs);
+    addUnsigned(row.historyCanRelease);
+    addUnsigned(0); // Retired oscillation diagnostic column.
+    addUnsigned(0);
     line.append('\n');
 
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {
@@ -1659,6 +1707,36 @@ void VrrPacingWorker::openTraceIfRequested()
         return;
     }
 
+#endif
+
+    // The launcher owns one path for the application lifetime, while each
+    // reconnect creates a new worker. Preserve the completed connection before
+    // reusing that path so launchers and their latest-trace links still name
+    // the current capture. A failed archive must never fall through to truncate.
+    QFile previousTrace(QString::fromLocal8Bit(tracePath));
+    if (previousTrace.exists()) {
+        const QFileInfo traceInfo(previousTrace);
+        const QString extension = traceInfo.suffix().isEmpty() ? QString() :
+            QStringLiteral(".") + traceInfo.suffix();
+        QString archivePath;
+        for (unsigned connection = 1; ; ++connection) {
+            archivePath = traceInfo.absoluteDir().filePath(
+                traceInfo.completeBaseName() +
+                QStringLiteral("-connection-%1").arg(connection) + extension);
+            if (!QFileInfo::exists(archivePath)) break;
+        }
+        if (!previousTrace.rename(archivePath)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Unable to preserve previous VRR trace; tracing disabled: %s",
+                        tracePath);
+            return;
+        }
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "VRR trace: preserved earlier connection at %s",
+                    QFile::encodeName(archivePath).constData());
+    }
+
+#ifdef _WIN32
     // Use the checked CRT variant on Windows so enabling diagnostics does not
     // introduce a deprecation warning in the normal application build.
     if (fopen_s(&m_TraceFile, tracePath, "wb") != 0) {

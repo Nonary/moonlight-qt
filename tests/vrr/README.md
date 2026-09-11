@@ -16,9 +16,10 @@ time into the worker clock, with bounded uncertainty. Unknown IDs, stale results
 failed presents, and the first sample after swapchain resets cannot establish a
 cadence interval. Regular X11 without the Gamescope WSI layer is still unsupported.
 Missing platform timing support leaves native display measurement unavailable
-and produces a startup warning. Production then uses labeled submission
-estimates for diagnostic cadence reporting. Readiness prediction independently
-controls padding in both directions.
+and produces a startup warning. Production always uses submission estimates for
+its user-facing cadence report, even when native display timing is available;
+native observations remain separate tracking evidence. Readiness prediction
+independently controls padding in both directions.
 
 `tst_vulkantiming` tests this dispatch bridge with fake Vulkan entry points,
 including delayed completion IDs, clock conversion, swapchain errors, unchanged
@@ -822,7 +823,7 @@ timeline for that display; controller/cadence results remain available:
 ```
 
 VRR uses adaptive timestamp playout with a **Smooth frame timing** preference
-under the VRR checkbox. It defaults to enabled, preserving the existing policy,
+under the VRR checkbox. It defaults to enabled, preserving saved preference choices,
 and is snapshotted for the stream, including decoder resets. The stream CLI
 can override it with `--vrr-smooth-frame-timing` or
 `--no-vrr-smooth-frame-timing` without saving the override.
@@ -847,8 +848,13 @@ explicitly set both parameters above to zero to evaluate timestamp-following
 candidates.
 
 With smoothing enabled, production uses the gain smoother: it advances by a
-tracked source period and pulls 20 percent toward the mapped timestamp slot,
-with a 10-percent period EMA and a 6 ms lag cap. The metronome remains disabled.
+tracked source period and pulls 50 percent toward the mapped timestamp slot,
+with a 10-percent period EMA and a 2 ms positive adjustment cap. The cap does
+not bound total client latency. The metronome remains disabled. The production
+controller test covers approximately 77 FPS host jitter in all three timing
+presets, smoothing off/on, a host stall, a late wake, and a change to 60 FPS.
+It requires reduced interval jerk, bounded latency and queue occupancy, and
+settling at the new rate without persistent smoothing debt.
 
 The retired metronome policy is available for replay with
 `controller.timestamp_playout_enabled` and
@@ -1280,3 +1286,32 @@ Old captures omit that controller field and retain zero for exact historical
 replay. A historical exact match does not validate refresh-reference timestamps
 as actual display events. Regression tests cover the shared refresh timestamp
 from the Windows-host capture and genuine delayed display events separately.
+
+### Gamescope composition checkbox
+
+`tst_gamescopecomposition` validates the connection-scoped compositor guard:
+unchecked/Desktop no-ops, readback before mutation, preservation of an already
+forced setting, restoration on normal exit and partial setup failure, malformed
+zero-exit replies, and retry after failed restoration. It uses injected commands
+and does not claim live Gamescope smoothness validation.
+
+Linux current-policy replay selects readiness-attributed growth for a declared
+Vulkan backend (`playout_readiness_hitch_threshold_us=2000`). Exact replay
+retains recorded parameters, including the historical zero default. When
+isolating this change with a custom scenario, provide the complete captured
+controller snapshot before overriding the threshold: partial custom scenarios
+start from generic defaults, not the captured policy. Readiness-attribution
+and cache isolation regressions are in `tst_vrrtimingcontroller`.
+
+`tst_gamescoperepaint` uses an isolated Wayland protocol server to verify the
+optional per-frame Gamescope repaint helper. It covers request acknowledgements,
+coalescing/backpressure, protocol absence/rejection, disconnect, and bounded
+teardown without touching a real compositor. It does not establish display
+cadence or equivalence with Steam's performance overlay.
+# Observed latency comparison
+
+See [the capture procedure](../../docs/vrr-latency-captures.md). Run
+`python3 tests/vrr/test_latency_report.py` for the observed-report contracts.
+`scripts/report-vrr-latency.py` compares actual captures, preserving the distinction
+between immutable decoder output, later GPU readiness, and present-call return.
+It does not substitute replay scenarios for missing measured presets.

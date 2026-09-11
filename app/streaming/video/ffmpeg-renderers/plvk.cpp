@@ -237,7 +237,30 @@ PlVkRenderer::~PlVkRenderer()
     // started libplacebo frame owns an internal swapchain mutex, so release it
     // before any of the Vulkan objects below are destroyed.
     cancelVrrFrame();
+#if defined(HAS_WAYLAND) && defined(Q_OS_LINUX)
+    m_GamescopeRepaint.reset();
+#endif
 #ifdef Q_OS_LINUX
+    if (m_GamescopeTiming && m_GamescopeTiming->statistics().submissions) {
+        const auto& stats = m_GamescopeTiming->statistics();
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Gamescope timing summary: submissions=%llu returned=%llu emitted=%llu "
+                    "unmatched=%llu before_submission=%llu future=%llu stale=%llu "
+                    "invalid=%llu clock_rejected=%llu warmup_skipped=%llu "
+                    "empty_queries=%llu query_errors=%llu",
+                    static_cast<unsigned long long>(stats.submissions),
+                    static_cast<unsigned long long>(stats.returned),
+                    static_cast<unsigned long long>(stats.emitted),
+                    static_cast<unsigned long long>(stats.unmatched),
+                    static_cast<unsigned long long>(stats.beforeSubmission),
+                    static_cast<unsigned long long>(stats.future),
+                    static_cast<unsigned long long>(stats.stale),
+                    static_cast<unsigned long long>(stats.invalid),
+                    static_cast<unsigned long long>(stats.clockRejected),
+                    static_cast<unsigned long long>(stats.warmupSkipped),
+                    static_cast<unsigned long long>(stats.emptyQueries),
+                    static_cast<unsigned long long>(stats.queryErrors));
+    }
     m_GamescopeTiming.reset();
 #endif
 
@@ -504,7 +527,7 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
         if (enabled && timing->initialize(m_Vulkan->device)) {
             m_GamescopeTiming = std::move(timing);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Vulkan VRR: Gamescope WSI presentation timing enabled for adaptive buffering");
+                        "Vulkan VRR: Gamescope WSI presentation timing enabled for diagnostics");
         }
     }
 #endif
@@ -636,6 +659,16 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
         }
     }
 
+#if defined(HAS_WAYLAND) && defined(Q_OS_LINUX)
+    const QString gamescopeDisplay = qEnvironmentVariable("GAMESCOPE_WAYLAND_DISPLAY");
+    if (params->gamescopeRepaint && !params->testOnly && !gamescopeDisplay.isEmpty()) {
+        m_GamescopeRepaint = std::make_unique<GamescopeRepaint>(gamescopeDisplay);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Gamescope per-frame repaint test requested");
+    }
+    else if (params->gamescopeRepaint && !params->testOnly) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Gamescope repaint test inactive outside Gamescope");
+    }
+#endif
     m_Renderer = pl_renderer_create(m_Log, m_Vulkan->gpu);
 #ifdef HAS_WAYLAND
     if (m_VrrRequested && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
@@ -1483,6 +1516,9 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& reques
         return feedback;
     }
 
+#if defined(HAS_WAYLAND) && defined(Q_OS_LINUX)
+    if (m_GamescopeRepaint) m_GamescopeRepaint->request();
+#endif
     feedback.presented = true;
     feedback.submissionTimeValid = true;
     feedback.submissionTimeUs = submissionTimeUs;
@@ -1749,6 +1785,9 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
         SDL_PushEvent(&event);
         goto UnmapExit;
     }
+#if defined(HAS_WAYLAND) && defined(Q_OS_LINUX)
+    if (m_GamescopeRepaint && frame && renderSucceeded) m_GamescopeRepaint->request();
+#endif
 
 #ifndef PLVK_USE_EARLY_RENDER_TO_WAIT
     endRenderTiming();

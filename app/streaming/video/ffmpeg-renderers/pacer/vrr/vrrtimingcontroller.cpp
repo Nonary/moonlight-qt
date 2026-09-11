@@ -39,17 +39,15 @@ constexpr uint64_t kPlayoutMaximumUs = 8000;
 // the frames bunched behind it), never ordinary jitter.
 constexpr uint64_t kPlayoutPercentilePerMille = 1000;
 constexpr uint64_t kPlayoutBurstExclusionPerMille = 750;
-// Host presentation stamps jitter frame to frame (about +-2 ms at 1440p and
-// +-5 ms at 4K on the reference rig) even when the game runs at a steady
-// rate, and a VRR display shows every one of those steps. Advance by a
-// tracked source period and pull 20 percent toward each raw mapped slot. A
-// ten-percent period EMA follows genuine game-rate motion, while the 6 ms
-// lag cap prevents smoothing debt from turning into excess latency. These
-// values were selected across sustained gameplay traces after excluding
-// desktop/idle regions and sustained source cadence above 120 FPS.
-constexpr uint64_t kPlayoutSmoothingGainPerMille = 0;
+// Smooth frame timing blends the predicted slot equally with the raw mapped
+// timestamp. Track gradual source-rate changes with a ten-percent period EMA
+// and cap positive retiming at 2 ms. Reuse the existing playout headroom for
+// early retiming; the adjustment cap is not a bound on total client latency.
+// Unchecked sessions retain timestamp-following playout. Schema defaults and
+// explicit captured parameters preserve historical replay behavior.
+constexpr uint64_t kPlayoutSmoothingGainPerMille = 500;
 constexpr uint64_t kPlayoutSmoothingPeriodAlphaPerMille = 100;
-constexpr uint64_t kPlayoutSmoothingMaxLagUs = 6000;
+constexpr uint64_t kPlayoutSmoothingMaxLagUs = 2000;
 // Retired metronome playout, kept reachable for replay. It advances the
 // presented slot by the fitted source period, corrects phase toward the mapped
 // sender clock by a bounded step, and moves a frame that cannot make its tick
@@ -154,10 +152,8 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayMaximumUs = 16000;
     parameters.playoutDelayPercentilePerMille = kPlayoutPercentilePerMille;
     parameters.playoutBurstExclusionPerMille = kPlayoutBurstExclusionPerMille;
-    // RTP supplies relative game-frame spacing. Padding absorbs delivery
-    // jitter; smoothing those intervals instead changes the game's timing
-    // and creates client-side spacing errors, especially during rate changes.
-    // Retain the gain smoother only for explicitly selected replay policies.
+    // The independent smoothing preference trades timestamp fidelity for
+    // steadier cadence. The timing profile still bounds adaptive buffering.
     parameters.playoutSmoothingGainPerMille =
         kPlayoutSmoothingGainPerMille;
     parameters.playoutSmoothingPeriodAlphaPerMille =
@@ -696,9 +692,12 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
 
     VrrTimingDecision decision;
     decision.frameNumber = uint64_t(frame.frameNumber());
-    decision.smoothnessProtectionUs = m_Parameters.playoutNativeHitchAdaptation ?
-        activeSmoothnessFeedback(nowUs).protectionUs() :
-        std::max(m_SubmissionSmoothness.protectionUs(), m_NativeSmoothness.protectionUs());
+    decision.smoothnessProtectionUs = m_Parameters.playoutPredictionOnly ?
+        m_SubmissionSmoothness.protectionUs() :
+        m_Parameters.playoutNativeHitchAdaptation ?
+            activeSmoothnessFeedback(nowUs).protectionUs() :
+            std::max(m_SubmissionSmoothness.protectionUs(),
+                     m_NativeSmoothness.protectionUs());
     decision.requestedPlayoutDelayUs = m_RequestedPlayoutDelayUs;
     decision.playoutCapacityLimited = m_RequestedPlayoutDelayUs > playoutDelayMaximumUs();
     decision.submissionSmoothnessSamples = m_SubmissionSmoothness.samples();
@@ -2101,6 +2100,7 @@ uint64_t VrrTimingController::latencyFixDelayLimitUs() const
 {
     return scaledPerMille(m_DisplayPeriodUs, m_Parameters.latencyFixDelayPeriodPerMille);
 }
+
 
 uint64_t VrrTimingController::playoutDelayCapUs() const
 {

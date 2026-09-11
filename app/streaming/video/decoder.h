@@ -25,6 +25,11 @@ typedef struct _VIDEO_STATS {
     uint64_t vrrPacingDroppedFrames;
     uint64_t vrrEligibleFrames;
     uint64_t vrrPrepareLateFrames;
+    uint64_t vrrQueueResidenceUs;
+    uint64_t vrrDecodeWaitUs;
+    uint64_t vrrBufferUs;
+    uint64_t vrrMotionPairs;
+    uint64_t vrrMotionHitches;
     uint64_t vrrCadenceIntervals;
     uint64_t vrrCadenceHitches;
     uint64_t vrrEstimatedCadenceIntervals;
@@ -55,8 +60,9 @@ typedef struct _VIDEO_STATS {
     uint32_t framesWithHostProcessingLatency;  // low-res from RTP
     uint64_t totalReassemblyTimeUs;            // high-res (1us)
     uint64_t totalDecodeTimeUs;                // high-res (1us)
-    uint64_t totalPacerTimeUs;                 // high-res (1us)
-    uint64_t totalRenderTimeUs;                // high-res (1us)
+    uint64_t totalClientProcessingTimeUs;      // high-res (1us)
+    uint64_t totalQueuePacingTimeUs;           // high-res (1us)
+    uint64_t totalRenderingTimeUs;             // high-res (1us)
     uint32_t lastRtt;                          // low-res from enet (1ms)
     uint32_t lastRttVariance;                  // low-res from enet (1ms)
     double totalFps;                           // high-res
@@ -82,6 +88,7 @@ typedef struct _DECODER_PARAMETERS {
     bool enableVrr;
     int vrrLatencyMode = 0;
     bool gamescopeMailbox = false;
+    bool gamescopeRepaint = false;
     bool smoothVrrFrameTiming;
     // Strictly obtained during Session initialization. A value of zero means
     // the session was not qualified for VRR; Pacer must not substitute a

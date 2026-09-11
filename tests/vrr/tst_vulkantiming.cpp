@@ -18,6 +18,7 @@ const auto otherDevice = reinterpret_cast<VkDevice>(uintptr_t(4));
 const auto otherQueue = reinterpret_cast<VkQueue>(uintptr_t(5));
 std::vector<VkPastPresentationTimingGOOGLE> history;
 bool hold = false;
+int64_t timingOffsetNs = 0;
 VkResult presentResult = VK_SUCCESS;
 unsigned tagged = 0, forwarded = 0, destroyed = 0;
 const void* expectedChain = nullptr;
@@ -31,6 +32,11 @@ VKAPI_ATTR void VKAPI_CALL getQueue2(VkDevice d, const VkDeviceQueueInfo2*, VkQu
 }
 VKAPI_ATTR void VKAPI_CALL destroyDevice(VkDevice, const VkAllocationCallbacks*) { ++destroyed; }
 VKAPI_ATTR VkResult VKAPI_CALL present(VkQueue, const VkPresentInfoKHR* info) {
+    // Leave a real interval after the recorded submission boundary. An
+    // instantaneous mock can round a correlated nanosecond timestamp below
+    // that boundary by one microsecond and be correctly rejected as stale.
+    const timespec delay{0, 100000};
+    nanosleep(&delay, nullptr);
     const auto* p = static_cast<const VkBaseInStructure*>(info->pNext);
     if (p && p->sType == VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE) {
         auto* times = reinterpret_cast<const VkPresentTimesInfoGOOGLE*>(p);
@@ -38,7 +44,8 @@ VKAPI_ATTR VkResult VKAPI_CALL present(VkQueue, const VkPresentInfoKHR* info) {
         assert(times->pNext == expectedChain && info->pWaitSemaphores == expectedSemaphores);
         ++tagged;
         if (presentResult == VK_SUCCESS || presentResult == VK_SUBOPTIMAL_KHR)
-            history.push_back({times->pTimes[0].presentID, 0, monotonicNs(), 0, 0});
+            history.push_back({times->pTimes[0].presentID, 0,
+                               uint64_t(int64_t(monotonicNs()) + timingOffsetNs), 0, 0});
     }
     else ++forwarded;
     if (info->pResults) info->pResults[0] = presentResult;
@@ -133,6 +140,21 @@ int main()
     get2(otherDevice, &queueInfo, &q);
     assert(q == otherQueue && submit(q, &info) == VK_SUCCESS);
     assert(forwarded == 2 && tagged == 9);
+    // Invalid compositor timestamps stay rejected, with a reason available
+    // to distinguish poor timing coverage from frames not being displayed.
+    const auto emitted = timing.statistics().emitted;
+    timingOffsetNs = -1000000000;
+    assert(!frame(100).latchSampleValid);
+    assert(timing.statistics().beforeSubmission == 1);
+    timingOffsetNs = 1000000000;
+    assert(!frame(110).latchSampleValid);
+    assert(timing.statistics().future == 1);
+    timingOffsetNs = 0;
+    assert(frame(120).latchSampleValid);
+    assert(timing.statistics().emitted == emitted + 1);
+    const auto returned = timing.statistics().returned;
+    timing.reset();
+    assert(timing.statistics().returned == returned);
     auto destroy = reinterpret_cast<PFN_vkDestroyDevice>(getDevice(device, "vkDestroyDevice"));
     destroy(otherDevice, nullptr);
     destroy(device, nullptr);

@@ -26,7 +26,6 @@
 #define SER_ENABLEVRR "enablevrr"
 #define SER_VRRLATENCYFIX "vrrlatencyfix"
 #define SER_VRRLATENCYMODE "vrrlatencymode"
-#define SER_GAMESCOPEMAILBOX "gamescopemailbox"
 #define SER_SMOOTHVRRFRAMETIMING "smoothvrrframetiming"
 #define SER_GAMEOPTS "gameopts"
 #define SER_HOSTAUDIO "hostaudio"
@@ -152,7 +151,6 @@ void StreamingPreferences::reload()
         // Preserve the old checkbox choice while new users start on Balanced.
         vrrLatencyMode = settings.value(SER_VRRLATENCYFIX).toBool() ? VLM_BALANCED : VLM_SMOOTHEST;
     }
-    gamescopeMailbox = settings.value(SER_GAMESCOPEMAILBOX, false).toBool();
     smoothVrrFrameTiming = settings.value(SER_SMOOTHVRRFRAMETIMING, true).toBool();
     gameOptimizations = settings.value(SER_GAMEOPTS, true).toBool();
     playAudioOnHost = settings.value(SER_HOSTAUDIO, false).toBool();
@@ -356,7 +354,10 @@ void StreamingPreferences::save()
     settings.setValue(SER_VSYNC, enableVsync);
     settings.setValue(SER_ENABLEVRR, enableVrr);
     settings.setValue(SER_VRRLATENCYMODE, vrrLatencyMode);
-    settings.setValue(SER_GAMESCOPEMAILBOX, gamescopeMailbox);
+    settings.remove("vrrlatencyoscillation");
+    settings.remove("gamescopemailbox"); // Retired Mailbox A/B experiment.
+    settings.remove("gamescoperepaint");
+    settings.remove("gamescopeforcecomposition");
     settings.setValue(SER_SMOOTHVRRFRAMETIMING, smoothVrrFrameTiming);
     settings.setValue(SER_GAMEOPTS, gameOptimizations);
     settings.setValue(SER_HOSTAUDIO, playAudioOnHost);

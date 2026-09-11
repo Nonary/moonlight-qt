@@ -198,6 +198,7 @@ SOURCES += \
     streaming/input/mouse.cpp \
     streaming/input/reltouch.cpp \
     streaming/session.cpp \
+    streaming/gamescopecomposition.cpp \
     streaming/audio/audio.cpp \
     streaming/audio/renderers/sdlaud.cpp \
     gui/computermodel.cpp \
@@ -237,6 +238,8 @@ HEADERS += \
     settings/streamingpreferences.h \
     streaming/input/input.h \
     streaming/session.h \
+    streaming/video/amddecodepolicy.h \
+    streaming/gamescopecomposition.h \
     streaming/audio/renderers/renderer.h \
     streaming/audio/renderers/sdl.h \
     gui/computermodel.h \
@@ -477,6 +480,12 @@ gpuslow {
     DEFINES += GL_IS_SLOW VULKAN_IS_SLOW
 }
 wayland {
+    linux {
+        SOURCES += streaming/video/ffmpeg-renderers/gamescoperepaint.cpp \
+                   streaming/video/ffmpeg-renderers/protocols/gamescope-private-protocol.c
+        HEADERS += streaming/video/ffmpeg-renderers/gamescoperepaint.h \
+                   streaming/video/ffmpeg-renderers/protocols/gamescope-private-client-protocol.h
+    }
     message(Wayland extensions enabled)
 
     DEFINES += HAS_WAYLAND

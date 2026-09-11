@@ -136,6 +136,8 @@ bool loadCapture(const QString& path, Capture& capture, QString& error)
             capture.session.latencyFix = value(fields, columns, "param_latency_fix_enabled") != 0 && !allRates;
             capture.session.latencyMode = allRates ?
                 (value(fields, columns, "param_latency_fix_delay_period_per_mille") == 0 ? 2 : 1) : 0;
+            capture.session.readinessHitchFeedback = false; // Shared current policy.
+
         }
         const uint64_t preparation = value(fields, columns, "prepare_us");
         if (preparation != 0) {

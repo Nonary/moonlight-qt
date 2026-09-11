@@ -138,7 +138,6 @@ public:
     Q_PROPERTY(bool enableVsync MEMBER enableVsync NOTIFY enableVsyncChanged)
     Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
     Q_PROPERTY(int vrrLatencyMode MEMBER vrrLatencyMode NOTIFY vrrLatencyModeChanged)
-    Q_PROPERTY(bool gamescopeMailbox MEMBER gamescopeMailbox NOTIFY gamescopeMailboxChanged)
     Q_PROPERTY(bool smoothVrrFrameTiming MEMBER smoothVrrFrameTiming NOTIFY smoothVrrFrameTimingChanged)
     Q_PROPERTY(bool gameOptimizations MEMBER gameOptimizations NOTIFY gameOptimizationsChanged)
     Q_PROPERTY(bool playAudioOnHost MEMBER playAudioOnHost NOTIFY playAudioOnHostChanged)
@@ -188,7 +187,6 @@ public:
     bool enableVsync;
     bool enableVrr;
     int vrrLatencyMode;
-    bool gamescopeMailbox;
     // Re-present the last frame inside a host gap longer than the panel's
     // adaptive-refresh floor, so the panel never engages its own
     // low-framerate compensation.
@@ -234,7 +232,6 @@ signals:
     void enableVsyncChanged();
     void enableVrrChanged();
     void vrrLatencyModeChanged();
-    void gamescopeMailboxChanged();
     void smoothVrrFrameTimingChanged();
     void gameOptimizationsChanged();
     void playAudioOnHostChanged();

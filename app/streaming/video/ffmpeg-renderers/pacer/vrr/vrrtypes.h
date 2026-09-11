@@ -46,12 +46,13 @@ public:
                int frameNumber,
                uint32_t rtpTimestamp,
                bool timestampValid,
-               uint64_t decodeCompleteUs) :
+               uint64_t decoderOutputUs) :
         m_Frame(frame),
         m_FrameNumber(frameNumber),
         m_RtpTimestamp(rtpTimestamp),
         m_TimestampValid(timestampValid),
-        m_DecodeCompleteUs(decodeCompleteUs)
+        m_DecoderOutputUs(decoderOutputUs),
+        m_DecodeCompleteUs(decoderOutputUs)
     {
     }
 
@@ -68,8 +69,9 @@ public:
         return m_Frame.release();
     }
 
-    // The decoder's GPU work was observed to finish after the CPU reported
-    // completion: readiness moves to that later time.
+    // The historical decode-complete scheduling boundary advances when GPU
+    // work finishes, but the decoder-output timestamp remains unchanged for
+    // client-processing measurements.
     void noteGpuReadyUs(uint64_t gpuReadyUs)
     {
         if (gpuReadyUs > m_DecodeCompleteUs) {
@@ -100,6 +102,11 @@ public:
     uint64_t decodeCompleteUs() const
     {
         return m_DecodeCompleteUs;
+    }
+
+    uint64_t decoderOutputUs() const
+    {
+        return m_DecoderOutputUs;
     }
 
     // Pre-decode timeline of the same frame, all on the LiGetMicroseconds()
@@ -154,6 +161,7 @@ private:
     int m_FrameNumber = -1;
     uint32_t m_RtpTimestamp = 0;
     bool m_TimestampValid = false;
+    uint64_t m_DecoderOutputUs = 0;
     uint64_t m_DecodeCompleteUs = 0;
     uint64_t m_ReceiveUs = 0;
     uint64_t m_ReassembledUs = 0;

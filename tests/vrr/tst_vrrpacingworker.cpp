@@ -578,6 +578,66 @@ void testLatencyFixQueueAgeIncludesDecodeWait()
 
 void testTelemetrySnapshotsRemainCumulative()
 {
+    PacedFrame readinessProbe(nullptr, 1, 0, false, 100);
+    readinessProbe.noteGpuReadyUs(250);
+    expect(readinessProbe.decoderOutputUs() == 100 &&
+               readinessProbe.decodeCompleteUs() == 250,
+           "GPU readiness must not rewrite the decoder-output timestamp");
+
+    // Motion must reveal host-timed judder even when source fidelity is perfect.
+    PacerTelemetry motion;
+    VrrTelemetrySample motionSample;
+    motionSample.presented = true;
+    motionSample.submissionUs = 1000000;
+    motion.recordVrrFrame(motionSample);
+    for (int i = 0; i < 6; ++i) {
+        motionSample.submissionUs += i % 2 ? 16000 : 10000;
+        motion.recordVrrFrame(motionSample);
+    }
+    expect(motion.snapshot().vrrMotionPairs == 5 &&
+               motion.snapshot().vrrMotionHitches == 5,
+           "alternating host-spaced output must lower motion cadence");
+    motionSample.motionDiscontinuity = true;
+    motionSample.submissionUs += 1000000;
+    motion.recordVrrFrame(motionSample);
+    motionSample.motionDiscontinuity = false;
+    for (int i = 0; i < 3; ++i) {
+        motionSample.submissionUs += 16667;
+        motion.recordVrrFrame(motionSample);
+    }
+    expect(motion.snapshot().vrrMotionPairs == 7 &&
+               motion.snapshot().vrrMotionHitches == 5,
+           "an epoch reset must exclude downtime and stable lower FPS must score cleanly");
+    motion.recordVrrDrop();
+    motionSample.submissionUs += 33334;
+    motion.recordVrrFrame(motionSample);
+    expect(motion.snapshot().vrrMotionHitches == 6,
+           "a local drop must not hide the resulting motion hitch");
+
+    PacerTelemetry legacyTelemetry;
+    // Decode synchronization must not inflate the visible queue statistic.
+    PacerTelemetry decodeTelemetry;
+    VrrTelemetrySample decodeSample;
+    decodeSample.presented = true;
+    decodeSample.clientProcessingTimeUs = 10000;
+    decodeSample.renderingTimeUs = 1000;
+    decodeSample.decodeWaitUs = 4000;
+    decodeTelemetry.recordVrrFrame(decodeSample);
+    const auto decodeSnapshot = decodeTelemetry.snapshot();
+    expect(decodeSnapshot.totalQueuePacingTimeUs == 5000 &&
+           decodeSnapshot.totalClientProcessingTimeUs == 10000 &&
+           decodeSnapshot.totalRenderingTimeUs == 1000 &&
+           decodeSnapshot.vrrDecodeWaitUs == 4000,
+           "decode synchronization is diagnostic time, not visible queue delay");
+    legacyTelemetry.recordLegacyFrame(100, 40);
+    const PacerTelemetrySnapshot legacySnapshot =
+        telemetryStats(legacyTelemetry);
+    expect(legacySnapshot.renderedFrames == 1 &&
+               legacySnapshot.totalClientProcessingTimeUs == 100 &&
+               legacySnapshot.totalQueuePacingTimeUs == 60 &&
+               legacySnapshot.totalRenderingTimeUs == 40,
+           "legacy timing must use the same exact client-processing partition");
+
     PacerTelemetry telemetry;
     telemetry.beginVrrSession();
 
@@ -587,8 +647,8 @@ void testTelemetrySnapshotsRemainCumulative()
         for (uint64_t i = 1; i <= frameCount; ++i) {
             VrrTelemetrySample sample;
             sample.decisionTimeUs = i;
-            sample.pacerTimeUs = i;
-            sample.renderTimeUs = i * 2;
+            sample.clientProcessingTimeUs = i * 3;
+            sample.renderingTimeUs = i * 2;
             sample.prepareLate = (i % 2) == 0;
             sample.preparationLatenessUs = i;
             sample.cadenceIntervals = i / 2;
@@ -625,9 +685,12 @@ void testTelemetrySnapshotsRemainCumulative()
     delayedSubmission.cadenceIntervals = frameCount / 2;
     delayedSubmission.cadenceHitches = frameCount / 128;
     delayedSubmission.targetWaitEntryLate = true;
+    delayedSubmission.clientProcessingTimeUs = 1000000;
+    delayedSubmission.renderingTimeUs = 900000;
     telemetry.recordVrrFrame(delayedSubmission);
 
     const PacerTelemetrySnapshot finalSnapshot = telemetryStats(telemetry);
+    constexpr uint64_t sequenceSum = frameCount * (frameCount + 1) / 2;
     expect(finalSnapshot.vrrCadenceIntervals == frameCount / 2 &&
                finalSnapshot.vrrCadenceHitches == frameCount / 128,
            "publishing cumulative cadence snapshots must not count them repeatedly");
@@ -637,6 +700,13 @@ void testTelemetrySnapshotsRemainCumulative()
                finalSnapshot.renderedFrames == frameCount &&
                finalSnapshot.vrrEligibleFrames == frameCount + 1,
            "cumulative telemetry must retain every published frame");
+    expect(finalSnapshot.totalClientProcessingTimeUs == sequenceSum * 3 &&
+               finalSnapshot.totalQueuePacingTimeUs == sequenceSum &&
+               finalSnapshot.totalRenderingTimeUs == sequenceSum * 2 &&
+               finalSnapshot.totalClientProcessingTimeUs ==
+                   finalSnapshot.totalQueuePacingTimeUs +
+                       finalSnapshot.totalRenderingTimeUs,
+           "presented-frame timing must be paired and partition client processing exactly");
     expect(finalSnapshot.vrrPrepareLateFrames == frameCount / 2 &&
                finalSnapshot.vrrPrepareLatenessP50Us == 384 &&
                finalSnapshot.vrrPrepareLatenessP95Us == 500 &&
@@ -1411,6 +1481,8 @@ void testTraceCapturesEveryDeliveredFrame()
     SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
 }
 
+
+
 void testSmoothnessTraceCapturesReadinessPolicy()
 {
     resetFakeClock();
@@ -1548,6 +1620,39 @@ void testFailedCancellationNativeEvidenceIsTraced()
     SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
 }
 
+void testReconnectPreservesCompletedTraces()
+{
+    resetFakeClock();
+    QTemporaryDir directory;
+    expect(directory.isValid(), "reconnect trace directory must exist");
+    const QString tracePath = directory.filePath("capture.vrrtrace");
+    SDL_setenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(tracePath).constData(), 1);
+    QByteArray previous;
+    for (int connection = 1; connection <= 3; ++connection) {
+        FakeVrrFramePresenter backend;
+        TrackedFrameLifetime lifetime;
+        {
+            VrrPacingWorker worker(&backend, enabledConfig(), nullptr);
+            expect(worker.start(), "reconnected worker must start");
+            worker.submit(frame(connection, lifetime));
+            expect(backend.waitForPresentCount(1), "reconnected stream must present");
+        }
+        if (connection > 1) {
+            expect(readExpandedTrace(directory.filePath(
+                       QStringLiteral("capture-connection-%1.vrrtrace").arg(connection - 1))) == previous,
+                   "reconnect must preserve the previous complete trace unchanged");
+        }
+        const QByteArray current = readExpandedTrace(tracePath);
+        expect(current.contains("clean_shutdown=1,arrival_sequence_allocated=1"),
+               "canonical trace path must contain the latest complete connection");
+        expect(current != previous, "new connection must write its own frame data");
+        previous = current;
+    }
+    expect(!readExpandedTrace(directory.filePath("capture-connection-1.vrrtrace")).isEmpty(),
+           "third connection must retain the first archived capture");
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+}
+
 void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
 {
     resetFakeClock();
@@ -1573,7 +1678,9 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     {
         VrrPacingWorker worker(&backend, cachedConfig, &telemetry);
         expect(worker.start(), "worker must start for deep diagnostics testing");
-        worker.submit(frame(1, first));
+        auto input = frame(1, first);
+        input.noteGpuReadyUs(input.decoderOutputUs() + 1);
+        worker.submit(std::move(input));
         expect(backend.waitForPresentCount(1),
                "deep diagnostics must not suppress presentation");
     }
@@ -1590,6 +1697,19 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     const QByteArray row = lines.value(1);
     const QList<QByteArray> columns = header.split(',');
     const QList<QByteArray> fields = row.split(',');
+    expect(columns.size() == fields.size(), "diagnostic columns must align with every value");
+    expect(columns.contains("decoder_output_us") &&
+               fields.value(columns.indexOf("decoder_output_us")).toULongLong() > 0 &&
+               fields.value(columns.indexOf("decoder_output_us")).toULongLong() <
+                   fields.value(columns.indexOf("decode_complete_us")).toULongLong(),
+           "trace must retain the immutable decoder output separately from readiness");
+    expect(fields.value(columns.indexOf("session_latency_mode")) ==
+               QByteArray::number(cachedConfig.latencyMode) &&
+               fields.value(columns.indexOf("calibration_loaded")) == "1" &&
+               fields.value(columns.indexOf("initial_cached_samples")).toULongLong() >= 240 &&
+               fields.value(columns.indexOf("history_version")) == "18" &&
+               fields.value(columns.indexOf("history_state_valid")) == "1",
+           "capture must identify the active preset and loaded calibration independently of native present results");
     expect(columns.contains("presentation_uncertainty_us") &&
            fields.value(columns.indexOf("presentation_uncertainty_us")) == "0",
            "trace must preserve non-DXGI clock uncertainty, defaulting to zero for legacy presenters");
@@ -1780,6 +1900,7 @@ int main()
     testTraceCapturesEveryDeliveredFrame();
     testSmoothnessTraceCapturesReadinessPolicy();
     testFailedCancellationNativeEvidenceIsTraced();
+    testReconnectPreservesCompletedTraces();
     testDeepTraceRequestsNativeObservationsWithoutChangingMode();
 
     exportWarmHistoryReplayFixture();

@@ -133,6 +133,12 @@ private:
         uint32_t rtpTimestamp = 0;
         bool timestampValid = false;
         uint64_t decodeCompleteUs = 0;
+        uint64_t decoderOutputUs = 0;
+        int latencyMode = 0;
+        uint64_t historySamples = 0;
+        uint64_t historyMisses = 0;
+        uint64_t historyDurationUs = 0;
+        bool historyCanRelease = false;
         uint64_t receiveUs = 0;
         uint64_t reassembledUs = 0;
         uint64_t decodeSubmitUs = 0;
@@ -194,6 +200,9 @@ private:
     bool m_WorkerStarted = false;
     std::atomic_bool m_CalibrationInvalidated { false };
     QByteArray m_InitialPlayoutProfile;
+    bool m_CalibrationLoaded = false;
+    uint64_t m_InitialCachedSamples = 0;
+    int m_HistoryVersion = 0;
 
     std::unique_ptr<VrrTimingController> m_TimingController;
     std::unique_ptr<VrrTargetWaiter> m_TargetWaiter;

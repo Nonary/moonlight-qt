@@ -20,6 +20,9 @@
 
 #ifdef HAS_WAYLAND
 #include "waylandfeedback/wayland.h"
+#ifdef Q_OS_LINUX
+#include "gamescoperepaint.h"
+#endif
 #endif
 
 #ifdef Q_OS_DARWIN
@@ -172,6 +175,9 @@ private:
 #endif
 #ifdef HAS_WAYLAND
     std::unique_ptr<Vrr13::WaylandFeedback> m_PresentationFeedback;
+#ifdef Q_OS_LINUX
+    std::unique_ptr<GamescopeRepaint> m_GamescopeRepaint;
+#endif
 #endif
 
     std::unique_ptr<OverlayCompletion> m_OverlayCompletion;

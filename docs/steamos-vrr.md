@@ -1,16 +1,24 @@
+> The forced-composition and per-frame repaint checkboxes described historically
+> below are retired. Saved values no longer activate them. Use **Oscillate VRR
+> latency** for the current within-stream preset comparison; see
+> [the capture procedure](vrr-latency-captures.md).
+
 # SteamOS VRR and the performance overlay
 
 Investigated 2026-09-09 against Moonlight `faeff9bd` plus the existing local
 VRR work, Gamescope `3.16.10`, and upstream Gamescope
-`b385948cce5858e69d18e48c43c6baabdf258b85`. An affected SteamOS device has not
-yet been tested with the candidate. This is a source-backed fix candidate
-and a reversible workaround procedure, not confirmation of the reported cause.
+`b385948cce5858e69d18e48c43c6baabdf258b85`. Updated 2026-09-10 after testing
+on Gamescope 3.16.23.5: the application mode changed from FIFO to Mailbox, but
+the user still needed Steam's performance overlay for smooth motion. Mailbox
+alone did not resolve the symptom. The checkbox now tests forced composition
+instead; the saved Mailbox preference no longer affects production. See
+[capture findings](steamos-judder-20260910.md).
 
-## Candidate in Moonlight
+## Previous Mailbox experiment
 
 Linux VRR prefers Vulkan even for 8-bit SDR. Previously, Gamescope surfaces
 without Immediate support went straight to the WSI FIFO compatibility path;
-Mailbox was never queried. With the experiment enabled, the selector tries Immediate, then Mailbox,
+Mailbox was never queried. The retired experiment made the selector try Immediate, then Mailbox,
 and retains FIFO only for the existing Gamescope WSI exception when neither
 adaptive mode is exposed. Ordinary Wayland and X11/KMSDRM selection is unchanged.
 
@@ -90,17 +98,22 @@ Gamescope build.
 
 ## Checkbox A/B test
 
-On Linux, enable VRR to reveal **Test SteamOS VRR fix (experimental)** in
-Settings. It defaults to unchecked and is saved between launches. Reconnect
-the stream after each change; the setting is captured when the session starts.
+On Linux, Settings now offers **Test forced composition in Gaming Mode** in
+place of the Mailbox experiment. It defaults off and persists between launches.
+The old Mailbox setting is ignored. No Steam Launch Options changes are needed.
 
-- Unchecked (A): previous Gamescope selection, Immediate then the WSI FIFO fallback.
-- Checked (B): Immediate then Mailbox, then the WSI FIFO fallback.
+- Unchecked (A): leave Gamescope composition policy unchanged.
+- Checked (B): read and force composition for the stream, verify it, and restore
+  the previous setting on exit. An already-forced setting is preserved.
 
-Compare the same moving scene with the Steam performance overlay off and the
-same limiter settings. The session log records the experiment state and actual
-selected mode. If both runs select Immediate or FIFO, the checkbox did not
-change the presentation mode. Ordinary desktop Wayland and X11 are unaffected.
+Reconnect after changing it. Compare the same moving scene with Steam's
+performance overlay off and the same limiter settings. The log reports successful
+verification and restoration. If setup cannot be verified, Moonlight displays a
+launch error; uncheck the option to stream normally. Desktop Mode is unaffected.
+This experiment may increase GPU power use and has not yet been validated as a
+remedy for the reported motion. Setup/teardown commands never run on the pacing
+worker. Other software can still change the compositor policy during a stream;
+use the optional monitored launcher below when investigating that possibility.
 
 ## Determine which remedy works
 
@@ -126,3 +139,36 @@ Do not implement dummy frame repetition or increase Moonlight's playout buffer
 from this symptom alone. Vulkan submission statistics do not establish physical
 frame delivery. Use display feedback or an external recording when determining
 whether the candidate displays all frames, and measure latency separately.
+
+## Optional monitored composition test launcher
+
+`scripts/moonlight-gamescope-composition-test.py` runs the composition test in
+the existing Gaming Mode session, outside Distrobox. It requires a supplied
+`GAMESCOPE_WAYLAND_DISPLAY`, verifies support and the current value, enables
+composition, and reads the value back. It rechecks three seconds after launch
+and every ten seconds thereafter, logging any loss of the test condition.
+It restores the original value when the command exits, including failed launches
+and nonzero exits. An already-enabled value is preserved and explicitly reported
+as an unchanged test condition. SIGKILL or a system crash cannot run cleanup;
+the recovery command is `gamescopectl composite_force 0` if the prior value was 0.
+
+For the existing Moonlight Steam shortcut, temporarily use this Launch Options
+line (the script must be executable):
+
+```text
+/home/deck/sources/moonlight-qt/scripts/moonlight-gamescope-composition-test.py %command%
+```
+
+Leave the performance overlay off and keep the same stream settings and scene.
+Remove the Launch Options line for the ordinary comparison. The local convenience
+command `~/.local/bin/moonlight-dev-composite` runs the same test with
+`~/.local/bin/moonlight-dev` by default. Logs go to
+`~/moonlight-logs/composition-test-<time>-<pid>.log` beside the ordinary app logs.
+`--check` only verifies control support and reads the current state. A Desktop
+Mode refusal is expected; it does not validate the Gaming Mode workaround.
+
+The helper changes the current compositor's global composition setting only
+for the run. Extra GPU composition can affect power and latency. It does not
+simulate the overlay's repaint scheduling, so failure here leaves that other
+overlay effect unresolved. The installed-version control and composition branch
+are defined in [Gamescope 3.16.23.5](https://github.com/ValveSoftware/gamescope/blob/3.16.23.5/src/Backends/DRMBackend.cpp#L3496-L3497).

@@ -144,6 +144,7 @@ VkResult VulkanTiming::presentFrame(PFN_vkQueuePresentKHR next, VkQueue queue, c
     const uint64_t submitted = LiGetMicroseconds();
     const VkResult result = next(queue, &copy);
     if (accepted(result) && (!info->pResults || accepted(info->pResults[0]))) {
+        ++m_Statistics.submissions;
         m_Pending[m_Next++ % m_Pending.size()] = {m_Token, id, submitted};
         m_AcceptedId = id;
     }
@@ -157,23 +158,36 @@ void VulkanTiming::collect()
     // Gamescope consumes returned records. Query the count with zero input,
     // then request exactly that count, never an oversized capacity.
     uint32_t count = 0;
-    if (m_GetTimings(m_Device, m_Swapchain, &count, nullptr) != VK_SUCCESS || count > 256) return;
-    if (!count) return;
+    if (m_GetTimings(m_Device, m_Swapchain, &count, nullptr) != VK_SUCCESS || count > 256) {
+        ++m_Statistics.queryErrors;
+        return;
+    }
+    if (!count) { ++m_Statistics.emptyQueries; return; }
     std::array<VkPastPresentationTimingGOOGLE, 256> times{};
     const auto result = m_GetTimings(m_Device, m_Swapchain, &count, times.data());
-    if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+        ++m_Statistics.queryErrors;
+        return;
+    }
     count = std::min<uint32_t>(count, times.size());
+    m_Statistics.returned += count;
     const uint64_t before = LiGetMicroseconds();
     timespec clock{};
-    if (clock_gettime(CLOCK_MONOTONIC, &clock) != 0) return;
+    if (clock_gettime(CLOCK_MONOTONIC, &clock) != 0) {
+        m_Statistics.clockRejected += count;
+        return;
+    }
     const uint64_t observed = LiGetMicroseconds();
-    if (observed < before || observed - before > 998) return;
+    if (observed < before || observed - before > 998) {
+        m_Statistics.clockRejected += count;
+        return;
+    }
     const int64_t offset = int64_t(before + (observed - before) / 2) -
         (int64_t(clock.tv_sec) * 1000000 + clock.tv_nsec / 1000);
     const bool clockJump = m_HaveOffset && std::abs(offset - m_Offset) > 1000;
     m_Offset = offset;
     m_HaveOffset = true;
-    if (clockJump) { reset(); return; }
+    if (clockJump) { m_Statistics.clockRejected += count; reset(); return; }
     std::sort(times.begin(), times.begin() + count, [](const auto& a, const auto& b) {
         return a.actualPresentTime < b.actualPresentTime;
     });
@@ -182,13 +196,15 @@ void VulkanTiming::collect()
         auto p = std::find_if(m_Pending.begin(), m_Pending.end(), [&](const auto& pending) {
             return pending.token && pending.token == t.presentID;
         });
-        if (p == m_Pending.end()) continue;
+        if (p == m_Pending.end()) { ++m_Statistics.unmatched; continue; }
         const auto pending = *p;
         *p = {};
         const int64_t converted = int64_t(t.actualPresentTime / 1000) + offset;
-        if (!t.actualPresentTime || converted <= 0 || uint64_t(converted) < pending.submitted ||
-            uint64_t(converted) > observed || observed - uint64_t(converted) > 100000) continue;
-        if (m_SkipFirst) { m_SkipFirst = false; continue; }
+        if (!t.actualPresentTime || converted <= 0) { ++m_Statistics.invalid; continue; }
+        if (uint64_t(converted) < pending.submitted) { ++m_Statistics.beforeSubmission; continue; }
+        if (uint64_t(converted) > observed) { ++m_Statistics.future; continue; }
+        if (observed - uint64_t(converted) > 100000) { ++m_Statistics.stale; continue; }
+        if (m_SkipFirst) { m_SkipFirst = false; ++m_Statistics.warmupSkipped; continue; }
         if (m_Completed.size() == 64) m_Completed.pop_front();
         m_Completed.push_back({pending.id, uint64_t(converted), (observed - before + 1) / 2 + 1});
     }
@@ -206,6 +222,7 @@ void VulkanTiming::finish(VrrPresentFeedback& feedback)
     if (m_Completed.empty()) return;
     const auto sample = m_Completed.front();
     m_Completed.pop_front();
+    ++m_Statistics.emitted;
     feedback.latchSampleValid = true;
     feedback.latchTimeKind = Vrr13::PresentationTimeKind::DisplayEvent;
     feedback.latchSubmissionId = sample.id;

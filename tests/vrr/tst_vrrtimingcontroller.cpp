@@ -52,6 +52,7 @@ VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
     policy.playoutPredictionEnabled = 0;
     policy.playoutSmoothnessFeedbackEnabled = 0;
     policy.playoutSmoothingGainPerMille = session.smoothFrameTiming ? 200 : 0;
+    policy.playoutSmoothingMaxLagUs = 6000;
     policy.playoutDelayMaximumUs = 8000;
     policy.playoutDelayMaximumPeriodPerMille = 950;
     policy.playoutDelayAttackUs = 50;
@@ -68,6 +69,8 @@ VrrTimingParameters legacyFeedbackParameters(const VrrSessionConfig& session)
     policy.playoutSubmissionEstimateFallback = 0;
     policy.playoutNativeHitchAdaptation = 1;
     policy.playoutDelayMarginUs = 300;
+    policy.playoutSmoothingGainPerMille = 0;
+    policy.playoutSmoothingMaxLagUs = 6000;
     return policy;
 }
 
@@ -3396,6 +3399,8 @@ void testSubmissionEstimateFallback()
     }
 }
 
+
+
 void testReadinessHitchAttribution()
 {
     using Feedback = Vrr13::ReadinessFeedback;
@@ -3509,6 +3514,7 @@ void testPredictionOnlyBufferAdaptation()
         expect(controller.nativeCadenceIntervals() == 0,
                "bidirectional predictive adaptation must work with no display-event coverage");
     }
+
     // Low-rate desktop delivery must not expand protection past 16 ms.
     for (int fps : {20, 30, 60}) {
         auto desktopSession = config(fps, 120);
@@ -3548,7 +3554,8 @@ void testPredictionOnlyBufferAdaptation()
         const auto a = control.schedule(frame(i, uint32_t(i * 1500), true, at), at);
         const auto b = feedback.schedule(frame(i, uint32_t(i * 1500), true, at), at);
         identical &= a.targetUs == b.targetUs && a.renderStartUs == b.renderStartUs &&
-            a.playoutDelayUs == b.playoutDelayUs && b.compositorLeadUs == 0;
+            a.playoutDelayUs == b.playoutDelayUs && b.compositorLeadUs == 0 &&
+            a.smoothnessProtectionUs == b.smoothnessProtectionUs;
         if (!i) initial = a.playoutDelayUs;
         finalDelay = a.playoutDelayUs;
         for (auto* c : {&control, &feedback}) {
@@ -3569,6 +3576,8 @@ void testPredictionOnlyBufferAdaptation()
            "display-only hitches must neither inflate padding, block release nor move render deadlines");
     expect(feedback.nativeCadenceHitches() > 100,
            "ignored display timing must remain available as optional diagnostic evidence");
+    expect(feedback.estimatedCadenceIntervals() > 900,
+           "submission prediction must remain the production cadence report");
 
     Vrr13::Reserve oldHistory(17);
     oldHistory.observe(46000000, 16000000);
@@ -3579,9 +3588,87 @@ void testPredictionOnlyBufferAdaptation()
            "prediction-only profiles must remain loadable for trace initialization");
 }
 
+void testProductionSmoothFrameTiming()
+{
+    // Approx. 77 FPS with alternating 11/15 ms source intervals. Exercise
+    // the actual session resolver and adaptive buffer at every latency preset.
+    for (int mode : {0, 1, 2}) {
+        struct Result {
+            uint64_t jerk = 0;
+            uint64_t latency = 0;
+            unsigned samples = 0;
+        } results[2];
+        for (int enabled : {0, 1}) {
+            auto session = config(120, 120);
+            session.latencyMode = mode;
+            session.smoothFrameTiming = enabled != 0;
+            const auto policy = vrrTimingParametersForSession(session);
+            expect(policy.playoutSmoothingGainPerMille == (enabled ? 500 : 0) &&
+                       policy.playoutSmoothingMaxLagUs == 2000 &&
+                       policy.playoutMetronomeEnabled == 0,
+                   "the preference must select moderate smoothing independently of the timing preset");
+            VrrTimingController controller(session, true, policy);
+            uint32_t ticks = 0;
+            uint64_t lastSubmission = 0, previousInterval = 0;
+            for (int i = 0; i < 1800; ++i) {
+                // A host stall, then a sustained change to 60 FPS, must not
+                // trap the smoother at the original rate or grow phase debt.
+                ticks += i == 600 ? 4500 : i >= 900 ? 1500 :
+                    (i % 2 ? 1350 : 990);
+                const auto decoded = decodedTimeForRtp(1000000, ticks);
+                const auto now = std::max(decoded, lastSubmission);
+                const auto d = controller.schedule(frame(i, ticks, true, decoded), now);
+                const uint64_t lateWake = i == 750 ? 4000 : 0;
+                const auto ready = std::max(now, d.renderStartUs) + 1000 + lateWake;
+                const auto submitted = std::max(d.targetUs, ready);
+                controller.notePreparationDuration(1000);
+                controller.noteSchedulerDelays(lateWake, 0, true);
+                controller.noteSubmission(true, false, submitted);
+                expect(d.cadenceSmoothingUs <= 2000 &&
+                           (enabled || d.cadenceSmoothingUs == 0),
+                       "smoothing must respect its positive retiming cap and the off switch");
+                expect(submitted >= decoded && submitted - decoded <= 30000 &&
+                           d.playoutDelayUs <= controller.playoutQueueLimitUs(),
+                       "host jitter, stalls and rate changes must retain bounded latency and queue capacity");
+                if (i == 600) {
+                    expect(d.cadenceSmoothingUs == 0,
+                           "a host stall must restart smoothing on the raw source slot");
+                }
+                if (i > 1200) {
+                    expect(std::abs(int64_t(controller.sourcePeriodUs()) - 16667) <= 2 &&
+                               std::abs(d.cadenceSmoothingUs) <= 100,
+                           "the smoother must settle at a new source rate without persistent phase debt");
+                }
+                const uint64_t interval = submitted - lastSubmission;
+                if (i >= 200 && i < 600) {
+                    results[enabled].jerk += interval > previousInterval ?
+                        interval - previousInterval : previousInterval - interval;
+                    results[enabled].latency += submitted - decoded;
+                    ++results[enabled].samples;
+                }
+                previousInterval = interval;
+                lastSubmission = submitted;
+            }
+        }
+        expect(results[1].jerk * 2 < results[0].jerk,
+               "moderate smoothing must more than halve adjacent interval wobble near 77 FPS");
+        std::fprintf(stderr, "production smoothing mode %d: mean jerk %llu -> %llu us, latency %llu -> %llu us\n",
+                     mode, static_cast<unsigned long long>(results[0].jerk / results[0].samples),
+                     static_cast<unsigned long long>(results[1].jerk / results[1].samples),
+                     static_cast<unsigned long long>(results[0].latency / results[0].samples),
+                     static_cast<unsigned long long>(results[1].latency / results[1].samples));
+        // Unlike the captured stream, this clean-delivery fixture has little
+        // spare buffering. Retiming can acquire extra readiness protection;
+        // bound its average cost to 4 ms, well below one 13 ms source frame.
+        expect(results[1].latency <= results[0].latency + results[1].samples * 4000ULL,
+               "moderate smoothing must add at most 4 ms average latency under alternating host jitter");
+    }
+}
+
 void testProductionPreservesRelativeGameSpacing()
 {
-    const auto session = config(120, 120);
+    auto session = config(120, 120);
+    session.smoothFrameTiming = false;
     auto policy = vrrTimingParametersForSession(session);
     expect(policy.playoutDelayMaximumUs == 16000 &&
                policy.playoutDelayMaximumPeriodPerMille == 0 &&
@@ -3992,6 +4079,7 @@ int main()
     testNativeHitchGatesPadding();
     testDelayedDisplayEventsAgreeAcrossBackends();
     testProductionPreservesRelativeGameSpacing();
+    testProductionSmoothFrameTiming();
     testReadinessDrivenPadding();
     testStableNativeSmoothnessReference();
     testPreparationKeepsLearnedLead();

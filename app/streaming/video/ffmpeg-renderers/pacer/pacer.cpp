@@ -306,9 +306,8 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
     // rejection continues through the original fixed path below.
     if (enableVrr) {
         VrrSessionConfig config;
-#ifdef Q_OS_LINUX
-        config.readinessHitchFeedback = true;
-#endif
+// All native backends use the shared prediction-based buffer policy.
+        config.readinessHitchFeedback = false;
         config.latencyMode = vrrLatencyMode >= 0 && vrrLatencyMode <= 2 ? vrrLatencyMode : 1;
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         if (!calibrationKey.isEmpty()) {
@@ -316,8 +315,17 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
             auto context = calibrationKey + QString("|%1|%2|%3|%4")
                 .arg(display).arg(maxVideoFps).arg(vrrDisplayRefreshHz)
                 .arg(smoothVrrFrameTiming);
+#ifdef Q_OS_LINUX
+            // Do not seed the shared policy with retired Linux hitch-policy history.
+            context += QStringLiteral("|shared-readiness-policy-v18");
+#endif
             if (config.latencyMode != 0) {
                 context += QStringLiteral("|latency-mode=%1").arg(config.latencyMode);
+            }
+            if (smoothVrrFrameTiming) {
+                // The saved flag previously selected timestamp-following
+                // playout too. Do not cross-seed its readiness calibration.
+                context += QStringLiteral("|frame-smoothing=500-100-2000");
             }
             config.calibrationKey = QCryptographicHash::hash(context.toUtf8(), QCryptographicHash::Sha256).toHex().toStdString();
             config.calibrationPath = Path::getCacheFileInfo("vrr13-calibration.json").absoluteFilePath().toStdString();
@@ -475,15 +483,17 @@ void Pacer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
 
 void Pacer::renderFrame(AVFrame* frame)
 {
-    // Count time spent in Pacer's queues
-    uint64_t beforeRender = LiGetMicroseconds();
+    const uint64_t decoderOutputUs =
+        static_cast<uint64_t>(frame->pkt_dts);
+    const uint64_t beforeRender = LiGetMicroseconds();
     // Render it
     m_VsyncRenderer->renderFrame(frame);
-    uint64_t afterRender = LiGetMicroseconds();
+    const uint64_t afterRender = LiGetMicroseconds();
 
     m_Telemetry.recordLegacyFrame(
-        beforeRender - static_cast<uint64_t>(frame->pkt_dts),
-        afterRender - beforeRender);
+        afterRender >= decoderOutputUs ?
+            afterRender - decoderOutputUs : 0,
+        afterRender >= beforeRender ? afterRender - beforeRender : 0);
 
     // Wait until after next frame to free this one to ensure the GPU
     // doesn't stall or read garbage if the backing buffer gets returned

@@ -23,6 +23,10 @@ unix:!macx:packagesExist(libplacebo) {
 
 incomingtiming.file = $$PWD/incomingtiming.pro
 SUBDIRS += incomingtiming
+amddecodepolicy.file = $$PWD/amddecodepolicy.pro
+SUBDIRS += amddecodepolicy
+gamescopecomposition.file = $$PWD/gamescopecomposition.pro
+SUBDIRS += gamescopecomposition
 linux:packagesExist(vulkan) {
     vulkantiming.file = $$PWD/vulkantiming.pro
     SUBDIRS += vulkantiming
@@ -53,3 +57,8 @@ overlay.file = $$PWD/overlay.pro
 SUBDIRS += overlay
 profile.file = $$PWD/profile.pro
 SUBDIRS += profile
+
+linux:packagesExist(wayland-client wayland-server) {
+    gamescoperepaint.file = $$PWD/gamescoperepaint.pro
+    SUBDIRS += gamescoperepaint
+}

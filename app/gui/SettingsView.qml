@@ -933,17 +933,17 @@ Flickable {
 
                 CheckBox {
                     hoverEnabled: true
-                    text: qsTr("Test SteamOS VRR fix (experimental)")
+                    text: qsTr("Smooth frame timing")
                     font.pointSize: 12
-                    visible: Qt.platform.os === "linux" && StreamingPreferences.enableVrr
+                    visible: StreamingPreferences.enableVrr
                     enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
-                    checked: StreamingPreferences.gamescopeMailbox
-                    onCheckedChanged: StreamingPreferences.gamescopeMailbox = checked
+                    checked: StreamingPreferences.smoothVrrFrameTiming
+                    onCheckedChanged: StreamingPreferences.smoothVrrFrameTiming = checked
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
                     ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Tests an alternative presentation mode in SteamOS Gaming Mode (Gamescope) that may reduce stutter. Uncheck to compare with the previous behavior. Reconnect the stream after changing this setting.")
+                    ToolTip.text: qsTr("Reduces small variations in host frame timing for steadier motion. May add a little delay. Uncheck to follow the host's frame timing more closely. Reconnect the stream after changing this setting.")
                 }
 
                 CheckBox {

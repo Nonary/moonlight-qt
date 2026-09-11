@@ -10,13 +10,22 @@
 // It only appends a timing ID; desiredPresentTime remains zero.
 class VulkanTiming {
 public:
+    struct Statistics {
+        uint64_t submissions = 0, returned = 0, emitted = 0;
+        uint64_t unmatched = 0, beforeSubmission = 0, future = 0, stale = 0;
+        uint64_t invalid = 0, clockRejected = 0, warmupSkipped = 0;
+        uint64_t emptyQueries = 0, queryErrors = 0;
+    };
     ~VulkanTiming();
     static PFN_vkGetInstanceProcAddr bridge(PFN_vkGetInstanceProcAddr loader);
     bool initialize(VkDevice device);
     void begin(uint64_t id) { m_ArmedId = id; m_AcceptedId = 0; }
     void finish(VrrPresentFeedback& feedback);
     void reset();
+    const Statistics& statistics() const { return m_Statistics; }
 private:
+    // Cumulative across swapchain resets; observation only, never pacing input.
+    Statistics m_Statistics;
     struct Pending { uint32_t token = 0; uint64_t id = 0, submitted = 0; };
     struct Completed { uint64_t id = 0, time = 0, uncertainty = 0; };
     static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL instanceProc(VkInstance, const char*);

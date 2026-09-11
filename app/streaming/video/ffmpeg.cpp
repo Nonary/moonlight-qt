@@ -857,6 +857,11 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.vrrPacingDroppedFrames += src.vrrPacingDroppedFrames;
     dst.vrrEligibleFrames += src.vrrEligibleFrames;
     dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
+    dst.vrrQueueResidenceUs += src.vrrQueueResidenceUs;
+    dst.vrrDecodeWaitUs += src.vrrDecodeWaitUs;
+    dst.vrrBufferUs += src.vrrBufferUs;
+    dst.vrrMotionPairs += src.vrrMotionPairs;
+    dst.vrrMotionHitches += src.vrrMotionHitches;
     dst.vrrCadenceIntervals += src.vrrCadenceIntervals;
     dst.vrrCadenceHitches += src.vrrCadenceHitches;
     dst.vrrEstimatedCadenceIntervals += src.vrrEstimatedCadenceIntervals;
@@ -894,8 +899,9 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     }
     dst.totalReassemblyTimeUs += src.totalReassemblyTimeUs;
     dst.totalDecodeTimeUs += src.totalDecodeTimeUs;
-    dst.totalPacerTimeUs += src.totalPacerTimeUs;
-    dst.totalRenderTimeUs += src.totalRenderTimeUs;
+    dst.totalClientProcessingTimeUs += src.totalClientProcessingTimeUs;
+    dst.totalQueuePacingTimeUs += src.totalQueuePacingTimeUs;
+    dst.totalRenderingTimeUs += src.totalRenderingTimeUs;
 
     if (dst.minHostProcessingLatency == 0) {
         dst.minHostProcessingLatency = src.minHostProcessingLatency;
@@ -955,12 +961,15 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
     m_ActiveWndVideoStats.pacerDroppedFrames += static_cast<uint32_t>(
         delta(snapshot.pacerDroppedFrames,
               m_LastPacerTelemetry.pacerDroppedFrames));
-    m_ActiveWndVideoStats.totalPacerTimeUs +=
-        delta(snapshot.totalPacerTimeUs,
-              m_LastPacerTelemetry.totalPacerTimeUs);
-    m_ActiveWndVideoStats.totalRenderTimeUs +=
-        delta(snapshot.totalRenderTimeUs,
-              m_LastPacerTelemetry.totalRenderTimeUs);
+    m_ActiveWndVideoStats.totalClientProcessingTimeUs +=
+        delta(snapshot.totalClientProcessingTimeUs,
+              m_LastPacerTelemetry.totalClientProcessingTimeUs);
+    m_ActiveWndVideoStats.totalQueuePacingTimeUs +=
+        delta(snapshot.totalQueuePacingTimeUs,
+              m_LastPacerTelemetry.totalQueuePacingTimeUs);
+    m_ActiveWndVideoStats.totalRenderingTimeUs +=
+        delta(snapshot.totalRenderingTimeUs,
+              m_LastPacerTelemetry.totalRenderingTimeUs);
 
     m_ActiveWndVideoStats.vrrTelemetryActive =
         m_ActiveWndVideoStats.vrrTelemetryActive || snapshot.vrrActive;
@@ -973,6 +982,16 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
     m_ActiveWndVideoStats.vrrPrepareLateFrames +=
         delta(snapshot.vrrPrepareLateFrames,
               m_LastPacerTelemetry.vrrPrepareLateFrames);
+    m_ActiveWndVideoStats.vrrQueueResidenceUs +=
+        delta(snapshot.vrrQueueResidenceUs, m_LastPacerTelemetry.vrrQueueResidenceUs);
+    m_ActiveWndVideoStats.vrrDecodeWaitUs +=
+        delta(snapshot.vrrDecodeWaitUs, m_LastPacerTelemetry.vrrDecodeWaitUs);
+    m_ActiveWndVideoStats.vrrBufferUs +=
+        delta(snapshot.vrrBufferUs, m_LastPacerTelemetry.vrrBufferUs);
+    m_ActiveWndVideoStats.vrrMotionPairs +=
+        delta(snapshot.vrrMotionPairs, m_LastPacerTelemetry.vrrMotionPairs);
+    m_ActiveWndVideoStats.vrrMotionHitches +=
+        delta(snapshot.vrrMotionHitches, m_LastPacerTelemetry.vrrMotionHitches);
     m_ActiveWndVideoStats.vrrCadenceIntervals +=
         delta(snapshot.vrrCadenceIntervals, m_LastPacerTelemetry.vrrCadenceIntervals);
     m_ActiveWndVideoStats.vrrCadenceHitches +=
@@ -1200,8 +1219,8 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                        (float)stats.pacerDroppedFrames / stats.decodedFrames * 100,
                        rttString,
                        (double)(stats.totalDecodeTimeUs / 1000.0) / stats.decodedFrames,
-                       (double)(stats.totalPacerTimeUs / 1000.0) / stats.renderedFrames,
-                       (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames);
+                       (double)(stats.totalQueuePacingTimeUs / 1000.0) / stats.renderedFrames,
+                       (double)(stats.totalRenderingTimeUs / 1000.0) / stats.renderedFrames);
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);
             return;
@@ -2140,13 +2159,16 @@ void FFmpegVideoDecoder::decoderThreadProc()
             do {
                 err = avcodec_receive_frame(m_VideoDecoderCtx, frame);
                 if (err == 0) {
+                    // This is the immutable origin for client-processing
+                    // timing. Capture it immediately when FFmpeg exposes the
+                    // decoded frame, before any metadata or handoff work.
+                    const uint64_t decoderOutputUs = LiGetMicroseconds();
                     SDL_assert(m_FrameInfoQueue.size() == m_FramesIn - m_FramesOut);
                     m_FramesOut++;
 
-                    // Only active VRR needs decoder-facing pacing metadata.
-                    // Keep legacy handoff and its AVFrame-only path unchanged.
+                    // Only active VRR needs the rest of the decoder-facing
+                    // pacing metadata.
                     const bool vrrActive = m_Pacer->isVrrActive();
-                    uint64_t decodeCompleteUs = 0;
                     int frameNumber = -1;
                     uint32_t rtpTimestamp = 0;
                     bool timestampValid = false;
@@ -2159,7 +2181,6 @@ void FFmpegVideoDecoder::decoderThreadProc()
                         // still available. RTP timestamp 0 is valid, so
                         // validity is represented separately rather than
                         // inferred from the raw value.
-                        decodeCompleteUs = LiGetMicroseconds();
                         if (!m_FrameInfoQueue.isEmpty()) {
                             // Snapshot without moving the legacy dequeue point.
                             const DECODE_UNIT& du = m_FrameInfoQueue.head();
@@ -2168,7 +2189,7 @@ void FFmpegVideoDecoder::decoderThreadProc()
                             timestampValid = true;
                             // First packet from the network and completed
                             // reassembly, stamped by moonlight-common-c on
-                            // the same clock as decodeCompleteUs.
+                            // the same clock as decoderOutputUs.
                             receiveUs = du.receiveTimeUs;
                             reassembledUs = du.enqueueTimeUs;
                         }
@@ -2243,18 +2264,14 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     // Restore default log level after a successful decode
                     av_log_set_level(AV_LOG_INFO);
 
-                    // Keep the established legacy pacing timestamp at its
-                    // original handoff point. VRR never reads pkt_dts: its
-                    // PacedFrame carries the earlier decoder-complete stamp.
-                    frame->pkt_dts = LiGetMicroseconds();
+                    // Legacy pacing carries the same immutable decoder-output
+                    // origin in pkt_dts. VRR keeps it in PacedFrame.
+                    frame->pkt_dts = static_cast<int64_t>(decoderOutputUs);
 
                     if (!m_FrameInfoQueue.isEmpty()) {
                         // Data buffers in the DU are not valid here!
                         DECODE_UNIT du = m_FrameInfoQueue.dequeue();
 
-                        // Preserve the legacy measurement point. VRR's
-                        // decode-complete timestamp above is intentionally a
-                        // separate, earlier value used only for scheduling.
                         m_ActiveWndVideoStats.totalDecodeTimeUs +=
                             (LiGetMicroseconds() - du.enqueueTimeUs);
 
@@ -2274,7 +2291,7 @@ void FFmpegVideoDecoder::decoderThreadProc()
                                               frameNumber,
                                               rtpTimestamp,
                                               timestampValid,
-                                              decodeCompleteUs);
+                                              decoderOutputUs);
                         pacedFrame.setDeliveryTimeline(receiveUs,
                                                        reassembledUs,
                                                        decodeSubmitUs);
@@ -2373,7 +2390,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
             addVideoStats(m_LastWndVideoStats, lastTwoWndStats);
             addVideoStats(m_ActiveWndVideoStats, lastTwoWndStats);
 
-            char text[1024];
+            char text[2048];
             stringifyVideoStats(lastTwoWndStats, text, sizeof(text));
             Session::get()->getOverlayManager().updateOverlayText(Overlay::OverlayDebug, text);
         }
