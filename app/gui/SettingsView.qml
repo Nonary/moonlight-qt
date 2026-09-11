@@ -933,7 +933,7 @@ Flickable {
 
                 CheckBox {
                     hoverEnabled: true
-                    text: qsTr("Smooth frame timing")
+                    text: qsTr("Reduce judder")
                     font.pointSize: 12
                     visible: StreamingPreferences.enableVrr
                     enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
@@ -943,7 +943,8 @@ Flickable {
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
                     ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Reduces small variations in host frame timing for steadier motion. May add a little delay. Uncheck to follow the host's frame timing more closely. Reconnect the stream after changing this setting.")
+                    ToolTip.text: qsTr("Gently adjusts when frames are displayed to reduce uneven timing, using existing buffering to keep added latency low. Does not blend images or eliminate game stalls.") + "\n\n" +
+                                  qsTr("Reconnect the stream after changing this setting.")
                 }
 
                 CheckBox {

@@ -822,11 +822,12 @@ timeline for that display; controller/cadence results remain available:
 .\vrr\release\vrrreplay.exe capture.vrrtrace --display-hz 120 --stream-fps 116
 ```
 
-VRR uses adaptive timestamp playout with a **Smooth frame timing** preference
+VRR uses adaptive timestamp playout with a **Reduce judder** preference
 under the VRR checkbox. It defaults to enabled, preserving saved preference choices,
 and is snapshotted for the stream, including decoder resets. The stream CLI
 can override it with `--vrr-smooth-frame-timing` or
-`--no-vrr-smooth-frame-timing` without saving the override.
+`--no-vrr-smooth-frame-timing` without saving the override. The label rename
+preserves the `smoothvrrframetiming` saved preference key.
 
 Disabling smoothing follows mapped RTP intervals more closely. It disables
 both `controller.playout_metronome_enabled` and

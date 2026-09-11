@@ -6,7 +6,7 @@ It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
 Source baseline: `e7b05319` plus the local client-processing,
-vrr14-style compact stats reporting, restored Smooth frame timing, reconnect
+vrr14-style compact stats reporting, restored Reduce judder, reconnect
 trace preservation, motion cadence telemetry, hard buffer ceiling, AMD low-latency decode request, observed-latency trace diagnostics, and removal of the latency oscillation test,
 inspected 2026-09-11. The latency
 presets and persistent Vulkan presentation changes remain active.
@@ -303,7 +303,7 @@ the live path records and which parts replay holds fixed.
 `StreamingPreferences` persists ordinary settings through `QSettings`.
 At the inspected revision, V-sync defaults on and VRR defaults off. The VRR
 timing selector defaults to Balanced for new users, with the saved-checkbox
-migration described above. Smooth frame timing defaults on, preserves the saved
+migration described above. Reduce judder defaults on, preserves the saved
 `smoothvrrframetiming` choice, and enables the moderate cadence smoother below.
 Legacy frame pacing defaults off. The default requested stream is 720p60.
 These are defaults, not evidence of the user's current saved settings.
@@ -634,7 +634,7 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | Delay attack | At most 500 us per update |
 | Delay release input | 10 us, scaled by elapsed time at a 120 FPS reference rate |
 | Prediction margin | Both platforms: 3,000 us above estimated readiness demand, inside preset caps |
-| Smoothing gain | 500 when Smooth frame timing is checked; 0 when unchecked |
+| Smoothing gain | 500 when Reduce judder is checked; 0 when unchecked |
 | Smoothing period EMA | 100 per mille; active only with smoothing enabled |
 | Positive smoothing lag cap | 2,000 us; active only with smoothing enabled |
 | Render lead floor | 3,000 us |
@@ -682,11 +682,14 @@ timestamp production behavior.
 
 ### 8.3 Cadence smoothing
 
-The restored **Smooth frame timing** checkbox controls cadence smoothing
+The **Reduce judder** checkbox controls cadence smoothing
 independently of the three VRR timing presets. It defaults on and preserves
 existing saved choices. Session startup snapshots it, including across decoder
 resets; reconnect after changing it. The stream CLI can override it with
 `--vrr-smooth-frame-timing` or `--no-vrr-smooth-frame-timing` without saving.
+The label rename preserves the `smoothvrrframetiming` INI key and
+`smoothVrrFrameTiming` QML property, so existing enabled and disabled choices
+carry over unchanged.
 
 Unchecked, production follows relative RTP spacing while buffering delivery
 variation. Checked, it blends the predicted source slot equally with the raw
@@ -801,7 +804,7 @@ Preparing immediately at arrival remains an experiment, not production default.
 `schedule()` retains a pending probe: decoded time, intended source slot,
 period, typical render cost, applied delay, guard, and decoder backlog.
 The readiness-driven policy uses the scheduled source slot with playout padding
-removed. With Smooth frame timing enabled, the smoothed slot remains the
+removed. With Reduce judder enabled, the smoothed slot remains the
 readiness reference; otherwise the raw mapped source slot is used.
 Preparation and scheduler measurements are recorded for future decisions.
 On successful non-cancelled submission, `ReadinessPrediction` models expected
