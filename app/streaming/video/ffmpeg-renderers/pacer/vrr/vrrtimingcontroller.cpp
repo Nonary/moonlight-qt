@@ -126,6 +126,8 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.latencyFixEnabled = config.latencyFix || latencyMode != 0 ? 1 : 0;
     parameters.latencyFixAllRates = latencyMode != 0 ? 1 : 0;
     parameters.latencyFixDelayPeriodPerMille = latencyMode == 2 ? 0 : 500;
+    parameters.playoutDelayCapSourcePeriodPerMille = config.latencyFix ? 0 :
+        latencyMode == 2 ? 500 : latencyMode == 1 ? 1000 : 2000;
     parameters.playoutPredictionOnly = 1;
     parameters.playoutNativeHitchAdaptation = 0;
     // Display observations are optional diagnostics. They never steer the
@@ -162,7 +164,9 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutSmoothingMaxLagUs = kPlayoutSmoothingMaxLagUs;
     parameters.playoutMetronomeEnabled = 0;
     parameters.playoutDelayStartPeriodPerMille = kPlayoutStartPeriodPerMille;
-    parameters.playoutDelayMaximumPeriodPerMille = 0;
+    // Keep the learner's input ceiling at least as large as the Smoothest
+    // preset; the selected source-frame cap applies after this maximum.
+    parameters.playoutDelayMaximumPeriodPerMille = 2000;
     parameters.playoutSmoothingSnapPerMille = kPlayoutMetronomeSnapPerMille;
     parameters.playoutOffsetReseedFrames = kPlayoutOffsetReseedFrames;
     parameters.playoutDelaySlewAcrossBands = 1;
@@ -549,8 +553,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     const uint64_t proposedPlayoutDelayUs = timestampPlayout ?
         (metronomeEnabled() ? delayBeforeUs : effectivePlayoutDelayUs()) :
         m_Parameters.sourcePlayoutDelayUs;
-    const uint64_t playoutDelayUs = m_LatencyFixActive ?
-        std::min(proposedPlayoutDelayUs, latencyFixDelayLimitUs()) : proposedPlayoutDelayUs;
+    const uint64_t playoutDelayUs =
+        std::min(proposedPlayoutDelayUs, playoutDelayCapUs());
     const uint64_t renderOffsetUs = m_Parameters.playoutPredictionEnabled ? typicalRenderUs() : m_RenderLeadUs;
     const uint64_t compositorLeadUs = m_Parameters.playoutPredictionEnabled &&
         !m_Parameters.playoutPredictionOnly ? m_PresentationPrediction.lead(nowUs) : 0;
@@ -1998,7 +2002,7 @@ uint64_t VrrTimingController::playoutDelayUs() const
 {
     const uint64_t delayUs = m_TimestampPlayoutActive ? effectivePlayoutDelayUs() :
                                                       m_Parameters.sourcePlayoutDelayUs;
-    return m_LatencyFixActive ? std::min(delayUs, latencyFixDelayLimitUs()) : delayUs;
+    return std::min(delayUs, playoutDelayCapUs());
 }
 
 unsigned int VrrTimingController::playoutBandIndex() const
@@ -2022,19 +2026,17 @@ uint64_t VrrTimingController::effectivePlayoutDelayUs() const
         // Before the first band opens, the delay the band will open with.
         const uint64_t delayUs = m_PlayoutBandValid ? m_AppliedPlayoutDelayUs :
                                                     playoutDelayStartUs();
-        return m_LatencyFixActive ? std::min(delayUs, latencyFixDelayLimitUs()) : delayUs;
+        return std::min(delayUs, playoutDelayCapUs());
     }
     return m_Parameters.sourcePlayoutDelayUs;
 }
 
 uint64_t VrrTimingController::playoutDelayMinimumUs() const
 {
-    if (m_LatencyFixActive)
-        return std::min({m_Parameters.playoutDelayMinimumUs,
-                         playoutQueueLimitUs(), latencyFixDelayLimitUs()});
-    if (m_Parameters.playoutHistoryEnabled != 0)
-        return std::min(m_Parameters.playoutDelayMinimumUs, playoutQueueLimitUs());
-    return m_Parameters.playoutDelayMinimumUs;
+    uint64_t minimumUs = std::min(m_Parameters.playoutDelayMinimumUs,
+                                  playoutDelayCapUs());
+    return m_Parameters.playoutHistoryEnabled != 0 ?
+        std::min(minimumUs, playoutQueueLimitUs()) : minimumUs;
 }
 
 uint64_t VrrTimingController::scaledPerMille(uint64_t value,
@@ -2059,7 +2061,7 @@ uint64_t VrrTimingController::playoutDelayMaximumUs() const
             scaledPerMille(m_SourcePeriodUs,
                            m_Parameters.playoutDelayMaximumPeriodPerMille));
     }
-    if (m_LatencyFixActive) maximumUs = std::min(maximumUs, latencyFixDelayLimitUs());
+    maximumUs = std::min(maximumUs, playoutDelayCapUs());
     return m_Parameters.playoutHistoryEnabled != 0 ?
         std::min(maximumUs, playoutQueueLimitUs()) : maximumUs;
 }
@@ -2067,6 +2069,19 @@ uint64_t VrrTimingController::playoutDelayMaximumUs() const
 uint64_t VrrTimingController::latencyFixDelayLimitUs() const
 {
     return scaledPerMille(m_DisplayPeriodUs, m_Parameters.latencyFixDelayPeriodPerMille);
+}
+
+uint64_t VrrTimingController::playoutDelayCapUs() const
+{
+    if (m_Parameters.playoutDelayCapSourcePeriodPerMille != 0) {
+        return scaledPerMille(
+            m_SourcePeriodUs,
+            m_Parameters.playoutDelayCapSourcePeriodPerMille);
+    }
+    // Parameterized captures predating the source-frame preset cap retain the
+    // old display-relative limiter for exact replay.
+    return m_LatencyFixActive ? latencyFixDelayLimitUs() :
+        std::numeric_limits<uint64_t>::max();
 }
 
 void VrrTimingController::updateLatencyFixState()

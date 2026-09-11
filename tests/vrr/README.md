@@ -88,23 +88,23 @@ It also covers the FIFO-only WSI compatibility path, unsupported backends, and
 preservation of ordinary Wayland and X11/KMSDRM choices. The test cannot prove
 which mode an affected device exposes or whether Gamescope displays each frame.
 
-On Linux, `tst_plvkswapchain` exercises the shared libplacebo replacement
-boundary with fake native operations. It covers pending-image rejection,
-destroy/create ordering, FIFO/Immediate/Mailbox creation parameters, retained
-depth and HDR metadata, and creation failure. It is built when libplacebo
+On Linux, `tst_plvkswapchain` covers the persistent present-mode classification:
+Mailbox provides latch protection through synchronized stale-image replacement,
+while Immediate and FIFO retain software spacing. It is built when libplacebo
 development files are available. The worker tests also verify that the same
 protection request reaches preparation before acquisition and reaches Present
 unchanged after a slow preparation. These checks do not establish compositor
 or physical scanout behavior.
 
-Linux Vulkan recreates its Immediate/Mailbox chain as FIFO when the current
-per-frame controller requests latching, then restores the saved adaptive mode
-for an unlatched request. Mode changes happen during measured preparation,
-with no image acquired, and preserve the colorspace hint. The Gamescope WSI
-FIFO compatibility path retains its compositor-owned behavior and software
-spacing floor. Gamescope Mailbox selection still requires the existing opt-in
-experiment. The latency presets continue to bound padding independently of
-native mode selection.
+Linux Vulkan keeps the startup-selected present mode for the lifetime of one
+persistent swapchain; per-frame latch decisions never destroy or recreate it.
+Persistent Mailbox counts as protected presentation and omits the redundant
+software spacing floor, while Immediate and FIFO retain that floor. The
+Gamescope WSI FIFO compatibility path retains its compositor-owned behavior,
+and Gamescope Mailbox selection still requires the existing opt-in experiment.
+The latency presets cap adaptive padding independently of native mode: half a
+fitted source frame for Lowest latency, one frame for Balanced, and two frames
+for Smoothest. Stale-work replacement remains a separate two-frame rule.
 
 The FPS picker offers native VRR rates and preserves saved custom values; the
 reduced-rate Low Latency VRR recommendation has been removed. The worker no
@@ -251,7 +251,9 @@ Schema 5 retains the schema-4 tear signals and adds the complete resolved
 controller parameter set, controller call duration and learned-model state,
 stale-check age, render/target wait boundaries, both spacing-floor checks,
 correction-wait boundaries, explicit worker-requested rebase cause, and
-terminal time. Header-resolved schema-5 extensions also record the native
+terminal time. The parameter set includes the source-frame-relative playout
+cap so new captures distinguish the 0.5/1/2-frame presets while older headers
+retain their historical default. Header-resolved schema-5 extensions also record the native
 queue policy, render baseline, render-tail insurance, pacing-latency budget,
 presentation backend/result, signed `GetLastPresentCount()` and
 `GetFrameStatistics()` results, the exact DXGI Present sync interval/flags,
@@ -891,8 +893,9 @@ periods, so a fresh session is never short of cushion), rises at most
 `playout_delay_release_us` per frame and only after
 `playout_delay_release_samples`, and is capped at the larger of
 `playout_delay_maximum_us` and `playout_delay_maximum_period_per_mille` of
-the period. A cap that shrinks with the fitted period is approached at the
-release rate. The former "smoothness" option, one extra source interval of
+the period, then by `playout_delay_cap_source_period_per_mille` when the
+current preset supplies it. A cap that shrinks with the fitted period is
+approached at the release rate. The former "smoothness" option, one extra source interval of
 queue age and one extra source period of render-lead budget, was retired: on
 a render-bound client it deepened the standing backlog and saturated the
 worker without reducing hitches. Captures made under it still replay with

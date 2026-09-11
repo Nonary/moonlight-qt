@@ -386,16 +386,18 @@ void testLatencyFixDropBoundaries()
     VrrTimingDecision decision;
     decision.sourcePeriodUs = 8333;
     decision.targetUs = 50000;
-    expect(!VrrFrameDropPolicy::beforeRender(decision, 8333, 8333, false, true),
-           "latency fix must retain a frame exactly one source period old");
-    expect(VrrFrameDropPolicy::beforeRender(decision, 8333, 8334, false, true),
-           "latency fix may replace an older frame when a successor exists");
+    expect(!VrrFrameDropPolicy::beforeRender(decision, 8333, 8334, false, true),
+           "latency fix must retain ordinary one-period worker occupancy");
+    expect(!VrrFrameDropPolicy::beforeRender(decision, 8333, 16666, false, true),
+           "latency fix must retain the exact two-period boundary");
+    expect(VrrFrameDropPolicy::beforeRender(decision, 8333, 16667, false, true),
+           "latency fix may replace work older than two periods when a successor exists");
     expect(!VrrFrameDropPolicy::beforeRender(decision, 8333, 12500, false, false),
            "ordinary VRR must retain its two-period age tolerance");
-    expect(VrrFrameDropPolicy::afterRenderWait(decision, 10000, 18334, false, true),
-           "latency fix must count queue age even when the target is still ahead");
-    expect(!VrrFrameDropPolicy::afterRenderWait(decision, 10000, 18333, false, true),
-           "post-wait replacement must also preserve the exact one-period boundary");
+    expect(VrrFrameDropPolicy::afterRenderWait(decision, 10000, 26667, false, true),
+           "latency fix must replace work beyond two periods even when the target is ahead");
+    expect(!VrrFrameDropPolicy::afterRenderWait(decision, 10000, 26666, false, true),
+           "post-wait replacement must preserve the exact two-period boundary");
     expect(!VrrFrameDropPolicy::afterRenderWait(decision, 10000, 18334, false, false),
            "ordinary post-wait policy must retain its target-relative horizon");
 
@@ -437,7 +439,7 @@ void runLatencyFixQueuedRecovery(int streamRateHz, bool enabled,
     const bool reducedDelay = latencyMode == 1 || latencyMode == 2 ||
         (enabled && streamRateHz >= 116);
     const bool replaceQueued = reducedDelay &&
-        fresherSuccessor && agePerMille > 1000;
+        fresherSuccessor && agePerMille > 2000;
     auto makeFrame = [streamRateHz](int number, TrackedFrameLifetime& lifetime) {
         return makeTrackedPacedFrame(number,
             static_cast<uint32_t>((number - 1) * 90000 / streamRateHz),
@@ -496,6 +498,8 @@ void testLatencyFixQueuedRecovery()
 {
     runLatencyFixQueuedRecovery(120, true, true);
     runLatencyFixQueuedRecovery(116, true, true);
+    runLatencyFixQueuedRecovery(120, true, true, 2500);
+    runLatencyFixQueuedRecovery(116, true, true, 2500);
     runLatencyFixQueuedRecovery(120, false, true);
     runLatencyFixQueuedRecovery(110, true, true);
     runLatencyFixQueuedRecovery(120, true, false);
@@ -513,8 +517,7 @@ void testLatencyPresetsQueuedRecovery()
 {
     for (int rate : {60, 100, 110}) {
         for (int mode : {0, 1, 2}) {
-            // The two reduced-delay presets must replace stale queued work
-            // below the old near-refresh band; Smoothest retains that frame.
+            // A single interval is normal worker occupancy for every preset.
             runLatencyFixQueuedRecovery(rate, false, true, 1500, false, mode);
             // Even Lowest latency must keep the only available image.
             runLatencyFixQueuedRecovery(rate, false, false, 1500, false, mode);
@@ -552,7 +555,7 @@ void testLatencyFixQueueAgeIncludesDecodeWait()
         worker.submit(makeFrame(2, delayed));
         expect(backend.waitForDecodeWaitCount(1),
                "second image must enter the controlled GPU-readiness wait");
-        clock.advance(12500);
+        clock.advance(21000);
         worker.submit(makeFrame(3, fresh));
         backend.releaseDecode();
         expect(backend.waitForPrepareCount(2),

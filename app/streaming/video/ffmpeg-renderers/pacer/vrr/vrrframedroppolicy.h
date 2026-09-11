@@ -8,7 +8,13 @@
 namespace VrrFrameDropPolicy {
 inline uint64_t maximumAgeUs(const VrrTimingDecision& decision, bool metronome, bool latencyFix)
 {
-    const uint64_t periods = latencyFix ? 1 : metronome ? 4 : 2;
+    // One source interval is normal occupancy for a single worker that waits
+    // on the preceding frame's target. Using it as the stale threshold makes
+    // a refresh-rate stream alternate present/drop as soon as its successor
+    // arrives. Lower-latency modes still measure age from admission, but they
+    // must tolerate two intervals before replacing valid decoded work.
+    (void) latencyFix;
+    const uint64_t periods = metronome ? 4 : 2;
     return decision.sourcePeriodUs > std::numeric_limits<uint64_t>::max() / periods ?
         std::numeric_limits<uint64_t>::max() : decision.sourcePeriodUs * periods;
 }

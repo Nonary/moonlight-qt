@@ -528,9 +528,11 @@ void VrrReplayConfigTest::latencyFixPolicyRoundTrip()
     QCOMPARE(historical.scenarios.front().controller.latencyFixEnabled, uint64_t(0));
     QCOMPARE(historical.scenarios.front().controller.latencyFixAllRates, uint64_t(0));
     QCOMPARE(historical.scenarios.front().controller.latencyFixDelayPeriodPerMille, uint64_t(500));
+    QCOMPARE(historical.scenarios.front().controller.playoutDelayCapSourcePeriodPerMille, uint64_t(0));
     QVERIFY(vrrReplayParameterNames().contains("controller.latency_fix_enabled"));
     QVERIFY(vrrReplayParameterNames().contains("controller.latency_fix_all_rates"));
     QVERIFY(vrrReplayParameterNames().contains("controller.latency_fix_delay_period_per_mille"));
+    QVERIFY(vrrReplayParameterNames().contains("controller.playout_delay_cap_source_period_per_mille"));
 
     VrrTimingParameters policy;
     policy.latencyFixEnabled = 1;
@@ -562,6 +564,14 @@ void VrrReplayConfigTest::latencyFixPolicyRoundTrip()
     }
 
     policy.latencyFixDelayPeriodPerMille = 500;
+    policy.playoutDelayCapSourcePeriodPerMille = 1000;
+    {
+        const auto snapshot = vrrTimingParametersToJson(policy);
+        VrrTimingParameters restored;
+        QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error), qPrintable(error));
+        QCOMPARE(restored.playoutDelayCapSourcePeriodPerMille, uint64_t(1000));
+        QCOMPARE(vrrTimingParametersToJson(restored), snapshot);
+    }
     for (const auto invalid : {QJsonObject{{"latency_fix_enabled", 2}},
                                QJsonObject{{"latency_fix_all_rates", 2}},
                                QJsonObject{{"latency_fix_enabled", 0}},
@@ -569,6 +579,14 @@ void VrrReplayConfigTest::latencyFixPolicyRoundTrip()
         const auto before = vrrTimingParametersToJson(policy);
         QVERIFY(!applyVrrReplayControllerSnapshot(invalid, policy, error));
         QVERIFY(error.contains("latency_fix"));
+        QCOMPARE(vrrTimingParametersToJson(policy), before);
+    }
+    {
+        const auto before = vrrTimingParametersToJson(policy);
+        QVERIFY(!applyVrrReplayControllerSnapshot(
+            QJsonObject{{"playout_delay_cap_source_period_per_mille", 4001}},
+            policy, error));
+        QVERIFY(error.contains("playout_delay_cap_source_period_per_mille"));
         QCOMPARE(vrrTimingParametersToJson(policy), before);
     }
 

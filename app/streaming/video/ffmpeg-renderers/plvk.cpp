@@ -610,8 +610,7 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
-    // Remember the platform's adaptive mode separately from the active chain.
-    // Linux can recreate it as FIFO when the controller requests protection.
+    // Retain the platform's adaptive mode for the lifetime of the swapchain.
     selectPresentationMode(params);
     m_VrrAdaptivePresentMode = m_VkPresentMode;
 
@@ -901,6 +900,8 @@ bool PlVkRenderer::createSwapchain(int depth)
         cancelVrrFrame();
     }
 
+    pl_swapchain_destroy(&m_Swapchain);
+
     pl_vulkan_swapchain_params vkSwapchainParams = {};
     vkSwapchainParams.surface = m_VkSurface;
     vkSwapchainParams.present_mode = m_VkPresentMode;
@@ -919,12 +920,15 @@ bool PlVkRenderer::createSwapchain(int depth)
             colorspace = &pl_color_space_srgb;
         }
 #endif
-        if (!recreatePlVkSwapchain(m_Vulkan, &m_Swapchain, vkSwapchainParams,
-                                   *colorspace, m_HasPendingSwapchainFrame)) {
+        m_Swapchain = pl_vulkan_create_swapchain(m_Vulkan, &vkSwapchainParams);
+        if (m_Swapchain == nullptr) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                          "pl_vulkan_create_swapchain() failed");
             return false;
         }
+        // Restore before resize/start_frame chooses the new surface format.
+        // The next frame may have unchanged HDR metadata and skip re-hinting.
+        pl_swapchain_colorspace_hint(m_Swapchain, colorspace);
     }
 
     m_SwapchainDepth = depth;
@@ -934,41 +938,11 @@ bool PlVkRenderer::createSwapchain(int depth)
 bool PlVkRenderer::canLatchAdaptivePresent() const
 {
 #ifdef Q_OS_LINUX
-    // An already-FIFO Gamescope WSI path maps through the compositor's own
-    // Mailbox chain. Preserve its software floor: recreating the same FIFO
-    // application chain cannot promise a different native latch behavior.
     return m_VrrRequested && m_VrrFallbackReason == VrrFallbackReason::NoFallback &&
-        (m_VrrAdaptivePresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ||
-         m_VrrAdaptivePresentMode == VK_PRESENT_MODE_MAILBOX_KHR);
+        plVkPersistentPresentModeProvidesLatchProtection(m_VrrAdaptivePresentMode);
 #else
     return false;
 #endif
-}
-
-bool PlVkRenderer::selectVrrPresentMode(bool latchedPresentation)
-{
-    if (!canLatchAdaptivePresent()) {
-        return true;
-    }
-    const auto mode = latchedPresentation ? VK_PRESENT_MODE_FIFO_KHR :
-                                           m_VrrAdaptivePresentMode;
-    if (mode == m_VkPresentMode) {
-        return true;
-    }
-    // This must happen before acquisition. Do not invoke createSwapchain's
-    // legacy cancellation guard, which may submit an acquired image.
-    if (m_HasPendingSwapchainFrame || m_VrrFramePrepared) {
-        return false;
-    }
-    m_VkPresentMode = mode;
-    if (!createSwapchain(m_SwapchainDepth)) {
-        queueRenderDeviceReset();
-        return false;
-    }
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Vulkan VRR switched swapchain to %s for %s presentation",
-                vulkanPresentModeName(mode), latchedPresentation ? "protected" : "adaptive");
-    return true;
 }
 
 bool PlVkRenderer::prepareDecoderContext(AVCodecContext *context, AVDictionary **)
@@ -1385,6 +1359,7 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
                                             const VrrPresentRequest& request)
 {
     (void) decodeBoundary;
+    (void) request;
     VrrPrepareResult result;
     if (frame == nullptr || checkSupport() != VrrFallbackReason::NoFallback ||
             m_VrrSuspended) {
@@ -1415,8 +1390,7 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
     result.decodeSyncUs = waitForDecode(frame);
     const uint64_t acquireStartUs = LiGetMicroseconds();
     (void) syncStartUs;
-    if (!selectVrrPresentMode(request.latchedPresentation) ||
-            !acquireVrrSwapchainFrame()) {
+    if (!acquireVrrSwapchainFrame()) {
         return result;
     }
     const uint64_t acquireEndUs = LiGetMicroseconds();
@@ -1465,10 +1439,6 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
 
 VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& request)
 {
-    // Preparation selected the mode before acquiring this image. Never
-    // destroy a prepared swapchain at the final presentation boundary.
-    SDL_assert(!canLatchAdaptivePresent() || m_VkPresentMode ==
-        (request.latchedPresentation ? VK_PRESENT_MODE_FIFO_KHR : m_VrrAdaptivePresentMode));
     (void) request;
     if (!m_VrrFramePrepared || !m_HasPendingSwapchainFrame ||
         m_VrrSuspended ||
@@ -1607,8 +1577,8 @@ void PlVkRenderer::setSuspended(bool suspended)
 #endif
     m_VrrSuspended = suspended;
     if (!suspended) {
-        // Re-run resize/start-frame after restoration without changing the
-        // swapchain's immutable presentation mode.
+        // Re-run resize/start-frame after restoration without replacing the
+        // persistent swapchain.
         m_VrrWindowChangePending.store(true);
     }
 }
@@ -1616,9 +1586,8 @@ void PlVkRenderer::setSuspended(bool suspended)
 bool PlVkRenderer::restoreFixedPresentation(VrrFallbackReason reason)
 {
     // Pacer calls this synchronously after it failed to create the VRR worker,
-    // before any frame or legacy render thread exists. The Vulkan present mode
-    // is immutable, so restore FIFO by recreating the swapchain rather than
-    // continuing with a Mailbox or Immediate selection under fixed pacing.
+    // before any frame or legacy render thread exists. Restore the ordinary
+    // fixed FIFO renderer rather than retaining the adaptive VRR swapchain.
     cancelVrrFrame();
     m_VrrRequested = false;
     m_VrrSuspended = false;

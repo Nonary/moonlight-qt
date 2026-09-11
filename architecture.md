@@ -5,12 +5,12 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Source baseline: `b1655095` plus the local Vulkan preparation/swapchain changes,
+Source baseline: `afe88387` plus the local persistent Vulkan presentation changes,
 inspected 2026-09-10. The main `vrr13` checkout was fast-forwarded to this
 commit before reconciling those changes; the latency presets remain active.
 Production uses readiness prediction
 for both growth and release, targeting 3 ms of headroom within the three-frame
-queue, 16 ms cap and selected timing allowance. Display feedback is optional diagnostic evidence;
+queue and selected 0.5/1/2-source-frame timing cap. Display feedback is optional diagnostic evidence;
 it cannot change deadlines or authorize/veto padding changes. Historical
 native-hitch and combined-feedback policies remain available for exact replay.
 The initial map came from nine Luna Medium specialists, followed by
@@ -66,11 +66,11 @@ existing `vrrlatencyfix=true` migrates to Balanced and `false` to Smoothest.
 The selection is snapshotted through session, decoder, and pacer setup, so
 reconnect after changing it. Fixed-refresh pacing is independent of this setting.
 
-| Timing choice | Adaptive extra playout allowance | Stale-work allowance with a successor |
+| Timing choice | Adaptive playout-buffer cap | Stale-work allowance with a successor |
 | --- | --- | --- |
-| Lowest latency (2) | Zero extra padding | One fitted source period |
-| Balanced (1, default) | Up to half a display period, about 4.17 ms at 120 Hz | One fitted source period |
-| Smoothest (0) | Existing learned protection, up to 16 ms and queue capacity | Two fitted source periods |
+| Lowest latency (2) | Half a fitted source period | Two fitted source periods |
+| Balanced (1, default) | One fitted source period | Two fitted source periods |
+| Smoothest (0) | Two fitted source periods | Two fitted source periods |
 
 The allowance bounds extra padding, not total latency or native queue depth.
 Source-clock mapping, rendering/readiness learning, per-frame latch decisions,
@@ -82,25 +82,28 @@ that variation. It does not regularize game-driven frame intervals. Stable
 delivery may look the same across choices, and no universal percentage of lost
 smoothness follows from the selected allowance.
 
-`VrrSessionConfig::latencyMode` resolves to the trace/replay parameters
-`latency_fix_enabled`, `latency_fix_all_rates`, and
-`latency_fix_delay_period_per_mille`. Balanced and Lowest latency set the first
-two fields to one and choose 500 or zero per mille respectively. Smoothest
-leaves the limiter disabled. The new `latency_fix_all_rates` field defaults to
-zero for historical capture compatibility; the internal session mode also
-defaults to zero for historical tests and replay, independently of the UI's
-Balanced default. Balanced and Lowest latency append `|latency-mode=1` or
-`|latency-mode=2` before calibration-key hashing, while Smoothest retains the
-ordinary key.
+`VrrSessionConfig::latencyMode` resolves the buffer cap into the trace/replay
+parameter `playout_delay_cap_source_period_per_mille`: 500 for Lowest latency,
+1000 for Balanced, and 2000 for Smoothest. A zero schema default means an older
+capture has no source-relative cap and retains its recorded behavior. The
+historical `latency_fix_enabled`, `latency_fix_all_rates`, and
+`latency_fix_delay_period_per_mille` fields remain recorded so old captures
+replay exactly and Balanced/Lowest retain their admission-age policy. The
+internal session mode defaults to zero for historical tests and replay,
+independently of the UI's Balanced default. Balanced and Lowest latency append
+`|latency-mode=1` or `|latency-mode=2` before calibration-key hashing, while
+Smoothest retains the ordinary key.
 
 `VrrFrameDropPolicy` is shared by the real worker and all-arrival queue
-simulation. Both lower-latency choices permit replacing work older than one
-fitted source period when a newer queued successor exists. Age starts at pacer
+simulation. Every non-metronome profile permits replacing work older than two
+fitted source periods when a newer queued successor exists. One period is
+ordinary occupancy for a single worker waiting on the preceding frame and is
+not a stale condition. In the lower-latency profiles age starts at pacer
 admission so GPU decode waiting cannot erase it, and is checked again after
-waiting to render, before spending GPU work. Smoothest retains the two-period
-allowance and target-relative second check. The sole available frame is never
-discarded by this policy. Local skips preserve the source clock and last
-submission. These choices do not impose an FPS cap or change the native presenter.
+waiting to render, before spending GPU work. Smoothest retains the
+target-relative second check. The sole available frame is never discarded by
+this policy. Local skips preserve the source clock and last submission. These
+choices do not impose an FPS cap or change the native presenter.
 
 Historical Latency fix checkbox (after `db596431`): `vrrlatencyfix` defaulted
 off and applied the half-display-period allowance only near the refresh ceiling.
@@ -453,9 +456,10 @@ reject frames; a full queue evicts the oldest waiting frame, marks a discontinui
 and admits the new frame. Trace/counter work occurs outside the queue lock.
 
 The worker also sheds stale work when a fresher queued successor exists and
-age/backlog/missed-tick criteria apply. Balanced and Lowest latency use a
-one-source-period age allowance throughout VRR; Smoothest retains two periods.
-A lone late frame may still be shown.
+age/backlog/missed-tick criteria apply. All non-metronome profiles use a
+two-source-period age allowance. Balanced and Lowest latency measure it from
+pacer admission, while Smoothest uses the scheduled target for its second
+check. A lone late frame may still be shown.
 This differs from throwing away compressed reference frames and does not require
 resetting the codec merely because an image was not presented.
 
@@ -471,7 +475,7 @@ resetting the codec merely because an image was not presented.
    and the selected `VrrPresentRequest`. Mode changes, rendering, and image
    acquisition belong inside this measured preparation interval; intentional
    target waiting does not. D3D11 keeps its mode selection at Present; Linux
-   Vulkan may recreate the swapchain before acquiring the image.
+   Vulkan keeps the swapchain's startup-selected mode.
 7. Handle preparation failure/cancellation. If the presenter reports
    `sourceFrameReusable`, release the decoder surface before the target wait.
 8. Wait for the target, then enforce the controller's currently applicable
@@ -541,9 +545,9 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | --- | --- |
 | Delay start seed | 6,000 us, then source/display/work/capacity scaling below |
 | Delay minimum input | 1,000 us, capped by available capacity and the selected timing allowance |
-| Delay maximum input | 16,000 us, capped by available capacity; Balanced additionally limits to half a display period, Lowest latency to zero |
+| Delay maximum input | Larger of 16,000 us and two fitted source periods, then capped by available capacity and the selected source-frame allowance |
 | Start-period ratio | 950 per mille of fitted source period |
-| Maximum-period ratio | 0; no additional period-ratio maximum input |
+| Maximum-period ratio | 2,000 per mille; keeps the learner ceiling large enough for Smoothest |
 | Delay attack | At most 500 us per update |
 | Delay release input | 10 us, scaled by elapsed time at a 120 FPS reference rate |
 | Prediction margin | 3,000 us above estimated readiness demand |
@@ -792,9 +796,10 @@ Production sets `playout_prediction_only=1` and updates padding as follows:
   at a 120 FPS reference, capped at 33,333 us of elapsed recovery per update.
 - Readiness tails still age out over the existing five-minute window; a brief
   clean period does not immediately erase a recent burst or valid cached tail.
-- Capacity, the 16 ms cap and the selected timing allowance remain hard bounds
-  in both directions. Balanced allows up to half a display period; Lowest
-  allows no extra padding. These bounds can prevent the full 3 ms headroom.
+- Capacity and the selected timing allowance remain hard bounds
+  in both directions. Lowest latency allows half a fitted source period,
+  Balanced one period, and Smoothest two periods. These bounds can prevent the
+  full 3 ms headroom.
 
 The legacy readiness and combined-feedback laws remain available for replay.
 
@@ -806,21 +811,22 @@ capacity        = 3 * period
 occupied        = renderLead + presentationSafety
                 + (smoothingEnabled ? maximumSmoothingLag : 0)
 queueDelayLimit = max(0, capacity - occupied)
-modeAllowance   = Smoothest: no extra bound
-                | Balanced: displayPeriod * 500 / 1000
-                | Lowest latency: 0
+modeAllowance   = Smoothest: fittedSourcePeriod * 2000 / 1000
+                | Balanced: fittedSourcePeriod * 1000 / 1000
+                | Lowest latency: fittedSourcePeriod * 500 / 1000
+maximumInput    = max(16000 us, fittedSourcePeriod * 2000 / 1000)
 effectiveMin    = min(1000 us, queueDelayLimit, modeAllowance)
-effectiveMax    = min(16000 us, queueDelayLimit, modeAllowance)
+effectiveMax    = min(maximumInput, queueDelayLimit, modeAllowance)
 ```
 
 The cold start first takes `max(6000 us, 0.95 * sourcePeriod)`, caps that by
 `max(displayPeriod, renderLead)` for history mode, then clamps to effective
 minimum/maximum. Consequently neither “the buffer always starts at 6 ms” nor
-"the maximum is 8 ms" describes current production. The 16 ms input is a
-ceiling on padding, independently of the three-frame storage limit; the selected
-timing allowance can lower it. Zero extra padding retains target construction,
-rendering opportunity and applicable native/CPU floors, so it is not a promise
-of zero decode-to-submission delay or total latency.
+"the maximum is 8 ms" describes current production. The 16 ms absolute input
+is raised to two fitted source periods when necessary, then the selected
+source-frame allowance and three-frame storage limit cap it. The allowance is not a promise of total
+decode-to-submission latency because rendering and applicable native/CPU floors
+remain outside the adaptive playout buffer.
 
 More protection can improve jitter tolerance while consuming latency and queue
 capacity. If the requested protection exceeds capacity, record the limitation
@@ -1001,27 +1007,22 @@ selected for the surface at startup: Mailbox on ordinary Wayland, Immediate
 on X11/KMSDRM, and Immediate on Gamescope. Gamescope additionally tries Mailbox
 when the SteamOS experiment is enabled, according to exposed surface capabilities.
 
-The selected adaptive mode is retained separately from the active swapchain.
-Immediate/Mailbox Linux paths advertise latch support and honor the controller's
-per-frame request by selecting FIFO for a latched frame and restoring the saved
-adaptive mode for an unlatched frame. This uses the current per-frame policy,
-not the historical fitted-rate cutoff. It does not change the latency preset.
-
-The worker passes the same request to preparation and presentation. Recreation
-occurs before image acquisition, with no prepared or acquired image outstanding.
-It preserves swapchain depth and the cached colorspace/HDR hint, and clears the
-old swapchain's presentation feedback. Recreation/acquisition are measured as
-acquisition time; intentional waits are not learned as additional buffer demand.
-Failure requests renderer recovery. Presentation never recreates a prepared chain.
-A FIFO-only compatibility path does not advertise switchable latch support.
-Repeated changes of the per-frame request can recreate the swapchain repeatedly;
-deterministic tests do not establish the runtime cost or visual result on hardware.
+The selected adaptive mode remains immutable for the lifetime of one persistent
+swapchain. Per-frame controller requests never destroy or recreate that chain.
+Persistent Mailbox provides synchronized, stale-image-replacing presentation,
+so it advertises protected latch support without a native mode change or the
+controller's redundant software spacing floor. Immediate retains that floor
+because it may tear. A FIFO-only compatibility path likewise does not advertise
+adaptive latch support because it may accumulate queued frames. Actual resize,
+reset, or fallback can recreate the swapchain and restores the cached
+colorspace/HDR hint before the next acquisition. Deterministic tests do not
+establish compositor or physical scanout behavior.
 
 Gamescope WSI's FIFO compatibility exception is used when Immediate is unavailable
 and the Mailbox experiment is disabled or Mailbox is unavailable. Although the WSI layer sends Mailbox to the underlying
 driver, it forwards the application's original present mode to Gamescope, which
 implements FIFO commit scheduling itself. Selecting Mailbox explicitly avoids
-that FIFO policy; recreating the same FIFO mode cannot change it. Steam's frame
+that FIFO policy. Steam's frame
 limiter can still override a request to FIFO. Native presentation here remains
 compositor-owned, and submission success is not physical scanout feedback.
 See [SteamOS VRR investigation](docs/steamos-vrr.md) for source evidence and the

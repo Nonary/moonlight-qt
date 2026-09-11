@@ -4,6 +4,7 @@
     "controller": {
       "latency_fix_enabled": 0,
       "latency_fix_delay_period_per_mille": 500,
+      "playout_delay_cap_source_period_per_mille": 2000,
       "playout_require_display_events": 1,
       "playout_submission_estimate_fallback": 1,
       "playout_native_hitch_adaptation": 1,
@@ -53,7 +54,7 @@
       "playout_smoothing_snap_per_mille": 3000,
       "playout_metronome_enabled": 0,
       "playout_delay_start_period_per_mille": 950,
-      "playout_delay_maximum_period_per_mille": 0,
+      "playout_delay_maximum_period_per_mille": 2000,
       "playout_phase_step_minimum_us": 30,
       "playout_phase_step_divisor": 64,
       "playout_phase_step_period_per_mille": 20,
@@ -171,7 +172,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 500
+          "latency_fix_delay_period_per_mille": 500,
+          "playout_delay_cap_source_period_per_mille": 1000
         }
       },
       "assertions": [
@@ -204,7 +206,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 0
+          "latency_fix_delay_period_per_mille": 0,
+          "playout_delay_cap_source_period_per_mille": 500
         }
       },
       "assertions": [
@@ -274,7 +277,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 500
+          "latency_fix_delay_period_per_mille": 500,
+          "playout_delay_cap_source_period_per_mille": 1000
         },
         "execution": {
           "periodic_stall_every_frames": 37,
@@ -311,7 +315,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 0
+          "latency_fix_delay_period_per_mille": 0,
+          "playout_delay_cap_source_period_per_mille": 500
         },
         "execution": {
           "periodic_stall_every_frames": 37,
@@ -385,7 +390,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 500
+          "latency_fix_delay_period_per_mille": 500,
+          "playout_delay_cap_source_period_per_mille": 1000
         },
         "execution": {
           "periodic_stall_every_frames": 31,
@@ -422,7 +428,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 0
+          "latency_fix_delay_period_per_mille": 0,
+          "playout_delay_cap_source_period_per_mille": 500
         },
         "execution": {
           "periodic_stall_every_frames": 31,
@@ -496,7 +503,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 500
+          "latency_fix_delay_period_per_mille": 500,
+          "playout_delay_cap_source_period_per_mille": 1000
         },
         "execution": {
           "periodic_stall_every_frames": 43,
@@ -533,7 +541,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 0
+          "latency_fix_delay_period_per_mille": 0,
+          "playout_delay_cap_source_period_per_mille": 500
         },
         "execution": {
           "periodic_stall_every_frames": 43,
@@ -609,7 +618,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 500
+          "latency_fix_delay_period_per_mille": 500,
+          "playout_delay_cap_source_period_per_mille": 1000
         },
         "execution": {
           "periodic_stall_every_frames": 53,
@@ -648,7 +658,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 0
+          "latency_fix_delay_period_per_mille": 0,
+          "playout_delay_cap_source_period_per_mille": 500
         },
         "execution": {
           "periodic_stall_every_frames": 53,
@@ -724,7 +735,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 500
+          "latency_fix_delay_period_per_mille": 500,
+          "playout_delay_cap_source_period_per_mille": 1000
         },
         "execution": {
           "periodic_stall_every_frames": 300,
@@ -761,7 +773,8 @@
         "controller": {
           "latency_fix_enabled": 1,
           "latency_fix_all_rates": 1,
-          "latency_fix_delay_period_per_mille": 0
+          "latency_fix_delay_period_per_mille": 0,
+          "playout_delay_cap_source_period_per_mille": 500
         },
         "execution": {
           "periodic_stall_every_frames": 300,

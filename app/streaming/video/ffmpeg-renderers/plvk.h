@@ -98,7 +98,6 @@ private:
     void queueRenderDeviceReset();
 
     bool createSwapchain(int depth);
-    bool selectVrrPresentMode(bool latchedPresentation);
     bool createOverlay(pl_overlay* overlay, SDL_Surface* surface);
     bool mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
     void unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappedFrame);

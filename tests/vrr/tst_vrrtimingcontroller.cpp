@@ -37,6 +37,7 @@ VrrSessionConfig config(int streamRateHz = 60, int displayRefreshHz = 120)
 VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
 {
     auto policy = vrrTimingParametersForSession(session);
+    policy.playoutDelayCapSourcePeriodPerMille = 0;
     policy.playoutPredictionOnly = 0;
     policy.playoutSubmissionEstimateFallback = 0;
     policy.playoutDelayMarginUs = 300;
@@ -61,6 +62,8 @@ VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
 VrrTimingParameters legacyFeedbackParameters(const VrrSessionConfig& session)
 {
     auto policy = vrrTimingParametersForSession(session);
+    policy.playoutDelayCapSourcePeriodPerMille = 0;
+    policy.playoutDelayMaximumPeriodPerMille = 0;
     policy.playoutPredictionOnly = 0;
     policy.playoutSubmissionEstimateFallback = 0;
     policy.playoutNativeHitchAdaptation = 1;
@@ -3488,9 +3491,13 @@ void testProductionPreservesRelativeGameSpacing()
 {
     const auto session = config(120, 120);
     auto policy = vrrTimingParametersForSession(session);
-    expect(policy.playoutDelayMaximumUs == 16000,
-           "production padding must retain the explicit 16 ms cap");
+    expect(policy.playoutDelayMaximumUs == 16000 &&
+               policy.playoutDelayMaximumPeriodPerMille == 2000 &&
+               policy.playoutDelayCapSourcePeriodPerMille == 2000,
+           "production Smoothest must expose a two-source-frame buffer cap");
     // Hold padding constant to isolate the spacing contract from adaptation.
+    policy.playoutDelayMaximumPeriodPerMille = 0;
+    policy.playoutDelayCapSourcePeriodPerMille = 0;
     policy.playoutDelayMinimumUs = policy.playoutDelayMaximumUs;
     VrrTimingController zeroEpoch(session, true, policy);
     VrrTimingController shiftedEpoch(session, true, policy);
@@ -3710,6 +3717,7 @@ void testLatencyFixBufferlessLateFrameSafety()
     auto session = config(120, 120);
     session.latencyFix = true;
     auto policy = vrrTimingParametersForSession(session);
+    policy.playoutDelayCapSourcePeriodPerMille = 0;
     policy.latencyFixDelayPeriodPerMille = 0;
     for (bool canLatch : {false, true}) {
         VrrTimingController controller(session, canLatch, policy);
@@ -3738,29 +3746,33 @@ void testLatencyFixBufferlessLateFrameSafety()
 void testLatencyPresetsAcrossSourceAndDisplayRates()
 {
     expect(VrrSessionConfig{}.latencyMode == 0 &&
-               VrrTimingParameters{}.latencyFixAllRates == 0,
+               VrrTimingParameters{}.latencyFixAllRates == 0 &&
+               VrrTimingParameters{}.playoutDelayCapSourcePeriodPerMille == 0,
            "historical session and replay defaults must retain Smoothest and the legacy rate band");
     struct Rates { int source; int display; };
     for (const auto rates : {Rates{40, 120}, Rates{60, 120}, Rates{100, 120},
                              Rates{120, 120}, Rates{60, 60}, Rates{120, 240}}) {
         const auto ordinarySession = config(rates.source, rates.display);
         const auto ordinaryPolicy = vrrTimingParametersForSession(ordinarySession);
-        expect(ordinaryPolicy.latencyFixEnabled == 0 && ordinaryPolicy.latencyFixAllRates == 0,
-               "Smoothest must preserve the pre-preset adaptive-buffer policy");
+        expect(ordinaryPolicy.latencyFixEnabled == 0 &&
+                   ordinaryPolicy.latencyFixAllRates == 0 &&
+                   ordinaryPolicy.playoutDelayCapSourcePeriodPerMille == 2000,
+               "Smoothest must cap adaptive buffering at two source frames");
         for (int mode : {1, 2}) {
             auto session = ordinarySession;
             session.latencyMode = mode;
             const auto policy = vrrTimingParametersForSession(session);
+            const uint64_t capPerMille = mode == 1 ? 1000 : 500;
             expect(policy.latencyFixEnabled == 1 && policy.latencyFixAllRates == 1 &&
-                       policy.latencyFixDelayPeriodPerMille == (mode == 1 ? 500 : 0),
-                   "Balanced and Lowest must resolve to replayable all-rate delay budgets");
+                       policy.latencyFixDelayPeriodPerMille == (mode == 1 ? 500 : 0) &&
+                       policy.playoutDelayCapSourcePeriodPerMille == capPerMille,
+                   "Balanced and Lowest must resolve to replayable source-frame buffer caps");
             for (bool canLatch : {false, true}) {
                 VrrTimingController selected(session, canLatch, policy);
                 VrrTimingController ordinary(ordinarySession, canLatch, ordinaryPolicy);
                 // Replay parameters, including an old disabled snapshot, win
                 // over the user's current preference.
                 VrrTimingController recorded(session, canLatch, ordinaryPolicy);
-                const uint64_t limit = mode == 1 ? selected.displayPeriodUs() / 2 : 0;
                 expect(selected.latencyFixActive() && !recorded.latencyFixActive(),
                        "all-rate presets must activate at cold start without altering old snapshots");
                 for (int i = 0; i < 240; ++i) {
@@ -3772,21 +3784,24 @@ void testLatencyPresetsAcrossSourceAndDisplayRates()
                         std::max(decoded, ordinary.lastSubmissionUs()));
                     const auto b = recorded.schedule(frame(i, rtp, validRtp, decoded),
                         std::max(decoded, recorded.lastSubmissionUs()));
+                    const uint64_t ordinaryLimit =
+                        ordinary.sourcePeriodUs() * 2000 / 1000;
                     expect(a.targetUs == b.targetUs && a.originalTargetUs == b.originalTargetUs &&
                                a.renderStartUs == b.renderStartUs &&
                                a.playoutDelayUs == b.playoutDelayUs &&
                                a.requestedPlayoutDelayUs == b.requestedPlayoutDelayUs &&
                                a.latchedPresentation == b.latchedPresentation,
                            "Smoothest and its recorded policy must retain identical decisions through late and invalid-RTP frames");
+                    expect(a.playoutDelayUs <= ordinaryLimit &&
+                               ordinary.playoutDelayUs() <= ordinaryLimit,
+                           "Smoothest padding must stay within two fitted source frames");
                     const auto now = std::max(decoded, selected.lastSubmissionUs());
                     const auto decision = selected.schedule(frame(i, rtp, validRtp, decoded), now);
+                    const uint64_t limit =
+                        selected.sourcePeriodUs() * capPerMille / 1000;
                     expect(selected.latencyFixActive() && decision.playoutDelayUs <= limit &&
                                selected.playoutDelayUs() <= limit,
-                           "startup, late-frame and invalid-RTP padding must obey the display-based budget at every source rate");
-                    if (mode == 2) {
-                        expect(decision.playoutDelayUs == 0,
-                               "Lowest must add no intentional cushion even during timestamp fallback");
-                    }
+                           "startup, late-frame and invalid-RTP padding must obey the source-frame cap at every rate");
                     expect(decision.targetUs >= now &&
                                decision.targetUs >= selected.earliestSubmissionUs(),
                            "reduced padding must retain readiness and native presentation deadlines");
@@ -3815,7 +3830,7 @@ void testLatencyPresetsBoundHitchesThroughCadenceChanges()
         selectedSession.latencyMode = mode;
         VrrTimingController ordinary(ordinarySession, true, vrrTimingParametersForSession(ordinarySession));
         VrrTimingController selected(selectedSession, true, vrrTimingParametersForSession(selectedSession));
-        const uint64_t limit = mode == 1 ? selected.displayPeriodUs() / 2 : 0;
+        const uint64_t capPerMille = mode == 1 ? 1000 : 500;
         uint64_t ordinaryBeforeHitches = 0;
         uint64_t ordinaryMaximum = 0;
         double ticks = 0;
@@ -3835,6 +3850,8 @@ void testLatencyPresetsBoundHitchesThroughCadenceChanges()
                             ordinaryMaximum = std::max(ordinaryMaximum, decision.playoutDelayUs);
                     }
                     if (controller == &selected) {
+                        const uint64_t limit =
+                            controller->sourcePeriodUs() * capPerMille / 1000;
                         expect(controller->latencyFixActive() && decision.playoutDelayUs <= limit,
                                "native hitches and cadence steps must not revive the old rate band or exceed the preset cushion");
                         expect(controller->lastSubmissionUs() == priorSubmission,

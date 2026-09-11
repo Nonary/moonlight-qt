@@ -22,7 +22,7 @@ struct VrrSessionConfig {
     int streamRateHz = 0;
     bool allowAdditionalQueuedFrame = false;
     // A session preference resolved into the recorded controller parameters.
-    // Both modes retain jitter buffering and display-spacing protection.
+    // All presets retain jitter buffering and display-spacing protection.
     bool smoothFrameTiming = true;
     // Historical near-ceiling checkbox, retained for old tests and captures.
     bool latencyFix = false;

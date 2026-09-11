@@ -21,6 +21,7 @@
     X(uint64_t, latency_fix_enabled, latencyFixEnabled, 0) \
     X(uint64_t, latency_fix_all_rates, latencyFixAllRates, 0) \
     X(uint64_t, latency_fix_delay_period_per_mille, latencyFixDelayPeriodPerMille, 500) \
+    X(uint64_t, playout_delay_cap_source_period_per_mille, playoutDelayCapSourcePeriodPerMille, 0) \
     X(uint64_t, playout_prediction_only, playoutPredictionOnly, 0) \
     X(uint64_t, playout_require_display_events, playoutRequireDisplayEvents, 0) \
     X(uint64_t, playout_submission_estimate_fallback, playoutSubmissionEstimateFallback, 0) \
@@ -311,6 +312,7 @@ public:
 private:
     void updateLatencyFixState();
     uint64_t latencyFixDelayLimitUs() const;
+    uint64_t playoutDelayCapUs() const;
     bool m_LatencyFixActive = false;
     struct PendingFrame {
         Vrr13::SmoothnessFeedback::Sample smoothness;
