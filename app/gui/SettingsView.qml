@@ -958,7 +958,7 @@ Flickable {
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
                     ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Compare queue behavior during gameplay. Off uses the original queue policy. On follows the host's changing frame rate and adjusts buffering when average client-added interval error over one second exceeds 0.5 ms.") + "\n\n" +
+                    ToolTip.text: qsTr("Compare queue behavior during gameplay. Off uses the original queue policy. On follows the host's changing frame rate, allows 0.5 ms of average client timing error, and adjusts buffering toward a 30-second smoothness target: 99% for Lowest latency, 99.5% for Balanced, or 99.95% for Smoothest. Larger timing errors reduce the score more. Buffer limits still apply.") + "\n\n" +
                                   qsTr("Reconnect the stream after changing this setting.")
                 }
 

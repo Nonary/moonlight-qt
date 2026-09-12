@@ -128,9 +128,11 @@ VrrTimingParameters vrrTimingParametersForSession(
         latencyMode == 2 ? 500 : latencyMode == 1 ? 1000 : 2000;
     parameters.playoutPredictionOnly = 1;
     // Historical revisions retain their captured deadlines and short history.
-    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : config.v2Queue ? 6 : 4;
-    parameters.playoutMeanMissHoldUs = latencyMode == 2 ? 2000000 : latencyMode == 1 ? 4000000 : 10000000;
-    parameters.playoutMeanMissReleaseUsPerSecond = latencyMode == 2 ? 250 : latencyMode == 1 ? 200 : 100;
+    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : config.v2Queue ? 7 : 4;
+    // Retain earned protection between bursts instead of repeatedly shedding
+    // it and reacquiring it. Explicit captured values preserve older release.
+    parameters.playoutMeanMissHoldUs = latencyMode == 2 ? 6000000 : latencyMode == 1 ? 8000000 : 10000000;
+    parameters.playoutMeanMissReleaseUsPerSecond = latencyMode == 2 ? 125 : 100;
     parameters.playoutOnTimeTargetPerMillion = latencyMode == 2 ? 990000 :
         latencyMode == 1 ? 995000 : 999500;
     parameters.playoutReadinessWindowUs = latencyMode == 2 ? 30000000 :
@@ -1575,7 +1577,9 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 submitted && !cancelled && m_Pending.intervalValid && m_Pending.hasPreparationDuration,
                 p.eligible && work <= p.period && p.decoderQueue <= p.period},
                 playoutDelayMinimumUs(), playoutDelayMaximumUs(),
-                m_Parameters.playoutMeanMissHoldUs, m_Parameters.playoutMeanMissReleaseUsPerSecond);
+                m_Parameters.playoutMeanMissHoldUs, m_Parameters.playoutMeanMissReleaseUsPerSecond,
+                m_Parameters.playoutResponsiveBuffer >= 7, m_Parameters.playoutOnTimeTargetPerMillion,
+                m_Parameters.playoutResponsiveBuffer == 8 ? 250 : Vrr13::IntervalBuffer::ToleranceUs);
         }
         else m_MeanMissBuffer.observe(submissionUs, ready > deadline ? ready - deadline : 0,
             p.applied, submitted && !cancelled && m_Pending.hasPreparationDuration &&

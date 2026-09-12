@@ -1275,15 +1275,16 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 char score[32], average[32];
                 if (interval.evaluatedUs)
                     snprintf(score, sizeof(score), "%.2f%%",
-                        100.0 * (interval.evaluatedUs - qMin(interval.failedUs, interval.evaluatedUs)) / interval.evaluatedUs);
+                        interval.qualityPercent());
                 else snprintf(score, sizeof(score), "collecting");
                 if (interval.averageValid)
                     snprintf(average, sizeof(average), "%.3f ms", interval.averageErrorUs / 1000.0);
                 else snprintf(average, sizeof(average), "collecting");
                 ret = snprintf(&output[offset], length - offset,
-                    "VRR pacing: %s | V2 Queue | Smoothness (30s): %s%s\n"
-                    "Client interval error (1s): %s | Tolerance: %.1f ms | Dropped (30s): %llu\n",
+                    "VRR pacing: %s | V2 Queue | Smoothness (30s): %s / %.2f%% target%s\n"
+                    "Client interval error (1s): %s | Tolerance: %.2f ms | Dropped (30s): %llu\n",
                     stats.vrrTelemetryActive ? "Active" : "Inactive", score,
+                    stats.vrrOnTimeTargetPerMillion / 10000.0,
                     stats.vrrBufferAtLimit ? " (buffer limit)" : "", average,
                     Vrr13::IntervalBuffer::ToleranceUs / 1000.0,
                     static_cast<unsigned long long>(readiness.dropped));

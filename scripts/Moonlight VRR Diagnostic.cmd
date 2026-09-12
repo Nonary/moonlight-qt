@@ -1,5 +1,5 @@
 @echo off
-rem Live A/B: V2 Queue off uses revision 4; on uses revision 5, averaging missed-frame lateness with a 1 ms deadband. Reconnect after changing the checkbox.
+rem Live A/B: V2 Queue off uses revision 4; on uses revision 7, with 0.5 ms tolerance and severity-weighted 99/99.5/99.95 percent preset targets. Reconnect after changing the checkbox.
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%SystemRoot%"
 set "PORTABLE=\\allytwo\ChaseShare\MoonlightPortable-x64-6.1.0-vrr-lite"

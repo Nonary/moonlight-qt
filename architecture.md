@@ -5,7 +5,7 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Source baseline: `e2f264fb` plus the local revision-4 baseline and optional V2 Queue (revision 6),
+Source baseline: `c5d3bb76` plus the local target-driven V2 Queue (revision 7 restored),
 client-processing,
 vrr14-style compact stats reporting, restored Reduce judder, reconnect
 trace preservation, motion cadence telemetry, hard buffer ceiling, AMD low-latency decode request, observed-latency trace diagnostics, and removal of the latency oscillation test,
@@ -150,7 +150,9 @@ decoder-output-to-submission latency. No scenario is worker-saturated.
 
 ### V2 Queue live A/B experiment (2026-09-11)
 
-Current revision 6 supersedes the revision-5 conditional-lateness measurement
+Live V2 returns to revision 7 and 500 us tolerance after the user reported that motion worsened only with revision 8's 250 us tolerance. Preset targets and severity weighting remain active. Revision 7 retains revision 6's interval measurement and replaces its
+binary score with severity-weighted quality tied to each latency preset.
+Revision 6 superseded the revision-5 conditional-lateness measurement
 described below. For consecutive submitted frames, intended spacing is the
 difference in mapped source time plus deliberate Reduce judder adjustment.
 The measured residual is `abs(submissionInterval - intendedInterval)`, including
@@ -160,23 +162,43 @@ not optical scanout confirmation. Discontinuous/missing frames break the pair;
 their drops remain separately visible.
 
 The controller and overlay share one one-second average (10 ms buckets). After
-one second of valid coverage, mean error through 500 us is accepted (lowered from
-1000 us at the user's request). Above it,
-fresh readiness-attributable interval errors can acquire the mean excess, bounded
-by the affected frame's lateness, 250 us per 250 ms, and 125 us applied per frame.
+one second of valid coverage, mean error through 500 us is accepted (originally lowered from
+1000 us at the user's request). For each evaluated interval, revision 7 computes
+`loss = clamp(max(meanErrorUs - 500, 0) / intendedIntervalUs, 0, 1)`.
+The shared score is `100 * (1 - sum(actualIntervalUs * loss) / sum(actualIntervalUs))`
+over the last 30 seconds, using 100 ms buckets. Loss retains fractional
+microseconds rather than rounding every frame. Missing coverage is unknown;
+before 30 seconds, the score uses the available evaluated time. This is timing
+quality, not a percentage of perfect frames or a perceptually calibrated score.
+The same calculation serves all presets and both controller and overlay.
+
+Lowest latency / Balanced / Smoothest seek 99% / 99.5% / 99.95%, respectively.
+An attack requires the 30-second score below its target, current one-second loss
+above the preset's allowed loss, and a fresh interval error over 500 us with
+readiness-attributable lateness. It acquires only the current mean excess above
+the preset allowance (`(1 - target) * intendedIntervalUs`), bounded by fresh
+error above tolerance, the affected frame's lateness, 250 us per 250 ms, and
+125 us applied per frame. Old score debt alone cannot authorize buffer growth.
 Unfinished work must explain the error before extra buffering is authorized.
-Smoothest now requires ten clean seconds before release (increased from six
+Either a below-target score or current above-target loss renews the protection
+hold and clears fractional release credit. Release requires both measurements
+meeting the selected target throughout the hold. Smoothest requires ten clean
+seconds before release (increased from six
 after the latest gameplay report), retaining its 100 us/second release speed.
-Lowest and Balanced retain their two/four-second holds and 250/200 us/second
-release. The one-second detection window, 0.5 ms tolerance and buffer caps remain
-unchanged. The score is the proportion
-of evaluated time in the last 30 seconds whose rolling mean stayed within 0.5 ms,
-weighted by elapsed interval time rather than frame count. Unavailable periods
-are not counted as success. The overlay shows this score plus the current
-one-second mean; the previous arbitrary percentage curve is retired for V2.
+Lowest and Balanced now hold for six/eight clean seconds (previously two/four)
+and release at 125/100 us per second (previously 250/200). This halves their
+decay speeds and retains protection longer between disturbances. A below-target
+score or current above-target loss still renews the hold; this adjustment cannot
+improve a session already pinned at its buffer cap. The hold and release values
+are serialized independently, so revision 7 captures retain their own settings.
+The one-second detection window and buffer caps remain
+unchanged. The overlay shows quality versus the selected target plus the current
+one-second mean. Historical revision 6 retains its binary proportion of evaluated
+time within 500 us and its threshold-only buffer adaptation when selected through
+explicit controller parameters. Explicit revision 8 retains its 250 us severity tolerance for historical compatibility; live V2 sessions capture revision 7 and display 0.50 ms. The regression report supports restoring the last user-confirmed smooth setting; the initial capture was a 417-row connection fragment. After normal application exit, the finalized latest capture contained 1,981 rows over 17.91 seconds, in Lowest latency mode, with applied buffer fixed at its 4,310 us cap and 26 playback drops. It does not demonstrate buffer oscillation or isolate tolerance as the cause of the reported motion regression.
 
 The user explicitly requested code, compilation and publication without tests
-or trace work. Revision-6 diagnostics/replay support and validation are deferred
+or trace work. Revision-6/7/8 diagnostics/replay support and validation are deferred
 until finalization; the existing deployed diagnostic utilities are preserved.
 
 Historical revision-5 implementation and publication record:

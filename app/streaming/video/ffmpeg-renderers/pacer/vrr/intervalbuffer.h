@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 
 namespace Vrr13 {
@@ -16,10 +17,21 @@ public:
     struct Stats {
         double averageErrorUs = 0;
         uint64_t evaluatedUs = 0, failedUs = 0;
+        double weightedLossUs = 0;
+        bool severityWeighted = false;
         bool averageValid = false;
+        double lossFraction() const {
+            return evaluatedUs ? std::clamp(
+                (severityWeighted ? weightedLossUs : double(failedUs)) / evaluatedUs,
+                0.0, 1.0) : 0.0;
+        }
+        double qualityPercent() const { return 100.0 * (1.0 - lossFraction()); }
     };
     void observe(const Sample& s, uint64_t minimum, uint64_t maximum,
-                 uint64_t hold, uint64_t releaseRate) {
+                 uint64_t hold, uint64_t releaseRate,
+                 bool severityWeighted = false, uint64_t targetPerMillion = 990000,
+                 uint64_t toleranceUs = 500) {
+        m_Stats.severityWeighted = severityWeighted;
         minimum = std::min(minimum, maximum);
         if (!m_Initialized) { m_Target = s.buffer; m_Initialized = true; }
         m_Target = std::clamp(m_Target, minimum, maximum);
@@ -51,28 +63,49 @@ public:
         m_Stats.averageErrorUs = samples ? double(total) / samples : 0;
         m_Stats.averageValid = samples >= 2 && s.submitted - m_First >= 1000000;
         if (!m_Stats.averageValid) return;
-        const bool pressure = total > samples * ToleranceUs;
+        const bool pressure = total > samples * toleranceUs;
         // Weight the score by evaluated time, not frame rate. Attribute the
         // preceding interval to its evaluated one-second mean; gaps are unknown.
         auto& score = m_Score[(s.submitted / 100000) % m_Score.size()];
         if (score.tick != s.submitted / 100000) score = ScoreBucket{s.submitted / 100000};
         score.evaluated += actual;
         if (pressure) score.failed += actual;
+        // Revision 7 measures severity rather than treating a tiny crossing as
+        // a completely failed interval. Keep sub-microsecond loss in double so
+        // Smoothest's 99.95% target is not biased by per-frame rounding.
+        const double excessUs = std::max(0.0, m_Stats.averageErrorUs - toleranceUs);
+        const double loss = std::min(1.0, excessUs / intended);
+        if (severityWeighted) score.weightedLoss += actual * loss;
         updateScore(s.submitted);
 
-        if (pressure) m_LastPressure = s.submitted;
+        const double allowedLoss = (1000000 - std::min<uint64_t>(targetPerMillion, 1000000)) / 1000000.0;
+        const bool belowTarget = m_Stats.lossFraction() > allowedLoss;
+        const bool currentPressure = severityWeighted ? loss > allowedLoss : pressure;
+        // Old score debt holds protection, but cannot authorize another attack
+        // without current, attributable error outside the preset's allowance.
+        const bool holdProtection = currentPressure || (severityWeighted && belowTarget);
+        if (holdProtection) {
+            m_LastPressure = s.submitted;
+            if (severityWeighted) m_ReleaseFraction = 0;
+        }
         const auto& delayed = actual >= intended ? s : previous;
         const auto lateness = delayed.ready > delayed.deadline ? delayed.ready - delayed.deadline : 0;
-        if (pressure && error && delayed.absorbable && lateness &&
+        const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
+        const bool grow = currentPressure && (!severityWeighted || belowTarget);
+        if (grow && freshError && delayed.absorbable && lateness &&
                 (!m_LastAttack || s.submitted - m_LastAttack >= 250000)) {
-            const auto excess = (total - samples * ToleranceUs + samples - 1) / samples;
-            const auto increase = std::min({uint64_t(250), excess, lateness});
+            const auto excess = severityWeighted ?
+                uint64_t(std::ceil(std::min(250.0, std::max(0.0, excessUs - allowedLoss * intended)))) :
+                (total - samples * toleranceUs + samples - 1) / samples;
+            const auto freshExcess = severityWeighted ? error - toleranceUs : error;
+            const auto increase = std::min({uint64_t(250), excess, lateness,
+                severityWeighted ? freshExcess : uint64_t(250)});
             const auto base = std::min(delayed.buffer, maximum);
             m_Target = std::max(m_Target, base + std::min(increase, maximum - base));
             m_LastAttack = s.submitted;
             m_ReleaseFraction = 0;
         }
-        else if (!pressure && s.absorbable && s.submitted - m_First >= hold &&
+        else if (!holdProtection && s.absorbable && s.submitted - m_First >= hold &&
                 (!m_LastPressure || s.submitted - m_LastPressure >= hold)) {
             m_ReleaseFraction += std::min<uint64_t>(actual, 100000) * releaseRate;
             const auto release = m_ReleaseFraction / 1000000;
@@ -89,12 +122,17 @@ public:
     void reset() { *this = IntervalBuffer{}; }
 private:
     struct Bucket { uint64_t tick = 0, samples = 0, total = 0; };
-    struct ScoreBucket { uint64_t tick = 0, evaluated = 0, failed = 0; };
+    struct ScoreBucket {
+        uint64_t tick = 0, evaluated = 0, failed = 0;
+        double weightedLoss = 0;
+    };
     void updateScore(uint64_t at) {
         m_Stats.evaluatedUs = m_Stats.failedUs = 0;
+        m_Stats.weightedLossUs = 0;
         for (const auto& b : m_Score) {
             if (at / 100000 >= b.tick && at / 100000 - b.tick < m_Score.size()) {
                 m_Stats.evaluatedUs += b.evaluated; m_Stats.failedUs += b.failed;
+                m_Stats.weightedLossUs += b.weightedLoss;
             }
         }
     }
