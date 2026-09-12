@@ -11600,7 +11600,6 @@ int main(int argc, char* argv[])
                 capturedParameters.latencyFixAllRates == 0;
             capturedConfig.latencyMode = capturedParameters.latencyFixAllRates != 0 ?
                 (capturedParameters.latencyFixDelayPeriodPerMille == 0 ? 2 : 1) : 0;
-            capturedConfig.v2Queue = capturedParameters.playoutResponsiveBuffer >= 5;
             simulatedConfig = capturedConfig;
             // Current policy is shared across backends. Exact replay below
             // still uses the captured parameters, including the retired Linux policy.

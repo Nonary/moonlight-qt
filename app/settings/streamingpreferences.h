@@ -139,7 +139,6 @@ public:
     Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
     Q_PROPERTY(int vrrLatencyMode MEMBER vrrLatencyMode NOTIFY vrrLatencyModeChanged)
     Q_PROPERTY(bool smoothVrrFrameTiming MEMBER smoothVrrFrameTiming NOTIFY smoothVrrFrameTimingChanged)
-    Q_PROPERTY(bool v2Queue MEMBER v2Queue NOTIFY v2QueueChanged)
     Q_PROPERTY(bool gameOptimizations MEMBER gameOptimizations NOTIFY gameOptimizationsChanged)
     Q_PROPERTY(bool playAudioOnHost MEMBER playAudioOnHost NOTIFY playAudioOnHostChanged)
     Q_PROPERTY(bool multiController MEMBER multiController NOTIFY multiControllerChanged)
@@ -192,7 +191,6 @@ public:
     // adaptive-refresh floor, so the panel never engages its own
     // low-framerate compensation.
     bool smoothVrrFrameTiming;
-    bool v2Queue;
     bool gameOptimizations;
     bool playAudioOnHost;
     bool multiController;
@@ -235,7 +233,6 @@ signals:
     void enableVrrChanged();
     void vrrLatencyModeChanged();
     void smoothVrrFrameTimingChanged();
-    void v2QueueChanged();
     void gameOptimizationsChanged();
     void playAudioOnHostChanged();
     void multiControllerChanged();

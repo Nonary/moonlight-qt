@@ -1907,9 +1907,7 @@ void exportWarmHistoryReplayFixture()
     PacerTelemetry telemetry;
     TrackedFrameLifetime lifetime[180];
     {
-        auto v2Config = enabledConfig();
-        v2Config.v2Queue = true;
-        VrrPacingWorker worker(&backend, v2Config, &telemetry);
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
         expect(worker.start(), "warm-history replay worker must start");
         const auto start = std::chrono::steady_clock::now();
         for (int i = 0; i < 180; ++i) {

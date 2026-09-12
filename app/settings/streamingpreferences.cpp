@@ -152,7 +152,6 @@ void StreamingPreferences::reload()
         vrrLatencyMode = settings.value(SER_VRRLATENCYFIX).toBool() ? VLM_BALANCED : VLM_SMOOTHEST;
     }
     smoothVrrFrameTiming = settings.value(SER_SMOOTHVRRFRAMETIMING, true).toBool();
-    v2Queue = settings.value("v2queue", false).toBool();
     gameOptimizations = settings.value(SER_GAMEOPTS, true).toBool();
     playAudioOnHost = settings.value(SER_HOSTAUDIO, false).toBool();
     multiController = settings.value(SER_MULTICONT, true).toBool();
@@ -360,7 +359,7 @@ void StreamingPreferences::save()
     settings.remove("gamescoperepaint");
     settings.remove("gamescopeforcecomposition");
     settings.setValue(SER_SMOOTHVRRFRAMETIMING, smoothVrrFrameTiming);
-    settings.setValue("v2queue", v2Queue);
+    settings.remove("v2queue"); // The interval queue is now the production policy.
     settings.setValue(SER_GAMEOPTS, gameOptimizations);
     settings.setValue(SER_HOSTAUDIO, playAudioOnHost);
     settings.setValue(SER_MULTICONT, multiController);

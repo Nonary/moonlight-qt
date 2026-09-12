@@ -5,17 +5,18 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Source baseline: `c5d3bb76` plus the local target-driven V2 Queue (revision 7 restored),
+Source baseline: `e0908f08` plus promotion of the interval-quality queue to production (revision 7),
 client-processing,
 vrr14-style compact stats reporting, restored Reduce judder, reconnect
 trace preservation, motion cadence telemetry, hard buffer ceiling, AMD low-latency decode request, observed-latency trace diagnostics, and removal of the latency oscillation test,
 inspected 2026-09-11; now includes responsive readiness revision 4, desktop-rate isolation,
 and fence-value-verified Windows readiness waits. The latency
 presets and persistent Vulkan presentation changes remain active.
-Windows and Linux share both queue policies. With V2 Queue off (the default), the policy remains:
-99% / 99.5% / 99.95% readiness targets over 30 / 60 / 120 seconds for
-Lowest latency / Balanced / Smoothest, a two-second miss boost, and a 500 us readiness margin
-within the shared three-frame queue and 0.5/1/2-configured-frame preset caps.
+Windows and Linux share one production queue policy: mean absolute client-added
+interval error over one second with 0.5 ms tolerance, driving a severity-weighted
+30-second quality score. Lowest latency / Balanced / Smoothest seek
+99% / 99.5% / 99.95%, with 6/8/10-second holds and 125/100/100 us-per-second
+release, within the shared three-frame queue and 0.5/1/2-configured-frame caps.
 The minimum remains 1 ms (subject to capacity). Five-minute version-20 raw
 readiness calibration is diagnostic only and cannot inflate the live request.
 Linux's event-gated history-version-19
@@ -23,9 +24,10 @@ policy is retired from live selection; explicit historical parameters remain
 supported for exact replay. Linux calibration keys are segregated from that
 retired policy. Native synchronization and presentation remain backend-specific.
 Display feedback is optional diagnostic evidence and does not steer this policy.
-With V2 Queue on, mean absolute client-added interval error across all valid
-intervals replaces percentile growth. The live A/B experiment is described below; the baseline policy remains
-available without rebuilding. Reconnect after changing the checkbox.
+The former V2 Queue A/B checkbox and its runtime configuration fields are removed.
+The saved `v2queue` setting is ignored and removed on save, so previously disabled
+installations also use the new queue. Legacy policies remain only for explicit
+historical diagnostic configurations. Reconnect after changing latency presets.
 Updated 2026-09-11: displayed frame queue delay excludes the worker's explicit
 GPU decode synchronization wait. The existing decoding statistic is unchanged;
 no new overlay statistic is added. Full decoder-output-to-present-return timing
@@ -148,9 +150,12 @@ Final session-policy comparison is identical to the capture; the five stress
 scenarios pass with zero modeled interval violations and 16.91--18.41 ms p99
 decoder-output-to-submission latency. No scenario is worker-saturated.
 
-### V2 Queue live A/B experiment (2026-09-11)
+### Production interval-quality queue (promoted from V2)
 
-Live V2 returns to revision 7 and 500 us tolerance after the user reported that motion worsened only with revision 8's 250 us tolerance. Preset targets and severity weighting remain active. Revision 7 retains revision 6's interval measurement and replaces its
+Every normal VRR session now selects revision 7 without an A/B setting. The queue
+uses 500 us tolerance after the user reported that motion worsened only with
+revision 8's 250 us tolerance. Preset targets and severity weighting remain active.
+Revision 7 retains revision 6's interval measurement and replaces its
 binary score with severity-weighted quality tied to each latency preset.
 Revision 6 superseded the revision-5 conditional-lateness measurement
 described below. For consecutive submitted frames, intended spacing is the
@@ -195,13 +200,19 @@ The one-second detection window and buffer caps remain
 unchanged. The overlay shows quality versus the selected target plus the current
 one-second mean. Historical revision 6 retains its binary proportion of evaluated
 time within 500 us and its threshold-only buffer adaptation when selected through
-explicit controller parameters. Explicit revision 8 retains its 250 us severity tolerance for historical compatibility; live V2 sessions capture revision 7 and display 0.50 ms. The regression report supports restoring the last user-confirmed smooth setting; the initial capture was a 417-row connection fragment. After normal application exit, the finalized latest capture contained 1,981 rows over 17.91 seconds, in Lowest latency mode, with applied buffer fixed at its 4,310 us cap and 26 playback drops. It does not demonstrate buffer oscillation or isolate tolerance as the cause of the reported motion regression.
+explicit controller parameters. Explicit revision 8 retains its 250 us severity tolerance for historical compatibility; production sessions capture revision 7 and display 0.50 ms. The regression report supports restoring the last user-confirmed smooth setting; the initial capture was a 417-row connection fragment. After normal application exit, the finalized latest capture contained 1,981 rows over 17.91 seconds, in Lowest latency mode, with applied buffer fixed at its 4,310 us cap and 26 playback drops. It does not demonstrate buffer oscillation or isolate tolerance as the cause of the reported motion regression.
+
+The preference, Session presentation snapshot, decoder parameters, Pacer signature,
+and VrrSessionConfig no longer carry a queue-arm flag. The existing
+`|mean-miss-queue-v2` calibration suffix is retained unconditionally to preserve
+previous V2 users' cache identity; its spelling is historical, not a selector.
+The overlay reports smoothness and the preset target without V1/V2 arm labels.
 
 The user explicitly requested code, compilation and publication without tests
 or trace work. Revision-6/7/8 diagnostics/replay support and validation are deferred
 until finalization; the existing deployed diagnostic utilities are preserved.
 
-Historical revision-5 implementation and publication record:
+Historical revision-5 implementation and publication record (superseded):
 
 Published to ChaseShare after the successful incremental app/diagnostic builds.
 Application SHA-256: `E00649E8F5CD70E2AEA1C87F96D97D0CA413EB7CE03B1FE6ADEBF4C88223D62A`.
@@ -210,10 +221,10 @@ Build/deploy/live copies and portable markers were checked. The user explicitly
 requested skipping further tests until they say to finalize; no additional
 replay, help smoke test or simulation was run after that instruction. The four
 deterministic suites had already completed successfully before the interruption.
-Finalization and live A/B assessment remain pending; do not resume testing
-without the user's finalization instruction.
+At that stage finalization and live A/B assessment were pending. The user has
+since ended A/B selection; test and replay finalization remain separately deferred.
 
-The `V2 Queue` checkbox is persisted as `v2queue`, defaults off, and is captured
+The former `V2 Queue` checkbox was persisted as `v2queue`, defaulted off, and was captured
 once per stream through preferences, Session::PresentationSettings,
 DECODER_PARAMETERS, Pacer::initialize, and VrrSessionConfig. Decoder recreation
 retains that snapshot. Off resolves `playout_responsive_buffer=4`, preserving the
@@ -264,7 +275,7 @@ waiting for the writer. Capacity exhaustion or bounded producer contention still
 drops diagnostics explicitly. Three-producer tests check 60,000 rows for intact
 contents and per-producer ordering; shutdown drains in-flight publication.
 
-### Baseline preset on-time targets and thresholded misses (2026-09-11)
+### Historical baseline preset on-time targets and thresholded misses (2026-09-11)
 
 Responsive revision 4 selects 99% / 99.5% / 99.95% readiness targets and
 30 / 60 / 120-second learning windows for Lowest latency / Balanced / Smoothest.
@@ -1179,10 +1190,11 @@ legacy/replay behavior. In that branch 1000 per mille means p100, 999 means
 p99.9, and 995 means p99.5. Those values must not be confused with the active
 Reserve p99.95 implementation.
 
-Production sets `playout_prediction_only=1`; V2 Queue off selects
-`playout_responsive_buffer=4`. V2 Queue on selects revision 5 and the mean-miss
-observer described above, bypassing the following percentile growth/release law.
-The live estimator keeps 100 ms buckets over the selected preset's learning
+Production sets `playout_prediction_only=1` and `playout_responsive_buffer=7`
+for every normal VRR session. The interval-quality observer described above owns
+requested delay, with 125 us per-frame attack application and preset-timed
+release. It bypasses the following historical percentile growth/release law.
+The retired revision-4 estimator keeps 100 ms buckets over the selected preset's learning
 window, including successes. Lowest latency uses 99% over 30 seconds, Balanced
 99.5% over 60 seconds, and Smoothest 99.95% over 120 seconds. These are
 best-effort targets within the existing latency caps. Historical revisions 1

@@ -1,20 +1,23 @@
 # VRR deterministic tests
 
-`V2 Queue` is a live gameplay A/B checkbox, off by default. Off preserves
-responsive revision 4. On selects revision 5: average positive preparation
-lateness among missed frames over one second, a 1 ms deadband, at most 250 us
-requested growth per 250 ms, 125 us applied per frame, and preset-specific
-clean holds/slow release. Both arms retain the same buffer caps and decode/queue
-accounting. The overlay identifies the arm; V2 shows the thirty-second mean
-and `100 / (1 + (max(meanUs - 1000, 0) / 3000)^2)` diagnostic score. Its 100%
-plateau through 1 ms is intentional, not optical smoothness proof.
+The interval-quality queue is now the production VRR policy (responsive
+revision 7). There is no A/B checkbox; saved `v2queue` values are ignored and
+removed when settings are saved. Every normal session uses the same 0.5 ms
+tolerance and severity-weighted thirty-second score, with targets of
+99% / 99.5% / 99.95% for Lowest latency / Balanced / Smoothest. Their clean
+holds are 6 / 8 / 10 seconds and release speeds are 125 / 100 / 100 us per
+second. Growth requires both below-target quality and fresh readiness-related
+interval error. See architecture.md for the complete measurement and bounds.
 
-The user requested actual gameplay comparison rather than simulation. Tests
-cover threshold arithmetic, missed-only denominators, expiry, bounded growth,
-release and trace integrity; do not present simulation
-results as this experiment's A/B outcome. Warm fixture export selects V2, while
-the ordinary deep fixture preserves V1. The trace queue concurrency test checks
-60,000 rows from three producers plus bounded-full/empty behavior.
+Historical policy implementations remain available through explicit captured
+controller parameters; session configuration no longer selects an A/B arm.
+Both ordinary and warm fixture exports inherit the current production policy.
+Existing historical arithmetic and trace tests remain, but revision-6/7/8 replay
+support and final validation are still deferred at the user's request. The
+deployed replay utility rejects those captured revisions; do not claim an exact
+baseline or a gameplay improvement from this promotion. No tests or simulations
+were run for it. The trace queue concurrency test covers 60,000 rows from three
+producers plus bounded-full/empty behavior.
 
 Linux Vulkan on Wayland now attaches presentation-time feedback to each native
 surface submission and records correlated compositor timestamps for native

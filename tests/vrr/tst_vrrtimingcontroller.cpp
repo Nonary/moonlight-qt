@@ -4317,13 +4317,11 @@ void testMeanMissBuffer()
     for (int mode : {0, 1, 2}) {
         auto session = config(116, 120);
         session.latencyMode = mode;
-        expect(vrrTimingParametersForSession(session).playoutResponsiveBuffer == 4,
-            "V2 Queue off must retain the installed revision-four policy");
-        session.v2Queue = true;
         const auto policy = vrrTimingParametersForSession(session);
-        expect(policy.playoutResponsiveBuffer == 5 &&
-            policy.playoutMeanMissHoldUs == (mode == 2 ? 2000000 : mode == 1 ? 4000000 : 6000000),
-            "V2 Queue and its preset hold must be recorded as replayable parameters");
+        expect(policy.playoutResponsiveBuffer == 7 &&
+            policy.playoutMeanMissHoldUs == (mode == 2 ? 6000000 : mode == 1 ? 8000000 : 10000000) &&
+            policy.playoutMeanMissReleaseUsPerSecond == (mode == 2 ? 125 : 100),
+            "every preset must select the production interval queue and record its release policy");
     }
 }
 

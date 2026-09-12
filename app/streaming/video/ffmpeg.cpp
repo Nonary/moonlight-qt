@@ -577,7 +577,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
                                  Session::get()->vrrCalibrationContext() + QString("|%1|%2|%3|%4|%5")
                                      .arg(params->width).arg(params->height).arg(params->videoFormat)
                                      .arg(m_FrontendRenderer->getCalibrationIdentity()).arg(decoder->name),
-                                 params->vrrLatencyMode, params->v2Queue)) {
+                                 params->vrrLatencyMode)) {
             return false;
         }
     }
@@ -1281,7 +1281,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                     snprintf(average, sizeof(average), "%.3f ms", interval.averageErrorUs / 1000.0);
                 else snprintf(average, sizeof(average), "collecting");
                 ret = snprintf(&output[offset], length - offset,
-                    "VRR pacing: %s | V2 Queue | Smoothness (30s): %s / %.2f%% target%s\n"
+                    "VRR pacing: %s | Smoothness (30s): %s / %.2f%% target%s\n"
                     "Client interval error (1s): %s | Tolerance: %.2f ms | Dropped (30s): %llu\n",
                     stats.vrrTelemetryActive ? "Active" : "Inactive", score,
                     stats.vrrOnTimeTargetPerMillion / 10000.0,
@@ -1291,7 +1291,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             }
             else if (readiness.meanMissPolicy) {
                 ret = snprintf(&output[offset], length - offset,
-                    "VRR pacing: %s | V2 Queue | Smoothness (30s): %.2f%%%s\n"
+                    "VRR pacing: %s | Smoothness (30s): %.2f%%%s\n"
                     "Average miss (30s): %.3f ms | Dropped (30s): %llu\n",
                     stats.vrrTelemetryActive ? "Active" : "Inactive",
                     Vrr13::ReadinessWindow::meanMissScore(readiness),
@@ -1302,7 +1302,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             else {
                 ret = snprintf(&output[offset],
                            length - offset,
-                           "VRR pacing: %s | V1 Queue | Client ready on time (30s): %.2f%% / %.2f%% target%s\n"
+                           "VRR pacing: %s | Client ready on time (30s): %.2f%% / %.2f%% target%s\n"
                            "Late >1 ms: %.2f%% | >2 ms: %.2f%% | Dropped (30s): %llu\n",
                            stats.vrrTelemetryActive ? "Active" : "Inactive",
                            readyOnTimePercent,

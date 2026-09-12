@@ -11,24 +11,9 @@ constexpr uint64_t kMicrosecondsPerSecond = 1000000ULL;
 constexpr uint64_t kRtpClockRate = 90000ULL;
 constexpr uint64_t kQ16One = 1ULL << 16;
 constexpr uint64_t kQ16Half = kQ16One >> 1;
-// Both queue policies are a fixed jitter buffer hung off the sender
-// timestamps: every frame presents at its RTP time plus one constant delay.
-// Arrival variation up to that delay is invisible; anything larger is one
-// late frame and nothing else moves. On the reference 116 FPS / 120 Hz rig
-// decode-versus-RTP jitter is about 1 ms at p50 and 4 ms at p95, so 2 ms
-// absorbs the common case at low latency and 5 ms covers roughly p97.
-// One VRR queue policy. The adaptive calibrator learns the playout delay per
-// source-rate band from the lateness of arrivals against the slot the
-// metronome is trying to reach, targeting the p99.9 of lateness plus a
-// margin. On the 2026-09-01 20:04 capture p99 let one frame in a hundred
-// through as a hitch; p99.9 halved those hitches (13 to 6 in 106 s) for
-// 1.2 ms more median latency, a trade the user judged well worth it. The
-// absolute bounds below are floors; the session policy scales the start and
-// cap to 95 percent of one source period. That was the replay-calibrated knee:
-// it retained almost all of the one-period policy's cadence smoothing while
-// recovering its added latency. Reports of the 8 ms cap were consistent: at
-// 4K the host stamp wobble alone consumed most of it. The fixed delay is only
-// used when the calibrator is disabled by replay parameters.
+// These base values also serve historical replay policies. Live sessions
+// resolve the interval-quality controller and preset caps below; the rolling
+// quality target, rather than a calibration percentile, owns reserve changes.
 constexpr uint64_t kFixedPlayoutDelayUs = 3000;
 constexpr uint64_t kPlayoutStartUs = 6000;
 constexpr uint64_t kPlayoutMinimumUs = 1000;
@@ -127,8 +112,9 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayCapSourcePeriodPerMille = config.latencyFix ? 0 :
         latencyMode == 2 ? 500 : latencyMode == 1 ? 1000 : 2000;
     parameters.playoutPredictionOnly = 1;
-    // Historical revisions retain their captured deadlines and short history.
-    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : config.v2Queue ? 7 : 4;
+    // Every normal VRR session uses the interval-quality queue. Historical
+    // policies remain selectable only through explicit diagnostic parameters.
+    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 7;
     // Retain earned protection between bursts instead of repeatedly shedding
     // it and reacquiring it. Explicit captured values preserve older release.
     parameters.playoutMeanMissHoldUs = latencyMode == 2 ? 6000000 : latencyMode == 1 ? 8000000 : 10000000;
@@ -139,7 +125,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         latencyMode == 1 ? 60000000 : 120000000;
     parameters.playoutReadinessHitchThresholdUs = config.readinessHitchFeedback ? 2000 : 0;
     parameters.playoutNativeHitchAdaptation = 0;
-    // Display observations remain diagnostics; V2 observes measured readiness.
+    // Display observations remain diagnostics; the queue uses interval quality.
     parameters.playoutRequireDisplayEvents = 1;
     parameters.playoutSubmissionEstimateFallback = 1;
     parameters.playoutReadinessDrivenAdaptation = 1;

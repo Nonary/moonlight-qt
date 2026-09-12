@@ -4,7 +4,7 @@
 #include <cstdint>
 
 namespace Vrr13 {
-// Live V2 queue experiment. Average measured lateness among missed frames in
+// Historical revision-5 queue. Average measured lateness among missed frames in
 // the last second; successful frames establish coverage but do not dilute it.
 class MeanMissBuffer {
 public:
