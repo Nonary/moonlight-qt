@@ -453,7 +453,7 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
         error = QStringLiteral("Mean-miss hold must be 1-60 seconds and release at most 1000 us per second");
         return false;
     }
-    if (value.playoutResponsiveBuffer > 5 || (value.playoutResponsiveBuffer &&
+    if (value.playoutResponsiveBuffer > 8 || (value.playoutResponsiveBuffer &&
             (!value.playoutPredictionOnly || value.playoutReadinessHitchThresholdUs))) {
         return fail("playout_responsive_buffer requires prediction-only playout without historical hitch feedback");
     }

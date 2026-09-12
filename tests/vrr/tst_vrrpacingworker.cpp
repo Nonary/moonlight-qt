@@ -1762,9 +1762,9 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     expect(restored.loadProfile(profile) && restored.common() == 4000000 && restored.evidence() == 0,
            "captured calibration must restore prior history without inventing fresh successes");
     expect(fields.value(columns.indexOf("param_playout_prediction_only")) == "1" &&
-               fields.value(columns.indexOf("param_playout_responsive_buffer")) == "4" &&
+               fields.value(columns.indexOf("param_playout_responsive_buffer")) == "7" &&
                fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "0",
-           "capture must identify prediction-only adaptation for exact replay");
+           "capture must identify production interval-quality adaptation for exact replay");
     expect(header.contains("frame_receive_us") &&
                header.contains("frame_reassembled_us") &&
                header.contains("decode_submit_us") &&

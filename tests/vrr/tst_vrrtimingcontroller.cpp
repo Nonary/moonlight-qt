@@ -4222,7 +4222,7 @@ void testPresetReadinessTargets()
         const auto policy = vrrTimingParametersForSession(session);
         const uint64_t target = mode == 2 ? 990000 : mode == 1 ? 995000 : 999500;
         const uint64_t window = mode == 2 ? 30000000 : mode == 1 ? 60000000 : 120000000;
-        expect(policy.playoutResponsiveBuffer == 4 &&
+        expect(policy.playoutResponsiveBuffer == 7 &&
                    policy.playoutOnTimeTargetPerMillion == target &&
                    policy.playoutReadinessWindowUs == window,
                "presets must resolve their exact reliability target and bounded history");
@@ -4325,8 +4325,42 @@ void testMeanMissBuffer()
     }
 }
 
+void testIntervalQualityBuffer()
+{
+    // Constant lateness must cancel from spacing; alternating late readiness
+    // must acquire bounded protection only when it explains the error.
+    for (bool variable : {false, true}) {
+        for (bool absorbable : {false, true}) {
+            Vrr13::IntervalBuffer buffer;
+            uint64_t applied = 1000;
+            for (uint64_t i = 1; i <= 500; ++i) {
+                const uint64_t intended = 1000000 + i * 10000;
+                const uint64_t late = variable && i % 2 ? 3000 : 1000;
+                const uint64_t previous = applied;
+                buffer.observe({i, intended, intended + late, intended,
+                    intended + late, applied, true, absorbable},
+                    1000, 4000, 6000000, 125, true, 990000);
+                applied = buffer.demand(applied);
+                expect(applied >= 1000 && applied <= 4000 && applied <= previous + 250,
+                       "interval buffer must respect its minimum, cap, and bounded attack");
+            }
+            expect(buffer.stats().averageValid, "continuous intervals must establish valid coverage");
+            if (!variable) {
+                expect(applied == 1000 && buffer.stats().qualityPercent() == 100.0,
+                       "constant lateness must not reduce interval quality or grow buffering");
+            } else {
+                expect(buffer.stats().qualityPercent() < 99.0,
+                       "sustained spacing variation must lower the severity-weighted score");
+                expect(absorbable ? applied > 1000 : applied == 1000,
+                       "only readiness-attributable spacing errors may grow protection");
+            }
+        }
+    }
+}
+
 int main()
 {
+    testIntervalQualityBuffer();
     testMeanMissBuffer();
     testThresholdedReadinessGrowth();
     testPresetReadinessTargets();

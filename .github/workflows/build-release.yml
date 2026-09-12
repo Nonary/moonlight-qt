@@ -12,6 +12,11 @@ on:
         description: Release version without the leading v
         required: true
         type: string
+      build_macos:
+        description: Include the macOS build
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   setup:
@@ -33,6 +38,7 @@ jobs:
     uses: ./.github/workflows/build-win-mac.yml
     with:
       ci_version: ${{ needs.setup.outputs.ci_version }}
+      build_macos: ${{ github.event_name != 'workflow_dispatch' || inputs.build_macos }}
 
   appimage:
     needs: setup

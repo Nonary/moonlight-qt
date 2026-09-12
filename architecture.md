@@ -208,9 +208,12 @@ and VrrSessionConfig no longer carry a queue-arm flag. The existing
 previous V2 users' cache identity; its spelling is historical, not a selector.
 The overlay reports smoothness and the preset target without V1/V2 arm labels.
 
-The user explicitly requested code, compilation and publication without tests
-or trace work. Revision-6/7/8 diagnostics/replay support and validation are deferred
-until finalization; the existing deployed diagnostic utilities are preserved.
+During gameplay iteration, diagnostic validation was deferred at the user's
+request. VRR16 release finalization now accepts revisions 6/7/8 in replay,
+round-trips their captured parameters, and updates production capture assertions
+to revision 7. Release CI runs the deterministic suites plus fresh single-frame
+and warm-history exact-replay fixtures before packaging Windows diagnostics.
+These are synthetic validation checks, not live A/B or optical latency evidence.
 
 Historical revision-5 implementation and publication record (superseded):
 

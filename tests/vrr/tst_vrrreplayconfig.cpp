@@ -528,7 +528,13 @@ void VrrReplayConfigTest::predictionOnlyPolicyRoundTrip()
     QCOMPARE(responsive.playoutResponsiveBuffer, uint64_t(4));
     QVERIFY(applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 5}}, responsive, error));
     QCOMPARE(responsive.playoutResponsiveBuffer, uint64_t(5));
-    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 6}}, responsive, error));
+    for (int revision : {6, 7, 8}) {
+        QVERIFY2(applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", revision}}, responsive, error), qPrintable(error));
+        auto restored = VrrTimingParameters{};
+        QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(responsive), restored, error), qPrintable(error));
+        QCOMPARE(restored.playoutResponsiveBuffer, uint64_t(revision));
+    }
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 9}}, responsive, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_on_time_target_per_million", 1000001}}, responsive, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_readiness_window_us", 120100000}}, responsive, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_readiness_window_us", 30000001}}, responsive, error));

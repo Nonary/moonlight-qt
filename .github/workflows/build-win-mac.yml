@@ -9,12 +9,21 @@ on:
       ci_version:
         required: true
         type: string
+      build_macos:
+        required: false
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
       ci_version:
         description: Version string used for the release artifacts
         required: true
         type: string
+      build_macos:
+        description: Include the macOS build
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -23,13 +32,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Windows
-          - os: windows-2025
-            qt_version: 6.11.1
-          # macOS
-          - os: macos-26
-            qt_version: 6.11.1
+        os: ${{ fromJSON(inputs.build_macos && '["windows-2025", "macos-26"]' || '["windows-2025"]') }}
+        qt_version: ['6.11.1']
 
     runs-on: ${{ matrix.os }}
 
@@ -98,6 +102,10 @@ jobs:
         timeout-minutes: 5
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
+          MOONLIGHT_VRR_TEST_EXPORT_TRACE: ${{ github.workspace }}/build/replay-fixture.vrrtrace
+          MOONLIGHT_VRR_TEST_EXPORT_WARM_TRACE: ${{ github.workspace }}/build/replay-warm-fixture.vrrtrace
         run: |
           $deploy = (Resolve-Path build/deploy-x64-release).Path
           $env:Path = "$deploy;$env:QT_PATH;$env:Path"
@@ -115,8 +123,6 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "$($test.Name) failed: $LASTEXITCODE" }
             Write-Host "Passed $($test.Name)"
           }
-        env:
-          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
 
       - name: Stage and smoke-test VRR replay (Windows x64)
         if: runner.os == 'Windows'
@@ -133,6 +139,23 @@ jobs:
             throw "Packaged replay smoke test failed"
           }
           Get-Content build/vrrreplay-help.txt
+
+      - name: Verify exact replay of production captures (Windows x64)
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES: '1'
+        run: |
+          $replay = (Resolve-Path build/deploy-x64-release/vrrreplay.exe).Path
+          foreach ($fixture in @('replay-fixture', 'replay-warm-fixture')) {
+            & $replay "build/$fixture.vrrtrace" --require-exact-baseline --output "build/$fixture.json"
+            if ($LASTEXITCODE -ne 0) { throw "$fixture exact replay failed: $LASTEXITCODE" }
+            $result = Get-Content "build/$fixture.json" -Raw | ConvertFrom-Json
+            if (!$result.capture.recorded_sequence_integrity_valid -or !$result.fidelity.baseline_exact) {
+              throw "$fixture has incomplete sequence or inexact baseline"
+            }
+          }
 
       - name: Recreate Windows portable ZIP with diagnostics
         if: runner.os == 'Windows'
