@@ -948,6 +948,21 @@ Flickable {
                 }
 
                 CheckBox {
+                    hoverEnabled: true
+                    text: qsTr("V2 Queue")
+                    font.pointSize: 12
+                    visible: StreamingPreferences.enableVrr
+                    enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                    checked: StreamingPreferences.v2Queue
+                    onCheckedChanged: StreamingPreferences.v2Queue = checked
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Compare queue behavior during gameplay. Off uses the original queue policy. On follows the host's changing frame rate and adjusts buffering when average client-added interval error over one second exceeds 0.5 ms.") + "\n\n" +
+                                  qsTr("Reconnect the stream after changing this setting.")
+                }
+
+                CheckBox {
                     id: enableHdr
                     width: parent.width
                     text: qsTr("Enable HDR")

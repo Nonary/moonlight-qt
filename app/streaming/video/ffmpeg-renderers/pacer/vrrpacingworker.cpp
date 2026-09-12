@@ -29,7 +29,6 @@ namespace {
 constexpr size_t kMaximumQueuedFrames = VrrMaximumQueuedFrames;
 // ~64 seconds of rows at 120 FPS. When the writer thread cannot keep up the
 // pacing thread drops rows rather than ever waiting on diagnostics.
-constexpr size_t kMaximumTraceQueueRows = 8192;
 // Each compressed chunk covers only a few seconds, limiting crash loss while
 // still turning repeated timestamps and controller state into very small,
 // infrequent physical writes.
@@ -425,7 +424,13 @@ int VrrPacingWorker::run()
         const uint64_t decodeSyncWaitUs = m_Presenter->waitForDecode(
             frame.frame(), frame.decodeBoundary());
         if (decodeSyncWaitUs > kDecodeSyncNoticeUs) {
-            frame.noteGpuReadyUs(LiGetMicroseconds());
+            // The wait can overlap time already spent in the pacing queue.
+            // Keep that queue residence out of the readiness model by adding
+            // only the blocking fence cost to immutable decoder output.
+            frame.noteGpuReadyUs(decodeSyncWaitUs >
+                    std::numeric_limits<uint64_t>::max() - frame.decoderOutputUs() ?
+                std::numeric_limits<uint64_t>::max() :
+                frame.decoderOutputUs() + decodeSyncWaitUs);
         }
 
         const uint64_t decisionTimeUs = LiGetMicroseconds();
@@ -555,7 +560,8 @@ int VrrPacingWorker::run()
         telemetry.prepareFlushUs = preparation.flushUs;
         m_TimingController->notePreparationDuration(
             telemetry.preparationDurationUs,
-            preparation.timingValid ? preparation.acquireUs : 0);
+            preparation.timingValid ? preparation.acquireUs : 0,
+            telemetry.preparationEndUs);
 
         midframeWindowStateFlags =
             consumeWindowStateNotifications();
@@ -1091,35 +1097,28 @@ void VrrPacingWorker::recordFrameCompletion(const QueuedFrame& queuedFrame,
         const uint64_t deadlineUs = parameters.playoutResponsiveBuffer >= 3 ?
             decision.originalTargetUs : decision.targetUs;
         const bool dropped = disposition != TraceDisposition::Presented;
+        // Controller state belongs to the worker. Producer-side drop rows
+        // preserve the last published interval result instead of reading it.
+        const bool intervalValid = decisionValid && parameters.playoutResponsiveBuffer >= 6;
+        const auto intervalStats = intervalValid ? m_TimingController->intervalStats() : Vrr13::IntervalBuffer::Stats{};
         m_Telemetry->recordVrrReadiness(LiGetMicroseconds(),
             decisionValid ? positiveDifference(telemetry.preparationEndUs, deadlineUs) : 0,
             dropped, parameters.playoutOnTimeTargetPerMillion,
-            decision.playoutCapacityLimited, decisionValid);
+            decision.playoutCapacityLimited, decisionValid,
+            parameters.playoutResponsiveBuffer >= 4,
+            parameters.playoutResponsiveBuffer >= 5,
+            parameters.playoutResponsiveBuffer >= 6, intervalValid ? &intervalStats : nullptr);
     }
     if (queuedFrame.trace.arrivalSequence == 0) {
         return;
     }
+    struct ProducerGuard {
+        std::atomic_uint& active;
+        explicit ProducerGuard(std::atomic_uint& value) : active(value) { ++active; }
+        ~ProducerGuard() { --active; }
+    } producer(m_TraceProducersActive);
     if (!m_TraceAcceptingRows.load()) {
         m_TraceDroppedRows.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
-    // A trace can lose a row, but it must never make the time-critical pacing
-    // thread wait for the background writer. The replay reports sequence gaps
-    // explicitly, so dropping under contention is preferable to skewing the
-    // timing being measured.
-    if (!m_TraceLock.tryLock()) {
-        m_TraceDroppedRows.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    if (!m_TraceAcceptingRows.load()) {
-        m_TraceDroppedRows.fetch_add(1, std::memory_order_relaxed);
-        m_TraceLock.unlock();
-        return;
-    }
-    if (m_TraceQueue.size() >= kMaximumTraceQueueRows) {
-        m_TraceDroppedRows.fetch_add(1, std::memory_order_relaxed);
-        m_TraceLock.unlock();
         return;
     }
 
@@ -1160,10 +1159,10 @@ void VrrPacingWorker::recordFrameCompletion(const QueuedFrame& queuedFrame,
     row.decisionValid = decisionValid;
     row.terminalTimeUs = LiGetMicroseconds();
 
-    m_TraceQueue.emplace_back(std::move(row));
-    m_TraceRowsEnqueued.fetch_add(1, std::memory_order_relaxed);
-    m_TraceLock.unlock();
-    m_TraceQueueNotEmpty.wakeOne();
+    if (m_TraceQueue->push(std::move(row)))
+        m_TraceRowsEnqueued.fetch_add(1, std::memory_order_relaxed);
+    else
+        m_TraceDroppedRows.fetch_add(1, std::memory_order_relaxed);
 }
 
 int VrrPacingWorker::traceThreadProc(void* context)
@@ -1173,32 +1172,29 @@ int VrrPacingWorker::traceThreadProc(void* context)
 
 int VrrPacingWorker::traceRun()
 {
-    std::vector<TraceRow> batch;
-    batch.reserve(kMaximumTraceQueueRows);
+    TraceRow row;
     while (true) {
-        {
-            QMutexLocker lock(&m_TraceLock);
-            while (m_TraceQueue.empty() && !m_TraceStopping.load()) {
-                m_TraceQueueNotEmpty.wait(&m_TraceLock);
-            }
-            batch.swap(m_TraceQueue);
+        if (m_TraceQueue->pop(row)) {
+            if (m_TraceAcceptingRows.load() ||
+                    (m_TraceStopping.load() && !m_TraceWriteFailed && !m_TraceSizeCapped))
+                writeTraceRow(row);
+            continue;
         }
-
-        if (batch.empty() && m_TraceStopping.load()) {
+        if (m_TraceStopping.load() && m_TraceProducersActive.load() == 0) {
+            // A producer could have published between the first empty read
+            // and the active-count check. Drain that final row before exiting.
+            if (m_TraceQueue->pop(row)) {
+                if (!m_TraceWriteFailed && !m_TraceSizeCapped) writeTraceRow(row);
+                continue;
+            }
             if (m_TraceFormat == TraceFormat::ChunkedCompressed) {
                 flushTraceChunk();
             }
             return 0;
         }
-        for (const TraceRow& row : batch) {
-            if (!m_TraceAcceptingRows.load() &&
-                    (!m_TraceStopping.load() ||
-                     m_TraceWriteFailed || m_TraceSizeCapped)) {
-                break;
-            }
-            writeTraceRow(row);
-        }
-        batch.clear();
+        // Poll only the background writer. Producers never wait for it or
+        // contend with a reader-held mutex while delivering a frame.
+        SDL_Delay(2);
     }
 }
 
@@ -1784,8 +1780,7 @@ void VrrPacingWorker::openTraceIfRequested()
 
     m_TraceBytesWritten = 0;
     m_TraceChunk.clear();
-    m_TraceQueue.clear();
-    m_TraceQueue.reserve(kMaximumTraceQueueRows);
+    m_TraceQueue = std::make_unique<Vrr13::TraceQueue<TraceRow, 8192>>();
     m_TraceDecodedHash.reset();
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {
         const size_t magicBytes = sizeof(kTraceMagic) - 1;
@@ -1841,12 +1836,8 @@ void VrrPacingWorker::closeTrace()
     // could enqueue after the writer observes an empty stopping queue, leaving
     // a normal shutdown with an unwritten row behind the footer.
     if (m_TraceThread != nullptr) {
-        {
-            QMutexLocker lock(&m_TraceLock);
-            m_TraceAcceptingRows.store(false);
-            m_TraceStopping.store(true);
-        }
-        m_TraceQueueNotEmpty.wakeAll();
+        m_TraceAcceptingRows.store(false);
+        m_TraceStopping.store(true);
         SDL_WaitThread(m_TraceThread, nullptr);
         m_TraceThread = nullptr;
     }

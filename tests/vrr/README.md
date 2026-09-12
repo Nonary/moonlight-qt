@@ -1,5 +1,21 @@
 # VRR deterministic tests
 
+`V2 Queue` is a live gameplay A/B checkbox, off by default. Off preserves
+responsive revision 4. On selects revision 5: average positive preparation
+lateness among missed frames over one second, a 1 ms deadband, at most 250 us
+requested growth per 250 ms, 125 us applied per frame, and preset-specific
+clean holds/slow release. Both arms retain the same buffer caps and decode/queue
+accounting. The overlay identifies the arm; V2 shows the thirty-second mean
+and `100 / (1 + (max(meanUs - 1000, 0) / 3000)^2)` diagnostic score. Its 100%
+plateau through 1 ms is intentional, not optical smoothness proof.
+
+The user requested actual gameplay comparison rather than simulation. Tests
+cover threshold arithmetic, missed-only denominators, expiry, bounded growth,
+release and trace integrity; do not present simulation
+results as this experiment's A/B outcome. Warm fixture export selects V2, while
+the ordinary deep fixture preserves V1. The trace queue concurrency test checks
+60,000 rows from three producers plus bounded-full/empty behavior.
+
 Linux Vulkan on Wayland now attaches presentation-time feedback to each native
 surface submission and records correlated compositor timestamps for native
 cadence diagnostics, as DXGI/composition do. Production buffer adaptation uses
@@ -125,10 +141,12 @@ interval safety separately; they do not claim 99.95% under post-target faults.
 The all-arrival queue simulator uses the capture's `can_latch_present` capability;
 forcing it off invents software-floor backlog on a latch-capable session.
 
-Production sets `playout_responsive_buffer=3`: Lowest latency targets 99% over
+Production sets `playout_responsive_buffer=4`: Lowest latency targets 99% over
 30 seconds, Balanced 99.5% over 60 seconds, and Smoothest 99.95% over 120 seconds.
-A two-second fresh-miss boost and 500 us margin control the buffer. The 1 ms
-minimum remains. Version-20 five-minute raw-readiness history is diagnostic
+A shortfall through 1 ms does not grow the buffer. A 1-2 ms shortfall permits
+growth only above 50% prevalence in the live window, while any shortfall over
+2 ms starts the two-second fresh-miss boost. A 500 us margin and 1 ms minimum
+remain. Version-20 five-minute raw-readiness history is diagnostic
 only; cached tails cannot grow or hold the live buffer. Recovery headroom
 speeds gradual release rather than being subtracted from readiness demand.
 Preset limits use the configured stream rate, so 120/19/30 FPS desktop changes
@@ -1333,13 +1351,16 @@ See [the capture procedure](../../docs/vrr-latency-captures.md). Run
 between immutable decoder output, later GPU readiness, and present-call return.
 It does not substitute replay scenarios for missing measured presets.
 
-### Responsive buffer revision 3
+### Responsive buffer revision 4
 
-Production resolves `playout_responsive_buffer=3`. Values 0, 1 and 2 remain
+Production resolves `playout_responsive_buffer=4`. Values 0 through 3 remain
 available for exact historical replay. Revision 3 records the selected target
 in `playout_on_time_target_per_million` and learning window in
-`playout_readiness_window_us`. The rolling 30-second outcome readout counts
-client drops as misses and measures lateness before deadline recovery clamps.
+`playout_readiness_window_us`; revision 4 adds thresholded misses and excludes
+pacing-queue residence from the decode-ready timestamp. The rolling 30-second
+outcome readout always counts client drops and lateness over 2 ms as misses,
+counts 1-2 ms lateness only above 50% prevalence, tolerates lateness through
+1 ms, and measures lateness before deadline recovery clamps.
 Replay exposes `observed.readiness` and `simulation.readiness`, including
 misses over 1 ms and 2 ms. Targets are best effort within the existing caps.
 Quantile, expiry, preset selection and drop-accounting tests cover this policy.
@@ -1355,7 +1376,8 @@ These tests do not prove the cause of a particular driver's event delay or
 measure physical display cadence.
 
 Replay distinguishes `decoder_output_us` (immutable CPU output and the latency
-origin) from `decode_complete_us` (the later GPU-ready scheduling boundary).
+origin) from `decode_complete_us` (decoder output plus a blocking GPU fence wait,
+excluding time already spent in the pacing queue).
 Timestamp integrity validates output before admission, readiness before the
 decision, and the recorded decode wait inside the worker lifecycle. Older
 captures without immutable output retain their historical boundary. Busy-worker

@@ -5,13 +5,14 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Source baseline: `6f8e5e79` plus the local client-processing,
+Source baseline: `e2f264fb` plus the local revision-4 baseline and optional V2 Queue (revision 6),
+client-processing,
 vrr14-style compact stats reporting, restored Reduce judder, reconnect
 trace preservation, motion cadence telemetry, hard buffer ceiling, AMD low-latency decode request, observed-latency trace diagnostics, and removal of the latency oscillation test,
-inspected 2026-09-11; now includes responsive readiness revision 3, desktop-rate isolation,
+inspected 2026-09-11; now includes responsive readiness revision 4, desktop-rate isolation,
 and fence-value-verified Windows readiness waits. The latency
 presets and persistent Vulkan presentation changes remain active.
-Windows and Linux now use the same responsive prediction-based buffer policy:
+Windows and Linux share both queue policies. With V2 Queue off (the default), the policy remains:
 99% / 99.5% / 99.95% readiness targets over 30 / 60 / 120 seconds for
 Lowest latency / Balanced / Smoothest, a two-second miss boost, and a 500 us readiness margin
 within the shared three-frame queue and 0.5/1/2-configured-frame preset caps.
@@ -22,6 +23,9 @@ policy is retired from live selection; explicit historical parameters remain
 supported for exact replay. Linux calibration keys are segregated from that
 retired policy. Native synchronization and presentation remain backend-specific.
 Display feedback is optional diagnostic evidence and does not steer this policy.
+With V2 Queue on, mean absolute client-added interval error across all valid
+intervals replaces percentile growth. The live A/B experiment is described below; the baseline policy remains
+available without rebuilding. Reconnect after changing the checkbox.
 Updated 2026-09-11: displayed frame queue delay excludes the worker's explicit
 GPU decode synchronization wait. The existing decoding statistic is unchanged;
 no new overlay statistic is added. Full decoder-output-to-present-return timing
@@ -144,28 +148,154 @@ Final session-policy comparison is identical to the capture; the five stress
 scenarios pass with zero modeled interval violations and 16.91--18.41 ms p99
 decoder-output-to-submission latency. No scenario is worker-saturated.
 
-### Preset on-time targets (2026-09-11)
+### V2 Queue live A/B experiment (2026-09-11)
 
-Responsive revision 3 selects 99% / 99.5% / 99.95% readiness targets and
+Current revision 6 supersedes the revision-5 conditional-lateness measurement
+described below. For consecutive submitted frames, intended spacing is the
+difference in mapped source time plus deliberate Reduce judder adjustment.
+The measured residual is `abs(submissionInterval - intendedInterval)`, including
+zero-error intervals. Constant latency offsets cancel, and host cadence changes
+are removed before scoring. Submission boundaries are a display-timing proxy,
+not optical scanout confirmation. Discontinuous/missing frames break the pair;
+their drops remain separately visible.
+
+The controller and overlay share one one-second average (10 ms buckets). After
+one second of valid coverage, mean error through 500 us is accepted (lowered from
+1000 us at the user's request). Above it,
+fresh readiness-attributable interval errors can acquire the mean excess, bounded
+by the affected frame's lateness, 250 us per 250 ms, and 125 us applied per frame.
+Unfinished work must explain the error before extra buffering is authorized.
+Smoothest now requires ten clean seconds before release (increased from six
+after the latest gameplay report), retaining its 100 us/second release speed.
+Lowest and Balanced retain their two/four-second holds and 250/200 us/second
+release. The one-second detection window, 0.5 ms tolerance and buffer caps remain
+unchanged. The score is the proportion
+of evaluated time in the last 30 seconds whose rolling mean stayed within 0.5 ms,
+weighted by elapsed interval time rather than frame count. Unavailable periods
+are not counted as success. The overlay shows this score plus the current
+one-second mean; the previous arbitrary percentage curve is retired for V2.
+
+The user explicitly requested code, compilation and publication without tests
+or trace work. Revision-6 diagnostics/replay support and validation are deferred
+until finalization; the existing deployed diagnostic utilities are preserved.
+
+Historical revision-5 implementation and publication record:
+
+Published to ChaseShare after the successful incremental app/diagnostic builds.
+Application SHA-256: `E00649E8F5CD70E2AEA1C87F96D97D0CA413EB7CE03B1FE6ADEBF4C88223D62A`.
+ZIP SHA-256: `12F1752A43A0DCCE2EA5CCCC74DE3A6744D185550465C2F8B494C6E9A129A220`.
+Build/deploy/live copies and portable markers were checked. The user explicitly
+requested skipping further tests until they say to finalize; no additional
+replay, help smoke test or simulation was run after that instruction. The four
+deterministic suites had already completed successfully before the interruption.
+Finalization and live A/B assessment remain pending; do not resume testing
+without the user's finalization instruction.
+
+The `V2 Queue` checkbox is persisted as `v2queue`, defaults off, and is captured
+once per stream through preferences, Session::PresentationSettings,
+DECODER_PARAMETERS, Pacer::initialize, and VrrSessionConfig. Decoder recreation
+retains that snapshot. Off resolves `playout_responsive_buffer=4`, preserving the
+installed baseline; on resolves revision 5. Both use the same queue capacity,
+decode/queue accounting, readiness clock correction, and preset buffer caps.
+V2 calibration keys have a separate suffix, although cached history is diagnostic.
+
+V2 uses actual preparation completion against the original deadline before
+recovery clamps. It averages positive lateness among **late frames only** over
+one second (10 ms buckets). On-time frames establish sample coverage but do not
+enter that mean. A mean through 1000 us cannot request more buffering. Above
+1000 us, a fresh late frame may request only the mean excess, capped at 250 us
+per 250 ms, after at least 32 observations spanning 800 ms. The applied increase
+is limited to 125 us per frame. Old samples alone cannot repeatedly request more
+buffer. Discontinuities, source stalls, cancellation and sustained overload do
+not supply clean adaptation evidence. Native presentation timing remains diagnostic.
+
+V2 retains protection for 2/4/6 clean seconds and releases at 250/200/100 us per
+second for Lowest/Balanced/Smoothest. These values are captured in
+`playout_mean_miss_hold_us` and `playout_mean_miss_release_us_per_second`, so the
+current preference cannot change exact historical replay. Silence does not
+count as clean time. The existing 1 ms minimum, configured-frame caps and 16 ms
+absolute ceiling remain in force.
+
+The V2 overlay shows `Average miss (30s)` and a separate diagnostic smoothness
+curve: `100 / (1 + (max(averageMissUs - 1000, 0) / 3000)^2)`. It is exactly 100
+through a 1 ms average and continuous above it; it is not a measured probability
+of visible smoothness. The 30-second score does not drive the one-second
+controller. Client drops are reported separately and have no invented lateness.
+The V1 overlay retains its historical on-time percentage/target and identifies
+the selected queue arm explicitly.
+
+User requested live gameplay A/B rather than simulated tuning. No candidate
+sweep is used to select this experiment. Deterministic arithmetic/lifecycle tests
+and exact diagnostic fixture checks validate implementation, not visual quality.
+The earlier newest completed capture was
+`\\allytwo\ChaseShare\vrr-traces\Moonlight-vrr-20260911-212200-077.vrrtrace`,
+4,929,919 bytes, UTC last-write 2026-09-12 02:25:07, SHA-256
+`8A65280D51E1489548A8785A28457B9C562F3D8EC6FFCD6C3BD4FEA80243BFD3`.
+Fresh exact replay exited 3 on frame 10,737. Its footer records 16,255 arrivals,
+16,253 enqueued rows and two dropped diagnostic rows; missing frame 10,736
+prevents faithful reconstruction. Its matching launcher stderr records the same
+failure. This capture is exploratory only, not A/B proof.
+
+The tracer now uses a bounded MPSC ring instead of dropping a row whenever the
+writer holds the handoff mutex. Producers publish completed row copies without
+waiting for the writer. Capacity exhaustion or bounded producer contention still
+drops diagnostics explicitly. Three-producer tests check 60,000 rows for intact
+contents and per-producer ordering; shutdown drains in-flight publication.
+
+### Baseline preset on-time targets and thresholded misses (2026-09-11)
+
+Responsive revision 4 selects 99% / 99.5% / 99.95% readiness targets and
 30 / 60 / 120-second learning windows for Lowest latency / Balanced / Smoothest.
-The displayed outcome window is 30 seconds for every preset; client drops count
-as misses and the overlay exposes lateness over 1 ms and 2 ms and a capacity
-indicator. Existing preset caps and the 16 ms absolute ceiling still apply.
+The displayed outcome window is 30 seconds for every preset. Lateness through
+1 ms is on time. Lateness over 1 ms through 2 ms becomes buffer pressure and an
+outcome miss only when more than half of the live window exceeds 1 ms. Any
+lateness over 2 ms and every client drop is a hard miss. The overlay continues
+to expose lateness over 1 ms and 2 ms and a capacity indicator. Existing preset
+caps and the 16 ms absolute ceiling still apply.
 
-The latest completed capture selected before this change was
-`C:\Users\Chase\vrr-traces\Moonlight-vrr-20260911-200538-640.vrrtrace`,
-17,791,245 bytes, last write 2026-09-12 01:14:58.1621328 UTC, SHA-256
-`331B3CB49E414FDA9C4F952F07ACA76C0B7ABC1CE9CCA4BE9CAC591D3B9885A6`.
-Its clean footer reports two missing rows out of 57,497 allocated. The unchanged
-replay exits 3 on frame 16,169; this capture is not strict before/after evidence.
-All eight deterministic suites pass with the final diagnostic build, both fresh
-schema-5 fixtures pass exact replay with complete sequences, and all five fault
-scenarios pass interval and latency assertions. Gameplay validation is pending.
+Revision 4 also fixes the readiness clock boundary. The worker used to replace
+`decode_complete_us` with the wall clock after its GPU fence wait. If a decoded
+frame had already waited in the pacing queue, that queue residence was therefore
+reported as decode work. More buffer created more queue residence, which raised
+the learned requirement and produced a positive feedback loop. The worker now
+adds only the measured blocking fence wait to immutable `decoder_output_us`.
+Transport queue age and the displayed queue-delay metric retain their separate
+origins. Revision 3 and earlier keep their recorded behavior during replay.
+
+The exact capture used to prove the loop was
+`C:\Users\Chase\vrr-traces\Moonlight-vrr-20260911-202703-700.vrrtrace`,
+8,375,449 bytes, last write 2026-09-12 01:35:46 UTC, SHA-256
+`D967B40BFD6676A52FE58F5FF0963572C71F9FC6DACBFFD1E849F60A492F2700`.
+It contains 27,707 delivered frames with exact replay and complete sequence
+integrity. In its last 30 seconds, strict accounting reported 96.79% on time;
+only 39 of 3,210 outcomes were over 1 ms and 12 were over 2 ms. The old
+readiness boundary included about 5.39 ms mean pacing-queue residence and drove
+the applied buffer to its 16 ms ceiling. Reconstructing the boundary from
+decoder output plus the measured fence wait removes that self-induced input.
+
+The newest completed capture at final validation was
+`C:\Users\Chase\vrr-traces\Moonlight-vrr-20260911-210959-966.vrrtrace`,
+7,698,997 bytes, last write 2026-09-12 02:14:45 UTC, SHA-256
+`9304641A0A24251DAA71B94373E23FEEEA6173F6BAEB80A878D0371FCA8B4214`.
+Its exact replay exits 3 on frame 13,134 and the launcher produced no successful
+sidecar, so it remains exploratory. Historical compatibility was instead gated
+against the exact 27,707-frame capture named above. The four required
+deterministic suites and replay help pass with the final diagnostic build, both
+fresh schema-5 revision-4 fixtures pass exact replay with complete sequences,
+and all five fault scenarios pass interval and latency assertions without worker
+saturation. Gameplay validation is pending.
+
 The iterative application build, complete ChaseShare tree and ZIP are published
-and hash-verified. Application SHA-256:
-`C8BEF3C3B889DA16CBA28AA7714804150FE617E788465D016C583708603D8DE7`.
+and hash-verified. SHA-256 values are application
+`74BBA6A97424629D831793A34CDF55F9FC3FAD391A45194BA837B1404FCABD37`,
+replay
+`FC58B6A30F705263AF320702AB81FB22FC550FFA6064A8960704CAC09A7EA2BC`,
+queue simulator
+`A7E34EA1C8F3B9037B9AE5C9F7FEEBA08CC3175F952126176B7A75F73B1DDD36`,
+and ZIP
+`AB069FF0A8885717774F4CE59C66626269A95E77591AA5632B96A29EA21A4D52`.
 The deployed UNC replay help check passes; both diagnostic launchers describe
-revision 3 and retain their existing local capture and upload behavior.
+revision 4 and retain their existing local capture and upload behavior.
 
 ### Historical per-frame Gamescope repaint experiment (retired 2026-09-10)
 
@@ -552,7 +682,7 @@ successful IDR completion establishes valid reference state.
 | `enqueueTimeUs` / reassembled time | Client monotonic microseconds | Complete compressed frame assembled/queued. |
 | `decodeSubmitUs` | Client monotonic microseconds | Sampled immediately before FFmpeg packet submission. |
 | `decoderOutputUs` | Client monotonic microseconds | Immutable timestamp captured immediately when FFmpeg returns the decoded frame; origin for client-processing reporting. |
-| `decodeCompleteUs` | Client monotonic microseconds | Historical scheduling/readiness boundary, initialized from decoder output and advanced when later GPU readiness is observed. |
+| `decodeCompleteUs` | Client monotonic microseconds | Scheduling/readiness service boundary. Revision 4 uses decoder output plus only the blocking fence wait; historical traces may use the wall-clock GPU-ready observation. |
 | Worker queue, decision, preparation, wait, submission times | Client monotonic microseconds | Distinct CPU-side lifecycle boundaries. |
 | Shared fence values | GPU ordering identities | Establish dependencies/completion; not elapsed time by themselves. |
 | Native DXGI QPC fields | QPC ticks plus frequency/correlation | OS timing evidence requiring identity and clock mapping. |
@@ -1027,7 +1157,9 @@ legacy/replay behavior. In that branch 1000 per mille means p100, 999 means
 p99.9, and 995 means p99.5. Those values must not be confused with the active
 Reserve p99.95 implementation.
 
-Production sets `playout_prediction_only=1` and `playout_responsive_buffer=3`.
+Production sets `playout_prediction_only=1`; V2 Queue off selects
+`playout_responsive_buffer=4`. V2 Queue on selects revision 5 and the mean-miss
+observer described above, bypassing the following percentile growth/release law.
 The live estimator keeps 100 ms buckets over the selected preset's learning
 window, including successes. Lowest latency uses 99% over 30 seconds, Balanced
 99.5% over 60 seconds, and Smoothest 99.95% over 120 seconds. These are
@@ -1045,8 +1177,10 @@ uses individual intervals and resets confidence. This confidence uses source
 time, not a fixed frame count. Actual RTP
 spacing remains eligible for delivery learning while the rate fit catches up.
 
-A readiness shortfall of at least 1 ms renews a two-second burst boost. Only
-fresh misses renew it; old histogram or cache tails cannot. The target adds
+A readiness shortfall over 2 ms renews a two-second burst boost. A shortfall
+over 1 ms through 2 ms permits growth only when more than half of the current
+readiness window exceeds 1 ms. Shortfalls through 1 ms never grow the buffer.
+Only fresh hard misses renew the boost; old histogram or cache tails cannot. The target adds
 500 us to the larger of the selected recent percentile and that boost, bounded by the existing
 minimum, configured-rate preset maximum, 16 ms ceiling, and queue capacity.
 Growth is at most 500 us per update. Release requires 32 recent observations,
@@ -1057,7 +1191,7 @@ frame. Thus the falling recent target probes downward without waiting for
 five-minute diagnostic tails. Silence/overload is not clean release evidence.
 Requested demand remains visible above the cap for capacity diagnostics, but
 is recomputed every frame rather than stored as debt. No new queue is added.
-Revision 3 retires live learning history on a confirmed material source-rate
+Revision 3 and later retire live learning history on a confirmed material source-rate
 change while preserving the applied buffer for gradual recovery. Host stalls
 above max(25 ms, 1.5 source periods) and catch-up intervals below half a source
 period do not train the estimator; their playback outcomes still affect the
@@ -1389,8 +1523,11 @@ selects CSV output. UNC capture paths are rejected to keep network I/O away
 from frame delivery. `MOONLIGHT_VRR_DEEP_TRACE` requests deeper instrumentation;
 alignment is the separate native raster option described above.
 
-The writer consumes a bounded 8192-row queue. Producer handoff uses `tryLock()`;
-contention or a full queue drops trace rows rather than blocking presentation.
+The writer consumes a bounded 8192-row MPSC ring. Producers reserve and publish
+slots with atomic sequence numbers; the writer never owns a producer mutex.
+A full queue or exhaustion of 16 bounded reservation attempts drops diagnostic
+rows rather than blocking presentation. The background writer polls every 2 ms
+when empty; formatting, compression and file I/O remain off the pacing thread.
 The size policy uses a 512 MiB cap only after at least an hour of arrival-time
 coverage. Clean-close footer accounting, row sequences, dropped rows, write
 failures, and cap state therefore matter to replay fidelity.
@@ -1409,8 +1546,9 @@ evidence. Terminal rows may be emitted outside the controller-owning worker
 and intentionally lack its live diagnostic state.
 
 The optional schema-5 diagnostic extension records `decoder_output_us` separately
-from `decode_complete_us`. The former is immutable FFmpeg output; the latter may
-advance after GPU synchronization. Overlay client processing is
+from `decode_complete_us`. The former is immutable FFmpeg output. Revision 4
+adds only the worker's blocking GPU synchronization cost to form the latter;
+older policies may store the wall time after that wait. Overlay client processing is
 `present_end_us - decoder_output_us`, and queue/pacing subtracts `prepare_us` and
 `present_call_us` and the explicit `decode_sync_wait_us` from that same interval. Older traces cannot reconstruct this
 boundary exactly; readiness-to-submission is not an interchangeable latency metric.
@@ -1525,7 +1663,7 @@ not change buffer adaptation.
 
 The stats overlay and session summary show client readiness over a rolling
 30-second outcome window, alongside the selected target and a buffer-limit
-indicator. Revision 3 measures preparation completion against the intended
+indicator. Revision 3 and later measure preparation completion against the intended
 smooth deadline before late-readiness and display-floor recovery clamps.
 Client playback drops count as misses; deliberate shutdown, suspension, and
 interruption discards are excluded. A second row reports the percentages late
@@ -1534,8 +1672,10 @@ lateness magnitude. Window snapshots are selected by timestamp, never summed
 across overlay refreshes. The window uses 100 ms buckets and starts with the
 available outcomes before 30 seconds have elapsed. This remains a readiness
 measurement, not a visible-smoothness score. With no eligible frames, the line
-shows the starting state. Motion cadence, queue residence and GPU waits remain
-internal diagnostics.
+shows the starting state. Revision 4 applies the same thresholded-miss policy to
+this score: through 1 ms is on time, 1-2 ms counts only above 50% prevalence,
+and over 2 ms or a drop always counts. Motion cadence, queue residence and GPU
+waits remain internal diagnostics.
 
 Submission cadence, motion jerk, queue residence, decode waits, and buffer
 counters remain collected internally. Submission cadence counts eligible

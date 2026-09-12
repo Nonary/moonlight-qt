@@ -7,11 +7,20 @@
 bool vrrDecodeReadinessOrderValid(uint64_t decoderOutputUs, uint64_t readyUs,
                                   uint64_t arrivalUs, uint64_t dequeueUs,
                                   uint64_t decisionUs, uint64_t decodeWaitUs,
-                                  bool decisionValid)
+                                  bool decisionValid,
+                                  bool readinessExcludesQueue)
 {
     if (!decoderOutputUs || decoderOutputUs > arrivalUs || readyUs < decoderOutputUs)
         return false;
     if (decisionValid && readyUs > decisionUs) return false;
+    if (readinessExcludesQueue) {
+        const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+        const uint64_t expectedReadyUs = decodeWaitUs > 200 ?
+            decoderOutputUs + std::min(maximum - decoderOutputUs, decodeWaitUs) :
+            decoderOutputUs;
+        return decisionValid ? readyUs == expectedReadyUs :
+            readyUs == decoderOutputUs && decodeWaitUs == 0;
+    }
     // Readiness may move past queue admission only through the worker's GPU
     // wait. Retired/evicted frames never visited that wait and keep CPU output.
     return readyUs <= arrivalUs ||

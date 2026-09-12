@@ -5,6 +5,8 @@
 #include "workload.h"
 #include "prediction.h"
 #include "readinessfeedback.h"
+#include "meanmissbuffer.h"
+#include "intervalbuffer.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +27,8 @@
     X(uint64_t, playout_delay_cap_source_period_per_mille, playoutDelayCapSourcePeriodPerMille, 0) \
     X(uint64_t, playout_prediction_only, playoutPredictionOnly, 0) \
     X(uint64_t, playout_responsive_buffer, playoutResponsiveBuffer, 0) \
+    X(uint64_t, playout_mean_miss_hold_us, playoutMeanMissHoldUs, 4000000) \
+    X(uint64_t, playout_mean_miss_release_us_per_second, playoutMeanMissReleaseUsPerSecond, 200) \
     X(uint64_t, playout_on_time_target_per_million, playoutOnTimeTargetPerMillion, 990000) \
     X(uint64_t, playout_readiness_window_us, playoutReadinessWindowUs, 3000000) \
     X(uint64_t, playout_readiness_hitch_threshold_us, playoutReadinessHitchThresholdUs, 0) \
@@ -261,7 +265,8 @@ public:
     // Samples affect subsequent frames only. The current presentation target
     // never moves after rendering has begun.
     void notePreparationDuration(uint64_t preparationDurationUs,
-                                 uint64_t acquisitionWaitUs = 0);
+                                 uint64_t acquisitionWaitUs = 0,
+                                 uint64_t preparationCompleteUs = 0);
     void noteSchedulerDelays(uint64_t renderDelayUs,
                              uint64_t targetDelayUs,
                              bool targetDelayValid);
@@ -281,6 +286,7 @@ public:
     uint64_t estimatedCadenceHitches() const { return m_EstimatedCadenceHitches; }
     uint64_t nativeCadenceHitches() const { return m_NativeCadenceHitches; }
     Vrr13::SmoothnessFeedback::Sample smoothnessSample(const VrrTimingDecision& decision) const;
+    Vrr13::IntervalBuffer::Stats intervalStats() const { return m_IntervalBuffer.stats(); }
     uint64_t typicalRenderUs() const;
     uint64_t recoveryHeadroomUs() const;
 
@@ -331,6 +337,9 @@ private:
         bool hasPreparationDuration = false;
         int64_t readyOffsetUs = 0;
         uint64_t preparationDurationUs = 0;
+        uint64_t preparationCompleteUs = 0;
+        uint64_t intervalIntendedUs = 0;
+        bool intervalValid = false;
         // Metronome: the slot this frame occupies, committed as the schedule
         // basis only if the frame is actually presented so a dropped frame
         // frees its tick for the successor.
@@ -507,6 +516,8 @@ private:
     Vrr13::WorkloadEpisode m_WorkloadEpisode;
     Vrr13::ReadinessPrediction m_ReadinessPrediction;
     Vrr13::ReadinessFeedback m_ReadinessFeedback;
+    Vrr13::MeanMissBuffer m_MeanMissBuffer;
+    Vrr13::IntervalBuffer m_IntervalBuffer;
     Vrr13::PresentationPrediction m_PresentationPrediction;
     Vrr13::SmoothnessFeedback m_SubmissionSmoothness, m_NativeSmoothness;
     // Lifetime counters for decoder-owned reporting windows. These do not

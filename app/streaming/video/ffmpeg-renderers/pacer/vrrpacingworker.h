@@ -6,6 +6,7 @@
 #include "vrr/vrrtargetwaiter.h"
 #include "vrr/vrrtypes.h"
 #include "vrr/vrrtimingcontroller.h"
+#include "vrr/tracequeue.h"
 
 #include <atomic>
 #include <cstdio>
@@ -226,10 +227,9 @@ private:
     bool m_DeepTraceEnabled = false;
     std::FILE* m_TraceFile = nullptr;
     SDL_Thread* m_TraceThread = nullptr;
-    QMutex m_TraceLock;
-    QWaitCondition m_TraceQueueNotEmpty;
-    std::vector<TraceRow> m_TraceQueue;
+    std::unique_ptr<Vrr13::TraceQueue<TraceRow, 8192>> m_TraceQueue;
     std::atomic_bool m_TraceStopping { false };
+    std::atomic_uint m_TraceProducersActive { 0 };
     std::atomic_bool m_TraceAcceptingRows { false };
     std::atomic_uint64_t m_TraceArrivalSequence { 0 };
     std::atomic_size_t m_TraceDroppedRows { 0 };

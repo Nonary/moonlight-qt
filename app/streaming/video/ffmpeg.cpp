@@ -577,7 +577,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
                                  Session::get()->vrrCalibrationContext() + QString("|%1|%2|%3|%4|%5")
                                      .arg(params->width).arg(params->height).arg(params->videoFormat)
                                      .arg(m_FrontendRenderer->getCalibrationIdentity()).arg(decoder->name),
-                                 params->vrrLatencyMode)) {
+                                 params->vrrLatencyMode, params->v2Queue)) {
             return false;
         }
     }
@@ -1270,9 +1270,38 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 static_cast<double>(readiness.samples - lateFrames) *
                 100.0 / static_cast<double>(readiness.samples);
 
-            ret = snprintf(&output[offset],
+            if (readiness.intervalPolicy) {
+                const auto& interval = readiness.interval;
+                char score[32], average[32];
+                if (interval.evaluatedUs)
+                    snprintf(score, sizeof(score), "%.2f%%",
+                        100.0 * (interval.evaluatedUs - qMin(interval.failedUs, interval.evaluatedUs)) / interval.evaluatedUs);
+                else snprintf(score, sizeof(score), "collecting");
+                if (interval.averageValid)
+                    snprintf(average, sizeof(average), "%.3f ms", interval.averageErrorUs / 1000.0);
+                else snprintf(average, sizeof(average), "collecting");
+                ret = snprintf(&output[offset], length - offset,
+                    "VRR pacing: %s | V2 Queue | Smoothness (30s): %s%s\n"
+                    "Client interval error (1s): %s | Tolerance: %.1f ms | Dropped (30s): %llu\n",
+                    stats.vrrTelemetryActive ? "Active" : "Inactive", score,
+                    stats.vrrBufferAtLimit ? " (buffer limit)" : "", average,
+                    Vrr13::IntervalBuffer::ToleranceUs / 1000.0,
+                    static_cast<unsigned long long>(readiness.dropped));
+            }
+            else if (readiness.meanMissPolicy) {
+                ret = snprintf(&output[offset], length - offset,
+                    "VRR pacing: %s | V2 Queue | Smoothness (30s): %.2f%%%s\n"
+                    "Average miss (30s): %.3f ms | Dropped (30s): %llu\n",
+                    stats.vrrTelemetryActive ? "Active" : "Inactive",
+                    Vrr13::ReadinessWindow::meanMissScore(readiness),
+                    stats.vrrBufferAtLimit ? " (buffer limit)" : "",
+                    Vrr13::ReadinessWindow::meanMissUs(readiness) / 1000.0,
+                    static_cast<unsigned long long>(readiness.dropped));
+            }
+            else {
+                ret = snprintf(&output[offset],
                            length - offset,
-                           "VRR pacing: %s | Client ready on time (30s): %.2f%% / %.2f%% target%s\n"
+                           "VRR pacing: %s | V1 Queue | Client ready on time (30s): %.2f%% / %.2f%% target%s\n"
                            "Late >1 ms: %.2f%% | >2 ms: %.2f%% | Dropped (30s): %llu\n",
                            stats.vrrTelemetryActive ? "Active" : "Inactive",
                            readyOnTimePercent,
@@ -1281,6 +1310,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                            readiness.over1ms * 100.0 / readiness.samples,
                            readiness.over2ms * 100.0 / readiness.samples,
                            static_cast<unsigned long long>(readiness.dropped));
+            }
         }
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);

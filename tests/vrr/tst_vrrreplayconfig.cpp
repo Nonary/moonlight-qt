@@ -523,7 +523,12 @@ void VrrReplayConfigTest::predictionOnlyPolicyRoundTrip()
         {"playout_readiness_window_us", 120000000}}, responsive, error), qPrintable(error));
     QCOMPARE(responsive.playoutOnTimeTargetPerMillion, uint64_t(999500));
     QCOMPARE(responsive.playoutReadinessWindowUs, uint64_t(120000000));
-    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 4}}, responsive, error));
+    QVERIFY2(applyVrrReplayControllerSnapshot(
+        {{"playout_responsive_buffer", 4}}, responsive, error), qPrintable(error));
+    QCOMPARE(responsive.playoutResponsiveBuffer, uint64_t(4));
+    QVERIFY(applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 5}}, responsive, error));
+    QCOMPARE(responsive.playoutResponsiveBuffer, uint64_t(5));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 6}}, responsive, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_on_time_target_per_million", 1000001}}, responsive, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_readiness_window_us", 120100000}}, responsive, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_readiness_window_us", 30000001}}, responsive, error));
@@ -1979,6 +1984,12 @@ void VrrReplayConfigTest::decodeReadinessOrder()
     QVERIFY(!vrrDecodeReadinessOrderValid(1000, 2200, 1020, 1030, 2210, 0, true));
     QVERIFY(!vrrDecodeReadinessOrderValid(1000, 2200, 1020, 1030, 2210, 1300, true));
     QVERIFY(!vrrDecodeReadinessOrderValid(1000, 2200, 1020, 0, 0, 1100, false));
+    QVERIFY(vrrDecodeReadinessOrderValid(
+        1000, 2100, 1020, 1500, 2200, 1100, true, true));
+    QVERIFY(vrrDecodeReadinessOrderValid(
+        1000, 1000, 1020, 1500, 1600, 0, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 2600, 1020, 1500, 2700, 1100, true, true));
 }
 
 QTEST_APPLESS_MAIN(VrrReplayConfigTest)

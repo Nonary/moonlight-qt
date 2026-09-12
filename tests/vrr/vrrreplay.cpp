@@ -3236,6 +3236,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
                           int simulatedDisplayHz, int simulatedStreamFps,
                           bool additionalQueuedFrame,
                           bool simulatedCanLatch,
+                          uint64_t capturedResponsiveBuffer,
                           const VrrReplayScenario& scenario)
 {
     const uint64_t captureDurationUs =
@@ -5353,8 +5354,9 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         "pre_present_envelope_to_equality_anchored_classification for the same Present ID";
     observedTears["exact_present_refresh_timing"] = exactPresentRefresh;
 
-    const auto readinessObject = [](const Vrr13::ReadinessWindow& window) {
-        const auto sample = window.snapshot();
+    const auto readinessObject = [](const Vrr13::ReadinessWindow& window,
+                                    uint64_t revision) {
+        const auto sample = window.snapshot(0, revision >= 4, revision >= 5);
         QJsonObject result;
         result["window_us"] = qint64(30000000);
         result["samples"] = qint64(sample.samples);
@@ -5365,11 +5367,19 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         result["valid"] = sample.samples != 0;
         result["on_time_percent"] = sample.samples ?
             QJsonValue(100.0 * (sample.samples - sample.misses) / sample.samples) : QJsonValue();
-        result["scope"] = "intended smoothed slot before recovery clamps; client drops are misses; window/shutdown discards excluded";
+        if (revision >= 5) {
+            result["average_miss_us"] = Vrr13::ReadinessWindow::meanMissUs(sample);
+            result["mean_miss_smoothness_percent"] = Vrr13::ReadinessWindow::meanMissScore(sample);
+        }
+        result["scope"] = revision >= 5 ?
+            "V2 Queue: average measured lateness among late frames; smoothness score remains 100 through a 1 ms mean; 30-second reporting and one-second buffer control; drops counted separately" : revision >= 4 ?
+            "intended smoothed slot before recovery clamps; lateness through 1 ms is tolerated, 1-2 ms counts only above 50 percent prevalence, over 2 ms and client drops are misses; window/shutdown discards excluded" :
+            "intended smoothed slot before recovery clamps; any lateness and client drops are misses; window/shutdown discards excluded";
         return result;
     };
     QJsonObject observed;
-    observed["readiness"] = readinessObject(metrics.observedReadiness);
+    observed["readiness"] = readinessObject(
+        metrics.observedReadiness, capturedResponsiveBuffer);
     observed["dispositions"] = countObject(metrics.dispositions);
     observed["drops"] = static_cast<qint64>(metrics.originalDrops);
     observed["latency_us"] = observedLatency;
@@ -5875,7 +5885,9 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
                               simulatedStreamFps : 1);
     simulation["playout_delay_us"] = distributionObject(
         metrics.simulatedPlayoutDelayUs);
-    simulation["readiness"] = readinessObject(metrics.simulatedReadiness);
+    simulation["readiness"] = readinessObject(
+        metrics.simulatedReadiness,
+        scenario.controller.playoutResponsiveBuffer);
     simulation["on_time_target_percent"] = scenario.controller.playoutOnTimeTargetPerMillion / 10000.0;
     simulation["readiness_history_us"] = qint64(scenario.controller.playoutReadinessWindowUs);
     simulation["sender_cadence"] = senderCadenceObject(
@@ -10621,7 +10633,8 @@ int main(int argc, char* argv[])
             vrrDecodeReadinessOrderValid(decoderOutputUs, decodeCompleteUs,
                 pacerArrivalUs, dequeueUs, decisionUs,
                 optionalUnsignedField(fields, columns.decodeSyncWaitUs),
-                rowDecisionValid) ? 0 : 1;
+                rowDecisionValid,
+                capturedParameters.playoutResponsiveBuffer >= 4) ? 0 : 1;
         metrics.arrivalToDequeueOrderViolations +=
             dequeueUs != 0 && dequeueUs < pacerArrivalUs ? 1 : 0;
         metrics.dequeueToDecisionOrderViolations +=
@@ -11587,6 +11600,7 @@ int main(int argc, char* argv[])
                 capturedParameters.latencyFixAllRates == 0;
             capturedConfig.latencyMode = capturedParameters.latencyFixAllRates != 0 ?
                 (capturedParameters.latencyFixDelayPeriodPerMille == 0 ? 2 : 1) : 0;
+            capturedConfig.v2Queue = capturedParameters.playoutResponsiveBuffer >= 5;
             simulatedConfig = capturedConfig;
             // Current policy is shared across backends. Exact replay below
             // still uses the captured parameters, including the retired Linux policy.
@@ -13210,8 +13224,8 @@ int main(int argc, char* argv[])
         if (hasPreparationTelemetry) {
             const uint64_t acquire = optionalUnsignedField(fields, traceHeader.indexOf("prepare_timing_valid")) ?
                 optionalUnsignedField(fields, traceHeader.indexOf("prepare_acquire_us")) : 0;
-            referenceController->notePreparationDuration(preparationUs, acquire);
-            simulatedController->notePreparationDuration(simulatedPreparationUs, acquire);
+            referenceController->notePreparationDuration(preparationUs, acquire, recordedPreparationEndUs);
+            simulatedController->notePreparationDuration(simulatedPreparationUs, acquire, simulatedPreparationEndUs);
         }
         const bool spacingHadPriorSubmission =
             referenceController->hasLastSubmission();
@@ -14483,7 +14497,8 @@ int main(int argc, char* argv[])
         capturedConfig.displayRefreshHz, capturedConfig.streamRateHz,
         simulatedConfig.displayRefreshHz, simulatedConfig.streamRateHz,
         capturedConfig.allowAdditionalQueuedFrame,
-        simulatedCanLatch, scenario);
+        simulatedCanLatch, capturedParameters.playoutResponsiveBuffer,
+        scenario);
     bool comparisonCompatible = true;
     if (parser.isSet(compareOption)) {
         QFile baselineFile(parser.value(compareOption));

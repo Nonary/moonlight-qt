@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include "intervalbuffer.h"
 
 namespace Vrr13 {
 // A rolling thirty-second outcome window, with 100 ms bucket resolution.
 // Counts are snapshots, never cumulative counters to be summed across windows.
+// Raw severity and the conditional mean of late frames remain available.
+// Revision 4 keeps its historical score; V2 reports the mean-miss curve.
 class ReadinessWindow {
 public:
     struct Snapshot {
@@ -16,6 +19,11 @@ public:
         uint64_t over1ms = 0;
         uint64_t over2ms = 0;
         uint64_t dropped = 0;
+        uint64_t lateFrames = 0;
+        uint64_t lateTotalUs = 0;
+        bool meanMissPolicy = false;
+        bool intervalPolicy = false;
+        IntervalBuffer::Stats interval;
     };
 
     void record(uint64_t atUs, uint64_t latenessUs, bool dropped)
@@ -32,9 +40,15 @@ public:
         bucket.counts.over1ms += !dropped && latenessUs > 1000;
         bucket.counts.over2ms += !dropped && latenessUs > 2000;
         bucket.counts.dropped += dropped;
+        if (!dropped && latenessUs) {
+            ++bucket.counts.lateFrames;
+            bucket.counts.lateTotalUs += std::min<uint64_t>(latenessUs, 1000000);
+        }
     }
 
-    Snapshot snapshot(uint64_t nowUs = 0) const
+    Snapshot snapshot(uint64_t nowUs = 0,
+                      bool thresholdedMissPolicy = false,
+                      bool meaningfulMissesOnly = false) const
     {
         Snapshot result;
         if (!m_LastUs) return result;
@@ -47,9 +61,32 @@ public:
                 result.over1ms += bucket.counts.over1ms;
                 result.over2ms += bucket.counts.over2ms;
                 result.dropped += bucket.counts.dropped;
+                result.lateFrames += bucket.counts.lateFrames;
+                result.lateTotalUs += bucket.counts.lateTotalUs;
+            }
+        }
+        if (meaningfulMissesOnly) {
+            result.meanMissPolicy = true;
+            result.misses = result.dropped + result.over2ms;
+        }
+        else if (thresholdedMissPolicy) {
+            const uint64_t softMisses = result.over1ms - result.over2ms;
+            result.misses = result.dropped + result.over2ms;
+            if (result.over1ms > result.samples / 2) {
+                result.misses += softMisses;
             }
         }
         return result;
+    }
+
+    static double meanMissUs(const Snapshot& s) {
+        return s.lateFrames ? double(s.lateTotalUs) / s.lateFrames : 0.0;
+    }
+    static double meanMissScore(const Snapshot& s) {
+        // A diagnostic curve, not a probability of noticing stutter. Exactly
+        // 100 through 1 ms; continuous above it, without an individual-frame cliff.
+        const double excess = std::max(0.0, meanMissUs(s) - 1000.0) / 3000.0;
+        return 100.0 / (1.0 + excess * excess);
     }
 
 private:

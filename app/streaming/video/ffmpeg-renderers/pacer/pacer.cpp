@@ -296,7 +296,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                        bool enablePacing, bool enableVsync,
                        bool enableVrr, int vrrDisplayRefreshHz,
                        bool smoothVrrFrameTiming, const QString& calibrationKey,
-                       int vrrLatencyMode)
+                       int vrrLatencyMode, bool v2Queue)
 {
     m_MaxVideoFps = maxVideoFps;
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
@@ -306,8 +306,9 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
     // rejection continues through the original fixed path below.
     if (enableVrr) {
         VrrSessionConfig config;
-// All native backends use the shared prediction-based buffer policy.
+        // Both queue policies are shared across native backends.
         config.readinessHitchFeedback = false;
+        config.v2Queue = v2Queue;
         config.latencyMode = vrrLatencyMode >= 0 && vrrLatencyMode <= 2 ? vrrLatencyMode : 1;
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         if (!calibrationKey.isEmpty()) {
@@ -322,6 +323,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
             if (config.latencyMode != 0) {
                 context += QStringLiteral("|latency-mode=%1").arg(config.latencyMode);
             }
+            if (config.v2Queue) context += QStringLiteral("|mean-miss-queue-v2");
             if (smoothVrrFrameTiming) {
                 // The saved flag previously selected timestamp-following
                 // playout too. Do not cross-seed its readiness calibration.

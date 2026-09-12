@@ -537,8 +537,15 @@ void testLatencyPresetsQueuedRecovery()
 void testLatencyFixQueueAgeIncludesDecodeWait()
 {
     resetFakeClock();
+    QTemporaryDir traceDirectory;
+    expect(traceDirectory.isValid(),
+           "decode-wait timing test must create a temporary directory");
+    const QString tracePath = traceDirectory.filePath("decode-wait.vrrtrace");
+    const QByteArray tracePathBytes = QFile::encodeName(tracePath);
+    SDL_setenv("MOONLIGHT_VRR_TRACE", tracePathBytes.constData(), 1);
     FakeVrrFramePresenter backend;
     backend.setCanLatch(true);
+    backend.blockPreparation();
     backend.blockDecodeFrame(2);
     backend.setPreparationLimit(1);
     PacerTelemetry telemetry;
@@ -556,9 +563,14 @@ void testLatencyFixQueueAgeIncludesDecodeWait()
         VrrPacingWorker worker(&backend, config, &telemetry);
         expect(worker.start(), "decode-wait latency-fix worker must start");
         worker.submit(makeFrame(1, first));
-        expect(backend.waitForPresentCount(1), "first image must present before the decode gate");
+        expect(backend.waitForPrepareCount(1),
+               "first image must hold the worker before the decode gate");
         FrozenTestClock clock;
         worker.submit(makeFrame(2, delayed));
+        clock.advance(5000);
+        backend.releasePreparation();
+        expect(backend.waitForPresentCount(1),
+               "first image must present before the queued decode gate");
         expect(backend.waitForDecodeWaitCount(1),
                "second image must enter the controlled GPU-readiness wait");
         clock.advance(21000);
@@ -580,6 +592,28 @@ void testLatencyFixQueueAgeIncludesDecodeWait()
     expect(first.releases.load() == 1 && delayed.releases.load() == 1 &&
                fresh.releases.load() == 1,
            "decode-wait recovery must release every source surface exactly once");
+
+    const QByteArray expandedTrace = readExpandedTrace(tracePath);
+    const QList<QByteArray> lines = expandedTrace.split('\n');
+    const QList<QByteArray> columns = lines.value(0).split(',');
+    const int frameColumn = columns.indexOf("frame");
+    const int decoderOutputColumn = columns.indexOf("decoder_output_us");
+    const int decodeCompleteColumn = columns.indexOf("decode_complete_us");
+    const int decodeWaitColumn = columns.indexOf("decode_sync_wait_us");
+    bool verifiedDecodeBoundary = false;
+    for (int i = 1; i < lines.size(); ++i) {
+        const QList<QByteArray> fields = lines[i].split(',');
+        if (fields.value(frameColumn) != "2") continue;
+        const uint64_t decoderOutputUs = fields.value(decoderOutputColumn).toULongLong();
+        const uint64_t decodeCompleteUs = fields.value(decodeCompleteColumn).toULongLong();
+        const uint64_t decodeWaitUs = fields.value(decodeWaitColumn).toULongLong();
+        verifiedDecodeBoundary = decoderOutputUs != 0 && decodeWaitUs == 21000 &&
+            decodeCompleteUs - decoderOutputUs == decodeWaitUs;
+        break;
+    }
+    expect(verifiedDecodeBoundary,
+           "GPU readiness must add only the blocking fence wait and exclude pacing-queue residence");
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
 }
 
 void testTelemetrySnapshotsRemainCumulative()
@@ -1687,7 +1721,6 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
         VrrPacingWorker worker(&backend, cachedConfig, &telemetry);
         expect(worker.start(), "worker must start for deep diagnostics testing");
         auto input = frame(1, first);
-        input.noteGpuReadyUs(input.decoderOutputUs() + 1);
         worker.submit(std::move(input));
         expect(backend.waitForPresentCount(1),
                "deep diagnostics must not suppress presentation");
@@ -1708,9 +1741,9 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     expect(columns.size() == fields.size(), "diagnostic columns must align with every value");
     expect(columns.contains("decoder_output_us") &&
                fields.value(columns.indexOf("decoder_output_us")).toULongLong() > 0 &&
-               fields.value(columns.indexOf("decoder_output_us")).toULongLong() <
+               fields.value(columns.indexOf("decoder_output_us")).toULongLong() ==
                    fields.value(columns.indexOf("decode_complete_us")).toULongLong(),
-           "trace must retain the immutable decoder output separately from readiness");
+           "a frame without a blocking fence wait must keep decoder output as its readiness boundary");
     expect(fields.value(columns.indexOf("session_latency_mode")) ==
                QByteArray::number(cachedConfig.latencyMode) &&
                fields.value(columns.indexOf("calibration_loaded")) == "1" &&
@@ -1729,7 +1762,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     expect(restored.loadProfile(profile) && restored.common() == 4000000 && restored.evidence() == 0,
            "captured calibration must restore prior history without inventing fresh successes");
     expect(fields.value(columns.indexOf("param_playout_prediction_only")) == "1" &&
-               fields.value(columns.indexOf("param_playout_responsive_buffer")) == "3" &&
+               fields.value(columns.indexOf("param_playout_responsive_buffer")) == "4" &&
                fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "0",
            "capture must identify prediction-only adaptation for exact replay");
     expect(header.contains("frame_receive_us") &&
@@ -1828,6 +1861,41 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
 }
 
+void testTraceQueueConcurrency()
+{
+    Vrr13::TraceQueue<uint64_t, 4> bounded;
+    for (uint64_t i = 0; i < 4; ++i) expect(bounded.push(uint64_t(i)), "trace queue must accept its capacity");
+    expect(!bounded.push(99), "a full trace queue must reject immediately");
+    for (uint64_t i = 0, value = 0; i < 4; ++i)
+        expect(bounded.pop(value) && value == i, "trace queue must preserve order across wrap");
+    uint64_t value = 0;
+    expect(!bounded.pop(value), "an empty trace queue must reject immediately");
+    struct Row { uint64_t producer = 0, sequence = 0, checksum = 0; };
+    Vrr13::TraceQueue<Row, 1024> queue;
+    constexpr unsigned producers = 3, rows = 20000;
+    std::array<std::thread, producers> threads;
+    for (unsigned p = 0; p < producers; ++p) {
+        threads[p] = std::thread([&, p] {
+            for (unsigned i = 0; i < rows; ++i) {
+                Row row{p, i, (uint64_t(p) << 32) ^ i ^ 0xabcddcba};
+                while (!queue.push(std::move(row))) std::this_thread::yield();
+            }
+        });
+    }
+    std::array<uint64_t, producers> next{};
+    bool valid = true;
+    for (unsigned i = 0; i < producers * rows;) {
+        Row row;
+        if (!queue.pop(row)) { std::this_thread::yield(); continue; }
+        valid &= row.producer < producers;
+        if (row.producer < producers) valid &= row.sequence == next[row.producer]++;
+        valid &= row.checksum == ((row.producer << 32) ^ row.sequence ^ 0xabcddcba);
+        ++i;
+    }
+    for (auto& thread : threads) thread.join();
+    expect(valid, "concurrent trace producers must publish complete rows exactly once and in producer order");
+}
+
 void exportWarmHistoryReplayFixture()
 {
     const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_WARM_TRACE");
@@ -1839,7 +1907,9 @@ void exportWarmHistoryReplayFixture()
     PacerTelemetry telemetry;
     TrackedFrameLifetime lifetime[180];
     {
-        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        auto v2Config = enabledConfig();
+        v2Config.v2Queue = true;
+        VrrPacingWorker worker(&backend, v2Config, &telemetry);
         expect(worker.start(), "warm-history replay worker must start");
         const auto start = std::chrono::steady_clock::now();
         for (int i = 0; i < 180; ++i) {
@@ -1885,6 +1955,17 @@ void testReadinessWindow()
     expect(result.samples == 5 && result.misses == 4 && result.over1ms == 2 &&
                result.over2ms == 1 && result.dropped == 1,
            "readiness must retain strict deadlines, separate severity, and count drops as misses");
+    result = window.snapshot(0, true);
+    expect(result.samples == 5 && result.misses == 2 && result.over1ms == 2 &&
+               result.over2ms == 1 && result.dropped == 1,
+           "thresholded readiness must tolerate through 1 ms and sparse 1-2 ms misses");
+    Vrr13::ReadinessWindow prevalentSoft;
+    prevalentSoft.record(1000000, 1500, false);
+    prevalentSoft.record(1000000, 1500, false);
+    prevalentSoft.record(1000000, 0, false);
+    result = prevalentSoft.snapshot(0, true);
+    expect(result.samples == 3 && result.misses == 2,
+           "1-2 ms readiness misses must count only when they exceed half the window");
     expect(window.snapshot(31000000).samples == 0,
            "the thirty-second outcome window must expire without another frame");
     window.record(32000000, 0, false);
@@ -1896,6 +1977,19 @@ void testReadinessWindow()
 
 int main()
 {
+    Vrr13::ReadinessWindow averageWindow;
+    averageWindow.record(1000000, 500, false);
+    averageWindow.record(1001000, 1500, false);
+    averageWindow.record(1002000, 0, false);
+    expect(Vrr13::ReadinessWindow::meanMissUs(averageWindow.snapshot()) == 1000.0 &&
+        Vrr13::ReadinessWindow::meanMissScore(averageWindow.snapshot()) == 100.0,
+        "the mean-miss score must remain exactly 100 through one millisecond");
+    averageWindow.record(1003000, 2000, false);
+    expect(Vrr13::ReadinessWindow::meanMissScore(averageWindow.snapshot()) < 100.0,
+        "the mean-miss score must fall only when the average exceeds one millisecond");
+    expect(Vrr13::ReadinessWindow::meanMissScore(averageWindow.snapshot(32000000)) == 100.0,
+        "expired misses must not depress the current mean-miss score");
+    testTraceQueueConcurrency();
     testReadinessWindow();
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_TIMER) != 0) {

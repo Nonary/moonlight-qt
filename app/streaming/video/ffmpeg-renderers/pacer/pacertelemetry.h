@@ -142,11 +142,17 @@ public:
 
     void recordVrrReadiness(uint64_t atUs, uint64_t latenessUs, bool dropped,
                            uint64_t targetPerMillion, bool capacityLimited,
-                           bool decisionValid)
+                           bool decisionValid, bool thresholdedMissPolicy,
+                           bool meaningfulMissesOnly = false, bool intervalPolicy = false,
+                           const Vrr13::IntervalBuffer::Stats* interval = nullptr)
     {
         QMutexLocker lock(&m_Lock);
         m_ReadinessWindow.record(atUs, latenessUs, dropped);
-        m_Snapshot.vrrReadiness = m_ReadinessWindow.snapshot();
+        const auto intervalStats = interval ? *interval : m_Snapshot.vrrReadiness.interval;
+        m_Snapshot.vrrReadiness = m_ReadinessWindow.snapshot(
+            0, thresholdedMissPolicy, meaningfulMissesOnly);
+        m_Snapshot.vrrReadiness.intervalPolicy = intervalPolicy;
+        m_Snapshot.vrrReadiness.interval = intervalStats;
         m_Snapshot.vrrOnTimeTargetPerMillion = targetPerMillion;
         if (decisionValid) m_Snapshot.vrrBufferAtLimit = capacityLimited;
         touchLocked();

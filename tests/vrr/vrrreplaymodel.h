@@ -14,7 +14,8 @@ uint64_t vrrBusyWorkerDecisionUs(uint64_t arrivalUs, uint64_t recordedDecisionUs
 bool vrrDecodeReadinessOrderValid(uint64_t decoderOutputUs, uint64_t readyUs,
                                   uint64_t arrivalUs, uint64_t dequeueUs,
                                   uint64_t decisionUs, uint64_t decodeWaitUs,
-                                  bool decisionValid);
+                                  bool decisionValid,
+                                  bool readinessExcludesQueue = false);
 
 enum class VrrRasterPhaseState {
     Unclassified,

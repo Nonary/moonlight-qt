@@ -1,5 +1,5 @@
 @echo off
-rem Captures responsive buffer revision 3 with preset readiness targets/windows and version-20 diagnostic history; older policies remain exactly replayable.
+rem Live A/B: V2 Queue off uses revision 4; on uses revision 5, averaging missed-frame lateness with a 1 ms deadband. Reconnect after changing the checkbox.
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%SystemRoot%"
 set "PORTABLE=\\allytwo\ChaseShare\MoonlightPortable-x64-6.1.0-vrr-lite"

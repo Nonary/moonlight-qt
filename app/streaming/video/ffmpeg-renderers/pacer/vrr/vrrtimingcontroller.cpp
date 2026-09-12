@@ -128,15 +128,16 @@ VrrTimingParameters vrrTimingParametersForSession(
         latencyMode == 2 ? 500 : latencyMode == 1 ? 1000 : 2000;
     parameters.playoutPredictionOnly = 1;
     // Historical revisions retain their captured deadlines and short history.
-    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 3;
+    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : config.v2Queue ? 6 : 4;
+    parameters.playoutMeanMissHoldUs = latencyMode == 2 ? 2000000 : latencyMode == 1 ? 4000000 : 10000000;
+    parameters.playoutMeanMissReleaseUsPerSecond = latencyMode == 2 ? 250 : latencyMode == 1 ? 200 : 100;
     parameters.playoutOnTimeTargetPerMillion = latencyMode == 2 ? 990000 :
         latencyMode == 1 ? 995000 : 999500;
     parameters.playoutReadinessWindowUs = latencyMode == 2 ? 30000000 :
         latencyMode == 1 ? 60000000 : 120000000;
     parameters.playoutReadinessHitchThresholdUs = config.readinessHitchFeedback ? 2000 : 0;
     parameters.playoutNativeHitchAdaptation = 0;
-    // Display observations are optional diagnostics. They never steer the
-    // production schedule or authorize either direction of buffer adaptation.
+    // Display observations remain diagnostics; V2 observes measured readiness.
     parameters.playoutRequireDisplayEvents = 1;
     parameters.playoutSubmissionEstimateFallback = 1;
     parameters.playoutReadinessDrivenAdaptation = 1;
@@ -283,6 +284,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_CadenceStableSinceUs = 0;
     m_PreviousSmoothingIntervalUs = 0;
     m_ReadinessFeedback.reset();
+    m_MeanMissBuffer.breakSequence();
+    m_IntervalBuffer.breakSequence();
     m_PresentationPrediction.reset();
     m_SubmissionSmoothness.breakSequence();
     m_NativeSmoothness.breakSequence();
@@ -290,12 +293,15 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     // Learned per-band delays survive a source-phase rebase like the other
     // learned budgets; only a full reset discards them.
     if (!retainLearnedBudgets) {
+        m_MeanMissBuffer.reset();
+        m_IntervalBuffer.reset();
         m_SubmissionSmoothness.reset();
         m_NativeSmoothness.reset();
         m_RequestedPlayoutDelayUs = 0;
         m_RecentReadiness = m_Parameters.playoutResponsiveBuffer >= 3 ?
             Vrr13::RecentReadiness(m_Parameters.playoutReadinessWindowUs,
-                                  m_Parameters.playoutOnTimeTargetPerMillion) :
+                                  m_Parameters.playoutOnTimeTargetPerMillion,
+                                  m_Parameters.playoutResponsiveBuffer >= 4) :
             Vrr13::RecentReadiness{};
         m_PlayoutHistory = Vrr13::Reserve(m_Parameters.playoutResponsiveBuffer ? 20 :
             m_Parameters.playoutReadinessHitchThresholdUs ? 19 :
@@ -802,6 +808,10 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     m_Pending.valid = true;
     m_Pending.smoothness = smoothnessSample(decision);
     m_Pending.smoothness.intended = decision.originalTargetUs;
+    // Follow the host and deliberate judder correction. Buffer/render-budget
+    // changes do not redefine the intended motion or conceal client errors.
+    m_Pending.intervalIntendedUs = addSigned(decision.sourceTimeUs, decision.cadenceSmoothingUs);
+    m_Pending.intervalValid = decision.usedRtpTimestamp && !decision.rebased && !decision.phaseDiscontinuity;
     // Timestamp playout never feeds the learned readiness reserve.
     m_Pending.cadenceEligible = decision.cadenceEligible && !timestampPlayout;
     m_Pending.readyOffsetUs = readyOffsetUs;
@@ -1499,7 +1509,7 @@ void VrrTimingController::anchorSourceTime(uint64_t sourceTimeUs)
 }
 
 void VrrTimingController::notePreparationDuration(
-    uint64_t preparationDurationUs, uint64_t acquisitionWaitUs)
+    uint64_t preparationDurationUs, uint64_t acquisitionWaitUs, uint64_t preparationCompleteUs)
 {
     // Swapchain availability is not work that a larger jitter buffer fixes.
     // The worker already excludes its intentional waits from this duration.
@@ -1511,6 +1521,7 @@ void VrrTimingController::notePreparationDuration(
     }
     m_Pending.hasPreparationDuration = true;
     m_Pending.preparationDurationUs = preparationDurationUs;
+    m_Pending.preparationCompleteUs = preparationCompleteUs;
 }
 
 void VrrTimingController::noteSchedulerDelays(uint64_t renderDelayUs,
@@ -1551,6 +1562,26 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
 {
     if (!m_Pending.valid) {
         return;
+    }
+
+    if (m_Parameters.playoutResponsiveBuffer >= 5) {
+        const auto& p = m_Pending.prediction;
+        const auto work = saturatingAdd(m_Pending.preparationDurationUs, m_Pending.renderSchedulerUs);
+        const auto ready = m_Pending.preparationCompleteUs ? m_Pending.preparationCompleteUs : saturatingAdd(p.decoded, work);
+        const auto deadline = m_Pending.smoothness.intended;
+        if (m_Parameters.playoutResponsiveBuffer >= 6) {
+            m_IntervalBuffer.observe({m_Pending.smoothness.frame, m_Pending.intervalIntendedUs,
+                submissionUs, deadline, ready, p.applied,
+                submitted && !cancelled && m_Pending.intervalValid && m_Pending.hasPreparationDuration,
+                p.eligible && work <= p.period && p.decoderQueue <= p.period},
+                playoutDelayMinimumUs(), playoutDelayMaximumUs(),
+                m_Parameters.playoutMeanMissHoldUs, m_Parameters.playoutMeanMissReleaseUsPerSecond);
+        }
+        else m_MeanMissBuffer.observe(submissionUs, ready > deadline ? ready - deadline : 0,
+            p.applied, submitted && !cancelled && m_Pending.hasPreparationDuration &&
+                m_Pending.smoothness.eligible && p.eligible && work <= p.period && p.decoderQueue <= p.period,
+            playoutDelayMinimumUs(), playoutDelayMaximumUs(),
+            m_Parameters.playoutMeanMissHoldUs, m_Parameters.playoutMeanMissReleaseUsPerSecond);
     }
 
     if (m_Parameters.playoutReadinessHitchThresholdUs) {
@@ -1626,7 +1657,7 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                     !m_Parameters.playoutReadinessHitchThresholdUs) {
                     m_ReadinessPrediction.observe(m_PlayoutHistory, m_Pending.prediction,
                         m_Pending.preparationDurationUs, m_Pending.renderSchedulerUs,
-                        m_Parameters.playoutResponsiveBuffer ? &m_RecentReadiness : nullptr);
+                        m_Parameters.playoutResponsiveBuffer && m_Parameters.playoutResponsiveBuffer < 5 ? &m_RecentReadiness : nullptr);
                 }
                 appendBounded(m_PreparationDurations,
                               m_Pending.preparationDurationUs,
@@ -2424,19 +2455,47 @@ void VrrTimingController::updatePlayoutHistory(
     m_PlayoutBandIndex = 0; // One distribution, shared across source rates.
 
     if (m_Parameters.playoutPredictionOnly) {
+        if (m_Parameters.playoutResponsiveBuffer >= 5) {
+            if (rebased || cadence.sourceRateChanged || cadence.phaseDiscontinuity) {
+                m_MeanMissBuffer.breakSequence();
+                if (rebased || cadence.phaseDiscontinuity) m_IntervalBuffer.breakSequence();
+            }
+            m_RequestedPlayoutDelayUs = clampUnsigned(
+                m_Parameters.playoutResponsiveBuffer >= 6 ?
+                    m_IntervalBuffer.demand(m_AppliedPlayoutDelayUs) : m_MeanMissBuffer.demand(m_AppliedPlayoutDelayUs),
+                playoutDelayMinimumUs(), playoutDelayMaximumUs());
+            // Increases spread over several frames; release is time-based in
+            // the observer. No prediction or cached percentile can authorize growth.
+            if (m_RequestedPlayoutDelayUs > m_AppliedPlayoutDelayUs)
+                m_AppliedPlayoutDelayUs += std::min<uint64_t>(125,
+                    m_RequestedPlayoutDelayUs - m_AppliedPlayoutDelayUs);
+            else
+                m_AppliedPlayoutDelayUs = m_RequestedPlayoutDelayUs;
+            m_AppliedPlayoutDelayUs = std::min(m_AppliedPlayoutDelayUs, playoutDelayMaximumUs());
+            return;
+        }
         if (m_Parameters.playoutResponsiveBuffer) {
             if (m_Parameters.playoutResponsiveBuffer >= 3 && cadence.sourceRateChanged) {
                 // A confirmed material rate change retires incompatible history.
                 // Preserve the applied delay and slew it toward fresh evidence.
                 m_RecentReadiness = Vrr13::RecentReadiness(
                     m_Parameters.playoutReadinessWindowUs,
-                    m_Parameters.playoutOnTimeTargetPerMillion);
+                    m_Parameters.playoutOnTimeTargetPerMillion,
+                    m_Parameters.playoutResponsiveBuffer >= 4);
                 m_ReadinessPrediction.reset();
             }
             // Calibration is diagnostic only. The selected live percentile
             // and expiring miss boost own demand, subject to the latency cap.
-            m_RequestedPlayoutDelayUs = saturatingAdd(
+            // Revision 4 admits growth only for a hard miss or prevalent
+            // 1-2 ms pressure; the raw target remains available for release.
+            uint64_t requestedPlayoutDelayUs = saturatingAdd(
                 m_RecentReadiness.demand(at), m_Parameters.playoutDelayMarginUs);
+            if (m_Parameters.playoutResponsiveBuffer >= 4 &&
+                    requestedPlayoutDelayUs > m_AppliedPlayoutDelayUs &&
+                    !m_RecentReadiness.allowsGrowth(at, m_AppliedPlayoutDelayUs)) {
+                requestedPlayoutDelayUs = m_AppliedPlayoutDelayUs;
+            }
+            m_RequestedPlayoutDelayUs = requestedPlayoutDelayUs;
             const auto desired = clampUnsigned(m_RequestedPlayoutDelayUs,
                 playoutDelayMinimumUs(), playoutDelayMaximumUs());
             if (desired > m_AppliedPlayoutDelayUs) {

@@ -24,6 +24,7 @@ struct VrrSessionConfig {
     // A session preference resolved into the recorded controller parameters.
     // All presets retain jitter buffering and display-spacing protection.
     bool smoothFrameTiming = true;
+    bool v2Queue = false;
     // Linux readiness boundaries differ from D3D11. Resolve into trace parameters.
     bool readinessHitchFeedback = false;
     // Historical near-ceiling checkbox, retained for old tests and captures.

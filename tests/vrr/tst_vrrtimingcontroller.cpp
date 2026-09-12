@@ -3526,6 +3526,7 @@ void testPredictionOnlyBufferAdaptation()
         const auto desktopPolicy = vrrTimingParametersForSession(desktopSession);
         VrrTimingController desktop(desktopSession, true, desktopPolicy);
         auto expandingPolicy = desktopPolicy;
+        expandingPolicy.playoutResponsiveBuffer = 4;
         expandingPolicy.playoutDelayMaximumPeriodPerMille = 2000;
         VrrTimingController expanding(desktopSession, true, expandingPolicy);
         uint64_t maximumDelay = 0, historicalMaximum = 0;
@@ -4221,7 +4222,7 @@ void testPresetReadinessTargets()
         const auto policy = vrrTimingParametersForSession(session);
         const uint64_t target = mode == 2 ? 990000 : mode == 1 ? 995000 : 999500;
         const uint64_t window = mode == 2 ? 30000000 : mode == 1 ? 60000000 : 120000000;
-        expect(policy.playoutResponsiveBuffer == 3 &&
+        expect(policy.playoutResponsiveBuffer == 4 &&
                    policy.playoutOnTimeTargetPerMillion == target &&
                    policy.playoutReadinessWindowUs == window,
                "presets must resolve their exact reliability target and bounded history");
@@ -4240,8 +4241,96 @@ void testPresetReadinessTargets()
     }
 }
 
+void testThresholdedReadinessGrowth()
+{
+    const uint64_t startUs = 1000000;
+    Vrr13::RecentReadiness isolatedSoft(3000000, 1000000, true);
+    for (uint64_t n = 0; n < 100; ++n) {
+        isolatedSoft.observe(n == 99 ? 1500 : 0, 0, 0,
+                            startUs + n * 1000);
+    }
+    expect(isolatedSoft.demand(startUs + 100000) == 1500 &&
+               !isolatedSoft.allowsGrowth(startUs + 100000, 0),
+           "an isolated 1-2 ms miss may be measured but must not grow the buffer");
+
+    Vrr13::RecentReadiness prevalentSoft(3000000, 1000000, true);
+    for (uint64_t n = 0; n < 100; ++n) {
+        prevalentSoft.observe(n < 51 ? 1500 : 0, 0, 0,
+                             startUs + n * 1000);
+    }
+    expect(prevalentSoft.allowsGrowth(startUs + 100000, 0),
+           "1-2 ms misses must grow the buffer only above half of the live window");
+
+    Vrr13::RecentReadiness hardMiss(3000000, 990000, true);
+    for (uint64_t n = 0; n < 100; ++n) {
+        hardMiss.observe(n == 99 ? 2250 : 0, 0, 0,
+                         startUs + n * 1000);
+    }
+    expect(hardMiss.demand(startUs + 100000) >= 2250 &&
+               hardMiss.allowsGrowth(startUs + 100000, 0),
+           "one miss over 2 ms must acquire temporary buffer protection");
+
+    Vrr13::RecentReadiness oneMillisecond(3000000, 1000000, true);
+    for (uint64_t n = 0; n < 100; ++n) {
+        oneMillisecond.observe(1000, 0, 0, startUs + n * 1000);
+    }
+    expect(!oneMillisecond.allowsGrowth(startUs + 100000, 0),
+           "lateness through 1 ms must never grow the buffer");
+}
+
+void testMeanMissBuffer()
+{
+    Vrr13::MeanMissBuffer threshold;
+    uint64_t at = 1000000;
+    // An exactly one-millisecond mean is inside the deadband.
+    for (unsigned i = 0; i < 120; ++i, at += 10000)
+        threshold.observe(at, 1000, 1000, true, 1000, 16000, 4000000, 200);
+    expect(threshold.demand(1000) == 1000, "a mean miss of exactly one millisecond must not grow buffer");
+    Vrr13::MeanMissBuffer rare;
+    at = 1000000;
+    for (unsigned i = 0; i < 101; ++i, at += 10000)
+        rare.observe(at, i == 100 ? 2000 : 0, 1000, true, 1000, 16000, 4000000, 200);
+    expect(rare.demand(1000) == 1250, "successful frames must not dilute the missed-frame average");
+    for (unsigned i = 0; i < 50; ++i, at += 10000)
+        rare.observe(at, 0, 1250, true, 1000, 16000, 4000000, 200);
+    expect(rare.demand(1000) == 1250, "old missed frames alone cannot repeatedly increase protection");
+    Vrr13::MeanMissBuffer above;
+    at = 1000000;
+    for (unsigned i = 0; i < 100; ++i, at += 10000)
+        above.observe(at, 1001, 1000, true, 1000, 16000, 4000000, 200);
+    expect(above.demand(1000) == 1001, "one microsecond above the average threshold must request only that excess");
+    Vrr13::MeanMissBuffer held;
+    at = 1000000;
+    for (unsigned i = 0; i < 100; ++i, at += 10000)
+        held.observe(at, 2000, 4000, true, 1000, 16000, 4000000, 200);
+    const auto peak = held.demand(1000);
+    for (unsigned i = 0; i < 300; ++i, at += 10000)
+        held.observe(at, 0, peak, true, 1000, 16000, 4000000, 200);
+    expect(held.demand(1000) == peak, "hold must preserve protection before clean recovery");
+    for (unsigned i = 0; i < 400; ++i, at += 10000)
+        held.observe(at, 0, peak, true, 1000, 16000, 4000000, 200);
+    expect(held.demand(1000) < peak && held.demand(1000) >= peak - 600,
+        "release must remain slow and require clean observations");
+    const auto beforeGap = held.demand(1000);
+    held.observe(at + 10000000, 0, beforeGap, true, 1000, 16000, 4000000, 200);
+    expect(held.demand(1000) == beforeGap, "silence must not be treated as clean release time");
+    for (int mode : {0, 1, 2}) {
+        auto session = config(116, 120);
+        session.latencyMode = mode;
+        expect(vrrTimingParametersForSession(session).playoutResponsiveBuffer == 4,
+            "V2 Queue off must retain the installed revision-four policy");
+        session.v2Queue = true;
+        const auto policy = vrrTimingParametersForSession(session);
+        expect(policy.playoutResponsiveBuffer == 5 &&
+            policy.playoutMeanMissHoldUs == (mode == 2 ? 2000000 : mode == 1 ? 4000000 : 6000000),
+            "V2 Queue and its preset hold must be recorded as replayable parameters");
+    }
+}
+
 int main()
 {
+    testMeanMissBuffer();
+    testThresholdedReadinessGrowth();
     testPresetReadinessTargets();
     testResponsiveSmoothingWithWideJitter();
     testResponsiveReadinessKeepsEarlySlack();
