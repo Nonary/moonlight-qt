@@ -136,7 +136,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayMarginUs = parameters.playoutResponsiveBuffer ? 500 : 3000;
     parameters.playoutDelayAttackUs = 500;
     parameters.playoutAdaptiveOnly = 0;
-    parameters.playoutPerFrameLatch = 1;
+    parameters.playoutPerFrameLatch = 2;
     parameters.playoutRateProtectionEnabled = 0;
     parameters.playoutHistoryEnabled = 1;
     parameters.timestampPlayoutEnabled = 1;
@@ -651,10 +651,18 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         m_LatchedPresentation = rateProtectedPresentation();
     }
     else if (m_Parameters.playoutPerFrameLatch != 0) {
-        // Judge this frame's planned submission, not a fitted-FPS band or a
-        // multi-frame cooldown after jitter. The buffer already protects cadence.
+        // Judge this frame's planned submission. Revision 1 omitted the
+        // headroom that VRR12 required beyond the display period and guard:
+        // at 116/120 its 188 us remaining slack was incorrectly enough to
+        // permit tearing. Restore that margin and full exit hysteresis without
+        // adding it to the playout buffer or imposing a source-rate band.
+        // Explicit revision 1 remains unchanged for historical exact replay.
+        const uint64_t safetyHeadroomUs = m_Parameters.playoutPerFrameLatch >= 2 ?
+            (m_LatchedPresentation ? latchedPresentationExitHeadroomUs() :
+                                     latchedPresentationHeadroomUs()) : 0;
         const uint64_t safeAdaptiveUs = saturatingAdd(m_LastSubmissionUs,
-            saturatingAdd(m_DisplayPeriodUs, m_GuardUs));
+            saturatingAdd(saturatingAdd(m_DisplayPeriodUs, m_GuardUs),
+                          safetyHeadroomUs));
         m_LatchedPresentation = m_CanLatchPresentation && m_HaveLastSubmission &&
                                 targetUs < safeAdaptiveUs;
     }
@@ -2012,9 +2020,16 @@ uint64_t VrrTimingController::earliestSubmissionUs() const
         // manufactured a backlog there.
         return 0;
     }
+    // Persistent Vulkan Immediate cannot switch to a protected native present.
+    // Enforce the same entry margin by waiting instead. Capable presenters
+    // already selected protection for slots inside this margin; their adaptive
+    // slots naturally satisfy it. Historical captures retain the old floor.
+    const uint64_t safetyHeadroomUs = m_Parameters.playoutPerFrameLatch >= 2 ?
+        latchedPresentationHeadroomUs() : 0;
     return saturatingAdd(
         m_LastSubmissionUs,
-        saturatingAdd(m_DisplayPeriodUs, m_GuardUs));
+        saturatingAdd(saturatingAdd(m_DisplayPeriodUs, m_GuardUs),
+                      safetyHeadroomUs));
 }
 
 uint64_t VrrTimingController::lastSubmissionUs() const

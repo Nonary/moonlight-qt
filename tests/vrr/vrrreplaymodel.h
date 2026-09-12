@@ -4,6 +4,25 @@
 
 #include <cstdint>
 
+// Historical captures omit the permission field and therefore keep the old
+// tearing-permitted native contract. The A/B option changes only permission;
+// it does not turn an unlatched scheduling decision into a latched one.
+inline bool vrrDxgiPresentParametersValid(bool parametersDeclared,
+                                         bool nativeDxgiPresentAttempt,
+                                         bool latchedPresent,
+                                         uint64_t syncInterval,
+                                         uint64_t flags,
+                                         bool sessionAllowTearing = true)
+{
+    constexpr uint64_t allowTearingFlag = 0x00000200ULL;
+    const uint64_t expectedFlags = !latchedPresent && sessionAllowTearing ?
+        allowTearingFlag : 0;
+    return parametersDeclared == nativeDxgiPresentAttempt &&
+        (!parametersDeclared ||
+         ((syncInterval == 0 || (latchedPresent && syncInterval == 1)) &&
+          flags == expectedFlags));
+}
+
 // Reconstruct a busy worker's next decision without allowing an older idle
 // estimate to overrule this row's observed, faster readiness.
 uint64_t vrrBusyWorkerDecisionUs(uint64_t arrivalUs, uint64_t recordedDecisionUs,

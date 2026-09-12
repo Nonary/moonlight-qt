@@ -1,7 +1,7 @@
 # VRR deterministic tests
 
 The interval-quality queue is now the production VRR policy (responsive
-revision 7). There is no A/B checkbox; saved `v2queue` values are ignored and
+revision 7). There is no queue-policy A/B checkbox; saved `v2queue` values are ignored and
 removed when settings are saved. Every normal session uses the same 0.5 ms
 tolerance and severity-weighted thirty-second score, with targets of
 99% / 99.5% / 99.95% for Lowest latency / Balanced / Smoothest. Their clean
@@ -10,7 +10,7 @@ second. Growth requires both below-target quality and fresh readiness-related
 interval error. See architecture.md for the complete measurement and bounds.
 
 Historical policy implementations remain available through explicit captured
-controller parameters; session configuration no longer selects an A/B arm.
+controller parameters; session configuration no longer selects a queue-policy A/B arm.
 Both ordinary and warm fixture exports inherit the current production policy.
 Existing historical arithmetic and trace tests remain, but revision-6/7/8 replay
 support and final validation are still deferred at the user's request. The
@@ -63,7 +63,8 @@ unavailable coverage. This diagnostic does not change the controller or buffer.
 
 `tst_dxgipresent` tests the shared D3D11 native-call boundary with a fake
 swapchain, without Windows or Qt dependencies. It verifies synchronized
-`Present(1, 0)`, adaptive `Present(0, ALLOW_TEARING)`, mode transitions, legacy
+`Present(1, 0)`, adaptive `Present(0, ALLOW_TEARING)`, the Allow tearing off arm's
+adaptive `Present(0, 0)`, mode transitions, legacy
 interval-zero calls, telemetry parameter agreement, and result propagation.
 It does not replace a Windows renderer build or a live scanout test.
 
@@ -107,6 +108,9 @@ with the experiment enabled, or the prior WSI FIFO mode with it disabled.
 It also covers the FIFO-only WSI compatibility path, unsupported backends, and
 preservation of ordinary Wayland and X11/KMSDRM choices. The test cannot prove
 which mode an affected device exposes or whether Gamescope displays each frame.
+The Allow tearing off cases require supported Mailbox on every qualified
+surface, independent of the retired experiment, and fixed FIFO fallback when
+Mailbox is unavailable; unsupported surfaces remain ineligible.
 
 On Linux, `tst_plvkswapchain` covers the persistent present-mode classification:
 Mailbox provides latch protection through synchronized stale-image replacement,
@@ -121,10 +125,21 @@ persistent swapchain; per-frame latch decisions never destroy or recreate it.
 Persistent Mailbox counts as protected presentation and omits the redundant
 software spacing floor, while Immediate and FIFO retain that floor. The
 Gamescope WSI FIFO compatibility path retains its compositor-owned behavior,
-and Gamescope Mailbox selection still requires the existing opt-in experiment.
+while disabling Allow tearing selects supported Mailbox at session startup.
 The latency presets cap adaptive padding independently of native mode: half a
 configured stream frame for Lowest latency, one frame for Balanced, and two frames
 for Smoothest. Stale-work replacement remains a separate two-frame rule.
+
+The Allow tearing checkbox defaults on and requires reconnect. The worker tests
+verify identical controller parameters in both arms, an unchanged initial latch
+decision, and the appended schema-5 `session_allow_tearing` field. Set
+`MOONLIGHT_VRR_TEST_EXPORT_NO_TEAR_TRACE` to export the off-arm fixture for
+`vrrreplay --require-exact-baseline`. Replay-config tests preserve the strict
+DXGI argument contract: unlatched flags zero require explicit off permission;
+absent historical permission still requires `ALLOW_TEARING`. Native capability
+checks remain unchanged. A replay of one arm cannot model the other arm's
+driver blocking or establish optical tear freedom; that comparison needs fresh
+captures and visual checks on the affected Windows/Linux device.
 
 The FPS picker offers native VRR rates and preserves saved custom values; the
 reduced-rate Low Latency VRR recommendation has been removed. The worker no
@@ -1302,14 +1317,30 @@ directory.
 
 ### Per-frame production presentation protection
 
-Production sets `playout_adaptive_only=0` and `playout_per_frame_latch=1`.
-Slots closer than a display period plus guard use native protection when the
+Production sets `playout_adaptive_only=0` and `playout_per_frame_latch=2`.
+Slots closer than a display period plus guard plus safety headroom use native protection when the
 presenter supports it, removing the software floor for that slot. DXGI can
 alternate synchronized and tearing presents; composition provides native
 ordering without DXGI flags. The controller suite checks bounded latency at
 120 FPS / 120 Hz, recovery from late submissions, and return to adaptive mode
 with source-rate headroom. Explicit adaptive-only and rate-protection policies
 remain covered for historical replay.
+
+Revision 2 restores VRR12's 225 us entry / 400 us exit headroom thresholds
+on the planned slot. Revision 1 retains the historical period-plus-guard rule;
+revision 0 retains the cadence-based policy. Boundary tests exercise both
+thresholds across all presets and 60/120/144/165/240/360 Hz. The 116/120 fixture
+checks restored protection with unchanged planned deadlines and buffer depth,
+alongside the explicit revision-1 result. These checks do not measure native
+blocking or physical tearing. Use the rebuilt replay for revision-2 captures.
+
+On persistent Vulkan Immediate/FIFO, `canLatchAdaptivePresent()` stays false.
+The software floor includes the entry margin instead of requesting a mode
+change. Tests exercise this floor across the same presets/refresh rates,
+including late submissions. Persistent Mailbox supplies native protection.
+The Vulkan selection/capability suites cover those distinctions; no per-frame
+request recreates or replaces the swapchain. Native Linux visual behavior
+still requires a live Linux test.
 
 Display timing evidence is explicit: `latch_time_kind` is 0 (unavailable),
 1 (refresh reference), or 2 (display event). Production enables

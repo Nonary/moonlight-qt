@@ -42,7 +42,6 @@ constexpr uint64_t kRawQpcTranslationToleranceUs = 2;
 constexpr uint64_t kSyncAnchorMinimumIntervalToleranceUs = 500;
 constexpr uint64_t kDisplaySignalConsistencyTolerancePpm = 100;
 constexpr uint64_t kCapturedWorkerQueueCapacity = 3;
-constexpr uint64_t kDxgiPresentAllowTearing = 0x00000200ULL;
 constexpr uint64_t kNativeBackendDxgi = 1;
 constexpr uint64_t kNativeBackendVulkan = 2;
 constexpr uint64_t kNativeBackendComposition = 3;
@@ -301,6 +300,7 @@ bool validateTraceRowSyntax(const QList<QByteArray>& header,
         "decision_valid",
         "can_latch_present",
         "additional_queued_frame",
+        "session_allow_tearing",
         "render_scheduler_delay_valid",
         "render_deadline_already_elapsed",
         "render_wait_coarse_clock_stalled",
@@ -466,6 +466,7 @@ struct Columns {
     int displayRefreshHz = -1;
     int streamRateHz = -1;
     int additionalQueuedFrame = -1;
+    int sessionAllowTearing = -1;
     int displayPeriodUs = -1;
     int canLatch = -1;
     int sourceIntervalUs = -1;
@@ -753,6 +754,7 @@ struct Columns {
         displayRefreshHz = find("display_refresh_hz");
         streamRateHz = find("stream_rate_hz");
         additionalQueuedFrame = find("additional_queued_frame");
+        sessionAllowTearing = find("session_allow_tearing");
         displayPeriodUs = find("display_period_us");
         canLatch = find("can_latch_present");
         sourceIntervalUs = find("sender_interval_us");
@@ -1693,6 +1695,8 @@ struct Metrics {
     uint64_t displayRefreshMismatchRows = 0;
     uint64_t streamRateMismatchRows = 0;
     uint64_t additionalQueuedFrameMismatchRows = 0;
+    bool sessionAllowTearingTelemetryAvailable = false;
+    uint64_t sessionAllowTearingMismatchRows = 0;
     uint64_t latchCapabilityMismatchRows = 0;
     uint64_t displayPeriodMismatchRows = 0;
     uint64_t controllerParameterMismatchRows = 0;
@@ -3235,6 +3239,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
                           int capturedDisplayHz, int capturedStreamFps,
                           int simulatedDisplayHz, int simulatedStreamFps,
                           bool additionalQueuedFrame,
+                          bool sessionAllowTearing,
                           bool simulatedCanLatch,
                           uint64_t capturedResponsiveBuffer,
                           const VrrReplayScenario& scenario)
@@ -3334,6 +3339,9 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     capture["display_hz"] = capturedDisplayHz;
     capture["stream_fps"] = capturedStreamFps;
     capture["additional_queued_frame"] = additionalQueuedFrame;
+    capture["session_allow_tearing"] = sessionAllowTearing;
+    capture["session_allow_tearing_field_available"] =
+        metrics.sessionAllowTearingTelemetryAvailable;
     QJsonObject sessionConfigIntegrity;
     sessionConfigIntegrity["display_refresh_mismatch_rows"] =
         static_cast<qint64>(metrics.displayRefreshMismatchRows);
@@ -3342,6 +3350,8 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     sessionConfigIntegrity["additional_queued_frame_mismatch_rows"] =
         static_cast<qint64>(
             metrics.additionalQueuedFrameMismatchRows);
+    sessionConfigIntegrity["allow_tearing_mismatch_rows"] =
+        static_cast<qint64>(metrics.sessionAllowTearingMismatchRows);
     sessionConfigIntegrity["latch_capability_mismatch_rows"] =
         static_cast<qint64>(metrics.latchCapabilityMismatchRows);
     sessionConfigIntegrity["display_period_mismatch_rows"] =
@@ -3352,6 +3362,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
         metrics.additionalQueuedFrameMismatchRows == 0 &&
+        metrics.sessionAllowTearingMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
         metrics.controllerParameterMismatchRows == 0;
@@ -4343,7 +4354,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     nativeOutcomeIntegrity["backend_semantics"] =
         "1=DXGI, 2=Vulkan; strict raster diagnostics require every normal present attempt to be DXGI";
     nativeOutcomeIntegrity["present_contract"] =
-        "sync interval 0; DXGI_PRESENT_ALLOW_TEARING (512) for adaptive Presents and flags 0 for latched Presents; renderer eligibility flags must remain true with no fallback; the raw D3D render-adapter LUID must remain stable and equal the matched DisplayConfig source-adapter LUID";
+        "Unlatched DXGI Presents require sync interval 0 and flags 512 when session_allow_tearing is true (including historical captures without the field), otherwise flags 0. Latched Presents require flags 0 and sync interval 0 or 1 for historical compatibility. Disabling session permission does not remove swapchain tearing capability. Renderer eligibility must remain valid with no fallback; adapter LUIDs must remain stable and match.";
     nativeOutcomeIntegrity["frame_statistics_topology_scope"] =
         "DXGI documents frame statistics as unreliable in many multiple-monitor scenarios and with other fullscreen apps; strict diagnostic readiness therefore requires one desktop monitor and Moonlight foreground on every DXGI Present, but cannot enumerate every background fullscreen process";
     QJsonObject nativeVblankVirtualization;
@@ -5543,6 +5554,9 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     simulation["display_hz"] = simulatedDisplayHz;
     simulation["stream_fps"] = simulatedStreamFps;
     simulation["additional_queued_frame"] = additionalQueuedFrame;
+    simulation["session_allow_tearing"] = sessionAllowTearing;
+    simulation["native_presentation_permission_scope"] =
+        "Retains the captured session's tearing permission. Controller spacing and raster classifications remain timing proxies; disabling permission does not establish optical tear absence or model changed native blocking.";
     simulation["can_latch_present"] = simulatedCanLatch;
     simulation["scenario"] = scenario.name;
     simulation["mode"] = scenario.mode;
@@ -6047,6 +6061,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
         metrics.additionalQueuedFrameMismatchRows == 0 &&
+        metrics.sessionAllowTearingMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
         metrics.controllerParameterMismatchRows == 0 &&
@@ -6277,6 +6292,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
         metrics.additionalQueuedFrameMismatchRows == 0 &&
+        metrics.sessionAllowTearingMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
         metrics.controllerParameterMismatchRows == 0;
@@ -8550,6 +8566,7 @@ int main(int argc, char* argv[])
         columns.latchQpcCorrelationReferenceTicks >= 0 &&
         columns.latchQpcCorrelationReferenceTimeUs >= 0 &&
         columns.latchQpcCorrelationSpanTicks >= 0;
+    metrics.sessionAllowTearingTelemetryAvailable = columns.sessionAllowTearing >= 0;
     VrrSessionConfig capturedConfig;
     VrrSessionConfig simulatedConfig;
     VrrTimingParameters capturedParameters;
@@ -8813,6 +8830,8 @@ int main(int argc, char* argv[])
 
         const QByteArray disposition = fields[columns.disposition];
         const QByteArray recordedTear = fields[columns.tearClassification];
+        const bool rowAllowTearing = columns.sessionAllowTearing < 0 ||
+            unsignedField(fields, columns.sessionAllowTearing) != 0;
         const bool deepTraceRow = optionalUnsignedField(
             fields, columns.deepTrace) != 0;
         metrics.deepTraceRows += deepTraceRow ? 1 : 0;
@@ -9828,15 +9847,11 @@ int main(int argc, char* argv[])
                 ++metrics.nativeDesktopMonitorCounts[
                     QByteArray::number(nativeDesktopMonitorCount)];
             }
-            const uint64_t expectedPresentFlags = rowLatchedPresent ?
-                0 : kDxgiPresentAllowTearing;
             const bool nativePresentParametersValid =
-                nativePresentParametersDeclared ==
-                    nativeDxgiPresentAttempt &&
-                (!nativePresentParametersDeclared ||
-                 ((nativePresentSyncInterval == 0 ||
-                   (rowLatchedPresent && nativePresentSyncInterval == 1)) &&
-                  nativePresentFlags == expectedPresentFlags));
+                vrrDxgiPresentParametersValid(
+                    nativePresentParametersDeclared, nativeDxgiPresentAttempt,
+                    rowLatchedPresent, nativePresentSyncInterval,
+                    nativePresentFlags, rowAllowTearing);
             metrics.nativePresentParameterMismatchRows +=
                 nativePresentParametersValid ? 0 : 1;
             const bool nativeVrrStateValid =
@@ -11455,6 +11470,7 @@ int main(int argc, char* argv[])
             capturedConfig.streamRateHz = rowStreamRateHz;
             capturedConfig.allowAdditionalQueuedFrame =
                 rowAdditionalQueuedFrame;
+            capturedConfig.allowTearing = rowAllowTearing;
             capturedCanLatch = rowCanLatch;
             if (traceSchema < 5) {
                 // Schema-3/4 rows predate captured controller parameters.
@@ -11661,6 +11677,8 @@ int main(int argc, char* argv[])
             metrics.additionalQueuedFrameMismatchRows +=
                 rowAdditionalQueuedFrame !=
                     capturedConfig.allowAdditionalQueuedFrame ? 1 : 0;
+            metrics.sessionAllowTearingMismatchRows +=
+                rowAllowTearing != capturedConfig.allowTearing ? 1 : 0;
             metrics.latchCapabilityMismatchRows +=
                 rowCanLatch != capturedCanLatch ? 1 : 0;
         }
@@ -14496,7 +14514,7 @@ int main(int argc, char* argv[])
         capturedConfig.displayRefreshHz, capturedConfig.streamRateHz,
         simulatedConfig.displayRefreshHz, simulatedConfig.streamRateHz,
         capturedConfig.allowAdditionalQueuedFrame,
-        simulatedCanLatch, capturedParameters.playoutResponsiveBuffer,
+        capturedConfig.allowTearing, simulatedCanLatch, capturedParameters.playoutResponsiveBuffer,
         scenario);
     bool comparisonCompatible = true;
     if (parser.isSet(compareOption)) {

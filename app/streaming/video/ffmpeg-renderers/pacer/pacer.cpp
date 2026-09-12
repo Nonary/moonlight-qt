@@ -296,7 +296,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                        bool enablePacing, bool enableVsync,
                        bool enableVrr, int vrrDisplayRefreshHz,
                        bool smoothVrrFrameTiming, const QString& calibrationKey,
-                       int vrrLatencyMode)
+                       int vrrLatencyMode, bool allowVrrTearing)
 {
     m_MaxVideoFps = maxVideoFps;
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
@@ -309,6 +309,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
         // The production queue policy is shared across native backends.
         config.readinessHitchFeedback = false;
         config.latencyMode = vrrLatencyMode >= 0 && vrrLatencyMode <= 2 ? vrrLatencyMode : 1;
+        config.allowTearing = allowVrrTearing;
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         if (!calibrationKey.isEmpty()) {
             const QString display = QString::fromUtf8(SDL_GetDisplayName(SDL_GetWindowDisplayIndex(window)));

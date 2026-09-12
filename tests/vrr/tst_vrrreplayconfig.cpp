@@ -17,6 +17,7 @@ private slots:
     void submissionEstimatePolicyRoundTrip();
     void predictionOnlyPolicyRoundTrip();
     void rateProtectionPolicyRoundTrip();
+    void perFrameSafetyPolicyRoundTrip();
     void adaptiveOnlyPolicyRoundTrip();
     void latencyFixPolicyRoundTrip();
     void inheritanceAndOverride();
@@ -39,6 +40,7 @@ private slots:
     void wakeDelayInjectionEligibility();
     void waitLifecycleAudit();
     void dxgiCapabilityAudit();
+    void dxgiPresentPermissionAudit();
     void periodicInjectionSelector();
     void rationalDisplayTiming();
     void busyWorkerReadinessFloor();
@@ -693,6 +695,26 @@ void VrrReplayConfigTest::rateProtectionPolicyRoundTrip()
     QVERIFY(!applyVrrReplayControllerSnapshot(snapshot, parameters, error));
     QVERIFY(error.contains("playout_rate_protection_enabled"));
     QCOMPARE(parameters.playoutRateProtectionEnabled, uint64_t(1));
+}
+
+void VrrReplayConfigTest::perFrameSafetyPolicyRoundTrip()
+{
+    VrrTimingParameters parameters;
+    QCOMPARE(parameters.playoutPerFrameLatch, uint64_t(0));
+    QString error;
+    for (int revision : {0, 1, 2}) {
+        const QJsonObject snapshot{{"playout_per_frame_latch", revision}};
+        QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, parameters, error), qPrintable(error));
+        QCOMPARE(parameters.playoutPerFrameLatch, uint64_t(revision));
+        VrrTimingParameters restored;
+        QVERIFY2(applyVrrReplayControllerSnapshot(
+            vrrTimingParametersToJson(parameters), restored, error), qPrintable(error));
+        QCOMPARE(restored.playoutPerFrameLatch, uint64_t(revision));
+    }
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        QJsonObject{{"playout_per_frame_latch", 3}}, parameters, error));
+    QVERIFY(error.contains("playout_per_frame_latch"));
+    QCOMPARE(parameters.playoutPerFrameLatch, uint64_t(2));
 }
 
 void VrrReplayConfigTest::rasterEnvelope()
@@ -1962,6 +1984,30 @@ void VrrReplayConfigTest::dxgiCapabilityAudit()
         false, 0, 0, 0, false,
         false, 0, false, 0x1001, false);
     QVERIFY(!audit.relationshipsValid);
+}
+
+void VrrReplayConfigTest::dxgiPresentPermissionAudit()
+{
+    // A missing session permission field retains the historical contract.
+    QVERIFY(vrrDxgiPresentParametersValid(true, true, false, 0, 512));
+    QVERIFY(!vrrDxgiPresentParametersValid(true, true, false, 0, 0));
+    QVERIFY(vrrDxgiPresentParametersValid(true, true, false, 0, 512, true));
+    QVERIFY(!vrrDxgiPresentParametersValid(true, true, false, 0, 0, true));
+    // Only the explicit off arm permits unlatched zero-flag Presents.
+    QVERIFY(vrrDxgiPresentParametersValid(true, true, false, 0, 0, false));
+    QVERIFY(!vrrDxgiPresentParametersValid(true, true, false, 0, 512, false));
+    QVERIFY(!vrrDxgiPresentParametersValid(true, true, false, 1, 0, false));
+    QVERIFY(!vrrDxgiPresentParametersValid(true, true, false, 0, 1, false));
+    // Preserve historical latched interval 0 and the corrected interval 1.
+    for (bool allowTearing : {false, true}) {
+        QVERIFY(vrrDxgiPresentParametersValid(true, true, true, 0, 0, allowTearing));
+        QVERIFY(vrrDxgiPresentParametersValid(true, true, true, 1, 0, allowTearing));
+        QVERIFY(!vrrDxgiPresentParametersValid(true, true, true, 2, 0, allowTearing));
+        QVERIFY(!vrrDxgiPresentParametersValid(true, true, true, 0, 512, allowTearing));
+        QVERIFY(!vrrDxgiPresentParametersValid(false, true, false, 0, 0, allowTearing));
+        QVERIFY(!vrrDxgiPresentParametersValid(true, false, false, 0, 0, allowTearing));
+        QVERIFY(vrrDxgiPresentParametersValid(false, false, false, 0, 0, allowTearing));
+    }
 }
 
 void VrrReplayConfigTest::busyWorkerReadinessFloor()

@@ -2574,7 +2574,7 @@ void testProductionAdaptiveProtectionRecoversWithoutDrift()
 {
     const auto session = config(120, 120);
     const auto policy = vrrTimingParametersForSession(session);
-    expect(policy.playoutAdaptiveOnly == 0 && policy.playoutPerFrameLatch == 1 &&
+    expect(policy.playoutAdaptiveOnly == 0 && policy.playoutPerFrameLatch == 2 &&
            policy.playoutRateProtectionEnabled == 0,
            "production must choose protection for each slot, not force a rate band");
     VrrTimingController controller(session, true, policy);
@@ -2605,6 +2605,112 @@ void testProductionAdaptiveProtectionRecoversWithoutDrift()
     }
     expect(protectedAtCeiling > 400, "native-rate slots must use protection");
     expect(adaptiveWithHeadroom > 300, "source slowdown must return to adaptive presentation");
+}
+
+void testPerFrameLatchIncludesSafetyHeadroom()
+{
+    for (int mode : {0, 1, 2}) {
+        for (int refresh : {60, 120, 144, 165, 240, 360}) {
+            auto session = config(refresh * 3 / 4, refresh);
+            session.latencyMode = mode;
+            session.smoothFrameTiming = false;
+            const auto policy = vrrTimingParametersForSession(session);
+            // A shadow schedule supplies the uncompressed source slots. No
+            // preparation observations means both controllers retain the same
+            // render budget and buffer; only submitted spacing differs.
+            for (uint64_t slack : {224ULL, 225ULL, 399ULL, 400ULL}) {
+                VrrTimingController reference(session, true, policy);
+                VrrTimingController controller(session, true, policy);
+                const auto period = 1000000ULL / session.streamRateHz;
+                const auto a = frame(0, 0, true, 1000000);
+                reference.schedule(a, 1000000);
+                controller.schedule(a, 1000000);
+                const auto b = frame(1, uint32_t(90000 / session.streamRateHz), true, 1000000 + period);
+                const auto rawB = reference.schedule(b, b.decodeCompleteUs());
+                const auto floorInterval = controller.displayPeriodUs() + controller.guardUs();
+                controller.noteSubmission(true, false, rawB.targetUs - floorInterval - slack);
+                auto d = controller.schedule(b, b.decodeCompleteUs());
+                expect(d.latchedPresentation == (slack < policy.latchedPresentationHeadroomUs),
+                       "entry must include the VRR12 safety headroom in every preset and refresh rate");
+
+                // Force entry, then verify exit uses the larger hysteresis
+                // threshold on the planned slot rather than fitted source FPS.
+                const auto c = frame(2, uint32_t(180000 / session.streamRateHz), true, 1000000 + 2 * period);
+                const auto rawC = reference.schedule(c, c.decodeCompleteUs());
+                controller.noteSubmission(true, false, rawC.targetUs - floorInterval - 224);
+                d = controller.schedule(c, c.decodeCompleteUs());
+                expect(d.latchedPresentation, "a tight slot must enter native protection");
+                const auto e = frame(3, uint32_t(270000 / session.streamRateHz), true, 1000000 + 3 * period);
+                const auto rawE = reference.schedule(e, e.decodeCompleteUs());
+                controller.noteSubmission(true, false, rawE.targetUs - floorInterval - slack);
+                d = controller.schedule(e, e.decodeCompleteUs());
+                expect(d.latchedPresentation == (slack < policy.latchedPresentationExitHeadroomUs),
+                       "exit must retain the full VRR12 safety headroom hysteresis");
+                expect(d.targetUs == rawE.targetUs,
+                       "native protection must not add padding to the source deadline");
+            }
+        }
+    }
+}
+
+void testProductionNearRefreshSafetyMargin()
+{
+    for (int mode : {0, 1, 2}) {
+        auto session = config(116, 120);
+        session.latencyMode = mode;
+        session.smoothFrameTiming = false;
+        const auto policy = vrrTimingParametersForSession(session);
+        auto historical = policy;
+        historical.playoutPerFrameLatch = 1;
+        VrrTimingController controller(session, true, policy);
+        VrrTimingController oldController(session, true, historical);
+        unsigned protectedFrames = 0, oldProtectedFrames = 0;
+        for (int i = 0; i < 600; ++i) {
+            const auto ticks = uint32_t(uint64_t(i) * 90000 / 116);
+            const auto at = 1000000 + uint64_t(ticks) * 1000 / 90;
+            const auto f = frame(i, ticks, true, at);
+            const auto d = controller.schedule(f, at);
+            const auto old = oldController.schedule(f, at);
+            if (i > 100) {
+                protectedFrames += d.latchedPresentation;
+                oldProtectedFrames += old.latchedPresentation;
+            }
+            expect(d.targetUs == old.targetUs && d.playoutDelayUs == old.playoutDelayUs,
+                   "restoring protection must preserve VRR16's queue and planned deadlines");
+            controller.noteSubmission(true, false, d.targetUs);
+            oldController.noteSubmission(true, false, old.targetUs);
+        }
+        expect(protectedFrames == 499 && oldProtectedFrames == 0,
+               "116/120 must regain protection while explicit VRR16 replay preserves its original decision");
+    }
+}
+
+void testPersistentImmediateUsesSafetyFloor()
+{
+    for (int mode : {0, 1, 2}) {
+        for (int refresh : {60, 120, 144, 165, 240, 360}) {
+            auto session = config(refresh, refresh);
+            session.latencyMode = mode;
+            auto policy = vrrTimingParametersForSession(session);
+            VrrTimingController controller(session, false, policy);
+            uint64_t prior = 0;
+            for (int i = 0; i < 200; ++i) {
+                const auto ticks = uint32_t(uint64_t(i) * 90000 / refresh);
+                const auto at = 1000000 + uint64_t(ticks) * 1000 / 90;
+                const auto d = controller.schedule(frame(i, ticks, true, at), std::max(at, prior));
+                expect(!d.latchedPresentation,
+                       "persistent Immediate/FIFO must never request unsupported native protection");
+                if (prior) {
+                    const auto safe = prior + controller.displayPeriodUs() + d.guardUs +
+                        policy.latchedPresentationHeadroomUs;
+                    expect(controller.earliestSubmissionUs() == safe && d.targetUs >= safe,
+                           "an immutable unprotected backend must enforce safety headroom through its software floor");
+                }
+                prior = d.targetUs + (i % 37 == 0 ? 3000 : 0);
+                controller.noteSubmission(true, false, prior);
+            }
+        }
+    }
 }
 
 void testSourceRateProtection()
@@ -4391,6 +4497,9 @@ int main()
     testPerFrameLatchAtNativeMaximum();
     testExplicitAdaptiveOnlyPolicy();
     testProductionAdaptiveProtectionRecoversWithoutDrift();
+    testPerFrameLatchIncludesSafetyHeadroom();
+    testProductionNearRefreshSafetyMargin();
+    testPersistentImmediateUsesSafetyFloor();
     testSourceRateProtection();
     testRollingPlayoutHistory();
     testHistoryPreservesVrr13Scheduling();

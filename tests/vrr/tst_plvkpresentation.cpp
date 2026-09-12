@@ -10,12 +10,12 @@ int failures = 0;
 void check(PlVkVrrSurface surface, bool wsi,
            std::initializer_list<VkPresentModeKHR> available,
            std::optional<VkPresentModeKHR> expected, const char* description,
-           bool gamescopeMailbox = true)
+           bool gamescopeMailbox = true, bool allowTearing = true)
 {
     const auto selected = selectPlVkVrrPresentMode(surface, wsi, gamescopeMailbox,
         [&](VkPresentModeKHR mode) {
             return std::find(available.begin(), available.end(), mode) != available.end();
-        });
+        }, allowTearing);
     if (selected != expected || (selected &&
             std::find(available.begin(), available.end(), *selected) == available.end())) {
         std::fprintf(stderr, "FAIL: %s\n", description);
@@ -30,6 +30,19 @@ int main()
     constexpr auto fifo = VK_PRESENT_MODE_FIFO_KHR;
     constexpr auto mailbox = VK_PRESENT_MODE_MAILBOX_KHR;
     constexpr auto immediate = VK_PRESENT_MODE_IMMEDIATE_KHR;
+
+    for (const auto surface : {Surface::Wayland, Surface::Immediate, Surface::Gamescope}) {
+        for (const bool wsi : {false, true}) {
+            check(surface, wsi, {fifo, mailbox, immediate}, mailbox,
+                  "disabling tearing must choose persistent Mailbox over Immediate", false, false);
+            check(surface, wsi, {fifo, immediate}, std::nullopt,
+                  "disabling tearing without Mailbox must use fixed FIFO fallback", false, false);
+            check(surface, wsi, {fifo}, std::nullopt,
+                  "disabling tearing must not qualify Gamescope WSI FIFO as protection", true, false);
+        }
+    }
+    check(Surface::Unsupported, true, {fifo, mailbox, immediate}, std::nullopt,
+          "disabling tearing must not qualify an unsupported window backend", false, false);
 
     check(Surface::Gamescope, true, {fifo, mailbox}, fifo,
           "unchecked experiment restores Gamescope WSI FIFO", false);

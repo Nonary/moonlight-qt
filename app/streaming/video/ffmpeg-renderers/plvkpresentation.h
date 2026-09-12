@@ -17,8 +17,18 @@ enum class PlVkVrrSurface
 template<typename SupportsMode>
 std::optional<VkPresentModeKHR> selectPlVkVrrPresentMode(
     PlVkVrrSurface surface, bool gamescopeWsi, bool gamescopeMailbox,
-    SupportsMode supportsMode)
+    SupportsMode supportsMode, bool allowTearing = true)
 {
+    if (!allowTearing) {
+        // Choose once before creating the swapchain. Mailbox preserves
+        // replacement semantics without tearing on every supported surface.
+        // Without it, let the caller select its ordinary fixed FIFO fallback;
+        // neither Immediate nor the Gamescope WSI exception proves protection.
+        if (surface != PlVkVrrSurface::Unsupported && supportsMode(VK_PRESENT_MODE_MAILBOX_KHR)) {
+            return VK_PRESENT_MODE_MAILBOX_KHR;
+        }
+        return std::nullopt;
+    }
     if (surface == PlVkVrrSurface::Wayland) {
         if (supportsMode(VK_PRESENT_MODE_MAILBOX_KHR)) {
             return VK_PRESENT_MODE_MAILBOX_KHR;

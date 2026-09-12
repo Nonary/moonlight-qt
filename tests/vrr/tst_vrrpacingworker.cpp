@@ -1861,6 +1861,64 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
 }
 
+void testTraceCapturesAllowTearingWithoutChangingController()
+{
+    for (bool allowTearing : {true, false}) {
+        resetFakeClock();
+        QTemporaryDir directory;
+        expect(directory.isValid(), "permission trace fixture needs a temporary directory");
+        const QString tracePath = directory.filePath("vrr-permission.vrrtrace");
+        const QByteArray tracePathBytes = QFile::encodeName(tracePath);
+        SDL_setenv("MOONLIGHT_VRR_TRACE", tracePathBytes.constData(), 1);
+        SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "1", 1);
+        FakeVrrFramePresenter backend;
+        PacerTelemetry telemetry;
+        TrackedFrameLifetime lifetime;
+        auto config = enabledConfig();
+        config.allowTearing = allowTearing;
+        const auto parameters = vrrTimingParametersForSession(config);
+        auto controlConfig = config;
+        controlConfig.allowTearing = !allowTearing;
+        const auto controlParameters = vrrTimingParametersForSession(controlConfig);
+#define VRR_EXPECT_PERMISSION_INDEPENDENT_PARAMETER(type, jsonName, memberName, defaultValue) \
+        expect(parameters.memberName == controlParameters.memberName, \
+               "Allow tearing must leave controller parameter " #jsonName " unchanged");
+        VRR_TIMING_PARAMETER_FIELDS(VRR_EXPECT_PERMISSION_INDEPENDENT_PARAMETER)
+#undef VRR_EXPECT_PERMISSION_INDEPENDENT_PARAMETER
+        {
+            VrrPacingWorker worker(&backend, config, &telemetry);
+            expect(worker.start(), "permission fixture worker must start");
+            worker.submit(frame(1, lifetime));
+            expect(backend.waitForPresentCount(1), "both permission arms must present");
+        }
+        const auto requests = backend.presentRequests();
+        expect(requests.size() == 1 && !requests[0].latchedPresentation,
+               "native permission must not manufacture a controller latch request");
+        const QByteArray expanded = readExpandedTrace(tracePath);
+        const auto lines = expanded.split('\n');
+        const auto columns = lines.value(0).split(',');
+        const auto fields = lines.value(1).split(',');
+        expect(columns.size() == fields.size() && columns.last() == "session_allow_tearing",
+               "permission must be an appended schema-5 field aligned with the row");
+        expect(fields.value(columns.indexOf("session_allow_tearing")) ==
+                   (allowTearing ? "1" : "0"),
+               "trace must identify the snapshotted native permission arm");
+        expect(fields.value(columns.indexOf("trace_schema")) == "5" &&
+                   fields.value(columns.indexOf("latched_present")) == "0",
+               "the off arm keeps the existing schema and recorded controller decision");
+        if (!allowTearing) {
+            const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_NO_TEAR_TRACE");
+            if (exportPath && exportPath[0]) {
+                QFile::remove(QString::fromLocal8Bit(exportPath));
+                expect(QFile::copy(tracePath, QString::fromLocal8Bit(exportPath)),
+                       "off-arm trace must export its exact replay fixture when requested");
+            }
+        }
+        SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+        SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
+    }
+}
+
 void testTraceQueueConcurrency()
 {
     Vrr13::TraceQueue<uint64_t, 4> bounded;
@@ -2023,6 +2081,7 @@ int main()
     testFailedCancellationNativeEvidenceIsTraced();
     testReconnectPreservesCompletedTraces();
     testDeepTraceRequestsNativeObservationsWithoutChangingMode();
+    testTraceCapturesAllowTearingWithoutChangingController();
 
     exportWarmHistoryReplayFixture();
     SDL_Quit();

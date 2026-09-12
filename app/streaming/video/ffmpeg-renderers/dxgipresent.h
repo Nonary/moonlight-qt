@@ -8,10 +8,11 @@ struct DxgiPresentParameters
     unsigned int flags;
 
     static constexpr DxgiPresentParameters adaptive(bool latched,
-                                                    unsigned int tearingFlag)
+                                                    unsigned int tearingFlag,
+                                                    bool allowTearing = true)
     {
         return latched ? DxgiPresentParameters{1, 0} :
-                         DxgiPresentParameters{0, tearingFlag};
+                         DxgiPresentParameters{0, allowTearing ? tearingFlag : 0};
     }
 
     template<typename SwapChain>

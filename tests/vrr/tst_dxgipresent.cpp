@@ -82,6 +82,14 @@ int main()
     submit(DxgiPresentParameters::adaptive(false, allowTearing), 0, allowTearing);
     submit(DxgiPresentParameters::adaptive(true, allowTearing), 1, 0);
 
+    // Changing the session preference only removes permission from the
+    // interval-zero path. Thin-headroom synchronized protection stays active.
+    for (const bool allow : {false, true, false}) {
+        submit(DxgiPresentParameters::adaptive(false, allowTearing, allow),
+               0, allow ? allowTearing : 0);
+        submit(DxgiPresentParameters::adaptive(true, allowTearing, allow), 1, 0);
+    }
+
     // Preserve the legacy software-paced caller's explicit interval-zero path.
     submit({0, 0}, 0, 0);
     submit({0, allowTearing}, 0, allowTearing);
@@ -91,5 +99,6 @@ int main()
     submit(DxgiPresentParameters::adaptive(true, allowTearing), 1, 0);
     swapChain.result = 1;
     submit(DxgiPresentParameters::adaptive(false, allowTearing), 0, allowTearing);
+    submit(DxgiPresentParameters::adaptive(false, allowTearing, false), 0, 0);
     return failures == 0 ? 0 : 1;
 }

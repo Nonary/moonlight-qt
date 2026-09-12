@@ -40,6 +40,7 @@
     X(uint64_t, render_start_preserve_learned_lead, renderStartPreserveLearnedLead, 0) \
     X(uint64_t, playout_smoothness_feedback_enabled, playoutSmoothnessFeedbackEnabled, 0) \
     X(uint64_t, playout_prediction_enabled, playoutPredictionEnabled, 0) \
+    /* 0: historical cadence latch; 1: slot only; 2: slot plus safety headroom. */ \
     X(uint64_t, playout_per_frame_latch, playoutPerFrameLatch, 0) \
     X(uint64_t, playout_adaptive_only, playoutAdaptiveOnly, 0) \
     X(uint64_t, playout_rate_protection_enabled, playoutRateProtectionEnabled, 0) \

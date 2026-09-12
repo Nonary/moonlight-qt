@@ -5,7 +5,8 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Source baseline: `e0908f08` plus promotion of the interval-quality queue to production (revision 7),
+Source baseline: `3c372cce` plus per-frame safety-headroom correction and the
+Allow tearing comparison setting (2026-09-12),
 client-processing,
 vrr14-style compact stats reporting, restored Reduce judder, reconnect
 trace preservation, motion cadence telemetry, hard buffer ceiling, AMD low-latency decode request, observed-latency trace diagnostics, and removal of the latency oscillation test,
@@ -48,7 +49,42 @@ have been retired. Their saved settings (and the older Mailbox preference) are
 ignored and removed on settings save. Session startup no longer invokes the
 composition guard and passes repaint=false to the decoder. Dormant renderer
 helpers and their deterministic tests remain available for development.
-Production retains its original Immediate/WSI FIFO selection.
+With Allow tearing enabled, production retains its original Immediate/WSI FIFO
+selection. The separate permission comparison below can select Mailbox.
+
+### Allow tearing comparison (2026-09-12)
+
+The VRR settings expose `Allow tearing`, saved as `allowvrrtearing` and enabled
+by default. The session snapshots it before decoder creation, carries it through
+decoder recovery, and requires reconnect to change it. Latency preset, queue
+targets, smoothing and per-frame headroom decisions use the same controller
+parameters in both arms. This setting controls native presentation permission;
+it does not force every controller decision to be latched.
+
+On Windows DXGI, adaptive frames use `Present(0, ALLOW_TEARING)` when enabled
+and `Present(0, 0)` when disabled. Tight slots retain `Present(1, 0)` in both
+arms. The swapchain retains its tearing capability and is not recreated to
+change per-frame flags. Calibration identities separate the two permission
+arms because acquisition and native service can differ. The optional composition
+diagnostic presenter has no DXGI tearing flag, so this checkbox does not change
+its native ordering.
+
+On Linux Vulkan, disabling permission selects supported Mailbox once at session
+startup on qualified Wayland, X11/KMSDRM and Gamescope surfaces. If Mailbox is
+unavailable, it uses the existing fixed FIFO fallback. The swapchain's mode
+stays persistent during per-frame protection decisions. Ordinary Wayland already
+uses Mailbox with permission enabled, so the two arms may be identical there.
+Calibration identities include the selected mode. A Linux comparison can change
+the native mode and effective pacing fallback; it is not a DXGI-style per-call
+flag comparison.
+
+Schema-5 rows append `session_allow_tearing`. Replay retains the captured arm
+and treats an absent historical field as enabled. Its native argument audit
+allows zero flags on unlatched DXGI frames only for explicit off captures, and
+rejects a permission change within one captured session. Timing and raster
+metrics remain proxies; replay cannot predict the driver's changed blocking
+behavior by flipping a permission bit on an existing capture. Compare fresh
+on/off gameplay captures for smoothness and visible tearing.
 
 ### Retired oscillating latency test (removed 2026-09-11)
 
@@ -1044,10 +1080,12 @@ qualifying projections, so one early timestamp does not shift the entire stream.
 A late frame can clamp to the present execution opportunity while the next
 frame retains its own source slot.
 
-Production sets `playout_adaptive_only=0`, `playout_per_frame_latch=1`, and
+Production sets `playout_adaptive_only=0`, `playout_per_frame_latch=2`, and
 `playout_rate_protection_enabled=0`. Before applying software spacing floors,
-each target is compared with `lastSubmission + displayPeriod + guard`. If it
-falls earlier and the presenter supports native protection, that slot is latched
+each target is compared with `lastSubmission + displayPeriod + guard + safetyHeadroom`.
+The headroom uses the existing VRR12 entry threshold (225 us) or full exit
+threshold (400 us when already latched), including explicit display-scaled
+threshold overrides. If it falls earlier and the presenter supports native protection, that slot is latched
 and its software floor is disabled. Otherwise the adaptive floor applies.
 DXGI uses `Present(1, 0)` for protected slots and
 `Present(0, DXGI_PRESENT_ALLOW_TEARING)` with headroom. Diagnostic composition already
@@ -1058,7 +1096,59 @@ This allows source-rate changes and recovery from late work without permanently
 carrying a refresh-plus-guard delay into every subsequent frame. The explicit
 adaptive-only policy remains replayable and takes precedence over latch flags.
 Historical rate protection uses the shared below-refresh recommendation cutoff.
-Backends without native protection retain their software spacing floors.
+Backends without native protection enforce the entry safety margin through
+their software spacing floor. Their presentation mode remains unchanged.
+
+Revision 1 omitted the extra headroom and remains available for exact historical
+replay; revision 0 retains the older cadence-based latch policy. At steady
+116 FPS / 120 Hz, rounded periods are 8621 and 8333 us with a 100 us base guard:
+188 us clears revision 1's interval check but not VRR12's 225 us entry margin.
+Revision 2 restores that missing allowance on the planned per-frame interval,
+without reinstating the 64-frame recovery hold or changing buffer targets.
+This is a protection correction, not evidence that VRR12 predicted scanout more
+accurately. Both versions start their spacing calculation at CPU submission.
+The extra margin is a historical safety allowance, not a measured bound on
+driver/flip/scanout delay. Native synchronized presents may change actual
+latency and cadence even when planned targets are identical. A capture from
+the affected machine and Windows visual validation are still required.
+
+Validation on macOS, 2026-09-12: timing-controller, rate-policy, pacing-worker,
+replay-config, DXGI-call-boundary, profile, Vulkan mode-selection and persistent
+mode-capability tests pass. The new headroom regressions fail against the
+unchanged VRR16 calculation and pass after the correction. Fresh single-frame
+and warm-history schema-5 worker fixtures pass exact replay with complete
+sequence integrity; all five responsive-buffer stress scenarios pass their
+interval and 30 ms p99 latency assertions without saturation. These fixtures
+are synthetic. Results are under `build/vrr-hybrid/final-*`; no affected-user
+capture was available, no native Windows/Linux gameplay was tested, and no
+Windows release or ChaseShare update was produced from this macOS checkout.
+
+Follow-up report: the affected user also sees tearing in Lowest latency and
+Balanced well below the refresh ceiling; vrr12 and vrr13 reportedly worked
+there, while vrr13 failed higher in the range. The restored 225/400 us margin
+does not by itself explain or establish a fix for this broader report.
+Comparison of the actual vrr12/vrr13 tags identifies additional differences:
+
+- Both older controllers used 64 clean frames of latch recovery after startup,
+  ineligible cadence, source-rate changes or phase discontinuities. Per-frame
+  revisions 1 and 2 bypass that recovery state even though it is still counted.
+- Both older Windows renderers used `Present(0, 0)` for protected frames. Their
+  D3D11 source is identical. Current DXGI protection uses `Present(1, 0)`;
+  restoring headroom does not restore the old native queue semantics.
+- VRR12 retained its submission-spacing floor for every frame. VRR13 disabled
+  it for latched frames while still issuing interval-zero native calls. This is
+  a relevant high-rate difference, not proof of the reported failure's cause.
+- Older smoothing continued from the late-clamped/floored target. Current
+  smoothing continues from the original intended target, allowing quicker
+  recovery and potentially shorter following intervals. VRR12/13 also used
+  different tail-based buffering and did not have the current latency presets.
+
+Both generations anchor software spacing at CPU submission, not verified
+image-change time. A large average source interval therefore does not establish
+physical scanout headroom, particularly through stalls or native mode changes.
+Distinguish steady-state behavior from recovery and identify the affected native
+backend before attributing the report to prediction accuracy. Linux's persistent
+presentation modes remain separate from these Windows per-present flags.
 
 Prediction-only production ignores the presentation model's compositor lead
 and scanout floor. Deadlines use the mapped source cadence, readiness protection
@@ -1068,7 +1158,9 @@ field equals the submission target in this policy; it is not a calibrated
 measurement of physical scanout. Historical policies can still learn a
 compositor lead and scanout floor from native observations.
 
-Normally that earliest submission is `lastSubmission + displayPeriod + guard`.
+Normally that earliest submission is
+`lastSubmission + displayPeriod + guard + entrySafetyHeadroom` for revision 2;
+historical revisions omit the last term.
 With `latchedFloorDisabled` and a latched decision it returns zero. This is a
 deliberate reliance on native presentation behavior; it must be checked against
 the actual renderer implementation, not inferred from the request flag.
@@ -1363,6 +1455,7 @@ telemetry and `presentPreparedFrame()`, which forwards it to DXGI:
 
 - Latched: `Present(1, 0)`.
 - Adaptive: `Present(0, DXGI_PRESENT_ALLOW_TEARING)`.
+- Adaptive with Allow tearing disabled: `Present(0, 0)`.
 - Legacy: interval zero with the existing `legacyPresentFlags()` value.
 
 The controller can omit its software spacing floor for a latched decision;
@@ -1474,22 +1567,30 @@ Its implementations can have different acquisition and cancellation semantics.
 Do not transfer D3D11 fence or Present assumptions directly to Vulkan.
 
 On Linux the VRR request prefers the Vulkan frontend. The adaptive mode is
-selected for the surface at startup: Mailbox on ordinary Wayland, Immediate
+selected for the surface at startup. With Allow tearing enabled: Mailbox on ordinary Wayland, Immediate
 on X11/KMSDRM, and Immediate on Gamescope. Gamescope additionally tries Mailbox
-when the SteamOS experiment is enabled, according to exposed surface capabilities.
+when the dormant SteamOS experiment is enabled, according to exposed surface
+capabilities. With Allow tearing disabled, all qualified surfaces prefer
+supported Mailbox; missing Mailbox selects fixed FIFO pacing instead.
 
 The selected adaptive mode remains immutable for the lifetime of one persistent
 swapchain. Per-frame controller requests never destroy or recreate that chain.
 Persistent Mailbox provides synchronized, stale-image-replacing presentation,
 so it advertises protected latch support without a native mode change or the
 controller's redundant software spacing floor. Immediate retains that floor
-because it may tear. A FIFO-only compatibility path likewise does not advertise
+because it may tear; revision 2 includes the same 225 us entry safety margin in
+that floor. This prevents the shared headroom correction from having no effect
+on an Immediate backend that cannot request a synchronized native present.
+The additional spacing can reduce sustainable throughput near native refresh;
+worker stale-frame replacement remains responsible for bounded backlog.
+It does not turn Immediate into a tear-free native presentation mode.
+A FIFO-only compatibility path likewise does not advertise
 adaptive latch support because it may accumulate queued frames. Actual resize,
 reset, or fallback can recreate the swapchain and restores the cached
 colorspace/HDR hint before the next acquisition. Deterministic tests do not
 establish compositor or physical scanout behavior.
 
-Gamescope WSI's FIFO compatibility exception is used when Immediate is unavailable
+With Allow tearing enabled, Gamescope WSI's FIFO compatibility exception is used when Immediate is unavailable
 and the Mailbox experiment is disabled or Mailbox is unavailable. Although the WSI layer sends Mailbox to the underlying
 driver, it forwards the application's original present mode to Gamescope, which
 implements FIFO commit scheduling itself. Selecting Mailbox explicitly avoids
@@ -1591,7 +1692,9 @@ older policies may store the wall time after that wait. Overlay client processin
 boundary exactly; readiness-to-submission is not an interchangeable latency metric.
 
 Every row also records `session_latency_mode`, `session_readiness_hitch_feedback`,
-`calibration_loaded`, `initial_cached_samples`, and `history_version`. Worker
+`calibration_loaded`, `initial_cached_samples`, and `history_version`. The final
+`session_allow_tearing` column records the snapshotted native permission;
+historical captures without it default to enabled. Worker
 decision rows have `history_state_valid=1` and scalar snapshots of history samples,
 misses, duration, and release eligibility. These snapshots are taken at trace
 enqueue, after the outcome, rather than at the earlier scheduling decision.

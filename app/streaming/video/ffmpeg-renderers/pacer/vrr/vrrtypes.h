@@ -31,6 +31,8 @@ struct VrrSessionConfig {
     // 0: Smoothest, 1: Balanced, 2: Lowest latency, across all VRR rates.
     // Zero preserves the historical default for replay and explicit test configs.
     int latencyMode = 0;
+    // Session-native A/B choice, recorded separately from controller timing.
+    bool allowTearing = true;
     std::string calibrationKey;
     std::string calibrationPath;
 };

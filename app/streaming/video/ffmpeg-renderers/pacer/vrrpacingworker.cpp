@@ -83,7 +83,7 @@ constexpr char kTraceHeader[] =
     "gap_fills_before,gap_fill_last_us,original_target_us,playout_initial_profile,original_scanout_us,predicted_scanout_us,compositor_lead_us,recovery_headroom_us,smoothness_protection_us,requested_playout_delay_us,submission_smoothness_samples,submission_smoothness_misses,native_smoothness_samples,native_smoothness_misses,playout_capacity_limited,presentation_uncertainty_us"
     VRR_TIMING_PARAMETER_FIELDS(VRR_TRACE_PARAMETER_HEADER)
     ",decoder_output_us,session_latency_mode,session_readiness_hitch_feedback,calibration_loaded,initial_cached_samples,history_version,history_state_valid,history_samples,history_misses,history_duration_us,history_can_release"
-    ",session_latency_oscillation,latency_test_phase"
+    ",session_latency_oscillation,latency_test_phase,session_allow_tearing"
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
 constexpr uint32_t kVrrWindowStateMask =
@@ -1583,6 +1583,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(row.historyCanRelease);
     addUnsigned(0); // Retired oscillation diagnostic column.
     addUnsigned(0);
+    addUnsigned(m_Config.allowTearing);
     line.append('\n');
 
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {

@@ -933,6 +933,22 @@ Flickable {
 
                 CheckBox {
                     hoverEnabled: true
+                    text: qsTr("Allow tearing")
+                    font.pointSize: 12
+                    visible: StreamingPreferences.enableVrr
+                    enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                    checked: StreamingPreferences.allowVrrTearing
+                    onCheckedChanged: StreamingPreferences.allowVrrTearing = checked
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Allows lower-latency presentation when timing permits, with a risk of visible tearing. Disable to request tear-free presentation; latency and smoothness may change.") + "\n\n" +
+                                  qsTr("Reconnect the stream after changing this setting.")
+                }
+
+                CheckBox {
+                    hoverEnabled: true
                     text: qsTr("Reduce judder")
                     font.pointSize: 12
                     visible: StreamingPreferences.enableVrr

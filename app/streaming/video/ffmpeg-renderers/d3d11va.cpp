@@ -863,10 +863,11 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
 
     if (m_DecoderParams.enableVrr && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "D3D11 VRR backend enabled: refresh=%d Hz, presentation=%s",
+                    "D3D11 VRR backend enabled: refresh=%d Hz, presentation=%s, allow tearing=%s",
                     m_DecoderParams.vrrDisplayRefreshHz,
                     m_CompositionPresenter.active() ? "composition diagnostic (native ordering)" :
-                        "DXGI (per-frame tearing/synchronized, estimated timing)");
+                        "DXGI (per-frame tearing/synchronized, estimated timing)",
+                    m_DecoderParams.allowVrrTearing ? "on" : "off");
     }
 
     {
@@ -2592,10 +2593,12 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         return feedback;
     }
 
-    // The risk decision is per frame. Sync interval 1 holds a risky frame for
-    // the next scanout; safe frames retain the immediate VRR presentation path.
+    // The risk decision is per frame. Sync interval 1 protects risky frames;
+    // other frames retain interval-zero replacement semantics. The session's
+    // tearing preference controls permission on those interval-zero frames.
     const auto presentParameters = DxgiPresentParameters::adaptive(
-        request.latchedPresentation, DXGI_PRESENT_ALLOW_TEARING);
+        request.latchedPresentation, DXGI_PRESENT_ALLOW_TEARING,
+        m_DecoderParams.allowVrrTearing);
     feedback.nativeBackendValid = true;
     feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
     feedback.nativePresentParametersValid = true;
@@ -3511,10 +3514,11 @@ QString D3D11VARenderer::getCalibrationIdentity()
     if (!m_RenderDevice || FAILED(m_RenderDevice.As(&device)) ||
         FAILED(device->GetAdapter(&adapter)) || FAILED(adapter->GetDesc(&desc)) ||
         FAILED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver))) return {};
-    // Buffer acquisition and native service differ between these presenters.
-    // Do not seed DXGI readiness from a composition capture, or vice versa.
-    return QString("D3D11|%1|%2|%3|%4|%5|%6|%7")
+    // Buffer acquisition and native service differ between presenters and
+    // tearing choices. Keep their readiness histories separate.
+    return QString("D3D11|%1|%2|%3|%4|%5|%6|%7|allow-tearing=%8")
         .arg(desc.VendorId).arg(desc.DeviceId).arg(desc.SubSysId).arg(desc.Revision)
         .arg(driver.QuadPart).arg(m_DecodeDevice == m_RenderDevice)
-        .arg(m_CompositionPresenter.active() ? "composition" : "dxgi");
+        .arg(m_CompositionPresenter.active() ? "composition" : "dxgi")
+        .arg(m_DecoderParams.allowVrrTearing);
 }
