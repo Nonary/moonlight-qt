@@ -1,4 +1,5 @@
 #include "../../app/streaming/video/ffmpeg-renderers/dxgipresent.h"
+#include "../../app/streaming/video/ffmpeg-renderers/d3d11fencewait.h"
 
 #include <cstdio>
 
@@ -31,6 +32,36 @@ int main()
             ++failures;
         }
     };
+    for (const auto readyAt : {0ULL, 3000ULL, 50000ULL, 100000ULL}) {
+        uint64_t now = 0;
+        const auto result = D3D11FenceWait::wait(7, [&] { return now; },
+            [&] { return now >= readyAt ? 7ULL : 6ULL; },
+            [&](unsigned timeoutMs) { now += timeoutMs * 1000; return true; });
+        check(result.status == (readyAt <= 50000 ? D3D11FenceWait::Status::Complete :
+            D3D11FenceWait::Status::Timeout),
+            "missing event notifications must not hide completed GPU work or admit incomplete work");
+        check(now == std::min<uint64_t>(readyAt, 50000),
+            "completion polling must recover promptly and retain the 50 ms total timeout");
+    }
+    {
+        uint64_t now = 0;
+        unsigned calls = 0;
+        const auto result = D3D11FenceWait::wait(7, [&] { return now; },
+            [&] { return now >= 3000 ? 7ULL : 6ULL; },
+            [&](unsigned timeoutMs) { if (calls++) now += timeoutMs * 1000; return true; });
+        check(result.status == D3D11FenceWait::Status::Complete && now == 3000 && calls == 4,
+              "a stale signalled event must not release a still-incomplete frame");
+    }
+    check(D3D11FenceWait::wait(7, [] { return 0ULL; }, [] { return 6ULL; },
+          [](unsigned) { return false; }).status == D3D11FenceWait::Status::WaitFailed,
+          "native wait failures must propagate");
+    check(D3D11FenceWait::wait(7, [] { return 0ULL; },
+          [] { return std::numeric_limits<uint64_t>::max(); },
+          [](unsigned) { return true; }).status == D3D11FenceWait::Status::DeviceRemoved,
+          "the device-removed fence sentinel must never count as GPU completion");
+    check(D3D11FenceWait::wait(7, [] { return 0ULL; }, [] { return 6ULL; },
+          [](unsigned) { return true; }).status == D3D11FenceWait::Status::Timeout,
+          "stale events and a stalled clock must not loop forever");
     const auto submit = [&](DxgiPresentParameters parameters,
                             unsigned int interval, unsigned int flags) {
         const auto previousCalls = swapChain.calls;

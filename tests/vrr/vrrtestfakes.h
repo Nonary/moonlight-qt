@@ -47,6 +47,15 @@ public:
         return LiGetMicroseconds() - startUs;
     }
 
+    uint64_t waitForDecode(AVFrame* frame, uint64_t boundary) override
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_Mutex);
+            m_WaitedDecodeBoundaries.push_back(boundary);
+        }
+        return waitForDecode(frame);
+    }
+
     VrrFallbackReason checkSupport() const override
     {
         std::lock_guard<std::mutex> lock(m_Mutex);
@@ -402,6 +411,12 @@ public:
         return m_PreparedDecodeBoundaries;
     }
 
+    std::vector<uint64_t> waitedDecodeBoundaries() const
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        return m_WaitedDecodeBoundaries;
+    }
+
 private:
     mutable std::mutex m_Mutex;
     std::condition_variable m_Condition;
@@ -433,6 +448,7 @@ private:
     std::vector<VrrPresentRequest> m_PresentRequests;
     std::vector<VrrPresentRequest> m_PrepareRequests;
     std::vector<uint64_t> m_PreparedDecodeBoundaries;
+    std::vector<uint64_t> m_WaitedDecodeBoundaries;
     std::vector<uint64_t> m_PresentCallTimesUs;
     std::vector<uint64_t> m_PresentReturnTimesUs;
 };

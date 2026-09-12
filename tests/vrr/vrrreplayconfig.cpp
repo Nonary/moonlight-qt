@@ -448,6 +448,15 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             (!value.playoutReadinessDrivenAdaptation || value.playoutNativeHitchAdaptation)) {
         return fail("playout_prediction_only requires readiness adaptation without native hitch adaptation");
     }
+    if (value.playoutResponsiveBuffer > 3 || (value.playoutResponsiveBuffer &&
+            (!value.playoutPredictionOnly || value.playoutReadinessHitchThresholdUs))) {
+        return fail("playout_responsive_buffer requires prediction-only playout without historical hitch feedback");
+    }
+    if (value.playoutOnTimeTargetPerMillion < 900000 || value.playoutOnTimeTargetPerMillion > 1000000)
+        return fail("playout_on_time_target_per_million must be in 900000..1000000");
+    if (value.playoutReadinessWindowUs < 3000000 || value.playoutReadinessWindowUs > 120000000 ||
+            value.playoutReadinessWindowUs % 100000 != 0)
+        return fail("playout_readiness_window_us must be a multiple of 100000 in 3000000..120000000");
     if (value.playoutReadinessHitchThresholdUs &&
             (!value.playoutPredictionOnly || value.playoutReadinessHitchThresholdUs > 10000)) {
         return fail("playout_readiness_hitch_threshold_us requires prediction-only playout and must be in 1..10000");

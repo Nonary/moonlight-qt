@@ -321,6 +321,14 @@ public:
         return 0;
     }
 
+    // Fence-based backends need the boundary captured for this particular
+    // output, rather than a later decoder signal. Existing frame-based
+    // implementations retain their readiness handling through this overload.
+    virtual uint64_t waitForDecode(AVFrame* frame, uint64_t)
+    {
+        return waitForDecode(frame);
+    }
+
     // May acquire a swapchain image and submit rendering work, but must not
     // intentionally pace or wait for the worker's presentation target.
     // Called on the decoder-output thread immediately before a frame enters

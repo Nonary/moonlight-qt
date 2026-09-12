@@ -104,15 +104,15 @@ software spacing floor, while Immediate and FIFO retain that floor. The
 Gamescope WSI FIFO compatibility path retains its compositor-owned behavior,
 and Gamescope Mailbox selection still requires the existing opt-in experiment.
 The latency presets cap adaptive padding independently of native mode: half a
-fitted source frame for Lowest latency, one frame for Balanced, and two frames
+configured stream frame for Lowest latency, one frame for Balanced, and two frames
 for Smoothest. Stale-work replacement remains a separate two-frame rule.
 
 The FPS picker offers native VRR rates and preserves saved custom values; the
 reduced-rate Low Latency VRR recommendation has been removed. The worker no
 longer generates gap-fill repeats when new frames are unavailable.
 
-Production preserves the game's relative RTP intervals and caps playout padding
-at 16 ms. Its gain smoother is disabled; historical policies remain replayable.
+Production caps playout padding at 16 ms. Reduce judder optionally smooths
+credible source cadence; transitions follow raw RTP slots. Historical policies remain replayable.
 For controller accuracy, use `simulation.sender_cadence.spacing_accuracy_percent`
 and `spacing_errors_over_2ms`: both long and short spacing errors count. The
 existing sender/arrival stall exclusions and denominator are unchanged. Raw
@@ -125,7 +125,18 @@ interval safety separately; they do not claim 99.95% under post-target faults.
 The all-arrival queue simulator uses the capture's `can_latch_present` capability;
 forcing it off invents software-floor backlog on a latch-capable session.
 
-Production sets `playout_prediction_only=1`: readiness prediction controls both
+Production sets `playout_responsive_buffer=3`: Lowest latency targets 99% over
+30 seconds, Balanced 99.5% over 60 seconds, and Smoothest 99.95% over 120 seconds.
+A two-second fresh-miss boost and 500 us margin control the buffer. The 1 ms
+minimum remains. Version-20 five-minute raw-readiness history is diagnostic
+only; cached tails cannot grow or hold the live buffer. Recovery headroom
+speeds gradual release rather than being subtracted from readiness demand.
+Preset limits use the configured stream rate, so 120/19/30 FPS desktop changes
+cannot expand them. Smoothing follows raw source slots during rate transitions
+until 200 ms of credible cadence returns; delivery learning continues against
+RTP spacing. Historical traces default the new parameter to zero.
+
+Historical production sets `playout_prediction_only=1`: readiness prediction controls both
 growth and release, independently of display feedback. Required protection is
 readiness p99.95 plus any recent readiness-miss boost, with 3 ms of headroom.
 Growth is bounded at 500 us per update; gradual release requires warmed readiness
@@ -136,9 +147,9 @@ waits and post-submission display delay do not become more readiness demand.
 Display observations cannot change compositor lead or the scanout floor in
 this policy. They remain optional trace/cadence diagnostics, with absent display
 events reported as unavailable or through separately labeled submission
-estimates. The selected latency preset still limits the allowed padding. Version-18
-profiles prevent old native-hitch
-calibration from holding the new buffer high. The three-frame queue and 16 ms
+estimates. The selected latency preset still limits the allowed padding. The
+historical version-18 profiles isolate that policy from native-hitch estimates;
+current version-20 diagnostics cannot hold the live buffer high. The three-frame queue and 16 ms
 padding cap are unchanged. Missing `playout_prediction_only` defaults to zero;
 the historical native-hitch and combined-feedback policies remain replayable.
 Controller regressions cover growth and later release without display events,
@@ -146,6 +157,11 @@ delivery/render/scheduler faults, startup without double-counted protection,
 latency/spacing bounds, and identical scheduling despite display-only hitches.
 `--require-exact-baseline` selects that captured policy; an ordinary replay or
 the `session-policy` scenario selects the current production policy instead.
+`configs/responsive-buffer-stress.json` covers nominal, decision, preparation,
+submission and scheduler-burst scenarios with explicit latency and interval
+bounds. Deterministic desktop fixtures additionally require clean 120/19/30 FPS
+transitions to remain at 1 ms, real faults to acquire protection, and recovery
+within seconds across all presets with smoothing enabled and disabled.
 The spacing lifecycle audit accepts a zero correction floor only when the
 reconstructed controller also disables that software floor. It still validates
 the deficit, wait ordering, and any required nonzero floor.
@@ -1316,3 +1332,33 @@ See [the capture procedure](../../docs/vrr-latency-captures.md). Run
 `scripts/report-vrr-latency.py` compares actual captures, preserving the distinction
 between immutable decoder output, later GPU readiness, and present-call return.
 It does not substitute replay scenarios for missing measured presets.
+
+### Responsive buffer revision 3
+
+Production resolves `playout_responsive_buffer=3`. Values 0, 1 and 2 remain
+available for exact historical replay. Revision 3 records the selected target
+in `playout_on_time_target_per_million` and learning window in
+`playout_readiness_window_us`. The rolling 30-second outcome readout counts
+client drops as misses and measures lateness before deadline recovery clamps.
+Replay exposes `observed.readiness` and `simulation.readiness`, including
+misses over 1 ms and 2 ms. Targets are best effort within the existing caps.
+Quantile, expiry, preset selection and drop-accounting tests cover this policy.
+Controller regressions cover stable 9/17 ms alternating source intervals, early
+readiness slack covering a smoothed deadline, and the existing 120/19/30 FPS
+desktop transitions and fault recovery in every timing preset.
+
+`tst_dxgipresent` also exercises the shared Windows fence-wait helper. Completion
+must follow the actual fence value despite missing or stale event notifications;
+timeouts, native wait failures, device removal, and a stalled clock stay bounded.
+The helper blocks in 1 ms event slices within the existing 50 ms total budget.
+These tests do not prove the cause of a particular driver's event delay or
+measure physical display cadence.
+
+Replay distinguishes `decoder_output_us` (immutable CPU output and the latency
+origin) from `decode_complete_us` (the later GPU-ready scheduling boundary).
+Timestamp integrity validates output before admission, readiness before the
+decision, and the recorded decode wait inside the worker lifecycle. Older
+captures without immutable output retain their historical boundary. Busy-worker
+reconstruction caps a learned idle floor by the current row's observed readiness;
+a long startup wait cannot shift an otherwise unchanged replay. Both contracts
+have deterministic regressions in `tst_vrrreplayconfig`.

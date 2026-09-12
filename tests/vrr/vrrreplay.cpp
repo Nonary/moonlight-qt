@@ -3,6 +3,7 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h"
 #include "vrrreplayconfig.h"
 #include "vrrreplaymodel.h"
+#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/readinesswindow.h"
 
 #include <QCommandLineParser>
 #include <QCoreApplication>
@@ -452,6 +453,8 @@ struct Columns {
     int rtpTimestamp = -1;
     int rtpValid = -1;
     int decodeCompleteUs = -1;
+    int decoderOutputUs = -1;
+    int decodeSyncWaitUs = -1;
     int pacerArrivalUs = -1;
     int queueDepthBefore = -1;
     int queueDepthAfter = -1;
@@ -737,6 +740,8 @@ struct Columns {
         rtpTimestamp = find("rtp_timestamp");
         rtpValid = find("rtp_valid");
         decodeCompleteUs = find("decode_complete_us");
+        decoderOutputUs = find("decoder_output_us");
+        decodeSyncWaitUs = find("decode_sync_wait_us");
         pacerArrivalUs = find("pacer_arrival_us");
         queueDepthBefore = find("arrival_queue_depth_before");
         queueDepthAfter = find("arrival_queue_depth_after");
@@ -1647,6 +1652,8 @@ struct RasterEnvelopeMetrics {
 };
 
 struct Metrics {
+    Vrr13::ReadinessWindow observedReadiness;
+    Vrr13::ReadinessWindow simulatedReadiness;
     uint64_t feedbackCapacityLimitedFrames = 0;
     VrrTimingDecision lastFeedbackDecision;
 
@@ -1690,6 +1697,7 @@ struct Metrics {
     uint64_t displayPeriodMismatchRows = 0;
     uint64_t controllerParameterMismatchRows = 0;
     uint64_t decodeToArrivalOrderViolations = 0;
+    uint64_t decodeReadinessOrderViolations = 0;
     uint64_t arrivalToDequeueOrderViolations = 0;
     uint64_t dequeueToDecisionOrderViolations = 0;
     uint64_t controllerCallOrderViolations = 0;
@@ -3350,6 +3358,8 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     QJsonObject timestampIntegrity;
     timestampIntegrity["decode_to_arrival_order_violations"] =
         static_cast<qint64>(metrics.decodeToArrivalOrderViolations);
+    timestampIntegrity["decode_readiness_order_violations"] =
+        static_cast<qint64>(metrics.decodeReadinessOrderViolations);
     timestampIntegrity["arrival_to_dequeue_order_violations"] =
         static_cast<qint64>(metrics.arrivalToDequeueOrderViolations);
     timestampIntegrity["dequeue_to_decision_order_violations"] =
@@ -3418,6 +3428,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         static_cast<qint64>(metrics.submissionTimestampRegressions);
     timestampIntegrity["valid"] =
         metrics.decodeToArrivalOrderViolations == 0 &&
+        metrics.decodeReadinessOrderViolations == 0 &&
         metrics.arrivalToDequeueOrderViolations == 0 &&
         metrics.dequeueToDecisionOrderViolations == 0 &&
         metrics.controllerCallOrderViolations == 0 &&
@@ -5342,7 +5353,23 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         "pre_present_envelope_to_equality_anchored_classification for the same Present ID";
     observedTears["exact_present_refresh_timing"] = exactPresentRefresh;
 
+    const auto readinessObject = [](const Vrr13::ReadinessWindow& window) {
+        const auto sample = window.snapshot();
+        QJsonObject result;
+        result["window_us"] = qint64(30000000);
+        result["samples"] = qint64(sample.samples);
+        result["misses"] = qint64(sample.misses);
+        result["late_over_1ms"] = qint64(sample.over1ms);
+        result["late_over_2ms"] = qint64(sample.over2ms);
+        result["dropped"] = qint64(sample.dropped);
+        result["valid"] = sample.samples != 0;
+        result["on_time_percent"] = sample.samples ?
+            QJsonValue(100.0 * (sample.samples - sample.misses) / sample.samples) : QJsonValue();
+        result["scope"] = "intended smoothed slot before recovery clamps; client drops are misses; window/shutdown discards excluded";
+        return result;
+    };
     QJsonObject observed;
+    observed["readiness"] = readinessObject(metrics.observedReadiness);
     observed["dispositions"] = countObject(metrics.dispositions);
     observed["drops"] = static_cast<qint64>(metrics.originalDrops);
     observed["latency_us"] = observedLatency;
@@ -5848,6 +5875,9 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
                               simulatedStreamFps : 1);
     simulation["playout_delay_us"] = distributionObject(
         metrics.simulatedPlayoutDelayUs);
+    simulation["readiness"] = readinessObject(metrics.simulatedReadiness);
+    simulation["on_time_target_percent"] = scenario.controller.playoutOnTimeTargetPerMillion / 10000.0;
+    simulation["readiness_history_us"] = qint64(scenario.controller.playoutReadinessWindowUs);
     simulation["sender_cadence"] = senderCadenceObject(
         metrics.simulatedSenderCadence,
         metrics.lastArrivalUs >= metrics.firstArrivalUs ?
@@ -6009,6 +6039,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.displayPeriodMismatchRows == 0 &&
         metrics.controllerParameterMismatchRows == 0 &&
         metrics.decodeToArrivalOrderViolations == 0 &&
+        metrics.decodeReadinessOrderViolations == 0 &&
         metrics.arrivalToDequeueOrderViolations == 0 &&
         metrics.dequeueToDecisionOrderViolations == 0 &&
         metrics.controllerCallOrderViolations == 0 &&
@@ -6239,6 +6270,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.controllerParameterMismatchRows == 0;
     const bool timestampIntegrityReady =
         metrics.decodeToArrivalOrderViolations == 0 &&
+        metrics.decodeReadinessOrderViolations == 0 &&
         metrics.arrivalToDequeueOrderViolations == 0 &&
         metrics.dequeueToDecisionOrderViolations == 0 &&
         metrics.controllerCallOrderViolations == 0 &&
@@ -7034,6 +7066,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
 }
 
 struct TimelineDetails {
+    uint64_t decoderOutputUs = 0;
     int recordedSourceRateHz = 0;
     int simulatedSourceRateHz = 0;
     uint64_t recordedSourcePeriodUs = 0;
@@ -7223,7 +7256,7 @@ struct TimelineDetails {
 bool writeTimelineHeader(QFile& file)
 {
     static const QByteArray header =
-        "arrival_sequence,frame,disposition,decode_complete_us,pacer_arrival_us,"
+        "arrival_sequence,frame,disposition,decode_complete_us,decoder_output_us,pacer_arrival_us,"
         "recorded_target_us,simulated_target_us,target_delta_us,"
         "recorded_submission_us,simulated_submission_us,submission_delta_us,"
         "recorded_presenter_submission_time_valid,"
@@ -7434,6 +7467,7 @@ bool writeTimelineRow(QFile& file, uint64_t arrivalSequence, int frame,
     append(QByteArray::number(frame));
     append(disposition);
     append(QByteArray::number(decodeCompleteUs));
+    append(QByteArray::number(details.decoderOutputUs));
     append(QByteArray::number(pacerArrivalUs));
     append(QByteArray::number(recordedTargetUs));
     append(QByteArray::number(simulatedTargetUs));
@@ -7563,10 +7597,10 @@ bool writeTimelineRow(QFile& file, uint64_t arrivalSequence, int frame,
         details.recordedFrameStatsQueryStartUs));
     append(QByteArray::number(
         details.recordedFrameStatsQueryEndUs));
-    append(QByteArray::number(recordedSubmissionUs >= decodeCompleteUs ?
-        recordedSubmissionUs - decodeCompleteUs : 0));
-    append(QByteArray::number(simulatedSubmissionUs >= decodeCompleteUs ?
-        simulatedSubmissionUs - decodeCompleteUs : 0));
+    append(QByteArray::number(recordedSubmissionUs >= details.decoderOutputUs ?
+        recordedSubmissionUs - details.decoderOutputUs : 0));
+    append(QByteArray::number(simulatedSubmissionUs >= details.decoderOutputUs ?
+        simulatedSubmissionUs - details.decoderOutputUs : 0));
     append(recordedTear);
     append(simulatedTear);
     append(QByteArray::number(details.recordedSourceRateHz));
@@ -10524,10 +10558,24 @@ int main(int argc, char* argv[])
 
         const uint64_t decodeCompleteUs = unsignedField(
             fields, columns.decodeCompleteUs);
+        const uint64_t decoderOutputUs = columns.decoderOutputUs >= 0 ?
+            unsignedField(fields, columns.decoderOutputUs) : decodeCompleteUs;
         const uint64_t dequeueUs = unsignedField(fields, columns.dequeueUs);
         const uint64_t decisionUs = unsignedField(fields, columns.decisionUs);
         const bool rowDecisionValid =
             unsignedField(fields, columns.decisionValid) != 0;
+        const bool readinessOutcome = disposition == "presented" || disposition == "output_dropped" ||
+            disposition == "queue_capacity" || disposition == "stale" || disposition == "preparation_failed";
+        if (readinessOutcome) {
+            const int intendedColumn = traceHeader.indexOf("original_target_us");
+            const uint64_t deadline = intendedColumn >= 0 ? unsignedField(fields, intendedColumn) :
+                unsignedField(fields, columns.recordedTargetUs);
+            const uint64_t ready = unsignedField(fields, columns.preparationEndUs);
+            const uint64_t at = optionalUnsignedField(fields, columns.terminalTimeUs);
+            metrics.observedReadiness.record(at ? at : pacerArrivalUs,
+                rowDecisionValid ? positiveDifference(ready, deadline) : 0,
+                disposition != "presented");
+        }
         const bool dispositionRequiresDecision =
             disposition == "presented" ||
             disposition == "output_dropped" ||
@@ -10568,7 +10616,12 @@ int main(int argc, char* argv[])
         metrics.sourceRateDisplayMismatches +=
             fields[columns.sourceRateHz] != expectedSourceRateHz ? 1 : 0;
         metrics.decodeToArrivalOrderViolations +=
-            decodeCompleteUs == 0 || pacerArrivalUs < decodeCompleteUs ? 1 : 0;
+            decoderOutputUs == 0 || pacerArrivalUs < decoderOutputUs ? 1 : 0;
+        metrics.decodeReadinessOrderViolations +=
+            vrrDecodeReadinessOrderValid(decoderOutputUs, decodeCompleteUs,
+                pacerArrivalUs, dequeueUs, decisionUs,
+                optionalUnsignedField(fields, columns.decodeSyncWaitUs),
+                rowDecisionValid) ? 0 : 1;
         metrics.arrivalToDequeueOrderViolations +=
             dequeueUs != 0 && dequeueUs < pacerArrivalUs ? 1 : 0;
         metrics.dequeueToDecisionOrderViolations +=
@@ -11343,7 +11396,7 @@ int main(int argc, char* argv[])
             nativeRasterAfterInVerticalBlank,
             nativeRasterAfterScanLine);
         metrics.observedDecodeToArrival.addElapsed(pacerArrivalUs,
-                                                   decodeCompleteUs);
+                                                   decoderOutputUs);
         metrics.observedArrivalToDequeue.addElapsed(dequeueUs,
                                                     pacerArrivalUs);
         metrics.observedDequeueToDecision.addElapsed(decisionUs, dequeueUs);
@@ -11862,6 +11915,7 @@ int main(int argc, char* argv[])
         }
 
         TimelineDetails timelineDetails;
+        timelineDetails.decoderOutputUs = decoderOutputUs;
         timelineDetails.recordedDecisionUs = decisionUs;
         timelineDetails.recordedRenderWaitOvershootUs =
             optionalUnsignedField(
@@ -12332,6 +12386,10 @@ int main(int argc, char* argv[])
             metrics.tearRiskMismatches +=
                 unsignedField(fields, columns.tearRisk) != 0 ? 1 : 0;
             ++metrics.simulatedTearClassifications["not_presented"];
+            if (readinessOutcome) {
+                const auto terminal = optionalUnsignedField(fields, columns.terminalTimeUs);
+                metrics.simulatedReadiness.record(terminal ? terminal : pacerArrivalUs, 0, true);
+            }
             metrics.exactTearClassifications +=
                 recordedTear == "not_presented" ? 1 : 0;
             if (timelineFile.isOpen() &&
@@ -12423,7 +12481,8 @@ int main(int argc, char* argv[])
                          frameNumber,
                          rtpTimestamp,
                          unsignedField(fields, columns.rtpValid) != 0,
-                         decodeCompleteUs);
+                         decoderOutputUs);
+        frame.noteGpuReadyUs(decodeCompleteUs);
         frame.setDeliveryTimeline(
             optionalUnsignedField(fields, traceHeader.indexOf("frame_receive_us")),
             optionalUnsignedField(fields, traceHeader.indexOf("frame_reassembled_us")),
@@ -12744,10 +12803,10 @@ int main(int argc, char* argv[])
                         simulatedPreviousSubmissionUs,
                         postSubmissionGapUs);
                     if (metrics.modeledIdleLatencyValid) {
-                        occupancyDecisionUs = std::max(
-                            saturatingAdd(pacerArrivalUs,
-                                          metrics.modeledIdleLatencyUs),
-                            occupancyDecisionUs);
+                        occupancyDecisionUs = vrrBusyWorkerDecisionUs(
+                            pacerArrivalUs, decisionUs,
+                            simulatedPreviousSubmissionUs, postSubmissionGapUs,
+                            metrics.modeledIdleLatencyUs);
                     }
                 }
                 else {
@@ -12867,7 +12926,14 @@ int main(int argc, char* argv[])
         const int originalColumn = traceHeader.indexOf("original_target_us");
         if (originalColumn >= 0 && referenceDecision.originalTargetUs !=
                 unsignedField(fields, originalColumn)) {
-            std::fprintf(stderr, "Original deadline diverged on frame %d\n", frameNumber);
+            std::fprintf(stderr,
+                "Original deadline diverged on frame %d: replay=%llu recorded=%llu source=%llu period=%llu smoothing=%lld buffer=%llu\n",
+                frameNumber, (unsigned long long)referenceDecision.originalTargetUs,
+                (unsigned long long)unsignedField(fields, originalColumn),
+                (unsigned long long)referenceDecision.sourceTimeUs,
+                (unsigned long long)referenceDecision.sourcePeriodUs,
+                (long long)referenceDecision.cadenceSmoothingUs,
+                (unsigned long long)referenceDecision.playoutDelayUs);
             return 3;
         }
         metrics.referenceTargetDrift.add(referenceTargetDrift);
@@ -13768,6 +13834,11 @@ int main(int argc, char* argv[])
         }
 
         const bool hadPriorSimulatedSubmission = haveSimulatedSubmission;
+        if (readinessOutcome) {
+            metrics.simulatedReadiness.record(std::max(simulatedSubmissionUs, simulatedPreparationEndUs),
+                positiveDifference(simulatedPreparationEndUs, simulatedDecision.originalTargetUs),
+                disposition != "presented");
+        }
         const QByteArray simulatedTear = simulatedTearClassification(
             presented, simulatedDecision.latchedPresentation,
             simulatedCanLatch, hadPriorSimulatedSubmission,
@@ -14161,11 +14232,11 @@ int main(int argc, char* argv[])
                     false, false, simulatedDisplayPeriodUs);
             }
             addCadenceFrame(metrics.observedRateBands,
-                timelineDetails.recordedSourceRateHz, decodeCompleteUs,
+                timelineDetails.recordedSourceRateHz, decoderOutputUs,
                 recordedSubmissionUs, timelineDetails.recordedCadence,
                 recordedTear == "adaptive_interval_violation");
             addCadenceFrame(metrics.simulatedRateBands,
-                timelineDetails.simulatedSourceRateHz, decodeCompleteUs,
+                timelineDetails.simulatedSourceRateHz, decoderOutputUs,
                 simulatedSubmissionUs, timelineDetails.simulatedCadence,
                 simulatedTear == "adaptive_interval_violation");
             metrics.observedJerkAnomalies.observe(recordedSubmissionUs,
@@ -14188,7 +14259,7 @@ int main(int argc, char* argv[])
                 signedDifference(simulatedSubmissionUs,
                                  simulatedDecision.targetUs)));
             metrics.observedDecodeToSubmission.addElapsed(
-                recordedSubmissionUs, decodeCompleteUs);
+                recordedSubmissionUs, decoderOutputUs);
             metrics.observedArrivalToSubmission.addElapsed(
                 recordedSubmissionUs, pacerArrivalUs);
             metrics.observedDecisionToSubmission.addElapsed(
@@ -14199,7 +14270,7 @@ int main(int argc, char* argv[])
             metrics.observedSubmissionSpacing.add(unsignedField(
                 fields, columns.submissionSpacingUs));
             metrics.simulatedDecodeToSubmission.addElapsed(
-                simulatedSubmissionUs, decodeCompleteUs);
+                simulatedSubmissionUs, decoderOutputUs);
             metrics.simulatedArrivalToSubmission.addElapsed(
                 simulatedSubmissionUs, pacerArrivalUs);
             metrics.simulatedDecisionToSubmission.addElapsed(

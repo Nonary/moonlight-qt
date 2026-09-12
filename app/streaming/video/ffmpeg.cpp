@@ -857,6 +857,11 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.vrrPacingDroppedFrames += src.vrrPacingDroppedFrames;
     dst.vrrEligibleFrames += src.vrrEligibleFrames;
     dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
+    if (src.vrrReadiness.atUs > dst.vrrReadiness.atUs) {
+        dst.vrrReadiness = src.vrrReadiness;
+        dst.vrrOnTimeTargetPerMillion = src.vrrOnTimeTargetPerMillion;
+        dst.vrrBufferAtLimit = src.vrrBufferAtLimit;
+    }
     dst.vrrQueueResidenceUs += src.vrrQueueResidenceUs;
     dst.vrrDecodeWaitUs += src.vrrDecodeWaitUs;
     dst.vrrBufferUs += src.vrrBufferUs;
@@ -973,6 +978,9 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
 
     m_ActiveWndVideoStats.vrrTelemetryActive =
         m_ActiveWndVideoStats.vrrTelemetryActive || snapshot.vrrActive;
+    m_ActiveWndVideoStats.vrrReadiness = snapshot.vrrReadiness;
+    m_ActiveWndVideoStats.vrrOnTimeTargetPerMillion = snapshot.vrrOnTimeTargetPerMillion;
+    m_ActiveWndVideoStats.vrrBufferAtLimit = snapshot.vrrBufferAtLimit;
     m_ActiveWndVideoStats.vrrPacingDroppedFrames +=
         delta(snapshot.vrrPacingDroppedFrames,
               m_LastPacerTelemetry.vrrPacingDroppedFrames);
@@ -1249,25 +1257,30 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             stats.vrrPacingDroppedFrames != 0 ||
             stats.vrrPresentFailedFrames != 0 ||
             stats.vrrPresentCancelledFrames != 0) {
-        if (stats.vrrEligibleFrames == 0) {
+        if (stats.vrrReadiness.samples == 0) {
             ret = snprintf(&output[offset],
                            length - offset,
                            "VRR pacing: %s (starting...)\n",
                            stats.vrrTelemetryActive ? "Active" : "Inactive");
         }
         else {
-            const uint64_t lateFrames = qMin(stats.vrrPrepareLateFrames,
-                                             stats.vrrEligibleFrames);
+            const auto& readiness = stats.vrrReadiness;
+            const uint64_t lateFrames = qMin(readiness.misses, readiness.samples);
             const double readyOnTimePercent =
-                static_cast<double>(stats.vrrEligibleFrames - lateFrames) *
-                100.0 / static_cast<double>(stats.vrrEligibleFrames);
+                static_cast<double>(readiness.samples - lateFrames) *
+                100.0 / static_cast<double>(readiness.samples);
 
             ret = snprintf(&output[offset],
                            length - offset,
-                           "VRR pacing: %s | Client ready on time: %.1f%% | Dropped: %llu\n",
+                           "VRR pacing: %s | Client ready on time (30s): %.2f%% / %.2f%% target%s\n"
+                           "Late >1 ms: %.2f%% | >2 ms: %.2f%% | Dropped (30s): %llu\n",
                            stats.vrrTelemetryActive ? "Active" : "Inactive",
                            readyOnTimePercent,
-                           static_cast<unsigned long long>(stats.vrrPacingDroppedFrames));
+                           stats.vrrOnTimeTargetPerMillion / 10000.0,
+                           stats.vrrBufferAtLimit ? " (buffer limit)" : "",
+                           readiness.over1ms * 100.0 / readiness.samples,
+                           readiness.over2ms * 100.0 / readiness.samples,
+                           static_cast<unsigned long long>(readiness.dropped));
         }
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);

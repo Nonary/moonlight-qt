@@ -41,6 +41,8 @@ private slots:
     void dxgiCapabilityAudit();
     void periodicInjectionSelector();
     void rationalDisplayTiming();
+    void busyWorkerReadinessFloor();
+    void decodeReadinessOrder();
 };
 
 void VrrReplayConfigTest::defaultsRoundTrip()
@@ -481,6 +483,7 @@ void VrrReplayConfigTest::nativeHitchPolicyRoundTrip()
 void VrrReplayConfigTest::predictionOnlyPolicyRoundTrip()
 {
     VrrTimingParameters defaults;
+    QCOMPARE(defaults.playoutResponsiveBuffer, uint64_t(0));
     QCOMPARE(defaults.playoutPredictionOnly, uint64_t(0));
     auto parameters = defaults;
     parameters.playoutPredictionOnly = 1;
@@ -506,6 +509,24 @@ void VrrReplayConfigTest::predictionOnlyPolicyRoundTrip()
     QCOMPARE(defaults.playoutPredictionOnly, uint64_t(1));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_native_hitch_adaptation", 1}}, defaults, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_readiness_driven_adaptation", 0}}, defaults, error));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 1}}, defaults, error));
+    QVERIFY2(applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 1},
+        {"playout_readiness_hitch_threshold_us", 0}, {"playout_delay_margin_us", 500}}, defaults, error), qPrintable(error));
+    auto responsive = VrrTimingParameters{};
+    QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(defaults), responsive, error), qPrintable(error));
+    QCOMPARE(responsive.playoutResponsiveBuffer, uint64_t(1));
+    QCOMPARE(responsive.playoutDelayMarginUs, uint64_t(500));
+    QVERIFY2(applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 2}}, responsive, error), qPrintable(error));
+    QCOMPARE(responsive.playoutResponsiveBuffer, uint64_t(2));
+    QVERIFY2(applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 3},
+        {"playout_on_time_target_per_million", 999500},
+        {"playout_readiness_window_us", 120000000}}, responsive, error), qPrintable(error));
+    QCOMPARE(responsive.playoutOnTimeTargetPerMillion, uint64_t(999500));
+    QCOMPARE(responsive.playoutReadinessWindowUs, uint64_t(120000000));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 4}}, responsive, error));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_on_time_target_per_million", 1000001}}, responsive, error));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_readiness_window_us", 120100000}}, responsive, error));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_readiness_window_us", 30000001}}, responsive, error));
 }
 
 void VrrReplayConfigTest::adaptiveOnlyPolicyRoundTrip()
@@ -1930,6 +1951,34 @@ void VrrReplayConfigTest::dxgiCapabilityAudit()
         false, 0, 0, 0, false,
         false, 0, false, 0x1001, false);
     QVERIFY(!audit.relationshipsValid);
+}
+
+void VrrReplayConfigTest::busyWorkerReadinessFloor()
+{
+    // Startup can teach a long idle decode wait. A faster frame arriving
+    // while the worker is occupied disproves that floor even before a new
+    // idle sample is available. The unchanged policy must remain exact.
+    QCOMPARE(vrrBusyWorkerDecisionUs(100, 120, 110, 10, 30), uint64_t(120));
+    QCOMPARE(vrrBusyWorkerDecisionUs(100, 120, 110, 10, 5), uint64_t(120));
+    // Candidates still propagate extra occupancy and may free the worker
+    // earlier, subject to the supported idle readiness floor.
+    QCOMPARE(vrrBusyWorkerDecisionUs(100, 120, 130, 10, 30), uint64_t(140));
+    QCOMPARE(vrrBusyWorkerDecisionUs(100, 120, 100, 10, 5), uint64_t(110));
+    QCOMPARE(vrrBusyWorkerDecisionUs(100, 120, 100, 1, 5), uint64_t(105));
+    QCOMPARE(vrrBusyWorkerDecisionUs(100, 120, UINT64_MAX - 1, 10, 5), UINT64_MAX);
+}
+
+void VrrReplayConfigTest::decodeReadinessOrder()
+{
+    QVERIFY(vrrDecodeReadinessOrderValid(1000, 1000, 1020, 1030, 1040, 0, true));
+    QVERIFY(vrrDecodeReadinessOrderValid(1000, 2200, 1020, 1030, 2210, 1100, true));
+    QVERIFY(vrrDecodeReadinessOrderValid(1000, 1000, 1020, 0, 0, 0, false));
+    QVERIFY(!vrrDecodeReadinessOrderValid(1030, 1030, 1020, 1040, 1050, 0, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(1000, 999, 1020, 1030, 1040, 0, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(1000, 2200, 1020, 1030, 2100, 1100, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(1000, 2200, 1020, 1030, 2210, 0, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(1000, 2200, 1020, 1030, 2210, 1300, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(1000, 2200, 1020, 0, 0, 1100, false));
 }
 
 QTEST_APPLESS_MAIN(VrrReplayConfigTest)

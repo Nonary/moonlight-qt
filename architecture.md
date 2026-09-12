@@ -5,14 +5,19 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Source baseline: `e7b05319` plus the local client-processing,
+Source baseline: `6f8e5e79` plus the local client-processing,
 vrr14-style compact stats reporting, restored Reduce judder, reconnect
 trace preservation, motion cadence telemetry, hard buffer ceiling, AMD low-latency decode request, observed-latency trace diagnostics, and removal of the latency oscillation test,
-inspected 2026-09-11. The latency
+inspected 2026-09-11; now includes responsive readiness revision 3, desktop-rate isolation,
+and fence-value-verified Windows readiness waits. The latency
 presets and persistent Vulkan presentation changes remain active.
-Windows and Linux now use the same prediction-based buffer policy for growth
-and release, targeting a 3 ms readiness margin within the shared three-frame
-queue and 0.5/1/2-source-frame preset caps. Linux's event-gated history-version-19
+Windows and Linux now use the same responsive prediction-based buffer policy:
+99% / 99.5% / 99.95% readiness targets over 30 / 60 / 120 seconds for
+Lowest latency / Balanced / Smoothest, a two-second miss boost, and a 500 us readiness margin
+within the shared three-frame queue and 0.5/1/2-configured-frame preset caps.
+The minimum remains 1 ms (subject to capacity). Five-minute version-20 raw
+readiness calibration is diagnostic only and cannot inflate the live request.
+Linux's event-gated history-version-19
 policy is retired from live selection; explicit historical parameters remain
 supported for exact replay. Linux calibration keys are segregated from that
 retired policy. Native synchronization and presentation remain backend-specific.
@@ -48,6 +53,119 @@ Trace columns `session_latency_oscillation` and `latency_test_phase` remain zero
 for schema compatibility. The report tool retains historical phase parsing so
 existing captures remain readable; historical oscillation reports are not exact
 fixed-policy A/B evidence. Calibration follows the selected preset normally.
+
+### Windows buffer regression investigation (2026-09-11)
+
+The user-confirmed 4K/116 FPS Balanced session at 18:52:58 recorded 39 GPU-ready
+event timeouts, followed by decoder recreation, approximately every ten seconds.
+The newest completed connection is `Moonlight-vrr-20260911-185258-376.vrrtrace`
+(259,093 bytes, SHA-256
+`CA2D3824F96865F8F30BC7EACCE70BE70DA7ABBF636333875EEB28D4EF2C51B5`).
+Its 858 arrivals pass exact replay before and after this correction. Its final
+8.24 seconds contain no source intervals above 25 ms, but 11% of presented
+interval pairs have jerk above 2 ms. Earlier connection fragments from this
+same application run supply the timeout evidence; they are not mixed into the
+newest connection's baseline metrics.
+
+Two reproducible controller defects are corrected in responsive revision 2:
+compensating source jitter no longer permanently disables smoothing, and early
+readiness slack pays for an advanced deadline before acquiring extra reserve.
+All three preset fixtures reduce average jerk from 8 ms to about 2.95 ms for
+9/17 ms source pairs. Clean desktop transition bounds and recovery still pass.
+The original final 8.24-second segment's candidate replay is unchanged because these defects
+are not triggered there; it must not be cited as a measured gameplay improvement.
+
+Windows now validates fence values between short event waits rather than
+depending on one event notification for readiness. Deterministic missing-event,
+stale-event, timeout and device-removal tests pass. A local GPU-copy probe passed
+1,000 asynchronous fence completions, including 500 suppressed event waits.
+The original single-event wait did not reproduce the periodic failure in that
+standalone probe. A subsequent 64.94-second gameplay check
+(`Moonlight-vrr-20260911-192230-869.vrrtrace`, SHA-256
+`47D95A875F91A7023C0EAC938B3483E74D6DC724B3CBE049CA9CEB24A3C5325F`)
+recorded no GPU-fence timeouts or decoder recreation; the user reported noticeably
+better motion. Readiness was still 83.9%, with mean preparation 5.96 ms, including
+5.48 ms in the render-ready wait. It lost arrival row 2 at startup (footer:
+6,975 allocated, 6,974 recorded, one dropped); exact replay correctly fails on
+frame 35. Do not treat this incomplete capture as strict A/B proof.
+
+The follow-up Windows change implements the existing pre-schedule decode wait
+using the frame's captured D2R fence. Previously Windows inherited the no-op
+implementation, so asynchronous decode waiting was mixed into rendering service
+and its predictor. The same bounded, fence-verified wait is used, without holding
+the decode context lock. Monitored fences use the shared worker event as a wake
+hint; non-monitored fences use short sleeps and completion polls. Failed waits
+invalidate adaptive preparation and request recovery without advertising readiness.
+The interface overload retains existing frame-based Linux readiness behavior.
+New per-frame capture data must establish how much of the former render wait was
+decode work; moving the boundary alone is not proof of lower total latency.
+The follow-up app and diagnostics were rebuilt, all six deterministic suites
+passed, fresh single-frame and warm-history fixtures passed exact replay, and
+five fault scenarios passed their interval and latency assertions. The original
+complete capture also retained exact historical replay. ChaseShare and its ZIP
+were updated and hash-verified; the installed follow-up executable SHA-256 is
+`0A52F9DAA1A2D4E77F125EABB86FFDAB4BF93D8F9AB816F38E5D180A36BF83DA`.
+The deployed UNC replay executable passed its runtime help smoke test.
+
+The subsequent 117.71-second capture,
+`Moonlight-vrr-20260911-193700-084.vrrtrace` (3,740,216 bytes, last write
+2026-09-12 00:39:09 UTC, SHA-256
+`2AAF8DC583805162CC7A4D17E0958D40151CDE39BF80A4C78E66F5256919DB24`),
+contains all 12,824 arrivals and 12,816 presentations. It records no fence
+timeouts; the user confirmed the spikes were gone and motion was much smoother.
+Mean GPU decode wait is 5.47 ms; preparation is 1.34 ms (0.91 ms render-fence
+wait). Full decoder-output-to-submission latency is 12.67 ms mean / 16.91 ms p99.
+Presented jerk is 6.045 ms p99, with 11.9% of pairs over 2 ms; sender-spacing
+error is 4.402 ms p99. Three raw sender intervals exceed 25 ms. These remain
+separate from client readiness and do not establish optical display smoothness.
+
+The user identified the fluctuating overlay score as `Client ready on time`.
+Its global value is 74.9%; the overlay combines the current and preceding
+one-second windows and treats any preparation completion after the target as
+late. Among 3,215 late presentations the median miss is 64 us, p95 663 us,
+and p99 1,226 us. The buffer is held at its Balanced 8,621 us cap; this score's
+variation is not evidence of oscillating buffer depth. Its strict deadline
+definition is retained, and it must not be called a visual smoothness score.
+
+This capture exposed two replay bugs: a startup idle estimate shifted one busy
+frame despite unchanged submissions, and the timestamp audit confused GPU
+readiness with immutable CPU output. The corrected replay caps the idle floor
+by the row's own evidence, validates both timing boundaries and the explicit
+decode wait, and measures latency from immutable output. All targets,
+submissions, tear/raster classes, refresh phases and required controller fields
+now reproduce exactly, with zero missing arrivals and exit code zero. The
+original launcher sidecar retains the pre-correction failure; the fresh exact
+result is `build/buffer-readiness-complete-baseline.json`.
+Its verified share copy is `Moonlight-vrr-20260911-193700-084-replay-verified.json`.
+Final replay SHA-256 is
+`DCA1A60C6E88D31EE53AC8A3DAC79A483F437DDE6C2228267C98F214A184058F`;
+the diagnostic executable and refreshed ZIP were republished and hash-verified.
+Final session-policy comparison is identical to the capture; the five stress
+scenarios pass with zero modeled interval violations and 16.91--18.41 ms p99
+decoder-output-to-submission latency. No scenario is worker-saturated.
+
+### Preset on-time targets (2026-09-11)
+
+Responsive revision 3 selects 99% / 99.5% / 99.95% readiness targets and
+30 / 60 / 120-second learning windows for Lowest latency / Balanced / Smoothest.
+The displayed outcome window is 30 seconds for every preset; client drops count
+as misses and the overlay exposes lateness over 1 ms and 2 ms and a capacity
+indicator. Existing preset caps and the 16 ms absolute ceiling still apply.
+
+The latest completed capture selected before this change was
+`C:\Users\Chase\vrr-traces\Moonlight-vrr-20260911-200538-640.vrrtrace`,
+17,791,245 bytes, last write 2026-09-12 01:14:58.1621328 UTC, SHA-256
+`331B3CB49E414FDA9C4F952F07ACA76C0B7ABC1CE9CCA4BE9CAC591D3B9885A6`.
+Its clean footer reports two missing rows out of 57,497 allocated. The unchanged
+replay exits 3 on frame 16,169; this capture is not strict before/after evidence.
+All eight deterministic suites pass with the final diagnostic build, both fresh
+schema-5 fixtures pass exact replay with complete sequences, and all five fault
+scenarios pass interval and latency assertions. Gameplay validation is pending.
+The iterative application build, complete ChaseShare tree and ZIP are published
+and hash-verified. Application SHA-256:
+`C8BEF3C3B889DA16CBA28AA7714804150FE617E788465D016C583708603D8DE7`.
+The deployed UNC replay help check passes; both diagnostic launchers describe
+revision 3 and retain their existing local capture and upload behavior.
 
 ### Historical per-frame Gamescope repaint experiment (retired 2026-09-10)
 
@@ -110,9 +228,9 @@ reconnect after changing it. Fixed-refresh pacing is independent of this setting
 
 | Timing choice | Adaptive playout-buffer cap | Stale-work allowance with a successor |
 | --- | --- | --- |
-| Lowest latency (2) | Half a fitted source period | Two fitted source periods |
-| Balanced (1, default) | One fitted source period | Two fitted source periods |
-| Smoothest (0) | Two fitted source periods | Two fitted source periods |
+| Lowest latency (2) | Half a configured stream period | Two fitted source periods |
+| Balanced (1, default) | One configured stream period | Two fitted source periods |
+| Smoothest (0) | Two configured stream periods | Two fitted source periods |
 
 Every preset is additionally capped at 16 ms. Production sets
 `playout_delay_maximum_period_per_mille=0`: a slow desktop source must not
@@ -128,6 +246,9 @@ that variation. It does not regularize game-driven frame intervals. Stable
 delivery may look the same across choices, and no universal percentage of lost
 smoothness follows from the selected allowance.
 
+With `playout_responsive_buffer` enabled, preset caps use the configured stream rate,
+so a desktop transition from 120 to 19 or 30 FPS cannot expand the allowance.
+The zero default retains fitted-period caps for historical replay.
 `VrrSessionConfig::latencyMode` resolves the buffer cap into the trace/replay
 parameter `playout_delay_cap_source_period_per_mille`: 500 for Lowest latency,
 1000 for Balanced, and 2000 for Smoothest. A zero schema default means an older
@@ -633,7 +754,7 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | Maximum-period ratio | 0; source-rate reduction cannot expand the absolute ceiling |
 | Delay attack | At most 500 us per update |
 | Delay release input | 10 us, scaled by elapsed time at a 120 FPS reference rate |
-| Prediction margin | Both platforms: 3,000 us above estimated readiness demand, inside preset caps |
+| Prediction margin | Both platforms: 500 us above recent readiness demand, inside preset caps |
 | Smoothing gain | 500 when Reduce judder is checked; 0 when unchecked |
 | Smoothing period EMA | 100 per mille; active only with smoothing enabled |
 | Positive smoothing lag cap | 2,000 us; active only with smoothing enabled |
@@ -803,9 +924,9 @@ Preparing immediately at arrival remains an experiment, not production default.
 
 `schedule()` retains a pending probe: decoded time, intended source slot,
 period, typical render cost, applied delay, guard, and decoder backlog.
-The readiness-driven policy uses the scheduled source slot with playout padding
-removed. With Reduce judder enabled, the smoothed slot remains the
-readiness reference; otherwise the raw mapped source slot is used.
+Responsive production uses the raw mapped RTP slot for FIFO prediction and
+accounts for any smoothing advance separately in the recent estimator. The
+historical readiness-driven policy uses the smoothed slot with padding removed.
 Preparation and scheduler measurements are recorded for future decisions.
 On successful non-cancelled submission, `ReadinessPrediction` models expected
 and actual FIFO service using those measurements, excluding intentional pacing
@@ -820,6 +941,11 @@ model can distinguish a recoverable burst from a pipeline that cannot sustain
 the stream.
 
 ### 9.2 Reserve history and smoothness feedback
+
+The version-18/19 descriptions below are historical. Current production uses
+version 20 for five-minute raw FIFO-readiness diagnostics and a separate
+`RecentReadiness` estimator for live control (section 9.3). Cached diagnostics
+are not a live growth or release gate. Native feedback remains diagnostic.
 
 Linux uses `ReadinessFeedback` and `Reserve(19)`. For consecutive eligible
 submissions it compares actual spacing with intended target spacing, then
@@ -901,7 +1027,43 @@ legacy/replay behavior. In that branch 1000 per mille means p100, 999 means
 p99.9, and 995 means p99.5. Those values must not be confused with the active
 Reserve p99.95 implementation.
 
-Production sets `playout_prediction_only=1` and updates padding as follows:
+Production sets `playout_prediction_only=1` and `playout_responsive_buffer=3`.
+The live estimator keeps 100 ms buckets over the selected preset's learning
+window, including successes. Lowest latency uses 99% over 30 seconds, Balanced
+99.5% over 60 seconds, and Smoothest 99.95% over 120 seconds. These are
+best-effort targets within the existing latency caps. Historical revisions 1
+and 2 retain their three-second p99 estimator for exact replay.
+Raw readiness is measured against RTP
+source slots in the FIFO model; an earlier smoothed deadline is a separate
+cost applied before clamping away early-readiness slack. Revision 1 incorrectly
+discarded that slack first, charging reserve even when an advanced deadline was
+already covered. Large source changes disable smoothing until 200 ms of eligible
+cadence falls within 25% of the fitted period. Revision 2 evaluates compensating
+short/long outliers together, so alternating 9/17 ms intervals at a stable 77 FPS
+do not keep Reduce judder disabled. A sustained same-direction change still
+uses individual intervals and resets confidence. This confidence uses source
+time, not a fixed frame count. Actual RTP
+spacing remains eligible for delivery learning while the rate fit catches up.
+
+A readiness shortfall of at least 1 ms renews a two-second burst boost. Only
+fresh misses renew it; old histogram or cache tails cannot. The target adds
+500 us to the larger of the selected recent percentile and that boost, bounded by the existing
+minimum, configured-rate preset maximum, 16 ms ceiling, and queue capacity.
+Growth is at most 500 us per update. Release requires 32 recent observations,
+two seconds of live history, no miss for two seconds, and a sample within
+250 ms. It approaches the recent target at approximately 1.2 ms/second, up to
+twice that with spare display and processing capacity, at most 250 us per
+frame. Thus the falling recent target probes downward without waiting for
+five-minute diagnostic tails. Silence/overload is not clean release evidence.
+Requested demand remains visible above the cap for capacity diagnostics, but
+is recomputed every frame rather than stored as debt. No new queue is added.
+Revision 3 retires live learning history on a confirmed material source-rate
+change while preserving the applied buffer for gradual recovery. Host stalls
+above max(25 ms, 1.5 source periods) and catch-up intervals below half a source
+period do not train the estimator; their playback outcomes still affect the
+displayed readiness result. The diagnostic five-minute calibration is unchanged.
+
+Historical prediction-only mode (`playout_responsive_buffer=0`) behaves as follows:
 
 - Required protection is readiness p99.95 plus any recent readiness-miss boost,
   then 3,000 us of headroom. The model includes delivery variation, FIFO render
@@ -932,9 +1094,9 @@ capacity        = 3 * period
 occupied        = renderLead + presentationSafety
                 + (smoothingEnabled ? maximumSmoothingLag : 0)
 queueDelayLimit = max(0, capacity - occupied)
-modeAllowance   = Smoothest: fittedSourcePeriod * 2000 / 1000
-                | Balanced: fittedSourcePeriod * 1000 / 1000
-                | Lowest latency: fittedSourcePeriod * 500 / 1000
+modeAllowance   = Smoothest: negotiatedStreamPeriod * 2000 / 1000
+                | Balanced: negotiatedStreamPeriod * 1000 / 1000
+                | Lowest latency: negotiatedStreamPeriod * 500 / 1000
 maximumInput    = 16000 us
 effectiveMin    = min(1000 us, queueDelayLimit, modeAllowance)
 effectiveMax    = min(maximumInput, queueDelayLimit, modeAllowance)
@@ -962,7 +1124,10 @@ latency add distinct timing-mode suffixes. Enabled smoothing also appends
 Profiles expire after 14 days; saves require at least
 240 observations, use locking/atomic replacement, and cap storage at 16 profiles.
 
-Prediction-only production accepts version-18 readiness histograms; versions
+Responsive production accepts version-20 raw readiness histograms for diagnostics
+only. Startup uses the existing bounded cold-start seed; cached tails cannot
+raise or hold the live request. The separate recent estimator starts empty.
+Historical prediction-only mode accepts version-18 readiness histograms; versions
 from native-hitch and earlier policies are rejected. Its requested protection
 uses the readiness distribution and recent boost, not a display-validated
 "proven buffer". Reserve ages the prior and replaces its mass
@@ -993,13 +1158,27 @@ decode-to-render fence when a decoder output is handed off. Rendering waits for
 that exact value, so it need not wait for newer decode work. Render-to-decode
 ordering protects texture reuse. The purpose is both correctness and avoiding
 accidental waits for work belonging to subsequent frames.
+Windows also waits for that captured decode boundary before controller scheduling.
+A material wait advances scheduling readiness while preserving immutable decoder
+output time, and enters the existing explicit decode-wait telemetry. This keeps
+decoder synchronization out of the measured rendering service used by prediction.
+The original GPU-side render dependency and final render-ready fence remain.
 
 Preparation binds/clears the backbuffer, renders video and overlays, and sets
 colorspace/HDR state. It uses the D3D/FFmpeg context lock while manipulating
 shared state. Present-ready fence handling signals, flushes, polls completion,
 and waits on an event, releasing the lock where needed so decoding can proceed.
-The event wait has a 50 ms bound; only actual completion is accepted as readiness.
-Failure disables the adaptive path and requests device recovery.
+The complete fence wait has a 50 ms bound. It blocks on the event in 1 ms slices
+and checks the fence value between waits; the value, rather than notification
+delivery alone, proves readiness. A stale notification cannot release incomplete
+work, and a delayed notification cannot hold already-completed work for 50 ms.
+The device-removed sentinel is rejected. A true fence timeout or wait failure
+still disables the adaptive path and requests recovery; its log includes the
+target, final completed value, last event result and device status.
+`gpu_ready_wait_result` records the aggregate fence-wait status in Win32 wait
+codes; individual slice timeouts are not whole-fence failures. The initial poll
+and final readiness timestamp retain conservative completion bounds. Historical
+captures retain their original single-event-wait observations unchanged.
 
 Fence completion proves source texture reads have finished, allowing the
 presenter to report `sourceFrameReusable` before the target wait. CPU poll/event
@@ -1344,13 +1523,19 @@ it cannot isolate the game engine or detect repeated image content from timing
 alone. It is independent of the native-confirmed client hitch metric and does
 not change buffer adaptation.
 
-The stats overlay and session summary restore the compact vrr14 format:
-`VRR pacing: Active | Client ready on time: ... | Dropped: ...`.
-Client readiness is the percentage of eligible frames without a preparation
-deadline miss (late counts clamped to eligible frames). It is a readiness
+The stats overlay and session summary show client readiness over a rolling
+30-second outcome window, alongside the selected target and a buffer-limit
+indicator. Revision 3 measures preparation completion against the intended
+smooth deadline before late-readiness and display-floor recovery clamps.
+Client playback drops count as misses; deliberate shutdown, suspension, and
+interruption discards are excluded. A second row reports the percentages late
+by more than 1 ms and 2 ms and the 30-second drop count. Drops have no invented
+lateness magnitude. Window snapshots are selected by timestamp, never summed
+across overlay refreshes. The window uses 100 ms buckets and starts with the
+available outcomes before 30 seconds have elapsed. This remains a readiness
 measurement, not a visible-smoothness score. With no eligible frames, the line
-shows the starting state. The extra client-processing, estimated client pacing,
-motion cadence, queue residence, GPU wait, buffer, and hitch rows are omitted.
+shows the starting state. Motion cadence, queue residence and GPU waits remain
+internal diagnostics.
 
 Submission cadence, motion jerk, queue residence, decode waits, and buffer
 counters remain collected internally. Submission cadence counts eligible
@@ -1509,10 +1694,22 @@ than remaining at the cap; Windows-level visual parity remains unverified.
 
 The historical 2026-09-10 Linux readiness-hitch sections above describe the retired policy.
 Production session setup leaves `readinessHitchFeedback=false` on both platforms,
-selecting history version 18 and the same prediction-plus-margin adaptation.
+selecting responsive adaptation with version-20 diagnostic history. The earlier
+shared version-18 prediction-plus-margin law remains replayable.
 Current-policy replay also selects this shared policy regardless of captured
 backend; exact replay and explicit scenario parameters preserve version 19.
 The changed queue statistic subtracts the explicit worker decode wait after
 bounding it to non-render client time, preventing unsigned underflow. Native
 render preparation costs keep their existing classification. This is an accounting
 correction, not evidence that the GPU became faster.
+
+Responsive-policy validation (2026-09-11): all four required deterministic
+suites and profile tests pass. Eighteen 56-second controller fixtures cover
+all presets, smoothing on/off, delivery/render/scheduler faults, and repeated
+120/19/30 FPS transitions: clean padding stays at 1 ms and recovers near 1 ms
+within eight seconds of the injected faults ending. A synthetic worker capture
+passes exact replay and the five-scenario responsive-buffer stress config.
+The latest completed live capture (20260911-181549-892) fails original-deadline
+replay at frame 8355 in both the old and new binary, exit 3; no live A/B or
+physical smoothness improvement is established. Existing history_* trace fields
+refer to five-minute diagnostics, not the new live release gate.

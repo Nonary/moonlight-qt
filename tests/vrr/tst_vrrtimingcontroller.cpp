@@ -37,6 +37,7 @@ VrrSessionConfig config(int streamRateHz = 60, int displayRefreshHz = 120)
 VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
 {
     auto policy = vrrTimingParametersForSession(session);
+    policy.playoutResponsiveBuffer = 0;
     policy.playoutDelayCapSourcePeriodPerMille = 0;
     policy.playoutPredictionOnly = 0;
     policy.playoutSubmissionEstimateFallback = 0;
@@ -63,6 +64,7 @@ VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
 VrrTimingParameters legacyFeedbackParameters(const VrrSessionConfig& session)
 {
     auto policy = vrrTimingParametersForSession(session);
+    policy.playoutResponsiveBuffer = 0;
     policy.playoutDelayCapSourcePeriodPerMille = 0;
     policy.playoutDelayMaximumPeriodPerMille = 0;
     policy.playoutPredictionOnly = 0;
@@ -3467,7 +3469,10 @@ void testReadinessHitchBufferAdaptation()
 void testPredictionOnlyBufferAdaptation()
 {
     const auto session = config(60, 120);
-    const auto policy = vrrTimingParametersForSession(session);
+    // Preserve the previous five-minute/3 ms law for historical replay.
+    auto policy = vrrTimingParametersForSession(session);
+    policy.playoutResponsiveBuffer = 0;
+    policy.playoutDelayMarginUs = 3000;
     expect(policy.playoutPredictionOnly == 1 && policy.playoutNativeHitchAdaptation == 0 &&
                policy.playoutReadinessDrivenAdaptation == 1 && policy.playoutDelayMarginUs == 3000,
            "production must adapt from readiness prediction with 3 ms headroom");
@@ -4064,8 +4069,183 @@ void testLatencyPresetsBoundHitchesThroughCadenceChanges()
     }
 }
 
+void testResponsiveSmoothingWithWideJitter()
+{
+    for (int mode : {0, 1, 2}) {
+        uint64_t jerk[2] = {};
+        for (int smooth : {0, 1}) {
+            auto session = config(120, 120);
+            session.latencyMode = mode;
+            session.smoothFrameTiming = smooth;
+            VrrTimingController controller(session, true, vrrTimingParametersForSession(session));
+            uint32_t ticks = 0;
+            uint64_t last = 0, previousInterval = 0;
+            unsigned active = 0;
+            for (int i = 0; i < 2400; ++i) {
+                // 9/17 ms pairs have a steady 77 FPS mean. Neither interval
+                // is a source stall; both exceed the old single-frame gate.
+                ticks += i % 2 ? 1530 : 810;
+                const auto decoded = decodedTimeForRtp(1000000, ticks);
+                const auto now = std::max(last, decoded);
+                const auto d = controller.schedule(frame(i, ticks, true, decoded), now);
+                const auto submitted = std::max(d.targetUs,
+                    std::max(now, d.renderStartUs) + 1000);
+                controller.notePreparationDuration(1000);
+                controller.noteSchedulerDelays(0, 0, true);
+                controller.noteSubmission(true, false, submitted);
+                const auto interval = submitted - last;
+                if (i > 600) {
+                    active += d.cadenceSmoothingUs != 0;
+                    jerk[smooth] += interval > previousInterval ?
+                        interval - previousInterval : previousInterval - interval;
+                }
+                expect(submitted - decoded <= 22000,
+                       "wide source jitter must retain bounded client latency");
+                last = submitted;
+                previousInterval = interval;
+            }
+            expect(!smooth || active > 1700,
+                   "Reduce judder must stay active on alternating source jitter above 25 percent");
+        }
+        std::printf("wide jitter mode=%d jerk=%llu -> %llu us\n", mode,
+            (unsigned long long)(jerk[0] / 1799), (unsigned long long)(jerk[1] / 1799));
+        expect(jerk[1] * 2 < jerk[0], "Reduce judder must halve wide alternating jitter");
+    }
+}
+
+void testResponsiveReadinessKeepsEarlySlack()
+{
+    for (bool corrected : {false, true}) {
+        Vrr13::ReadinessPrediction prediction;
+        Vrr13::Reserve history(20);
+        Vrr13::RecentReadiness recent;
+        Vrr13::ReadinessPrediction::Probe p{1000000, 1005000, 16667, 1000,
+            1000, 0, 500, 0, true, 3000, corrected};
+        prediction.observe(history, p, 1000, 0, &recent);
+        expect(recent.demand(1000000) == (corrected ? 0 : 3000),
+               "early-ready slack must pay for smoothing before demanding more buffer; revision 1 must replay unchanged");
+        p.decoded += 20000;
+        p.expected = p.decoded + 1000;
+        prediction.observe(history, p, 1000, 0, &recent);
+        expect(recent.demand(p.decoded) == (corrected ? 2000 : 3000),
+               "only the uncovered part of an advanced deadline must become reserve demand");
+    }
+}
+
+void testResponsiveBufferRecoveryAndDesktopCadence()
+{
+    // Start from a deliberately expensive saved prior: it must not own the
+    // live request. Test the real scheduler/work loop, not only its estimator.
+    for (int mode : {0, 1, 2}) for (bool smooth : {false, true}) for (int faultKind : {0, 1, 2}) {
+        auto session = config(120, 120);
+        session.latencyMode = mode;
+        session.smoothFrameTiming = smooth;
+        auto policy = vrrTimingParametersForSession(session);
+        // Preserve the revision-2 three-second recovery contract. Revision 3
+        // has explicit, longer retention tested separately below.
+        policy.playoutResponsiveBuffer = 2;
+        expect(policy.playoutResponsiveBuffer == 2 && policy.playoutDelayMarginUs == 500,
+               "live policy must select recent readiness rather than the five-minute tail");
+        VrrTimingController controller(session, true, policy);
+        Vrr13::Reserve cache(20);
+        for (int i = 0; i < 300; ++i) cache.observe(90000000, 16000000);
+        expect(controller.loadPlayoutHistory(cache.profile()), "matching diagnostic prior must load");
+        uint64_t ticks = 0, last = 0, previousDelay = 0, clean = 0, peak = 0, finalDelay = 0;
+        uint64_t transitionPeak = 0, recoveryAt = 0, maximumLatency = 0;
+        unsigned number = 0;
+        const uint64_t cap = std::min<uint64_t>(16000,
+            (1000000 / 120) * (mode == 0 ? 2000 : mode == 1 ? 1000 : 500) / 1000);
+        // 12 s clean startup; repeated large desktop transitions, jitter during
+        // one transition cycle, then 16 s to prove bounded recovery.
+        for (int second = 0; second < 56; ++second) {
+            const int fps = second < 12 || second >= 40 ? 120 :
+                (second / 2) % 4 == 0 ? 19 : (second / 2) % 4 == 1 ? 120 :
+                (second / 2) % 4 == 2 ? 30 : 19;
+            for (int n = 0; n < fps; ++n, ++number) {
+                ticks += uint64_t((n + 1) * 90000 / fps - n * 90000 / fps);
+                const auto source = decodedTimeForRtp(1000000, uint32_t(ticks));
+                const bool fault = second >= 28 && second < 36 && n % 5 == 0;
+                const auto decoded = source + (fault && faultKind == 0 ? 6000 : 0);
+                const auto now = std::max(decoded, last);
+                const auto d = controller.schedule(frame(number, uint32_t(ticks), true, decoded), now);
+                const uint64_t work = fault && faultKind == 1 ? 7000 : 1000;
+                const uint64_t scheduler = fault && faultKind == 2 ? 6000 : 0;
+                const auto ready = std::max(now, d.renderStartUs) + work + scheduler;
+                last = std::max(ready, d.targetUs);
+                controller.notePreparationDuration(work);
+                controller.noteSchedulerDelays(scheduler, 0, true);
+                controller.noteSubmission(true, false, last);
+                expect(d.playoutDelayUs <= cap, "desktop FPS must not expand the configured-rate cap");
+                expect(!number || d.playoutDelayUs <= previousDelay + 500,
+                       "buffer attack must remain bounded through rate changes");
+                maximumLatency = std::max(maximumLatency, last - decoded);
+                if (second == 11) clean = d.playoutDelayUs;
+                if (second >= 12 && second < 28) transitionPeak = std::max(transitionPeak, d.playoutDelayUs);
+                if (second >= 28 && second < 40) peak = std::max(peak, d.playoutDelayUs);
+                if (second >= 36 && !recoveryAt && d.playoutDelayUs <= 1250) recoveryAt = source;
+                previousDelay = finalDelay = d.playoutDelayUs;
+            }
+        }
+        std::printf("responsive mode=%d smoothing=%d fault=%d clean=%llu transition=%llu peak=%llu final=%llu recovery=%llu latency=%llu us\n",
+            mode, smooth, faultKind, (unsigned long long)clean, (unsigned long long)transitionPeak,
+            (unsigned long long)peak, (unsigned long long)finalDelay,
+            (unsigned long long)recoveryAt, (unsigned long long)maximumLatency);
+        expect(clean <= 1250 && transitionPeak <= 1500,
+               "clean 120/19/30 FPS desktop changes and cached tails must not inflate buffering");
+        expect(peak >= std::min<uint64_t>(cap, 5000),
+               "real delivery jitter during desktop transitions must still earn protection");
+        expect(finalDelay <= 1250 && recoveryAt && recoveryAt < 53000000,
+               "a recovered burst must drain within 16 seconds, not five minutes");
+        expect(maximumLatency <= 22000, "desktop transitions must retain a bounded client residence");
+    }
+
+    // Expiring burst protection, successful observations, and silence behavior.
+    Vrr13::RecentReadiness recent;
+    for (uint64_t at = 1000000; at < 5000000; at += 10000)
+        recent.observe(0, 0, 1000, at);
+    recent.observe(9000, 0, 1000, 5000000);
+    expect(recent.demand(5010000) >= 9000 && !recent.canRelease(5010000),
+           "a meaningful isolated miss must acquire temporary protection");
+    for (uint64_t at = 5010000; at <= 9000000; at += 10000)
+        recent.observe(0, 0, 9000, at);
+    expect(recent.demand(9000000) == 0 && recent.canRelease(9000000),
+           "old bursts must expire while clean evidence permits downward probing");
+    expect(!recent.canRelease(10000000), "silence is not clean readiness evidence");
+}
+
+void testPresetReadinessTargets()
+{
+    for (int mode : {0, 1, 2}) {
+        auto session = config(120, 116);
+        session.latencyMode = mode;
+        const auto policy = vrrTimingParametersForSession(session);
+        const uint64_t target = mode == 2 ? 990000 : mode == 1 ? 995000 : 999500;
+        const uint64_t window = mode == 2 ? 30000000 : mode == 1 ? 60000000 : 120000000;
+        expect(policy.playoutResponsiveBuffer == 3 &&
+                   policy.playoutOnTimeTargetPerMillion == target &&
+                   policy.playoutReadinessWindowUs == window,
+               "presets must resolve their exact reliability target and bounded history");
+        Vrr13::RecentReadiness recent(window, target);
+        for (uint64_t n = 0; n < 20000; ++n) {
+            const uint64_t required = n < 19800 ? 1000 : n < 19900 ? 3000 : n < 19990 ? 6000 : 9000;
+            recent.observe(required, 0, 100000, 1000000 + n * 1000);
+        }
+        const uint64_t expected = mode == 2 ? 1000 : mode == 1 ? 3000 : 6000;
+        expect(recent.demand(21000000) == expected,
+               "nearest-rank percentiles must distinguish 99, 99.5, and 99.95 without rounding to 100");
+        expect(recent.demand(21000000 + window) == 0,
+               "samples older than each preset's history must expire completely");
+        expect(!recent.canRelease(21000000 + window),
+               "empty history after silence must not authorize release");
+    }
+}
+
 int main()
 {
+    testPresetReadinessTargets();
+    testResponsiveSmoothingWithWideJitter();
+    testResponsiveReadinessKeepsEarlySlack();
+    testResponsiveBufferRecoveryAndDesktopCadence();
     testLatencyFixModeSelection();
     testLatencyFixFittedRateHysteresis();
     testLatencyFixNativeHitchesStayBounded();

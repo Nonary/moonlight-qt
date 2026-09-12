@@ -4,6 +4,18 @@
 
 #include <cstdint>
 
+// Reconstruct a busy worker's next decision without allowing an older idle
+// estimate to overrule this row's observed, faster readiness.
+uint64_t vrrBusyWorkerDecisionUs(uint64_t arrivalUs, uint64_t recordedDecisionUs,
+                                uint64_t simulatedPreviousSubmissionUs,
+                                uint64_t postSubmissionGapUs,
+                                uint64_t learnedIdleLatencyUs);
+
+bool vrrDecodeReadinessOrderValid(uint64_t decoderOutputUs, uint64_t readyUs,
+                                  uint64_t arrivalUs, uint64_t dequeueUs,
+                                  uint64_t decisionUs, uint64_t decodeWaitUs,
+                                  bool decisionValid);
+
 enum class VrrRasterPhaseState {
     Unclassified,
     Active,

@@ -3,6 +3,7 @@
 #include <Limelight.h>
 #include "SDL_compat.h"
 #include "settings/streamingpreferences.h"
+#include "ffmpeg-renderers/pacer/vrr/readinesswindow.h"
 
 #define SDL_CODE_FRAME_READY 0
 
@@ -25,6 +26,9 @@ typedef struct _VIDEO_STATS {
     uint64_t vrrPacingDroppedFrames;
     uint64_t vrrEligibleFrames;
     uint64_t vrrPrepareLateFrames;
+    Vrr13::ReadinessWindow::Snapshot vrrReadiness;
+    uint64_t vrrOnTimeTargetPerMillion;
+    bool vrrBufferAtLimit;
     uint64_t vrrQueueResidenceUs;
     uint64_t vrrDecodeWaitUs;
     uint64_t vrrBufferUs;

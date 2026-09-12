@@ -33,6 +33,7 @@ public:
     virtual bool canLatchAdaptivePresent() const override { return true; }
     virtual VrrFallbackReason checkSupport() const override;
     virtual uint64_t captureDecodeBoundary() override;
+    uint64_t waitForDecode(AVFrame* frame, uint64_t decodeBoundary) override;
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
                                           uint64_t decodeBoundary) override;
     virtual VrrPresentFeedback presentAdaptive(

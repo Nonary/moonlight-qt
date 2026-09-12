@@ -2,6 +2,7 @@
 #include <initguid.h>
 
 #include "d3d11va.h"
+#include "d3d11fencewait.h"
 #include "dxutil.h"
 #include "path.h"
 #include "utils.h"
@@ -1197,6 +1198,55 @@ uint64_t D3D11VARenderer::captureDecodeBoundary()
     return fenceValue;
 }
 
+uint64_t D3D11VARenderer::waitForDecode(AVFrame*, uint64_t decodeBoundary)
+{
+    if (decodeBoundary == 0 || m_DecodeD2RFence == nullptr ||
+            m_VrrPresentReadyFenceEvent == nullptr || !m_VrrPresentReadyAvailable) {
+        return 0;
+    }
+
+    const auto startUs = LiGetMicroseconds();
+    const auto completed = m_DecodeD2RFence->GetCompletedValue();
+    if (completed != (std::numeric_limits<UINT64>::max)() && completed >= decodeBoundary)
+        return 0;
+
+    // The decoder context already signalled this value at frame admission.
+    // No context lock or new signal is needed here. Waiting on the captured
+    // fence before scheduling prevents asynchronous decode from inflating
+    // both the render lead and the FIFO rendering-cost predictor.
+    const bool useEvent = m_FenceType == SupportedFenceType::Monitored;
+    HRESULT eventResult = S_OK;
+    if (useEvent) {
+        // Decode and render waits are sequential on this worker. The shared
+        // auto-reset event is only a wake hint; either fence's delayed event
+        // may wake us, but only the requested fence value can finish the wait.
+        eventResult = m_DecodeD2RFence->SetEventOnCompletion(
+            decodeBoundary, m_VrrPresentReadyFenceEvent);
+    }
+    const auto result = D3D11FenceWait::wait(decodeBoundary, LiGetMicroseconds,
+        [&] { return m_DecodeD2RFence->GetCompletedValue(); },
+        [&](unsigned timeoutMs) {
+            if (!useEvent || FAILED(eventResult)) {
+                Sleep(timeoutMs);
+                return true;
+            }
+            const auto status = WaitForSingleObject(m_VrrPresentReadyFenceEvent, timeoutMs);
+            return status == WAIT_OBJECT_0 || status == WAIT_TIMEOUT;
+        });
+    if (result.status != D3D11FenceWait::Status::Complete) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "D3D11 VRR decode-ready fence wait failed (target=%llu completed=%llu device=%x)",
+            static_cast<unsigned long long>(decodeBoundary),
+            static_cast<unsigned long long>(result.completedValue),
+            m_DecodeDevice->GetDeviceRemovedReason());
+        m_VrrPresentReadyAvailable = false;
+        m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+        queueRenderDeviceReset();
+        return 0; // Failure must never advertise GPU readiness.
+    }
+    return LiGetMicroseconds() - startUs;
+}
+
 void D3D11VARenderer::renderVideo(AVFrame* frame, uint64_t decodeBoundary)
 {
     // Insert a fence to force the render context to wait for the decode context to finish writing
@@ -2304,8 +2354,8 @@ bool D3D11VARenderer::waitForVrrPresentReady()
     // is still incomplete, its call start is a conservative lower bound for
     // the eventual completion. If it is already complete, Signal() call start
     // remains the only defensible lower bound and the poll end is the upper
-    // bound. In both cases the later event wait preserves the existing
-    // synchronization behavior.
+    // bound. Subsequent polls may tighten completion internally, but retaining
+    // this initial bracket keeps the trace's existing conservative bounds.
     m_VrrGpuReadyPollStartUs = LiGetMicroseconds();
     const UINT64 completedValue =
         m_VrrPresentReadyFence->GetCompletedValue();
@@ -2313,8 +2363,17 @@ bool D3D11VARenderer::waitForVrrPresentReady()
     m_VrrGpuReadyPollEndUs = LiGetMicroseconds();
     m_VrrGpuReadyCompletedBeforeWait = completedValue >= fenceValue;
     m_VrrGpuReadyWaitStartUs = LiGetMicroseconds();
-    const DWORD waitResult = WaitForSingleObject(
-        m_VrrPresentReadyFenceEvent, 50);
+    DWORD lastEventResult = WAIT_TIMEOUT;
+    const auto fenceWait = D3D11FenceWait::wait(fenceValue, LiGetMicroseconds,
+        [&] { return m_VrrPresentReadyFence->GetCompletedValue(); },
+        [&](unsigned timeoutMs) {
+            lastEventResult = WaitForSingleObject(m_VrrPresentReadyFenceEvent, timeoutMs);
+            return lastEventResult == WAIT_OBJECT_0 || lastEventResult == WAIT_TIMEOUT;
+        });
+    // This is the result of the complete fence wait, including completion
+    // polling. An individual event timeout is not a fence timeout.
+    const DWORD waitResult = fenceWait.status == D3D11FenceWait::Status::Complete ? WAIT_OBJECT_0 :
+        fenceWait.status == D3D11FenceWait::Status::Timeout ? WAIT_TIMEOUT : WAIT_FAILED;
     m_VrrGpuReadyWaitResultValid = true;
     m_VrrGpuReadyWaitResult = waitResult;
     m_VrrGpuReadyTimeUs = LiGetMicroseconds();
@@ -2326,8 +2385,12 @@ bool D3D11VARenderer::waitForVrrPresentReady()
 
     if (waitResult != WAIT_OBJECT_0) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "D3D11 VRR present-ready fence wait failed or timed out: %lu",
-                     static_cast<unsigned long>(waitResult));
+                     "D3D11 VRR present-ready fence wait failed or timed out: %lu (target=%llu completed=%llu event=%lu device=%x)",
+                     static_cast<unsigned long>(waitResult),
+                     static_cast<unsigned long long>(fenceValue),
+                     static_cast<unsigned long long>(fenceWait.completedValue),
+                     static_cast<unsigned long>(lastEventResult),
+                     m_RenderDevice->GetDeviceRemovedReason());
         m_VrrPresentReadyAvailable = false;
         return false;
     }

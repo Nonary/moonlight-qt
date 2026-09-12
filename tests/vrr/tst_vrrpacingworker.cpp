@@ -248,6 +248,9 @@ void testQueueCapacityAndDrops()
         expect(stats.vrrPacingDroppedFrames == 1 &&
                    stats.pacerDroppedFrames == 1,
                "a short successor burst must be buffered with only capacity overflow coalesced");
+        expect(stats.vrrReadiness.samples == 1 && stats.vrrReadiness.misses == 1 &&
+                   stats.vrrReadiness.dropped == 1,
+               "capacity eviction must count as one readiness miss even without tracing");
 
         const uint64_t releaseUs = LiGetMicroseconds();
         backend.releasePreparation();
@@ -269,6 +272,9 @@ void testQueueCapacityAndDrops()
 
     expect(backend.cancelCount() == 1,
            "worker shutdown must release the presenter exactly once");
+    expect(telemetryStats(telemetry).vrrReadiness.samples == 5 &&
+               telemetryStats(telemetry).vrrReadiness.dropped == 1,
+           "completion accounting must count each presented or evicted frame once");
 }
 
 void testLatePreparedFramePresentsImmediately()
@@ -840,6 +846,8 @@ void testDecodeBoundaryCapturedBeforeQueueAndPreparedExactly()
                "each submitted frame must capture one decoder boundary");
         expect(boundaries.size() == 1 && boundaries.front() == 73,
                "preparation must receive the submitted frame's exact boundary");
+        expect(backend.waitedDecodeBoundaries() == boundaries,
+               "the pre-schedule decode wait must receive the same frame-specific boundary as preparation");
     }
 }
 
@@ -1670,7 +1678,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     auto cachedConfig = enabledConfig();
     cachedConfig.calibrationPath = traceDirectory.filePath("profile.json").toStdString();
     cachedConfig.calibrationKey = "replay-test";
-    Vrr13::Reserve cachedHistory(18);
+    Vrr13::Reserve cachedHistory(20);
     for (int i = 0; i < 256; ++i)
         cachedHistory.observe(4000000, 8000000, Vrr13::Reserve::Second + int64_t(i) * 16667000);
     expect(Vrr13::saveProfile(QString::fromStdString(cachedConfig.calibrationPath),
@@ -1707,7 +1715,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
                QByteArray::number(cachedConfig.latencyMode) &&
                fields.value(columns.indexOf("calibration_loaded")) == "1" &&
                fields.value(columns.indexOf("initial_cached_samples")).toULongLong() >= 240 &&
-               fields.value(columns.indexOf("history_version")) == "18" &&
+               fields.value(columns.indexOf("history_version")) == "20" &&
                fields.value(columns.indexOf("history_state_valid")) == "1",
            "capture must identify the active preset and loaded calibration independently of native present results");
     expect(columns.contains("presentation_uncertainty_us") &&
@@ -1717,10 +1725,11 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     expect(columns.contains("original_target_us") &&
            decodeVrrPlayoutProfile(fields.value(columns.indexOf("playout_initial_profile")), profile),
            "capture must carry its original deadline and complete starting calibration");
-    Vrr13::Reserve restored(18);
+    Vrr13::Reserve restored(20);
     expect(restored.loadProfile(profile) && restored.common() == 4000000 && restored.evidence() == 0,
            "captured calibration must restore prior history without inventing fresh successes");
     expect(fields.value(columns.indexOf("param_playout_prediction_only")) == "1" &&
+               fields.value(columns.indexOf("param_playout_responsive_buffer")) == "3" &&
                fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "0",
            "capture must identify prediction-only adaptation for exact replay");
     expect(header.contains("frame_receive_us") &&
@@ -1866,8 +1875,28 @@ extern "C" uint64_t LiGetMicroseconds(void)
     return static_cast<uint64_t>(elapsedUs + g_TestClockOffsetUs.load());
 }
 
+void testReadinessWindow()
+{
+    Vrr13::ReadinessWindow window;
+    for (uint64_t late : {uint64_t(0), uint64_t(1000), uint64_t(2000), uint64_t(2001)})
+        window.record(1000000, late, false);
+    window.record(1000000, 0, true);
+    auto result = window.snapshot();
+    expect(result.samples == 5 && result.misses == 4 && result.over1ms == 2 &&
+               result.over2ms == 1 && result.dropped == 1,
+           "readiness must retain strict deadlines, separate severity, and count drops as misses");
+    expect(window.snapshot(31000000).samples == 0,
+           "the thirty-second outcome window must expire without another frame");
+    window.record(32000000, 0, false);
+    window.record(31999999, 0, false);
+    result = window.snapshot();
+    expect(result.samples == 2 && result.misses == 0 && result.atUs == 32000000,
+           "old failures must expire and reversed producer lock order must preserve both outcomes");
+}
+
 int main()
 {
+    testReadinessWindow();
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_TIMER) != 0) {
         std::fprintf(stderr, "FAIL: SDL_Init: %s\n", SDL_GetError());

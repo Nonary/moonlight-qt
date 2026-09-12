@@ -1,5 +1,5 @@
 @echo off
-rem Captures readiness-driven padding (profile 16), stable cadence, and learned preparation lead; older policies remain exactly replayable.
+rem Captures responsive buffer revision 3 with preset readiness targets/windows and version-20 diagnostic history; older policies remain exactly replayable.
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%SystemRoot%"
 set "PORTABLE=\\allytwo\ChaseShare\MoonlightPortable-x64-6.1.0-vrr-lite"

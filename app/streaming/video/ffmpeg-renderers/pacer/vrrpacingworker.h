@@ -178,7 +178,7 @@ private:
                           FrameTelemetry& telemetry);
     void deferFrame(PacedFrame&& frame);
     void noteDrop();
-    void writeTrace(const QueuedFrame& frame,
+    void recordFrameCompletion(const QueuedFrame& frame,
                     const VrrTimingDecision& decision,
                     const VrrPresentFeedback& feedback,
                     const FrameTelemetry& telemetry,

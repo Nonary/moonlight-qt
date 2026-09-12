@@ -285,6 +285,8 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/recentreadiness.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/readinesswindow.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/readinessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h \
@@ -440,6 +442,7 @@ win32:!winrt {
         streaming/video/ffmpeg-renderers/d3d11composition.h \
         streaming/video/ffmpeg-renderers/presentationclock.h \
         streaming/video/ffmpeg-renderers/dxgipresent.h \
+        streaming/video/ffmpeg-renderers/d3d11fencewait.h \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.h
 }
 macx {

@@ -127,6 +127,12 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayCapSourcePeriodPerMille = config.latencyFix ? 0 :
         latencyMode == 2 ? 500 : latencyMode == 1 ? 1000 : 2000;
     parameters.playoutPredictionOnly = 1;
+    // Historical revisions retain their captured deadlines and short history.
+    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 3;
+    parameters.playoutOnTimeTargetPerMillion = latencyMode == 2 ? 990000 :
+        latencyMode == 1 ? 995000 : 999500;
+    parameters.playoutReadinessWindowUs = latencyMode == 2 ? 30000000 :
+        latencyMode == 1 ? 60000000 : 120000000;
     parameters.playoutReadinessHitchThresholdUs = config.readinessHitchFeedback ? 2000 : 0;
     parameters.playoutNativeHitchAdaptation = 0;
     // Display observations are optional diagnostics. They never steer the
@@ -138,7 +144,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.renderStartPreserveLearnedLead = 1;
     parameters.playoutPredictionEnabled = 1;
     parameters.playoutSmoothnessFeedbackEnabled = 1;
-    parameters.playoutDelayMarginUs = 3000;
+    parameters.playoutDelayMarginUs = parameters.playoutResponsiveBuffer ? 500 : 3000;
     parameters.playoutDelayAttackUs = 500;
     parameters.playoutAdaptiveOnly = 0;
     parameters.playoutPerFrameLatch = 1;
@@ -274,6 +280,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     resetPlayoutOffsets();
     m_WorkloadEpisode.reset();
     m_ReadinessPrediction.reset();
+    m_CadenceStableSinceUs = 0;
+    m_PreviousSmoothingIntervalUs = 0;
     m_ReadinessFeedback.reset();
     m_PresentationPrediction.reset();
     m_SubmissionSmoothness.breakSequence();
@@ -285,7 +293,12 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_SubmissionSmoothness.reset();
         m_NativeSmoothness.reset();
         m_RequestedPlayoutDelayUs = 0;
-        m_PlayoutHistory = Vrr13::Reserve(m_Parameters.playoutReadinessHitchThresholdUs ? 19 :
+        m_RecentReadiness = m_Parameters.playoutResponsiveBuffer >= 3 ?
+            Vrr13::RecentReadiness(m_Parameters.playoutReadinessWindowUs,
+                                  m_Parameters.playoutOnTimeTargetPerMillion) :
+            Vrr13::RecentReadiness{};
+        m_PlayoutHistory = Vrr13::Reserve(m_Parameters.playoutResponsiveBuffer ? 20 :
+            m_Parameters.playoutReadinessHitchThresholdUs ? 19 :
             m_Parameters.playoutPredictionOnly ? 18 :
             m_Parameters.playoutNativeHitchAdaptation ? 17 :
             m_Parameters.playoutReadinessDrivenAdaptation ? 16 :
@@ -799,7 +812,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         // RTP time misses the extra readiness requirement of an earlier
         // smoothed slot. Intentional worker waits are excluded by the FIFO
         // readiness model; late native presentation is not readiness work.
-        const uint64_t unpaddedSlotUs = m_Parameters.playoutReadinessDrivenAdaptation ?
+        const uint64_t unpaddedSlotUs = m_Parameters.playoutReadinessDrivenAdaptation &&
+            !m_Parameters.playoutResponsiveBuffer ?
             addSigned(m_SourceTimeUs, smoothingUs) : m_SourceTimeUs;
         m_Pending.prediction = {frame.decodeCompleteUs(), unpaddedSlotUs, m_SourcePeriodUs,
             typicalRenderUs(), playoutDelayUs,
@@ -809,6 +823,23 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             timestampPlayout && !rebased && cadence.eligible && !cadence.phaseDiscontinuity &&
             cadence.frameDelta == 1 && cadence.intervalUs <= stall &&
             cadence.intervalUs >= scaledPerMille(m_SourcePeriodUs, m_Parameters.playoutBurstExclusionPerMille)};
+        if (m_Parameters.playoutResponsiveBuffer) {
+            // RTP spacing owns source timing even while the rate fit catches up.
+            // Only actual delivery/FIFO lateness enters the raw predictor.
+            auto& probe = m_Pending.prediction;
+            probe.period = std::max(m_ConfiguredStreamPeriodUs, cadence.intervalUs);
+            probe.eligible = timestampPlayout && !rebased && cadence.usedRtpTimestamp &&
+                cadence.frameDelta == 1 && !cadence.phaseDiscontinuity;
+            probe.smoothingAdvance = smoothingUs < 0 ? uint64_t(-smoothingUs) : 0;
+            probe.accountReadinessSlack = m_Parameters.playoutResponsiveBuffer >= 2;
+            if (m_Parameters.playoutResponsiveBuffer >= 3) {
+                // A host stall or catch-up burst is not steady delivery jitter.
+                // Its real output effect is still counted by readiness telemetry.
+                probe.eligible = probe.eligible && cadence.intervalUs <=
+                    std::max<uint64_t>(25000, m_SourcePeriodUs * 3 / 2) &&
+                    cadence.intervalUs >= m_SourcePeriodUs / 2;
+            }
+        }
     }
     m_LastDecodeCompleteUs = frame.decodeCompleteUs();
     m_HaveLastDecodeComplete = true;
@@ -1067,6 +1098,30 @@ int64_t VrrTimingController::cadenceSmoothingAdjustUs(
     const CadenceObservation& cadence, bool rebased, uint64_t rawBasisUs,
     uint64_t playoutDelayUs)
 {
+    if (m_Parameters.playoutResponsiveBuffer) {
+        // Judge adjacent intervals together: alternating short/long frames are
+        // exactly what the smoother is meant to handle, not a sustained change
+        // of source rate. Keep the 200 ms recovery gate for actual transitions.
+        const bool compensatingPair = m_Parameters.playoutResponsiveBuffer >= 2 &&
+            m_PreviousSmoothingIntervalUs &&
+            !withinPercent(m_PreviousSmoothingIntervalUs, m_SourcePeriodUs, 25) &&
+            ((cadence.intervalUs < m_SourcePeriodUs && m_PreviousSmoothingIntervalUs > m_SourcePeriodUs) ||
+             (cadence.intervalUs > m_SourcePeriodUs && m_PreviousSmoothingIntervalUs < m_SourcePeriodUs));
+        const auto confidenceIntervalUs = compensatingPair ?
+            (cadence.intervalUs + m_PreviousSmoothingIntervalUs) / 2 : cadence.intervalUs;
+        const bool stable = !rebased && !cadence.sourceRateChanged &&
+            !cadence.phaseDiscontinuity && cadence.eligible && cadence.frameDelta == 1 &&
+            withinPercent(confidenceIntervalUs, m_SourcePeriodUs, 25);
+        m_PreviousSmoothingIntervalUs = cadence.eligible && cadence.frameDelta == 1 &&
+            !rebased && !cadence.phaseDiscontinuity ? cadence.intervalUs : 0;
+        if (!stable) m_CadenceStableSinceUs = 0;
+        else if (!m_CadenceStableSinceUs) m_CadenceStableSinceUs = m_SourceTimeUs;
+        if (!m_CadenceStableSinceUs || m_SourceTimeUs < m_CadenceStableSinceUs ||
+            m_SourceTimeUs - m_CadenceStableSinceUs < 200000) {
+            resetCadenceSmoothing();
+            return 0;
+        }
+    }
     const uint64_t gainPerMille = m_Parameters.playoutSmoothingGainPerMille;
     if (gainPerMille == 0 || gainPerMille >= 1000) {
         resetCadenceSmoothing();
@@ -1570,7 +1625,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 if (m_Parameters.playoutPredictionEnabled &&
                     !m_Parameters.playoutReadinessHitchThresholdUs) {
                     m_ReadinessPrediction.observe(m_PlayoutHistory, m_Pending.prediction,
-                        m_Pending.preparationDurationUs, m_Pending.renderSchedulerUs);
+                        m_Pending.preparationDurationUs, m_Pending.renderSchedulerUs,
+                        m_Parameters.playoutResponsiveBuffer ? &m_RecentReadiness : nullptr);
                 }
                 appendBounded(m_PreparationDurations,
                               m_Pending.preparationDurationUs,
@@ -2106,7 +2162,7 @@ uint64_t VrrTimingController::playoutDelayCapUs() const
 {
     if (m_Parameters.playoutDelayCapSourcePeriodPerMille != 0) {
         return scaledPerMille(
-            m_SourcePeriodUs,
+            m_Parameters.playoutResponsiveBuffer ? m_ConfiguredStreamPeriodUs : m_SourcePeriodUs,
             m_Parameters.playoutDelayCapSourcePeriodPerMille);
     }
     // Parameterized captures predating the source-frame preset cap retain the
@@ -2368,6 +2424,41 @@ void VrrTimingController::updatePlayoutHistory(
     m_PlayoutBandIndex = 0; // One distribution, shared across source rates.
 
     if (m_Parameters.playoutPredictionOnly) {
+        if (m_Parameters.playoutResponsiveBuffer) {
+            if (m_Parameters.playoutResponsiveBuffer >= 3 && cadence.sourceRateChanged) {
+                // A confirmed material rate change retires incompatible history.
+                // Preserve the applied delay and slew it toward fresh evidence.
+                m_RecentReadiness = Vrr13::RecentReadiness(
+                    m_Parameters.playoutReadinessWindowUs,
+                    m_Parameters.playoutOnTimeTargetPerMillion);
+                m_ReadinessPrediction.reset();
+            }
+            // Calibration is diagnostic only. The selected live percentile
+            // and expiring miss boost own demand, subject to the latency cap.
+            m_RequestedPlayoutDelayUs = saturatingAdd(
+                m_RecentReadiness.demand(at), m_Parameters.playoutDelayMarginUs);
+            const auto desired = clampUnsigned(m_RequestedPlayoutDelayUs,
+                playoutDelayMinimumUs(), playoutDelayMaximumUs());
+            if (desired > m_AppliedPlayoutDelayUs) {
+                m_AppliedPlayoutDelayUs += std::min(
+                    desired - m_AppliedPlayoutDelayUs,
+                    m_Parameters.playoutDelayAttackUs);
+            }
+            else if (m_RecentReadiness.canRelease(at)) {
+                // Drain faster when both display and processing have spare
+                // capacity; never spend post-deadline headroom as readiness.
+                const auto headroom = std::min(recoveryHeadroomUs(),
+                    m_SourcePeriodUs > m_RenderLeadUs ? m_SourcePeriodUs - m_RenderLeadUs : 0);
+                const auto speed = 1000 + headroom * 1000 /
+                    std::max<uint64_t>(1, m_SourcePeriodUs);
+                const auto release = std::min<uint64_t>(250, scaledPerMille(
+                    scaledPerMille(m_Parameters.playoutDelayReleaseUs, elapsed * 120 / 1000), speed));
+                m_AppliedPlayoutDelayUs -= std::min(
+                    m_AppliedPlayoutDelayUs - desired, release);
+            }
+            m_AppliedPlayoutDelayUs = std::min(m_AppliedPlayoutDelayUs, playoutDelayMaximumUs());
+            return;
+        }
         // Predict the required protection from delivery, FIFO work and
         // scheduler observations. Count existing padding once: neither our
         // intentional waits nor post-submission display delay is more work.

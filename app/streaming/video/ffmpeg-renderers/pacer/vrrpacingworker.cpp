@@ -308,7 +308,7 @@ void VrrPacingWorker::submit(PacedFrame&& frame)
     }
 
     if (droppedFrame) {
-        writeTrace(droppedFrame, VrrTimingDecision {},
+        recordFrameCompletion(droppedFrame, VrrTimingDecision {},
                    VrrPresentFeedback {}, FrameTelemetry {},
                    droppedDisposition, false);
         noteDrop();
@@ -374,7 +374,7 @@ int VrrPacingWorker::run()
         consumeWindowStateNotifications();
         if (isStopping()) {
             if (frame) {
-                writeTrace(queuedFrame, VrrTimingDecision {},
+                recordFrameCompletion(queuedFrame, VrrTimingDecision {},
                            VrrPresentFeedback {}, FrameTelemetry {},
                            TraceDisposition::ShutdownDiscard, false);
                 noteDrop();
@@ -383,7 +383,7 @@ int VrrPacingWorker::run()
         }
         if (presentationSuspended()) {
             if (frame) {
-                writeTrace(queuedFrame, VrrTimingDecision {},
+                recordFrameCompletion(queuedFrame, VrrTimingDecision {},
                            VrrPresentFeedback {}, FrameTelemetry {},
                            TraceDisposition::SuspensionDiscard, false);
                 noteDrop();
@@ -422,7 +422,8 @@ int VrrPacingWorker::run()
         // frame. Wait for it here, where the worker would otherwise idle, so
         // readiness and the lateness the calibrator learns from are real and
         // the preparation never blocks on the decoder.
-        const uint64_t decodeSyncWaitUs = m_Presenter->waitForDecode(frame.frame());
+        const uint64_t decodeSyncWaitUs = m_Presenter->waitForDecode(
+            frame.frame(), frame.decodeBoundary());
         if (decodeSyncWaitUs > kDecodeSyncNoticeUs) {
             frame.noteGpuReadyUs(LiGetMicroseconds());
         }
@@ -464,7 +465,7 @@ int VrrPacingWorker::run()
         const uint64_t ageUs = positiveDifference(scheduleNowUs, ageOriginUs);
         if (hasQueuedFrame() && VrrFrameDropPolicy::beforeRender(
                 decision, m_TimingController->displayPeriodUs(), ageUs, metronome, latencyFix)) {
-            writeTrace(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
+            recordFrameCompletion(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
                        TraceDisposition::Stale);
             noteDrop();
             m_TimingController->noteSubmission(false, false, 0);
@@ -509,7 +510,7 @@ int VrrPacingWorker::run()
                 m_Telemetry->recordVrrOutcome(feedback.presented,
                                               feedback.cancelled);
             }
-            writeTrace(queuedFrame, decision, feedback, telemetry,
+            recordFrameCompletion(queuedFrame, decision, feedback, telemetry,
                        TraceDisposition::Interrupted);
             noteDrop();
             continue;
@@ -521,7 +522,7 @@ int VrrPacingWorker::run()
         uint64_t nowUs = LiGetMicroseconds();
         if (hasQueuedFrame() && VrrFrameDropPolicy::afterRenderWait(
                 decision, ageOriginUs, nowUs, metronome, latencyFix)) {
-            writeTrace(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
+            recordFrameCompletion(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
                        TraceDisposition::Stale);
             noteDrop();
             if (metronome || latencyFix) {
@@ -605,7 +606,7 @@ int VrrPacingWorker::run()
                 m_Telemetry->recordVrrOutcome(feedback.presented,
                                               feedback.cancelled);
             }
-            writeTrace(queuedFrame, decision, feedback, telemetry,
+            recordFrameCompletion(queuedFrame, decision, feedback, telemetry,
                        preparation.prepared ? TraceDisposition::Interrupted :
                                               TraceDisposition::PreparationFailed);
             noteDrop();
@@ -662,7 +663,7 @@ int VrrPacingWorker::run()
                 m_Telemetry->recordVrrOutcome(feedback.presented,
                                               feedback.cancelled);
             }
-            writeTrace(queuedFrame, decision, feedback, telemetry,
+            recordFrameCompletion(queuedFrame, decision, feedback, telemetry,
                        TraceDisposition::Interrupted);
             noteDrop();
             deferFrame(std::move(frame));
@@ -764,7 +765,7 @@ int VrrPacingWorker::run()
                 m_Telemetry->recordVrrOutcome(feedback.presented,
                                               feedback.cancelled);
             }
-            writeTrace(queuedFrame, decision, feedback, telemetry,
+            recordFrameCompletion(queuedFrame, decision, feedback, telemetry,
                        TraceDisposition::Interrupted);
             noteDrop();
             deferFrame(std::move(frame));
@@ -800,13 +801,16 @@ int VrrPacingWorker::run()
                     telemetry.presentEndUs - frame.decoderOutputUs() : 0;
             sample.renderingTimeUs = telemetry.preparationDurationUs +
                 telemetry.presentDurationUs;
-            sample.prepareLate = telemetry.preparationEndUs > decision.targetUs;
+            const uint64_t readinessDeadlineUs =
+                m_TimingController->parameters().playoutResponsiveBuffer >= 3 ?
+                decision.originalTargetUs : decision.targetUs;
+            sample.prepareLate = telemetry.preparationEndUs > readinessDeadlineUs;
             sample.cadenceIntervals = m_TimingController->nativeCadenceIntervals();
             sample.cadenceHitches = m_TimingController->nativeCadenceHitches();
             sample.estimatedCadenceIntervals = m_TimingController->estimatedCadenceIntervals();
             sample.estimatedCadenceHitches = m_TimingController->estimatedCadenceHitches();
             sample.preparationLatenessUs = sample.prepareLate ?
-                telemetry.preparationEndUs - decision.targetUs : 0;
+                telemetry.preparationEndUs - readinessDeadlineUs : 0;
             sample.targetWaitEntryLate = !sample.prepareLate &&
                 telemetry.preparationEndUs < decision.targetUs &&
                 targetWait.deadlineAlreadyElapsed;
@@ -828,7 +832,7 @@ int VrrPacingWorker::run()
         if (outputDropped) {
             noteDrop();
         }
-        writeTrace(queuedFrame, decision, feedback, telemetry,
+        recordFrameCompletion(queuedFrame, decision, feedback, telemetry,
                    outputDropped ?
                        TraceDisposition::OutputDropped :
                        TraceDisposition::Presented);
@@ -880,7 +884,7 @@ void VrrPacingWorker::discardQueuedFrames(
     }
 
     for (const QueuedFrame& frame : discardedFrames) {
-        writeTrace(frame, VrrTimingDecision {}, VrrPresentFeedback {},
+        recordFrameCompletion(frame, VrrTimingDecision {}, VrrPresentFeedback {},
                    FrameTelemetry {}, disposition, false);
         if (countDrops) {
             noteDrop();
@@ -1068,13 +1072,30 @@ void VrrPacingWorker::noteDrop()
     }
 }
 
-void VrrPacingWorker::writeTrace(const QueuedFrame& queuedFrame,
+void VrrPacingWorker::recordFrameCompletion(const QueuedFrame& queuedFrame,
                                  const VrrTimingDecision& decision,
                                  const VrrPresentFeedback& feedback,
                                  const FrameTelemetry& telemetry,
                                  TraceDisposition disposition,
                                  bool decisionValid)
 {
+    // Publish every playback outcome once, even when disk tracing is disabled
+    // or drops a row. Intentional window/shutdown discards are not playback.
+    const bool playbackOutcome = disposition == TraceDisposition::Presented ||
+        disposition == TraceDisposition::OutputDropped ||
+        disposition == TraceDisposition::QueueCapacity ||
+        disposition == TraceDisposition::Stale ||
+        disposition == TraceDisposition::PreparationFailed;
+    if (m_Telemetry && playbackOutcome) {
+        const auto& parameters = m_TimingController->parameters();
+        const uint64_t deadlineUs = parameters.playoutResponsiveBuffer >= 3 ?
+            decision.originalTargetUs : decision.targetUs;
+        const bool dropped = disposition != TraceDisposition::Presented;
+        m_Telemetry->recordVrrReadiness(LiGetMicroseconds(),
+            decisionValid ? positiveDifference(telemetry.preparationEndUs, deadlineUs) : 0,
+            dropped, parameters.playoutOnTimeTargetPerMillion,
+            decision.playoutCapacityLimited, decisionValid);
+    }
     if (queuedFrame.trace.arrivalSequence == 0) {
         return;
     }

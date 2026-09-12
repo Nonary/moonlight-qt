@@ -6,6 +6,7 @@
 #include <cstdint>
 
 #include <QMutex>
+#include "vrr/readinesswindow.h"
 
 // Pacer work can happen on the decoder, render, V-sync, and VRR worker
 // threads. Keep its cumulative measurements separate from VIDEO_STATS, which
@@ -25,6 +26,9 @@ struct PacerTelemetrySnapshot {
     uint64_t vrrPacingDroppedFrames = 0;
     uint64_t vrrEligibleFrames = 0;
     uint64_t vrrPrepareLateFrames = 0;
+    Vrr13::ReadinessWindow::Snapshot vrrReadiness;
+    uint64_t vrrOnTimeTargetPerMillion = 0;
+    bool vrrBufferAtLimit = false;
     uint64_t vrrQueueResidenceUs = 0;
     uint64_t vrrDecodeWaitUs = 0;
     uint64_t vrrBufferUs = 0;
@@ -136,6 +140,18 @@ public:
         touchLocked();
     }
 
+    void recordVrrReadiness(uint64_t atUs, uint64_t latenessUs, bool dropped,
+                           uint64_t targetPerMillion, bool capacityLimited,
+                           bool decisionValid)
+    {
+        QMutexLocker lock(&m_Lock);
+        m_ReadinessWindow.record(atUs, latenessUs, dropped);
+        m_Snapshot.vrrReadiness = m_ReadinessWindow.snapshot();
+        m_Snapshot.vrrOnTimeTargetPerMillion = targetPerMillion;
+        if (decisionValid) m_Snapshot.vrrBufferAtLimit = capacityLimited;
+        touchLocked();
+    }
+
     void recordVrrOutcome(bool presented, bool cancelled)
     {
         QMutexLocker lock(&m_Lock);
@@ -208,6 +224,7 @@ public:
     }
 
 private:
+    Vrr13::ReadinessWindow m_ReadinessWindow;
     static constexpr size_t kPrepareLatenessSampleCount = 128;
     static constexpr size_t kSubmitErrorSampleCount = 128;
 

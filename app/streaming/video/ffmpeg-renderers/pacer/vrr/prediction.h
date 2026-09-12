@@ -2,6 +2,7 @@
 #include "reserve.h"
 #include "smoothnessfeedback.h"
 #include "presentationtiming.h"
+#include "recentreadiness.h"
 #include <array>
 
 namespace Vrr13 {
@@ -13,19 +14,28 @@ public:
         uint64_t decoded = 0, expected = 0, period = 0, typical = 0;
         uint64_t applied = 0, headroom = 0, guard = 0, decoderQueue = 0;
         bool eligible = false;
+        uint64_t smoothingAdvance = 0;
+        bool accountReadinessSlack = false;
     };
-    void observe(Reserve& reserve, const Probe& p, uint64_t work, uint64_t scheduler) {
+    void observe(Reserve& reserve, const Probe& p, uint64_t work, uint64_t scheduler,
+                 RecentReadiness* recent = nullptr) {
         if (!p.eligible) { reset(); return; }
         work = std::min<uint64_t>(work, 100000);
         scheduler = std::min<uint64_t>(scheduler, 100000);
         const auto backlog = m_Ready > p.decoded ? m_Ready - p.decoded : 0;
-        if (!backlog && p.decoderQueue <= p.period) flush(reserve);
+        if (!backlog && p.decoderQueue <= p.period) flush(reserve, recent);
         const auto expectedBacklog = !m_Overloaded && m_Expected > p.expected ? m_Expected - p.expected : 0;
         m_Expected = p.expected + std::min<uint64_t>(1000000, expectedBacklog + p.typical);
         m_Ready = p.decoded + std::min<uint64_t>(1000000, (m_Overloaded ? 0 : backlog) + scheduler + work);
         if (m_Overloaded) return;
         const uint64_t required = m_Ready > m_Expected ? m_Ready - m_Expected : 0;
-        Sample s{required, p.applied, p.headroom, p.guard, p.decoded};
+        // Preserve early-ready slack until after advancing the deadline. A
+        // frame ready 5 ms early needs no reserve for a 3 ms advance. Clamping
+        // the raw residual first would incorrectly request another 3 ms.
+        const auto slack = p.accountReadinessSlack && m_Expected > m_Ready ?
+            m_Expected - m_Ready : 0;
+        Sample s{required, p.applied, p.headroom, p.guard, p.decoded,
+            p.smoothingAdvance - std::min(p.smoothingAdvance, slack)};
         if (backlog || m_Count || work + scheduler > p.period || p.decoderQueue > p.period) {
             if (!m_Start) m_Start = p.decoded;
             if (m_Count == m_Samples.size() || p.decoded - m_Start >= 2000000) {
@@ -33,17 +43,18 @@ public:
             }
             else m_Samples[m_Count++] = s;
         }
-        else record(reserve, s);
+        else record(reserve, s, recent);
     }
     void reset() { *this = ReadinessPrediction{}; }
 private:
-    struct Sample { uint64_t required, applied, headroom, guard, at; };
-    static void record(Reserve& reserve, const Sample& s) {
+    struct Sample { uint64_t required, applied, headroom, guard, at, advance; };
+    static void record(Reserve& reserve, const Sample& s, RecentReadiness* recent) {
         const auto ns = [](uint64_t us) { return int64_t(std::min<uint64_t>(us, INT64_MAX / 1000)) * 1000; };
         reserve.observe(ns(s.required), ns(s.applied + s.headroom), ns(s.at), ns(s.guard + s.headroom));
+        if (recent) recent->observe(s.required, s.advance, s.applied, s.at);
     }
-    void flush(Reserve& reserve) {
-        for (size_t i = 0; i < m_Count; ++i) record(reserve, m_Samples[i]);
+    void flush(Reserve& reserve, RecentReadiness* recent) {
+        for (size_t i = 0; i < m_Count; ++i) record(reserve, m_Samples[i], recent);
         m_Count = 0; m_Start = 0; m_Overloaded = false;
     }
     std::array<Sample, 512> m_Samples{};
