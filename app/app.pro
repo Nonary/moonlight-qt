@@ -192,6 +192,7 @@ SOURCES += \
     settings/mappingfetcher.cpp \
     settings/streamingpreferences.cpp \
     diagnostics/diagnosticcapture.cpp \
+    diagnostics/gputrace.cpp \
     diagnostics/diagnosticzip.cpp \
     streaming/input/abstouch.cpp \
     streaming/input/dualsensehaptics.cpp \
@@ -240,6 +241,7 @@ HEADERS += \
     cli/startstream.h \
     settings/streamingpreferences.h \
     diagnostics/diagnosticcapture.h \
+    diagnostics/gputrace.h \
     diagnostics/diagnosticzip.h \
     streaming/input/dualsensehaptics.h \
     streaming/input/input.h \

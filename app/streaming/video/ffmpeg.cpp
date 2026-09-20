@@ -2,6 +2,7 @@
 #include "ffmpeg.h"
 #include "utils.h"
 #include "streaming/session.h"
+#include "diagnostics/gputrace.h"
 
 #ifdef HAVE_H264BITSTREAM
 #include <h264_stream.h>
@@ -2325,7 +2326,14 @@ void FFmpegVideoDecoder::decoderThreadProc()
 
             // Waiting for input. All output frames have been received.
             // Block until we receive a new frame from the host.
-            if (!LiWaitForNextVideoFrame(&handle, &du)) {
+            auto* inputTrace = m_FrontendRenderer->gpuDiagnosticTrace();
+            const auto inputBeginUs = inputTrace ? LiGetMicroseconds() : 0;
+            const bool haveInput = LiWaitForNextVideoFrame(&handle, &du);
+            if (inputTrace) inputTrace->record({"decoder_input_wait",
+                haveInput ? int64_t(du->rtpTimestamp) : -1, 0,
+                inputBeginUs, LiGetMicroseconds(), 0, haveInput,
+                haveInput ? du->frameNumber : -1});
+            if (!haveInput) {
                 // This might be a signal from the main thread to exit
                 continue;
             }
@@ -2349,12 +2357,34 @@ void FFmpegVideoDecoder::decoderThreadProc()
 
             int err;
             do {
+                auto* gpuTrace = m_FrontendRenderer->gpuDiagnosticTrace();
+                const auto receiveCpu = gpuTrace ? GpuTrace::ThreadSample::capture() : GpuTrace::ThreadSample{};
+                const auto receiveBeginUs = gpuTrace ? LiGetMicroseconds() : 0;
                 err = avcodec_receive_frame(m_VideoDecoderCtx, frame);
+                // Preserve the immutable decoder-output boundary before any
+                // diagnostic publication or metadata work.
+                const auto receiveEndUs = (gpuTrace || err == 0) ? LiGetMicroseconds() : 0;
+                if (gpuTrace) {
+                    const auto pts = m_FrameInfoQueue.isEmpty() ? int64_t(-1) :
+                        int64_t(m_FrameInfoQueue.head().rtpTimestamp);
+                    gpuTrace->recordThreadSpan({"decoder_receive", pts,
+                        err == 0 ? receiveEndUs : 0, receiveBeginUs, receiveEndUs, 0, err}, receiveCpu);
+                    if (err == 0) {
+                        // Reading AVFrame metadata is passive; never query VA
+                        // readiness on this thread (v1 serialized the decoder).
+                        const auto surface = frame->format == AV_PIX_FMT_VAAPI ?
+                            uint64_t(reinterpret_cast<uintptr_t>(frame->data[3])) : 0;
+                        gpuTrace->record({"decoder_surface", pts, receiveEndUs,
+                            receiveEndUs, receiveEndUs, surface,
+                            m_FrameInfoQueue.isEmpty() ? -1 : m_FrameInfoQueue.head().frameNumber,
+                            frame->format, frame->width, frame->height, int64_t(m_FramesIn - m_FramesOut)});
+                    }
+                }
                 if (err == 0) {
                     // This is the immutable origin for client-processing
                     // timing. Capture it immediately when FFmpeg exposes the
                     // decoded frame, before any metadata or handoff work.
-                    const uint64_t decoderOutputUs = LiGetMicroseconds();
+                    const uint64_t decoderOutputUs = receiveEndUs;
                     SDL_assert(m_FrameInfoQueue.size() == m_FramesIn - m_FramesOut);
                     m_FramesOut++;
 
@@ -2487,7 +2517,10 @@ void FFmpegVideoDecoder::decoderThreadProc()
                         pacedFrame.setDeliveryTimeline(receiveUs,
                                                        reassembledUs,
                                                        decodeSubmitUs);
+                        const auto handoffBeginUs = gpuTrace ? LiGetMicroseconds() : 0;
                         m_Pacer->submitFrame(std::move(pacedFrame));
+                        if (gpuTrace) gpuTrace->record({"decoder_handoff", rtpTimestamp,
+                            decoderOutputUs, handoffBeginUs, LiGetMicroseconds(), 0, frameNumber});
                     }
                     else {
                         m_Pacer->submitFrame(frame);
@@ -2547,6 +2580,8 @@ void FFmpegVideoDecoder::decoderThreadProc()
 
 int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
 {
+    auto* gpuTrace = m_FrontendRenderer->gpuDiagnosticTrace();
+    const auto submitEntryUs = gpuTrace ? LiGetMicroseconds() : 0;
     PLENTRY entry = du->bufferList;
     int err;
 
@@ -2646,8 +2681,21 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
 
     m_ActiveWndVideoStats.totalReassemblyTimeUs += (du->enqueueTimeUs - du->receiveTimeUs);
 
+    if (gpuTrace) {
+        gpuTrace->record({"packet_delivery", du->rtpTimestamp, 0, du->receiveTimeUs,
+            du->enqueueTimeUs, 0, du->frameNumber, du->fullLength, m_Pkt->size,
+            du->frameType, int64_t(m_FramesIn - m_FramesOut)});
+        gpuTrace->record({"packet_build", du->rtpTimestamp, 0, submitEntryUs,
+            LiGetMicroseconds(), 0, du->frameNumber});
+        const auto now = LiGetMicroseconds();
+        gpuTrace->record({"packet_send_enter", du->rtpTimestamp, 0, now, now, 0, du->frameNumber});
+    }
+    const auto sendCpu = gpuTrace ? GpuTrace::ThreadSample::capture() : GpuTrace::ThreadSample{};
     const uint64_t decodeSubmitUs = LiGetMicroseconds();
     err = avcodec_send_packet(m_VideoDecoderCtx, m_Pkt);
+    const auto sendEndUs = gpuTrace ? LiGetMicroseconds() : 0;
+    if (gpuTrace) gpuTrace->recordThreadSpan({"packet_send", du->rtpTimestamp, 0,
+        decodeSubmitUs, sendEndUs, 0, err}, sendCpu);
     if (err < 0) {
         char errorstring[512];
         av_strerror(err, errorstring, sizeof(errorstring));

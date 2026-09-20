@@ -823,7 +823,8 @@ int VrrPacingWorker::run()
                 m_TimingController->noteDeferredGpuReady(
                     gpuReadyWaitUs, true, completionUpperBoundUs,
                     completionUpperBoundUs >= telemetry.preparationStartUs ?
-                        completionUpperBoundUs - telemetry.preparationStartUs : 0);
+                        completionUpperBoundUs - telemetry.preparationStartUs : 0,
+                    !feedback.gpuReadyCompletedBeforeWait);
             }
         }
         recordSubmission(decision, feedback, telemetry.presentStartUs,

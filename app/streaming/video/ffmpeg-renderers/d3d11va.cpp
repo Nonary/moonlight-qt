@@ -2455,8 +2455,20 @@ bool D3D11VARenderer::finishVrrPresentReady(
     // a replacement frame.
     const uint64_t waitStartUs = LiGetMicroseconds();
     DWORD lastEventResult = WAIT_TIMEOUT;
+    uint64_t initialPollStartUs = 0, initialPollEndUs = 0, initialCompletedValue = 0;
+    bool sampledInitialPoll = false;
     const auto fenceWait = D3D11FenceWait::wait(fenceValue, LiGetMicroseconds,
-        [&] { return fence->GetCompletedValue(); },
+        [&] {
+            const auto pollStartUs = LiGetMicroseconds();
+            const auto value = fence->GetCompletedValue();
+            if (!sampledInitialPoll) {
+                initialPollStartUs = pollStartUs;
+                initialPollEndUs = LiGetMicroseconds();
+                initialCompletedValue = value;
+                sampledInitialPoll = true;
+            }
+            return value;
+        },
         [&](unsigned timeoutMs) {
             lastEventResult = WaitForSingleObject(fenceEvent, timeoutMs);
             return lastEventResult == WAIT_OBJECT_0 || lastEventResult == WAIT_TIMEOUT;
@@ -2478,7 +2490,14 @@ bool D3D11VARenderer::finishVrrPresentReady(
         return false;
     }
 
-    m_VrrGpuReadyWaitStartUs = waitStartUs;
+    m_VrrGpuReadyWaitStartUs = initialPollEndUs;
+    // Readiness before the residual wait must describe this check, not the
+    // earlier prepare-time poll. Work often completes during the cadence hold.
+    m_VrrGpuReadyPollStartUs = initialPollStartUs;
+    m_VrrGpuReadyPollEndUs = initialPollEndUs;
+    m_VrrGpuReadyPollCompletedValue = initialCompletedValue;
+    m_VrrGpuReadyCompletedBeforeWait =
+        fenceWait.status == D3D11FenceWait::Status::Complete && fenceWait.waitCalls == 0;
     m_VrrGpuReadyWaitResultValid = true;
     m_VrrGpuReadyWaitResult = waitResult;
     m_VrrGpuReadyTimeUs = readyTimeUs;

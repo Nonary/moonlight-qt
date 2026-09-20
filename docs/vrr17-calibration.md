@@ -13,7 +13,7 @@ decode/queue/render accounting are documented in [the review](vrr17-review.md).
 | High-rate presentation protection | vrr14's per-slot rule, `playout_per_frame_latch=1`: protect slots closer than a display period plus guard; do not add vrr17's 225/400 us entry/exit margins. |
 | Low Latency / Balanced Target / Smooth | Maximum allowances of 2 / 2 / 4 fitted source frames, not fixed added delay. Existing absolute ceilings of 16 / 16 / 24 ms and the physical queue-capacity bound still apply. |
 | Initial calibration | Require both 500 ms of contiguous interval coverage and 32 consecutive valid intervals. The historical gate required one second and two intervals. Low FPS can still take longer than one second to collect 32 intervals. |
-| Ongoing growth | Require below-target long-window quality, current pressure, fresh readiness-attributed error, and serial service plus decoder-queue time that each fit the intended interval; request at most 250 us per 250 ms and apply at most 125 us per frame. |
+| Ongoing growth | Require below-target long-window quality, current pressure, fresh readiness-attributed error, and serial service plus decoder-queue pressure that each fit the qualified one-second window's intended time; request at most 250 us per 250 ms and apply at most 125 us per frame. |
 | Retention and release | 6 / 8 / 10-second holds and 125 / 250 / 50 us per second release. Only current pressure renews the live release hold; long quality history still qualifies future growth. |
 | FPS changes and gaps | Do not clear completed initial calibration or earned protection. A broken interval sequence uses the historical one-second requalification gate afterward, not another fast startup. |
 
@@ -131,3 +131,6 @@ the Desktop without changing timing policies.
 A matched high-rate gameplay comparison on an
 affected client remains necessary before claiming the smoothness regression
 is fixed.
+
+The current serial-service revision 2 and deferred GPU accounting correction
+are described in [service-gate correction](vrr-service-gate-correction.md).

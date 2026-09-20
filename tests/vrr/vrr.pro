@@ -21,6 +21,11 @@ unix:!macx:packagesExist(libplacebo) {
     SUBDIRS += plvkswapchain
 }
 
+unix:!macx:packagesExist(sdl2) {
+    gputrace.file = $$PWD/gputrace.pro
+    SUBDIRS += gputrace
+}
+
 incomingtiming.file = $$PWD/incomingtiming.pro
 SUBDIRS += incomingtiming
 amddecodepolicy.file = $$PWD/amddecodepolicy.pro

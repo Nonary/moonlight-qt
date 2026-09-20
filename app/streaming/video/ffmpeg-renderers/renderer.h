@@ -139,6 +139,7 @@ private:
 
 class IVrrFramePresenter;
 
+class GpuTrace;
 class IFFmpegRenderer : public Overlay::IOverlayRenderer {
 public:
     enum class RendererType {
@@ -162,6 +163,7 @@ public:
     virtual bool initialize(PDECODER_PARAMETERS params) = 0;
     virtual bool prepareDecoderContext(AVCodecContext* context, AVDictionary** options) = 0;
     virtual void renderFrame(AVFrame* frame) = 0;
+    virtual GpuTrace* gpuDiagnosticTrace() { return nullptr; }
 
     enum class InitFailureReason
     {

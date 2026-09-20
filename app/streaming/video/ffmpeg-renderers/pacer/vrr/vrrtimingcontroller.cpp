@@ -54,12 +54,8 @@ constexpr uint64_t kPlayoutMetronomeSnapPerMille = 3000;
 // used to be enough, so a four-frame host hitch became a 30 Hz source and
 // every rate-dependent term followed it there and back.
 constexpr uint64_t kRateCandidateMinimumUs = 200000;
-// Preparation acquires the next swapchain image, and on a compositor that
-// releases the previous image only when it flips, an acquire that follows
-// the previous present too closely blocks for up to several display periods.
-// Preparation that starts this long after the previous present did not
-// block; the minimum lead keeps enough time for the preparation itself.
-constexpr uint64_t kRenderStartAfterSubmissionUs = 6000;
+// Historical post-present acquisition spacing retains this minimum lead.
+// Production uses native acquisition backpressure without software spacing.
 constexpr uint64_t kRenderStartMinimumLeadUs = 2500;
 // With the decoder's GPU work synced before preparation, the learned lead
 // collapses to the 0.6 ms render and no longer covers the sporadic 2 to 3 ms
@@ -174,10 +170,10 @@ VrrTimingParameters vrrTimingParametersForSession(
     // Worker/backend waits are consequences of local execution timing. They
     // may describe readiness, but must never move the sender-clock mapping.
     parameters.playoutSourceMappingDecoderOutput = 1;
-    // Buffer only work that can fit within the actual intended interval. This
-    // includes the worker's decoder wait and raw preparation service, even
-    // when readiness-lead learning excludes them from generic render cost.
-    parameters.playoutSerialServiceGate = parameters.playoutResponsiveBuffer ? 1 : 0;
+    // Buffer transient work when measured service fits within intended time
+    // over the qualified window. Include decoder waits and raw preparation
+    // even when readiness-lead learning excludes them from generic render cost.
+    parameters.playoutSerialServiceGate = parameters.playoutResponsiveBuffer ? 2 : 0;
     // Keep the preset's long quality history for reporting and future attack,
     // while allowing genuinely clean recent operation to shed old latency.
     parameters.playoutRecentPressureRelease = parameters.playoutResponsiveBuffer ? 1 : 0;
@@ -259,12 +255,15 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutSmoothingSnapPerMille = kPlayoutMetronomeSnapPerMille;
     parameters.playoutOffsetReseedFrames = kPlayoutOffsetReseedFrames;
     parameters.playoutDelaySlewAcrossBands = 1;
-    // Preparing on arrival is replay-only: on the Vulkan desktop path the
-    // preparation blocks in the swapchain when it follows a present too
-    // closely, so the worker sat busy and the next frame aged past the
-    // stale limit.
-    parameters.playoutPrepareOnArrival = 0;
-    parameters.renderStartAfterSubmissionUs = kRenderStartAfterSubmissionUs;
+    // Spend the existing playout interval on preparation on both platforms.
+    // Vulkan can hand off a pending GPU render using its present semaphore;
+    // D3D11 can execute during the target hold before its final fence check.
+    // Delaying preparation until just before Present would remove that overlap,
+    // especially when no synchronous GPU wait is available to train a lead.
+    // Acquisition still enforces native backpressure; it does not justify an
+    // additional six-millisecond software delay after every submission.
+    parameters.playoutPrepareOnArrival = 1;
+    parameters.renderStartAfterSubmissionUs = 0;
     parameters.renderStartMinimumLeadUs = kRenderStartMinimumLeadUs;
     parameters.renderLeadFloorUs = kRenderLeadFloorUs;
     parameters.rateCandidateMinimumUs = kRateCandidateMinimumUs;
@@ -822,10 +821,9 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     uint64_t renderStartUs = targetUs > totalLeadUs ?
         targetUs - totalLeadUs : 0;
     if (timestampPlayout && m_Parameters.playoutPrepareOnArrival != 0) {
-        // The playout delay already holds the frame for a whole cushion
-        // before its slot; preparing it the moment it arrives spends that
-        // cushion on the renderer too. Only for renderers whose preparation
-        // never blocks on the previous present.
+        // Preparation may use the existing playout interval. Native image
+        // acquisition can still apply backpressure; the presentation target
+        // remains unchanged regardless of when that acquisition completes.
         const uint64_t arrivalLeadUs = saturatingAdd(totalLeadUs,
                                                      playoutDelayUs);
         renderStartUs = targetUs > arrivalLeadUs ?
@@ -1804,7 +1802,8 @@ void VrrTimingController::noteGpuReadyWait(uint64_t waitUs, bool completed,
 void VrrTimingController::noteDeferredGpuReady(uint64_t waitUs,
                                                bool completed,
                                                uint64_t completionUs,
-                                               uint64_t serviceUpperBoundUs)
+                                               uint64_t serviceUpperBoundUs,
+                                               bool readinessWasPending)
 {
     noteGpuReadyWait(waitUs, completed, completionUs);
     if (m_Parameters.playoutSerialServiceGate == 0 ||
@@ -1820,6 +1819,15 @@ void VrrTimingController::noteDeferredGpuReady(uint64_t waitUs,
     // use the measured residual wait for following-frame lead learning above.
     m_Pending.deferredGpuServiceUs = std::max(
         m_Pending.deferredGpuServiceUs, serviceUpperBoundUs);
+    if (m_Parameters.playoutSerialServiceGate >= 2) {
+        // Only the residual CPU wait occupies this serial worker. The entire
+        // preparation-to-fence interval includes intentional cadence holding
+        // and concurrent GPU execution, neither of which is serial CPU service.
+        m_Pending.deferredGpuWaitUs = waitUs;
+        if (readinessWasPending && waitUs != 0) {
+            m_Pending.deferredGpuReadyUs = completionUs;
+        }
+    }
 }
 
 void VrrTimingController::noteSchedulerDelays(uint64_t renderDelayUs,
@@ -1876,11 +1884,14 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         const uint64_t serialServiceUs = saturatingAdd(
             m_Pending.decodeSyncWaitUs,
             saturatingAdd(m_Pending.renderSchedulerUs,
-                std::max(preparationServiceUs, m_Pending.deferredGpuServiceUs)));
+                m_Parameters.playoutSerialServiceGate >= 2 ?
+                    saturatingAdd(preparationServiceUs, m_Pending.deferredGpuWaitUs) :
+                    std::max(preparationServiceUs, m_Pending.deferredGpuServiceUs)));
         const bool legacyServiceAbsorbable =
             m_Parameters.playoutSerialServiceGate != 0 ||
             (work <= p.period && p.decoderQueue <= p.period);
-        const auto ready = m_Pending.preparationCompleteUs ? m_Pending.preparationCompleteUs : saturatingAdd(p.decoded, work);
+        const auto ready = std::max(m_Pending.deferredGpuReadyUs,
+            m_Pending.preparationCompleteUs ? m_Pending.preparationCompleteUs : saturatingAdd(p.decoded, work));
         const auto deadline = m_Pending.smoothness.intended;
         if (m_Parameters.playoutResponsiveBuffer >= 6) {
             m_IntervalBuffer.observe({m_Pending.smoothness.frame, m_Pending.intervalIntendedUs,
@@ -1896,7 +1907,7 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutIntervalInitialWarmupUs,
                 m_Parameters.playoutIntervalInitialMinimumSamples,
                 m_Parameters.playoutRecentPressureRelease != 0,
-                m_Parameters.playoutSerialServiceGate != 0);
+                m_Parameters.playoutSerialServiceGate);
         }
         else m_MeanMissBuffer.observe(submissionUs, ready > deadline ? ready - deadline : 0,
             p.applied, submitted && !cancelled && m_Pending.hasPreparationDuration &&

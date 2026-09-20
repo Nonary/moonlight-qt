@@ -80,7 +80,7 @@ public:
                  uint64_t initialWarmupUs = 1000000,
                  size_t initialMinimumSamples = 2,
                  bool recentPressureRelease = false,
-                 bool serialServiceGate = false) {
+                 uint64_t serialServiceGate = 0) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.severityWeighted = severityWeighted;
         minimum = std::min(minimum, maximum);
@@ -119,6 +119,9 @@ public:
         if (bucket.tick != tick) bucket = Bucket{tick};
         ++bucket.samples;
         bucket.total += error;
+        bucket.service += s.serialService;
+        bucket.decoderQueue += s.decoderQueue;
+        bucket.intended += intended;
         if (!m_First) {
             m_First = s.submitted;
             // Only a fresh session may use the shorter calibration window.
@@ -128,10 +131,11 @@ public:
             m_SequenceMinimumSamples = m_Stats.initialCalibrationComplete ? 2 : initialMinimumSamples;
         }
         ++m_SequenceSamples;
-        uint64_t samples = 0, total = 0;
+        uint64_t samples = 0, total = 0, service = 0, decoderQueue = 0, intendedTime = 0;
         for (const auto& b : m_Window) {
             if (tick >= b.tick && tick - b.tick < m_Window.size()) {
                 samples += b.samples; total += b.total;
+                service += b.service; decoderQueue += b.decoderQueue; intendedTime += b.intended;
             }
         }
         m_Stats.averageErrorUs = samples ? double(total) / samples : 0;
@@ -184,10 +188,18 @@ public:
             historyHolds ? Action::HistoryHold : Action::RecoveryHold;
         const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
         const bool grow = currentPressure && (!severityWeighted || belowTarget);
+        // Revision 1 mistook every slow frame for sustained overload. A
+        // jitter buffer can cover a transient dependency stall when subsequent
+        // frames recover. Judge capacity over the same qualified one-second
+        // window as interval pressure, not the single late/catch-up pair.
+        // Sequence breaks discard this evidence, preventing stale headroom
+        // from authorizing growth across missing frames or source epochs.
+        const bool windowAbsorbable = service <= intendedTime && decoderQueue <= intendedTime;
         const bool delayedAbsorbable = delayed.absorbable &&
             (!serialServiceGate ||
-             (delayed.serialService <= intended &&
-              delayed.decoderQueue <= intended));
+             (serialServiceGate >= 2 ? windowAbsorbable :
+              (delayed.serialService <= intended &&
+               delayed.decoderQueue <= intended)));
         if (grow && freshError && delayedAbsorbable && lateness &&
                 (!m_LastAttack || s.submitted - m_LastAttack >= 250000)) {
             const auto excess = severityWeighted ?
@@ -227,9 +239,9 @@ public:
         }
         else if (!holdProtection &&
                  !(s.absorbable &&
-                   (!serialServiceGate ||
+                   (!serialServiceGate || (serialServiceGate >= 2 ? windowAbsorbable :
                     (s.serialService <= intended &&
-                     s.decoderQueue <= intended)))) {
+                     s.decoderQueue <= intended))))) {
             update.action = Action::NotAbsorbable;
         }
         if (beforeUs != boundedUs) update.action = Action::LimitChange;
@@ -246,7 +258,10 @@ public:
     }
     void reset() { *this = IntervalBuffer{}; }
 private:
-    struct Bucket { uint64_t tick = 0, samples = 0, total = 0; };
+    struct Bucket {
+        uint64_t tick = 0, samples = 0, total = 0;
+        uint64_t service = 0, decoderQueue = 0, intended = 0;
+    };
     struct ScoreBucket {
         uint64_t tick = 0, evaluated = 0, failed = 0;
         double weightedLoss = 0;

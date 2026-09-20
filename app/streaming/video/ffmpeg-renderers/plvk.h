@@ -11,6 +11,7 @@
 #include <libplacebo/renderer.h>
 #include <libplacebo/vulkan.h>
 #include "overlaycompletion.h"
+#include "diagnostics/gputrace.h"
 
 #include <atomic>
 #include <deque>
@@ -63,6 +64,7 @@ public:
     virtual VrrFallbackReason checkSupport() const override;
     virtual bool canLatchAdaptivePresent() const override;
     virtual uint64_t waitForDecode(AVFrame* frame) override;
+    GpuTrace* gpuDiagnosticTrace() override { return m_GpuTrace.get(); }
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
                                           uint64_t decodeBoundary) override;
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
@@ -89,6 +91,10 @@ private:
     static void lockQueue(AVHWDeviceContext *dev_ctx, uint32_t queue_family, uint32_t index);
     static void unlockQueue(AVHWDeviceContext *dev_ctx, uint32_t queue_family, uint32_t index);
     static void overlayUploadComplete(void* opaque);
+    static void gpuRenderInfo(void* opaque, const pl_render_info* info);
+    std::unique_ptr<GpuTrace> m_GpuTrace;
+    int64_t m_GpuTracePts = -1;
+    uint64_t m_GpuTraceOutputUs = 0;
 
     void beginRenderTiming();
     void endRenderTiming();
@@ -183,7 +189,13 @@ private:
     // retired its GPU reads. This lets presentation use libplacebo's existing
     // render-complete semaphore without allowing the decoder to recycle a VA
     // surface underneath an in-flight Vulkan command.
-    std::deque<pl_frame> m_VrrRetainedSourceFrames;
+    struct RetainedSource {
+        pl_frame frame;
+        int64_t pts;
+        uint64_t outputUs;
+        uint64_t lastBusyUs;
+    };
+    std::deque<RetainedSource> m_VrrRetainedSourceFrames;
     bool m_VrrCurrentSourceRetained = false;
     uint64_t m_VrrRetainedSourceFrameTotal = 0;
     uint64_t m_VrrSourceRetirementWaits = 0;

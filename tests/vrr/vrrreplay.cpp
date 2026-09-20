@@ -13417,11 +13417,13 @@ int main(int argc, char* argv[])
                 referenceController->noteDeferredGpuReady(
                     gpuReadyWaitUs, true, recordedGpuReadyUpperBoundUs,
                     recordedGpuReadyUpperBoundUs >= recordedPreparationStartUs ?
-                        recordedGpuReadyUpperBoundUs - recordedPreparationStartUs : 0);
+                        recordedGpuReadyUpperBoundUs - recordedPreparationStartUs : 0,
+                    !gpuReadyCompletedBeforeWait);
                 simulatedController->noteDeferredGpuReady(
                     gpuReadyWaitUs, true, simulatedGpuReadyUpperBoundUs,
                     simulatedGpuReadyUpperBoundUs >= simulatedPreparationStartUs ?
-                        simulatedGpuReadyUpperBoundUs - simulatedPreparationStartUs : 0);
+                        simulatedGpuReadyUpperBoundUs - simulatedPreparationStartUs : 0,
+                    !gpuReadyCompletedBeforeWait);
             }
             else if (!deferredGpuReady) {
                 referenceController->noteGpuReadyWait(

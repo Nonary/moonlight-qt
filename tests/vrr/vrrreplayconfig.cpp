@@ -486,9 +486,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
         return fail("playout_responsive_buffer requires prediction-only playout without historical hitch feedback");
     }
     if (value.playoutSourceMappingDecoderOutput > 1 ||
-            value.playoutSerialServiceGate > 1 ||
+            value.playoutSerialServiceGate > 2 ||
             value.playoutRecentPressureRelease > 1) {
-        return fail("source mapping, serial service and recent pressure flags must be 0 or 1");
+        return fail("source mapping and recent pressure flags must be 0 or 1; serial service revision must be 0..2");
     }
     if ((value.playoutSerialServiceGate || value.playoutRecentPressureRelease) &&
             value.playoutResponsiveBuffer < 6) {

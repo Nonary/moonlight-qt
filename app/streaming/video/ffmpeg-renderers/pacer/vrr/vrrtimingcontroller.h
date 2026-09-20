@@ -316,7 +316,8 @@ public:
     // the growth gate. The observation time is not the frame's readiness time.
     void noteDeferredGpuReady(uint64_t waitUs, bool completed,
                               uint64_t completionUs = 0,
-                              uint64_t serviceUpperBoundUs = 0);
+                              uint64_t serviceUpperBoundUs = 0,
+                              bool readinessWasPending = false);
     void noteSchedulerDelays(uint64_t renderDelayUs,
                              uint64_t targetDelayUs,
                              bool targetDelayValid);
@@ -396,6 +397,8 @@ private:
         uint64_t acquisitionWaitUs = 0;
         uint64_t decodeSyncWaitUs = 0;
         uint64_t deferredGpuServiceUs = 0;
+        uint64_t deferredGpuWaitUs = 0;
+        uint64_t deferredGpuReadyUs = 0;
         uint64_t preparationCompleteUs = 0;
         uint64_t intervalIntendedUs = 0;
         bool intervalValid = false;

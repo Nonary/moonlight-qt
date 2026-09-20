@@ -5,11 +5,35 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Reference baseline: `6bea92dd` (vrr17 branch), including the stats overview
-wording/layout follow-up and cadence qualification correction (2026-09-19).
-Current source also contains the cross-platform source ownership and buffer-
-attribution correction described below. It changes timing, ownership and
-readiness accounting and has not yet been live-validated. The
+Reference baseline: `78b99f1c` (vrr17 branch), including source ownership,
+buffer attribution and decode-wait starvation prevention (2026-09-20).
+Production now selects serial-service revision 2: the shared interval buffer
+compares workload with intended time over its qualified one-second window,
+rather than treating one slow frame as sustained overload. Deferred D3D GPU
+service counts residual CPU waiting, not intentional pacing hold; a fence
+verified pending at the final wait supplies readiness lateness. Historical
+revisions 0/1 remain available. See
+[service-gate correction](docs/vrr-service-gate-correction.md).
+Live GPU diagnostics now add a separate asynchronous CSV under existing deep
+tracing: VA surface status at the worker wait, CPU dependency
+spans, source-retirement bounds, output readiness before presentation, and
+libplacebo's delayed shader-duration history. Shader samples are not tagged to
+their originating frame and do not expose absolute GPU start times. See
+[live GPU tracing](docs/gpu-live-tracing.md). That tracing does not alter replay
+schema or policy; the service-gate correction above changes production policy.
+GPU diagnostic revision 2 removes the decoder-thread surface-status query: live
+revision-1 captures showed it blocking behind another frame's decode synchronization.
+The worker-side query and remaining timing observations are retained for retesting.
+Revision 3 timestamps existing packet send/receive, packet delivery/assembly and
+pacer handoff, associates output surfaces with frame IDs, and samples Linux
+thread CPU time/context switches around send/receive, VA sync/status and render
+commands. Decoder-thread instrumentation only reads metadata and OS counters;
+it performs no new driver calls. These spans expose CPU-versus-blocked time and
+cross-thread overlap, not internal driver locks or GPU engine execution times.
+The current follow-up enables early preparation on both platforms and
+asynchronous VAAPI/Vulkan Mailbox output, described below. That follow-up still needs
+live validation; the baseline's latest high-bitrate run delivers about 100 FPS
+at a 120 FPS source despite the starvation improvement. The
 earlier timing lineage remains `1ccefb6e` (vrr17.1), plus the buffer-accounting review and
 initial-calibration follow-up (2026-09-18). Accounting adds separate buffer
 reasons, latency breakdowns and replay audits. The follow-up restores vrr14's
@@ -61,8 +85,9 @@ Live sessions also cap the preset allowance against the fitted source period,
 not only the negotiated stream rate. Successful Windows present-ready fence
 waits and synchronous Linux Vulkan completion polls can feed a
 separate bounded readiness lead: a recent p99 wait plus 500 us, clamped to 12 ms
-and one source period. Linux now retains source mappings through a bounded output-completion poll,
-then releases idle mappings before the target wait. A learned
+and one source period. Linux VAAPI retains source mappings until their GPU reads
+finish and uses the Mailbox swapchain's GPU semaphore for output completion.
+Other presentation modes, imports and software frames retain the bounded CPU output poll. A learned
 lead advances only the render-start deadline; it does not move the source
 presentation target or claim that the GPU will complete on time.
 Explicit captured parameters keep the new controls
@@ -120,10 +145,11 @@ absent so old captures retain their recorded mapping, service and release rules:
 The live interval buffer now separates delivery variation from serial local
 service. Serial service includes the explicit decoder wait, preparation work
 excluding swapchain acquisition, and render-scheduler delay; a deferred backend
-completion can supply a conservative larger upper bound. Growth is eligible only
-when the attributed frame is late and both serial service and decoder-queue time
-fit that pair's actual intended target interval. The comparison uses the smoothed
-target-to-target interval, which can be shorter than the fitted or raw RTP period.
+completion contributes its actual residual CPU wait in revision 2. Revision 1
+used the conservative full preparation-to-observation upper bound. Growth is eligible only when the attributed frame is late and the qualified
+window has capacity for measured serial service and decoder-queue pressure.
+Revision 1 tested only one pair; revision 2 uses the total smoothed intended
+interval time over the same one-second window as interval pressure.
 Extra standing delay cannot make a pipeline whose serial work exceeds its slot
 process frames faster. The preset's long severity-weighted history remains part
 of quality reporting and attack qualification, while only recent current pressure
@@ -139,15 +165,20 @@ render context lock is released during both the cadence hold and that residual
 wait, and the source `AVFrame` stays owned through presentation. Linux VAAPI keeps
 one explicit worker readiness synchronization but removes the duplicate explicit
 prepare-time synchronization. Hardware Vulkan preparation retains the imported
-source mapping until GPU completion. The asynchronous output-wait bypass was
-withdrawn after a clean live throughput regression; hardware and software frames
-now use the bounded output-completion poll before the target hold.
+source mapping until GPU completion. The VAAPI Mailbox path now uses libplacebo's
+render-complete presentation semaphore without an additional CPU output wait.
+Other presentation modes, imports and software frames retain the bounded output-completion poll.
+Both platforms spend the existing playout interval on preparation, with
+`playout_prepare_on_arrival=1` and `render_start_after_submission_us=0`.
+This is necessary for the asynchronous path: without a CPU completion sample,
+it cannot rely on that sample to learn an adequate GPU render-ahead allowance.
+Presentation targets, buffer limits and native interval protection are unchanged.
 
 These changes improve overlap and prevent unabsorbable local work from buying
 more buffer; they do not prove lower visible latency or smoother scanout. Windows
 fence poll/event timestamps are conservative CPU observation bounds, and a fence
 first checked at the target can have completed earlier during the cadence hold.
-Linux source retirement proves that imported reads can be released. The restored
+Linux source retirement proves that imported reads can be released. The fallback
 output poll supplies a separate CPU completion upper bound. Neither observation
 is a hardware timestamp, and a Windows completion first observed at the target
 can conservatively overstate service. Passing the service gate is not proof of
@@ -1049,7 +1080,9 @@ delay” ends when the presentation call returns. It does not include unmeasured
 time from that return until the image becomes visible on the display.
 On Windows, decode-to-render ordering is normally a GPU-side wait and the residual
 present-ready fence wait occurs inside the presentation call, so neither is an
-independent CPU decode-wait row. On Linux Vulkan, output completion is sampled synchronously before the target hold. These accounting identities therefore partition the
+independent CPU decode-wait row. Linux VAAPI/Vulkan Mailbox output is asynchronous and
+does not report a CPU output-completion sample; other Linux imports still poll
+before the target hold. These accounting identities therefore partition the
 observed CPU path; they do not expose every GPU stage.
 None of these differences alone measures click-to-photon or glass-to-glass
 latency. RTT is a round trip, not measured one-way video delay.
@@ -1236,7 +1269,7 @@ Display smoothness feedback remains diagnostic. Historical Linux thresholded
 submission-error attribution is retained for replay; live revision 7 uses the
 shared interval policy described above.
 Historical feedback policies remain selectable for exact replay.
-It disables the retired metronome and prepare-on-arrival experiment.
+It disables the retired metronome and enables preparation on arrival.
 It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 
 | Production input | Value / meaning |
@@ -1253,14 +1286,14 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | Live interval-buffer release | 125/250/50 us per second after 6/8/10-second clean holds for Low Latency/Balanced Target/Smooth; recent pressure owns the hold, while long score debt remains reporting/attack evidence |
 | Historical readiness attack/release inputs | 500 us attack and 10 us release; not the live revision-7 growth/release rule |
 | Live preset-cap basis | Fitted source period (`playout_delay_cap_uses_observed_period=1`); captured policies retain their recorded basis |
-| GPU readiness lead | Recent completed backend wait p99 plus 500 us, attacked by at most 1,000 us per sample and released at 250 us/s; Linux Vulkan samples bounded output completion before the target hold |
+| GPU readiness lead | Recent completed backend wait p99 plus 500 us, attacked by at most 1,000 us per sample and released at 250 us/s; unavailable asynchronous VAAPI completion does not train this term |
 | GPU readiness ceiling | `min(12,000 us, fitted source period)`; target/deadline unchanged |
 | Capacity telemetry | `playout_capacity_telemetry=1` exposes unclamped demand and cap pressure in live decisions |
 | Smoothing gain | 150 when Reduce judder is checked; 0 when unchecked |
 | Smoothing period EMA | 25 per mille with fractional carry; active only with smoothing enabled |
 | Positive smoothing lag cap | 2,000 us; active only with smoothing enabled |
 | Render lead floor | 3,000 us |
-| Preparation-start spacing input | 6,000 us after prior submission |
+| Preparation start | Use the existing playout interval (`playout_prepare_on_arrival=1`), with no additional post-submission delay |
 | Minimum preparation lead input | 2,500 us |
 | Future-offset reseed requirement | 3 consecutive qualifying projections |
 
@@ -1470,16 +1503,13 @@ With `latchedFloorDisabled` and a latched decision it returns zero. This is a
 deliberate reliance on native presentation behavior; it must be checked against
 the actual renderer implementation, not inferred from the request flag.
 
-Preparation starts ahead of the target using learned render/scheduler budgets.
-The 6 ms post-submission preparation constraint addresses swapchain acquisition
-that can block when preparation immediately follows a previous present. The
-production `render_start_preserve_learned_lead=1` policy lets that constraint
-consume only spare lead: it cannot reduce the learned render plus scheduler
-lead to the legacy 2.5 ms minimum. Longer preparation therefore earns an earlier
-render start, instead of being squeezed into the same narrow window behind a
-larger playout buffer. The 3 ms render-lead
-floor remains subject to the existing source-rate and capacity bounds.
-Preparing immediately at arrival remains an experiment, not production default.
+Preparation starts ahead of the target using the existing playout interval plus
+learned render/scheduler budgets. Production enables preparation on arrival on
+both platforms and removes the former 6 ms post-submission software delay.
+Native acquisition still supplies backpressure when images are unavailable;
+deferring the start in software cannot make those images available sooner.
+The 3 ms render-lead floor remains subject to source-rate and capacity bounds.
+Historical traces retain their explicit preparation and spacing parameters.
 
 ## 9. Active production learning and bounded delay
 
@@ -1954,20 +1984,36 @@ surface. This removes redundant CPU serialization without treating decoder
 output as proof of GPU completion.
 
 Hardware Vulkan preparation retains the mapped `pl_frame`, including libplacebo's
-AVFrame reference and imported source textures, through the bounded output-FBO
-completion poll. It then retires idle source mappings and reports
+AVFrame reference and imported source textures, until their GPU reads finish.
+VAAPI Mailbox output is submitted asynchronously: libplacebo transitions the output
+image, signals a render-complete semaphore, and supplies it to
+`vkQueuePresentKHR`. CPU completion is not required for this handoff. Preparation,
+presentation and cancellation retire idle source mappings and preparation reports
 `sourceFrameReusable=true` only when no retained mapping remains. This releases
 the worker's surface before the target hold without recycling external decoder
 memory while Vulkan reads it. Cancellation and failure can leave mappings pending;
 they remain owned until idle or healthy-GPU teardown finishes them.
 
-The asynchronous output-wait bypass was withdrawn after the 2026-09-19 23:54:19
+The first asynchronous output-wait bypass was withdrawn after the 2026-09-19 23:54:19
 clean capture: 117.67 incoming FPS, 85.29 rendered FPS, 27.52% client drops and
 zero network drops. Concurrent Vibeshine capture was reported to cause a hard
-stall. The restored barrier is a recovery change, not proof of the stall's cause
-or of restored live performance. Both hardware and software output polls retain
-the 50 ms / 100,000-observation bound and shared CPU-observation telemetry.
-D3D11 fence/event fields remain unset on Vulkan rows.
+stall. Restoring the barrier did not establish the cause. The subsequent trace
+proved decode-wait discard starvation, corrected in `78b99f1c`. The 00:30:01
+launch then produced 76.11% client timing / 100.23 rendered FPS at 301.5 Mbps,
+versus 99.67% / 117.37 FPS at 57 Mbps, both Smooth without concurrent capture.
+After 20 seconds from the first arrival, high-bitrate presented frames averaged 9.559 ms of serial
+decode-wait + preparation + submission service against an 8.333 ms period.
+
+The new asynchronous VAAPI path pairs source retention and the corrected stale
+policy with early preparation. It retains at most two source mappings, applies
+bounded retirement backpressure before acquiring another swapchain image, and
+never calls an unavailable output-completion sample a zero-duration completion.
+Immediate presentation keeps the CPU completion check because GPU-delayed flips
+could otherwise bunch despite correctly spaced CPU submissions. Other modes,
+software and other imports keep the 50 ms / 100,000-observation output-poll bound.
+D3D11 fence/event fields remain unset on Vulkan rows. The reduced CPU service
+and improved submission score expected from this change do not establish actual
+display cadence; a new high-bitrate live run is required.
 
 The selected adaptive mode remains immutable for the lifetime of one persistent
 swapchain. Per-frame controller requests never destroy or recreate that chain.
@@ -2154,7 +2200,7 @@ Current-policy replay and queue simulation select the shared prediction policy
 regardless of native backend. Exact replay continues to use recorded parameters,
 including historical Linux thresholded-event demand. Replay audits Vulkan's
 historical texture-poll readiness rows with their recorded result and completion-
-bound rules. Captures from the withdrawn asynchronous Linux path can leave output readiness
+bound rules. Asynchronous Linux VAAPI captures can leave output readiness
 unavailable; replay must not invent completion evidence for those rows. The separate strict Windows/raster diagnostic gate remains backend-specific
 and may still reject otherwise reproducible Vulkan captures when its Windows-only
 display evidence is absent.
@@ -2265,9 +2311,9 @@ call). These retain the existing accounting and successful-frame denominator.
 An explicit GPU-ready wait is reported with measurement coverage and averages
 only frames with a valid sample. On Windows the residual present-ready wait is
 inside the submission call and therefore also inside rendering; the GPU-queued
-decode dependency is not a separate CPU wait. Linux hardware and software frames
-report the restored output-completion poll inside preparation. Captures from the
-withdrawn asynchronous hardware path can have no output-ready sample.
+decode dependency is not a separate CPU wait. Linux VAAPI Mailbox output uses GPU
+presentation synchronization and has no CPU output-ready sample. Other Linux
+imports and software frames report their completion poll inside preparation.
 These rows do not measure total GPU execution. Applied buffer is a
 schedule allowance, not another component to add to these measured times. The
 normal and non-VRR overviews retain their original queue/rendering rows. Request values,

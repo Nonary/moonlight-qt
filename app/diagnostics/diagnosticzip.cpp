@@ -30,7 +30,7 @@ bool writeDiagnosticZip(const QDir& source, const QString& destination, QString&
 {
     // Never sweep settings, keys, crash dumps, other captures, or symlinks into
     // a support bundle. Reconnected worker segments use this same prefix.
-    const auto files = source.entryInfoList({"Moonlight*.vrrtrace", "Moonlight.log", "capture-info.json"},
+    const auto files = source.entryInfoList({"Moonlight*.vrrtrace", "Moonlight*.vrrtrace.gpu-*.csv", "Moonlight.log", "capture-info.json"},
         QDir::Files | QDir::NoSymLinks, QDir::Name);
     if (files.isEmpty() || QFileInfo::exists(destination)) {
         error = QCoreApplication::translate("DiagnosticCapture", "No capture files to export, or the destination already exists.");

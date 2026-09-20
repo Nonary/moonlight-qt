@@ -641,6 +641,10 @@ void testDecodeWaitDoesNotExpireReadyFrame()
         expect(backend.waitForPrepareCount(1),
                "first image must hold the worker before the decode gate");
         FrozenTestClock clock;
+        // Early preparation now reaches this gate before the first target.
+        // Let the next source interval elapse before admitting frame 2; the
+        // frozen clock must not prevent frame 1 from reaching its own target.
+        clock.advance(8333);
         worker.submit(makeFrame(2, delayed));
         clock.advance(5000);
         backend.releasePreparation();

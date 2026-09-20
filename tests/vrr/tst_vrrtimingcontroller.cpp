@@ -52,6 +52,8 @@ VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
     policy.playoutSubmissionEstimateFallback = 0;
     policy.playoutStableSmoothnessReference = 0;
     policy.renderStartPreserveLearnedLead = 0;
+    policy.playoutPrepareOnArrival = 0;
+    policy.renderStartAfterSubmissionUs = 6000;
     policy.playoutPredictionEnabled = 0;
     policy.playoutSmoothnessFeedbackEnabled = 0;
     policy.playoutSmoothingGainPerMille = session.smoothFrameTiming ? 200 : 0;
@@ -945,6 +947,49 @@ void testPrepareOnArrivalSpendsTheCushion()
            "an on-time frame must be ready to prepare at its mapped slot");
     expect(decision.playoutDelayUs >= 6000,
            "the whole-tail cushion must not release below the start before it has evidence");
+}
+
+void testProductionPreparationUsesAvailableSlack()
+{
+    // An asynchronous renderer cannot learn a render-ahead budget from a CPU
+    // completion wait that it deliberately avoids. Give it the existing
+    // playout interval from the first frame, including after a decode stall,
+    // without moving the presentation target or increasing standing delay.
+    for (int mode : {0, 1, 2}) {
+        auto session = config(120, 120);
+        session.latencyMode = mode;
+        auto policy = vrrTimingParametersForSession(session);
+        policy.sourcePlayoutDelayUs = 10000;
+        policy.playoutDelayAdaptive = 0;
+        auto delayedPolicy = policy;
+        delayedPolicy.playoutPrepareOnArrival = 0;
+        delayedPolicy.renderStartAfterSubmissionUs = 6000;
+        VrrTimingController early(session, true, policy);
+        VrrTimingController delayed(session, true, delayedPolicy);
+        bool gainedSlack = false;
+        uint64_t previousSubmissionUs = 0;
+        for (int i = 0; i < 240; ++i) {
+            const uint32_t rtp = uint32_t(i * 750);
+            const uint64_t outputUs = decodedTimeForRtp(1000000, rtp);
+            const uint64_t decodeWaitUs = i % 23 == 0 ? 6000 : 1000;
+            const uint64_t nowUs = std::max(outputUs, previousSubmissionUs) + decodeWaitUs;
+            const auto a = early.schedule(frame(i + 1, rtp, true, outputUs), nowUs);
+            const auto b = delayed.schedule(frame(i + 1, rtp, true, outputUs), nowUs);
+            expect(a.targetUs == b.targetUs &&
+                       a.playoutDelayUs == b.playoutDelayUs &&
+                       a.latchedPresentation == b.latchedPresentation,
+                   "early preparation must preserve target, buffer and presentation protection");
+            expect(a.renderStartUs <= nowUs,
+                   "production must prepare a ready source immediately, including after a decode stall");
+            gainedSlack |= std::max(nowUs, a.renderStartUs) < b.renderStartUs;
+            early.notePreparationDuration(750);
+            delayed.notePreparationDuration(750);
+            previousSubmissionUs = std::max(nowUs + 750, a.targetUs);
+            early.noteSubmission(true, false, previousSubmissionUs);
+            delayed.noteSubmission(true, false, previousSubmissionUs);
+        }
+        expect(gainedSlack, "early preparation must recover usable GPU execution time");
+    }
 }
 
 void testRenderStartKeepsClearOfPreviousPresent()
@@ -3640,6 +3685,32 @@ void testDeferredGpuObservationDoesNotCreateBufferPressure()
     expect(preparationBound.intervalStats().update.requestedUs ==
                lateObservation.intervalStats().update.requestedUs,
            "fence observation time must leave the interval-buffer request unchanged");
+
+    // Actual unfinished GPU work at the target is different from observing
+    // an already-complete fence late. Revision 1 silently discarded this
+    // readiness miss; revision 2 must learn without counting the cadence hold.
+    auto oldPolicy = policy;
+    oldPolicy.playoutSerialServiceGate = 1;
+    VrrTimingController historical(session, true, oldPolicy);
+    VrrTimingController residualWait(session, true, policy);
+    bool residualGrew = false, historicalGrew = false;
+    for (int i = 0; i < 600; ++i) {
+        const uint32_t rtp = static_cast<uint32_t>(i * 750);
+        const uint64_t decoded = decodedTimeForRtp(1000000, rtp);
+        for (auto* controller : {&historical, &residualWait}) {
+            const auto decision = controller->schedule(frame(i, rtp, true, decoded), decoded);
+            controller->notePreparationDuration(500, 0, decoded + 500);
+            controller->noteSchedulerDelays(0, 0, true);
+            const uint64_t wait = i % 2 ? 3000 : 0;
+            controller->noteDeferredGpuReady(wait, true, decision.targetUs + wait,
+                decision.targetUs + wait - decoded, wait != 0);
+            controller->noteSubmission(true, false, decision.targetUs + wait);
+        }
+        residualGrew |= residualWait.intervalStats().update.action == Vrr13::IntervalBuffer::Action::Grow;
+        historicalGrew |= historical.intervalStats().update.action == Vrr13::IntervalBuffer::Action::Grow;
+    }
+    expect(residualGrew && !historicalGrew,
+           "only verified residual GPU waits must supply readiness pressure to the new policy");
 }
 
 void testReadinessDrivenPadding()
@@ -5005,7 +5076,7 @@ void testMeanMissBuffer()
         const auto policy = vrrTimingParametersForSession(session);
         expect(policy.playoutResponsiveBuffer == 7 &&
             policy.playoutSourceMappingDecoderOutput == 1 &&
-            policy.playoutSerialServiceGate == 1 &&
+            policy.playoutSerialServiceGate == 2 &&
             policy.playoutRecentPressureRelease == 1 &&
             policy.playoutMeanMissHoldUs == (mode == 2 ? 6000000 : mode == 1 ? 8000000 : 10000000) &&
             policy.playoutMeanMissReleaseUsPerSecond == (mode == 0 ? 50 : mode == 2 ? 125 : 250),
@@ -5064,6 +5135,45 @@ void testIntervalQualityUsesPresetHistory()
     expect(oneMinute.stats().averageValid && fiveMinutes.stats().averageValid &&
                fiveMinutes.stats().evaluatedUs > oneMinute.stats().evaluatedUs,
            "the active quality score must retain the selected preset history duration");
+}
+
+void testIntervalBufferTransientServiceRecovery()
+{
+    const auto run = [](unsigned gate, bool overloaded) {
+        Vrr13::IntervalBuffer buffer;
+        uint64_t applied = 1000, previousSubmit = 0, peak = applied;
+        unsigned growths = 0;
+        for (uint64_t i = 1; i <= 3000; ++i) {
+            const uint64_t source = 1000000 + i * 10000;
+            const uint64_t start = std::max(source, previousSubmit);
+            // An asynchronous dependency occasionally finishes late. The
+            // following cheap frames recover; persistent serial overload does not.
+            const uint64_t ready = overloaded ? start + 11000 :
+                std::max(start, source + (i % 4 == 0 ? 14000 : 0)) + 500;
+            const uint64_t target = source + applied;
+            const uint64_t submitted = std::max(target, ready);
+            buffer.observe({i, source, submitted, target, ready, applied,
+                            true, true, ready - start, 0},
+                           1000, 16000, 8000000, 250, true, 995000,
+                           500, 120000000, 500000, 32, true, gate);
+            growths += buffer.stats().update.action == Vrr13::IntervalBuffer::Action::Grow;
+            applied = buffer.demand(applied);
+            peak = std::max(peak, applied);
+            previousSubmit = submitted;
+        }
+        return std::array<double, 3>{double(peak), double(growths), buffer.stats().qualityPercent()};
+    };
+    const auto historical = run(1, false);
+    const auto recoverable = run(2, false);
+    const auto overloaded = run(2, true);
+    std::printf("transient service: historical peak=%.0f quality=%.3f; corrected peak=%.0f quality=%.3f; overload peak=%.0f\n",
+        historical[0], historical[2], recoverable[0], recoverable[2], overloaded[0]);
+    expect(historical[0] <= 5000,
+           "historical gate can cover cheap catch-up frames but vetoes the actual transient stall");
+    expect(recoverable[0] > 10000 && recoverable[2] > historical[2],
+           "recoverable serial-service bursts must acquire useful protection");
+    expect(overloaded[0] == 1000 && overloaded[1] == 0,
+           "sustained service overload must still reject additional latency");
 }
 
 void testIntervalBufferSeparatesDeliveryFromSerialService()
@@ -5322,6 +5432,7 @@ void testBufferDecisionDiagnostics()
 int main()
 {
     testIntervalBufferReleaseIgnoresReportingDebt();
+    testIntervalBufferTransientServiceRecovery();
     testIntervalBufferSeparatesDeliveryFromSerialService();
     testProductionCalibrationSurvivesFpsChanges();
     testInitialIntervalCalibration();
@@ -5384,6 +5495,7 @@ int main()
     testCadenceSmoothingEvensJitteredSource();
     testAdaptivePlayoutDelaySlewsAcrossBands();
     testPrepareOnArrivalSpendsTheCushion();
+    testProductionPreparationUsesAvailableSlack();
     testRenderStartKeepsClearOfPreviousPresent();
     testShortHitchDoesNotRefitSourceRate();
     testMotionDeadbandHonorsStampSteps();

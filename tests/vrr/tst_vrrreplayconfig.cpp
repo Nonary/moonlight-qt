@@ -248,7 +248,7 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     QCOMPARE(restored.playoutOffsetSourceClock, uint64_t(1));
     QCOMPARE(restored.playoutOffsetMaximumStepUs, uint64_t(100));
     QCOMPARE(restored.playoutSourceMappingDecoderOutput, uint64_t(1));
-    QCOMPARE(restored.playoutSerialServiceGate, uint64_t(1));
+    QCOMPARE(restored.playoutSerialServiceGate, uint64_t(2));
     QCOMPARE(restored.playoutRecentPressureRelease, uint64_t(1));
     QVERIFY(vrrReplayParameterNames().contains("controller.playout_offset_cadence_gate"));
     QVERIFY(vrrReplayParameterNames().contains("controller.playout_offset_slew_us_per_second"));
@@ -279,6 +279,12 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     QCOMPARE(historical.playoutSerialServiceGate, uint64_t(0));
     QCOMPARE(historical.playoutRecentPressureRelease, uint64_t(0));
 
+    auto revisionOneSnapshot = snapshot;
+    revisionOneSnapshot["playout_serial_service_gate"] = 1;
+    QVERIFY2(applyVrrReplayControllerSnapshot(revisionOneSnapshot, historical, error),
+             qPrintable(error));
+    QCOMPARE(historical.playoutSerialServiceGate, uint64_t(1));
+
     auto invalid = restored;
     invalid.playoutOffsetCadenceGate = 2;
     QVERIFY(!validateVrrTimingParameters(invalid, error));
@@ -298,6 +304,8 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     QVERIFY(!validateVrrTimingParameters(invalid, error));
     invalid = restored;
     invalid.playoutSerialServiceGate = 2;
+    QVERIFY(validateVrrTimingParameters(invalid, error));
+    invalid.playoutSerialServiceGate = 3;
     QVERIFY(!validateVrrTimingParameters(invalid, error));
     invalid = restored;
     invalid.playoutRecentPressureRelease = 2;
