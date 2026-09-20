@@ -316,10 +316,11 @@ public:
     // thread split prepare/present path using its adaptive presentation mode.
     virtual VrrFallbackReason checkSupport() const = 0;
 
-    // Block until the decoder's GPU work for this frame has completed, so
-    // the pacer sees the frame's true readiness and preparation never waits
-    // on the decoder. Returns the microseconds spent waiting; zero when the
-    // backend cannot tell or the frame was already complete.
+    // Establish the decoder dependency for this frame before preparation.
+    // A backend may block until the dependency completes or observe/queue it
+    // without blocking when its rendering API can wait on the GPU. Returns
+    // only CPU time actually spent waiting; zero for an asynchronous
+    // dependency, an unavailable observation, or an already-complete frame.
     virtual uint64_t waitForDecode(AVFrame*)
     {
         return 0;
@@ -358,7 +359,8 @@ public:
     }
 
     // Presents the prepared image using the backend's adaptive presentation
-    // path without intentionally waiting.
+    // path. A backend may finish a completion dependency here after the
+    // worker's cadence hold, so only its residual wait delays submission.
     virtual VrrPresentFeedback presentAdaptive(
         const VrrPresentRequest& request) = 0;
 

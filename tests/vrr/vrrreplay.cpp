@@ -381,6 +381,7 @@ bool validateTraceRowSyntax(const QList<QByteArray>& header,
         "presented",
         "output_dropped",
         "queue_capacity",
+        "queue_stale",
         "arrival_rejected",
         "suspension_discard",
         "shutdown_discard",
@@ -4997,7 +4998,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.gpuReadyNativeResultTelemetryAvailable &&
         metrics.gpuReadyNativeResultRelationshipMismatchRows == 0;
     gpuReadyNativeOperations["result_semantics"] =
-        "D3D11 Signal and SetEventOnCompletion retain signed HRESULT and its wait retains the exact DWORD; Vulkan texture-poll rows use 0 for idle completion, 1 for the bounded timeout, and 2 for interruption or GPU failure. D3D11 stage validity follows HRESULT success (nonnegative), while successful timing requires WAIT_OBJECT_0 (0); presented rows require the backend's successful completion result for strict coverage";
+        "D3D11 Signal and SetEventOnCompletion retain signed HRESULT; the bounded fence wait records aggregate completion (0), timeout (258), or failure (4294967295), with completion requiring the requested fence value. Vulkan texture-poll rows use 0 for idle completion, 1 for the bounded timeout, and 2 for interruption or GPU failure. D3D11 stage validity follows HRESULT success (nonnegative); presented rows require the backend's successful completion result for strict coverage";
     telemetryCoverage["gpu_ready_native_operations"] =
         gpuReadyNativeOperations;
     QJsonObject gpuReadyStageTiming;
@@ -6849,7 +6850,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     readiness["display_calibration_scope"] =
         "calibration_confirmed is an operator assertion covering the SyncQPCTime-to-first-active-line offset, Present-to-display transport, and phase uncertainty; replay cannot measure panel transport or output. Optional microsecond period and active-duration overrides must agree with the captured physical refresh rational and active/total pixel geometry; zero means derive them from that signal. The tear-exposure interval ends at the final active pixel rather than including the last line's trailing horizontal blank. Raster classification and counterfactual propagation use an explicit scanout_period_ps override or the exact captured physical-signal rational, and reject disagreement beyond one picosecond. D3DKMT validation separately uses the complete vertically-active line interval, compares every definite active prediction with the recorded scan-line index, and reports its phase-derived error and tolerance for later calibration sweeps. Raster readiness requires at least 100 such active scan-line comparisons and requires phase_uncertainty_us to cover at least the captured QPC-correlation half-span plus one microsecond of timestamp quantization";
     readiness["gpu_ready_scope"] =
-        "D3D11 records separate Signal, Flush, SetEventOnCompletion, completed-value poll, and event-wait brackets inside preparation. Exact native results and target/completed fence values validate stage progression, the producer's completed-before-wait bit, and reject device removal or impossible lag. The trace proves completion occurred within the derived interval and before Present; it does not fabricate an exact GPU completion timestamp";
+        "D3D11 records Signal, Flush, SetEventOnCompletion and the initial completed-value poll during preparation. The final bounded fence wait may run inside present or cancellation after preparation. Native results and target/completed fence values validate stage progression, the producer's completed-before-wait bit, and reject device removal or impossible lag. Successful bounds prove completion within the derived interval and before a recorded Present; they are not exact GPU completion timestamps";
     readiness["post_present_query_scope"] =
         "deep traces bracket GetLastPresentCount and GetFrameStatistics after native Present and any observation-only after-Present raster query. Replay requires their exact order before presenter return; ordinary traces retain result codes but deliberately leave the optional timing brackets zero";
     readiness["spacing_scope"] =
@@ -9029,21 +9030,28 @@ int main(int argc, char* argv[])
         const uint64_t gpuReadinessAppliedUs =
             optionalUnsignedField(
                 fields, columns.gpuReadinessAppliedUs);
+        const bool deferredGpuPolicy = optionalUnsignedField(
+            fields, columns.capturedParameterColumns.value(
+                QStringLiteral("controller.playout_serial_service_gate"), -1)) != 0;
         const bool nativeBackendDeclared =
             optionalUnsignedField(
                 fields, columns.nativeBackendValid) != 0;
         const uint64_t nativeBackend = optionalUnsignedField(
             fields, columns.nativeBackend);
-        // Vulkan's renderer reports image-local libplacebo completion polling
-        // through the shared readiness timing fields. The D3D11 signal/event
-        // and fence-value fields remain intentionally unavailable on those
-        // rows. Native backend identity is already captured on every Vulkan
-        // submission (including the neutral submit used for cancellation).
+        // Vulkan reports image-local libplacebo completion polling through
+        // the shared readiness fields. Historical asynchronous hardware rows
+        // can leave those fields unavailable. D3D11 signal/event/fence fields stay
+        // absent on every Vulkan row. Native backend identity is captured on
+        // each Vulkan submission, including neutral cancellation submits.
         const bool gpuReadyVulkanPoll =
             nativeBackendDeclared && nativeBackend == kNativeBackendVulkan;
         const bool nativePresentResultDeclared =
             optionalUnsignedField(
                 fields, columns.nativePresentResultValid) != 0;
+        const bool pendingCancelledGpuWaitAllowed =
+            deferredGpuPolicy && cancelled && !presented &&
+            (disposition == "interrupted" || disposition == "preparation_failed") &&
+            !nativeBackendDeclared && !nativePresentResultDeclared;
         const int64_t nativePresentResult = optionalSignedField(
             fields, columns.nativePresentResult);
         const bool nativePresentParametersDeclared =
@@ -9446,8 +9454,14 @@ int main(int argc, char* argv[])
                      gpuReadyWaitStartUs != 0 ||
                      gpuReadyTimeUs != 0 ||
                      gpuReadyWaitUs != 0) ? 1 : 0;
+            const bool deferredGpuCancellationPending =
+                pendingCancelledGpuWaitAllowed &&
+                gpuReadySetEventSucceeded &&
+                !gpuReadyWaitResultDeclared &&
+                !gpuReadyTimingDeclared;
             metrics.validityPayloadMismatches +=
                 !gpuReadyWaitResultDeclared &&
+                    !deferredGpuCancellationPending &&
                     (gpuReadyPollStartUs != 0 ||
                      gpuReadyPollEndUs != 0 ||
                      gpuReadyPollCompletedValue != 0 ||
@@ -9540,7 +9554,8 @@ int main(int argc, char* argv[])
                         gpuReadySetEventResultDeclared, gpuReadySetEventResult,
                         gpuReadyWaitResultDeclared, gpuReadyWaitResult,
                         gpuReadyTimingDeclared,
-                        gpuReadySignalStartUs, gpuReadyFenceValue);
+                        gpuReadySignalStartUs, gpuReadyFenceValue,
+                        pendingCancelledGpuWaitAllowed);
                 metrics.gpuReadyNativeResultRelationshipMismatchRows +=
                     gpuReadyOperation.relationshipValid ? 0 : 1;
                 gpuReadyNativeSuccess = gpuReadyOperation.exactSuccess;
@@ -10656,7 +10671,8 @@ int main(int argc, char* argv[])
         const bool rowDecisionValid =
             unsignedField(fields, columns.decisionValid) != 0;
         const bool readinessOutcome = disposition == "presented" || disposition == "output_dropped" ||
-            disposition == "queue_capacity" || disposition == "stale" || disposition == "preparation_failed";
+            disposition == "queue_capacity" || disposition == "queue_stale" ||
+            disposition == "stale" || disposition == "preparation_failed";
         if (readinessOutcome) {
             const int intendedColumn = traceHeader.indexOf("original_target_us");
             const uint64_t deadline = intendedColumn >= 0 ? unsignedField(fields, intendedColumn) :
@@ -10717,7 +10733,9 @@ int main(int argc, char* argv[])
                 // decision row. Audit that row with its recorded revision,
                 // too, rather than the default pre-revision-4 clock rule.
                 optionalUnsignedField(fields, columns.capturedParameterColumns.value(
-                    QStringLiteral("controller.playout_responsive_buffer"), -1)) >= 4) ? 0 : 1;
+                    QStringLiteral("controller.playout_responsive_buffer"), -1)) >= 4,
+                optionalUnsignedField(fields, columns.capturedParameterColumns.value(
+                    QStringLiteral("controller.playout_source_mapping_decoder_output"), -1)) != 0) ? 0 : 1;
         metrics.arrivalToDequeueOrderViolations +=
             dequeueUs != 0 && dequeueUs < pacerArrivalUs ? 1 : 0;
         metrics.dequeueToDecisionOrderViolations +=
@@ -12584,6 +12602,8 @@ int main(int argc, char* argv[])
                          unsignedField(fields, columns.rtpValid) != 0,
                          decoderOutputUs);
         frame.noteGpuReadyUs(decodeCompleteUs);
+        frame.noteDecodeSyncWaitUs(
+            optionalUnsignedField(fields, columns.decodeSyncWaitUs));
         frame.setDeliveryTimeline(
             optionalUnsignedField(fields, traceHeader.indexOf("frame_receive_us")),
             optionalUnsignedField(fields, traceHeader.indexOf("frame_reassembled_us")),
@@ -12724,9 +12744,12 @@ int main(int argc, char* argv[])
                 recordedStaleCheckUs >= recordedDecisionEndUs;
             metrics.staleCheckOrderViolations +=
                 staleCheckOrderValid ? 0 : 1;
+            const uint64_t staleAgeBoundaryUs =
+                capturedParameters.playoutSourceMappingDecoderOutput != 0 ?
+                    decoderOutputUs : decodeCompleteUs;
             const uint64_t expectedStaleAgeUs =
-                recordedStaleCheckUs >= decodeCompleteUs ?
-                    recordedStaleCheckUs - decodeCompleteUs : 0;
+                recordedStaleCheckUs >= staleAgeBoundaryUs ?
+                    recordedStaleCheckUs - staleAgeBoundaryUs : 0;
             metrics.staleAgeMismatchRows +=
                 expectedStaleAgeUs != optionalUnsignedField(
                     fields, columns.staleAgeUs) ? 1 : 0;
@@ -13362,16 +13385,50 @@ int main(int argc, char* argv[])
             const bool gpuReadyCompleted = gpuReadyTimingDeclared &&
                 gpuReadyWaitResultDeclared && gpuReadyWaitResult == 0 &&
                 gpuReadyTimeUs >= gpuReadyWaitStartUs;
+            const bool deferredGpuReady = gpuReadyCompleted &&
+                isVrrGpuReadyWaitDeferred(
+                    capturedParameters.playoutSerialServiceGate != 0,
+                    gpuReadySignalSucceeded && gpuReadySetEventSucceeded,
+                    gpuReadyWaitResultDeclared,
+                    recordedPreparationEndUs,
+                    gpuReadyWaitStartUs);
+            const uint64_t recordedGpuReadyUpperBoundUs =
+                gpuReadyCompletedBeforeWait ?
+                    gpuReadyPollEndUs : gpuReadyTimeUs;
             referenceController->notePreparationDuration(
                 preparationUs, acquire, recordedPreparationEndUs,
-                gpuReadyCompleted ? gpuReadyWaitUs : 0);
+                gpuReadyCompleted && !deferredGpuReady ? gpuReadyWaitUs : 0);
             simulatedController->notePreparationDuration(
                 simulatedPreparationUs, acquire, simulatedPreparationEndUs,
-                gpuReadyCompleted ? gpuReadyWaitUs : 0);
-            referenceController->noteGpuReadyWait(
-                gpuReadyWaitUs, gpuReadyCompleted, gpuReadyTimeUs);
-            simulatedController->noteGpuReadyWait(
-                gpuReadyWaitUs, gpuReadyCompleted, simulatedPreparationEndUs);
+                gpuReadyCompleted && !deferredGpuReady ? gpuReadyWaitUs : 0);
+            // Production consumes deferred completion only after
+            // presentAdaptive(). A cancelFrame() drain protects source
+            // lifetime but never trains the controller for an interrupted
+            // or failed-preparation lifecycle.
+            if (deferredGpuReady && normalPresentationLifecycle) {
+                const uint64_t simulatedGpuReadyUpperBoundUs =
+                    mapVrrGpuReadyUpperBound(
+                        recordedPreparationStartUs,
+                        recordedPreparationEndUs,
+                        simulatedPreparationStartUs,
+                        simulatedPreparationEndUs,
+                        recordedGpuReadyUpperBoundUs,
+                        gpuReadyCompletedBeforeWait);
+                referenceController->noteDeferredGpuReady(
+                    gpuReadyWaitUs, true, recordedGpuReadyUpperBoundUs,
+                    recordedGpuReadyUpperBoundUs >= recordedPreparationStartUs ?
+                        recordedGpuReadyUpperBoundUs - recordedPreparationStartUs : 0);
+                simulatedController->noteDeferredGpuReady(
+                    gpuReadyWaitUs, true, simulatedGpuReadyUpperBoundUs,
+                    simulatedGpuReadyUpperBoundUs >= simulatedPreparationStartUs ?
+                        simulatedGpuReadyUpperBoundUs - simulatedPreparationStartUs : 0);
+            }
+            else if (!deferredGpuReady) {
+                referenceController->noteGpuReadyWait(
+                    gpuReadyWaitUs, gpuReadyCompleted, gpuReadyTimeUs);
+                simulatedController->noteGpuReadyWait(
+                    gpuReadyWaitUs, gpuReadyCompleted, simulatedPreparationEndUs);
+            }
         }
         const bool spacingHadPriorSubmission =
             referenceController->hasLastSubmission();
@@ -13612,6 +13669,17 @@ int main(int argc, char* argv[])
                 presentOperationDurationValid ? 0 : 1;
         }
         const bool gpuReadyTimingValid = gpuReadyTimingDeclared;
+        const bool deferredGpuReadyWait = isVrrGpuReadyWaitDeferred(
+            capturedParameters.playoutSerialServiceGate != 0,
+            gpuReadySignalSucceeded && gpuReadySetEventSucceeded,
+            gpuReadyWaitResultDeclared,
+            recordedPreparationEndUs,
+            gpuReadyWaitStartUs);
+        const bool deferredGpuReadyTiming = gpuReadyTimingValid &&
+            deferredGpuReadyWait;
+        const bool deferredGpuReadyPending =
+            pendingCancelledGpuWaitAllowed && gpuReadySetEventSucceeded &&
+            !gpuReadyWaitResultDeclared && !gpuReadyTimingValid;
         bool gpuReadyBoundsValid = false;
         timelineDetails.recordedGpuReadyTimingValid =
             gpuReadyTimingValid;
@@ -13633,7 +13701,8 @@ int main(int argc, char* argv[])
                     gpuReadyPollStartUs,
                     gpuReadyPollEndUs,
                     gpuReadyWaitStartUs,
-                    gpuReadyTimeUs);
+                    gpuReadyTimeUs,
+                    deferredGpuReadyWait || deferredGpuReadyPending);
             metrics.gpuReadyStageTimingRelationshipMismatchRows +=
                 stageTimingAudit.relationshipValid ? 0 : 1;
             if (gpuReadyAttempted &&
@@ -13661,12 +13730,41 @@ int main(int argc, char* argv[])
         const bool gpuReadyWaitOperationObserved =
             metrics.gpuReadyNativeResultTelemetryAvailable ?
                 gpuReadyWaitResultDeclared : gpuReadyTimingValid;
+        if (metrics.gpuReadyBoundsTelemetryAvailable &&
+                !gpuReadyVulkanPoll && gpuReadySetEventSucceeded) {
+            // Signal/Event success always produces the preparation-time poll,
+            // even when the final wait is pending, times out, or fails. Audit
+            // its fence relationship independently of successful timing.
+            const bool deviceRemovalSentinelAllowed =
+                gpuReadyPollCompletedValue ==
+                    std::numeric_limits<uint64_t>::max() &&
+                !gpuReadyWaitResultDeclared &&
+                !gpuReadyTimingValid &&
+                disposition == "preparation_failed";
+            metrics.gpuReadyFenceRelationshipMismatchRows +=
+                isVrrGpuFencePollRelationshipValid(
+                    gpuReadyFenceValue,
+                    gpuReadyPollCompletedValue,
+                    gpuReadyCompletedBeforeWait,
+                    deviceRemovalSentinelAllowed) ? 0 : 1;
+        }
         if (gpuReadyWaitOperationObserved) {
             bool gpuReadyOrderValid =
                 gpuReadyWaitStartUs != 0 &&
                 gpuReadyTimeUs >= gpuReadyWaitStartUs &&
                 gpuReadyWaitStartUs >= recordedPreparationStartUs &&
-                gpuReadyTimeUs <= recordedPreparationEndUs;
+                (deferredGpuReadyWait ?
+                     isVrrDeferredGpuReadyOrderValid(
+                         gpuReadyWaitStartUs,
+                         gpuReadyTimeUs,
+                         recordedPreparationEndUs,
+                         recordedPresentStartUs,
+                         recordedPresentEndUs,
+                         nativePresentTimingDeclared &&
+                             metrics.presentTimingIntegrityTelemetryAvailable &&
+                             nativePresentStartUs != 0,
+                         nativePresentStartUs) :
+                     gpuReadyTimeUs <= recordedPreparationEndUs);
             if (metrics.gpuReadyBoundsTelemetryAvailable &&
                     !gpuReadyVulkanPoll) {
                 gpuReadyOrderValid =
@@ -13707,9 +13805,8 @@ int main(int argc, char* argv[])
                         gpuReadyPollCompletedValue,
                         gpuReadyCompletedBeforeWait,
                         gpuReadyWaitStartUs,
-                        gpuReadyTimeUs);
-                metrics.gpuReadyFenceRelationshipMismatchRows +=
-                    expectedBounds.fenceRelationshipValid ? 0 : 1;
+                        gpuReadyTimeUs,
+                        deferredGpuReadyTiming);
                 gpuReadyBoundsValid =
                     expectedBounds.valid &&
                     gpuReadyCompletionLowerBoundUs ==

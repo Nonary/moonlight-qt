@@ -34,7 +34,8 @@ bool vrrDecodeReadinessOrderValid(uint64_t decoderOutputUs, uint64_t readyUs,
                                   uint64_t arrivalUs, uint64_t dequeueUs,
                                   uint64_t decisionUs, uint64_t decodeWaitUs,
                                   bool decisionValid,
-                                  bool readinessExcludesQueue = false);
+                                  bool readinessExcludesQueue = false,
+                                  bool readinessUsesPostWaitClock = false);
 
 enum class VrrRasterPhaseState {
     Unclassified,
@@ -384,20 +385,50 @@ VrrDisplaySignalConsistency evaluateVrrDisplaySignalConsistency(
     uint64_t totalWidth, uint64_t totalHeight,
     uint64_t tolerancePpm);
 
+bool isVrrGpuReadyWaitDeferred(
+    bool deferredWaitPolicy,
+    bool asynchronousFenceSubmitted,
+    bool waitResultValid,
+    uint64_t preparationEndUs,
+    uint64_t waitStartUs);
+
+uint64_t mapVrrGpuReadyUpperBound(
+    uint64_t recordedPreparationStartUs,
+    uint64_t recordedPreparationEndUs,
+    uint64_t simulatedPreparationStartUs,
+    uint64_t simulatedPreparationEndUs,
+    uint64_t recordedUpperBoundUs,
+    bool completedBeforeWait);
+
+bool isVrrDeferredGpuReadyOrderValid(
+    uint64_t waitStartUs, uint64_t waitReturnUs,
+    uint64_t preparationEndUs,
+    uint64_t presentStartUs, uint64_t presentEndUs,
+    bool nativePresentTimingValid,
+    uint64_t nativePresentStartUs);
+
+bool isVrrGpuFencePollRelationshipValid(
+    uint64_t fenceValue,
+    uint64_t pollCompletedValue,
+    bool completedBeforeWait,
+    bool deviceRemovalSentinelAllowed = false);
+
 VrrGpuCompletionBounds evaluateVrrGpuCompletionBounds(
     uint64_t preparationStartUs, uint64_t preparationEndUs,
     uint64_t signalStartUs,
     uint64_t pollStartUs, uint64_t pollEndUs,
     uint64_t fenceValue, uint64_t pollCompletedValue,
     bool completedBeforeWait,
-    uint64_t waitStartUs, uint64_t waitReturnUs);
+    uint64_t waitStartUs, uint64_t waitReturnUs,
+    bool completionMayFollowPreparation = false);
 
 VrrGpuReadyOperationAudit evaluateVrrGpuReadyOperation(
     bool attempted,
     bool signalResultValid, int64_t signalResult,
     bool setEventResultValid, int64_t setEventResult,
     bool waitResultValid, uint64_t waitResult,
-    bool timingValid, uint64_t signalStartUs, uint64_t fenceValue);
+    bool timingValid, uint64_t signalStartUs, uint64_t fenceValue,
+    bool deferredWaitMayBePending = false);
 
 VrrGpuReadyStageTimingAudit evaluateVrrGpuReadyStageTiming(
     uint64_t preparationStartUs, uint64_t preparationEndUs,
@@ -406,7 +437,8 @@ VrrGpuReadyStageTimingAudit evaluateVrrGpuReadyStageTiming(
     uint64_t flushStartUs, uint64_t flushEndUs,
     uint64_t setEventStartUs, uint64_t setEventEndUs,
     uint64_t pollStartUs, uint64_t pollEndUs,
-    uint64_t waitStartUs, uint64_t waitReturnUs);
+    uint64_t waitStartUs, uint64_t waitReturnUs,
+    bool completionMayFollowPreparation = false);
 
 VrrPresenterSubmissionAudit evaluateVrrPresenterSubmission(
     bool presented,

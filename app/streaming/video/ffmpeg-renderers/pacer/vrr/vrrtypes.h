@@ -71,14 +71,23 @@ public:
         return m_Frame.release();
     }
 
-    // The historical decode-complete scheduling boundary advances when GPU
-    // work finishes, but the decoder-output timestamp remains unchanged for
-    // client-processing measurements.
+    // Preserve the historical decode-complete boundary for trace replay and
+    // completion diagnostics. Production source-clock mapping uses immutable
+    // decoder output instead.
     void noteGpuReadyUs(uint64_t gpuReadyUs)
     {
         if (gpuReadyUs > m_DecodeCompleteUs) {
             m_DecodeCompleteUs = gpuReadyUs;
         }
+    }
+
+    // The worker may have to block on a decoder/backend completion primitive
+    // after this frame leaves the decoder. Keep that service time separate
+    // from both immutable decoder output and the conservative completion
+    // bound: the controller uses each for a different purpose.
+    void noteDecodeSyncWaitUs(uint64_t waitUs)
+    {
+        m_DecodeSyncWaitUs = waitUs;
     }
 
     explicit operator bool() const
@@ -109,6 +118,11 @@ public:
     uint64_t decoderOutputUs() const
     {
         return m_DecoderOutputUs;
+    }
+
+    uint64_t decodeSyncWaitUs() const
+    {
+        return m_DecodeSyncWaitUs;
     }
 
     // Pre-decode timeline of the same frame, all on the LiGetMicroseconds()
@@ -165,6 +179,7 @@ private:
     bool m_TimestampValid = false;
     uint64_t m_DecoderOutputUs = 0;
     uint64_t m_DecodeCompleteUs = 0;
+    uint64_t m_DecodeSyncWaitUs = 0;
     uint64_t m_ReceiveUs = 0;
     uint64_t m_ReassembledUs = 0;
     uint64_t m_DecodeSubmitUs = 0;

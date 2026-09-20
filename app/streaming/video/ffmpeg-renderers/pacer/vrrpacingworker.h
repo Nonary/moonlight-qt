@@ -47,6 +47,7 @@ private:
         Presented,
         OutputDropped,
         QueueCapacity,
+        QueueStale,
         ArrivalRejected,
         SuspensionDiscard,
         ShutdownDiscard,

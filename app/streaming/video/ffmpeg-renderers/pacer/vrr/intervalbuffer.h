@@ -18,6 +18,7 @@ public:
     struct Sample {
         uint64_t frame = 0, intended = 0, submitted = 0, deadline = 0, ready = 0, buffer = 0;
         bool valid = false, absorbable = false;
+        uint64_t serialService = 0, decoderQueue = 0;
     };
     // Observation only. This explains the request made after an outcome;
     // the controller applies that request to subsequent frames. In particular,
@@ -77,7 +78,9 @@ public:
                  uint64_t toleranceUs = 500,
                  uint64_t scoreWindowUs = 30000000,
                  uint64_t initialWarmupUs = 1000000,
-                 size_t initialMinimumSamples = 2) {
+                 size_t initialMinimumSamples = 2,
+                 bool recentPressureRelease = false,
+                 bool serialServiceGate = false) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.severityWeighted = severityWeighted;
         minimum = std::min(minimum, maximum);
@@ -158,7 +161,10 @@ public:
         const bool currentPressure = severityWeighted ? loss > allowedLoss : pressure;
         // Old score debt holds protection, but cannot authorize another attack
         // without current, attributable error outside the preset's allowance.
-        const bool holdProtection = currentPressure || (severityWeighted && belowTarget);
+        const bool historicalPressure = severityWeighted && belowTarget;
+        const bool historyHolds = !recentPressureRelease && historicalPressure;
+        const bool holdProtection = currentPressure ||
+            historyHolds;
         if (holdProtection) {
             m_LastPressure = s.submitted;
             if (severityWeighted) m_ReleaseFraction = 0;
@@ -175,10 +181,14 @@ public:
         update.cooldownRemainingUs = m_LastAttack ?
             remaining(s.submitted - m_LastAttack, 250000) : 0;
         update.action = currentPressure ? Action::CurrentPressure :
-            holdProtection ? Action::HistoryHold : Action::RecoveryHold;
+            historyHolds ? Action::HistoryHold : Action::RecoveryHold;
         const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
         const bool grow = currentPressure && (!severityWeighted || belowTarget);
-        if (grow && freshError && delayed.absorbable && lateness &&
+        const bool delayedAbsorbable = delayed.absorbable &&
+            (!serialServiceGate ||
+             (delayed.serialService <= intended &&
+              delayed.decoderQueue <= intended));
+        if (grow && freshError && delayedAbsorbable && lateness &&
                 (!m_LastAttack || s.submitted - m_LastAttack >= 250000)) {
             const auto excess = severityWeighted ?
                 uint64_t(std::ceil(std::min(250.0, std::max(0.0, excessUs - allowedLoss * intended)))) :
@@ -212,10 +222,16 @@ public:
             update.action = m_Target == minimum ? Action::Minimum : Action::Release;
         }
         else if (grow) {
-            update.action = !delayed.absorbable ? Action::NotAbsorbable :
+            update.action = !delayedAbsorbable ? Action::NotAbsorbable :
                 !freshError || !lateness ? Action::NoFreshMiss : Action::Cooldown;
         }
-        else if (!holdProtection && !s.absorbable) update.action = Action::NotAbsorbable;
+        else if (!holdProtection &&
+                 !(s.absorbable &&
+                   (!serialServiceGate ||
+                    (s.serialService <= intended &&
+                     s.decoderQueue <= intended)))) {
+            update.action = Action::NotAbsorbable;
+        }
         if (beforeUs != boundedUs) update.action = Action::LimitChange;
         update.requestedUs = m_Target;
     }

@@ -14,9 +14,12 @@ removed when settings are saved. Every normal session uses 0.5 ms tolerance for
 Low Latency and Balanced Target and 0.2 ms for Smooth, with severity-weighted
 preset histories and targets of
 99% / 99.5% / 99.99% for Low Latency / Balanced Target / Smooth. Their clean
-holds are 6 / 8 / 10 seconds and release speeds are 125 / 100 / 50 us per
+holds are 6 / 8 / 10 seconds and release speeds are 125 / 250 / 50 us per
 second. Their score histories are 1 / 2 / 5 minutes respectively. Growth
-requires both below-target quality and fresh readiness-related interval error.
+requires below-target long-window quality, current pressure, fresh readiness-
+related interval error, and serial local work that fits the intended interval.
+Only current pressure renews the clean-time release hold; old score debt remains
+useful for qualifying future growth but cannot pin the live delay by itself.
 Preset allowances are now 2/2/4 fitted source frames, additionally limited by
 16/16/24 ms and the unchanged three-frame queue-capacity bound. Initial interval
 calibration needs at least 500 ms and 32 consecutive valid intervals. Growth
@@ -41,8 +44,9 @@ producers plus bounded-full/empty behavior.
 
 Linux Vulkan on Wayland now attaches presentation-time feedback to each native
 surface submission and records correlated compositor timestamps for native
-cadence diagnostics, as DXGI/composition do. Production buffer adaptation uses
-readiness prediction independently of these observations. The Vulkan swapchain's fixed mode does not change when the
+cadence diagnostics, as DXGI/composition do. Production interval-quality
+adaptation ignores these observations and uses readiness only to attribute
+whether current local work could be absorbed. The Vulkan swapchain's fixed mode does not change when the
 controller requests a per-frame DXGI latch mode. Clock uncertainty is recorded
 in the optional schema-5 `presentation_uncertainty_us` trace column and replayed.
 Gaming Mode retains its X11/HDR Gamescope WSI path. On that path, the Vulkan
@@ -57,8 +61,8 @@ cadence interval. Regular X11 without the Gamescope WSI layer is still unsupport
 Missing platform timing support leaves native display measurement unavailable
 and produces a startup warning. Production always uses submission estimates for
 its user-facing cadence report, even when native display timing is available;
-native observations remain separate tracking evidence. Readiness prediction
-independently controls padding in both directions.
+native observations remain separate tracking evidence. The interval-quality
+queue owns live padding growth and release.
 
 `tst_vulkantiming` tests this dispatch bridge with fake Vulkan entry points,
 including delayed completion IDs, clock conversion, swapchain errors, unchanged
@@ -141,9 +145,9 @@ persistent swapchain; per-frame latch decisions never destroy or recreate it.
 Persistent Mailbox counts as protected presentation and omits the redundant
 software spacing floor, while Immediate and FIFO retain that floor. The
 Gamescope WSI FIFO compatibility path retains its compositor-owned behavior.
-The latency presets cap adaptive padding independently of native mode: half a
-fitted source frame for Low Latency, one frame for Balanced Target, and three
-frames for Smooth in live sessions. Explicit historical replay parameters can
+The latency presets cap adaptive padding independently of native mode: two
+fitted source frames for Low Latency and Balanced Target, and four frames for
+Smooth in live sessions. Explicit historical replay parameters can
 retain the configured stream-rate basis. Smooth is additionally allowed up to
 24 ms, subject to queue capacity. Stale-work replacement remains a separate
 two-frame rule.
@@ -180,20 +184,22 @@ forcing it off invents software-floor backlog on a latch-capable session.
 
 Production sets `playout_responsive_buffer=7`: Low Latency targets 99% over
 1 minute, Balanced Target 99.5% over 2 minutes, and Smooth 99.99% over 5 minutes.
-A shortfall through 1 ms does not grow the buffer. A 1-2 ms shortfall permits
-growth only above 50% prevalence in the live window, while any shortfall over
-2 ms starts the two-second fresh-miss boost. A 500 us margin and 1 ms minimum
-remain. Version-20 five-minute raw-readiness history is diagnostic
-only; cached tails cannot grow or hold the live buffer. Recovery headroom
-speeds gradual release rather than being subtracted from readiness demand.
+It measures the one-second mean absolute submission-interval error against the
+preset's 0.5/0.5/0.2 ms tolerance, then weights long-window quality loss by the
+excess relative to the intended interval. Growth requires both below-target
+history and current excess, a fresh readiness-late frame, and decoder-queue and
+serial-service costs that each fit that interval. Requests can rise by at most
+250 us per 250 ms. Old score debt remains reportable but does not renew the
+clean-time release hold. The 500 us scheduling margin and 1 ms minimum remain.
 Preset limits use the fitted source period in live sessions, so 120/19/30 FPS
 desktop changes cannot expand them and a below-nominal source is not clipped to
 the negotiated rate. Smoothing follows raw source slots during rate transitions
 until 200 ms of credible cadence returns; delivery learning continues against
 RTP spacing. Historical traces default the observed-period switch to zero.
 
-Windows D3D11 also enables bounded GPU-readiness adaptation. Completed
-present-ready fence waits are kept in a ten-second p99 window with a 500 us
+Windows D3D11 also enables bounded GPU-readiness adaptation. Preparation queues
+the present-ready fence, and the target-boundary present path waits only for any
+residual work after the cadence hold. Completed residual waits are kept in a ten-second p99 window with a 500 us
 margin, slewed by at most 1 ms per sample and released at 250 us/s, capped at
 12 ms and one source period. The resulting lead advances render start only;
 it does not move the presentation target or turn a failed fence into a valid
@@ -201,17 +207,12 @@ sample. `gpu_readiness_lead_us` and `gpu_readiness_applied_us` make the decision
 and measured wait visible in schema-5 traces. `playout_capacity_telemetry=1`
 also records unclamped demand when the cadence cap limits the applied buffer.
 
-Linux Vulkan uses the same bounded readiness estimator. After flushing the
-render queue, it polls the acquired libplacebo swapchain texture with
-`pl_tex_poll(..., 0)` until its GPU references are idle, with a 50 ms / 100,000
-poll bound. The shared `gpu_ready_wait_*` and completion-bound fields describe
-that CPU observation bracket; D3D11 signal/event/fence fields remain unset.
-Successful polls release the decoder surface before target waiting, while a
-timeout, device failure, or lifecycle interruption abandons the image and is
-never used as a readiness-training sample. Failed poll timestamps remain
-available for diagnosis but leave `gpu_ready_timing_valid=0`. Replay applies
-Vulkan-specific poll/result validation instead of the D3D11 HRESULT/fence
-audit.
+Linux Vulkan retains imported hardware mappings through a bounded synchronous
+output-completion poll, then retires idle mappings before the target hold. The
+asynchronous output-wait bypass was withdrawn after a live throughput regression.
+Hardware and software frames now report the shared `gpu_ready_wait_*` CPU
+observation bracket; source retirement itself is not output-ready timing.
+D3D11 signal/event/fence fields remain unset on Vulkan rows.
 
 Historical production sets `playout_prediction_only=1`: readiness prediction controls both
 growth and release, independently of display feedback. Required protection is
@@ -304,9 +305,10 @@ period, including regression coverage that ordinary one-period worker
 occupancy does not manufacture a content drop,
 native submission timing across pre-submit work and blocking
 returns, clean-close trace accounting, explicit window-state rebase
-provenance, and the minimal prepare/present/cancel contract. D3D11 completes
-queued rendering behind a GPU fence before the worker waits for its target,
-then submits immediate frames with `DXGI_PRESENT_ALLOW_TEARING`. This keeps the
+provenance, and the minimal prepare/present/cancel contract. D3D11 submits
+rendering and a GPU fence during preparation, allows it to run during the target
+hold, then verifies that fence before submitting immediate frames with
+`DXGI_PRESENT_ALLOW_TEARING`. This keeps the
 timed CPU submission boundary adjacent to a displayable back buffer while the
 worker's display-period floor remains the tear-avoidance authority. Linux
 presentation mode remains an immutable renderer choice selected when its
@@ -582,26 +584,34 @@ External high-speed capture remains the authority for validating a suspected
 hardware/driver failure.
 
 Set `MOONLIGHT_VRR_DEEP_TRACE=1` for native flip diagnosis. It adds native-call
-timing, backend presentation values, and `gpu_ready_*` timing that proves
-queued rendering completed inside preparation and before the native submit.
+timing, backend presentation values, and any available `gpu_ready_*` timing.
+On D3D11 the fence is queued inside preparation and completion is verified at
+the native-present boundary after the cadence hold.
 The CPU return from the fence wait is only an upper bound on the actual GPU
 completion instant. D3D11 records the fence-signal start and a bracketed
 `GetCompletedValue()` poll, including the exact target and completed values.
 It also records whether synchronization was attempted, the exact signed
-HRESULT from `Signal()` and `SetEventOnCompletion()`, and the exact DWORD from
-`WaitForSingleObject()`. Signal return, `Flush()`, and
+HRESULT from `Signal()` and `SetEventOnCompletion()`, and the aggregate fence-wait status
+(complete, timeout, or failed). Signal return, `Flush()`, and
 `SetEventOnCompletion()` each have their own start/end bracket. Those native
-results and the timestamps reached before a failure are preserved on
-preparation-failure and cancellation rows instead of being replaced by a
-generic cancelled outcome. Replay checks the native stage chain independently:
+results and the timestamps reached before a preparation failure are preserved.
+A concurrent resize or display mutation can cancel a frame while its final wait
+runs without the context mutex; that cancellation reset is authoritative, so
+the cancelled row may omit the abandoned frame's GPU-ready telemetry. Replay
+checks every retained native stage chain independently:
 Signal must finish before Flush, Flush before SetEvent, and SetEvent before the
-poll/wait; failed stages must leave every later stage absent. Successful
+initial poll; the final wait starts inside the present or cancellation operation.
+Prepared cancellation drains the fence before releasing the source. Historical
+interrupted or preparation-failed rows with no native presentation may retain a
+pending wait. Failed stages must leave
+every later stage absent. Successful
 GPU-ready timing requires `WAIT_OBJECT_0`.
 An incomplete poll provides the conservative lower bound and the successful
-event-wait return provides the upper bound; if the poll already reports
+final fence-helper observation provides the upper bound; if the poll already reports
 completion, signal start and poll end bound it instead. Replay verifies the
-derived completion bit, rejects the device-removal sentinel or impossible
-fence lag, and independently rederives the bounds and their uncertainty. It
+derived completion bit, accepts the device-removal sentinel only on its
+preparation-failure path, rejects impossible fence lag, and independently
+rederives the bounds and their uncertainty. It
 never labels the CPU wake timestamp as an exact GPU timestamp. If preparation
 itself is late, this does not claim completion preceded the scheduled target.
 D3D11 reuses the previous post-Present observation for the diagnostic
@@ -609,7 +619,9 @@ before-state, so deep mode does not add synchronous DXGI queries around
 `Present()`; the essential post-Present submission/latch queries are collected
 in both modes.
 On Linux Vulkan, the same `gpu_ready_*` columns carry the libplacebo
-`pl_tex_poll(..., 0)` observation around the acquired swapchain texture. Vulkan
+`pl_tex_poll(..., 0)` observation around the acquired swapchain texture for both
+hardware and software frames. Captures from the withdrawn asynchronous hardware
+path can leave them unavailable. Vulkan
 leaves D3D11 signal/event/fence values unset; result 0 means the texture became
 idle, 1 is the bounded timeout (50 ms or the poll-iteration guard), and 2 is
 an interrupted or failed observation.
@@ -619,7 +631,8 @@ these rows with Vulkan-specific result, ordering, and completion-bound rules.
 For D3D11, diagnostic readiness requires exact `S_OK` results for both fence
 HRESULTs, `WAIT_OBJECT_0`, valid GPU-ready timing, and a reproducible completion
 bracket on every presented frame. It rejects any row where the
-signal/poll/wait order falls outside preparation, the recorded lower/upper
+signal/initial-poll order falls outside preparation, the deferred wait precedes
+preparation end, the recorded lower/upper
 bound cannot be derived from the raw observations, or the reported wait
 duration disagrees with its start/end timestamps. It likewise verifies that
 the worker-level presentation interval is causal and internally exact, and
@@ -953,8 +966,8 @@ explicitly set both parameters above to zero to evaluate timestamp-following
 candidates.
 
 With smoothing enabled, production uses the gain smoother: it advances by a
-tracked source period and pulls 50 percent toward the mapped timestamp slot,
-with a 10-percent period EMA and a 2 ms positive adjustment cap. The cap does
+tracked source period and pulls 15 percent toward the mapped timestamp slot,
+with a 2.5-percent period EMA and a 2 ms positive adjustment cap. The cap does
 not bound total client latency. The metronome remains disabled. The production
 controller test covers approximately 77 FPS host jitter in all three timing
 presets, smoothing off/on, a host stall, a late wake, and a change to 60 FPS.
@@ -1029,8 +1042,9 @@ rate, so a few long stamps are a hitch rather than a new rate.
 With `playout_delay_adaptive` off, `controller.source_playout_delay_us` is
 the fixed delay. The applied delay is recorded per frame as
 `playout_delay_us` and the tick's lag behind the raw slot as
-`cadence_smoothing_us`. The mapping offset is the windowed minimum of
-decode-complete minus RTP time (`playout_offset_window_us`), slewed at most
+`cadence_smoothing_us`. Production maps the windowed minimum of immutable
+decoder-output minus RTP time (`playout_offset_window_us`); historical captured
+policies can retain decode-complete mapping. The offset is slewed at most
 `playout_offset_slew_us` per frame. A frame whose mapped source time sits
 more than a period in the future is waited for; only
 `playout_offset_reseed_frames` consecutive such frames re-seed the mapping,
@@ -1054,9 +1068,9 @@ New live sessions enable `playout_offset_cadence_gate=1` and
 `playout_offset_source_clock=1`. Cadence breaks retire the observation
 window without reseeding either the applied mapping or the interval buffer.
 Ineligible samples cannot train the new floor. Monotonic unwrapped RTP time
-controls aging and slew, preventing local decode/renderer/GPU backlog from steering the
-source mapping; the value being mapped is still readiness minus RTP. A zero
-decode-clock switch preserves exact replay of the initial worker-clock captures,
+controls aging and slew, preventing worker/backend completion waits from steering the
+source mapping; the value being mapped is decoder output minus RTP. A zero
+source-mapping switch preserves exact replay of the decode-complete and initial worker-clock captures,
 and zero-valued gate/rate defaults preserve older exact replay. The
 per-frame `playout_offset_slew_us` setting is used only with the new rate at zero.
 
@@ -1431,8 +1445,9 @@ supply latency learning, native hitch adaptation, or measured client cadence.
 Submission estimates supply a separately labeled cadence percentage while
 verified events are unavailable. Windows composition records backend value 3
 and independent-flip display events, without populating DXGI-specific fields.
-Production scheduling and buffer adaptation ignore both display events and
-submission-interval estimates; readiness prediction is their only feedback.
+Production treats display events as diagnostics. Buffer growth uses the shared
+revision-7 submission-interval error policy with readiness attribution and a
+serial-service gate; display cadence percentages do not drive it.
 Old captures omit that controller field and retain zero for exact historical
 replay. A historical exact match does not validate refresh-reference timestamps
 as actual display events. Regression tests cover the shared refresh timestamp
@@ -1446,13 +1461,14 @@ forced setting, restoration on normal exit and partial setup failure, malformed
 zero-exit replies, and retry after failed restoration. It uses injected commands
 and does not claim live Gamescope smoothness validation.
 
-Linux current-policy replay selects readiness-attributed growth for a declared
-Vulkan backend (`playout_readiness_hitch_threshold_us=2000`). Exact replay
-retains recorded parameters, including the historical zero default. When
-isolating this change with a custom scenario, provide the complete captured
-controller snapshot before overriding the threshold: partial custom scenarios
-start from generic defaults, not the captured policy. Readiness-attribution
-and cache isolation regressions are in `tst_vrrtimingcontroller`.
+The retired readiness-hitch policy can select readiness-attributed growth for a
+declared Vulkan backend (`playout_readiness_hitch_threshold_us=2000`). Current
+session-policy replay uses responsive interval-buffer revision 7 and a zero
+threshold. Exact replay retains recorded parameters. When isolating the older
+policy with a custom scenario, provide the complete captured controller snapshot
+before overriding the threshold: partial custom scenarios start from generic
+defaults, not the captured policy. Readiness-attribution and cache isolation
+regressions are in `tst_vrrtimingcontroller`.
 
 `tst_gamescoperepaint` uses an isolated Wayland protocol server to verify the
 optional per-frame Gamescope repaint helper. It covers request acknowledgements,
@@ -1467,16 +1483,18 @@ See [the capture procedure](../../docs/vrr-latency-captures.md). Run
 between immutable decoder output, later GPU readiness, and present-call return.
 It does not substitute replay scenarios for missing measured presets.
 
-### Responsive buffer revision 4
+### Responsive buffer history
 
-Production resolves `playout_responsive_buffer=4`. Values 0 through 3 remain
+Production resolves `playout_responsive_buffer=7`; revisions 0 through 6 remain
 available for exact historical replay. Revision 3 records the selected target
 in `playout_on_time_target_per_million` and learning window in
-`playout_readiness_window_us`; revision 4 adds thresholded misses and excludes
-pacing-queue residence from the decode-ready timestamp. The rolling 30-second
-outcome readout always counts client drops and lateness over 2 ms as misses,
-counts 1-2 ms lateness only above 50% prevalence, tolerates lateness through
-1 ms, and measures lateness before deadline recovery clamps.
+`playout_readiness_window_us`; revision 4 added thresholded misses and excluded
+pacing-queue residence from its then-current decode-ready timestamp. Revisions
+5 through 7 move adaptation to interval quality, add severity weighting, and
+keep long score history separate from current release pressure. The rolling
+30-second outcome readout always counts client drops and lateness over 2 ms as
+misses, counts 1-2 ms lateness only above 50% prevalence, tolerates lateness
+through 1 ms, and measures lateness before deadline recovery clamps.
 Replay exposes `observed.readiness` and `simulation.readiness`, including
 misses over 1 ms and 2 ms. Targets are best effort within the existing caps.
 Quantile, expiry, preset selection and drop-accounting tests cover this policy.
@@ -1492,10 +1510,11 @@ These tests do not prove the cause of a particular driver's event delay or
 measure physical display cadence.
 
 Replay distinguishes `decoder_output_us` (immutable CPU output and the latency
-origin) from `decode_complete_us` (decoder output plus a blocking GPU fence wait,
-excluding time already spent in the pacing queue).
-Timestamp integrity validates output before admission, readiness before the
-decision, and the recorded decode wait inside the worker lifecycle. Older
+origin) from `decode_complete_us`. Current material decoder synchronization
+records `decode_complete_us` from the post-wait worker clock; a deferred D3D11
+render fence wait does not change it. Timestamp integrity validates output
+before admission, readiness before the decision, and the recorded decode wait
+inside the worker lifecycle. Older
 captures without immutable output retain their historical boundary. Busy-worker
 reconstruction caps a learned idle floor by the current row's observed readiness;
 a long startup wait cannot shift an otherwise unchanged replay. Both contracts
@@ -1536,3 +1555,20 @@ It first requires an exact baseline, then changes eight optional accounting
 fields and the three calibration fields when present, independently repairing
 the CSV footer hash. Each modified trace must
 fail the semantic exact gate, not merely the file-integrity check.
+
+The worker's early `queue_stale` disposition rejects expired queue fronts before
+blocking decoder synchronization. The blocking-decode regression covers all three
+presets, source-rate reductions, lifetime, and exact trace export through
+`MOONLIGHT_VRR_TEST_EXPORT_EARLY_STALE_TRACE`. Existing single-frame tests retain
+the sole image. `vrrqueuesim` does not model this new pruning point and must not
+be used to claim the live throughput recovery is validated.
+
+`testRepeatedDecodeContentionKeepsPresenting` reproduces the live starvation
+loop with repeated 40 ms GPU decode waits and a newer arrival during every wait,
+in all three presets. The ready image must progress through presentation instead
+of being discarded indefinitely. `testDecodeWaitDoesNotExpireReadyFrame` also
+checks that full elapsed age and the post-wait completion bound remain in the
+trace. Export the contention fixture with
+`MOONLIGHT_VRR_TEST_EXPORT_CONTENTION_TRACE` for the exact replay gate. Genuine
+queue age, the sole-image rule, and post-wait scheduler stalls remain covered by
+the other worker tests; this fixture does not model GPU throughput.

@@ -485,6 +485,15 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             (!value.playoutPredictionOnly || value.playoutReadinessHitchThresholdUs))) {
         return fail("playout_responsive_buffer requires prediction-only playout without historical hitch feedback");
     }
+    if (value.playoutSourceMappingDecoderOutput > 1 ||
+            value.playoutSerialServiceGate > 1 ||
+            value.playoutRecentPressureRelease > 1) {
+        return fail("source mapping, serial service and recent pressure flags must be 0 or 1");
+    }
+    if ((value.playoutSerialServiceGate || value.playoutRecentPressureRelease) &&
+            value.playoutResponsiveBuffer < 6) {
+        return fail("serial service and recent pressure policies require the interval buffer");
+    }
     if (value.playoutOnTimeTargetPerMillion < 900000 || value.playoutOnTimeTargetPerMillion > 1000000)
         return fail("playout_on_time_target_per_million must be in 900000..1000000");
     if (value.playoutReadinessWindowUs < 3000000 || value.playoutReadinessWindowUs > 300000000 ||

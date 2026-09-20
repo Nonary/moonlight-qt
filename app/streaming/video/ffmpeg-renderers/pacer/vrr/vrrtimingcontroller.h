@@ -37,6 +37,12 @@
     X(uint64_t, playout_gpu_readiness_maximum_us, playoutGpuReadinessMaximumUs, 12000) \
     X(uint64_t, playout_prediction_only, playoutPredictionOnly, 0) \
     X(uint64_t, playout_responsive_buffer, playoutResponsiveBuffer, 0) \
+    /* Production source mapping is anchored before worker/backend waits. */ \
+    X(uint64_t, playout_source_mapping_decoder_output, playoutSourceMappingDecoderOutput, 0) \
+    /* Gate buffer growth on the complete serial service path. */ \
+    X(uint64_t, playout_serial_service_gate, playoutSerialServiceGate, 0) \
+    /* Long quality history remains diagnostic while recent pressure owns release. */ \
+    X(uint64_t, playout_recent_pressure_release, playoutRecentPressureRelease, 0) \
     /* Historical captures retain the one-second/two-interval warmup. */ \
     X(uint64_t, playout_interval_initial_warmup_us, playoutIntervalInitialWarmupUs, 1000000) \
     X(size_t, playout_interval_initial_minimum_samples, playoutIntervalInitialMinimumSamples, 2) \
@@ -304,6 +310,13 @@ public:
     // starts. Failed/unknown waits are deliberately not learned.
     void noteGpuReadyWait(uint64_t waitUs, bool completed,
                           uint64_t completionUs = 0);
+    // A backend may verify render completion only at the final native-present
+    // boundary after useful overlap with the cadence hold. Feed its residual
+    // CPU wait to future lead learning and its conservative service bound to
+    // the growth gate. The observation time is not the frame's readiness time.
+    void noteDeferredGpuReady(uint64_t waitUs, bool completed,
+                              uint64_t completionUs = 0,
+                              uint64_t serviceUpperBoundUs = 0);
     void noteSchedulerDelays(uint64_t renderDelayUs,
                              uint64_t targetDelayUs,
                              bool targetDelayValid);
@@ -379,6 +392,10 @@ private:
         bool hasPreparationDuration = false;
         int64_t readyOffsetUs = 0;
         uint64_t preparationDurationUs = 0;
+        uint64_t rawPreparationDurationUs = 0;
+        uint64_t acquisitionWaitUs = 0;
+        uint64_t decodeSyncWaitUs = 0;
+        uint64_t deferredGpuServiceUs = 0;
         uint64_t preparationCompleteUs = 0;
         uint64_t intervalIntendedUs = 0;
         bool intervalValid = false;
@@ -464,6 +481,7 @@ private:
 
     void clearTimeline(bool retainLearnedBudgets);
     void initializeTimeline(const PacedFrame& frame);
+    uint64_t sourceMappingUs(const PacedFrame& frame) const;
     CadenceObservation observeCadence(const PacedFrame& frame);
     void observeRtpCadence(uint32_t rtpDelta,
                            CadenceObservation& observation);

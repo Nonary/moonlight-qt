@@ -124,12 +124,6 @@ uint64_t positiveDifference(uint64_t actualUs, uint64_t targetUs)
     return actualUs > targetUs ? actualUs - targetUs : 0;
 }
 
-uint64_t saturatingAdd(uint64_t left, uint64_t right)
-{
-    return left > std::numeric_limits<uint64_t>::max() - right ?
-        std::numeric_limits<uint64_t>::max() : left + right;
-}
-
 uint64_t submissionBoundaryUs(const VrrPresentFeedback& feedback,
                               uint64_t operationStartUs,
                               uint64_t operationEndUs,
@@ -421,20 +415,19 @@ int VrrPacingWorker::run()
         // its learned cadence.
         (void) queueDiscontinuity;
 
-        // The CPU reports decode completion before the GPU has finished the
-        // frame. Wait for it here, where the worker would otherwise idle, so
-        // readiness and the lateness the calibrator learns from are real and
-        // the preparation never blocks on the decoder.
+        // Establish this frame's exact decoder dependency before preparing
+        // it. Some backends wait here; others queue a GPU dependency and
+        // return immediately. Preserve only CPU time actually spent waiting
+        // as service telemetry.
         const uint64_t decodeSyncWaitUs = m_Presenter->waitForDecode(
             frame.frame(), frame.decodeBoundary());
+        frame.noteDecodeSyncWaitUs(decodeSyncWaitUs);
         if (decodeSyncWaitUs > kDecodeSyncNoticeUs) {
-            // The wait can overlap time already spent in the pacing queue.
-            // Keep that queue residence out of the readiness model by adding
-            // only the blocking fence cost to immutable decoder output.
-            frame.noteGpuReadyUs(decodeSyncWaitUs >
-                    std::numeric_limits<uint64_t>::max() - frame.decoderOutputUs() ?
-                std::numeric_limits<uint64_t>::max() :
-                frame.decoderOutputUs() + decodeSyncWaitUs);
+            // This is an upper bound on completion, sampled after the native
+            // wait. Adding the wait duration to decoder output is wrong when
+            // the frame already spent time in the pacing queue: it can place
+            // completion before the worker even began waiting.
+            frame.noteGpuReadyUs(LiGetMicroseconds());
         }
 
         const uint64_t decisionTimeUs = LiGetMicroseconds();
@@ -458,20 +451,26 @@ int VrrPacingWorker::run()
         // render-bound client it only deepened the standing backlog.
         const uint64_t scheduleNowUs = LiGetMicroseconds();
         telemetry.staleCheckUs = scheduleNowUs;
-        const uint64_t scheduleAgeUs = scheduleNowUs >=
-                frame.decodeCompleteUs() ?
-            scheduleNowUs - frame.decodeCompleteUs() : 0;
+        const uint64_t ageBoundaryUs =
+            m_TimingController->parameters().playoutSourceMappingDecoderOutput != 0 ?
+                frame.decoderOutputUs() : frame.decodeCompleteUs();
+        const uint64_t scheduleAgeUs = scheduleNowUs >= ageBoundaryUs ?
+            scheduleNowUs - ageBoundaryUs : 0;
         telemetry.staleAgeUs = scheduleAgeUs;
         const bool metronome =
             m_TimingController->parameters().playoutMetronomeEnabled != 0;
         const bool latencyFix = m_TimingController->latencyFixActive();
-        // The optional near-ceiling policy measures transport occupancy from
-        // admission. Other modes retain their existing GPU-readiness origin
-        // for stale-work policy; reporting always uses immutable decoder
-        // output below.
+        // Clock mapping and latency reporting retain the full elapsed age.
+        // Discard policy excludes only this image's explicit decode wait:
+        // replacing a now-ready image with an unverified successor can repeat
+        // forever under GPU contention. Actual pre-wait queue residence still
+        // counts, and already-expired queue fronts are rejected before decode.
         const uint64_t ageOriginUs = latencyFix ?
-            queuedFrame.trace.arrivalUs : frame.decodeCompleteUs();
-        const uint64_t ageUs = positiveDifference(scheduleNowUs, ageOriginUs);
+            queuedFrame.trace.arrivalUs :
+            (m_TimingController->parameters().playoutSourceMappingDecoderOutput != 0 ?
+                frame.decoderOutputUs() : frame.decodeCompleteUs());
+        const uint64_t ageUs = VrrFrameDropPolicy::ageExcludingDecodeWaitUs(
+            scheduleNowUs, ageOriginUs, decodeSyncWaitUs);
         if (hasQueuedFrame() && VrrFrameDropPolicy::beforeRender(
                 decision, m_TimingController->displayPeriodUs(), ageUs, metronome, latencyFix)) {
             recordFrameCompletion(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
@@ -530,7 +529,8 @@ int VrrPacingWorker::run()
         // fresh rather than rendering an avoidably old image.
         uint64_t nowUs = LiGetMicroseconds();
         if (hasQueuedFrame() && VrrFrameDropPolicy::afterRenderWait(
-                decision, ageOriginUs, nowUs, metronome, latencyFix)) {
+                decision, ageOriginUs, nowUs, metronome, latencyFix,
+                decodeSyncWaitUs)) {
             recordFrameCompletion(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
                        TraceDisposition::Stale);
             noteDrop();
@@ -562,13 +562,13 @@ int VrrPacingWorker::run()
         telemetry.prepareAcquireUs = preparation.acquireUs;
         telemetry.prepareRenderUs = preparation.renderUs;
         telemetry.prepareFlushUs = preparation.flushUs;
-        const bool gpuReadyCompleted =
+        bool gpuReadyCompleted =
             preparation.feedback.gpuReadyTimingValid &&
             preparation.feedback.gpuReadyWaitResultValid &&
             preparation.feedback.gpuReadyWaitResult == 0 &&
             preparation.feedback.gpuReadyTimeUs >=
                 preparation.feedback.gpuReadyWaitStartUs;
-        const uint64_t gpuReadyWaitUs = gpuReadyCompleted ?
+        uint64_t gpuReadyWaitUs = gpuReadyCompleted ?
             preparation.feedback.gpuReadyTimeUs -
                 preparation.feedback.gpuReadyWaitStartUs : 0;
         m_TimingController->notePreparationDuration(
@@ -806,6 +806,26 @@ int VrrPacingWorker::run()
         telemetry.presentDurationUs =
             telemetry.presentEndUs >= telemetry.presentStartUs ?
                 telemetry.presentEndUs - telemetry.presentStartUs : 0;
+        if (!gpuReadyCompleted) {
+            const bool deferredGpuReadyCompleted =
+                feedback.gpuReadyTimingValid &&
+                feedback.gpuReadyWaitResultValid &&
+                feedback.gpuReadyWaitResult == 0 &&
+                feedback.gpuReadyTimeUs >= feedback.gpuReadyWaitStartUs;
+            if (deferredGpuReadyCompleted) {
+                gpuReadyCompleted = true;
+                gpuReadyWaitUs = feedback.gpuReadyTimeUs -
+                    feedback.gpuReadyWaitStartUs;
+                const uint64_t completionUpperBoundUs =
+                    feedback.gpuReadyCompletedBeforeWait ?
+                        feedback.gpuReadyPollEndUs :
+                        feedback.gpuReadyTimeUs;
+                m_TimingController->noteDeferredGpuReady(
+                    gpuReadyWaitUs, true, completionUpperBoundUs,
+                    completionUpperBoundUs >= telemetry.preparationStartUs ?
+                        completionUpperBoundUs - telemetry.preparationStartUs : 0);
+            }
+        }
         recordSubmission(decision, feedback, telemetry.presentStartUs,
                          telemetry.presentEndUs,
                          telemetry);
@@ -876,6 +896,7 @@ int VrrPacingWorker::run()
 bool VrrPacingWorker::dequeueFrame(QueuedFrame& frame,
                                    bool& queueDiscontinuity)
 {
+    std::deque<QueuedFrame> expiredFrames;
     QMutexLocker lock(&m_FrameQueueLock);
     while (!isStopping() && !m_Suspended.load() && m_FrameQueue.empty()) {
         m_FrameQueueNotEmpty.wait(&m_FrameQueueLock);
@@ -888,10 +909,29 @@ bool VrrPacingWorker::dequeueFrame(QueuedFrame& frame,
         return true;
     }
 
+    const uint64_t nowUs = LiGetMicroseconds();
+    while (m_FrameQueue.size() > 1 && !m_RebaseOnNextFrame &&
+            VrrFrameDropPolicy::beforeDecodeWait(
+                m_FrameQueue[0].frame, m_FrameQueue[1].frame,
+                m_FrameQueue[0].trace.arrivalUs, nowUs,
+                m_TimingController->sourcePeriodUs(),
+                m_TimingController->parameters().playoutMetronomeEnabled != 0)) {
+        expiredFrames.push_back(std::move(m_FrameQueue.front()));
+        m_FrameQueue.pop_front();
+    }
+
     queueDiscontinuity = m_QueueDiscontinuity.exchange(false);
     frame = std::move(m_FrameQueue.front());
     m_FrameQueue.pop_front();
     m_FrameQueueDepth.store(m_FrameQueue.size(), std::memory_order_relaxed);
+    lock.unlock();
+    // No backend has read these images. Release them outside the queue lock
+    // without waiting for decode or perturbing the controller's source clock.
+    for (const auto& expired : expiredFrames) {
+        recordFrameCompletion(expired, VrrTimingDecision{}, VrrPresentFeedback{},
+                              FrameTelemetry{}, TraceDisposition::QueueStale, false);
+        noteDrop();
+    }
     return true;
 }
 
@@ -1113,6 +1153,7 @@ void VrrPacingWorker::recordFrameCompletion(const QueuedFrame& queuedFrame,
     const bool playbackOutcome = disposition == TraceDisposition::Presented ||
         disposition == TraceDisposition::OutputDropped ||
         disposition == TraceDisposition::QueueCapacity ||
+        disposition == TraceDisposition::QueueStale ||
         disposition == TraceDisposition::Stale ||
         disposition == TraceDisposition::PreparationFailed;
     if (m_Telemetry && playbackOutcome) {
@@ -1726,6 +1767,8 @@ const char* VrrPacingWorker::traceDispositionName(
         return "output_dropped";
     case TraceDisposition::QueueCapacity:
         return "queue_capacity";
+    case TraceDisposition::QueueStale:
+        return "queue_stale";
     case TraceDisposition::ArrivalRejected:
         return "arrival_rejected";
     case TraceDisposition::SuspensionDiscard:

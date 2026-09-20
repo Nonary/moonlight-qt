@@ -1,7 +1,8 @@
 # VRR17 follow-up: stable learning and vrr14-style protection
 
-Source: `1ccefb6e` (vrr17.1), plus the buffer-accounting review and this
-2026-09-18 follow-up. This implements the requested direction; it is not a
+Source: `1ccefb6e` (vrr17.1), plus the buffer-accounting review, the
+2026-09-18 follow-up, and the 2026-09-19 ownership/buffer-attribution correction.
+This implements the requested direction; it is not a
 claim of matched vrr14 gameplay smoothness. The initial comparison and separate
 decode/queue/render accounting are documented in [the review](vrr17-review.md).
 
@@ -12,8 +13,8 @@ decode/queue/render accounting are documented in [the review](vrr17-review.md).
 | High-rate presentation protection | vrr14's per-slot rule, `playout_per_frame_latch=1`: protect slots closer than a display period plus guard; do not add vrr17's 225/400 us entry/exit margins. |
 | Low Latency / Balanced Target / Smooth | Maximum allowances of 2 / 2 / 4 fitted source frames, not fixed added delay. Existing absolute ceilings of 16 / 16 / 24 ms and the physical queue-capacity bound still apply. |
 | Initial calibration | Require both 500 ms of contiguous interval coverage and 32 consecutive valid intervals. The historical gate required one second and two intervals. Low FPS can still take longer than one second to collect 32 intervals. |
-| Ongoing growth | Unchanged: current and historical quality pressure plus fresh readiness-attributed error; request at most 250 us per 250 ms and apply at most 125 us per frame. |
-| Retention and release | Unchanged: 6 / 8 / 10-second holds and 125 / 100 / 50 us per second release, with below-target quality history also retaining protection. |
+| Ongoing growth | Require below-target long-window quality, current pressure, fresh readiness-attributed error, and serial service plus decoder-queue time that each fit the intended interval; request at most 250 us per 250 ms and apply at most 125 us per frame. |
+| Retention and release | 6 / 8 / 10-second holds and 125 / 250 / 50 us per second release. Only current pressure renews the live release hold; long quality history still qualifies future growth. |
 | FPS changes and gaps | Do not clear completed initial calibration or earned protection. A broken interval sequence uses the historical one-second requalification gate afterward, not another fast startup. |
 
 At 116 FPS / 120 Hz, a nominal 8,621 us source interval clears vrr14's
@@ -57,6 +58,13 @@ report includes these as evidence attached to buffer events, not as additive
 latency. No trace schema version, launcher environment or retention changes.
 
 ## Validation
+
+The results below are the historical calibration record from before the
+2026-09-19 renderer-ownership and serial-service changes. They validate the
+2/2/4 allowance and initial-calibration policy on Linux, but they do not
+validate the newer D3D11 split fence, Vulkan source-mapping retirement, or the
+current serial-service/release rules. Current deterministic and replay results
+belong with the change that introduced those behaviors.
 
 The Linux application and diagnostics build successfully. All eight C++ suites,
 35 Python tests and `vrrreplay --help` pass. New controller tests cover initial

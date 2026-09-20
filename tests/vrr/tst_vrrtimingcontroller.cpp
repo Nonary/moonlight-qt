@@ -521,6 +521,75 @@ void testOffsetSlewIgnoresWorkerBacklogAndPreservesHistoricalClock()
            "a genuine epoch rebase must discard old offset state and credit");
 }
 
+void testSourceMappingIgnoresDecodePollTiming()
+{
+    auto policy = offsetTestPolicy();
+    policy.playoutSourceMappingDecoderOutput = 1;
+    policy.playoutOffsetWindowUs = 1;
+    VrrTimingController early(config(120, 120), true, policy);
+    VrrTimingController late(config(120, 120), true, policy);
+    VrrTimingController alreadyComplete(config(120, 120), true, policy);
+
+    auto historicalPolicy = policy;
+    historicalPolicy.playoutSourceMappingDecoderOutput = 0;
+    VrrTimingController historicalEarly(config(120, 120), true,
+                                         historicalPolicy);
+    VrrTimingController historicalLate(config(120, 120), true,
+                                        historicalPolicy);
+    bool historicalDiverged = false;
+
+    constexpr uint64_t epochUs = 1000000;
+    for (int i = 0; i < 240; ++i) {
+        const uint32_t timestamp = static_cast<uint32_t>(i * 750);
+        const uint64_t outputUs = decodedTimeForRtp(epochUs, timestamp);
+        auto makeObserved = [&](uint64_t syntheticCompletionUs,
+                                uint64_t residualWaitUs) {
+            auto value = frame(i + 1, timestamp, true, outputUs);
+            value.noteGpuReadyUs(syntheticCompletionUs);
+            value.noteDecodeSyncWaitUs(residualWaitUs);
+            return value;
+        };
+
+        const auto earlyDecision = early.schedule(
+            makeObserved(outputUs + 6000, 6000), outputUs + 6000);
+        const auto lateDecision = late.schedule(
+            makeObserved(outputUs + 2000, 2000), outputUs + 4000);
+        const auto completeDecision = alreadyComplete.schedule(
+            makeObserved(outputUs, 0), outputUs + 7000);
+
+        const auto sameMapping = [&](const VrrTimingDecision& decision,
+                                     const VrrTimingDecision& reference,
+                                     const VrrTimingController& controller,
+                                     const VrrTimingController& referenceController) {
+            return decision.sourceTimeUs == reference.sourceTimeUs &&
+                decision.sourcePeriodUs == reference.sourcePeriodUs &&
+                decision.originalTargetUs == reference.originalTargetUs &&
+                decision.cadenceSmoothingUs == reference.cadenceSmoothingUs &&
+                controller.playoutOffsetUs() == referenceController.playoutOffsetUs() &&
+                decision.cadenceEligible == reference.cadenceEligible &&
+                decision.sourceRateChanged == reference.sourceRateChanged &&
+                decision.phaseDiscontinuity == reference.phaseDiscontinuity &&
+                decision.rebased == reference.rebased;
+        };
+        expect(sameMapping(lateDecision, earlyDecision, late, early) &&
+                   sameMapping(completeDecision, earlyDecision,
+                               alreadyComplete, early),
+               "source mapping must be invariant to worker poll timing and residual decode wait");
+
+        const auto oldEarly = historicalEarly.schedule(
+            makeObserved(outputUs + 6000, 6000), outputUs + 6000);
+        const auto oldLate = historicalLate.schedule(
+            makeObserved(outputUs + 2000, 2000), outputUs + 4000);
+        historicalDiverged |=
+            oldEarly.sourceTimeUs != oldLate.sourceTimeUs ||
+            oldEarly.originalTargetUs != oldLate.originalTargetUs ||
+            historicalEarly.playoutOffsetUs() !=
+                historicalLate.playoutOffsetUs();
+    }
+    expect(historicalDiverged,
+           "the compatibility policy must retain decode-completion-based mapping for old captures");
+}
+
 void testOffsetRecoveryRejectsTransitionMinimum()
 {
     // A source discontinuity can contain an unusually early readiness
@@ -3499,6 +3568,80 @@ void testGpuReadinessLeadIsSeparateFromTarget()
            "failed GPU waits must not train readiness head start");
 }
 
+void testDeferredGpuObservationDoesNotCreateBufferPressure()
+{
+    auto session = config(120, 240);
+    session.latencyMode = 1;
+    auto policy = vrrTimingParametersForSession(session);
+    policy.playoutDelayStartUs = 1000;
+    policy.playoutDelayStartPeriodPerMille = 0;
+    policy.playoutDelayMinimumUs = 1000;
+    policy.playoutDelayMaximumUs = 6000;
+    policy.playoutDelayMaximumPeriodPerMille = 0;
+    policy.playoutDelayCapSourcePeriodPerMille = 0;
+    VrrTimingController preparationBound(session, true, policy);
+    VrrTimingController lateObservation(session, true, policy);
+    bool sawCurrentPressure = false;
+    bool sawPreparationBoundGrowth = false;
+    bool sawLateObservationGrowth = false;
+
+    for (int i = 0; i < 600; ++i) {
+        const uint32_t rtp = static_cast<uint32_t>(i * 750);
+        const uint64_t decoded = decodedTimeForRtp(1000000, rtp);
+        const auto boundedDecision = preparationBound.schedule(
+            frame(i, rtp, true, decoded), decoded);
+        const auto observedDecision = lateObservation.schedule(
+            frame(i, rtp, true, decoded), decoded);
+        expect(boundedDecision.targetUs == observedDecision.targetUs &&
+                   boundedDecision.playoutDelayUs ==
+                       observedDecision.playoutDelayUs,
+               "late fence observation must not change the current or future presentation target");
+
+        const uint64_t preparationStartUs = std::max(
+            decoded, boundedDecision.renderStartUs);
+        const uint64_t preparationCompleteUs = std::min(
+            boundedDecision.originalTargetUs,
+            preparationStartUs + 500);
+        preparationBound.notePreparationDuration(
+            500, 0, preparationCompleteUs);
+        lateObservation.notePreparationDuration(
+            500, 0, preparationCompleteUs);
+        preparationBound.noteSchedulerDelays(0, 0, true);
+        lateObservation.noteSchedulerDelays(0, 0, true);
+
+        // Both fences have zero residual wait and the same absorbable service
+        // bound. The second is merely first observed after its target wake.
+        preparationBound.noteDeferredGpuReady(
+            0, true, preparationCompleteUs, 6000);
+        lateObservation.noteDeferredGpuReady(
+            0, true, observedDecision.originalTargetUs + 1000, 6000);
+        const uint64_t submittedUs = boundedDecision.targetUs +
+            (i % 2 ? 3000 : 0);
+        preparationBound.noteSubmission(true, false, submittedUs);
+        lateObservation.noteSubmission(true, false, submittedUs);
+
+        const auto boundedUpdate = preparationBound.intervalStats().update;
+        const auto observedUpdate = lateObservation.intervalStats().update;
+        sawCurrentPressure |=
+            observedUpdate.action ==
+                Vrr13::IntervalBuffer::Action::CurrentPressure ||
+            observedUpdate.action ==
+                Vrr13::IntervalBuffer::Action::NoFreshMiss;
+        sawPreparationBoundGrowth |=
+            boundedUpdate.action == Vrr13::IntervalBuffer::Action::Grow;
+        sawLateObservationGrowth |=
+            observedUpdate.action == Vrr13::IntervalBuffer::Action::Grow;
+    }
+
+    expect(sawCurrentPressure,
+           "the deferred-observation fixture must exercise sustained interval pressure");
+    expect(!sawPreparationBoundGrowth && !sawLateObservationGrowth,
+           "observing an already-complete fence after cadence hold must not manufacture readiness growth");
+    expect(preparationBound.intervalStats().update.requestedUs ==
+               lateObservation.intervalStats().update.requestedUs,
+           "fence observation time must leave the interval-buffer request unchanged");
+}
+
 void testReadinessDrivenPadding()
 {
     // Identical FIFO and three-frame capacity throughout. Only time padding
@@ -4861,8 +5004,11 @@ void testMeanMissBuffer()
         session.latencyMode = mode;
         const auto policy = vrrTimingParametersForSession(session);
         expect(policy.playoutResponsiveBuffer == 7 &&
+            policy.playoutSourceMappingDecoderOutput == 1 &&
+            policy.playoutSerialServiceGate == 1 &&
+            policy.playoutRecentPressureRelease == 1 &&
             policy.playoutMeanMissHoldUs == (mode == 2 ? 6000000 : mode == 1 ? 8000000 : 10000000) &&
-            policy.playoutMeanMissReleaseUsPerSecond == (mode == 0 ? 50 : mode == 2 ? 125 : 100),
+            policy.playoutMeanMissReleaseUsPerSecond == (mode == 0 ? 50 : mode == 2 ? 125 : 250),
             "every preset must select the production interval queue and record its release policy");
     }
 }
@@ -4918,6 +5064,95 @@ void testIntervalQualityUsesPresetHistory()
     expect(oneMinute.stats().averageValid && fiveMinutes.stats().averageValid &&
                fiveMinutes.stats().evaluatedUs > oneMinute.stats().evaluatedUs,
            "the active quality score must retain the selected preset history duration");
+}
+
+void testIntervalBufferSeparatesDeliveryFromSerialService()
+{
+    const auto run = [](uint64_t serialServiceUs) {
+        Vrr13::IntervalBuffer buffer;
+        uint64_t applied = 1000;
+        unsigned growths = 0;
+        bool sawNotAbsorbable = false;
+        constexpr uint64_t periodUs = 8333;
+        for (uint64_t i = 1; i <= 600; ++i) {
+            const uint64_t intended = 1000000 + i * periodUs;
+            const uint64_t late = i > 80 && i % 2 ? 3000 : 0;
+            buffer.observe({i, intended, intended + late, intended,
+                            intended + late, applied, true, true,
+                            serialServiceUs, 0},
+                           1000, 6000, 1000000, 500, true, 990000,
+                           500, 60000000, 500000, 32, true, true);
+            const auto update = buffer.stats().update;
+            growths += update.action ==
+                Vrr13::IntervalBuffer::Action::Grow ? 1 : 0;
+            sawNotAbsorbable |= update.action ==
+                Vrr13::IntervalBuffer::Action::NotAbsorbable;
+            applied = buffer.demand(applied);
+        }
+        return std::array<uint64_t, 3>{applied, growths,
+                                       sawNotAbsorbable ? 1ULL : 0ULL};
+    };
+
+    const auto deliveryJitter = run(1000);
+    expect(deliveryJitter[0] > 1000 && deliveryJitter[1] > 1,
+           "absorbable delivery jitter must acquire bounded interval protection");
+
+    const auto saturatedService = run(9500);
+    expect(saturatedService[0] == 1000 && saturatedService[1] == 0 &&
+               saturatedService[2] == 1,
+           "service longer than the smoothed 120 Hz slot must not authorize buffering");
+
+    const auto rawLongIntervalTrap = run(9000);
+    expect(rawLongIntervalTrap[0] == 1000 && rawLongIntervalTrap[1] == 0,
+           "serial work must be compared with intended slots, not a longer raw RTP interval");
+}
+
+void testIntervalBufferReleaseIgnoresReportingDebt()
+{
+    const auto run = [](bool recentPressureRelease) {
+        Vrr13::IntervalBuffer buffer;
+        uint64_t applied = 1000;
+        uint64_t peak = applied;
+        bool sawRelease = false;
+        constexpr uint64_t periodUs = 10000;
+        uint64_t frameNumber = 0;
+        const auto observe = [&](uint64_t late, uint64_t& mutableApplied,
+                                 Vrr13::IntervalBuffer& mutableBuffer,
+                                 uint64_t frameIndex) {
+            const uint64_t intended = 1000000 + frameIndex * periodUs;
+            mutableBuffer.observe(
+                {frameIndex, intended, intended + late, intended,
+                 intended + late, mutableApplied, true, true, 1000, 0},
+                1000, 6000, 100000, 2000, true, 995000,
+                500, 120000000, 500000, 32,
+                recentPressureRelease, true);
+            mutableApplied = mutableBuffer.demand(mutableApplied);
+        };
+
+        for (unsigned i = 0; i < 120; ++i) {
+            observe(0, applied, buffer, ++frameNumber);
+        }
+        for (unsigned i = 0; i < 400; ++i) {
+            observe(i % 2 ? 3000 : 0, applied, buffer, ++frameNumber);
+            peak = std::max(peak, applied);
+        }
+        for (unsigned i = 0; i < 700; ++i) {
+            observe(0, applied, buffer, ++frameNumber);
+            sawRelease |= buffer.stats().update.action ==
+                Vrr13::IntervalBuffer::Action::Release;
+        }
+        return std::array<double, 4>{double(applied), double(peak),
+            buffer.stats().lossFraction(), sawRelease ? 1.0 : 0.0};
+    };
+
+    const auto current = run(true);
+    const auto historical = run(false);
+    expect(current[1] >= 2000,
+           "the release fixture must first acquire meaningful protection");
+    expect(current[0] == 1000 && current[2] > 0.005 && current[3] == 1.0,
+           "clean recent operation must release reserve while long reporting history stays below target");
+    expect(historical[0] > 1000,
+           "historical score-held behavior must remain replayable when the release revision is disabled");
 }
 
 void testProductionCalibrationSurvivesFpsChanges()
@@ -5086,6 +5321,8 @@ void testBufferDecisionDiagnostics()
 
 int main()
 {
+    testIntervalBufferReleaseIgnoresReportingDebt();
+    testIntervalBufferSeparatesDeliveryFromSerialService();
     testProductionCalibrationSurvivesFpsChanges();
     testInitialIntervalCalibration();
     testBufferDecisionDiagnostics();
@@ -5119,6 +5356,7 @@ int main()
     testStableNativeSmoothnessReference();
     testPreparationKeepsLearnedLead();
     testGpuReadinessLeadIsSeparateFromTarget();
+    testDeferredGpuObservationDoesNotCreateBufferPressure();
     testSmoothnessFeedback();
     testRefreshReferencesAreNotDisplayEvents();
     testVrr14Prediction();
@@ -5139,6 +5377,7 @@ int main()
     testTimestampModePreservesUnevenHostIntervals();
     testOffsetSlewUsesElapsedTime();
     testOffsetSlewIgnoresWorkerBacklogAndPreservesHistoricalClock();
+    testSourceMappingIgnoresDecodePollTiming();
     testOffsetRecoveryRejectsTransitionMinimum();
     testOffsetRecoveryKeepsStartupPaddingAndNativePolicy();
     testTimestampModeStillBoundsCatchUpBursts();

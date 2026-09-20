@@ -13,6 +13,7 @@
 #include "overlaycompletion.h"
 
 #include <atomic>
+#include <deque>
 
 #ifdef Q_OS_LINUX
 #include "vulkantiming.h"
@@ -100,6 +101,13 @@ private:
     bool cancelVrrFrame();
     bool waitForVrrGpuReady(VrrPresentFeedback& feedback);
     void queueRenderDeviceReset();
+#ifdef Q_OS_LINUX
+    bool ensureVrrSourceRetentionSlot();
+    bool vrrSourceFrameBusy(const pl_frame& frame) const;
+    void retireCompletedVrrSourceFrames();
+    void retainVrrSourceFrame(pl_frame& frame);
+    void releaseAllVrrSourceFrames();
+#endif
 
     bool createSwapchain(int depth);
     bool createOverlay(pl_overlay* overlay, SDL_Surface* surface);
@@ -169,6 +177,19 @@ private:
     bool m_VrrFramePrepared = false;
     bool m_VrrRenderSucceeded = false;
     bool m_VrrRenderTimingActive = false;
+#ifdef Q_OS_LINUX
+    // pl_map_avframe_ex() retains its own AVFrame reference. Keep that mapping
+    // alive after swapchain submission until every imported source plane has
+    // retired its GPU reads. This lets presentation use libplacebo's existing
+    // render-complete semaphore without allowing the decoder to recycle a VA
+    // surface underneath an in-flight Vulkan command.
+    std::deque<pl_frame> m_VrrRetainedSourceFrames;
+    bool m_VrrCurrentSourceRetained = false;
+    uint64_t m_VrrRetainedSourceFrameTotal = 0;
+    uint64_t m_VrrSourceRetirementWaits = 0;
+    uint64_t m_VrrSourceRetirementWaitUs = 0;
+    size_t m_VrrSourceRetentionHighWater = 0;
+#endif
     // Readiness evidence from the current prepared frame is copied into the
     // eventual present or cancellation result. Vulkan may have to submit an
     // acquired image to abandon it, and the worker must not lose the GPU wait

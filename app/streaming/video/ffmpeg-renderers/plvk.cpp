@@ -73,13 +73,16 @@ public:
 namespace {
 
 #ifdef Q_OS_LINUX
-// Keep the Vulkan completion observation bounded. A frame that cannot become
-// idle inside this interval is a renderer/device fault, not an invitation to
-// hold the pacer indefinitely. The shared controller learns only successful
-// waits, so this bound cannot turn a sustained GPU overload into unbounded
-// playout latency.
+// Bound both the synchronous software-frame completion fallback and
+// backpressure on the asynchronous hardware-source retirement queue. A frame
+// that cannot retire inside this interval is a renderer/device fault, not an
+// invitation to hold the pacer indefinitely.
 constexpr uint64_t kVulkanGpuReadyTimeoutUs = 50000;
 constexpr unsigned int kVulkanGpuReadyPollLimit = 100000;
+// PACER_MAX_OUTSTANDING_FRAMES reserves two decoder surfaces beyond its
+// three-frame queue for the worker/current backend lifetime. Do not retain a
+// third source here or the asynchronous path can exhaust that allowance.
+constexpr size_t kVulkanRetainedSourceFrameLimit = 2;
 #endif
 
 const char* vulkanPresentModeName(VkPresentModeKHR mode)
@@ -254,6 +257,17 @@ PlVkRenderer::~PlVkRenderer()
     // started libplacebo frame owns an internal swapchain mutex, so release it
     // before any of the Vulkan objects below are destroyed.
     cancelVrrFrame();
+#ifdef Q_OS_LINUX
+    releaseAllVrrSourceFrames();
+    if (m_VrrRetainedSourceFrameTotal != 0) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Vulkan VRR source retirement summary: retained=%llu capacity_waits=%llu wait_us=%llu high_water=%zu",
+                    static_cast<unsigned long long>(m_VrrRetainedSourceFrameTotal),
+                    static_cast<unsigned long long>(m_VrrSourceRetirementWaits),
+                    static_cast<unsigned long long>(m_VrrSourceRetirementWaitUs),
+                    m_VrrSourceRetentionHighWater);
+    }
+#endif
 #if defined(HAS_WAYLAND) && defined(Q_OS_LINUX)
     m_GamescopeRepaint.reset();
 #endif
@@ -1360,6 +1374,11 @@ void PlVkRenderer::cleanupRenderContext()
     // We have to submit a pending swapchain frame before shutting down in
     // order to release a mutex that pl_swapchain_start_frame() acquires.
     cancelVrrFrame();
+#ifdef Q_OS_LINUX
+    // The render context is about to stop servicing retirement polls. Finish
+    // outstanding commands before dropping the AVFrame references they own.
+    releaseAllVrrSourceFrames();
+#endif
 }
 
 IVrrFramePresenter* PlVkRenderer::getVrrFramePresenter()
@@ -1401,15 +1420,151 @@ uint64_t PlVkRenderer::waitForDecode(AVFrame* frame)
     const uint64_t startUs = LiGetMicroseconds();
     // libplacebo syncs the surface again when it imports the frame; that
     // second sync returns at once because this one already waited.
-    vaSyncSurface(vaDeviceContext->display,
-                  (VASurfaceID)(uintptr_t)frame->data[3]);
+    const VAStatus status = vaSyncSurface(
+        vaDeviceContext->display,
+        (VASurfaceID)(uintptr_t)frame->data[3]);
     const uint64_t endUs = LiGetMicroseconds();
+    if (status != VA_STATUS_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "vaSyncSurface() failed before Vulkan VRR preparation: %d (%s)",
+                     status, vaErrorStr(status));
+        // This is the hardware path's explicit decode-readiness barrier.
+        // Do not rely on a later mapping call to reject an unsynchronized VA
+        // surface: make prepareFrame() fail its support check and enter the
+        // normal renderer recovery path before any Vulkan read is recorded.
+        m_VrrFallbackReason =
+            VrrFallbackReason::AdaptivePresentationUnavailable;
+        queueRenderDeviceReset();
+    }
     return endUs >= startUs ? endUs - startUs : 0;
 #else
     (void) frame;
     return 0;
 #endif
 }
+
+#ifdef Q_OS_LINUX
+bool PlVkRenderer::vrrSourceFrameBusy(const pl_frame& frame) const
+{
+    if (m_Vulkan == nullptr || m_Vulkan->gpu == nullptr) {
+        return true;
+    }
+
+    for (int plane = 0; plane < frame.num_planes; ++plane) {
+        const pl_tex texture = frame.planes[plane].texture;
+        if (texture != nullptr && pl_tex_poll(m_Vulkan->gpu, texture, 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void PlVkRenderer::retireCompletedVrrSourceFrames()
+{
+    if (m_Vulkan == nullptr || m_Vulkan->gpu == nullptr) {
+        return;
+    }
+
+    for (auto frame = m_VrrRetainedSourceFrames.begin();
+         frame != m_VrrRetainedSourceFrames.end();) {
+        if (vrrSourceFrameBusy(*frame)) {
+            ++frame;
+            continue;
+        }
+
+        pl_unmap_avframe(m_Vulkan->gpu, &*frame);
+        frame = m_VrrRetainedSourceFrames.erase(frame);
+    }
+}
+
+bool PlVkRenderer::ensureVrrSourceRetentionSlot()
+{
+    retireCompletedVrrSourceFrames();
+    if (m_VrrRetainedSourceFrames.size() <
+            kVulkanRetainedSourceFrameLimit) {
+        return true;
+    }
+
+    // A two-entry bound accounts for the pacer's current/deferred surface
+    // allowance. Backpressure here is exceptional: normally the previous
+    // source read retires while the worker waits for its presentation target.
+    // Keep the same fault bound as the former output-completion wait.
+    ++m_VrrSourceRetirementWaits;
+    const uint64_t waitStartUs = LiGetMicroseconds();
+    uint64_t nowUs = waitStartUs;
+    unsigned int pollCount = 0;
+    while (m_VrrRetainedSourceFrames.size() >=
+           kVulkanRetainedSourceFrameLimit) {
+        if (m_VrrWindowChangePending.load() || m_VrrSuspended) {
+            m_VrrSourceRetirementWaitUs += nowUs >= waitStartUs ?
+                nowUs - waitStartUs : 0;
+            return false;
+        }
+        if (m_Vulkan == nullptr || m_Vulkan->gpu == nullptr ||
+                pl_gpu_is_failed(m_Vulkan->gpu)) {
+            m_VrrSourceRetirementWaitUs += nowUs >= waitStartUs ?
+                nowUs - waitStartUs : 0;
+            queueRenderDeviceReset();
+            return false;
+        }
+        if ((nowUs >= waitStartUs &&
+             nowUs - waitStartUs >= kVulkanGpuReadyTimeoutUs) ||
+                ++pollCount >= kVulkanGpuReadyPollLimit) {
+            const uint64_t waitedUs = nowUs >= waitStartUs ?
+                nowUs - waitStartUs : 0;
+            m_VrrSourceRetirementWaitUs += waitedUs;
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Vulkan VRR source retirement timed out after %llu us with %zu mappings retained",
+                         static_cast<unsigned long long>(waitedUs),
+                         m_VrrRetainedSourceFrames.size());
+            m_VrrFallbackReason =
+                VrrFallbackReason::AdaptivePresentationUnavailable;
+            queueRenderDeviceReset();
+            return false;
+        }
+
+        std::this_thread::yield();
+        retireCompletedVrrSourceFrames();
+        nowUs = LiGetMicroseconds();
+    }
+
+    m_VrrSourceRetirementWaitUs += nowUs >= waitStartUs ?
+        nowUs - waitStartUs : 0;
+    return true;
+}
+
+void PlVkRenderer::retainVrrSourceFrame(pl_frame& frame)
+{
+    SDL_assert(m_VrrRetainedSourceFrames.size() <
+               kVulkanRetainedSourceFrameLimit);
+    m_VrrRetainedSourceFrames.push_back(frame);
+    SDL_zero(frame);
+    ++m_VrrRetainedSourceFrameTotal;
+    m_VrrSourceRetentionHighWater = std::max(
+        m_VrrSourceRetentionHighWater,
+        m_VrrRetainedSourceFrames.size());
+}
+
+void PlVkRenderer::releaseAllVrrSourceFrames()
+{
+    if (m_VrrRetainedSourceFrames.empty() || m_Vulkan == nullptr ||
+            m_Vulkan->gpu == nullptr) {
+        return;
+    }
+
+    // Teardown is the intended use for pl_gpu_finish(). Once it returns, all
+    // retained source mappings can be unreferenced without recycling external
+    // decoder memory while Vulkan still reads it. A failed device has no
+    // useful completion to wait for; libplacebo teardown handles that state.
+    if (!pl_gpu_is_failed(m_Vulkan->gpu)) {
+        pl_gpu_finish(m_Vulkan->gpu);
+    }
+    for (pl_frame& frame : m_VrrRetainedSourceFrames) {
+        pl_unmap_avframe(m_Vulkan->gpu, &frame);
+    }
+    m_VrrRetainedSourceFrames.clear();
+}
+#endif
 
 bool PlVkRenderer::waitForVrrGpuReady(VrrPresentFeedback& feedback)
 {
@@ -1541,6 +1696,15 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
         return result;
     }
 
+#ifdef Q_OS_LINUX
+    // Retained source mappings are the completion authority for the
+    // asynchronous hardware path. Reserve space before acquiring a swapchain
+    // image so a retirement timeout never leaves an image mutex held.
+    if (!ensureVrrSourceRetentionSlot()) {
+        return result;
+    }
+#endif
+
     // Clear readiness evidence only after the duplicate-frame guard above;
     // an already-acquired frame keeps its telemetry until present/cancel.
     m_VrrGpuReadyFeedback = {};
@@ -1557,10 +1721,11 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
 #else
     (void) windowChanged;
 #endif
-    const uint64_t syncStartUs = LiGetMicroseconds();
-    result.decodeSyncUs = waitForDecode(frame);
+    // VrrPacingWorker already waited at the immutable decoder-output boundary.
+    // libplacebo's AV_HWFRAME_MAP_READ import validates that dependency again;
+    // another explicit vaSyncSurface() here only re-synchronizes the same VA
+    // surface and cannot make it ready sooner.
     const uint64_t acquireStartUs = LiGetMicroseconds();
-    (void) syncStartUs;
     if (!acquireVrrSwapchainFrame()) {
         return result;
     }
@@ -1576,6 +1741,9 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
     m_VrrPreparingFrame = true;
     m_VrrRenderSucceeded = false;
     m_VrrRenderTimingActive = false;
+#ifdef Q_OS_LINUX
+    m_VrrCurrentSourceRetained = false;
+#endif
     renderFrame(frame);
     const uint64_t renderEndUs = LiGetMicroseconds();
     result.renderUs = renderEndUs >= acquireEndUs ? renderEndUs - acquireEndUs : 0;
@@ -1603,6 +1771,10 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
     }
 
 #ifdef Q_OS_LINUX
+    // Keep hardware mappings alive through completion, then release them
+    // before the cadence hold. Letting multiple decoder surfaces remain in
+    // flight across presents regressed delivery under concurrent capture.
+    // Restore the bounded completion barrier while preserving source lifetime.
     if (!waitForVrrGpuReady(result.feedback)) {
         m_VrrGpuReadyFeedback = result.feedback;
         result.cancellationMaySubmit = m_HasPendingSwapchainFrame;
@@ -1618,12 +1790,18 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
         }
         return result;
     }
+    retireCompletedVrrSourceFrames();
 #endif
 
     m_VrrFramePrepared = true;
     result.prepared = true;
     result.cancellationMaySubmit = true;
+#ifdef Q_OS_LINUX
+    result.sourceFrameReusable = m_VrrRetainedSourceFrames.empty();
+    m_VrrCurrentSourceRetained = false;
+#else
     result.sourceFrameReusable = true;
+#endif
     m_VrrGpuReadyFeedback = result.feedback;
     return result;
 }
@@ -1656,6 +1834,12 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& reques
 #endif
     const uint64_t submissionTimeUs = LiGetMicroseconds();
     const bool submitted = submitPendingSwapchainFrame();
+#ifdef Q_OS_LINUX
+    // The target wait often gives the source reads enough time to finish.
+    // Reclaim completed mappings promptly; an incomplete one remains owned by
+    // the bounded queue and is checked again before the next preparation.
+    retireCompletedVrrSourceFrames();
+#endif
 
     VrrPresentFeedback feedback = m_VrrGpuReadyFeedback;
     m_VrrGpuReadyFeedback = {};
@@ -1730,8 +1914,15 @@ bool PlVkRenderer::cancelVrrFrame()
     m_VrrPreparingFrame = false;
     m_VrrFramePrepared = false;
     m_VrrRenderSucceeded = false;
+#ifdef Q_OS_LINUX
+    m_VrrCurrentSourceRetained = false;
+    retireCompletedVrrSourceFrames();
+#endif
 
     const bool submitted = submitPendingSwapchainFrame();
+#ifdef Q_OS_LINUX
+    retireCompletedVrrSourceFrames();
+#endif
     if (!submitted && hadPendingFrame) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "pl_swapchain_submit_frame() failed while abandoning Vulkan VRR frame");
@@ -1810,7 +2001,7 @@ bool PlVkRenderer::restoreFixedPresentation(VrrFallbackReason reason)
 
 void PlVkRenderer::renderFrame(AVFrame *frame)
 {
-    pl_frame mappedFrame, targetFrame;
+    pl_frame mappedFrame = {}, targetFrame = {};
 
     // If waitToRender() failed to get the next swapchain frame, skip
     // rendering this frame. It probably means the window is occluded.
@@ -1931,9 +2122,20 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
     if (m_VrrPreparingFrame) {
         // The VRR worker owns the target wait. It calls presentFrame()
         // later, so retain the acquired image instead of submitting here.
-        // Mapping and overlay lifetime can still end now because libplacebo
-        // retains the GPU work it recorded for the swapchain frame.
+        // Overlay lifetime can end now because libplacebo retains the recorded
+        // work. On Linux hardware mappings, retain the mapped AVFrame and its
+        // imported source textures until their GPU reads actually retire.
         m_VrrRenderSucceeded = renderSucceeded;
+#ifdef Q_OS_LINUX
+        const AVPixFmtDescriptor* pixelFormat =
+            frame != nullptr ? av_pix_fmt_desc_get(
+                static_cast<AVPixelFormat>(frame->format)) : nullptr;
+        if (pixelFormat != nullptr &&
+                (pixelFormat->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+            retainVrrSourceFrame(mappedFrame);
+            m_VrrCurrentSourceRetained = true;
+        }
+#endif
         goto UnmapExit;
     }
 

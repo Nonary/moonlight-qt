@@ -1,11 +1,46 @@
 #pragma once
 
 #include "vrrtimingcontroller.h"
+#include <algorithm>
 #include <limits>
 
 // Call only when a newer successor is available. Never discard the sole image
 // after a host stall. Shared by the worker and the all-arrival queue simulation.
 namespace VrrFrameDropPolicy {
+// Decode service has already been paid for when the worker checks the ready
+// image. A queued successor is not evidence that its GPU decode has finished.
+// Counting this wait as replaceable backlog can reject every ready image when
+// all decodes take longer than the age limit. Keep genuine queue residence and
+// scheduler delay, without changing the source clock or latency telemetry.
+inline uint64_t ageExcludingDecodeWaitUs(uint64_t nowUs, uint64_t originUs,
+                                       uint64_t decodeSyncWaitUs)
+{
+    const uint64_t elapsedUs = nowUs > originUs ? nowUs - originUs : 0;
+    return elapsedUs - std::min(elapsedUs, decodeSyncWaitUs);
+}
+
+// Queue-only rejection, before calling a backend that may block for GPU
+// decode. Use both the fitted cadence and the next source interval so a
+// slower source transition cannot be mistaken for stale queued work.
+inline bool beforeDecodeWait(const PacedFrame& frame, const PacedFrame& successor,
+                             uint64_t arrivalUs, uint64_t nowUs,
+                             uint64_t sourcePeriodUs, bool metronome)
+{
+    if (!sourcePeriodUs || !arrivalUs || nowUs <= arrivalUs ||
+            !frame.timestampValid() || !successor.timestampValid() ||
+            frame.frameNumber() < 0 ||
+            int64_t(successor.frameNumber()) != int64_t(frame.frameNumber()) + 1) {
+        return false;
+    }
+    const uint32_t ticks = successor.rtpTimestamp() - frame.rtpTimestamp();
+    if (ticks == 0 || ticks > 90000) return false;
+    const uint64_t nextIntervalUs = (uint64_t(ticks) * 1000000 + 89999) / 90000;
+    const uint64_t periodUs = std::max(sourcePeriodUs, nextIntervalUs);
+    const uint64_t periods = metronome ? 4 : 2;
+    return periodUs <= std::numeric_limits<uint64_t>::max() / periods &&
+        nowUs - arrivalUs > periodUs * periods;
+}
+
 inline uint64_t maximumAgeUs(const VrrTimingDecision& decision, bool metronome, bool latencyFix)
 {
     // One source interval is normal occupancy for a single worker that waits
@@ -31,10 +66,15 @@ inline bool beforeRender(const VrrTimingDecision& decision, uint64_t displayPeri
 }
 
 inline bool afterRenderWait(const VrrTimingDecision& decision, uint64_t ageOriginUs,
-                            uint64_t nowUs, bool metronome, bool latencyFix)
+                            uint64_t nowUs, bool metronome, bool latencyFix,
+                            uint64_t decodeSyncWaitUs = 0)
 {
     const uint64_t originUs = latencyFix ? ageOriginUs : decision.targetUs;
     const uint64_t limitUs = maximumAgeUs(decision, metronome, latencyFix);
-    return limitUs != 0 && nowUs > originUs && nowUs - originUs > limitUs;
+    // A target-relative horizon already starts after decode synchronization.
+    // Only admission-relative age includes the service we must exclude here.
+    const uint64_t ageUs = ageExcludingDecodeWaitUs(
+        nowUs, originUs, latencyFix ? decodeSyncWaitUs : 0);
+    return limitUs != 0 && ageUs > limitUs;
 }
 }
