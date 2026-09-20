@@ -5,7 +5,11 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Source baseline: `1ccefb6e` (vrr17.1), plus the buffer-accounting review and
+Source baseline: `72b93617` (vrr17 branch), with the stats overview wording/layout
+follow-up and cadence qualification correction (2026-09-19). The stats follow-up
+changes presentation only, not timing,
+telemetry accounting, or buffering policy. The timing baseline remains
+`1ccefb6e` (vrr17.1), plus the buffer-accounting review and
 initial-calibration follow-up (2026-09-18). Accounting adds separate buffer
 reasons, latency breakdowns and replay audits. The follow-up restores vrr14's
 slot-only presentation-protection threshold, expands the preset allowances to
@@ -73,8 +77,8 @@ installations also use the new queue. Legacy policies remain only for explicit
 historical diagnostic configurations. Reconnect after changing latency presets.
 Updated 2026-09-18: displayed frame queue delay still excludes the worker's
 explicit GPU decode synchronization wait. Existing decoding, queue and rendering
-statistics keep their definitions. The wait is now shown on its own labelled
-line; it is never merged into an old statistic. Full decoder-output-to-Present-
+statistics keep their definitions. Advanced tracing shows the wait on its own
+labelled line; it is never merged into an old statistic. Full decoder-output-to-Present-
 return time remains diagnostic, with no new aggregate overlay headline. Queue
 plus rendering plus that separate wait partitions internal client processing.
 The initial map came from nine Luna Medium specialists, followed by
@@ -94,6 +98,66 @@ composition guard and passes repaint=false to the decoder. Dormant renderer
 helpers and their deterministic tests remain available for development.
 Production retains its Immediate/WSI FIFO selection; adaptive presentation
 permission is owned by the VRR backend rather than a user preference.
+
+### Cadence qualification correction (2026-09-19)
+
+Production records `playout_smoothing_windowed_cadence=2`. Reduce judder
+qualifies a rolling four-interval mean within 25% of the fitted source period.
+There is no additional recovery timeout (`playout_smoothing_recovery_us=0`);
+the source-rate detector retains its independent transition confirmation.
+This replaces the single-interval/compensating-pair stability gate, whose
+threshold was repeatedly crossed by 90 kHz RTP rounding near 6.25/10.42 ms
+at 120 FPS, especially when normal intervals interrupted alternating pairs.
+Revision 2 also tolerates one RTP tick of rounding at the half-period bound
+and a short interval down to one quarter-period when the preceding long
+interval compensates it and their mean is within 25% of the fitted period.
+
+Missing frames, invalid source timing, phase/epoch discontinuities, detected
+rate changes, uncompensated bursts and intervals above 2.5 periods discard
+qualification evidence. Four new consecutive intervals are required. Storage
+is fixed; this does not wait for future frames or add a frame queue.
+Historical captures default to revision 0 and a 200 ms recovery timeout;
+revision 1 retains the four-interval gate with the original burst bound.
+Both retain their original integer period updates for exact replay.
+
+The selected blend keeps 85% of the predicted slot and 15% of the raw slot,
+with a 2.5% period EMA. Revision 2 retains fractional EMA updates so a slow
+filter cannot leave permanent period error after a source-rate change.
+Positive retiming remains capped at 2 ms. Preset buffer caps, quality targets,
+holds and release rates are unchanged. Calibration identity includes all five
+smoothing parameters so old readiness profiles cannot cross-seed this policy.
+
+Replay now audits first-frame GPU readiness using the row's captured responsive
+revision before constructing the controller. Previously that one row could be
+checked with the older queue-inclusive rule, falsely rejecting valid output-
+plus-blocking-wait timestamps. The timestamp constraints are unchanged.
+
+Validation: all six required deterministic VRR suites, diagnostics and overlay
+checks pass; the native application builds and passes offscreen help. The latest
+Balanced, preceding Smooth and earlier Balanced captures from the September 19
+20:53 run pass exact historical replay, as do new and revision-1 cold/warm and
+first-frame GPU-wait fixtures. Eleven diagnostic-tampering checks remain
+rejected. Final rebuilt replay matches the selected override to the production
+resolver on every capture.
+
+On the latest Balanced capture, presented jerk above 2 ms falls from 66.6% in
+the original recording to 25.0% with revision 1, then 10.2% with this policy.
+Against revision 1, median jerk falls from 1.540 to 0.393 ms and mean decoder-
+output-to-submission latency from 10.189 to 9.806 ms. p99 latency is essentially
+unchanged (13.173 to 13.182 ms); p99.95 remains 24.684 ms. Rare jerk tails do
+not uniformly improve: p99.95 increases from 10.300 to 12.148 ms. Preceding
+Smooth improves from 26.9% to 5.8% over 2 ms; earlier Balanced from 34.9% to
+17.4%, with a 0.236 ms mean latency increase in that backlogged capture. These
+are within-capture policy comparisons, not matched gameplay comparisons
+between presets.
+
+Four nominal/fault scenarios pass zero modeled interval violations, 16 ms
+reserve and 20 ms p99 latency bounds without worker saturation. These are
+fixed-admission controller results, not live GPU or physical scanout validation;
+the captures have no usable raster phase coverage. Input identities, full
+metrics, tradeoffs and final build hashes are in
+`build/judder-optimization-20260919/validation.md`; reusable variants are in
+`tests/vrr/configs/windowed-cadence-variants.json`.
 
 ### Source-offset transition recovery (2026-09-15)
 
@@ -898,8 +962,8 @@ and native submission behavior. It is not simply the configured playout delay.
 The performance overlay retains frame queue delay and rendering
 time, without a separate client-processing row. These use the current queue/pacing
 and rendering quantities for successfully presented frames, with one shared frame count.
-Queue/pacing excludes the explicit worker GPU decode wait. The two displayed
-components plus the separate GPU decode synchronization line partition client processing.
+Queue/pacing excludes the explicit worker GPU decode wait. In advanced tracing,
+the two components plus the separate GPU decode synchronization line partition client processing.
 Queue/pacing includes queue residence, target waits and other time outside
 preparation, presentation and explicit decode synchronization. “Client processing
 delay” ends when the presentation call returns. It does not include unmeasured
@@ -1087,8 +1151,8 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | GPU readiness lead | Recent completed present-ready wait p99 plus 500 us, attacked by at most 1,000 us per sample and released at 250 us/s |
 | GPU readiness ceiling | `min(12,000 us, fitted source period)`; target/deadline unchanged |
 | Capacity telemetry | `playout_capacity_telemetry=1` exposes unclamped demand and cap pressure in live decisions |
-| Smoothing gain | 500 when Reduce judder is checked; 0 when unchecked |
-| Smoothing period EMA | 100 per mille; active only with smoothing enabled |
+| Smoothing gain | 150 when Reduce judder is checked; 0 when unchecked |
+| Smoothing period EMA | 25 per mille with fractional carry; active only with smoothing enabled |
 | Positive smoothing lag cap | 2,000 us; active only with smoothing enabled |
 | Render lead floor | 3,000 us |
 | Preparation-start spacing input | 6,000 us after prior submission |
@@ -1147,10 +1211,12 @@ resets; reconnect after changing it. The stream CLI can override it with
 `--vrr-smooth-frame-timing` or `--no-vrr-smooth-frame-timing` without saving.
 The label rename preserves the `smoothvrrframetiming` INI key and
 `smoothVrrFrameTiming` QML property, so existing enabled and disabled choices
-carry over unchanged.
+carry over unchanged. Live qualification uses the four-interval gate described
+in the cadence qualification correction above; explicit older captures retain
+their single-interval/compensating-pair gate.
 
 Unchecked, production follows relative RTP spacing while buffering delivery
-variation. Checked, it blends the predicted source slot equally with the raw
+variation. Checked, it blends 85% of the predicted source slot with 15% of the raw
 mapped slot. This redistributes available waiting time to reduce adjacent
 short/long intervals, at the expense of timestamp fidelity. It cannot guarantee
 uniform motion between irregularly sampled images or prevent compositor jitter.
@@ -1158,9 +1224,9 @@ RTP values remain unchanged; their arbitrary epoch must not change scheduling.
 Conceptually, with `raw = sourceTime + delayBeforeThisFrame`:
 
 ```text
-trackedPeriod += 0.10 * (eligibleSourceInterval - trackedPeriod)
+trackedPeriod += 0.025 * (eligibleSourceInterval - trackedPeriod)
 predicted      = previousSmoothedBasis + trackedPeriod
-adjustment     = 0.50 * (predicted - raw)
+adjustment     = 0.85 * (predicted - raw)
 adjustment     = clamp(adjustment, -delayBeforeThisFrame, 2000 us)
 smoothedBasis  = raw + adjustment
 ```
@@ -1179,12 +1245,12 @@ retain execution-anchored smoothing and the retired metronome for compatibility.
 The 2 ms cap bounds positive retiming, not total client latency. Readiness,
 queue capacity, timing-preset buffer caps and applicable presentation floors
 still constrain the schedule. Smoothing does not add a queued-frame allowance.
-Its readiness calibration key gains `|frame-smoothing=500-100-2000` so profiles
+Its readiness calibration key gains `|frame-smoothing=150-25-2000|cadence=2-0` so profiles
 from the period when the saved checkbox was inactive cannot cross-seed it.
 Unchecked sessions keep their existing calibration identity. Historical traces
 retain their recorded parameters and need no schema change.
 
-The moderate policy was selected by exploratory replay of the completed
+The initial moderate policy was selected by exploratory replay of the completed
 2026-09-10 19:34:42 local capture (76.85 FPS). It reduced submission-interval
 jerk above 2 ms from 18.7% to 1.2%, with unchanged mean pacer residence and
 0.28 ms more p99 residence. The exact gate failed native-outcome validation;
@@ -1432,7 +1498,7 @@ Raw readiness is measured against RTP
 source slots in the FIFO model; an earlier smoothed deadline is a separate
 cost applied before clamping away early-readiness slack. Revision 1 incorrectly
 discarded that slack first, charging reserve even when an advanced deadline was
-already covered. Large source changes disable smoothing until 200 ms of eligible
+already covered. In the historical gate, large source changes disable smoothing until 200 ms of eligible
 cadence falls within 25% of the fitted period. Revision 2 evaluates compensating
 short/long outliers together, so alternating 9/17 ms intervals at a stable 77 FPS
 do not keep Reduce judder disabled. A sustained same-direction change still
@@ -1523,7 +1589,7 @@ rather than presenting the capped policy as able to absorb all observed work.
 display identity, stream FPS, display refresh, smoothing settings,
 and session context, including the active native presenter. Balanced Target and
 Low Latency add distinct timing-mode suffixes. Enabled smoothing also appends
-`|frame-smoothing=500-100-2000` to isolate its readiness history.
+`|frame-smoothing=150-25-2000|cadence=2-0` to isolate its readiness history.
 Profiles expire after 14 days; saves require at least
 240 observations, use locking/atomic replacement, and cap storage at 16 profiles.
 
@@ -2024,12 +2090,35 @@ and over 2 ms or a drop always counts. Production revision 7 instead reports
 the interval buffer's one-second mean error and severity-weighted quality over
 the preset's history window; these are not that older readiness percentage.
 
-The overlay now also shows reserve/cap/request, growth and hold reasons,
-last growth and capped-step ages, queue residence versus pacing/other time,
-preparation versus Present, GPU-ready waiting inside preparation, and protected
-submission share. GPU preparation head start is explicitly a budget. Submission
-jerk is exposed separately from the interval controller's **Client timing
-quality** score; neither is physical display smoothness. The trace extension
+With deep tracing off, the overview retains the VRR17 frame queue delay,
+rendering time, incoming host smoothness, VRR pacing/smoothness target, and
+interval-error rows. The historical Smoothness label still denotes the client
+interval-quality score, not measured physical display smoothness.
+
+Advanced stats follow the worker's `MOONLIGHT_VRR_DEEP_TRACE` switch (value
+starting with `1`), including the Settings tracing checkbox and external deep
+trace launchers. Merely enabling an ordinary trace path does not expand stats.
+Read the current Qt process environment, not SDL2-compat's cached environment,
+so Settings tracing enabled before connection takes effect in both places.
+
+The advanced VRR overview leads with applied buffer and its limit, followed by a plain
+language explanation of the interval observer's latest action. It distinguishes
+late-frame growth, capped growth, current timing pressure, historical score
+recovery, a remaining clean-time hold, release, minimum, and qualification.
+The reason describes the request for subsequent frames, not a diagnosis of a
+particular GPU/network fault. The client timing score and one-second error follow.
+
+The average delay block separates GPU decode synchronization, frame queue time
+(queue residence plus pacing/other), and rendering (preparation plus submission
+call). These retain the existing accounting and successful-frame denominator.
+The GPU wait within rendering is explicitly included, with measurement coverage;
+its average uses only frames with a valid wait sample. Applied buffer is a
+schedule allowance, not another component to add to these measured times. The
+normal and non-VRR overviews retain their original queue/rendering rows. Request values,
+growth/capped-step ages, calibration counts, GPU head-start budgets, protected
+submission share and submission jerk remain available in diagnostic telemetry
+instead of crowding the overview. Neither timing quality nor submission jerk is
+physical display smoothness. The trace extension
 records the attributed late frame, attempted and clipped growth, and hold/
 cooldown time. It does not change requested or applied delay. In particular,
 the historical capacity flag can miss revision-7 growth that was already

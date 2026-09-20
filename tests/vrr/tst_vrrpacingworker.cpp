@@ -616,6 +616,52 @@ void testLatencyFixQueueAgeIncludesDecodeWait()
     SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
 }
 
+void testFirstFrameDecodeReadinessTrace()
+{
+    resetFakeClock();
+    QTemporaryDir directory;
+    expect(directory.isValid(), "first-frame readiness fixture needs a trace directory");
+    const QString path = directory.filePath("first-decode-wait.vrrtrace");
+    SDL_setenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(path).constData(), 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "1", 1);
+    FakeVrrFramePresenter backend;
+    backend.blockDecodeFrame(1);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime;
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "first-frame readiness worker must start");
+        FrozenTestClock clock;
+        auto input = frame(1, lifetime);
+        clock.advance(1000);
+        worker.submit(std::move(input));
+        expect(backend.waitForDecodeWaitCount(1), "first frame must enter its GPU wait");
+        clock.advance(2000);
+        backend.releaseDecode();
+        clock.resume();
+        expect(backend.waitForPresentCount(1), "first frame must present after GPU readiness");
+    }
+    const auto lines = readExpandedTrace(path).split('\n');
+    const auto columns = lines.value(0).split(',');
+    const auto fields = lines.value(1).split(',');
+    auto value = [&](const char* name) {
+        return fields.value(columns.indexOf(name)).toULongLong();
+    };
+    expect(value("decode_sync_wait_us") >= 2000 &&
+               value("decode_complete_us") == value("decoder_output_us") + value("decode_sync_wait_us") &&
+               value("decode_complete_us") > value("pacer_arrival_us") &&
+               value("dequeue_us") > value("decoder_output_us"),
+           "first decision must capture revision-4 readiness, which excludes pre-wait residence");
+    const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_DECODE_TRACE");
+    if (exportPath && exportPath[0]) {
+        QFile::remove(QString::fromLocal8Bit(exportPath));
+        expect(QFile::copy(path, QString::fromLocal8Bit(exportPath)),
+               "first-frame decode fixture must export for exact replay");
+    }
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
+}
+
 void testTelemetrySnapshotsRemainCumulative()
 {
     PacedFrame readinessProbe(nullptr, 1, 0, false, 100);
@@ -1810,6 +1856,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
            "captured calibration must restore prior history without inventing fresh successes");
     expect(fields.value(columns.indexOf("param_playout_prediction_only")) == "1" &&
                fields.value(columns.indexOf("param_playout_responsive_buffer")) == "7" &&
+               fields.value(columns.indexOf("param_playout_smoothing_windowed_cadence")) == "2" &&
                fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "0",
            "capture must identify production interval-quality adaptation for exact replay");
     expect(header.contains("frame_receive_us") &&
@@ -2113,6 +2160,7 @@ int main()
     testLatencyFixQueuedRecovery();
     testLatencyPresetsQueuedRecovery();
     testLatencyFixQueueAgeIncludesDecodeWait();
+    testFirstFrameDecodeReadinessTrace();
     testTelemetrySnapshotsRemainCumulative();
     testSuspendDiscardAndFreshFrame();
     testDeferredSurfaceLifetime();

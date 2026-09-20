@@ -9,6 +9,7 @@
 #include "intervalbuffer.h"
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -97,6 +98,9 @@
     X(uint64_t, playout_smoothing_period_alpha_per_mille, playoutSmoothingPeriodAlphaPerMille, 50) \
     X(uint64_t, playout_smoothing_max_lag_us, playoutSmoothingMaxLagUs, 8000) \
     X(uint64_t, playout_smoothing_snap_per_mille, playoutSmoothingSnapPerMille, 1000) \
+    /* 0: historical pair gate; 1: window; 2: window and compensated bursts. */ \
+    X(uint64_t, playout_smoothing_windowed_cadence, playoutSmoothingWindowedCadence, 0) \
+    X(uint64_t, playout_smoothing_recovery_us, playoutSmoothingRecoveryUs, 200000) \
     X(uint64_t, playout_metronome_enabled, playoutMetronomeEnabled, 0) \
     X(uint64_t, playout_delay_start_period_per_mille, playoutDelayStartPeriodPerMille, 0) \
     X(uint64_t, playout_delay_maximum_period_per_mille, playoutDelayMaximumPeriodPerMille, 0) \
@@ -363,6 +367,9 @@ private:
     Vrr13::RecentReadiness m_RecentReadiness;
     uint64_t m_CadenceStableSinceUs = 0;
     uint64_t m_PreviousSmoothingIntervalUs = 0;
+    std::array<uint64_t, 4> m_SmoothingCadenceIntervals{};
+    size_t m_SmoothingCadenceCount = 0;
+    size_t m_SmoothingCadenceIndex = 0;
     struct PendingFrame {
         Vrr13::SmoothnessFeedback::Sample smoothness;
         Vrr13::ReadinessPrediction::Probe prediction;
@@ -607,6 +614,7 @@ private:
     // runs a dozen microseconds slow per frame drifts visibly.
     uint64_t m_MetronomePeriodUsQ16 = 0;
     uint64_t m_SmoothedPeriodUs = 0;
+    int64_t m_SmoothedPeriodRemainder = 0;
     // Recent magnitudes of the stamp's deviation from the metronome grid
     // once known debt is excluded. Their upper percentile is the capture
     // jitter the grid absorbs; a deviation beyond it is motion timing the

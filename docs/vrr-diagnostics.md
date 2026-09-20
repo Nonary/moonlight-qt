@@ -14,7 +14,11 @@ or **Export latest recording (ZIP)** to package the latest completed run beside
 the recording folders. Include when the problem happened and what it looked like.
 
 The checkbox defaults off and is remembered across application launches. Uncheck
-it after debugging; reconnect after changing it. It only enables recording. It
+it after debugging; reconnect after changing it. Deep tracing also expands the
+stats overlay with buffer status and the GPU/queue/rendering delay breakdown.
+Without deep tracing, the normal VRR17 queue delay and smoothness overview is
+shown. External launchers setting `MOONLIGHT_VRR_DEEP_TRACE=1` enable the same
+details; setting only a trace destination does not. Tracing
 does not select old/new timing rules, change the 2/2/4 buffer allowances, reset
 calibration or change the user's latency preset or Reduce judder choice.
 

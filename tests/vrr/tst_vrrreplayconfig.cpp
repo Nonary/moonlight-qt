@@ -13,6 +13,7 @@ class VrrReplayConfigTest : public QObject
 private slots:
     void defaultsRoundTrip();
     void initialCalibrationPolicyRoundTrip();
+    void windowedSmoothingPolicyRoundTrip();
     void offsetRecoveryPolicyRoundTrip();
     void nativeHitchPolicyRoundTrip();
     void displayEventPolicyRoundTrip();
@@ -69,6 +70,31 @@ void VrrReplayConfigTest::initialCalibrationPolicyRoundTrip()
             {{"playout_interval_initial_minimum_samples", invalid}}, parameters, error));
         QCOMPARE(parameters.playoutIntervalInitialMinimumSamples, size_t(32));
     }
+}
+
+void VrrReplayConfigTest::windowedSmoothingPolicyRoundTrip()
+{
+    VrrTimingParameters parameters;
+    QCOMPARE(parameters.playoutSmoothingWindowedCadence, uint64_t(0));
+    QCOMPARE(parameters.playoutSmoothingRecoveryUs, uint64_t(200000));
+    QString error;
+    auto production = vrrTimingParametersForSession(VrrSessionConfig{});
+    QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(production), parameters, error), qPrintable(error));
+    QCOMPARE(parameters.playoutSmoothingWindowedCadence, uint64_t(2));
+    QCOMPARE(parameters.playoutSmoothingRecoveryUs, uint64_t(0));
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        {{"playout_smoothing_windowed_cadence", 3}}, parameters, error));
+    QCOMPARE(parameters.playoutSmoothingWindowedCadence, uint64_t(2));
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        {{"playout_smoothing_recovery_us", 1000001}}, parameters, error));
+    QCOMPARE(parameters.playoutSmoothingRecoveryUs, production.playoutSmoothingRecoveryUs);
+    auto historical = vrrTimingParametersToJson(production);
+    historical.remove("playout_smoothing_windowed_cadence");
+    historical.remove("playout_smoothing_recovery_us");
+    parameters = VrrTimingParameters{};
+    QVERIFY2(applyVrrReplayControllerSnapshot(historical, parameters, error), qPrintable(error));
+    QCOMPARE(parameters.playoutSmoothingWindowedCadence, uint64_t(0));
+    QCOMPARE(parameters.playoutSmoothingRecoveryUs, uint64_t(200000));
 }
 
 void VrrReplayConfigTest::defaultsRoundTrip()

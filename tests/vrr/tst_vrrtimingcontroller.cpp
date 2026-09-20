@@ -55,6 +55,9 @@ VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
     policy.playoutPredictionEnabled = 0;
     policy.playoutSmoothnessFeedbackEnabled = 0;
     policy.playoutSmoothingGainPerMille = session.smoothFrameTiming ? 200 : 0;
+    policy.playoutSmoothingPeriodAlphaPerMille = 100;
+    policy.playoutSmoothingWindowedCadence = 0;
+    policy.playoutSmoothingRecoveryUs = 200000;
     policy.playoutSmoothingMaxLagUs = 6000;
     policy.playoutDelayMaximumUs = 8000;
     policy.playoutDelayMaximumPeriodPerMille = 950;
@@ -3958,10 +3961,12 @@ void testProductionSmoothFrameTiming()
             session.latencyMode = mode;
             session.smoothFrameTiming = enabled != 0;
             const auto policy = vrrTimingParametersForSession(session);
-            expect(policy.playoutSmoothingGainPerMille == (enabled ? 500 : 0) &&
+            expect(policy.playoutSmoothingGainPerMille == (enabled ? 150 : 0) &&
+                       policy.playoutSmoothingPeriodAlphaPerMille == 25 &&
+                       policy.playoutSmoothingRecoveryUs == 0 &&
                        policy.playoutSmoothingMaxLagUs == 2000 &&
                        policy.playoutMetronomeEnabled == 0,
-                   "the preference must select moderate smoothing independently of the timing preset");
+                   "the preference must select bounded smoothing independently of the timing preset");
             VrrTimingController controller(session, true, policy);
             uint32_t ticks = 0;
             uint64_t lastSubmission = 0, previousInterval = 0;
@@ -4464,6 +4469,164 @@ void testResponsiveSmoothingWithWideJitter()
     }
 }
 
+void testWindowedSmoothingQuantizedCadence()
+{
+    // Actual 90 kHz RTP quantization on either side of the former 25% gate:
+    // 6244/10422 us versus 6255/10411 us, with normal frames between pairs.
+    for (int mode : {0, 1, 2}) for (uint32_t shortTicks : {561U, 562U}) {
+        uint64_t jerk[2] = {}, latency[2] = {};
+        unsigned active[2] = {};
+        for (int windowed : {0, 1}) {
+            auto session = config(120, 120);
+            session.latencyMode = mode;
+            auto policy = vrrTimingParametersForSession(session);
+            expect(policy.playoutSmoothingWindowedCadence == 2,
+                   "every live preset must use windowed cadence qualification");
+            policy.playoutSmoothingWindowedCadence = windowed;
+            policy.playoutSmoothingRecoveryUs = 200000;
+            VrrTimingController controller(session, true, policy);
+            const uint32_t pattern[] = {750, shortTicks, 1500 - shortTicks,
+                                        750, 1500 - shortTicks, shortTicks};
+            uint32_t ticks = 0;
+            uint64_t last = 0, previousInterval = 0;
+            for (int i = 0; i < 1800; ++i) {
+                ticks += pattern[i % 6];
+                const auto decoded = decodedTimeForRtp(1000000, ticks);
+                const auto now = std::max(last, decoded);
+                const auto d = controller.schedule(frame(i, ticks, true, decoded), now);
+                const auto submitted = std::max(d.targetUs,
+                    std::max(now, d.renderStartUs) + 1000);
+                controller.notePreparationDuration(1000);
+                controller.noteSchedulerDelays(0, 0, true);
+                controller.noteSubmission(true, false, submitted);
+                const auto interval = submitted - last;
+                if (i >= 600) {
+                    active[windowed] += d.cadenceSmoothingUs != 0;
+                    jerk[windowed] += interval > previousInterval ?
+                        interval - previousInterval : previousInterval - interval;
+                    latency[windowed] += submitted - decoded;
+                }
+                expect(d.cadenceSmoothingUs <= 2000 &&
+                           d.cadenceSmoothingUs >= -int64_t(d.playoutDelayUs) &&
+                           d.playoutDelayUs <= controller.playoutQueueLimitUs() &&
+                           submitted - decoded <= 22000,
+                       "windowed smoothing must retain correction, latency and queue bounds");
+                previousInterval = interval;
+                last = submitted;
+            }
+        }
+        expect(active[1] > 1100,
+               "normal frames between compensating pairs must not disable Reduce judder");
+        if (shortTicks == 561) {
+            expect(active[0] < 200 && jerk[1] * 2 < jerk[0],
+                   "windowed qualification must fix the captured threshold cliff, preserving historical replay");
+        }
+        else {
+            expect(jerk[1] <= jerk[0] + 1200 * 50,
+                   "fixing the threshold cliff must preserve already-qualified cadence");
+        }
+        expect(latency[1] <= latency[0] + 1200 * 2000,
+               "cadence qualification must not buy smoothness with more than 2 ms mean latency");
+        std::printf("windowed mode=%d ticks=%u active=%u -> %u jerk=%llu -> %llu latency=%llu -> %llu us\n",
+            mode, shortTicks, active[0], active[1],
+            (unsigned long long)(jerk[0] / 1200), (unsigned long long)(jerk[1] / 1200),
+            (unsigned long long)(latency[0] / 1200), (unsigned long long)(latency[1] / 1200));
+    }
+}
+
+void testCompensatedHalfPeriodCadence()
+{
+    for (int mode : {0, 1, 2}) for (uint32_t shortTicks : {374U, 375U, 376U}) {
+        unsigned active[2] = {};
+        uint64_t jerk[2] = {}, latency[2] = {};
+        for (int revision : {1, 2}) {
+            auto session = config(120, 120);
+            session.latencyMode = mode;
+            auto policy = vrrTimingParametersForSession(session);
+            policy.playoutSmoothingWindowedCadence = revision;
+            policy.playoutSmoothingRecoveryUs = 200000;
+            VrrTimingController controller(session, true, policy);
+            // A 4.16 ms interval between two longer intervals is an ordinary
+            // 120 FPS timestamp pattern, not a delivery burst or a new FPS.
+            const uint32_t pattern[] = {750, 937, shortTicks, 1313 - shortTicks};
+            uint32_t ticks = 0;
+            uint64_t last = 0, previousInterval = 0;
+            for (int i = 0; i < 1800; ++i) {
+                ticks += pattern[i % 4];
+                const auto decoded = decodedTimeForRtp(1000000, ticks);
+                const auto now = std::max(last, decoded);
+                const auto d = controller.schedule(frame(i, ticks, true, decoded), now);
+                const auto submitted = std::max(d.targetUs,
+                    std::max(now, d.renderStartUs) + 1000);
+                controller.notePreparationDuration(1000);
+                controller.noteSubmission(true, false, submitted);
+                const auto interval = submitted - last;
+                if (i >= 600) {
+                    active[revision - 1] += d.cadenceSmoothingUs != 0;
+                    jerk[revision - 1] += interval > previousInterval ?
+                        interval - previousInterval : previousInterval - interval;
+                    latency[revision - 1] += submitted - decoded;
+                }
+                expect(d.cadenceSmoothingUs <= int64_t(policy.playoutSmoothingMaxLagUs) &&
+                           submitted - decoded <= 22000 &&
+                           d.playoutDelayUs <= controller.playoutQueueLimitUs(),
+                       "compensated half-period stamps must preserve correction, latency and queue bounds");
+                last = submitted;
+                previousInterval = interval;
+            }
+        }
+        expect(active[1] > 1100,
+               "half-period RTP rounding and small compensated variation must not disable smoothing");
+        if (shortTicks <= 375) {
+            expect(active[0] < 100 && jerk[1] * 2 < jerk[0],
+                   "compensated-burst policy must remove the half-period cadence cliff");
+        }
+        expect(latency[1] <= latency[0] + 1200 * 2000,
+               "half-period smoothing must cost at most 2 ms additional average latency");
+        std::printf("half-period mode=%d ticks=%u active=%u -> %u jerk=%llu -> %llu latency=%llu -> %llu us\n",
+            mode, shortTicks, active[0], active[1],
+            (unsigned long long)(jerk[0] / 1200), (unsigned long long)(jerk[1] / 1200),
+            (unsigned long long)(latency[0] / 1200), (unsigned long long)(latency[1] / 1200));
+    }
+}
+
+void testWindowedSmoothingResetsOnDiscontinuity()
+{
+    for (int mode : {0, 1, 2}) for (int fault : {0, 1, 2, 3, 4}) {
+        auto session = config(120, 120);
+        session.latencyMode = mode;
+        VrrTimingController controller(session, true, vrrTimingParametersForSession(session));
+        uint32_t ticks = 0;
+        int number = 0;
+        uint64_t last = 0;
+        unsigned recovered = 0;
+        for (int i = 0; i < 1000; ++i, ++number) {
+            // A missing local frame, a host stall, an epoch reset, or loss of RTP.
+            if (i == 600 && fault == 0) { ++number; ticks += 750; }
+            if (i == 600 && fault == 2) controller.rebase();
+            ticks += i == 600 && fault == 1 ? 4500 :
+                i == 600 && fault == 4 ? 90 : i % 3 == 0 ? 750 :
+                i % 3 == 1 ? 561 : 939;
+            const auto decoded = decodedTimeForRtp(1000000, ticks);
+            const auto now = std::max(last, decoded);
+            const auto d = controller.schedule(frame(number, ticks,
+                !(i == 600 && fault == 3), decoded), now);
+            const auto submitted = std::max(d.targetUs,
+                std::max(now, d.renderStartUs) + 1000);
+            controller.notePreparationDuration(1000);
+            controller.noteSubmission(true, false, submitted);
+            if (i >= 600 && i < 604)
+                expect(d.cadenceSmoothingUs == 0,
+                       "a true discontinuity must discard all four intervals before requalifying");
+            if (i >= 800) recovered += d.cadenceSmoothingUs != 0;
+            expect(submitted - decoded <= 30000,
+                   "discontinuity recovery must not accumulate latency debt");
+            last = submitted;
+        }
+        expect(recovered > 180, "windowed cadence must recover after genuine discontinuities");
+    }
+}
+
 void testResponsiveReadinessKeepsEarlySlack()
 {
     for (bool corrected : {false, true}) {
@@ -4495,6 +4658,8 @@ void testResponsiveBufferRecoveryAndDesktopCadence()
         // Preserve the revision-2 three-second recovery contract. Revision 3
         // has explicit, longer retention tested separately below.
         policy.playoutResponsiveBuffer = 2;
+        policy.playoutSmoothingWindowedCadence = 0;
+        policy.playoutSmoothingRecoveryUs = 200000;
         policy.playoutDelayMaximumUs = 16000;
         policy.playoutDelayCapSourcePeriodPerMille = mode == 0 ? 3000 : mode == 1 ? 1000 : 500;
         policy.playoutPerFrameLatch = 2;
@@ -4931,6 +5096,9 @@ int main()
     testThresholdedReadinessGrowth();
     testPresetReadinessTargets();
     testResponsiveSmoothingWithWideJitter();
+    testWindowedSmoothingQuantizedCadence();
+    testCompensatedHalfPeriodCadence();
+    testWindowedSmoothingResetsOnDiscontinuity();
     testResponsiveReadinessKeepsEarlySlack();
     testResponsiveBufferRecoveryAndDesktopCadence();
     testLatencyFixModeSelection();

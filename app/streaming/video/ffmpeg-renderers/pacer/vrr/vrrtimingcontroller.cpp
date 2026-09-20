@@ -33,14 +33,14 @@ constexpr uint64_t kSmoothIntervalToleranceUs = 200;
 // the frames bunched behind it), never ordinary jitter.
 constexpr uint64_t kPlayoutPercentilePerMille = 1000;
 constexpr uint64_t kPlayoutBurstExclusionPerMille = 750;
-// Smooth frame timing blends the predicted slot equally with the raw mapped
-// timestamp. Track gradual source-rate changes with a ten-percent period EMA
+// Reduce judder keeps 85% of the predicted slot and 15% of the raw mapped
+// timestamp. Track gradual source-rate changes with a 2.5-percent period EMA
 // and cap positive retiming at 2 ms. Reuse the existing playout headroom for
 // early retiming; the adjustment cap is not a bound on total client latency.
 // Unchecked sessions retain timestamp-following playout. Schema defaults and
 // explicit captured parameters preserve historical replay behavior.
-constexpr uint64_t kPlayoutSmoothingGainPerMille = 500;
-constexpr uint64_t kPlayoutSmoothingPeriodAlphaPerMille = 100;
+constexpr uint64_t kPlayoutSmoothingGainPerMille = 150;
+constexpr uint64_t kPlayoutSmoothingPeriodAlphaPerMille = 25;
 constexpr uint64_t kPlayoutSmoothingMaxLagUs = 2000;
 // Retired metronome playout, kept reachable for replay. It advances the
 // presented slot by the fitted source period, corrects phase toward the mapped
@@ -231,6 +231,11 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutSmoothingPeriodAlphaPerMille =
         kPlayoutSmoothingPeriodAlphaPerMille;
     parameters.playoutSmoothingMaxLagUs = kPlayoutSmoothingMaxLagUs;
+    parameters.playoutSmoothingWindowedCadence = 2;
+    // Four consecutive intervals qualify the new window. Source-rate changes
+    // already have their own confirmation gate; another 200 ms without
+    // smoothing after a recovered gap needlessly reproduces source jitter.
+    parameters.playoutSmoothingRecoveryUs = 0;
     parameters.playoutMetronomeEnabled = 0;
     parameters.playoutDelayStartPeriodPerMille = kPlayoutStartPeriodPerMille;
     // A slower desktop/source must not expand the configured-rate ceiling.
@@ -349,6 +354,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_ReadinessPrediction.reset();
     m_CadenceStableSinceUs = 0;
     m_PreviousSmoothingIntervalUs = 0;
+    m_SmoothingCadenceCount = 0;
+    m_SmoothingCadenceIndex = 0;
     m_ReadinessFeedback.reset();
     m_MeanMissBuffer.breakSequence();
     m_IntervalBuffer.breakSequence();
@@ -387,6 +394,7 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_LastDecodeCompleteUs = 0;
     resetCadenceSmoothing();
     m_SmoothedPeriodUs = 0;
+    m_SmoothedPeriodRemainder = 0;
     m_MotionResiduals.clear();
     m_FutureProjectionFrames = 0;
     m_BurstExclusionFrames = 0;
@@ -589,6 +597,11 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     }
     else {
         resetCadenceSmoothing();
+        if (m_Parameters.playoutSmoothingWindowedCadence) {
+            m_SmoothingCadenceCount = 0;
+            m_SmoothingCadenceIndex = 0;
+            m_CadenceStableSinceUs = 0;
+        }
         readyOffsetUs = signedDifference(frame.decodeCompleteUs(),
                                          m_SourceTimeUs);
         if (!rebased && !cadence.phaseDiscontinuity && cadence.eligible) {
@@ -1220,26 +1233,72 @@ int64_t VrrTimingController::cadenceSmoothingAdjustUs(
     const CadenceObservation& cadence, bool rebased, uint64_t rawBasisUs,
     uint64_t playoutDelayUs)
 {
+    // A half-period interval is 375 RTP ticks at 120 FPS: converting it to
+    // whole microseconds alternates 4166/4167. Do not turn that rounding into
+    // a burst. Also retain bounded short/long compensation while the fitted
+    // period follows a small rate drift. Truly compressed bursts stay resets.
+    const bool compensatedBurstPolicy = m_Parameters.playoutSmoothingWindowedCadence >= 2;
+    constexpr uint64_t rtpQuantumUs = (kMicrosecondsPerSecond + kRtpClockRate - 1) / kRtpClockRate;
+    const bool compensatedShortInterval = compensatedBurstPolicy &&
+        cadence.intervalUs * 4 >= m_SourcePeriodUs &&
+        m_PreviousSmoothingIntervalUs > m_SourcePeriodUs &&
+        cadence.intervalUs < m_SourcePeriodUs &&
+        withinPercent((cadence.intervalUs + m_PreviousSmoothingIntervalUs) / 2,
+                      m_SourcePeriodUs, 25);
+    const bool boundedInterval = cadence.intervalUs <= m_SourcePeriodUs * 5 / 2 &&
+        (cadence.intervalUs * 2 + (compensatedBurstPolicy ? rtpQuantumUs : 0) >= m_SourcePeriodUs ||
+         compensatedShortInterval);
     if (m_Parameters.playoutResponsiveBuffer) {
-        // Judge adjacent intervals together: alternating short/long frames are
-        // exactly what the smoother is meant to handle, not a sustained change
-        // of source rate. Keep the 200 ms recovery gate for actual transitions.
-        const bool compensatingPair = m_Parameters.playoutResponsiveBuffer >= 2 &&
-            m_PreviousSmoothingIntervalUs &&
-            !withinPercent(m_PreviousSmoothingIntervalUs, m_SourcePeriodUs, 25) &&
-            ((cadence.intervalUs < m_SourcePeriodUs && m_PreviousSmoothingIntervalUs > m_SourcePeriodUs) ||
-             (cadence.intervalUs > m_SourcePeriodUs && m_PreviousSmoothingIntervalUs < m_SourcePeriodUs));
-        const auto confidenceIntervalUs = compensatingPair ?
-            (cadence.intervalUs + m_PreviousSmoothingIntervalUs) / 2 : cadence.intervalUs;
-        const bool stable = !rebased && !cadence.sourceRateChanged &&
-            !cadence.phaseDiscontinuity && cadence.eligible && cadence.frameDelta == 1 &&
-            withinPercent(confidenceIntervalUs, m_SourcePeriodUs, 25);
-        m_PreviousSmoothingIntervalUs = cadence.eligible && cadence.frameDelta == 1 &&
-            !rebased && !cadence.phaseDiscontinuity ? cadence.intervalUs : 0;
+        bool stable;
+        if (m_Parameters.playoutSmoothingWindowedCadence) {
+            // Qualify cadence over several intervals, not the side of a
+            // rounding boundary an individual RTP stamp lands on. A normal
+            // interval between compensating short/long pairs is still steady
+            // cadence. Keep true gaps, stalls and rate transitions as resets.
+            const bool continuous = !rebased && !cadence.sourceRateChanged &&
+                !cadence.phaseDiscontinuity && cadence.eligible && cadence.frameDelta == 1 &&
+                cadence.intervalUs != 0 && boundedInterval;
+            if (!continuous) {
+                m_SmoothingCadenceCount = 0;
+                m_SmoothingCadenceIndex = 0;
+                stable = false;
+            }
+            else {
+                m_SmoothingCadenceIntervals[m_SmoothingCadenceIndex] = cadence.intervalUs;
+                m_SmoothingCadenceIndex = (m_SmoothingCadenceIndex + 1) %
+                    m_SmoothingCadenceIntervals.size();
+                m_SmoothingCadenceCount = std::min(m_SmoothingCadenceCount + 1,
+                                                   m_SmoothingCadenceIntervals.size());
+                uint64_t totalUs = 0;
+                for (size_t i = 0; i < m_SmoothingCadenceCount; ++i)
+                    totalUs += m_SmoothingCadenceIntervals[i];
+                stable = m_SmoothingCadenceCount == m_SmoothingCadenceIntervals.size() &&
+                    withinPercent(totalUs, m_SourcePeriodUs * m_SmoothingCadenceCount, 25);
+            }
+            m_PreviousSmoothingIntervalUs = cadence.eligible && cadence.frameDelta == 1 &&
+                !rebased && !cadence.phaseDiscontinuity ? cadence.intervalUs : 0;
+        }
+        else {
+            // Judge adjacent intervals together: alternating short/long frames are
+            // exactly what the smoother is meant to handle, not a sustained change
+            // of source rate. Keep the 200 ms recovery gate for actual transitions.
+            const bool compensatingPair = m_Parameters.playoutResponsiveBuffer >= 2 &&
+                m_PreviousSmoothingIntervalUs &&
+                !withinPercent(m_PreviousSmoothingIntervalUs, m_SourcePeriodUs, 25) &&
+                ((cadence.intervalUs < m_SourcePeriodUs && m_PreviousSmoothingIntervalUs > m_SourcePeriodUs) ||
+                 (cadence.intervalUs > m_SourcePeriodUs && m_PreviousSmoothingIntervalUs < m_SourcePeriodUs));
+            const auto confidenceIntervalUs = compensatingPair ?
+                (cadence.intervalUs + m_PreviousSmoothingIntervalUs) / 2 : cadence.intervalUs;
+            stable = !rebased && !cadence.sourceRateChanged &&
+                !cadence.phaseDiscontinuity && cadence.eligible && cadence.frameDelta == 1 &&
+                withinPercent(confidenceIntervalUs, m_SourcePeriodUs, 25);
+            m_PreviousSmoothingIntervalUs = cadence.eligible && cadence.frameDelta == 1 &&
+                !rebased && !cadence.phaseDiscontinuity ? cadence.intervalUs : 0;
+        }
         if (!stable) m_CadenceStableSinceUs = 0;
         else if (!m_CadenceStableSinceUs) m_CadenceStableSinceUs = m_SourceTimeUs;
         if (!m_CadenceStableSinceUs || m_SourceTimeUs < m_CadenceStableSinceUs ||
-            m_SourceTimeUs - m_CadenceStableSinceUs < 200000) {
+            m_SourceTimeUs - m_CadenceStableSinceUs < m_Parameters.playoutSmoothingRecoveryUs) {
             resetCadenceSmoothing();
             return 0;
         }
@@ -1267,9 +1326,9 @@ int64_t VrrTimingController::cadenceSmoothingAdjustUs(
             m_SmoothedPeriodUs > fittedPeriodUs + fittedPeriodUs / 4 ||
             m_SmoothedPeriodUs + fittedPeriodUs / 4 < fittedPeriodUs) {
         m_SmoothedPeriodUs = fittedPeriodUs;
+        m_SmoothedPeriodRemainder = 0;
     }
-    if (intervalUs > fittedPeriodUs * 5 / 2 ||
-            intervalUs * 2 < fittedPeriodUs) {
+    if (!boundedInterval) {
         // A host stall or burst is not cadence. Keep the period estimate,
         // restart the schedule on this frame's raw slot.
         resetCadenceSmoothing();
@@ -1280,9 +1339,14 @@ int64_t VrrTimingController::cadenceSmoothingAdjustUs(
             1000, m_Parameters.playoutSmoothingPeriodAlphaPerMille);
         const int64_t deltaUs = static_cast<int64_t>(intervalUs) -
             static_cast<int64_t>(m_SmoothedPeriodUs);
+        // Retain sub-microsecond updates. At a small alpha, truncating every
+        // frame leaves a permanent period error and therefore phase debt.
+        // Older captured revisions retain their original integer behavior.
+        const int64_t update = deltaUs * static_cast<int64_t>(alpha) +
+            (compensatedBurstPolicy ? m_SmoothedPeriodRemainder : 0);
         m_SmoothedPeriodUs = static_cast<uint64_t>(
-            static_cast<int64_t>(m_SmoothedPeriodUs) +
-            deltaUs * static_cast<int64_t>(alpha) / 1000);
+            static_cast<int64_t>(m_SmoothedPeriodUs) + update / 1000);
+        m_SmoothedPeriodRemainder = compensatedBurstPolicy ? update % 1000 : 0;
         if (m_SmoothedPeriodUs == 0) {
             m_SmoothedPeriodUs = 1;
         }

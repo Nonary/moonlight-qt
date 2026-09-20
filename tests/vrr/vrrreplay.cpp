@@ -10713,7 +10713,11 @@ int main(int argc, char* argv[])
                 pacerArrivalUs, dequeueUs, decisionUs,
                 optionalUnsignedField(fields, columns.decodeSyncWaitUs),
                 rowDecisionValid,
-                capturedParameters.playoutResponsiveBuffer >= 4) ? 0 : 1;
+                // The controller snapshot is initialized later on the first
+                // decision row. Audit that row with its recorded revision,
+                // too, rather than the default pre-revision-4 clock rule.
+                optionalUnsignedField(fields, columns.capturedParameterColumns.value(
+                    QStringLiteral("controller.playout_responsive_buffer"), -1)) >= 4) ? 0 : 1;
         metrics.arrivalToDequeueOrderViolations +=
             dequeueUs != 0 && dequeueUs < pacerArrivalUs ? 1 : 0;
         metrics.dequeueToDecisionOrderViolations +=
