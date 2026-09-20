@@ -2217,3 +2217,38 @@ The latest completed live capture (20260911-181549-892) fails original-deadline
 replay at frame 8355 in both the old and new binary, exit 3; no live A/B or
 physical smoothness improvement is established. Existing history_* trace fields
 refer to five-minute diagnostics, not the new live release gate.
+
+### Linux Bluetooth DualSense feedback (2026-09-19)
+
+The Deck client uses the same versioned 0x5601 waveform payload as Vibeshine:
+48 kHz stereo S16LE, a sequence number, and at most 240 frames per packet.
+The optional receive callback only queues bounded chunks; a separate worker
+resamples to signed 8-bit 3 kHz stereo and emits SAxense Bluetooth reports.
+Only a controller with an opened, kernel-verified Bluetooth hidraw path
+advertises LI_CCAP_HAPTICS_PCM. See third-party/saxense/PROVENANCE.md.
+
+In merged controller mode, startup opens attached DualSense controllers first
+so the host's first player-0 announcement describes the actual feedback target.
+Multi-controller numbering retains enumeration order. Rumble and adaptive
+trigger feedback are routed by player index to the matching DualSense; SDL
+remains responsible for input and non-waveform effects. Waveform teardown joins
+its worker before closing SDL's controller handle. Physical feedback still
+requires live validation; packet writes and tests do not establish sensation.
+
+Deck validation: the native Qt build and waveform worker tests passed using
+sdl2-compat over SDL 3.4.12. A live Desktop stream announced the Bluetooth
+DualSense first (player 0, PlayStation, capabilities 0x80fb); host tracing
+confirmed negotiated feature flags 0x7. One second of silent four-channel
+48 kHz audio written to the virtual DS5 ALSA endpoint reached the client's
+PCM callback and produced a 142-byte Bluetooth report. This proves the silent
+transport path only. Physical rumble, adaptive-trigger resistance and native
+007 First Light waveform output await user confirmation. The previous
+binary is /tmp/moonlight-pre-codex-ds5 and the pre-edit source snapshot is
+/tmp/moonlight-before-codex-ds5.tar.gz, with the common-c diff separately kept
+in /tmp on the host workstation. No existing game/Steam settings were changed
+by this Deck repair.
+
+A launch request also carries a bitmap identifying attached PlayStation
+controllers. Vibeshine can use it to delay a direct Proton title until its
+virtual DualSense and Sony audio endpoint have enumerated, avoiding a one-time
+game startup race without delaying launches for other controllers.

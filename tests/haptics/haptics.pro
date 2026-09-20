@@ -1,0 +1,9 @@
+QT -= gui core
+TEMPLATE = app
+TARGET = tst_dualsensehaptics
+CONFIG += console c++17 link_pkgconfig
+CONFIG -= app_bundle
+PKGCONFIG += sdl2
+LIBS += -pthread
+INCLUDEPATH += ../../app ../../moonlight-common-c/moonlight-common-c/src
+SOURCES += tst_dualsensehaptics.cpp

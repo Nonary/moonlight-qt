@@ -169,6 +169,7 @@ public:
              bool sops,
              bool localAudio,
              int gamepadMask,
+             int playStationGamepadMask,
              bool persistGameControllersOnDisconnect,
              QString& rtspSessionUrl);
 

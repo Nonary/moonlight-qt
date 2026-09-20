@@ -194,6 +194,7 @@ SOURCES += \
     diagnostics/diagnosticcapture.cpp \
     diagnostics/diagnosticzip.cpp \
     streaming/input/abstouch.cpp \
+    streaming/input/dualsensehaptics.cpp \
     streaming/input/gamepad.cpp \
     streaming/input/input.cpp \
     streaming/input/keyboard.cpp \
@@ -240,6 +241,7 @@ HEADERS += \
     settings/streamingpreferences.h \
     diagnostics/diagnosticcapture.h \
     diagnostics/diagnosticzip.h \
+    streaming/input/dualsensehaptics.h \
     streaming/input/input.h \
     streaming/session.h \
     streaming/video/amddecodepolicy.h \

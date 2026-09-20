@@ -1,3 +1,4 @@
+#include "streaming/input/dualsensehaptics.h"
 #include <QNetworkInterface>
 #include <QSysInfo>
 #include <QDir>
@@ -64,7 +65,12 @@ CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
     Session::clRumbleTriggers,
     Session::clSetMotionEventState,
     Session::clSetControllerLED,
-    Session::clSetAdaptiveTriggers
+    Session::clSetAdaptiveTriggers,
+#if defined(Q_OS_LINUX) && SDL_VERSION_ATLEAST(2, 24, 0)
+    DualSenseHaptics::receive
+#else
+    nullptr
+#endif
 };
 
 Session* Session::s_ActiveSession;
@@ -277,7 +283,6 @@ void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlag
     setControllerLEDEvent.user.data2 = (void *) state;
     SDL_PushEvent(&setControllerLEDEvent);
 }
-
 
 bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             StreamingPreferences::RendererSelection renderer,
@@ -1772,6 +1777,7 @@ bool Session::startConnectionAsync()
                       enableGameOptimizations,
                       m_Preferences->playAudioOnHost,
                       m_InputHandler->getAttachedGamepadMask(),
+                      m_InputHandler->getAttachedPlayStationGamepadMask(),
                       !m_Preferences->multiController,
                       rtspSessionUrl);
     } catch (const GfeHttpResponseException& e) {
@@ -2140,6 +2146,8 @@ void Session::exec()
 
     // Switch to async logging mode when we enter the SDL loop
     StreamUtils::enterAsyncLoggingMode();
+
+    m_InputHandler->initializeControllers();
 
     // Hijack this thread to be the SDL main thread. We have to do this
     // because we want to suspend all Qt processing until the stream is over.

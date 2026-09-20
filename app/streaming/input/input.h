@@ -5,10 +5,12 @@
 
 #include "SDL_compat.h"
 
+
 struct GamepadState {
     SDL_GameController* controller;
     SDL_JoystickID jsId;
     short index;
+    bool hapticsAttached;
 
 #if !SDL_VERSION_ATLEAST(2, 0, 9)
     SDL_Haptic* haptic;
@@ -102,6 +104,8 @@ public:
 
     void handleControllerButtonEvent(SDL_ControllerButtonEvent* event);
 
+    void initializeControllers();
+
     void handleControllerDeviceEvent(SDL_ControllerDeviceEvent* event);
 
 #if SDL_VERSION_ATLEAST(2, 0, 14)
@@ -128,9 +132,13 @@ public:
 
     void setAdaptiveTriggers(uint16_t controllerNumber, DualSenseOutputReport *report);
 
+
+
     void handleTouchFingerEvent(SDL_TouchFingerEvent* event);
 
     int getAttachedGamepadMask();
+
+    int getAttachedPlayStationGamepadMask();
 
     void raiseAllKeys();
 
@@ -173,6 +181,10 @@ private:
 
     GamepadState*
     findStateForGamepad(SDL_JoystickID id);
+
+    uint8_t moonlightControllerType(SDL_GameController* controller);
+
+    void sendControllerArrival(GamepadState* state);
 
     void sendGamepadState(GamepadState* state);
 

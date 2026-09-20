@@ -1,8 +1,10 @@
+#include <ControllerHaptics.h>
 #include "streaming/session.h"
 
 #include <Limelight.h>
 #include "SDL_compat.h"
 #include "settings/mappingmanager.h"
+#include "streaming/input/dualsensehaptics.h"
 
 #include <QtMath>
 
@@ -481,6 +483,120 @@ void SdlInputHandler::handleJoystickBatteryEvent(SDL_JoyBatteryEvent* event)
 
 #endif
 
+uint8_t SdlInputHandler::moonlightControllerType(SDL_GameController* controller)
+{
+    switch (SDL_GameControllerGetType(controller)) {
+    case SDL_CONTROLLER_TYPE_XBOX360:
+    case SDL_CONTROLLER_TYPE_XBOXONE:
+        return LI_CTYPE_XBOX;
+    case SDL_CONTROLLER_TYPE_PS3:
+    case SDL_CONTROLLER_TYPE_PS4:
+    case SDL_CONTROLLER_TYPE_PS5:
+        return LI_CTYPE_PS;
+#ifdef SDL_CONTROLLER_TYPE_STEAMDECK
+    case SDL_CONTROLLER_TYPE_STEAMDECK:
+        return LI_CTYPE_STEAM;
+#endif
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+#endif
+        return LI_CTYPE_NINTENDO;
+    default:
+        return LI_CTYPE_UNKNOWN;
+    }
+}
+
+void SdlInputHandler::sendControllerArrival(GamepadState* state)
+{
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    if (state == nullptr || state->controller == nullptr) {
+        return;
+    }
+
+    uint32_t supportedButtonFlags = 0;
+    for (int i = 0; i < (int)SDL_arraysize(k_ButtonMap); i++) {
+        if (SDL_GameControllerHasButton(state->controller, (SDL_GameControllerButton)i)) {
+            supportedButtonFlags |= k_ButtonMap[i];
+        }
+    }
+
+    uint32_t hapticCaps = 0;
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    hapticCaps |= SDL_GameControllerHasRumble(state->controller) ? ML_HAPTIC_GC_RUMBLE : 0;
+    hapticCaps |= SDL_GameControllerHasRumbleTriggers(state->controller) ? ML_HAPTIC_GC_TRIGGER_RUMBLE : 0;
+#endif
+
+    uint32_t capabilities = 0;
+    if (SDL_GameControllerGetBindForAxis(state->controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT).bindType == SDL_CONTROLLER_BINDTYPE_AXIS ||
+        SDL_GameControllerGetBindForAxis(state->controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT).bindType == SDL_CONTROLLER_BINDTYPE_AXIS) {
+        capabilities |= LI_CCAP_ANALOG_TRIGGERS;
+    }
+    if (hapticCaps & ML_HAPTIC_GC_RUMBLE) {
+        capabilities |= LI_CCAP_RUMBLE;
+    }
+    if (hapticCaps & ML_HAPTIC_GC_TRIGGER_RUMBLE) {
+        capabilities |= LI_CCAP_TRIGGER_RUMBLE;
+    }
+    if (SDL_GameControllerGetNumTouchpads(state->controller) > 0) {
+        capabilities |= LI_CCAP_TOUCHPAD;
+        if (SDL_GameControllerGetNumTouchpads(state->controller) > 1) {
+            capabilities |= LI_CCAP_DUAL_TOUCHPAD;
+        }
+    }
+    if (SDL_GameControllerHasSensor(state->controller, SDL_SENSOR_ACCEL)) {
+        capabilities |= LI_CCAP_ACCEL;
+    }
+    if (SDL_GameControllerHasSensor(state->controller, SDL_SENSOR_GYRO)) {
+        capabilities |= LI_CCAP_GYRO;
+    }
+    if (SDL_JoystickCurrentPowerLevel(SDL_GameControllerGetJoystick(state->controller)) != SDL_JOYSTICK_POWER_UNKNOWN || SDL_VERSION_ATLEAST(2, 24, 0)) {
+        capabilities |= LI_CCAP_BATTERY_STATE;
+    }
+    if (SDL_GameControllerHasLED(state->controller)) {
+        capabilities |= LI_CCAP_RGB_LED;
+    }
+
+    uint8_t type = moonlightControllerType(state->controller);
+
+    if (state->hapticsAttached) capabilities |= LI_CCAP_HAPTICS_PCM;
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Sending controller arrival: player %d type %u caps 0x%x buttons 0x%x",
+                state->index, type, capabilities, supportedButtonFlags);
+    LiSendControllerArrivalEvent(state->index, m_GamepadMask, type, supportedButtonFlags, capabilities);
+#else
+    Q_UNUSED(state);
+#endif
+}
+
+void SdlInputHandler::initializeControllers()
+{
+    // The host uses the first arrival for a player until disconnect. In merged
+    // mode announce an attached DualSense before the Deck's built-in controls.
+    // Preserve enumeration order and numbering in multi-controller mode.
+    SDL_PumpEvents();
+    SDL_FlushEvent(SDL_CONTROLLERDEVICEADDED);
+    const int count = SDL_NumJoysticks();
+    for (int pass = 0; pass < (m_MultiController ? 1 : 2); ++pass) {
+        for (int device = 0; device < count; ++device) {
+            if (!SDL_IsGameController(device)) continue;
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+            const bool preferred = SDL_GameControllerTypeForIndex(device) == SDL_CONTROLLER_TYPE_PS5;
+#else
+            const bool preferred = false;
+#endif
+            if (!m_MultiController && preferred != (pass == 0)) continue;
+            SDL_ControllerDeviceEvent event {};
+            event.type = SDL_CONTROLLERDEVICEADDED;
+            event.which = device;
+            handleControllerDeviceEvent(&event);
+        }
+    }
+}
+
 void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* event)
 {
     GamepadState* state;
@@ -614,18 +730,21 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
         uint16_t vendorId = SDL_GameControllerGetVendor(state->controller);
         uint16_t productId = SDL_GameControllerGetProduct(state->controller);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Gamepad %d (player %d) is: %s (VID/PID: 0x%.4x/0x%.4x) (haptic capabilities: 0x%x) (mapping: %s -> %s)",
+                    "Gamepad %d (player %d) is: %s (VID/PID: 0x%.4x/0x%.4x) (SDL type %d) (haptic capabilities: 0x%x) (mapping: %s -> %s)",
                     i,
                     state->index,
                     name != nullptr ? name : "<null>",
                     vendorId,
                     productId,
+                    (int)SDL_GameControllerGetType(state->controller),
                     hapticCaps,
                     guidStr,
                     mapping != nullptr ? mapping : "<null>");
         if (mapping != nullptr) {
             SDL_free((void*)mapping);
         }
+
+        state->hapticsAttached = DualSenseHaptics::attach(state->index, state->controller);
 
         // Add this gamepad to the gamepad mask
         if (m_MultiController) {
@@ -641,79 +760,15 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
         SDL_JoystickPowerLevel powerLevel = SDL_JoystickCurrentPowerLevel(SDL_GameControllerGetJoystick(state->controller));
 
 #if SDL_VERSION_ATLEAST(2, 0, 14)
-        // On SDL 2.0.14 and later, we can provide enhanced controller information to the host PC
-        // for it to use as a hint for the type of controller to emulate.
-        uint32_t supportedButtonFlags = 0;
-        for (int i = 0; i < (int)SDL_arraysize(k_ButtonMap); i++) {
-            if (SDL_GameControllerHasButton(state->controller, (SDL_GameControllerButton)i)) {
-                supportedButtonFlags |= k_ButtonMap[i];
-            }
-        }
-
-        uint32_t capabilities = 0;
-        if (SDL_GameControllerGetBindForAxis(state->controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT).bindType == SDL_CONTROLLER_BINDTYPE_AXIS ||
-            SDL_GameControllerGetBindForAxis(state->controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT).bindType == SDL_CONTROLLER_BINDTYPE_AXIS) {
-            // We assume these are analog triggers if the binding is to an axis rather than a button
-            capabilities |= LI_CCAP_ANALOG_TRIGGERS;
-        }
-        if (hapticCaps & ML_HAPTIC_GC_RUMBLE) {
-            capabilities |= LI_CCAP_RUMBLE;
-        }
-        if (hapticCaps & ML_HAPTIC_GC_TRIGGER_RUMBLE) {
-            capabilities |= LI_CCAP_TRIGGER_RUMBLE;
-        }
-        if (SDL_GameControllerGetNumTouchpads(state->controller) > 0) {
-            capabilities |= LI_CCAP_TOUCHPAD;
-            if (SDL_GameControllerGetNumTouchpads(state->controller) > 1) {
-                capabilities |= LI_CCAP_DUAL_TOUCHPAD;
-            }
-        }
-        if (SDL_GameControllerHasSensor(state->controller, SDL_SENSOR_ACCEL)) {
-            capabilities |= LI_CCAP_ACCEL;
-        }
-        if (SDL_GameControllerHasSensor(state->controller, SDL_SENSOR_GYRO)) {
-            capabilities |= LI_CCAP_GYRO;
-        }
-        if (powerLevel != SDL_JOYSTICK_POWER_UNKNOWN || SDL_VERSION_ATLEAST(2, 24, 0)) {
-            capabilities |= LI_CCAP_BATTERY_STATE;
-        }
-        if (SDL_GameControllerHasLED(state->controller)) {
-            capabilities |= LI_CCAP_RGB_LED;
-        }
-
-        uint8_t type;
-        switch (SDL_GameControllerGetType(state->controller)) {
-        case SDL_CONTROLLER_TYPE_XBOX360:
-        case SDL_CONTROLLER_TYPE_XBOXONE:
-            type = LI_CTYPE_XBOX;
-            break;
-        case SDL_CONTROLLER_TYPE_PS3:
-        case SDL_CONTROLLER_TYPE_PS4:
-        case SDL_CONTROLLER_TYPE_PS5:
-            type = LI_CTYPE_PS;
-            break;
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
-#if SDL_VERSION_ATLEAST(2, 24, 0)
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
-#endif
-            type = LI_CTYPE_NINTENDO;
-            break;
-        default:
-            type = LI_CTYPE_UNKNOWN;
-            break;
-        }
+        const uint8_t type = moonlightControllerType(state->controller);
 
         // If this is a PlayStation controller that doesn't have a touchpad button mapped,
         // we'll allow the Select+PS button combo to act as the touchpad.
         state->clickpadButtonEmulationEnabled =
-#if SDL_VERSION_ATLEAST(2, 0, 14)
             SDL_GameControllerGetBindForButton(state->controller, SDL_CONTROLLER_BUTTON_TOUCHPAD).bindType == SDL_CONTROLLER_BINDTYPE_NONE &&
-#endif
             type == LI_CTYPE_PS;
 
-        LiSendControllerArrivalEvent(state->index, m_GamepadMask, type, supportedButtonFlags, capabilities);
+        sendControllerArrival(state);
 #else
 
         // Send an empty event to tell the PC we've arrived
@@ -733,6 +788,7 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
                 SDL_RemoveTimer(state->mouseEmulationTimer);
             }
 
+            if (state->hapticsAttached) DualSenseHaptics::detach(state->index);
             SDL_GameControllerClose(state->controller);
 
 #if !SDL_VERSION_ATLEAST(2, 0, 9)
@@ -801,8 +857,53 @@ void SdlInputHandler::rumble(unsigned short controllerNumber, unsigned short low
     }
 
 #if SDL_VERSION_ATLEAST(2, 0, 9)
-    if (m_GamepadState[controllerNumber].controller != nullptr) {
-        SDL_GameControllerRumble(m_GamepadState[controllerNumber].controller, lowFreqMotor, highFreqMotor, 30000);
+    // Host controllerNumber is the player index, not the SDL slot. In
+    // single-controller mode the Deck occupies slot 0 and DualSense slot 1
+    // while both report player 0, so indexing by slot would rumble the Deck.
+    bool preferPs5 = false;
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        if (m_GamepadState[i].controller != nullptr &&
+            m_GamepadState[i].index == (short)controllerNumber &&
+            SDL_GameControllerGetType(m_GamepadState[i].controller) == SDL_CONTROLLER_TYPE_PS5) {
+            preferPs5 = true;
+            break;
+        }
+    }
+
+    bool routed = false;
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        GamepadState* state = &m_GamepadState[i];
+        if (state->controller == nullptr || state->index != (short)controllerNumber) {
+            continue;
+        }
+        if (preferPs5 && SDL_GameControllerGetType(state->controller) != SDL_CONTROLLER_TYPE_PS5) {
+            continue;
+        }
+
+        routed = true;
+        if (DualSenseHaptics::playing(controllerNumber)) continue;
+        const int rc = SDL_GameControllerRumble(state->controller, lowFreqMotor, highFreqMotor, 30000);
+
+        static uint32_t lastRumbleLogMs;
+        const uint32_t now = SDL_GetTicks();
+        if (rc != 0 || lastRumbleLogMs == 0 || SDL_TICKS_PASSED(now, lastRumbleLogMs + 2000)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Rumble player %d slot %d %s motors %u/%u rc %d%s",
+                        controllerNumber,
+                        i,
+                        SDL_GameControllerName(state->controller),
+                        lowFreqMotor,
+                        highFreqMotor,
+                        rc,
+                        rc != 0 ? SDL_GetError() : "");
+            lastRumbleLogMs = now;
+        }
+    }
+
+    if (!routed && (lowFreqMotor | highFreqMotor) != 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Rumble for player %d had no matching gamepad",
+                    controllerNumber);
     }
 #else
     // Check if the controller supports haptics (and if the controller exists at all)
@@ -859,8 +960,17 @@ void SdlInputHandler::rumbleTriggers(uint16_t controllerNumber, uint16_t leftTri
     }
 
 #if SDL_VERSION_ATLEAST(2, 0, 14)
-    if (m_GamepadState[controllerNumber].controller != nullptr) {
-        SDL_GameControllerRumbleTriggers(m_GamepadState[controllerNumber].controller, leftTrigger, rightTrigger, 30000);
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        GamepadState* state = &m_GamepadState[i];
+        if (state->controller == nullptr || state->index != (short)controllerNumber) {
+            continue;
+        }
+        const int rc = SDL_GameControllerRumbleTriggers(state->controller, leftTrigger, rightTrigger, 30000);
+        if (rc != 0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Trigger rumble player %d slot %d rc %d: %s",
+                        controllerNumber, i, rc, SDL_GetError());
+        }
     }
 #endif
 }
@@ -873,18 +983,22 @@ void SdlInputHandler::setMotionEventState(uint16_t controllerNumber, uint8_t mot
     }
 
 #if SDL_VERSION_ATLEAST(2, 0, 14)
-    if (m_GamepadState[controllerNumber].controller != nullptr) {
-        uint8_t reportPeriodMs = reportRateHz ? (1000 / reportRateHz) : 0;
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        GamepadState* state = &m_GamepadState[i];
+        if (state->controller == nullptr || state->index != (short)controllerNumber) {
+            continue;
+        }
 
+        uint8_t reportPeriodMs = reportRateHz ? (1000 / reportRateHz) : 0;
         switch (motionType) {
         case LI_MOTION_TYPE_ACCEL:
-            m_GamepadState[controllerNumber].accelReportPeriodMs = reportPeriodMs;
-            SDL_GameControllerSetSensorEnabled(m_GamepadState[controllerNumber].controller, SDL_SENSOR_ACCEL, reportRateHz ? SDL_TRUE : SDL_FALSE);
+            state->accelReportPeriodMs = reportPeriodMs;
+            SDL_GameControllerSetSensorEnabled(state->controller, SDL_SENSOR_ACCEL, reportRateHz ? SDL_TRUE : SDL_FALSE);
             break;
 
         case LI_MOTION_TYPE_GYRO:
-            m_GamepadState[controllerNumber].gyroReportPeriodMs = reportPeriodMs;
-            SDL_GameControllerSetSensorEnabled(m_GamepadState[controllerNumber].controller, SDL_SENSOR_GYRO, reportRateHz ? SDL_TRUE : SDL_FALSE);
+            state->gyroReportPeriodMs = reportPeriodMs;
+            SDL_GameControllerSetSensorEnabled(state->controller, SDL_SENSOR_GYRO, reportRateHz ? SDL_TRUE : SDL_FALSE);
             break;
         }
     }
@@ -899,8 +1013,12 @@ void SdlInputHandler::setControllerLED(uint16_t controllerNumber, uint8_t r, uin
     }
 
 #if SDL_VERSION_ATLEAST(2, 0, 14)
-    if (m_GamepadState[controllerNumber].controller != nullptr) {
-        SDL_GameControllerSetLED(m_GamepadState[controllerNumber].controller, r, g, b);
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        GamepadState* state = &m_GamepadState[i];
+        if (state->controller == nullptr || state->index != (short)controllerNumber) {
+            continue;
+        }
+        SDL_GameControllerSetLED(state->controller, r, g, b);
     }
 #endif
 }
@@ -908,13 +1026,33 @@ void SdlInputHandler::setControllerLED(uint16_t controllerNumber, uint8_t r, uin
 void SdlInputHandler::setAdaptiveTriggers(uint16_t controllerNumber, DualSenseOutputReport *report){
 
 #if SDL_VERSION_ATLEAST(2, 0, 16)
-        // Make sure the controller number is within our supported count
-    if (controllerNumber <= MAX_GAMEPADS &&
-        // and we have a valid controller
-        m_GamepadState[controllerNumber].controller != nullptr &&
-        // and it's a PS5 controller
-        SDL_GameControllerGetType(m_GamepadState[controllerNumber].controller) == SDL_CONTROLLER_TYPE_PS5) {
-        SDL_GameControllerSendEffect(m_GamepadState[controllerNumber].controller, report, sizeof(*report));
+    if (controllerNumber < MAX_GAMEPADS && report != nullptr) {
+        bool sent = false;
+        for (int i = 0; i < MAX_GAMEPADS; i++) {
+            GamepadState* state = &m_GamepadState[i];
+            if (state->controller == nullptr ||
+                state->index != (short)controllerNumber ||
+                SDL_GameControllerGetType(state->controller) != SDL_CONTROLLER_TYPE_PS5) {
+                continue;
+            }
+
+            const int rc = SDL_GameControllerSendEffect(state->controller, report, sizeof(*report));
+            sent = true;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Adaptive triggers player %d slot %d flags 0x%x types %u/%u rc %d%s",
+                        controllerNumber,
+                        i,
+                        report->validFlag0,
+                        report->leftTriggerEffectType,
+                        report->rightTriggerEffectType,
+                        rc,
+                        rc != 0 ? SDL_GetError() : "");
+        }
+        if (!sent) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Adaptive triggers for player %d had no PS5 gamepad",
+                        controllerNumber);
+        }
     }
 #endif
 
@@ -1007,6 +1145,44 @@ int SdlInputHandler::getAttachedGamepadMask()
                 mask |= (1 << count++);
             }
         }
+    }
+
+    return mask;
+}
+
+int SdlInputHandler::getAttachedPlayStationGamepadMask()
+{
+    int count = 0;
+    int mask = 0;
+    int numJoysticks = SDL_NumJoysticks();
+    for (int i = 0; i < numJoysticks; i++) {
+        if (!SDL_IsGameController(i)) {
+            continue;
+        }
+
+        char guidStr[33];
+        SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(i),
+                                  guidStr, sizeof(guidStr));
+        if (m_IgnoreDeviceGuids.contains(guidStr, Qt::CaseInsensitive)) {
+            continue;
+        }
+
+        bool isPlayStationController;
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+        const auto type = SDL_GameControllerTypeForIndex(i);
+        isPlayStationController = type == SDL_CONTROLLER_TYPE_PS3 ||
+                                  type == SDL_CONTROLLER_TYPE_PS4;
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+        isPlayStationController = isPlayStationController ||
+                                  type == SDL_CONTROLLER_TYPE_PS5;
+#endif
+#else
+        isPlayStationController = SDL_JoystickGetDeviceVendor(i) == 0x054c;
+#endif
+        if (isPlayStationController && (!m_MultiController || count < MAX_GAMEPADS)) {
+            mask |= 1 << (m_MultiController ? count : 0);
+        }
+        count++;
     }
 
     return mask;

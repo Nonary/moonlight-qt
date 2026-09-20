@@ -38,6 +38,7 @@ public:
         setSingleDashWordOptionMode(QCommandLineParser::ParseAsLongOptions);
         addHelpOption();
         addVersionOption();
+        addOption(QCommandLineOption("haptics-license", "Print haptics component notices, licenses and covered source (use alone)."));
     }
 
     void handleHelpAndVersionOptions()
