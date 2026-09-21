@@ -328,6 +328,11 @@ void FFmpegVideoDecoder::reset()
         m_LastPacerTelemetry = {};
     }
 
+    m_ClientPacingWarning = {};
+    if (Session::get() && !m_TestOnly) {
+        Session::get()->getOverlayManager().setStatusMessage(Overlay::StatusSource::ClientPacing, "");
+    }
+
     // Windows normally roll over from submitDecodeUnit(). Session shutdown
     // may occur at any point within a window, so merge its remaining decoder-
     // owned values before the final global log is produced.
@@ -570,6 +575,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     m_OriginalVideoHeight = params->height;
     m_StreamFps = params->frameRate;
     m_VideoFormat = params->videoFormat;
+    m_VrrLatencyMode = params->vrrLatencyMode;
     m_CurrentTestMode = testMode;
 
     // Don't bother initializing Pacer if we're not actually going to render
@@ -1086,6 +1092,18 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
             snapshot.vrrSubmitErrorMaxUs;
     }
 
+    const auto& interval = snapshot.vrrReadiness.interval;
+    const auto warning = m_ClientPacingWarning.observe(LiGetMicroseconds(),
+        snapshot.vrrActive && Session::get()->clientPacingWarningsEnabled(),
+        interval.initialCalibrationComplete && interval.evaluatedUs != 0,
+        snapshot.vrrBufferCapUs != 0 && snapshot.vrrAppliedBufferUs >= snapshot.vrrBufferCapUs,
+        interval.averageValid && interval.serviceOverloaded,
+        delta(snapshot.vrrPacingDroppedFrames, m_LastPacerTelemetry.vrrPacingDroppedFrames) != 0 ||
+        delta(snapshot.vrrPrepareLateFrames, m_LastPacerTelemetry.vrrPrepareLateFrames) != 0,
+        interval.qualityPercent());
+    Session::get()->getOverlayManager().setStatusMessage(Overlay::StatusSource::ClientPacing,
+        ClientPacingWarning::message(warning, (m_VideoFormat & VIDEO_FORMAT_MASK_AV1) != 0,
+            Session::get()->hevcPacingAlternative(), m_VrrLatencyMode == 0));
     m_LastPacerTelemetry = snapshot;
 }
 

@@ -520,6 +520,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.playoutSmoothingPeriodAlphaPerMille > 1000) {
         return fail("playout_smoothing gain and period alpha must be in 0..1000");
     }
+    if (value.playoutCatchupPerMille > 100) {
+        return fail("playout_catchup_per_mille must be in 0..100");
+    }
     if (value.playoutSmoothingWindowedCadence > 2) {
         return fail("playout_smoothing_windowed_cadence must be in 0..2");
     }

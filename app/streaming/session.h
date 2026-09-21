@@ -122,6 +122,9 @@ public:
         return m_OverlayManager;
     }
 
+    bool clientPacingWarningsEnabled() const { return m_Preferences->connectionWarnings; }
+    bool hevcPacingAlternative() const { return m_HevcPacingAlternative; }
+
     int streamColorRange() const
     {
         return m_StreamConfig.colorRange;
@@ -275,6 +278,7 @@ private:
     PresentationSettings m_PresentationSettings;
     std::unique_ptr<DiagnosticCapture> m_DiagnosticCapture;
     bool m_IsFullScreen;
+    bool m_HevcPacingAlternative = false;
     SupportedVideoFormatList m_SupportedVideoFormats; // Sorted in order of descending priority
     STREAM_CONFIGURATION m_StreamConfig;
     DECODER_RENDERER_CALLBACKS m_VideoCallbacks;

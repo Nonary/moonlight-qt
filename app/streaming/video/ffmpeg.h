@@ -7,6 +7,7 @@
 #include "../bandwidth.h"
 #include "decoder.h"
 #include "incomingframetiming.h"
+#include "clientpacingwarning.h"
 #include "ffmpeg-renderers/renderer.h"
 #include "ffmpeg-renderers/pacer/pacer.h"
 
@@ -123,6 +124,8 @@ private:
     VIDEO_STATS m_LastWndVideoStats;
     VIDEO_STATS m_GlobalVideoStats;
     PacerTelemetrySnapshot m_LastPacerTelemetry;
+    ClientPacingWarning m_ClientPacingWarning;
+    int m_VrrLatencyMode = 0;
     std::set<IFFmpegRenderer::RendererType> m_FailedRenderers;
 
     int m_FramesIn;

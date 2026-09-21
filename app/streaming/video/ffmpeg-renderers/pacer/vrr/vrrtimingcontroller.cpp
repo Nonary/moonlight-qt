@@ -1,3 +1,4 @@
+#include "vrrcatchup.h"
 #include "vrrtimingcontroller.h"
 #include "../../../../vrrratepolicy.h"
 
@@ -154,7 +155,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.latencyFixAllRates = latencyMode != 0 ? 1 : 0;
     parameters.latencyFixDelayPeriodPerMille = latencyMode == 2 ? 0 : 500;
     parameters.playoutDelayCapSourcePeriodPerMille = config.latencyFix ? 0 :
-        latencyMode != 0 ? 2000 :
+        latencyMode == 2 ? 1000 : latencyMode == 1 ? 2000 :
         kSmoothPlayoutCapSourcePeriodPerMille;
     // The nominal 116 Hz period was shorter than the measured ~99 Hz source
     // in the deep capture, so it clipped the queue exactly when GPU stalls
@@ -162,6 +163,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     // captured policies retain the old nominal-period behavior by default.
     parameters.playoutDelayCapUsesObservedPeriod = 1;
     parameters.playoutCapacityTelemetry = 1;
+    parameters.playoutCatchupPerMille = config.smoothFrameTiming ? 20 : 0;
     parameters.playoutGpuReadinessAdaptation = 1;
     parameters.playoutPredictionOnly = 1;
     // Every normal VRR session uses the interval-quality queue. Historical
@@ -310,6 +312,7 @@ void VrrTimingController::reset()
         m_Parameters.maximumBaseGuardUs);
 
     m_HaveLastSubmission = false;
+    m_CatchupActive = false;
     m_LastSubmissionUs = 0;
     m_CleanSpacingFrames = 0;
     m_PhaseErrorFrames = 0;
@@ -808,6 +811,35 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     }
     targetUs = std::max(targetUs, earliestSubmissionUs());
     const uint64_t presentationFloorPushUs = targetUs - unflooredTargetUs;
+    // Recovery is not display-floor backlog: the drop policy must not discard
+    // this frame just because we intentionally spread out its catch-up.
+    // Recover actual backlog only, after the native protection decision. A
+    // late source slot may already require a latched present; recovery must
+    // never remove that protection. Never hold past the stale horizon.
+    const uint64_t elapsed = nowUs > frame.decoderOutputUs() ? nowUs - frame.decoderOutputUs() : 0;
+    const uint64_t queueAge = elapsed - std::min(elapsed, frame.decodeSyncWaitUs());
+    const bool recoveryEligible = timestampPlayout && !rebased && !reseedPhase &&
+        cadence.eligible && !cadence.phaseDiscontinuity && !cadence.sourceRateChanged &&
+        m_HaveLastSubmission &&
+        m_Parameters.playoutCatchupPerMille != 0 &&
+        m_SourcePeriodUs <= 1000000 && cadence.intervalUs >= m_SourcePeriodUs * 9 / 10 &&
+        cadence.intervalUs <= m_SourcePeriodUs * 11 / 10;
+    if (recoveryEligible && (m_CatchupActive || queueAge > m_SourcePeriodUs)) {
+        const uint64_t floor = VrrCatchUp::floorUs(m_LastSubmissionUs, m_SourcePeriodUs,
+            saturatingAdd(m_DisplayPeriodUs, m_GuardUs), queueAge,
+            m_Parameters.playoutCatchupPerMille);
+        const uint64_t hardDeadline = saturatingAdd(frame.decoderOutputUs(),
+            saturatingAdd(m_SourcePeriodUs * 2, frame.decodeSyncWaitUs()));
+        m_CatchupActive = floor != 0 && (floor > targetUs || queueAge > m_SourcePeriodUs) &&
+            queueAge < m_SourcePeriodUs * 2 && targetUs < hardDeadline;
+        // Recovery may spend at most 1 ms beyond the otherwise safe slot.
+        // A slow drain must not turn repeated stalls into standing latency.
+        if (m_CatchupActive) targetUs = std::max(targetUs,
+            std::min({floor, hardDeadline, saturatingAdd(targetUs, 1000)}));
+    }
+    else {
+        m_CatchupActive = false;
+    }
     // GPU readiness is learned independently from CPU/render preparation.
     // Keep it out of targetUs: it is an earlier start opportunity, not extra
     // presentation latency. The source-period bound prevents the worker from

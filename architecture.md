@@ -5,7 +5,8 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Reference baseline: `78b99f1c` (vrr17 branch), including source ownership,
+Reference baseline: `06fae71f` (vrr17 branch), plus the client-warning and
+gradual backlog-recovery follow-up described below. This includes source ownership,
 buffer attribution and decode-wait starvation prevention (2026-09-20).
 Production now selects serial-service revision 2: the shared interval buffer
 compares workload with intended time over its qualified one-second window,
@@ -74,7 +75,7 @@ Latency and Balanced Target, 0.2 ms for Smooth), driving the severity-weighted
 preset-duration quality score. Low Latency / Balanced Target / Smooth seek
 99% / 99.5% / 99.99% over 1/2/5 minutes, with 6/8/10-second holds and
 125/250/50 us-per-second release, within the shared three-frame queue and
-2/2/4-source-frame allowances. Low Latency and Balanced Target remain capped at
+1/2/4-source-frame allowances. Low Latency and Balanced Target remain capped at
 16 ms, Smooth at 24 ms, all subject to the queue-capacity safety bound. These
 are ceilings, not fixed delays or a larger physical queue.
 Initial interval calibration requires at least 500 ms of contiguous coverage
@@ -126,6 +127,47 @@ composition guard and passes repaint=false to the decoder. Dormant renderer
 helpers and their deterministic tests remain available for development.
 Production retains its Immediate/WSI FIFO selection; adaptive presentation
 permission is owned by the VRR backend rather than a user preference.
+
+### Client warnings and gradual backlog recovery (2026-09-20)
+
+With Reduce judder enabled, production captures `playout_catchup_per_mille=20`.
+Recovery arms only after replaceable queue age exceeds one source period.
+A soft submission floor limits catch-up initially to a two-percent reduction
+in source interval. Between one and two source periods of replaceable queue
+age, it continuously allows more recovery, up to the display period plus guard.
+There is no extra floor without display headroom. The existing native
+protection decision is retained, including any latched present. Each added
+hold is bounded by the two-period stale deadline and at most 1 ms beyond the
+otherwise safe slot. Persistent stalls cannot authorize an unlimited slow drain. Source timestamps, dynamic reserve demand and
+hard queue capacity are unchanged. The decode wait is excluded from replaceable
+queue age; existing stale-frame rejection remains the last safeguard. Cadence
+breaks, rate transitions and unqualified source timing bypass this floor.
+The recovery parameter is included in the calibration identity. Zero preserves historical
+capture behavior; Reduce judder disabled also retains the former recovery.
+This smooths compression after stalls, but cannot guarantee preservation of every
+frame under overload, eliminate GPU waits, or prove physical scanout smoothness.
+
+Client warnings sample fresh pacing drops/late-preparation counters once per
+reporting interval, independently of the performance overlay. A buffer at its
+limit without fresh late/drop evidence does not warn. Sustained qualified
+one-second service overload has a distinct warning and never suggests more
+buffering. Both client warnings require the buffer to be at its maximum and
+the displayed measured smoothness score to be at or below 99%, regardless of
+preset. Leaving the cap or recovering above 99% hides them immediately.
+Missing qualification also suppresses them. Warnings require three seconds of startup and two seconds of
+persistent evidence, clear after five seconds without that evidence, and have
+a thirty-second repeat cooldown. Reporting gaps over 2.5 seconds restart
+qualification. They follow the existing connection-quality-warning preference.
+HEVC is suggested only for active AV1 with an initialization-time hardware
+HEVC probe matching the stream's HDR/chroma/resolution; Smooth is suggested
+only for a capped buffer when a different preset is selected. No setting changes
+automatically. Diagnostic `serviceOverloaded` does not change buffer control.
+
+Network and client messages retain independent status sources. Mouse-mode text
+has display priority while retaining both warnings; clearing any source cannot
+clear the others. Client pacing counters do not feed the network frame-gap
+counter or the transport connection callback. Those existing delivery-loss
+signals do not diagnose a specific network component or internal GPU cause.
 
 ### Cross-platform ownership and buffer-attribution correction (2026-09-19)
 
@@ -694,7 +736,7 @@ reconnect after changing it. Fixed-refresh pacing is independent of this setting
 
 | Timing choice | Adaptive playout-buffer cap | Stale-work allowance with a successor |
 | --- | --- | --- |
-| Low Latency (2) | Two fitted source periods | Two fitted source periods |
+| Low Latency (2) | One fitted source period | One fitted source period |
 | Balanced Target (1, default) | Two fitted source periods | Two fitted source periods |
 | Smooth (0) | Four fitted source periods | Two fitted source periods |
 
@@ -1276,7 +1318,7 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | --- | --- |
 | Delay start seed | 6,000 us, then source/display/work/capacity scaling below |
 | Delay minimum input | 1,000 us, capped by available capacity and the selected timing allowance |
-| Delay maximum input | 16,000 us for Low Latency/Balanced Target, 24,000 us for Smooth; also capped by capacity and the selected 2/2/4-source-frame allowance |
+| Delay maximum input | 16,000 us for Low Latency/Balanced Target, 24,000 us for Smooth; also capped by capacity and the selected 1/2/4-source-frame allowance |
 | Start-period ratio | 950 per mille of fitted source period |
 | Maximum-period ratio | 0; source-rate reduction cannot expand the absolute ceiling |
 | Initial interval calibration | At least 500 ms and 32 consecutive valid intervals; once per controller reset, not once per FPS change |
@@ -1707,7 +1749,7 @@ occupied        = renderLead + presentationSafety
 queueDelayLimit = max(0, capacity - occupied)
 modeAllowance   = Smooth: fittedSourcePeriod * 4000 / 1000
                 | Balanced Target: fittedSourcePeriod * 2000 / 1000
-                | Low Latency: fittedSourcePeriod * 2000 / 1000
+                | Low Latency: fittedSourcePeriod * 1000 / 1000
 maximumInput    = Smooth: 24000 us | other presets: 16000 us
 effectiveMin    = min(1000 us, queueDelayLimit, modeAllowance)
 effectiveMax    = min(maximumInput, queueDelayLimit, modeAllowance)

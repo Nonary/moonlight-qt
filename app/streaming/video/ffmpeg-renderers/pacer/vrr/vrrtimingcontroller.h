@@ -43,6 +43,8 @@
     X(uint64_t, playout_serial_service_gate, playoutSerialServiceGate, 0) \
     /* Long quality history remains diagnostic while recent pressure owns release. */ \
     X(uint64_t, playout_recent_pressure_release, playoutRecentPressureRelease, 0) \
+    /* Zero preserves historical burst recovery. Production starts at 2 percent. */ \
+    X(uint64_t, playout_catchup_per_mille, playoutCatchupPerMille, 0) \
     /* Historical captures retain the one-second/two-interval warmup. */ \
     X(uint64_t, playout_interval_initial_warmup_us, playoutIntervalInitialWarmupUs, 1000000) \
     X(size_t, playout_interval_initial_minimum_samples, playoutIntervalInitialMinimumSamples, 2) \
@@ -573,6 +575,7 @@ private:
     bool m_LastCadenceUsedRtp = false;
 
     bool m_HaveLastSubmission = false;
+    bool m_CatchupActive = false;
     uint64_t m_LastSubmissionUs = 0;
     unsigned int m_CleanSpacingFrames = 0;
     unsigned int m_PhaseErrorFrames = 0;

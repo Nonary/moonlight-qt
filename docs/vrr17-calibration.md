@@ -134,3 +134,11 @@ is fixed.
 
 The current serial-service revision 2 and deferred GPU accounting correction
 are described in [service-gate correction](vrr-service-gate-correction.md).
+
+## Current Low Latency correction (2026-09-20)
+
+Low Latency now allows one fitted source frame, Balanced Target two, and
+Smooth four. The earlier 2/2/4 results above describe the preceding policy.
+The absolute 16/16/24 ms ceilings and capacity safety bound still apply.
+The settings description and production resolver both use the corrected
+1/2/4 allowances; captured explicit policies retain their recorded limits.

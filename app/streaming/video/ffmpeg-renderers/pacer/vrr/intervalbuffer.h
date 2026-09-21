@@ -60,6 +60,7 @@ public:
         uint64_t toleranceUs = ToleranceUs;
         bool severityWeighted = false;
         bool averageValid = false;
+        bool serviceOverloaded = false; // Qualified one-second workload, diagnostic only.
         bool initialCalibrationComplete = false;
         uint64_t calibrationCoverageUs = 0, calibrationSamples = 0;
         Update update;
@@ -145,6 +146,7 @@ public:
             m_Stats.calibrationCoverageUs >= m_SequenceWarmupUs;
         if (!m_Stats.averageValid) return;
         m_Stats.initialCalibrationComplete = true;
+        m_Stats.serviceOverloaded = service > intendedTime || decoderQueue > intendedTime;
         const bool pressure = total > samples * toleranceUs;
         // Weight the score by evaluated time, not frame rate. Attribute the
         // preceding interval to its evaluated one-second mean; gaps are unknown.

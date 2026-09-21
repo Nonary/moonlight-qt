@@ -338,6 +338,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                     .arg(policy.playoutSmoothingMaxLagUs)
                     .arg(policy.playoutSmoothingWindowedCadence)
                     .arg(policy.playoutSmoothingRecoveryUs);
+                context += QStringLiteral("|catchup=%1").arg(policy.playoutCatchupPerMille);
             }
             config.calibrationKey = QCryptographicHash::hash(context.toUtf8(), QCryptographicHash::Sha256).toHex().toStdString();
             config.calibrationPath = Path::getCacheFileInfo("vrr13-calibration.json").absoluteFilePath().toStdString();

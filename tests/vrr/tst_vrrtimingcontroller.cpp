@@ -5,6 +5,8 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
 #include "../../app/streaming/vrrratepolicy.h"
+#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrcatchup.h"
+#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -37,6 +39,7 @@ VrrSessionConfig config(int streamRateHz = 60, int displayRefreshHz = 120)
 VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
 {
     auto policy = vrrTimingParametersForSession(session);
+    policy.playoutCatchupPerMille = 0;
     policy.playoutOffsetCadenceGate = 0;
     policy.playoutOffsetSlewUsPerSecond = 0;
     policy.playoutResponsiveBuffer = 0;
@@ -71,6 +74,7 @@ VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
 VrrTimingParameters legacyFeedbackParameters(const VrrSessionConfig& session)
 {
     auto policy = vrrTimingParametersForSession(session);
+    policy.playoutCatchupPerMille = 0;
     policy.playoutOffsetCadenceGate = 0;
     policy.playoutOffsetSlewUsPerSecond = 0;
     policy.playoutResponsiveBuffer = 0;
@@ -4516,7 +4520,7 @@ void testLatencyPresetsAcrossSourceAndDisplayRates()
             auto session = ordinarySession;
             session.latencyMode = mode;
             const auto policy = vrrTimingParametersForSession(session);
-            const uint64_t capPerMille = 2000;
+            const uint64_t capPerMille = mode == 2 ? 1000 : 2000;
             expect(policy.latencyFixEnabled == 1 && policy.latencyFixAllRates == 1 &&
                        policy.latencyFixDelayPeriodPerMille == (mode == 1 ? 500 : 0) &&
                        policy.playoutDelayCapSourcePeriodPerMille == capPerMille,
@@ -5429,8 +5433,71 @@ void testBufferDecisionDiagnostics()
     }
 }
 
+void testProductionGradualBacklogRecovery()
+{
+    auto session = config(100, 120);
+    session.latencyMode = 1;
+    auto policy = vrrTimingParametersForSession(session);
+    auto historical = policy;
+    historical.playoutCatchupPerMille = 0;
+    VrrTimingController current(session, true, policy), old(session, true, historical);
+    uint64_t submitted = 0, oldSubmitted = 0;
+    bool differed = false;
+    for (int i = 1; i <= 700; ++i) {
+        const uint64_t arrival = 1000000 + i * 10000;
+        const auto execute = [&](VrrTimingController& controller, uint64_t& last) {
+            uint64_t now = std::max(arrival, last);
+            if (i == 200) now += 15000;
+            const auto decision = controller.schedule(frame(i, i * 900, true, arrival), now);
+            expect(!VrrFrameDropPolicy::beforeRender(decision, controller.displayPeriodUs(),
+                       now - arrival, false, controller.latencyFixActive()),
+                   "intentional catch-up must not be misclassified as display-floor backlog and dropped");
+            const auto ready = std::max(now, decision.renderStartUs) + 500;
+            last = std::max(ready, decision.targetUs);
+            controller.notePreparationDuration(500, 0, ready);
+            controller.noteSchedulerDelays(0, 0, true);
+            controller.noteSubmission(true, false, last);
+            expect(last <= arrival + 20000,
+                   "gradual catch-up must stay within the two-period stale horizon");
+        };
+        execute(current, submitted);
+        execute(old, oldSubmitted);
+        if (i > 200 && submitted != oldSubmitted) differed = true;
+        if (i > 600) expect(submitted <= oldSubmitted + 1000,
+                            "recovering a transient backlog must not leave standing latency");
+    }
+    expect(differed, "the production worker schedule must exercise gradual recovery after a stall");
+}
+
 int main()
 {
+    testProductionGradualBacklogRecovery();
+    {
+        expect(VrrCatchUp::floorUs(100000, 10000, 8500, 0, 20) == 109800,
+               "gentle catch-up limits interval compression to two percent");
+        uint64_t previous = 109800;
+        for (uint64_t age = 10000; age <= 20000; age += 100) {
+            const auto floor = VrrCatchUp::floorUs(100000, 10000, 8500, age, 20);
+            expect(floor <= previous && previous - floor <= 14 && floor >= 108500,
+                   "recovery progressively uses headroom without crossing display safety");
+            previous = floor;
+        }
+        expect(previous == 108500, "hard-limit edge uses all safe recovery headroom");
+        expect(VrrCatchUp::floorUs(100000, 8333, 8500, 20000, 20) == 0,
+               "no recovery floor is added when the display has no headroom");
+        expect(VrrCatchUp::floorUs(100000, 10000, 8500, 0, 0) == 0,
+               "historical captures retain their recovery behavior");
+        uint64_t last = 110000; // A one-period late presentation.
+        for (unsigned i = 1; i <= 60; ++i) {
+            const uint64_t intended = 100000 + i * 10000;
+            const auto next = std::max(intended, VrrCatchUp::floorUs(last, 10000, 8500, 0, 20));
+            expect(next - last >= 9800 && next - intended <= 10000,
+                   "transient backlog drains without burst presentation or growing latency");
+            last = next;
+        }
+        expect(last == 700000, "bounded catch-up returns to the original source slots");
+    }
+
     testIntervalBufferReleaseIgnoresReportingDebt();
     testIntervalBufferTransientServiceRecovery();
     testIntervalBufferSeparatesDeliveryFromSerialService();

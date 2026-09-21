@@ -261,6 +261,7 @@ HEADERS += \
     settings/mappingmanager.h \
     gui/sdlgamepadkeynavigation.h \
     streaming/video/overlaymanager.h \
+    streaming/video/clientpacingwarning.h \
     backend/systemproperties.h \
     windowsvblankvirtualization.h
 
@@ -299,6 +300,7 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/vrrcatchup.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h
 }
 libva {

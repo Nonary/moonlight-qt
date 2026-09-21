@@ -929,6 +929,8 @@ Flickable {
                         wrapMode: Text.Wrap
                         text: StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_SMOOTH ?
                                   qsTr("Buffer allowance: up to 4 source frames, at most 24 ms, limited by queue capacity. Actual learned delay may be lower.") :
+                                  StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_LOW_LATENCY ?
+                                  qsTr("Buffer allowance: up to 1 source frame, at most 16 ms, limited by queue capacity. Actual learned delay may be lower.") :
                                   qsTr("Buffer allowance: up to 2 source frames, at most 16 ms, limited by queue capacity. Actual learned delay may be lower.")
                     }
 

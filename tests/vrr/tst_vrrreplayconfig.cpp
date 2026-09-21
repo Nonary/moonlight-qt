@@ -269,6 +269,7 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     oldSnapshot.remove("playout_source_mapping_decoder_output");
     oldSnapshot.remove("playout_serial_service_gate");
     oldSnapshot.remove("playout_recent_pressure_release");
+    oldSnapshot.remove("playout_catchup_per_mille");
     VrrTimingParameters historical;
     QVERIFY2(applyVrrReplayControllerSnapshot(oldSnapshot, historical, error), qPrintable(error));
     QCOMPARE(historical.playoutOffsetCadenceGate, uint64_t(0));
@@ -278,6 +279,7 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     QCOMPARE(historical.playoutSourceMappingDecoderOutput, uint64_t(0));
     QCOMPARE(historical.playoutSerialServiceGate, uint64_t(0));
     QCOMPARE(historical.playoutRecentPressureRelease, uint64_t(0));
+    QCOMPARE(historical.playoutCatchupPerMille, uint64_t(0));
 
     auto revisionOneSnapshot = snapshot;
     revisionOneSnapshot["playout_serial_service_gate"] = 1;
@@ -306,6 +308,9 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     invalid.playoutSerialServiceGate = 2;
     QVERIFY(validateVrrTimingParameters(invalid, error));
     invalid.playoutSerialServiceGate = 3;
+    QVERIFY(!validateVrrTimingParameters(invalid, error));
+    invalid = restored;
+    invalid.playoutCatchupPerMille = 101;
     QVERIFY(!validateVrrTimingParameters(invalid, error));
     invalid = restored;
     invalid.playoutRecentPressureRelease = 2;
