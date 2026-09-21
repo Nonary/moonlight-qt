@@ -2,15 +2,11 @@
 #include "dualsensehaptics.h"
 #include <ControllerHaptics.h>
 
-#if defined(__linux__) && SDL_VERSION_ATLEAST(2, 24, 0)
-#include <linux/hidraw.h>
-#include <linux/input.h>
-#include <sys/ioctl.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <cerrno>
+#if (defined(__linux__) || defined(_WIN32) || defined(MOONLIGHT_HAPTICS_TEST)) && SDL_VERSION_ATLEAST(2, 24, 0)
+#include "dualsensehid.h"
 #include "../../../third-party/saxense/packet.h"
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -31,7 +27,7 @@ struct Chunk {
 };
 
 struct Playback {
-    int hid = -1;
+    std::unique_ptr<DualSenseHidOutput> output;
     SDL_GameController* controller = nullptr;
     SDL_AudioStream* converter = nullptr;
     std::mutex mutex;
@@ -41,8 +37,6 @@ struct Playback {
     bool stopped = false;
     bool failed = false;
     bool waveformMode = false;
-    bool receivedLogged = false;
-    bool writeLogged = false;
     Clock::time_point lastReceived {};
 
     ~Playback() {
@@ -50,18 +44,12 @@ struct Playback {
         wake.notify_all();
         if (worker.joinable()) worker.join();
         if (converter) SDL_FreeAudioStream(converter);
-        if (hid >= 0) close(hid);
     }
 
     bool write(uint8_t sequence, const uint8_t* samples) {
         uint8_t report[SAXENSE_REPORT_BYTES];
         saxense_packet(report, sequence, samples);
-        const auto result = ::write(hid, report, sizeof(report));
-        if (result == sizeof(report) && !writeLogged) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "DualSense waveform: first Bluetooth report written (%u bytes)", unsigned(sizeof(report)));
-            writeLogged = true;
-        }
-        return result == sizeof(report) || (result < 0 && (errno == EAGAIN || errno == EINTR));
+        return output->write(report, sizeof(report));
     }
 
     void run() {
@@ -132,7 +120,7 @@ struct Playback {
         lock.unlock();
         uint8_t silence[SAXENSE_PCM_BYTES] {};
         if (active && !failed) write(sequence++, silence);
-        if (failed) SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "DualSense waveform output failed; reconnect the controller to retry");
+        if (failed) SDL_LogWarn(SDL_LOG_CATEGORY_INPUT, "DualSense waveform output failed; reconnect the controller to retry");
         // std::thread does not run SDL_CreateThread's TLS cleanup wrapper.
         SDL_TLSCleanup();
     }
@@ -143,23 +131,10 @@ std::array<std::shared_ptr<Playback>, 16> registry;
 }
 
 bool DualSenseHaptics::attach(unsigned slot, SDL_GameController* controller) {
-    if (slot >= registry.size() || SDL_GameControllerGetVendor(controller) != 0x054c ||
-        (SDL_GameControllerGetProduct(controller) != 0x0ce6 && SDL_GameControllerGetProduct(controller) != 0x0df2)) return false;
-    const char* path = SDL_GameControllerPath(controller);
-    if (!path) return false;
-    // Exact SDL path and kernel bus identity; never guess by model/name/order.
+    if (slot >= registry.size()) return false;
     auto playback = std::make_shared<Playback>();
-    playback->hid = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
-    if (playback->hid < 0) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "DualSense waveform open failed for %s: %s", path, strerror(errno));
-        return false;
-    }
-    hidraw_devinfo info {};
-    if (ioctl(playback->hid, HIDIOCGRAWINFO, &info) < 0 || info.bustype != BUS_BLUETOOTH ||
-        info.vendor != 0x054c || info.product != SDL_GameControllerGetProduct(controller)) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "DualSense waveform unavailable on SDL path %s (requires Bluetooth hidraw)", path);
-        return false;
-    }
+    playback->output = openDualSenseBluetoothOutput(controller);
+    if (!playback->output) return false;
     playback->converter = SDL_NewAudioStream(AUDIO_S16LSB, 2, 48000, AUDIO_S8, 2, SAXENSE_RATE);
     if (!playback->converter) return false;
     playback->controller = controller;
@@ -167,7 +142,7 @@ bool DualSenseHaptics::attach(unsigned slot, SDL_GameController* controller) {
     if (registry[slot]) return false; // Single-controller merging is ambiguous.
     playback->worker = std::thread([p = playback.get()] { p->run(); });
     registry[slot] = std::move(playback);
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "DualSense Bluetooth waveform backend ready for slot %u (SAxense)", slot);
+    SDL_LogInfo(SDL_LOG_CATEGORY_INPUT, "DualSense Bluetooth waveform backend ready for slot %u (SAxense)", slot);
     return true;
 }
 
@@ -201,10 +176,6 @@ void DualSenseHaptics::receive(uint16_t slot, uint32_t sequence, const uint8_t* 
     chunk.sequence = sequence; chunk.frames = frames;
     chunk.received = p.lastReceived = Clock::now();
     memcpy(chunk.pcm.data(), pcm, frames * 4);
-    if (!p.receivedLogged) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "DualSense waveform: first PCM received for player %u sequence %u frames %u", slot, sequence, frames);
-        p.receivedLogged = true;
-    }
     p.queue.push_back(chunk);
     p.wake.notify_all();
 }

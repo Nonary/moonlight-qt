@@ -256,6 +256,7 @@ void Session::clSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g
 }
 
 void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right){
+    if (controllerNumber >= MAX_GAMEPADS || !left || !right) return;
     // We push an event for the main thread to handle in order to properly synchronize
     // with the removal of game controllers that could result in our game controller
     // going away during this callback.
@@ -267,15 +268,11 @@ void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlag
     // Based on the following SDL code:
     // https://github.com/libsdl-org/SDL/blob/120c76c84bbce4c1bfed4e9eb74e10678bd83120/test/testgamecontroller.c#L286-L307
     DualSenseOutputReport *state = (DualSenseOutputReport *) SDL_malloc(sizeof(DualSenseOutputReport));
-    SDL_zero(*state);
-    state->validFlag0 = (eventFlags & DS_EFFECT_RIGHT_TRIGGER) | (eventFlags & DS_EFFECT_LEFT_TRIGGER);
-    state->rightTriggerEffectType = typeRight;
-    SDL_memcpy(state->rightTriggerEffect, right, sizeof(state->rightTriggerEffect));
-    state->leftTriggerEffectType = typeLeft;
-    SDL_memcpy(state->leftTriggerEffect, left, sizeof(state->leftTriggerEffect));
+    if (!state) return;
+    *state = makeDualSenseTriggerReport(eventFlags, typeLeft, typeRight, left, right);
 
     setControllerLEDEvent.user.data2 = (void *) state;
-    SDL_PushEvent(&setControllerLEDEvent);
+    if (SDL_PushEvent(&setControllerLEDEvent) <= 0) SDL_free(state);
 }
 
 bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,

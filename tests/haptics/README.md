@@ -1,6 +1,7 @@
 # DualSense Bluetooth waveform validation
 
-Linux with SDL 2.24 or newer:
+Requires SDL 2.24 or newer and the repository's pinned moonlight-common-c
+revision (including `ControllerHaptics.h`). Linux:
 
 ```sh
 mkdir -p build/tests-haptics
@@ -11,37 +12,50 @@ make -j10
 ```
 
 Use the same `PKG_CONFIG_PATH` and runtime `LD_LIBRARY_PATH` as the application
-if it links a local SDL build. The test uses a local datagram socket in place of
-hidraw and does not open a physical controller. It exercises the production
-worker and resampler, checks both channels and the Bluetooth CRC, bounded queue
-behavior, idle silence and controller removal.
+if it links a local SDL build. On Windows, from an x64 Native Tools prompt with
+Qt's `bin` directory on PATH:
+
+```bat
+mkdir build\tests-haptics
+cd build\tests-haptics
+qmake ..\..\tests\haptics\haptics.pro CONFIG+=release
+nmake
+set "PATH=..\..\libs\windows\lib\x64;%PATH%"
+release\tst_dualsensehaptics.exe
+```
+
+The opt-in `tests/tests.pro` tree also builds this suite, and Windows CI runs it.
+The test uses a recording HID output and a virtual controller; it does not open
+a physical controller. It exercises the production worker and resampler, checks
+both channels and the Bluetooth CRC, bounded queue behavior, packet loss and
+duplicates, idle/removal silence, write failure and SDL trigger payload dispatch.
+Some sdl2-compat versions invert virtual effect callback return values; that
+check asserts the dispatched bytes, not the virtual driver's return status.
 
 For real playback, use the coordinated Vibeshine and Moonlight builds. Pair the
-DualSense/Edge to the Linux **client**, select DS5 (or automatic PlayStation
+DualSense/Edge to the Windows or Linux **client**, select DS5 (or automatic PlayStation
 emulation) on the host, then reconnect the stream. The client log must contain
 `DualSense Bluetooth waveform backend ready`. Ordinary USB connections and
 unsupported clients keep conventional rumble. The game must send native haptic
-PCM to the host virtual controller's audio endpoint.
+PCM to the Linux host virtual controller's audio endpoint. Windows uses its
+built-in HID driver and the exact device path owned by SDL; no controller-name
+matching or virtual Xbox translation is used. A controller hidden from Moonlight
+by another input mapper will not expose native waveform/trigger support.
 
 Check distinct left/right native effects while moving both sticks and using
 adaptive triggers; stop the effect, pause/end the stream, disconnect/reconnect
 Bluetooth and repeat. Verify an older client still receives rumble. A working
-backend log or passing socket test alone is not physical haptics validation.
+backend log or passing recording-output test alone is not physical haptics validation.
+
+Specifically verify that LEDs and repeated adaptive-trigger changes do not
+interrupt a sustained waveform, and that input, conventional rumble after PCM
+idles, reconnects, multiple controllers and stream exit still work. Check the
+log for `Adaptive trigger output failed` or `DualSense waveform output failed`.
+
+The Windows transport follows Microsoft's [continuous HID output guidance](https://learn.microsoft.com/en-us/windows-hardware/drivers/hid/sending-hid-reports)
+and the maximum-report padding used by [SDL's Windows HID backend](https://github.com/libsdl-org/SDL/blob/SDL2/src/hidapi/windows/hid.c).
+The wire payload and its CRC remain the pinned SAxense adaptation.
 
 `moonlight --haptics-license` prints the embedded source and notices; see
 [`PROVENANCE.md`](../../third-party/saxense/PROVENANCE.md) for the pinned source,
 licenses and distribution requirements.
-
-The optional `probe_dualsense.cpp` exercises the same waveform renderer on a
-physical Bluetooth DualSense. Compile with the application's SDL environment:
-
-```sh
-g++ -std=c++17 -O2 -pthread -Iapp -Imoonlight-common-c/moonlight-common-c/src $(pkg-config --cflags sdl2) tests/haptics/probe_dualsense.cpp -o /tmp/probe-dualsense $(pkg-config --libs sdl2)
-/tmp/probe-dualsense enumerate
-```
-
-Coordinate with the person holding the controller before separately running
-`rumble`, `trigger`, and `wave` in place of `enumerate`. Each test is finite and
-clears its effects on normal completion. `wave` plays the left and then right
-actuator; the others use SDL's physical-controller output APIs. Run outside
-a streaming session to isolate local output from host/game feedback.

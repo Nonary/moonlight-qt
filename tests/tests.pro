@@ -5,7 +5,7 @@ CONFIG += ordered
 
 contains(CONFIG, tests) {
     SUBDIRS += vrr
-    linux: SUBDIRS += haptics
+    SUBDIRS += haptics
 } else {
     message(VRR tests are disabled; rerun qmake with CONFIG+=tests)
 }

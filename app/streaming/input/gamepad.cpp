@@ -851,6 +851,8 @@ void SdlInputHandler::handleJoystickArrivalEvent(SDL_JoyDeviceEvent* event)
 
 void SdlInputHandler::rumble(unsigned short controllerNumber, unsigned short lowFreqMotor, unsigned short highFreqMotor)
 {
+    // Native waveform playback takes precedence over legacy rumble.
+    if (DualSenseHaptics::playing(controllerNumber)) return;
     // Make sure the controller number is within our supported count
     if (controllerNumber >= MAX_GAMEPADS) {
         return;
@@ -1023,8 +1025,8 @@ void SdlInputHandler::setControllerLED(uint16_t controllerNumber, uint8_t r, uin
 #endif
 }
 
-void SdlInputHandler::setAdaptiveTriggers(uint16_t controllerNumber, DualSenseOutputReport *report){
-
+void SdlInputHandler::setAdaptiveTriggers(uint16_t controllerNumber, DualSenseOutputReport *report)
+{
 #if SDL_VERSION_ATLEAST(2, 0, 16)
     if (controllerNumber < MAX_GAMEPADS && report != nullptr) {
         bool sent = false;
@@ -1055,7 +1057,6 @@ void SdlInputHandler::setAdaptiveTriggers(uint16_t controllerNumber, DualSenseOu
         }
     }
 #endif
-
     SDL_free(report);
 }
 

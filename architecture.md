@@ -5,6 +5,11 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
+Controller-feedback update (2026-09-19), checked against `9362b0f0` and its
+common-library waveform protocol: section 12 now covers Windows
+Bluetooth waveform output and the shared adaptive-trigger path. This update
+does not change video timing or replay policy.
+
 Reference baseline: `06fae71f` (vrr17 branch), plus the client-warning and
 gradual backlog-recovery follow-up described below. This includes source ownership,
 buffer attribution and decode-wait starvation prevention (2026-09-20).
@@ -2118,6 +2123,63 @@ backpressure. Audio startup intentionally discards an initial backlog of about
 queued audio latency. Muting can suppress audio processing without retiming VRR.
 
 Input goes from SDL handlers to common-library input APIs and a separate sender.
+
+Windows/Linux DualSense waveform feedback (updated 2026-09-19) runs separately
+from video and ordinary stream audio. A Bluetooth Sony DualSense/Edge with an
+exact SDL HID device path can advertise controller capability
+`LI_CCAP_HAPTICS_PCM` (`0x8000`) after its output backend opens successfully.
+The client also advertises `ML_FF_HAPTICS_PCM` (`0x04`) in SDP. Vibeshine captures
+48 kHz S16LE actuator channels 3/4 from its virtual USB audio interface and sends
+5 ms stereo blocks using encrypted control type `0x5601`, unreliable ENet
+channel `0x08`. Both flags and the versioned payload are a coordinated extension
+in these forks; they are not an upstream Moonlight protocol guarantee.
+
+The receive callback validates exact length, version, format, controller range,
+reserved fields and sample count before copying into a bounded per-controller
+queue. It never accesses Session/InputHandler objects that may be tearing down.
+The shared worker resamples to 3 kHz signed 8-bit stereo with SDL's audio stream,
+then sends SAxense-derived Bluetooth reports. Linux uses the controller's hidraw
+node and verifies its kernel bus identity. Windows opens SDL's exact device
+path with shared access, verifies Sony VID/PID and the Bluetooth gamepad HID
+collection's report lengths, and writes through overlapped Windows HID I/O.
+Output is padded to the descriptor's maximum report length while preserving the
+142-byte waveform report's CRC offset. A pending write has a 40 ms completion
+wait; timeout cancels and drains the operation before its buffer can be reused
+or freed. This is not a hard bound on a faulty driver's cancellation completion.
+Input stays with SDL; no kernel module or Bluetooth reconfiguration is added on
+the client. USB and other platforms keep ordinary rumble. Native game haptics
+must originate from the Linux Vibeshine host's controller
+audio endpoint; game soundtrack audio is not a substitute.
+
+Playback drops old/duplicate packets, resets conversion history on packet loss,
+bounds its input and converted queues, sends silence on underflow/idle/removal,
+and joins its worker before SDL closes the controller. It cancels SDL emulated
+rumble when waveform playback starts and suppresses legacy rumble while active;
+LED, motion and adaptive-trigger callbacks retain their own paths. Write failure
+stops that waveform worker and logs the need to reconnect; ordinary controller
+input continues. Hardware coexistence with other applications writing the same
+controller still requires physical testing.
+
+Adaptive triggers already use `SDL_GameControllerSendEffect` on Windows and
+Linux, independently of PCM support. SDL owns Bluetooth framing/CRC. The shared
+47-byte effect builder sets only trigger validity bits, preserving waveform,
+rumble, LED and audio state. Callback admission and event consumption reject
+controller indices outside 0–15; allocation and event-push failure release the
+report safely. Failed SDL effect submission is logged. Trigger dispatch runs on
+the input thread so controller removal cannot race its SDL handle.
+
+The pinned SAxense source, license, research credit and adaptation notes are in
+[`third-party/saxense`](third-party/saxense/PROVENANCE.md). Every binary embeds the
+original/adapted covered source and both license texts, printable headlessly with
+`--haptics-license`. Hardware-free validation is `tests/haptics/haptics.pro`;
+passing it does not establish actual Bluetooth/game behavior. The suite runs on
+Windows, Linux and macOS using a recording output and SDL's real resampler; a
+virtual controller checks trigger payload dispatch. Windows CI builds the native
+HID transport and runs the suite. Local 2026-09-19 validation passed on macOS
+using isolated headers from the pinned common-library revision; Windows native
+build, simultaneous physical waveform/trigger playback and deployment remain
+unverified. The pre-existing local common-library checkout was left unchanged.
+
 See [InputStream.c](moonlight-common-c/moonlight-common-c/src/InputStream.c) and
 [input handlers](app/streaming/input). Mouse movement is coalesced/batched with
 a 1 ms interval; the stream event loop normally sleeps 1 ms when idle, with
