@@ -279,6 +279,7 @@ bool validateTraceRowSyntax(const QList<QByteArray>& header,
         "submit_error_us",
         "spacing_margin_us",
         "cadence_smoothing_us",
+        "playout_offset_us",
         "readiness_phase_us",
         "native_present_result",
         "native_tearing_feature_query_result",
@@ -294,6 +295,7 @@ bool validateTraceRowSyntax(const QList<QByteArray>& header,
         "gpu_ready_set_event_result",
     };
     static const QSet<QByteArray> booleanColumns {
+        "prepared_ahead",
         "rtp_valid",
         "queue_accepted",
         "queue_discontinuity",
@@ -1665,6 +1667,7 @@ struct Metrics {
     VrrTimingDecision lastFeedbackDecision;
 
     uint64_t delivered = 0;
+    uint64_t preparedAheadFrames = 0;
     uint64_t scheduled = 0;
     uint64_t presentedFrames = 0;
     uint64_t traceSchema = 0;
@@ -3299,6 +3302,9 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         1000000.0;
     capture["delivered_frames"] = static_cast<qint64>(metrics.delivered);
     capture["scheduled_frames"] = static_cast<qint64>(metrics.scheduled);
+    capture["prepared_ahead_frames"] = static_cast<qint64>(metrics.preparedAheadFrames);
+    capture["preparation_stage_scope"] =
+        "offscreen stage timings are recorded execution evidence; counterfactual replay does not resimulate decode/render GPU contention or preparation throughput";
     capture["presented_frames"] = static_cast<qint64>(
         metrics.presentedFrames);
     capture["arrival_sequence_first"] = static_cast<qint64>(
@@ -10710,8 +10716,13 @@ int main(int argc, char* argv[])
         metrics.dispositionDropFlagMismatches +=
             (unsignedField(fields, columns.dropped) != 0) !=
                 (disposition != "presented") ? 1 : 0;
+        const bool abandonedAfterDequeue = !rowDecisionValid && dequeueUs != 0 &&
+            (disposition == "shutdown_discard" || disposition == "suspension_discard") &&
+            optionalUnsignedField(fields, columns.queueAccepted) != 0 &&
+            dequeueUs >= pacerArrivalUs &&
+            optionalUnsignedField(fields, columns.terminalTimeUs) >= dequeueUs;
         metrics.dequeueDecisionPresenceMismatches +=
-            ((dequeueUs != 0) != rowDecisionValid ||
+            (((dequeueUs != 0) != rowDecisionValid && !abandonedAfterDequeue) ||
              (decisionUs != 0) != rowDecisionValid) ? 1 : 0;
         const uint64_t recordedSourcePeriodUs = unsignedField(
             fields, columns.sourcePeriodUs);
@@ -10724,7 +10735,7 @@ int main(int argc, char* argv[])
             fields[columns.sourceRateHz] != expectedSourceRateHz ? 1 : 0;
         metrics.decodeToArrivalOrderViolations +=
             decoderOutputUs == 0 || pacerArrivalUs < decoderOutputUs ? 1 : 0;
-        metrics.decodeReadinessOrderViolations +=
+        const bool directReadinessValid =
             vrrDecodeReadinessOrderValid(decoderOutputUs, decodeCompleteUs,
                 pacerArrivalUs, dequeueUs, decisionUs,
                 optionalUnsignedField(fields, columns.decodeSyncWaitUs),
@@ -10735,7 +10746,26 @@ int main(int argc, char* argv[])
                 optionalUnsignedField(fields, columns.capturedParameterColumns.value(
                     QStringLiteral("controller.playout_responsive_buffer"), -1)) >= 4,
                 optionalUnsignedField(fields, columns.capturedParameterColumns.value(
-                    QStringLiteral("controller.playout_source_mapping_decoder_output"), -1)) != 0) ? 0 : 1;
+                    QStringLiteral("controller.playout_source_mapping_decoder_output"), -1)) != 0 ||
+                // Serial-service revision 2 was introduced after the worker
+                // switched to actual post-wait clock readings. Source-map
+                // selection is independent of that timestamp contract.
+                optionalUnsignedField(fields, columns.capturedParameterColumns.value(
+                    QStringLiteral("controller.playout_serial_service_gate"), -1)) >= 2);
+        const auto stageField = [&](const char* name) {
+            return optionalUnsignedField(fields, traceHeader.indexOf(name));
+        };
+        const bool preparedAhead = stageField("prepared_ahead") != 0;
+        metrics.preparedAheadFrames += preparedAhead ? 1 : 0;
+        const bool stageReadinessValid = rowDecisionValid &&
+            optionalUnsignedField(fields, columns.decodeSyncWaitUs) == 0 &&
+            vrrPreparedReadinessOrderValid(decoderOutputUs, pacerArrivalUs,
+                dequeueUs, decisionUs, decodeCompleteUs,
+                stageField("stage_start_us"), stageField("stage_decode_ready_us"),
+                stageField("stage_decode_wait_us"), stageField("stage_render_start_us"),
+                stageField("stage_render_end_us"), stageField("stage_ready_us"));
+        metrics.decodeReadinessOrderViolations +=
+            (preparedAhead ? stageReadinessValid : directReadinessValid) ? 0 : 1;
         metrics.arrivalToDequeueOrderViolations +=
             dequeueUs != 0 && dequeueUs < pacerArrivalUs ? 1 : 0;
         metrics.dequeueToDecisionOrderViolations +=
@@ -12482,7 +12512,8 @@ int main(int argc, char* argv[])
             const bool nonDecisionPayloadValid = std::all_of(
                 std::begin(zeroPayloadColumns),
                 std::end(zeroPayloadColumns),
-                [&fields](int column) {
+                [&fields, &columns, abandonedAfterDequeue](int column) {
+                    if (abandonedAfterDequeue && column == columns.queueDiscontinuity) return true;
                     return column < 0 || fields[column] == "0";
                 });
             metrics.nonDecisionPayloadMismatchRows +=

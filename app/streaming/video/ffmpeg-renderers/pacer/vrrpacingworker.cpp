@@ -89,6 +89,7 @@ constexpr char kTraceHeader[] =
     ",buffer_request_before_us,buffer_request_after_us,buffer_interval_error_us,buffer_lateness_us"
     ",buffer_attempted_increase_us,buffer_clipped_increase_us,buffer_hold_remaining_us,buffer_cooldown_remaining_us"
     ",buffer_calibration_complete,buffer_calibration_samples,buffer_calibration_coverage_us"
+    ",prepared_ahead,stage_start_us,stage_decode_ready_us,stage_decode_wait_us,stage_render_start_us,stage_render_end_us,stage_ready_us"
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
 constexpr uint32_t kVrrWindowStateMask =
@@ -199,6 +200,8 @@ VrrPacingWorker::~VrrPacingWorker()
         m_WorkerThread = nullptr;
     }
 
+    if (m_Presenter) m_Presenter->stopFramePreparation();
+
     discardQueuedFrames(false, TraceDisposition::ShutdownDiscard);
     closeTrace();
     if (m_WorkerStarted && !m_Config.calibrationKey.empty() && !m_CalibrationInvalidated.load()) {
@@ -297,6 +300,8 @@ void VrrPacingWorker::submit(PacedFrame&& frame)
                 m_QueueDiscontinuity.store(true);
             }
             incoming.trace.queueAccepted = true;
+            incoming.preparation = m_Presenter->queueFramePreparation(
+                incoming.frame.frame(), incoming.frame.decodeBoundary());
             m_FrameQueue.emplace_back(std::move(incoming));
             m_FrameQueue.back().trace.queueDepthAfter = m_FrameQueue.size();
             queuedFrame = true;
@@ -402,13 +407,6 @@ int VrrPacingWorker::run()
 
         bool externalRebaseApplied = false;
         uint32_t externalRebaseFlags = 0;
-        if (m_RebaseOnNextFrame) {
-            m_TimingController->rebase();
-            m_RebaseOnNextFrame = false;
-            externalRebaseFlags = m_RebaseOnNextFrameFlags;
-            m_RebaseOnNextFrameFlags = 0;
-            externalRebaseApplied = true;
-        }
         // A local latest-frame queue replacement is not a source epoch
         // change. Frame-number and cumulative RTP movement let the timing
         // controller advance across the omitted frame without throwing away
@@ -419,9 +417,26 @@ int VrrPacingWorker::run()
         // it. Some backends wait here; others queue a GPU dependency and
         // return immediately. Preserve only CPU time actually spent waiting
         // as service telemetry.
-        const uint64_t decodeSyncWaitUs = m_Presenter->waitForDecode(
-            frame.frame(), frame.decodeBoundary());
+        const bool preparedAhead = queuedFrame.preparation &&
+            queuedFrame.preparation->wait([this]() {
+                return isStopping() || m_Suspended.load() ||
+                    m_PendingWindowStateFlags.load() != 0;
+            });
+        if (isStopping() || m_Suspended.load() ||
+                m_PendingWindowStateFlags.load() != 0) {
+            recordFrameCompletion(queuedFrame, VrrTimingDecision{},
+                VrrPresentFeedback{}, FrameTelemetry{},
+                isStopping() ? TraceDisposition::ShutdownDiscard :
+                               TraceDisposition::SuspensionDiscard, false);
+            noteDrop();
+            continue;
+        }
+        const uint64_t decodeSyncWaitUs = preparedAhead ? 0 :
+            m_Presenter->waitForDecode(frame.frame(), frame.decodeBoundary());
         frame.noteDecodeSyncWaitUs(decodeSyncWaitUs);
+        if (preparedAhead) {
+            frame.noteGpuReadyUs(queuedFrame.preparation->timing.decodeReadyUs);
+        }
         if (decodeSyncWaitUs > kDecodeSyncNoticeUs) {
             // This is an upper bound on completion, sampled after the native
             // wait. Adding the wait duration to decoder output is wrong when
@@ -430,10 +445,19 @@ int VrrPacingWorker::run()
             frame.noteGpuReadyUs(LiGetMicroseconds());
         }
 
+        if (m_RebaseOnNextFrame) {
+            m_TimingController->rebase();
+            m_RebaseOnNextFrame = false;
+            externalRebaseFlags = m_RebaseOnNextFrameFlags;
+            m_RebaseOnNextFrameFlags = 0;
+            externalRebaseApplied = true;
+        }
         const uint64_t decisionTimeUs = LiGetMicroseconds();
         VrrTimingDecision decision = m_TimingController->schedule(
             frame, decisionTimeUs);
         FrameTelemetry telemetry;
+        telemetry.preparedAhead = preparedAhead;
+        if (preparedAhead) telemetry.preparationStage = queuedFrame.preparation->timing;
         telemetry.decodeSyncWaitUs = decodeSyncWaitUs;
         telemetry.decisionTimeUs = decisionTimeUs;
         telemetry.decisionEndUs = LiGetMicroseconds();
@@ -550,9 +574,10 @@ int VrrPacingWorker::run()
         presentRequest.collectDiagnostics = m_DeepTraceEnabled;
 
         telemetry.preparationStartUs = LiGetMicroseconds();
-        const VrrPrepareResult preparation =
-            m_Presenter->prepareFrame(frame.frame(), frame.decodeBoundary(),
-                                     presentRequest);
+        const VrrPrepareResult preparation = preparedAhead ?
+            m_Presenter->activatePreparedFrame(queuedFrame.preparation,
+                frame.frame(), frame.decodeBoundary(), presentRequest) :
+            m_Presenter->prepareFrame(frame.frame(), frame.decodeBoundary(), presentRequest);
         telemetry.preparationEndUs = LiGetMicroseconds();
         telemetry.preparationDurationUs =
             telemetry.preparationEndUs >= telemetry.preparationStartUs ?
@@ -835,6 +860,13 @@ int VrrPacingWorker::run()
             sample.queueResidenceUs = positiveDifference(queuedFrame.trace.dequeueUs,
                                                          queuedFrame.trace.arrivalUs);
             sample.decodeWaitUs = telemetry.decodeSyncWaitUs;
+            if (preparedAhead) {
+                const auto& stage = telemetry.preparationStage;
+                sample.decodeWaitUs = stage.decodeWaitUs;
+                sample.queueResidenceUs =
+                    positiveDifference(stage.startUs, queuedFrame.trace.arrivalUs) +
+                    positiveDifference(queuedFrame.trace.dequeueUs, stage.readyUs);
+            }
             sample.bufferUs = decision.playoutDelayUs;
             sample.submissionUs = telemetry.submissionBoundaryUs;
             sample.motionDiscontinuity = decision.rebased || externalRebaseApplied;
@@ -844,10 +876,21 @@ int VrrPacingWorker::run()
                     telemetry.presentEndUs - frame.decoderOutputUs() : 0;
             sample.renderingTimeUs = telemetry.preparationDurationUs +
                 telemetry.presentDurationUs;
+            if (preparedAhead) {
+                sample.renderingTimeUs += positiveDifference(
+                    telemetry.preparationStage.readyUs,
+                    telemetry.preparationStage.renderStartUs);
+            }
             sample.preparationUs = telemetry.preparationDurationUs;
             sample.presentCallUs = telemetry.presentDurationUs;
             sample.gpuReadyWaitUs = gpuReadyWaitUs;
             sample.gpuReadyWaitValid = gpuReadyCompleted;
+            if (preparedAhead) {
+                const auto& stage = telemetry.preparationStage;
+                sample.preparationUs += positiveDifference(stage.readyUs, stage.renderStartUs);
+                sample.gpuReadyWaitUs += positiveDifference(stage.readyUs, stage.renderEndUs);
+                sample.gpuReadyWaitValid = true;
+            }
             sample.latched = decision.latchedPresentation;
             sample.bufferCapUs = decision.playoutDelayMaximumUs;
             sample.gpuReadinessLeadUs = decision.gpuReadinessLeadUs;
@@ -1680,6 +1723,13 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addBool(row.bufferStats.initialCalibrationComplete);
     addUnsigned(row.bufferStats.calibrationSamples);
     addUnsigned(row.bufferStats.calibrationCoverageUs);
+    addUnsigned(row.telemetry.preparedAhead);
+    addUnsigned(row.telemetry.preparationStage.startUs);
+    addUnsigned(row.telemetry.preparationStage.decodeReadyUs);
+    addUnsigned(row.telemetry.preparationStage.decodeWaitUs);
+    addUnsigned(row.telemetry.preparationStage.renderStartUs);
+    addUnsigned(row.telemetry.preparationStage.renderEndUs);
+    addUnsigned(row.telemetry.preparationStage.readyUs);
     line.append('\n');
 
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {

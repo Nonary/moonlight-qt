@@ -147,6 +147,181 @@ PacedFrame frame(int number, TrackedFrameLifetime& lifetime)
                                  lifetime);
 }
 
+class PreparedFramePresenter : public FakeVrrFramePresenter {
+public:
+    struct Ticket : VrrPreparedFrame {
+        explicit Ticket(std::atomic_uint& count) : waits(count) {}
+        bool wait(const std::function<bool()>& interrupted) override
+        {
+            ++waits;
+            return VrrPreparedFrame::wait(interrupted);
+        }
+        std::atomic_uint& waits;
+    };
+    std::vector<std::shared_ptr<VrrPreparedFrame>> tickets;
+    std::atomic_uint activated { 0 };
+    std::atomic_uint waits { 0 };
+    bool automaticCompletion = true;
+    bool stopped = false;
+
+    std::shared_ptr<VrrPreparedFrame> queueFramePreparation(AVFrame* input, uint64_t) override
+    {
+        auto ticket = std::make_shared<Ticket>(waits);
+        ticket->timing.startUs = LiGetMicroseconds();
+        ticket->timing.decodeReadyUs = uint64_t(input->pkt_dts);
+        ticket->timing.renderStartUs = LiGetMicroseconds();
+        ticket->timing.renderEndUs = LiGetMicroseconds();
+        ticket->timing.readyUs = LiGetMicroseconds();
+        tickets.push_back(ticket);
+        if (automaticCompletion) ticket->complete(true);
+        return ticket;
+    }
+    VrrPrepareResult activatePreparedFrame(const std::shared_ptr<VrrPreparedFrame>&,
+        AVFrame* input, uint64_t boundary, const VrrPresentRequest& request) override
+    {
+        ++activated;
+        return prepareFrame(input, boundary, request);
+    }
+    void stopFramePreparation() override { stopped = true; }
+};
+
+void testPreparedFramesOverlapAndTrace()
+{
+    resetFakeClock();
+    QTemporaryDir directory;
+    const QString path = directory.filePath("prepared.vrrtrace");
+    SDL_setenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(path).constData(), 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "1", 1);
+    PreparedFramePresenter backend;
+    backend.blockPreparation();
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime first, second, pending;
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "prepared-frame worker must start");
+        auto a = frame(1, first);
+        a.frame()->pkt_dts = a.decoderOutputUs();
+        worker.submit(std::move(a));
+        expect(backend.waitForPrepareCount(1), "completed stage must activate on the pacing thread");
+        auto b = frame(2, second);
+        b.frame()->pkt_dts = b.decoderOutputUs();
+        worker.submit(std::move(b));
+        expect(backend.tickets.size() == 2 && backend.tickets[1]->wait([] { return false; }),
+               "next image preparation must advance while the pacing thread owns the previous image");
+        backend.releasePreparation();
+        expect(backend.waitForPresentCount(2), "both completed images must be presented");
+        expect(backend.activated == 2 && backend.waitedDecodeBoundaries().empty(),
+               "prepared images must not repeat the decode wait on the pacing thread");
+        backend.automaticCompletion = false;
+        auto c = frame(3, pending);
+        c.frame()->pkt_dts = c.decoderOutputUs();
+        const auto priorWaits = backend.waits.load();
+        worker.submit(std::move(c));
+        expect(waitFor([&] { return backend.waits > priorWaits; }),
+               "shutdown fixture must include a dequeued image awaiting GPU preparation");
+    }
+    expect(backend.stopped && first.releases == 1 && second.releases == 1 && pending.releases == 1,
+           "prepared-frame shutdown must stop preparation and release each image exactly once");
+    const auto lines = readExpandedTrace(path).split('\n');
+    const auto columns = lines.value(0).split(',');
+    int stagedRows = 0;
+    for (int i = 1; i < lines.size(); ++i) {
+        const auto row = lines[i].split(',');
+        if (row.size() != columns.size()) continue;
+        const auto value = [&](const char* name) {
+            return row.value(columns.indexOf(name)).toULongLong();
+        };
+        if (!value("prepared_ahead")) continue;
+        ++stagedRows;
+        expect(value("stage_ready_us") <= value("decision_us") &&
+               value("stage_start_us") >= value("pacer_arrival_us") &&
+               value("decode_sync_wait_us") == 0,
+               "stage timestamps must retain actual overlap without inventing a pacing-thread decode wait");
+    }
+    expect(stagedRows == 2, "each prepared image must retain stage timing in its trace row");
+    const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_PREPARED_TRACE");
+    if (exportPath && exportPath[0]) {
+        QFile::remove(QString::fromLocal8Bit(exportPath));
+        expect(QFile::copy(path, QString::fromLocal8Bit(exportPath)),
+               "prepared-frame fixture must export for exact replay");
+    }
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
+}
+
+void testPreparedFrameCancellationAndBound()
+{
+    resetFakeClock();
+    PreparedFramePresenter backend;
+    backend.automaticCompletion = false;
+    PacerTelemetry telemetry;
+    std::array<TrackedFrameLifetime, 5> lifetimes;
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "pending preparation worker must start");
+        auto first = frame(1, lifetimes[0]);
+        first.frame()->pkt_dts = first.decoderOutputUs();
+        worker.submit(std::move(first));
+        for (int i = 1; i < 5; ++i) {
+            auto input = frame(i + 1, lifetimes[i]);
+            input.frame()->pkt_dts = input.decoderOutputUs();
+            worker.submit(std::move(input));
+        }
+        expect(waitFor([&] { return backend.tickets[0]->cancelled() ||
+                                   backend.tickets[1]->cancelled(); }),
+               "capacity eviction must cancel the corresponding preparation ticket");
+        expect(backend.activated == 0,
+               "an unfinished GPU image must never reach activation or presentation");
+    }
+    expect(backend.stopped, "shutdown must interrupt pending preparation without needing completion");
+    for (const auto& ticket : backend.tickets)
+        expect(ticket->cancelled(), "shutdown must cancel every admitted ticket");
+    for (const auto& lifetime : lifetimes)
+        expect(lifetime.releases == 1, "cancelled preparation must release each admitted frame exactly once");
+}
+
+void testPreparedFrameSuspendAndFallback()
+{
+    for (bool suspend : {false, true}) {
+        resetFakeClock();
+        PreparedFramePresenter backend;
+        backend.automaticCompletion = false;
+        PacerTelemetry telemetry;
+        TrackedFrameLifetime first, second;
+        {
+            VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+            expect(worker.start(), "preparation lifecycle worker must start");
+            auto input = frame(1, first);
+            input.frame()->pkt_dts = input.decoderOutputUs();
+            worker.submit(std::move(input));
+            if (suspend) {
+                WINDOW_STATE_CHANGE_INFO state = {};
+                state.stateChangeFlags = WINDOW_STATE_CHANGE_MINIMIZED;
+                worker.notifyWindowChanged(&state);
+                expect(waitFor([&] { return backend.tickets[0]->cancelled(); }),
+                       "suspension must abandon pending offscreen work without presenting it");
+                backend.automaticCompletion = true;
+                state.stateChangeFlags = WINDOW_STATE_CHANGE_RESTORED;
+                worker.notifyWindowChanged(&state);
+                auto fresh = frame(2, second);
+                fresh.frame()->pkt_dts = fresh.decoderOutputUs();
+                worker.submit(std::move(fresh));
+                expect(backend.waitForPresentCount(1) &&
+                       backend.presentedFrames() == std::vector<int>{2},
+                       "restore must present only a fresh completed image");
+            }
+            else {
+                backend.tickets[0]->complete(false);
+                expect(backend.waitForPresentCount(1) && backend.activated == 0 &&
+                       backend.waitedDecodeBoundaries().size() == 1,
+                       "failed offscreen preparation must safely use the ordinary decode/render path");
+            }
+        }
+        expect(first.releases == 1 && (!suspend || second.releases == 1),
+               "suspension and fallback must preserve exact source ownership");
+    }
+}
+
 void testCapabilityRejection()
 {
     FakeVrrFramePresenter backend;
@@ -2387,6 +2562,9 @@ int main()
         return 1;
     }
 
+    testPreparedFramesOverlapAndTrace();
+    testPreparedFrameCancellationAndBound();
+    testPreparedFrameSuspendAndFallback();
     testCapabilityRejection();
     testPresentationRequestSelectedBeforePreparation();
     testEmptyQueueDoesNotRepeatFrames();

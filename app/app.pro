@@ -394,6 +394,7 @@ libplacebo {
         streaming/video/ffmpeg-renderers/plvk_c.c
     HEADERS += \
         streaming/video/ffmpeg-renderers/plvk.h \
+        streaming/video/ffmpeg-renderers/vrrpreparedframe.h \
         streaming/video/ffmpeg-renderers/plvkpresentation.h \
         streaming/video/ffmpeg-renderers/plvkswapchain.h
     linux {

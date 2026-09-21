@@ -37,6 +37,11 @@ bool vrrDecodeReadinessOrderValid(uint64_t decoderOutputUs, uint64_t readyUs,
                                   bool readinessExcludesQueue = false,
                                   bool readinessUsesPostWaitClock = false);
 
+bool vrrPreparedReadinessOrderValid(uint64_t outputUs, uint64_t arrivalUs,
+    uint64_t dequeueUs, uint64_t decisionUs, uint64_t decodeCompleteUs,
+    uint64_t startUs, uint64_t decodeReadyUs, uint64_t decodeWaitUs,
+    uint64_t renderStartUs, uint64_t renderEndUs, uint64_t readyUs);
+
 enum class VrrRasterPhaseState {
     Unclassified,
     Active,

@@ -22,7 +22,7 @@ extern "C" {
 #include <thread>
 #include <vector>
 
-class FakeVrrFramePresenter final : public IVrrFramePresenter {
+class FakeVrrFramePresenter : public IVrrFramePresenter {
 public:
     bool canLatchAdaptivePresent() const override
     {

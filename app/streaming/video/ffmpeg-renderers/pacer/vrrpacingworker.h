@@ -2,6 +2,7 @@
 
 #include "../../decoder.h"
 #include "../ivrrframepresenter.h"
+#include "../vrrpreparedframe.h"
 #include "pacertelemetry.h"
 #include "vrr/vrrtargetwaiter.h"
 #include "vrr/vrrtypes.h"
@@ -21,9 +22,10 @@
 
 class VrrTimingController;
 
-// The complete greenfield VRR execution path lives in this one worker.  It
-// owns a bounded queue and the renderer context from preparation through
-// presentation; fixed-VSync and unpaced Pacer behavior never enter it.
+// Owns bounded admission, controller state and native presentation. A backend
+// may prepare independent offscreen images through cancellable tickets, but
+// swapchain activation/presentation remains on this worker. Fixed-VSync and
+// unpaced Pacer behavior never enter it.
 class VrrPacingWorker {
 public:
     VrrPacingWorker(IVrrFramePresenter* presenter,
@@ -69,6 +71,12 @@ private:
     struct QueuedFrame {
         PacedFrame frame;
         FrameTraceContext trace;
+        std::shared_ptr<VrrPreparedFrame> preparation;
+
+        QueuedFrame() = default;
+        QueuedFrame(QueuedFrame&&) = default;
+        QueuedFrame& operator=(QueuedFrame&&) = default;
+        ~QueuedFrame() { if (preparation) preparation->cancel(); }
 
         explicit operator bool() const
         {
@@ -77,6 +85,8 @@ private:
     };
 
     struct FrameTelemetry {
+        bool preparedAhead = false;
+        VrrPreparedFrame::Timing preparationStage;
         uint64_t decisionTimeUs = 0;
         uint64_t decisionEndUs = 0;
         bool externalRebaseApplied = false;

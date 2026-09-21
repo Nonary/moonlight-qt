@@ -88,6 +88,20 @@ GPU nanosecond durations from absolute CPU timestamps.
 | source_teardown | 0 | unused |
 | output_status_before_present | presentation ID | 1 = output pending, 0 = complete |
 | present | presentation ID | submission success |
+| stage_render | 0 | offscreen render submission succeeded; begin/end bracket import, rendering and flush |
+| stage_output_ready | 0 | 1 = completed within the bound; begin=render flush completion, end=CPU output-completion observation |
+| stage_copy | 0 | copy/readiness succeeded; pacing-thread copy and its completion wait, or rerender after an output-format change |
+
+For the VAAPI/Mailbox preparation stage, `decode_sync` runs on the preparation
+thread while the pacing thread can hold the preceding frame for its target.
+`stage_output_ready` completes before that frame is scheduled by the pacer.
+The remaining pacing-thread work is swapchain acquisition and a copy whose
+completion is checked before the target wait. Stage rendering uses a separate
+libplacebo renderer; its shader-history callback is not enabled. Do not infer
+missing rendering work from the absence of `shader_history` on this path.
+Main-trace `prepared_ahead` and `stage_*` fields preserve its independent
+timing. Counterfactual replay does not simulate the GPU contention of the new
+stage, even when unchanged-policy exact replay passes.
 
 Surface status is only valid when query VAStatus is success (0). libva defines
 Rendering=1, Displaying=2, Ready=4, Skipped=8. An error is unavailable evidence,

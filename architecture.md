@@ -13,6 +13,12 @@ does not change video timing or replay policy.
 Reference baseline: `06fae71f` (vrr17 branch), plus the client-warning and
 gradual backlog-recovery follow-up described below. This includes source ownership,
 buffer attribution and decode-wait starvation prevention (2026-09-20).
+The 2026-09-21 preparation-stage follow-up is based on `18602b1c`, including
+Gemini's decode-completion source mapping and preparation-on-arrival changes.
+Linux VAAPI/Mailbox now prepares offscreen images independently of the pacing
+thread, as described in section 7.2. Other presentation backends retain their
+existing execution path. This changes execution overlap, not buffer ceilings
+or source cadence policy; physical smoothness still requires a live retest.
 Production now selects serial-service revision 2: the shared interval buffer
 compares workload with intended time over its qualified one-second window,
 rather than treating one slow frame as sustained overload. Deferred D3D GPU
@@ -1211,9 +1217,9 @@ resetting the codec merely because an image was not presented.
    or discontinuous stamps. Record `queue_stale` without a controller decision.
    The sole image remains eligible. Then dequeue the retained frame.
 2. Check stop/suspend state and establish this frame's decode dependency. Record
-   any explicit CPU wait as serial service. Production keeps `decoderOutputUs`
-   as the source-mapping and stale-age boundary even when a later readiness
-   observation exists.
+   any explicit CPU wait as serial service. Production at `18602b1c` maps from
+   decode completion; immutable `decoderOutputUs` remains the full-latency
+   origin. Historical captured parameters can instead select decoder output.
 3. Ask `VrrTimingController::schedule()` for the target, render-start deadline,
    latch request, and diagnostics using the current monotonic time.
 4. Apply stale replacement policy when newer work is available.
@@ -1242,6 +1248,51 @@ resetting the codec merely because an image was not presented.
    the target already issued for this frame.
 12. Trace the outcome and retain/defer frame ownership as required by the presenter.
    Backend source retirement may continue after this worker step.
+
+On Linux VAAPI/Mailbox, after the first ordinary frame establishes the real
+swapchain format, admitted frames also receive cancellable preparation tickets.
+A separate thread performs decode synchronization, source import, rendering
+to an offscreen texture, and output-completion polling. It owns its own
+libplacebo renderer and mapping textures; it never acquires a swapchain image.
+The pacing thread waits for the ticket before scheduling, then acquires the
+swapchain, copies the completed output, verifies that short copy has completed,
+and applies the ordinary target wait. Only after the copy does preparation of
+the next image proceed, preventing its GPU work from delaying that copy.
+
+Tickets refer to the existing three waiting admissions plus the active image;
+they do not add another playout queue. Eviction and lifecycle discard cancel
+the corresponding ticket. The preparation queue is independently bounded to
+three pending jobs and one running job. Completed textures are reused. A
+cancelled job that already submitted GPU work retains its source mapping until
+the output completes; a timeout/error drains outstanding GPU work before
+unmapping. Shutdown interrupts ticket waits and joins preparation before
+renderer destruction. An output-size, representation, or colorspace mismatch
+rerenders the same source into the current swapchain instead of displaying an
+image encoded for the old output. Unsupported formats retain the existing path.
+
+The main trace appends `prepared_ahead` and `stage_*` fields to schema 5. Stage
+decode, render-command, and output-ready boundaries precede the scheduling
+decision and may precede pacing dequeue. The recorded pacing-thread decode wait
+remains zero for these frames. Aggregate statistics include actual stage decode
+wait and rendering service rather than counting them as queue residence.
+The GPU sidecar adds `stage_render` and `stage_output_ready` spans. The latter
+is a CPU completion observation, not a GPU execution timestamp or scanout proof.
+Replay validates stage ordering independently of direct-worker readiness.
+For direct-worker captures, serial-service revision 2 identifies post-wait
+clock semantics independently of the source-mapping selection, fixing the
+false exact-baseline rejection after Gemini restored decode-anchored mapping.
+Counterfactual replay retains recorded stage readiness; it cannot predict
+how changing GPU scheduling changes stage throughput or compositor service.
+
+Preparation-stage validation (2026-09-21): the native incremental release and
+offscreen startup help pass, as do eleven deterministic VRR/backend/profile/GPU
+trace suites. Nine exact replay checks pass, including prepared-frame shutdown
+while awaiting completion and the latest pre-change live capture
+`20260920-231030-28049`. The signed playout-offset parser and direct readiness
+clock audit were corrected without bypassing exactness checks. Evidence is in
+`build/prepared-stage-validation/`. These tests do not exercise the complete
+new GPU path in gameplay or establish lower physical judder; a matched live
+capture is still required. No Windows build or ChaseShare deployment was made.
 
 For performance reporting, the worker keeps the decoder-output timestamp
 unchanged through this sequence. On a successful presentation it records the

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ivrrframepresenter.h"
+#include "vrrpreparedframe.h"
 #include "renderer.h"
 
 #ifdef Q_OS_WIN32
@@ -15,6 +16,8 @@
 
 #include <atomic>
 #include <deque>
+#include <QMutex>
+#include <QWaitCondition>
 
 #ifdef Q_OS_LINUX
 #include "vulkantiming.h"
@@ -64,6 +67,10 @@ public:
     virtual VrrFallbackReason checkSupport() const override;
     virtual bool canLatchAdaptivePresent() const override;
     virtual uint64_t waitForDecode(AVFrame* frame) override;
+    std::shared_ptr<VrrPreparedFrame> queueFramePreparation(AVFrame*, uint64_t) override;
+    VrrPrepareResult activatePreparedFrame(const std::shared_ptr<VrrPreparedFrame>&,
+        AVFrame*, uint64_t, const VrrPresentRequest&) override;
+    void stopFramePreparation() override;
     GpuTrace* gpuDiagnosticTrace() override { return m_GpuTrace.get(); }
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
                                           uint64_t decodeBoundary) override;
@@ -92,6 +99,8 @@ private:
     static void unlockQueue(AVHWDeviceContext *dev_ctx, uint32_t queue_family, uint32_t index);
     static void overlayUploadComplete(void* opaque);
     static void gpuRenderInfo(void* opaque, const pl_render_info* info);
+    bool renderMappedImage(pl_renderer renderer, const pl_frame& source,
+                           pl_frame target, const pl_render_params& params);
     std::unique_ptr<GpuTrace> m_GpuTrace;
     int64_t m_GpuTracePts = -1;
     uint64_t m_GpuTraceOutputUs = 0;
@@ -117,7 +126,8 @@ private:
 
     bool createSwapchain(int depth);
     bool createOverlay(pl_overlay* overlay, SDL_Surface* surface);
-    bool mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
+    bool mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFrame,
+                            pl_tex* textures = nullptr);
     void unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
     bool populateQueues(int videoFormat);
     bool chooseVulkanDevice(PDECODER_PARAMETERS params, bool hdrOutputRequired);
@@ -160,6 +170,28 @@ private:
     pl_tex m_Textures[PL_MAX_PLANES] = {};
     pl_color_space m_LastColorspace = {};
 
+#ifdef Q_OS_LINUX
+    struct PreparedImage;
+    static int preparationThreadProc(void* opaque);
+    void prepareImage(const std::shared_ptr<PreparedImage>& image);
+    void updatePreparationTarget();
+    QMutex m_PreparationLock;
+    QWaitCondition m_PreparationChanged;
+    std::deque<std::shared_ptr<PreparedImage>> m_PreparationQueue;
+    std::shared_ptr<PreparedImage> m_PreparingImage;
+    SDL_Thread* m_PreparationThread = nullptr;
+    bool m_PreparationStopping = false;
+    bool m_PreparationTargetValid = false;
+    pl_swapchain_frame m_PreparationTarget = {};
+    pl_tex_params m_PreparationTextureParams = {};
+    pl_renderer m_PreparationRenderer = nullptr;
+    pl_tex m_PreparationTextures[PL_MAX_PLANES] = {};
+    std::vector<pl_tex> m_PreparationFreeTextures;
+    // The ordinary renderer can still handle an incompatible output epoch.
+    // Serialize the shared overlay snapshot while either renderer records it.
+    QMutex m_ImageRenderLock;
+#endif
+
 #ifdef PLVK_USE_EARLY_RENDER_TO_WAIT
     pl_overlay m_EmptyOverlay = {};
     pl_overlay_part m_EmptyOverlayPart = {};
@@ -177,7 +209,7 @@ private:
     // abandons a prepared image before resizing the swapchain.
     bool m_VrrRequested = false;
     bool m_VrrSuspended = false;
-    VrrFallbackReason m_VrrFallbackReason = VrrFallbackReason::InitializationFailed;
+    std::atomic<VrrFallbackReason> m_VrrFallbackReason { VrrFallbackReason::InitializationFailed };
     std::atomic<bool> m_VrrWindowChangePending { false };
     bool m_VrrPreparingFrame = false;
     bool m_VrrFramePrepared = false;

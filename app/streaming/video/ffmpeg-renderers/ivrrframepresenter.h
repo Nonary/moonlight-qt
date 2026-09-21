@@ -1,9 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include "pacer/vrr/presentationtiming.h"
 
 struct AVFrame;
+class VrrPreparedFrame;
 
 // Renderer-facing VRR contract. Pacing timestamps and sender metadata never
 // cross this boundary: the presenter only prepares, adaptively presents, or
@@ -302,6 +304,25 @@ struct VrrPrepareResult {
 class IVrrFramePresenter {
 public:
     virtual ~IVrrFramePresenter() = default;
+
+    // Optional bounded offscreen preparation. Called by the decoder producer;
+    // must only enqueue work, never wait for rendering or acquire a swapchain.
+    virtual std::shared_ptr<VrrPreparedFrame> queueFramePreparation(AVFrame*, uint64_t)
+    {
+        return {};
+    }
+
+    // Called on the pacing thread after a successful ticket wait. Backends
+    // must revalidate the current output format/epoch before using the image.
+    virtual VrrPrepareResult activatePreparedFrame(
+        const std::shared_ptr<VrrPreparedFrame>&, AVFrame* frame,
+        uint64_t decodeBoundary, const VrrPresentRequest& request)
+    {
+        return prepareFrame(frame, decodeBoundary, request);
+    }
+
+    // Join preparation before renderer teardown. Must also cancel queued work.
+    virtual void stopFramePreparation() {}
 
     // Some backends select native protection per present; persistent Vulkan
     // Mailbox already provides it. Vulkan Immediate/FIFO return false and keep

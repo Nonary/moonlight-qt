@@ -71,9 +71,8 @@ public:
         return m_Frame.release();
     }
 
-    // Preserve the historical decode-complete boundary for trace replay and
-    // completion diagnostics. Production source-clock mapping uses immutable
-    // decoder output instead.
+    // Preserve the decode-complete boundary independently of decoder output.
+    // Captured controller policy selects which boundary anchors source time.
     void noteGpuReadyUs(uint64_t gpuReadyUs)
     {
         if (gpuReadyUs > m_DecodeCompleteUs) {
