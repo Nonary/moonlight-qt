@@ -997,7 +997,8 @@ bool PlVkRenderer::canLatchAdaptivePresent() const
 {
 #ifdef Q_OS_LINUX
     return m_VrrRequested && m_VrrFallbackReason == VrrFallbackReason::NoFallback &&
-        plVkPersistentPresentModeProvidesLatchProtection(m_VrrAdaptivePresentMode);
+        plVkPersistentPresentModeProvidesLatchProtection(m_VrrAdaptivePresentMode,
+            isGamescopeWsiPresentation(SDL_GetCurrentVideoDriver()));
 #else
     return false;
 #endif

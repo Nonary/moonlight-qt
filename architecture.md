@@ -5,6 +5,25 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
+Moonmachine buffer correction (2026-09-21, on `1ccefb6e`): live sessions
+use responsive-buffer revision 9. Interval quality still reports all submission
+errors. Input buffering is retained only for fresh error attributable to a frame
+that was not ready by its deadline. Historical quality-score debt and display or
+scheduler jitter alone no longer restart the release hold. Readiness for this
+purpose is decoder readiness plus measured preparation work, excluding intentional
+waiting, swapchain acquisition and GPU-readiness waits. The existing hold times,
+release rates, minimums and caps are unchanged. Revisions 7 and 8 retain their
+historical behavior for replay. Clean-release time accumulates across observed
+adjacent intervals; a skipped frame contributes no time and clears interval
+comparison history, but does not erase previously observed clean time. A fresh
+readiness miss restarts the hold. Display feedback remains diagnostic.
+
+Gamescope WSI FIFO is now recognized as protected presentation. Its internal
+driver swapchain uses Mailbox while Gamescope enforces FIFO progress. It must not
+also receive the Immediate-mode software spacing floor: at 120 Hz that floor
+can limit a 116 FPS source to about 115.4 submissions per second. Ordinary FIFO,
+Immediate and relaxed FIFO retain their existing capability rules.
+
 Source baseline: `fb8bf9e7` plus only the D3D11 4K binding eligibility change
 (2026-09-17). Single-device streams at least 3840x2160 bind instead of copying
 when Feature Level 11.1+ or D3D11 fences are available. Existing Intel and

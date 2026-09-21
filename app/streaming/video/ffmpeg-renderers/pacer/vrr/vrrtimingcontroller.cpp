@@ -170,7 +170,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutPredictionOnly = 1;
     // Every normal VRR session uses the interval-quality queue. Historical
     // policies remain selectable only through explicit diagnostic parameters.
-    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 7;
+    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 9;
     // Retain earned protection between bursts instead of repeatedly shedding
     // it and reacquiring it. Explicit captured values preserve older release.
     parameters.playoutMeanMissHoldUs = latencyMode == 2 ? 6000000 : latencyMode == 1 ? 8000000 : 10000000;
@@ -1742,7 +1742,12 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
     if (m_Parameters.playoutResponsiveBuffer >= 5) {
         const auto& p = m_Pending.prediction;
         const auto work = saturatingAdd(m_Pending.preparationDurationUs, m_Pending.renderSchedulerUs);
-        const auto ready = m_Pending.preparationCompleteUs ? m_Pending.preparationCompleteUs : saturatingAdd(p.decoded, work);
+        // A later intentional preparation start must not look like input jitter.
+        // Acquisition and GPU readiness waits already have their own controls;
+        // they are removed from work by notePreparationDuration().
+        const auto ready = m_Parameters.playoutResponsiveBuffer >= 9 ?
+            saturatingAdd(p.decoded, work) :
+            m_Pending.preparationCompleteUs ? m_Pending.preparationCompleteUs : saturatingAdd(p.decoded, work);
         const auto deadline = m_Pending.smoothness.intended;
         if (m_Parameters.playoutResponsiveBuffer >= 6) {
             m_IntervalBuffer.observe({m_Pending.smoothness.frame, m_Pending.intervalIntendedUs,
@@ -1753,7 +1758,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutMeanMissHoldUs, m_Parameters.playoutMeanMissReleaseUsPerSecond,
                 m_Parameters.playoutResponsiveBuffer >= 7, m_Parameters.playoutOnTimeTargetPerMillion,
                 intervalQualityToleranceUs(m_Parameters),
-                intervalQualityWindowUs(m_Parameters));
+                intervalQualityWindowUs(m_Parameters),
+                m_Parameters.playoutResponsiveBuffer >= 9);
         }
         else m_MeanMissBuffer.observe(submissionUs, ready > deadline ? ready - deadline : 0,
             p.applied, submitted && !cancelled && m_Pending.hasPreparationDuration &&

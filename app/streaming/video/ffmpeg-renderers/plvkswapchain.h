@@ -5,10 +5,13 @@
 // Mailbox already waits for a display opportunity and replaces stale queued
 // images instead of tearing. It can therefore satisfy a protected latch
 // request without adding the controller's software spacing floor. Immediate
-// and FIFO cannot provide this fallback: Immediate may tear, while FIFO can
-// accumulate queued frames.
+// cannot provide this fallback. Ordinary FIFO may accumulate queued frames,
+// but Gamescope WSI implements its FIFO contract with a Mailbox driver
+// swapchain and compositor synchronization. Adding the software floor there
+// can itself create a backlog below the physical refresh rate.
 inline bool plVkPersistentPresentModeProvidesLatchProtection(
-    VkPresentModeKHR mode)
+    VkPresentModeKHR mode, bool gamescopeWsi = false)
 {
-    return mode == VK_PRESENT_MODE_MAILBOX_KHR;
+    return mode == VK_PRESENT_MODE_MAILBOX_KHR ||
+        (gamescopeWsi && mode == VK_PRESENT_MODE_FIFO_KHR);
 }

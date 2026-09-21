@@ -4579,7 +4579,7 @@ void testPresetReadinessTargets()
         const auto policy = vrrTimingParametersForSession(session);
         const uint64_t target = mode == 2 ? 990000 : mode == 1 ? 995000 : 999900;
         const uint64_t window = mode == 2 ? 60000000 : mode == 1 ? 120000000 : 300000000;
-        expect(policy.playoutResponsiveBuffer == 7 &&
+        expect(policy.playoutResponsiveBuffer == 9 &&
                    policy.playoutOnTimeTargetPerMillion == target &&
                    policy.playoutReadinessWindowUs == window,
                "presets must resolve their exact reliability target and bounded history");
@@ -4693,7 +4693,7 @@ void testMeanMissBuffer()
         auto session = config(116, 120);
         session.latencyMode = mode;
         const auto policy = vrrTimingParametersForSession(session);
-        expect(policy.playoutResponsiveBuffer == 7 &&
+        expect(policy.playoutResponsiveBuffer == 9 &&
             policy.playoutMeanMissHoldUs == (mode == 2 ? 6000000 : mode == 1 ? 8000000 : 10000000) &&
             policy.playoutMeanMissReleaseUsPerSecond == (mode == 0 ? 50 : mode == 2 ? 125 : 100),
             "every preset must select the production interval queue and record its release policy");
@@ -4753,8 +4753,82 @@ void testIntervalQualityUsesPresetHistory()
            "the active quality score must retain the selected preset history duration");
 }
 
+void testIntentionalPreparationWaitDoesNotInflateBuffer()
+{
+    const auto session = config(100, 120);
+    const auto policy = vrrTimingParametersForSession(session);
+    VrrTimingController early(session, true, policy);
+    VrrTimingController deferred(session, true, policy);
+    for (int i = 0; i < 12000; ++i) {
+        const uint32_t rtp = uint32_t(i * 900);
+        const uint64_t decoded = decodedTimeForRtp(1000000, rtp);
+        const auto a = early.schedule(frame(i, rtp, true, decoded), decoded);
+        const auto b = deferred.schedule(frame(i, rtp, true, decoded), decoded);
+        expect(a.playoutDelayUs == b.playoutDelayUs,
+               "intentional preparation scheduling must not change input-buffer demand");
+        const uint64_t completed = std::max(a.targetUs, decoded + 1000) + (i % 2 ? 2000 : 0);
+        early.notePreparationDuration(1000, 0, decoded + 1000);
+        deferred.notePreparationDuration(1000, 0, completed);
+        early.noteSubmission(true, false, completed);
+        deferred.noteSubmission(true, false, completed);
+    }
+}
+
+void testReadinessAttributedRelease()
+{
+    for (bool causalRelease : {false, true}) {
+        Vrr13::IntervalBuffer buffer;
+        uint64_t applied = 6000;
+        // A slow display's alternating submission delay lowers the reported
+        // quality, despite every input frame being ready before its deadline.
+        for (uint64_t i = 1; i <= 12000; ++i) {
+            const uint64_t intended = 1000000 + i * 10000;
+            const uint64_t deadline = intended + applied;
+            buffer.observe({i, intended, intended + (i % 2 ? 2000 : 0),
+                deadline, intended - 1000, applied, true, true},
+                1000, 16000, 8000000, 100, true, 995000, 500, 120000000, causalRelease);
+            applied = buffer.demand(applied);
+        }
+        expect(buffer.stats().qualityPercent() < 99.5,
+            "unrelated display jitter must remain visible in the quality score");
+        expect(causalRelease ? applied == 1000 : applied == 6000,
+            "timely inputs must release old protection despite non-readiness score debt; replay retains the old policy");
+    }
+    Vrr13::IntervalBuffer interrupted;
+    uint64_t interruptedApplied = 6000;
+    for (uint64_t i = 1; i <= 12000; ++i) {
+        const uint64_t intended = 1000000 + i * 10000;
+        interrupted.observe({i + i / 100, intended, intended,
+            intended + interruptedApplied, intended - 1000,
+            interruptedApplied, true, true},
+            1000, 16000, 8000000, 100, true, 995000, 500, 120000000, true);
+        interruptedApplied = interrupted.demand(interruptedApplied);
+    }
+    expect(interruptedApplied == 1000,
+        "occasional skipped frames must not erase accumulated clean release evidence");
+    Vrr13::IntervalBuffer buffer;
+    uint64_t applied = 1000;
+    for (uint64_t i = 1; i <= 2000; ++i) {
+        const uint64_t intended = 1000000 + i * 10000;
+        const uint64_t ready = intended + (i % 2 ? 5000 : 0);
+        buffer.observe({i, intended, std::max(intended + applied, ready),
+            intended + applied, ready, applied, true, true},
+            1000, 8000, 8000000, 100, true, 995000, 500, 120000000, true);
+        applied = buffer.demand(applied);
+    }
+    expect(applied > 1000 && applied <= 8000,
+        "genuine readiness jitter must still acquire bounded protection");
+    const auto beforeGap = applied;
+    buffer.observe({3000, 100000000, 100000000, 100000000, 99000000,
+        applied, true, true}, 1000, 8000, 8000000, 100, true, 995000, 500, 120000000, true);
+    expect(buffer.demand(applied) == beforeGap,
+        "an unobserved gap must not count as clean release time");
+}
+
 int main()
 {
+    testIntentionalPreparationWaitDoesNotInflateBuffer();
+    testReadinessAttributedRelease();
     testIntervalQualityBuffer();
     testIntervalQualityUsesPresetHistory();
     testPresetIntervalTolerances();

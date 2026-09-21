@@ -37,7 +37,8 @@ public:
                  uint64_t hold, uint64_t releaseRate,
                  bool severityWeighted = false, uint64_t targetPerMillion = 990000,
         uint64_t toleranceUs = 500,
-                 uint64_t scoreWindowUs = 30000000) {
+                 uint64_t scoreWindowUs = 30000000,
+                 bool attributableRelease = false) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.severityWeighted = severityWeighted;
         minimum = std::min(minimum, maximum);
@@ -70,6 +71,29 @@ public:
         }
         m_Stats.averageErrorUs = samples ? double(total) / samples : 0;
         m_Stats.averageValid = samples >= 2 && s.submitted - m_First >= 1000000;
+        const auto& delayed = actual >= intended ? s : previous;
+        const auto lateness = delayed.ready > delayed.deadline ? delayed.ready - delayed.deadline : 0;
+        const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
+        const bool readinessPressure = freshError && delayed.absorbable && lateness;
+        if (attributableRelease) {
+            if (readinessPressure) {
+                m_CleanReleaseUs = m_ReleaseFraction = 0;
+            }
+            else if (s.absorbable) {
+                // Count observed adjacent intervals, not wall time. A skipped
+                // frame cannot prove a clean interval, but must not erase all
+                // the clean evidence collected before it either.
+                const auto observed = std::min<uint64_t>(actual, 100000);
+                m_CleanReleaseUs += observed;
+                const auto releasable = m_CleanReleaseUs > hold ?
+                    std::min(observed, m_CleanReleaseUs - hold) : 0;
+                m_ReleaseFraction += releasable * releaseRate;
+                const auto release = m_ReleaseFraction / 1000000;
+                m_ReleaseFraction %= 1000000;
+                m_Target -= std::min(m_Target - minimum, release);
+                m_CleanReleaseUs = std::min(m_CleanReleaseUs, hold);
+            }
+        }
         if (!m_Stats.averageValid) return;
         const bool pressure = total > samples * toleranceUs;
         // Weight the score by evaluated time, not frame rate. Attribute the
@@ -89,16 +113,15 @@ public:
         const double allowedLoss = (1000000 - std::min<uint64_t>(targetPerMillion, 1000000)) / 1000000.0;
         const bool belowTarget = m_Stats.lossFraction() > allowedLoss;
         const bool currentPressure = severityWeighted ? loss > allowedLoss : pressure;
-        // Old score debt holds protection, but cannot authorize another attack
-        // without current, attributable error outside the preset's allowance.
-        const bool holdProtection = currentPressure || (severityWeighted && belowTarget);
+        // Historical policies held protection for total quality-score debt.
+        // Revision 9 retains it only for fresh readiness misses.
+        const bool holdProtection = attributableRelease ?
+            readinessPressure :
+            currentPressure || (severityWeighted && belowTarget);
         if (holdProtection) {
             m_LastPressure = s.submitted;
             if (severityWeighted) m_ReleaseFraction = 0;
         }
-        const auto& delayed = actual >= intended ? s : previous;
-        const auto lateness = delayed.ready > delayed.deadline ? delayed.ready - delayed.deadline : 0;
-        const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
         const bool grow = currentPressure && (!severityWeighted || belowTarget);
         if (grow && freshError && delayed.absorbable && lateness &&
                 (!m_LastAttack || s.submitted - m_LastAttack >= 250000)) {
@@ -113,7 +136,7 @@ public:
             m_LastAttack = s.submitted;
             m_ReleaseFraction = 0;
         }
-        else if (!holdProtection && s.absorbable && s.submitted - m_First >= hold &&
+        else if (!attributableRelease && !holdProtection && s.absorbable && s.submitted - m_First >= hold &&
                 (!m_LastPressure || s.submitted - m_LastPressure >= hold)) {
             m_ReleaseFraction += std::min<uint64_t>(actual, 100000) * releaseRate;
             const auto release = m_ReleaseFraction / 1000000;
@@ -154,6 +177,7 @@ private:
     std::vector<ScoreBucket> m_Score = std::vector<ScoreBucket>(MaximumScoreBuckets);
     Sample m_Previous;
     Stats m_Stats;
+    uint64_t m_CleanReleaseUs = 0;
     uint64_t m_Target = 0, m_First = 0, m_LastAttack = 0, m_LastPressure = 0, m_ReleaseFraction = 0;
     bool m_HavePrevious = false, m_Initialized = false;
 };

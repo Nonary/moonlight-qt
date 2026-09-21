@@ -25,5 +25,14 @@ int main()
                VK_PRESENT_MODE_FIFO_KHR),
            "persistent FIFO must not claim adaptive latch protection");
 
+    expect(plVkPersistentPresentModeProvidesLatchProtection(
+               VK_PRESENT_MODE_FIFO_KHR, true),
+           "Gamescope WSI FIFO must use compositor synchronization without a software floor");
+    expect(!plVkPersistentPresentModeProvidesLatchProtection(
+               VK_PRESENT_MODE_IMMEDIATE_KHR, true),
+           "Gamescope WSI identity alone must not make Immediate protected");
+    expect(!plVkPersistentPresentModeProvidesLatchProtection(
+               VK_PRESENT_MODE_FIFO_RELAXED_KHR, true),
+           "relaxed FIFO can tear and must not acquire latch protection");
     return failures ? 1 : 0;
 }
