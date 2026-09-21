@@ -1085,8 +1085,8 @@ successful IDR completion establishes valid reference state.
 | `receiveTimeUs` | Client monotonic microseconds | First packet arrival for the frame. Not host capture time. |
 | `enqueueTimeUs` / reassembled time | Client monotonic microseconds | Complete compressed frame assembled/queued. |
 | `decodeSubmitUs` | Client monotonic microseconds | Sampled immediately before FFmpeg packet submission. |
-| `decoderOutputUs` | Client monotonic microseconds | Immutable timestamp captured immediately when FFmpeg returns the decoded frame; production RTP-to-client mapping and client-processing reporting origin. |
-| `decodeCompleteUs` | Client monotonic microseconds | Conservative post-output readiness observation retained for historical policies. A material blocking wait advances it to the post-wait clock; production source mapping does not use it. |
+| `decoderOutputUs` | Client monotonic microseconds | Immutable timestamp captured immediately when FFmpeg returns the decoded frame; client-processing reporting origin. |
+| `decodeCompleteUs` | Client monotonic microseconds | Post-output readiness observation; anchors production RTP-to-client mapping so hardware decode duration is absorbed in the sender offset. |
 | `decodeSyncWaitUs` | Elapsed client microseconds | Explicit CPU time spent by the worker on a decoder/backend completion primitive. It is serial service and latency accounting, not a source-clock timestamp. A zero value does not exclude a GPU-queued dependency. |
 | Worker queue, decision, preparation, wait, submission times | Client monotonic microseconds | Distinct CPU-side lifecycle boundaries. |
 | Shared fence values | GPU ordering identities | Establish dependencies/completion; not elapsed time by themselves. |
@@ -1306,9 +1306,11 @@ delay. Both Linux and Windows use the revision-7 interval policy: client-added
 submission-interval error triggers growth only with attributable late work that
 can fit its intended interval. The older thresholded-event policy is disabled
 with `playout_readiness_hitch_threshold_us=0`. Native-hitch adaptation is disabled.
-Production also selects immutable decoder-output source mapping, a gate that
-checks complete serial service for absorbability, and release governed by recent
-pressure. Their
+Production restores VRR14 timeline mapping anchored to decode completion (`playout_source_mapping_decoder_output=0`),
+absorbing hardware decode duration into the sender offset instead of inflating client buffer delay.
+It also restores VRR14 preparation scheduling (`playout_prepare_on_arrival=0`, `render_start_after_submission_us=6000`),
+avoiding swapchain acquisition contention while letting spacing yield to the learned preparation lead.
+A gate checks complete serial service for absorbability, and release is governed by recent pressure. Their
 zero initializer values preserve historical replay when captures omit them.
 The latency presets set independent caps; per-frame native slot protection
 remains enabled.
@@ -1316,7 +1318,7 @@ Display smoothness feedback remains diagnostic. Historical Linux thresholded
 submission-error attribution is retained for replay; live revision 7 uses the
 shared interval policy described above.
 Historical feedback policies remain selectable for exact replay.
-It disables the retired metronome and enables preparation on arrival.
+It disables the retired metronome.
 It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 
 | Production input | Value / meaning |
@@ -1328,7 +1330,7 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | Maximum-period ratio | 0; source-rate reduction cannot expand the absolute ceiling |
 | Initial interval calibration | At least 500 ms and 32 consecutive valid intervals; once per controller reset, not once per FPS change |
 | Interval requalification after a break | One second and at least two valid intervals, after initial calibration has completed |
-| Production source mapping | Immutable decoder output (`playout_source_mapping_decoder_output=1`); worker/backend waits remain local service |
+| Production source mapping | Decode completion (`playout_source_mapping_decoder_output=0`); absorbs hardware decode duration into the timeline offset |
 | Live interval-buffer attack | Request at most 250 us per 250 ms; apply at most 125 us per frame, with current quality pressure, fresh readiness-attributed error, and serial service plus decoder queue each no longer than the actual intended interval |
 | Live interval-buffer release | 125/250/50 us per second after 6/8/10-second clean holds for Low Latency/Balanced Target/Smooth; recent pressure owns the hold, while long score debt remains reporting/attack evidence |
 | Historical readiness attack/release inputs | 500 us attack and 10 us release; not the live revision-7 growth/release rule |
@@ -1340,7 +1342,7 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | Smoothing period EMA | 25 per mille with fractional carry; active only with smoothing enabled |
 | Positive smoothing lag cap | 2,000 us; active only with smoothing enabled |
 | Render lead floor | 3,000 us |
-| Preparation start | Use the existing playout interval (`playout_prepare_on_arrival=1`), with no additional post-submission delay |
+| Preparation start | VRR14 scheduling (`playout_prepare_on_arrival=0`, `render_start_after_submission_us=6000`); spacing yields to the learned lead and does not move the target |
 | Minimum preparation lead input | 2,500 us |
 | Future-offset reseed requirement | 3 consecutive qualifying projections |
 
@@ -2032,8 +2034,8 @@ output as proof of GPU completion.
 
 Hardware Vulkan preparation retains the mapped `pl_frame`, including libplacebo's
 AVFrame reference and imported source textures, until their GPU reads finish.
-VAAPI Mailbox output is submitted asynchronously: libplacebo transitions the output
-image, signals a render-complete semaphore, and supplies it to
+Retained hardware output is submitted asynchronously in every presentation mode:
+libplacebo transitions the output image, signals a render-complete semaphore, and supplies it to
 `vkQueuePresentKHR`. CPU completion is not required for this handoff. Preparation,
 presentation and cancellation retire idle source mappings and preparation reports
 `sourceFrameReusable=true` only when no retained mapping remains. This releases
@@ -2051,16 +2053,15 @@ versus 99.67% / 117.37 FPS at 57 Mbps, both Smooth without concurrent capture.
 After 20 seconds from the first arrival, high-bitrate presented frames averaged 9.559 ms of serial
 decode-wait + preparation + submission service against an 8.333 ms period.
 
-The new asynchronous VAAPI path pairs source retention and the corrected stale
-policy with early preparation. It retains at most two source mappings, applies
-bounded retirement backpressure before acquiring another swapchain image, and
+The updated path pairs asynchronous retained-hardware output and the corrected stale
+policy with VRR14 preparation scheduling. It retains up to four source mappings to
+prevent capacity stalls, applies bounded retirement backpressure before acquiring another swapchain image, and
 never calls an unavailable output-completion sample a zero-duration completion.
-Immediate presentation keeps the CPU completion check because GPU-delayed flips
-could otherwise bunch despite correctly spaced CPU submissions. Other modes,
-software and other imports keep the 50 ms / 100,000-observation output-poll bound.
-D3D11 fence/event fields remain unset on Vulkan rows. The reduced CPU service
-and improved submission score expected from this change do not establish actual
-display cadence; a new high-bitrate live run is required.
+Immediate presentation now follows VRR14 and omits that CPU completion check
+when the source mapping is retained. GPU-delayed flips may still bunch despite
+correctly spaced CPU submissions. Software and unretained imports keep the 50 ms / 100,000-observation output-poll bound.
+D3D11 fence/event fields remain unset on Vulkan rows. Windows explicitly flushes the decoder context
+after signaling its cross-device boundary, so dispatch does not depend on a later input frame.
 
 The selected adaptive mode remains immutable for the lifetime of one persistent
 swapchain. Per-frame controller requests never destroy or recreate that chain.

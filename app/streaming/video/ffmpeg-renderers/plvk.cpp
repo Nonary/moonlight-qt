@@ -81,10 +81,9 @@ namespace {
 // invitation to hold the pacer indefinitely.
 constexpr uint64_t kVulkanGpuReadyTimeoutUs = 50000;
 constexpr unsigned int kVulkanGpuReadyPollLimit = 100000;
-// PACER_MAX_OUTSTANDING_FRAMES reserves two decoder surfaces beyond its
-// three-frame queue for the worker/current backend lifetime. Do not retain a
-// third source here or the asynchronous path can exhaust that allowance.
-constexpr size_t kVulkanRetainedSourceFrameLimit = 2;
+// Allow up to four retained source frames in flight on the GPU to prevent
+// capacity stalls during high frame rates, while bounding memory usage.
+constexpr size_t kVulkanRetainedSourceFrameLimit = 4;
 #endif
 
 const char* vulkanPresentModeName(VkPresentModeKHR mode)
@@ -1838,22 +1837,23 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
     }
 
 #ifdef Q_OS_LINUX
-    // VAAPI readiness was established before mapping, and the mapped source
-    // remains owned until its Vulkan reads retire. libplacebo's swapchain
+    // Restore VRR14's asynchronous hardware-render handoff. Decode readiness
+    // is established by the import path, and a retained mapped source remains
+    // owned until its Vulkan reads retire. libplacebo's swapchain
     // submission signals a render-complete semaphore that vkQueuePresentKHR
     // waits on; a CPU output wait is not needed for this handoff. Avoid
-    // serializing that wait with the next frame's vaSyncSurface(). The shared
-    // controller prepares on arrival so the GPU gets the existing target hold
-    // even when this path has no CPU completion sample to train a render lead.
-    // Mailbox provides native latch protection. Immediate still needs the
-    // completion check: a late GPU render must not bunch actual flips behind
-    // correctly spaced CPU submissions. Other imports/software keep it too.
-    const bool asynchronousVaapiSource =
-        frame->format == AV_PIX_FMT_VAAPI && m_VrrCurrentSourceRetained &&
-        canLatchAdaptivePresent();
+    // serializing that wait with the next frame's vaSyncSurface(). Rendering
+    // executes during the remaining target hold, using VRR14's render-start
+    // scheduling and the current controller's preserved preparation lead.
+    // The render-complete semaphore applies to every presentation mode, not
+    // just Mailbox. As in VRR14, CPU submission spacing is not proof of GPU
+    // completion or physical flip spacing. Keep the software/import fallback
+    // when no mapped source was retained; it must not release backing storage
+    // while GPU reads are outstanding.
+    const bool asynchronousHardwareSource = m_VrrCurrentSourceRetained;
     if (m_GpuTrace) m_GpuTrace->record({"output_wait_mode", m_GpuTracePts, m_GpuTraceOutputUs,
-        flushEndUs, flushEndUs, 0, asynchronousVaapiSource});
-    if (!asynchronousVaapiSource && !waitForVrrGpuReady(result.feedback)) {
+        flushEndUs, flushEndUs, 0, asynchronousHardwareSource});
+    if (!asynchronousHardwareSource && !waitForVrrGpuReady(result.feedback)) {
         m_VrrGpuReadyFeedback = result.feedback;
         result.cancellationMaySubmit = m_HasPendingSwapchainFrame;
         const bool gpuReadinessTimedOut =

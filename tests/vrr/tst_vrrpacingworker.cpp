@@ -689,11 +689,15 @@ void testDecodeWaitDoesNotExpireReadyFrame()
         const uint64_t decodeCompleteUs = fields.value(decodeCompleteColumn).toULongLong();
         const uint64_t decodeWaitUs = fields.value(decodeWaitColumn).toULongLong();
         const uint64_t dequeueUs = fields.value(dequeueColumn).toULongLong();
+        const uint64_t staleAgeUs = fields.value(staleAgeColumn).toULongLong();
+        const uint64_t expectedStaleAgeMinUs =
+            VrrTimingController(config).parameters().playoutSourceMappingDecoderOutput != 0 ?
+                26000 : 0;
         verifiedDecodeBoundary = decoderOutputUs != 0 && decodeWaitUs == 21000 &&
             dequeueUs > decoderOutputUs && decodeCompleteUs >= dequeueUs &&
             decodeCompleteUs - dequeueUs >= decodeWaitUs &&
             decodeCompleteUs - decoderOutputUs > decodeWaitUs &&
-            fields.value(staleAgeColumn).toULongLong() >= 26000;
+            staleAgeUs >= expectedStaleAgeMinUs;
         break;
     }
     expect(verifiedDecodeBoundary,
@@ -729,18 +733,21 @@ void testRepeatedDecodeContentionKeepsPresenting()
         {
             VrrPacingWorker worker(&backend, config, &telemetry);
             expect(worker.start(), "decode-contention worker must start");
+            std::unique_ptr<FrozenTestClock> clock = std::make_unique<FrozenTestClock>();
             worker.submit(makeFrame(1));
             for (int number = 1; number <= count; ++number) {
                 const bool waiting = backend.waitForDecodeWaitCount(number);
                 expect(waiting, "each retained image must enter the controlled decode wait");
                 if (!waiting) break;
-                FrozenTestClock clock;
-                clock.advance(40000);
+                if (!clock) {
+                    clock = std::make_unique<FrozenTestClock>();
+                }
+                clock->advance(40000);
                 worker.submit(makeFrame(++submitted));
                 // Freeze only the synthetic GPU delay. The target waiter
                 // needs an advancing clock to produce replay-valid render
                 // deadlines and preparation timestamps.
-                clock.resume();
+                clock.reset();
                 backend.releaseDecode();
                 const bool prepared = backend.waitForPrepareCount(number);
                 expect(prepared, "repeated slow decode must keep producing prepared images");

@@ -1186,6 +1186,14 @@ uint64_t D3D11VARenderer::captureDecodeBoundary()
     const UINT64 fenceValue = m_D2RFenceValue++;
     const HRESULT hr = m_DecodeDeviceContext->Signal(
         m_DecodeD2RFence.Get(), fenceValue);
+    if (SUCCEEDED(hr)) {
+        // Signal belongs to the decoder's immediate context. Flushing the
+        // render context cannot dispatch it. Submit the boundary now so the
+        // GPU-side render wait can progress without another compressed frame
+        // arriving to flush decoder commands. Flush submits; it does not wait
+        // for decode completion on the CPU.
+        m_DecodeDeviceContext->Flush();
+    }
     unlockContext(this);
 
     if (FAILED(hr)) {
@@ -1269,6 +1277,10 @@ bool D3D11VARenderer::renderVideo(AVFrame* frame, uint64_t decodeBoundary)
                 m_DecodeD2RFence.Get(), fenceValue);
             bool synchronized = false;
             if (SUCCEEDED(signalResult)) {
+                // The fallback signal needs the same producer submission as
+                // the exact per-frame boundary above, before the other device
+                // can wait on it. This does not wait for the GPU to finish.
+                m_DecodeDeviceContext->Flush();
                 const HRESULT waitResult = m_RenderDeviceContext->Wait(
                     m_RenderD2RFence.Get(), fenceValue);
                 if (FAILED(waitResult)) {

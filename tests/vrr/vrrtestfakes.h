@@ -341,6 +341,12 @@ public:
         });
     }
 
+    size_t decodeWaitCount() const
+    {
+        std::unique_lock<std::mutex> lock(m_Mutex);
+        return m_DecodeWaitCount;
+    }
+
     bool waitForPresentCount(size_t count,
                              std::chrono::milliseconds timeout =
                                  std::chrono::milliseconds(2000))

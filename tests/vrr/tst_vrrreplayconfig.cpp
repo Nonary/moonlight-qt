@@ -247,7 +247,7 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     QCOMPARE(restored.playoutOffsetSlewUsPerSecond, uint64_t(2400));
     QCOMPARE(restored.playoutOffsetSourceClock, uint64_t(1));
     QCOMPARE(restored.playoutOffsetMaximumStepUs, uint64_t(100));
-    QCOMPARE(restored.playoutSourceMappingDecoderOutput, uint64_t(1));
+    QCOMPARE(restored.playoutSourceMappingDecoderOutput, uint64_t(0));
     QCOMPARE(restored.playoutSerialServiceGate, uint64_t(2));
     QCOMPARE(restored.playoutRecentPressureRelease, uint64_t(1));
     QVERIFY(vrrReplayParameterNames().contains("controller.playout_offset_cadence_gate"));

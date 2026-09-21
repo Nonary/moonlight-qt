@@ -169,9 +169,9 @@ VrrTimingParameters vrrTimingParametersForSession(
     // Every normal VRR session uses the interval-quality queue. Historical
     // policies remain selectable only through explicit diagnostic parameters.
     parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 7;
-    // Worker/backend waits are consequences of local execution timing. They
-    // may describe readiness, but must never move the sender-clock mapping.
-    parameters.playoutSourceMappingDecoderOutput = 1;
+    // Timeline mapping anchors to decode completion, absorbing hardware decode
+    // duration into the sender offset instead of inflating client buffer delay.
+    parameters.playoutSourceMappingDecoderOutput = 0;
     // Buffer transient work when measured service fits within intended time
     // over the qualified window. Include decoder waits and raw preparation
     // even when readiness-lead learning excludes them from generic render cost.
@@ -257,15 +257,11 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutSmoothingSnapPerMille = kPlayoutMetronomeSnapPerMille;
     parameters.playoutOffsetReseedFrames = kPlayoutOffsetReseedFrames;
     parameters.playoutDelaySlewAcrossBands = 1;
-    // Spend the existing playout interval on preparation on both platforms.
-    // Vulkan can hand off a pending GPU render using its present semaphore;
-    // D3D11 can execute during the target hold before its final fence check.
-    // Delaying preparation until just before Present would remove that overlap,
-    // especially when no synchronous GPU wait is available to train a lead.
-    // Acquisition still enforces native backpressure; it does not justify an
-    // additional six-millisecond software delay after every submission.
-    parameters.playoutPrepareOnArrival = 1;
-    parameters.renderStartAfterSubmissionUs = 0;
+    // Restore VRR14 preparation scheduling. Spacing yields to the learned
+    // preparation lead and does not move the target, while avoiding swapchain
+    // acquisition contention.
+    parameters.playoutPrepareOnArrival = 0;
+    parameters.renderStartAfterSubmissionUs = 6000;
     parameters.renderStartMinimumLeadUs = kRenderStartMinimumLeadUs;
     parameters.renderLeadFloorUs = kRenderLeadFloorUs;
     parameters.rateCandidateMinimumUs = kRateCandidateMinimumUs;
