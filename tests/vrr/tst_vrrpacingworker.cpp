@@ -249,6 +249,48 @@ void testPreparedFramesOverlapAndTrace()
     SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
 }
 
+void testSlowPreparedFramesKeepPresenting()
+{
+    for (int mode : {0, 1, 2}) {
+        resetFakeClock();
+        PreparedFramePresenter backend;
+        backend.automaticCompletion = false;
+        PacerTelemetry telemetry;
+        std::array<TrackedFrameLifetime, 5> lifetimes;
+        auto config = enabledConfig();
+        config.latencyMode = mode;
+        config.streamRateHz = 120;
+        {
+            VrrPacingWorker worker(&backend, config, &telemetry);
+            expect(worker.start(), "slow preparation worker must start");
+            const auto submit = [&](int i) {
+                auto input = makeTrackedPacedFrame(i + 1, i * 750,
+                                                  LiGetMicroseconds(), lifetimes[i]);
+                input.frame()->pkt_dts = input.decoderOutputUs();
+                worker.submit(std::move(input));
+            };
+            submit(0);
+            for (int i = 0; i < 4; ++i) {
+                expect(waitFor([&] { return backend.waits > unsigned(i); }),
+                       "worker must wait for the next incomplete image");
+                // Every render exceeds the age limit. A newer admitted image
+                // is not ready, so discarding the completed one freezes video.
+                std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                submit(i + 1);
+                backend.tickets[i]->timing.renderEndUs = LiGetMicroseconds();
+                backend.tickets[i]->timing.readyUs = LiGetMicroseconds();
+                backend.tickets[i]->complete(true);
+                expect(backend.waitForPresentCount(i + 1),
+                       "slow completed preparation must present despite a newer queued frame");
+            }
+            expect(backend.presentedFrames() == std::vector<int>({1, 2, 3, 4}),
+                   "sustained preparation overload must keep making visible progress");
+        }
+        for (const auto& lifetime : lifetimes)
+            expect(lifetime.releases == 1, "slow-stage frames must release exactly once");
+    }
+}
+
 void testPreparedFrameCancellationAndBound()
 {
     resetFakeClock();
@@ -2563,6 +2605,7 @@ int main()
     }
 
     testPreparedFramesOverlapAndTrace();
+    testSlowPreparedFramesKeepPresenting();
     testPreparedFrameCancellationAndBound();
     testPreparedFrameSuspendAndFallback();
     testCapabilityRejection();

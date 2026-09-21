@@ -495,7 +495,12 @@ int VrrPacingWorker::run()
                 frame.decoderOutputUs() : frame.decodeCompleteUs());
         const uint64_t ageUs = VrrFrameDropPolicy::ageExcludingDecodeWaitUs(
             scheduleNowUs, ageOriginUs, decodeSyncWaitUs);
-        if (hasQueuedFrame() && VrrFrameDropPolicy::beforeRender(
+        // These checks shed work before expensive rendering. Offscreen
+        // preparation has already finished that work: a newer queued source
+        // is not a ready replacement. Repeatedly dropping completed outputs
+        // here can freeze video indefinitely under sustained GPU load. Keep
+        // queue admission/expiry bounded, but present the active ready image.
+        if (!preparedAhead && hasQueuedFrame() && VrrFrameDropPolicy::beforeRender(
                 decision, m_TimingController->displayPeriodUs(), ageUs, metronome, latencyFix)) {
             recordFrameCompletion(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
                        TraceDisposition::Stale);
@@ -552,7 +557,7 @@ int VrrPacingWorker::run()
         // start. Leave the surface unprepared and let the next iteration start
         // fresh rather than rendering an avoidably old image.
         uint64_t nowUs = LiGetMicroseconds();
-        if (hasQueuedFrame() && VrrFrameDropPolicy::afterRenderWait(
+        if (!preparedAhead && hasQueuedFrame() && VrrFrameDropPolicy::afterRenderWait(
                 decision, ageOriginUs, nowUs, metronome, latencyFix,
                 decodeSyncWaitUs)) {
             recordFrameCompletion(queuedFrame, decision, VrrPresentFeedback {}, telemetry,

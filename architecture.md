@@ -1259,6 +1259,22 @@ swapchain, copies the completed output, verifies that short copy has completed,
 and applies the ordinary target wait. Only after the copy does preparation of
 the next image proceed, preventing its GPU work from delaying that copy.
 
+The 2026-09-21 freeze correction is based on `abd6b82d`. A completed
+preparation ticket bypasses the two pre-render stale-replacement checks:
+rendering has already finished, and a newer queued source is not evidence of
+a ready replacement. Queue capacity and expiry still shed waiting work, and
+shutdown, suspension and output-epoch checks still cancel active work. This
+prevents a render/drop loop under sustained GPU load without altering source
+timestamps or hiding preparation latency. The completed live capture
+`20260921-002333-70409` reproduced exactly and contained only two presentations
+in 45.8 seconds, with 2,528 completed staged images rejected as stale. This was
+presentation starvation rather than a mutex deadlock. A worker regression
+exercises repeated 40 ms preparation with newer queued images in all three
+latency modes. It fails before the correction and passes afterward; all eleven
+VRR/backend/profile/GPU trace suites, replay help, native startup and the latest
+capture's exact replay check pass. Evidence is in `build/freeze-fix-validation/`.
+Actual GPU throughput and visible recovery still need a live retest.
+
 Tickets refer to the existing three waiting admissions plus the active image;
 they do not add another playout queue. Eviction and lifecycle discard cancel
 the corresponding ticket. The preparation queue is independently bounded to
