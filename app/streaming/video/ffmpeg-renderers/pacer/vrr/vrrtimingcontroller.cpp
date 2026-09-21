@@ -257,11 +257,15 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutSmoothingSnapPerMille = kPlayoutMetronomeSnapPerMille;
     parameters.playoutOffsetReseedFrames = kPlayoutOffsetReseedFrames;
     parameters.playoutDelaySlewAcrossBands = 1;
-    // Restore VRR14 preparation scheduling. Spacing yields to the learned
-    // preparation lead and does not move the target, while avoiding swapchain
-    // acquisition contention.
-    parameters.playoutPrepareOnArrival = 0;
-    parameters.renderStartAfterSubmissionUs = 6000;
+    // Spend the existing playout interval on preparation on both platforms.
+    // Vulkan can hand off a pending GPU render using its present semaphore;
+    // D3D11 can execute during the target hold before its final fence check.
+    // Delaying preparation until just before Present would remove that overlap,
+    // especially when no synchronous GPU wait is available to train a lead.
+    // Acquisition still enforces native backpressure; it does not justify an
+    // additional six-millisecond software delay after every submission.
+    parameters.playoutPrepareOnArrival = 1;
+    parameters.renderStartAfterSubmissionUs = 0;
     parameters.renderStartMinimumLeadUs = kRenderStartMinimumLeadUs;
     parameters.renderLeadFloorUs = kRenderLeadFloorUs;
     parameters.rateCandidateMinimumUs = kRateCandidateMinimumUs;

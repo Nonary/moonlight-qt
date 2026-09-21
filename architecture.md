@@ -1308,8 +1308,9 @@ can fit its intended interval. The older thresholded-event policy is disabled
 with `playout_readiness_hitch_threshold_us=0`. Native-hitch adaptation is disabled.
 Production restores VRR14 timeline mapping anchored to decode completion (`playout_source_mapping_decoder_output=0`),
 absorbing hardware decode duration into the sender offset instead of inflating client buffer delay.
-It also restores VRR14 preparation scheduling (`playout_prepare_on_arrival=0`, `render_start_after_submission_us=6000`),
-avoiding swapchain acquisition contention while letting spacing yield to the learned preparation lead.
+It pairs this with early preparation on arrival (`playout_prepare_on_arrival=1`, `render_start_after_submission_us=0`),
+spending the existing playout cushion on overlapping GPU preparation so libplacebo rendering finishes well before
+the target presentation boundary.
 A gate checks complete serial service for absorbability, and release is governed by recent pressure. Their
 zero initializer values preserve historical replay when captures omit them.
 The latency presets set independent caps; per-frame native slot protection
@@ -1318,7 +1319,7 @@ Display smoothness feedback remains diagnostic. Historical Linux thresholded
 submission-error attribution is retained for replay; live revision 7 uses the
 shared interval policy described above.
 Historical feedback policies remain selectable for exact replay.
-It disables the retired metronome.
+It disables the retired metronome and enables preparation on arrival.
 It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 
 | Production input | Value / meaning |
@@ -1342,7 +1343,7 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | Smoothing period EMA | 25 per mille with fractional carry; active only with smoothing enabled |
 | Positive smoothing lag cap | 2,000 us; active only with smoothing enabled |
 | Render lead floor | 3,000 us |
-| Preparation start | VRR14 scheduling (`playout_prepare_on_arrival=0`, `render_start_after_submission_us=6000`); spacing yields to the learned lead and does not move the target |
+| Preparation start | Use the existing playout interval (`playout_prepare_on_arrival=1`), with no additional post-submission delay |
 | Minimum preparation lead input | 2,500 us |
 | Future-offset reseed requirement | 3 consecutive qualifying projections |
 
@@ -2054,10 +2055,10 @@ After 20 seconds from the first arrival, high-bitrate presented frames averaged 
 decode-wait + preparation + submission service against an 8.333 ms period.
 
 The updated path pairs asynchronous retained-hardware output and the corrected stale
-policy with VRR14 preparation scheduling. It retains up to four source mappings to
+policy with preparation on arrival. It retains up to four source mappings to
 prevent capacity stalls, applies bounded retirement backpressure before acquiring another swapchain image, and
 never calls an unavailable output-completion sample a zero-duration completion.
-Immediate presentation now follows VRR14 and omits that CPU completion check
+Immediate presentation omits that CPU completion check
 when the source mapping is retained. GPU-delayed flips may still bunch despite
 correctly spaced CPU submissions. Software and unretained imports keep the 50 ms / 100,000-observation output-poll bound.
 D3D11 fence/event fields remain unset on Vulkan rows. Windows explicitly flushes the decoder context
