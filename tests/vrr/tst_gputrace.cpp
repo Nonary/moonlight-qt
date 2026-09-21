@@ -72,7 +72,7 @@ void GpuTraceTest::concurrentDrainAndExport()
     QVERIFY(file.open(QIODevice::ReadOnly));
     const auto data = file.readAll();
     QVERIFY(data.contains("closed=1; truncated=0; dropped_rows="));
-    QVERIFY(data.contains("gpu_trace_version=3; decoder_output_query=disabled"));
+    QVERIFY(data.contains("gpu_trace_version=4; decoder_output_query=disabled; worker_status_query=disabled"));
     QVERIFY(data.contains("thread_fixture,42,43,100,200,0,-11,"));
     std::set<int> ids;
     for (const auto& line : data.split('\n')) {

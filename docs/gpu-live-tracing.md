@@ -14,8 +14,10 @@ Revision 2 (`GPU diagnostics v2` in the log) removes the decoder-thread
 `decode_output_status` query. In the revision-1 high-bitrate capture, 296 of 297
 queries longer than 1 ms returned within 200 us of another frame's decode-sync
 completion, consistent with driver serialization. The new header explicitly
-records `decoder_output_query=disabled`. The worker-side readiness query remains,
-as do synchronization spans and shader timings. There is no diagnostic driver
+records `decoder_output_query=disabled`. Revision 4 also removes the worker-side readiness query after the latest 4K
+capture measured 1.05 ms mean / 7.62 ms p95 in that probe. Synchronization
+spans and shader timings remain. Some waiting may move into the required sync;
+removing the probe does not by itself establish recovered throughput. There is no diagnostic driver
 call on the decoder thread. This removes the observed intrusive probe; a new
 live comparison is still required to assess the remaining overhead.
 
@@ -30,7 +32,8 @@ still add overhead, which must be considered when interpreting the run.
 
 Revision 3 adds passive decoder-thread timestamps around existing FFmpeg calls
 and packet handoff, without adding driver calls. The log identifies `GPU diagnostics
-v3`. `packet_send`, `decoder_receive`, `decode_sync`, `decode_query_cpu`, and
+v4` with `worker_status_query=disabled` in the header. `packet_send`,
+`decoder_receive`, `decode_sync`, and
 `render_commands` have `a=result`, `b=thread CPU microseconds`, `c=voluntary context
 switches`, `d=involuntary context switches`, and `e=Linux thread ID`. Unavailable
 counters are -1. CPU/context-switch observations slightly bracket the wall-time
@@ -51,7 +54,7 @@ Additional events:
 | decoder_surface | Passive AVFrame metadata; object_id=VA surface ID, a=frame number, b=pixel format, c=width, d=height, e=outstanding frames before dequeue |
 | decoder_handoff | Pacer queue admission call; a=frame number |
 | decode_sync_enter | Marker before existing vaSyncSurface; object_id=VA surface ID |
-| decode_query_cpu | Thread counters for the retained worker-side status query |
+| decode_query_cpu | Historical revision-3 worker status query; absent in revision 4 |
 
 Packet events have no decoder-output timestamp yet; join by RTP and source
 frame number to `decoder_surface`, then by decoder-output timestamp to worker
@@ -74,7 +77,7 @@ GPU nanosecond durations from absolute CPU timestamps.
 
 | Event | object_id | a / b / c / d / e |
 | --- | --- | --- |
-| decode_wait_status | VA surface ID | query VAStatus / VASurfaceStatus |
+| decode_wait_status | VA surface ID | Historical revision-2/3 query VAStatus / VASurfaceStatus; absent in revision 4 |
 | decode_sync | VA surface ID | vaSyncSurface result |
 | source_capacity | 0 | success / retained source count |
 | acquire | 0 | unused |
@@ -88,7 +91,7 @@ GPU nanosecond durations from absolute CPU timestamps.
 | source_teardown | 0 | unused |
 | output_status_before_present | presentation ID | 1 = output pending, 0 = complete |
 | present | presentation ID | submission success |
-| stage_render | 0 | offscreen render submission succeeded; begin/end bracket import, rendering and flush |
+| stage_render | 0 | experimental offscreen render submission succeeded; begin/end bracket import, rendering and flush (requires `MOONLIGHT_VRR_OFFSCREEN_PREPARATION=1`) |
 | stage_output_ready | 0 | 1 = completed within the bound; begin=render flush completion, end=CPU output-completion observation |
 | stage_copy | 0 | copy/readiness succeeded; pacing-thread copy and its completion wait, or rerender after an output-format change |
 

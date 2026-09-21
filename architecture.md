@@ -15,8 +15,10 @@ gradual backlog-recovery follow-up described below. This includes source ownersh
 buffer attribution and decode-wait starvation prevention (2026-09-20).
 The 2026-09-21 preparation-stage follow-up is based on `18602b1c`, including
 Gemini's decode-completion source mapping and preparation-on-arrival changes.
-Linux VAAPI/Mailbox now prepares offscreen images independently of the pacing
-thread, as described in section 7.2. Other presentation backends retain their
+Linux VAAPI/Mailbox has experimental offscreen preparation independently of the
+pacing thread, as described in section 7.2. Following live 4K throughput
+regressions, this requires `MOONLIGHT_VRR_OFFSCREEN_PREPARATION=1`; the default
+retains the direct asynchronous hardware-source path. Other backends retain their
 existing execution path. This changes execution overlap, not buffer ceilings
 or source cadence policy; physical smoothness still requires a live retest.
 Production now selects serial-service revision 2: the shared interval buffer
@@ -27,7 +29,7 @@ verified pending at the final wait supplies readiness lateness. Historical
 revisions 0/1 remain available. See
 [service-gate correction](docs/vrr-service-gate-correction.md).
 Live GPU diagnostics now add a separate asynchronous CSV under existing deep
-tracing: VA surface status at the worker wait, CPU dependency
+tracing: CPU dependency
 spans, source-retirement bounds, output readiness before presentation, and
 libplacebo's delayed shader-duration history. Shader samples are not tagged to
 their originating frame and do not expose absolute GPU start times. See
@@ -35,13 +37,19 @@ their originating frame and do not expose absolute GPU start times. See
 schema or policy; the service-gate correction above changes production policy.
 GPU diagnostic revision 2 removes the decoder-thread surface-status query: live
 revision-1 captures showed it blocking behind another frame's decode synchronization.
-The worker-side query and remaining timing observations are retained for retesting.
+Revision 2 retained the worker-side query for retesting.
 Revision 3 timestamps existing packet send/receive, packet delivery/assembly and
 pacer handoff, associates output surfaces with frame IDs, and samples Linux
 thread CPU time/context switches around send/receive, VA sync/status and render
 commands. Decoder-thread instrumentation only reads metadata and OS counters;
 it performs no new driver calls. These spans expose CPU-versus-blocked time and
 cross-thread overlap, not internal driver locks or GPU engine execution times.
+Revision 4 removes the worker-side VA status query as well. The latest completed
+4K HEVC capture `20260921-005750-93776` recorded 1.05 ms mean and 7.62 ms p95
+inside that diagnostic call, before the required `vaSyncSurface` wait. Timing
+the existing synchronization preserves readiness and its measurements without
+adding this potentially blocking probe. This removes diagnostic driver work;
+some of its wait may move into synchronization, so FPS recovery is not implied.
 The current follow-up enables early preparation on both platforms and
 asynchronous VAAPI/Vulkan Mailbox output, described below. That follow-up still needs
 live validation; the baseline's latest high-bitrate run delivers about 100 FPS
@@ -1249,7 +1257,8 @@ resetting the codec merely because an image was not presented.
 12. Trace the outcome and retain/defer frame ownership as required by the presenter.
    Backend source retirement may continue after this worker step.
 
-On Linux VAAPI/Mailbox, after the first ordinary frame establishes the real
+With `MOONLIGHT_VRR_OFFSCREEN_PREPARATION=1` on Linux VAAPI/Mailbox,
+after the first ordinary frame establishes the real
 swapchain format, admitted frames also receive cancellable preparation tickets.
 A separate thread performs decode synchronization, source import, rendering
 to an offscreen texture, and output-completion polling. It owns its own
@@ -1274,6 +1283,16 @@ latency modes. It fails before the correction and passes afterward; all eleven
 VRR/backend/profile/GPU trace suites, replay help, native startup and the latest
 capture's exact replay check pass. Evidence is in `build/freeze-fix-validation/`.
 Actual GPU throughput and visible recovery still need a live retest.
+
+The subsequent `20260921-004719-85692` session log reported 54.17 and 31.90
+rendered FPS for its two 3840x2160 streams, despite 105.36 and 107.74 incoming
+FPS. Offscreen preparation introduces an extra target copy and CPU-observed
+completion waits before allowing the next preparation job. It is now opt-in;
+the default once again renders directly into the swapchain and retains the
+mapped source until GPU reads retire, using the presentation semaphore for
+completion. This removes the new staging cost; recovered 4K throughput still
+requires live verification. The completed-ticket starvation correction remains
+in place for experimental use.
 
 Tickets refer to the existing three waiting admissions plus the active image;
 they do not add another playout queue. Eviction and lifecycle discard cancel

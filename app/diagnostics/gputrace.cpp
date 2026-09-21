@@ -77,8 +77,8 @@ void GpuTrace::write(const QString& path)
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "GPU trace open failed: %s", qPrintable(path));
         return;
     }
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "GPU diagnostics v3: %s", qPrintable(path));
-    QByteArray batch("# gpu_trace_version=3; decoder_output_query=disabled; thread_counters=enabled_where_supported; CPU times=LiGetMicroseconds; shader samples=delayed GPU durations, NOT current-frame timestamps\n"
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "GPU diagnostics v4: %s", qPrintable(path));
+    QByteArray batch("# gpu_trace_version=4; decoder_output_query=disabled; worker_status_query=disabled; thread_counters=enabled_where_supported; CPU times=LiGetMicroseconds; shader samples=delayed GPU durations, NOT current-frame timestamps\n"
                      "event,rtp_pts,decoder_output_us,begin_us,end_us,object_id,a,b,c,d,e,detail\n");
     bool healthy = true;
     bool truncated = false;

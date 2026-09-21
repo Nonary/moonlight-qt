@@ -1449,18 +1449,10 @@ uint64_t PlVkRenderer::waitForDecode(AVFrame* frame)
     }
     auto vaDeviceContext = (AVVAAPIDeviceContext*)hwFrameCtx->device_ctx->hwctx;
     const auto surface = static_cast<VASurfaceID>(reinterpret_cast<uintptr_t>(frame->data[3]));
-    VASurfaceStatus before = VASurfaceRendering;
-    VAStatus queryStatus = VA_STATUS_ERROR_UNIMPLEMENTED;
-    if (m_GpuTrace) {
-        const auto queryCpu = GpuTrace::ThreadSample::capture();
-        const auto queryBegin = LiGetMicroseconds();
-        queryStatus = vaQuerySurfaceStatus(vaDeviceContext->display, surface, &before);
-        const auto queryEnd = LiGetMicroseconds();
-        m_GpuTrace->recordThreadSpan({"decode_query_cpu", frame->pts, uint64_t(frame->pkt_dts),
-            queryBegin, queryEnd, surface, queryStatus}, queryCpu);
-        m_GpuTrace->record({"decode_wait_status", frame->pts, uint64_t(frame->pkt_dts),
-            queryBegin, queryEnd, surface, queryStatus, before});
-    }
+    // Do not probe VA status for diagnostics here. On the Deck this query
+    // can block for milliseconds behind driver work, before the required
+    // synchronization even begins. Time the existing sync without adding
+    // another driver call to the frame-delivery path.
     const auto cpuBeforeSync = m_GpuTrace ? GpuTrace::ThreadSample::capture() : GpuTrace::ThreadSample{};
     if (m_GpuTrace) {
         const auto now = LiGetMicroseconds();
@@ -1763,7 +1755,11 @@ void PlVkRenderer::updatePreparationTarget()
     // Only the VAAPI Mailbox path diagnosed here opts into offscreen staging.
     // Other backends retain their existing synchronization and native policy.
     const auto texture = m_SwapchainFrame.fbo;
-    m_PreparationTargetValid = m_VrrRequested && !m_PreparationStopping &&
+    // Experimental: the extra render/copy completion waits regress 4K
+    // throughput. Keep the direct asynchronous retained-source path as the
+    // default until staged preparation demonstrates a live benefit.
+    m_PreparationTargetValid = qEnvironmentVariableIntValue("MOONLIGHT_VRR_OFFSCREEN_PREPARATION") == 1 &&
+        m_VrrRequested && !m_PreparationStopping &&
         m_VrrAdaptivePresentMode == VK_PRESENT_MODE_MAILBOX_KHR &&
         m_Vulkan->gpu->limits.thread_safe && texture && texture->params.format &&
         (texture->params.format->caps & PL_FMT_CAP_BLITTABLE);
