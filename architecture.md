@@ -5,6 +5,11 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
+Windows high-bitrate follow-up (2026-09-22), based on `26675aa8`: D3D11 VRR
+presentation no longer holds FFmpeg's decode lock on separate devices, and a
+monitored decode fence now supplies the decode-completion observation that
+production source mapping assumes. See the section below and section 10.1.
+
 Controller-feedback update (2026-09-19), checked against `9362b0f0` and its
 common-library waveform protocol: section 12 now covers Windows
 Bluetooth waveform output and the shared adaptive-trigger path. This update
@@ -147,6 +152,54 @@ helpers and their deterministic tests remain available for development.
 Production retains its Immediate/WSI FIFO selection; adaptive presentation
 permission is owned by the VRR backend rather than a user preference.
 
+### Windows decode/presentation decoupling (2026-09-22)
+
+Two Windows-only gaps against the Linux path were found from source, both
+growing with bitrate. No live capture, build or replay accompanied the change;
+this document was written on the host machine, which has no client toolchain.
+
+1. **Shared decode lock.** FFmpeg's D3D11VA hwaccel holds the renderer-supplied
+   lock for its whole per-frame submission (`DecoderBeginFrame` through
+   `DecoderEndFrame`, including the bitstream copy). The VRR worker held that
+   same mutex through preparation, the render-context `Flush`, `Present` and
+   the DXGI statistics queries, and took it twice more around the present-ready
+   wait. With a playout buffer near one source period, frame N's target lands
+   near frame N+1's decode submission, so the collision recurs with the cadence
+   and lengthens as larger frames make submission slower. Stock Moonlight, and
+   this fork's legacy path, take the lock only for decode-context calls on
+   separate devices. This is the Windows form of the Linux finding in
+   [live GPU tracing](docs/gpu-live-tracing.md): decoder-thread driver work
+   serialized behind the worker's wait on another frame.
+   `D3D11VARenderer` now has a separate presentation mutex for the render
+   context, swapchain and prepared-frame state, shared with window-change
+   callbacks and legacy rendering. It includes FFmpeg's lock only when decode
+   and render share one immediate context. `renderVideo()` takes FFmpeg's lock
+   solely around its decode-context `Signal`/`Wait`. Lock order is presentation,
+   then context; the decoder thread takes only the context lock.
+2. **No decode-completion observation.** Production maps source time from
+   `decodeCompleteUs` so hardware decode time is absorbed into the sender
+   offset (`93363745`). Linux supplies it from `vaSyncSurface()`. `78b99f1c`
+   had made the Windows decode check nonblocking, so `decodeCompleteUs`
+   stayed equal to decoder output, which precedes the hardware decode. The
+   whole decode duration then had to fit inside the capped playout buffer and
+   the residual present-ready wait. `waitForDecode()` again waits for the exact
+   captured decode-to-render fence value, without any context lock, using a
+   dedicated event. The GPU-side `Wait` in `renderVideo()` remains the
+   correctness mechanism. The CPU wait applies only to monitored fences; the CPU
+   cannot observe non-monitored fences, and shared-device sessions capture no
+   boundary, so both keep the previous nonblocking behavior. A failed or 50 ms
+   timed-out wait disables adaptive presentation and requests recovery without
+   advertising readiness. The last user-confirmed smooth Windows 4K capture
+   (2026-09-11, below) ran with this style of blocking decode wait.
+
+Expected trace differences: Windows rows gain nonzero `decode_sync_wait_us`,
+as Linux rows have; `gpu_ready_wait_us` at the target should fall toward
+zero; the lock-wait spans `gpu_ready_poll_start_us - present_start_us` and
+`native_present_start_us - gpu_ready_time_us` should no longer track the next
+frame's `decoder_output_us`. These changes do not alter controller parameters,
+buffer caps or replay policy. They require a Windows build, the deterministic
+suites, exact replay of a new capture and a matched high-bitrate live test.
+
 ### Client warnings and gradual backlog recovery (2026-09-20)
 
 With Reduce judder enabled, production captures `playout_catchup_per_mille=20`.
@@ -221,9 +274,12 @@ retain the former hold behavior.
 Windows queues the frame's decode dependency on the GPU, records the backbuffer,
 signals and flushes a present-ready fence during preparation, then lets the GPU
 run during the worker's cadence hold. At the target boundary it verifies the exact
-fence value and waits only for any residual work before `Present`. The decoder/
-render context lock is released during both the cadence hold and that residual
-wait, and the source `AVFrame` stays owned through presentation. Linux VAAPI keeps
+fence value and waits only for any residual work before `Present`. The
+presentation lock is released during both the cadence hold and that residual
+wait, and the source `AVFrame` stays owned through presentation. Since
+2026-09-22 that lock is not FFmpeg's decode lock on separate devices, and a
+monitored decode fence is waited on before scheduling (see the 2026-09-22
+section above). Linux VAAPI keeps
 one explicit worker readiness synchronization but removes the duplicate explicit
 prepare-time synchronization. Hardware Vulkan preparation retains the imported
 source mapping until GPU completion. The VAAPI Mailbox path now uses libplacebo's
@@ -481,7 +537,7 @@ wait-call count. Cross-device Signal/Wait failures include HRESULT and target.
 Present-ready failures additionally report signal/flush/event-setup duration,
 context-lock reacquisition duration, both device removal reasons, device/texture
 mode, the frame's captured decode target, and both views of the shared fences.
-Fence snapshots are sequential observations after reacquiring the context lock;
+Fence snapshots are sequential observations after reacquiring the presentation lock;
 the next-signal counters may include newer decode work and are not the failing
 frame's target. A zero captured target means no captured boundary is available.
 The existing 50 ms budget, 100-wait guard, synchronization ordering, error
@@ -1100,7 +1156,7 @@ successful IDR completion establishes valid reference state.
 | `enqueueTimeUs` / reassembled time | Client monotonic microseconds | Complete compressed frame assembled/queued. |
 | `decodeSubmitUs` | Client monotonic microseconds | Sampled immediately before FFmpeg packet submission. |
 | `decoderOutputUs` | Client monotonic microseconds | Immutable timestamp captured immediately when FFmpeg returns the decoded frame; client-processing reporting origin. |
-| `decodeCompleteUs` | Client monotonic microseconds | Post-output readiness observation; anchors production RTP-to-client mapping so hardware decode duration is absorbed in the sender offset. |
+| `decodeCompleteUs` | Client monotonic microseconds | Post-output readiness observation; anchors production RTP-to-client mapping so hardware decode duration is absorbed in the sender offset. Linux samples it after `vaSyncSurface()`, Windows after the monitored decode-to-render fence wait. Without a wait over 200 us it equals `decoderOutputUs`, as on Windows before 2026-09-22 and on shared-device or non-monitored-fence sessions. |
 | `decodeSyncWaitUs` | Elapsed client microseconds | Explicit CPU time spent by the worker on a decoder/backend completion primitive. It is serial service and latency accounting, not a source-clock timestamp. A zero value does not exclude a GPU-queued dependency. |
 | Worker queue, decision, preparation, wait, submission times | Client monotonic microseconds | Distinct CPU-side lifecycle boundaries. |
 | Shared fence values | GPU ordering identities | Establish dependencies/completion; not elapsed time by themselves. |
@@ -1139,9 +1195,11 @@ Queue/pacing includes queue residence, target waits and other time outside
 preparation, presentation and explicit decode synchronization. “Client processing
 delay” ends when the presentation call returns. It does not include unmeasured
 time from that return until the image becomes visible on the display.
-On Windows, decode-to-render ordering is normally a GPU-side wait and the residual
-present-ready fence wait occurs inside the presentation call, so neither is an
-independent CPU decode-wait row. Linux VAAPI/Vulkan Mailbox output is asynchronous and
+On Windows with monitored fences, the worker waits for the decode fence before
+scheduling, and that wait is the GPU decode synchronization line, as on Linux. The
+GPU-side decode-to-render wait remains queued. The residual present-ready fence
+wait occurs inside the presentation call and is not a decode-wait row.
+Linux VAAPI/Vulkan Mailbox output is asynchronous and
 does not report a CPU output-completion sample; other Linux imports still poll
 before the target hold. These accounting identities therefore partition the
 observed CPU path; they do not expose every GPU stage.
@@ -1917,29 +1975,45 @@ decode-to-render fence when a decoder output is handed off. Rendering waits for
 that exact value, so it need not wait for newer decode work. Render-to-decode
 ordering protects texture reuse. The purpose is both correctness and avoiding
 accidental waits for work belonging to subsequent frames.
-The worker's Windows decode check is nonblocking except for device-removal
-detection. `renderVideo()` queues `ID3D11DeviceContext4::Wait` for the captured
-boundary before any copy or shader read, letting controller scheduling and CPU
-command recording overlap the decoder tail. A zero CPU decode-wait measurement
-therefore does not mean the decode dependency was already complete.
+`renderVideo()` queues `ID3D11DeviceContext4::Wait` for the captured boundary
+before any copy or shader read; that GPU dependency is the correctness mechanism.
+With monitored fences, the worker's `waitForDecode()` also blocks until the
+exact captured value completes, taking no context lock and using its own event
+with the 50 ms / fence-value-verified wait described below. That post-wait clock
+is `decodeCompleteUs`, which production source mapping requires to absorb
+hardware decode time (the Linux `vaSyncSurface()` equivalent). Between
+`78b99f1c` and 2026-09-22 this check was nonblocking, which left Windows mapped
+from decoder output while Linux mapped from completion. Non-monitored fences and
+shared devices remain nonblocking; there, a zero CPU decode-wait measurement
+does not mean the decode dependency was already complete.
+
+Two mutexes serialize this renderer. FFmpeg's D3D11VA lock (`m_ContextLock`)
+guards the decode device's immediate context; FFmpeg holds it for each frame's
+entire decode submission. A separate presentation lock guards the render
+context, swapchain and prepared VRR frame against window-change callbacks. The
+presentation lock includes FFmpeg's lock only when decode and render share one
+immediate context. On separate devices, preparation and `Present` never hold
+FFmpeg's lock; `renderVideo()` and `captureDecodeBoundary()` take it only
+around decode-context `Signal`/`Wait`/`Flush`. Lock order is presentation, then
+context.
 
 Preparation binds and clears the backbuffer, renders video and overlays, and sets
 colorspace/HDR state. Direct decoder texture binding follows stock Moonlight on
 Intel and on separate decode/render devices. AMD/NVIDIA single-device sessions
 keep the compatibility copy below 4K; 4K streams bind when the GPU has Feature
-Level 11.1+ or D3D11 fences. It uses the D3D/FFmpeg context lock while manipulating
-shared state. Immediately after recording the frame, preparation signals and
+Level 11.1+ or D3D11 fences. It holds the presentation lock while manipulating
+render state. Immediately after recording the frame, preparation signals and
 flushes a present-ready fence, arms its event, and performs one nonblocking value
 poll. It publishes the prepared frame without waiting for completion, reports
-`sourceFrameReusable=false`, and releases the shared context lock before the
+`sourceFrameReusable=false`, and releases the presentation lock before the
 worker's cadence hold. The source `AVFrame` remains owned through presentation;
 on the separate-device path, the render-to-decode fence also protects decoder-
 surface reuse.
 
-At the target boundary `presentAdaptive()` reacquires the context lock and verifies
-that exact present-ready value before calling `Present`. It releases the shared
-lock while waiting, so subsequent decode can continue, then reacquires and
-revalidates the prepared frame, display state and device. Usually the cadence hold
+At the target boundary `presentAdaptive()` reacquires the presentation lock and
+verifies that exact present-ready value before calling `Present`. It releases
+that lock while waiting (on a shared device this also lets decode continue), then
+reacquires and revalidates the prepared frame, display state and device. Usually the cadence hold
 has already covered the GPU work and this is a completed-value poll. A late frame
 pays only the residual wait at the target. The complete fence wait has a 50 ms
 bound, blocks on the event in 1 ms slices, and checks the fence value between
