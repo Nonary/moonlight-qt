@@ -5,6 +5,18 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
+Reduce judder follow-up (2026-09-22), based on `e053b5cb`: the smoother's
+positive retiming cap rises from 2 ms to 6 ms, a learned readiness reserve
+delays the smoothed schedule by the lateness the smoother itself causes, and
+phase-error feedback lets its period follow drifting game rates. All three are
+new zero-default controller parameters, so older captures replay unchanged.
+See the section below and section 8.3.
+
+Windows high-bitrate follow-up (2026-09-22), based on `26675aa8`: D3D11 VRR
+presentation no longer holds FFmpeg's decode lock on separate devices, and a
+monitored decode fence now supplies the decode-completion observation that
+production source mapping assumes. See the section below and section 10.1.
+
 Controller-feedback update (2026-09-19), checked against `9362b0f0` and its
 common-library waveform protocol: section 12 now covers Windows
 Bluetooth waveform output and the shared adaptive-trigger path. This update
@@ -147,6 +159,141 @@ helpers and their deterministic tests remain available for development.
 Production retains its Immediate/WSI FIFO selection; adaptive presentation
 permission is owned by the VRR backend rather than a user preference.
 
+### Reduce judder readiness reserve and wider retiming (2026-09-22)
+
+Written on the Sunshine host (Ambidex), which has no client toolchain, traces or
+share access. Evidence is a synthetic harness around the real controller
+(g++ with FFmpeg/SDL stubs) plus new deterministic tests; no capture replay,
+application build or live test accompanied it.
+
+Two defects limited what Reduce judder could correct:
+
+1. **Readiness clamps undid the smoothing.** Centering a smoothed schedule on
+   uneven stamps moves late-stamped frames earlier than their raw slot. Because
+   arrival follows the stamp, those frames are frequently not ready: the target
+   clamp presents them late and restores the step. The negative bound was the
+   whole playout delay, i.e. down to the mapped source slot itself. The
+   interval-quality buffer does not respond, because 1-2 ms errors on 5-17% of
+   frames average under its 0.5 ms tolerance. The 2026-09-10 SteamOS capture
+   showed the same thing live: 0.4% of intended pairs over 2 ms jerk, 13.8%
+   after readiness clamps.
+2. **The 2 ms positive cap was too small** for host-refresh quantization. A
+   game at 90 FPS captured from a fixed 120 Hz host arrives as 8.3/8.3/16.7 ms
+   stamps, needing roughly ±2.8 ms of retiming; 100 or 110 FPS need more. The
+   cap also clipped only one side, pulling the schedule early.
+
+A third limitation affected drifting rates: the period followed a 2.5% interval
+EMA only, so a game ramping between 70 and 100 FPS left the smoothed slot
+several milliseconds from its stamps (≈2.7 ms mean in the new drift fixture).
+
+Changes, all active only with Reduce judder enabled:
+
+- `playout_smoothing_max_lag_us` 2000 → 6000.
+- `playout_smoothing_reserve_*` (max 3000 us, p980, tolerance 500 us, release
+  500 us/s): for each frame the smoother placed, the controller records
+  `min(readyOffset - playoutDelay, 0) - retiming`, the lateness caused by moving
+  the frame before its raw slot. Delivery that misses the raw slot remains
+  playout-buffer evidence. Worker backlog is excluded because it follows the
+  previous, already-reserved target and would feed the reserve back into
+  itself. The reserve is the p98 of the last 128 such values minus the
+  tolerance, acquired at most 250 us per frame after 32 samples, and it is
+  applied to every timestamp-playout frame while smoothing is enabled, so
+  cadence resets do not step by the reserve. It shares the 6 ms positive
+  retiming budget and is reported inside `cadence_smoothing_us`, never
+  `playout_delay_us`. The controller exposes it as `smoothingReserveUs()`;
+  there is no dedicated trace column.
+- `playout_smoothing_period_feedback_per_million=20000`: the smoothed period
+  also integrates 2% of each frame's phase error (a second-order tracking loop,
+  damping about 0.5 with the 15% phase gain).
+
+Synthetic results (60 s, three seeds, host-present stamps plus delivery jitter
+of 0.35 ms mean with 1% 2-5 ms spikes; per mille of pairs over 2 ms jerk,
+mean decode-to-submission change against Reduce judder off). The harness lets
+Balanced release to its 1 ms floor, so its row is a small-buffer worst case:
+
+| Content | Balanced previous → new | Low Latency previous → new | Smooth previous → new |
+| --- | --- | --- | --- |
+| 90 FPS on a 120 Hz host | 442 → 50‰, +0.34 → +1.31 ms | 194 → 28‰, -0.25 → +0.42 ms | 47 → 2‰, -0.53 → +0.00 ms |
+| 70 FPS on a 120 Hz host | 458 → 39‰, -0.23 → +1.39 ms | 231 → 23‰, -0.64 → +0.45 ms | 71 → 2‰, -0.86 → +0.00 ms |
+| 70-100 FPS ramp on a 120 Hz host | 562 → 86‰, +0.11 → +1.54 ms | 370 → 44‰, -0.59 → +0.63 ms | 201 → 8‰, -0.56 → +0.03 ms |
+| Paced 90 FPS, 2 ms stamp jitter | 80 → 25‰, -0.37 → +0.08 ms | 70 → 21‰, -0.40 → +0.03 ms | 67 → 20‰, -0.42 → +0.01 ms |
+| Even 120 FPS | 18 → 17‰, +0.00 → +0.00 ms | 5 → 5‰, 0 → 0 ms | 0 → 0‰, 0 → 0 ms |
+
+The previous policy's negative latency deltas are the early bias the one-sided
+cap introduced, not free smoothing. Random-walk frame pacing (a game whose own
+frame times vary by 2-3 ms) improves less and costs more (Balanced 60 FPS,
+3 ms: 352 → 182‰ for +1.9 ms), because no smooth line stays close to it.
+
+The new deterministic fixtures (`testReduceJudder*`) cover 90 FPS on a 120 Hz
+host with production and tight buffers (tight: 68.1% → 1.0% of pairs over 2 ms,
++0.9 ms), even stamps with delivery spikes (no reserve may be acquired), reserve
+release once pacing becomes even, and a 70-100 FPS ramp (standing retiming
+offset about 2.7 → 0.56 ms). All existing controller fixtures pass unchanged
+except the assertions that named the old 2 ms cap. The replay-config round trip
+test was added but not compiled here (it needs Qt).
+
+Still required on ALLYTWO: the Qt suites, exact replay of the newest capture
+(captured parameters lack the new fields, so it should still reproduce), a
+`configs/judder-reserve-variants.json` batch on real captures, and a live
+comparison. The synthetic harness does not model GPU render variance, the
+decode wait, stale-frame dropping or native presentation.
+
+Not addressed: with a 120 FPS stream, a sub-60 FPS game on a 60 Hz host
+(16.7/33.3 ms stamps) never fits its source period. Each 33 ms interval is a
+major cadence departure at the 8.3 ms negotiated period, and the following
+16.7 ms interval counts as a return to stable cadence, clearing the cadence
+window. The fitted period stays at 8.3 ms, every long interval is a phase
+discontinuity, and smoothing never engages. This is a rate-detection issue
+(section 8.2), not a smoother setting.
+
+### Windows decode/presentation decoupling (2026-09-22)
+
+Two Windows-only gaps against the Linux path were found from source, both
+growing with bitrate. No live capture, build or replay accompanied the change;
+this document was written on the host machine, which has no client toolchain.
+
+1. **Shared decode lock.** FFmpeg's D3D11VA hwaccel holds the renderer-supplied
+   lock for its whole per-frame submission (`DecoderBeginFrame` through
+   `DecoderEndFrame`, including the bitstream copy). The VRR worker held that
+   same mutex through preparation, the render-context `Flush`, `Present` and
+   the DXGI statistics queries, and took it twice more around the present-ready
+   wait. With a playout buffer near one source period, frame N's target lands
+   near frame N+1's decode submission, so the collision recurs with the cadence
+   and lengthens as larger frames make submission slower. Stock Moonlight, and
+   this fork's legacy path, take the lock only for decode-context calls on
+   separate devices. This is the Windows form of the Linux finding in
+   [live GPU tracing](docs/gpu-live-tracing.md): decoder-thread driver work
+   serialized behind the worker's wait on another frame.
+   `D3D11VARenderer` now has a separate presentation mutex for the render
+   context, swapchain and prepared-frame state, shared with window-change
+   callbacks and legacy rendering. It includes FFmpeg's lock only when decode
+   and render share one immediate context. `renderVideo()` takes FFmpeg's lock
+   solely around its decode-context `Signal`/`Wait`. Lock order is presentation,
+   then context; the decoder thread takes only the context lock.
+2. **No decode-completion observation.** Production maps source time from
+   `decodeCompleteUs` so hardware decode time is absorbed into the sender
+   offset (`93363745`). Linux supplies it from `vaSyncSurface()`. `78b99f1c`
+   had made the Windows decode check nonblocking, so `decodeCompleteUs`
+   stayed equal to decoder output, which precedes the hardware decode. The
+   whole decode duration then had to fit inside the capped playout buffer and
+   the residual present-ready wait. `waitForDecode()` again waits for the exact
+   captured decode-to-render fence value, without any context lock, using a
+   dedicated event. The GPU-side `Wait` in `renderVideo()` remains the
+   correctness mechanism. The CPU wait applies only to monitored fences; the CPU
+   cannot observe non-monitored fences, and shared-device sessions capture no
+   boundary, so both keep the previous nonblocking behavior. A failed or 50 ms
+   timed-out wait disables adaptive presentation and requests recovery without
+   advertising readiness. The last user-confirmed smooth Windows 4K capture
+   (2026-09-11, below) ran with this style of blocking decode wait.
+
+Expected trace differences: Windows rows gain nonzero `decode_sync_wait_us`,
+as Linux rows have; `gpu_ready_wait_us` at the target should fall toward
+zero; the lock-wait spans `gpu_ready_poll_start_us - present_start_us` and
+`native_present_start_us - gpu_ready_time_us` should no longer track the next
+frame's `decoder_output_us`. These changes do not alter controller parameters,
+buffer caps or replay policy. They require a Windows build, the deterministic
+suites, exact replay of a new capture and a matched high-bitrate live test.
+
 ### Client warnings and gradual backlog recovery (2026-09-20)
 
 With Reduce judder enabled, production captures `playout_catchup_per_mille=20`.
@@ -221,9 +368,12 @@ retain the former hold behavior.
 Windows queues the frame's decode dependency on the GPU, records the backbuffer,
 signals and flushes a present-ready fence during preparation, then lets the GPU
 run during the worker's cadence hold. At the target boundary it verifies the exact
-fence value and waits only for any residual work before `Present`. The decoder/
-render context lock is released during both the cadence hold and that residual
-wait, and the source `AVFrame` stays owned through presentation. Linux VAAPI keeps
+fence value and waits only for any residual work before `Present`. The
+presentation lock is released during both the cadence hold and that residual
+wait, and the source `AVFrame` stays owned through presentation. Since
+2026-09-22 that lock is not FFmpeg's decode lock on separate devices, and a
+monitored decode fence is waited on before scheduling (see the 2026-09-22
+section above). Linux VAAPI keeps
 one explicit worker readiness synchronization but removes the duplicate explicit
 prepare-time synchronization. Hardware Vulkan preparation retains the imported
 source mapping until GPU completion. The VAAPI Mailbox path now uses libplacebo's
@@ -481,7 +631,7 @@ wait-call count. Cross-device Signal/Wait failures include HRESULT and target.
 Present-ready failures additionally report signal/flush/event-setup duration,
 context-lock reacquisition duration, both device removal reasons, device/texture
 mode, the frame's captured decode target, and both views of the shared fences.
-Fence snapshots are sequential observations after reacquiring the context lock;
+Fence snapshots are sequential observations after reacquiring the presentation lock;
 the next-signal counters may include newer decode work and are not the failing
 frame's target. A zero captured target means no captured boundary is available.
 The existing 50 ms budget, 100-wait guard, synchronization ordering, error
@@ -1100,7 +1250,7 @@ successful IDR completion establishes valid reference state.
 | `enqueueTimeUs` / reassembled time | Client monotonic microseconds | Complete compressed frame assembled/queued. |
 | `decodeSubmitUs` | Client monotonic microseconds | Sampled immediately before FFmpeg packet submission. |
 | `decoderOutputUs` | Client monotonic microseconds | Immutable timestamp captured immediately when FFmpeg returns the decoded frame; client-processing reporting origin. |
-| `decodeCompleteUs` | Client monotonic microseconds | Post-output readiness observation; anchors production RTP-to-client mapping so hardware decode duration is absorbed in the sender offset. |
+| `decodeCompleteUs` | Client monotonic microseconds | Post-output readiness observation; anchors production RTP-to-client mapping so hardware decode duration is absorbed in the sender offset. Linux samples it after `vaSyncSurface()`, Windows after the monitored decode-to-render fence wait. Without a wait over 200 us it equals `decoderOutputUs`, as on Windows before 2026-09-22 and on shared-device or non-monitored-fence sessions. |
 | `decodeSyncWaitUs` | Elapsed client microseconds | Explicit CPU time spent by the worker on a decoder/backend completion primitive. It is serial service and latency accounting, not a source-clock timestamp. A zero value does not exclude a GPU-queued dependency. |
 | Worker queue, decision, preparation, wait, submission times | Client monotonic microseconds | Distinct CPU-side lifecycle boundaries. |
 | Shared fence values | GPU ordering identities | Establish dependencies/completion; not elapsed time by themselves. |
@@ -1139,9 +1289,11 @@ Queue/pacing includes queue residence, target waits and other time outside
 preparation, presentation and explicit decode synchronization. “Client processing
 delay” ends when the presentation call returns. It does not include unmeasured
 time from that return until the image becomes visible on the display.
-On Windows, decode-to-render ordering is normally a GPU-side wait and the residual
-present-ready fence wait occurs inside the presentation call, so neither is an
-independent CPU decode-wait row. Linux VAAPI/Vulkan Mailbox output is asynchronous and
+On Windows with monitored fences, the worker waits for the decode fence before
+scheduling, and that wait is the GPU decode synchronization line, as on Linux. The
+GPU-side decode-to-render wait remains queued. The residual present-ready fence
+wait occurs inside the presentation call and is not a decode-wait row.
+Linux VAAPI/Vulkan Mailbox output is asynchronous and
 does not report a CPU output-completion sample; other Linux imports still poll
 before the target hold. These accounting identities therefore partition the
 observed CPU path; they do not expose every GPU stage.
@@ -1426,8 +1578,9 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | GPU readiness ceiling | `min(12,000 us, fitted source period)`; target/deadline unchanged |
 | Capacity telemetry | `playout_capacity_telemetry=1` exposes unclamped demand and cap pressure in live decisions |
 | Smoothing gain | 150 when Reduce judder is checked; 0 when unchecked |
-| Smoothing period EMA | 25 per mille with fractional carry; active only with smoothing enabled |
-| Positive smoothing lag cap | 4,000 us; active only with smoothing enabled |
+| Smoothing period EMA | 25 per mille with fractional carry, plus 20,000 per million phase-error feedback; active only with smoothing enabled |
+| Positive smoothing lag cap | 6,000 us, shared with the readiness reserve; active only with smoothing enabled |
+| Smoothing readiness reserve | p98 of the last 128 smoother-caused shortfalls minus 500 us, at most 3,000 us, +250 us per frame, released at 500 us/s; zero when unchecked |
 | Render lead floor | 3,000 us |
 | Preparation start | Use the existing playout interval (`playout_prepare_on_arrival=1`), with no additional post-submission delay |
 | Minimum preparation lead input | 2,500 us |
@@ -1478,34 +1631,6 @@ timestamp production behavior.
 
 ### 8.3 Cadence smoothing
 
-Strength follow-up, based on `26675aa8`: the enabled option now permits 4 ms
-of positive retiming instead of 2 ms. The gain, period tracking, cadence
-qualification and recovery rules are unchanged. The three-frame capacity
-calculation reserves the full 4 ms before allowing adaptive queue delay;
-the timing presets' existing ceilings still apply. This is an allowance,
-not a fixed extra 4 ms wait, and it is not a bound on total client latency.
-The existing checkbox remains the only smoothing control. Captured parameters
-preserve historical exact replay, and the parameter-derived calibration key
-automatically separates the new enabled policy from the old 2 ms policy.
-
-Validation: all six required VRR/backend suites and replay help pass. The new
-60-case controller comparison spans three presets, five rates (60 through
-240 FPS) and four timing patterns. Severe 60 FPS patterns improve mean interval
-jerk by about 20-50%, with under 1 ms additional mean delay in those fixtures;
-clean cadence gains no standing delay. The latest local completed capture,
-`Moonlight-vrr-full-20260917-000310-518.vrrtrace` (365141 bytes, SHA-256
-`3659041c29f16d30c9bb12d7b71f745d12f001a8b332ab8c6c94ecb757fcc1dc`),
-passes fresh exact replay and sequence integrity. It has no matching launcher
-JSON and its workload is unidentified, so it is supplemental timing evidence,
-not proof about the reported difficult games. In its 16.63-second replay,
-submission-proxy jerk over 2 ms falls from 12.7% to 8.3%; p90 jerk falls from
-2.503 to 1.524 ms, while p99 remains 7.455 ms. Mean decode-to-submission grows
-by 0.495 ms and p95 by 1.032 ms. Both policies retain the capture's two source
-stall pairs. Nominal, periodic decision/preparation/submission and scheduler
-burst scenarios pass interval-safety and 30 ms p99 latency assertions without
-worker saturation. These models retain recorded admission and service; live
-motion and physical scanout still need a gameplay retest.
-
 The **Reduce judder** checkbox controls cadence smoothing
 independently of the three VRR timing presets. It defaults on and preserves
 existing saved choices. Session startup snapshots it, including across decoder
@@ -1523,15 +1648,26 @@ mapped slot. This redistributes available waiting time to reduce adjacent
 short/long intervals, at the expense of timestamp fidelity. It cannot guarantee
 uniform motion between irregularly sampled images or prevent compositor jitter.
 RTP values remain unchanged; their arbitrary epoch must not change scheduling.
-Conceptually, with `raw = sourceTime + delayBeforeThisFrame`:
+Conceptually, with `raw = sourceTime + delayBeforeThisFrame` and the learned
+readiness reserve `R` (zero for captures without the reserve parameters):
 
 ```text
 trackedPeriod += 0.025 * (eligibleSourceInterval - trackedPeriod)
 predicted      = previousSmoothedBasis + trackedPeriod
-adjustment     = 0.85 * (predicted - raw)
-adjustment     = clamp(adjustment, -delayBeforeThisFrame, 4000 us)
-smoothedBasis  = raw + adjustment
+error          = predicted - (raw + R)
+trackedPeriod -= 0.02 * error                 # phase feedback, next frame
+adjustment     = 0.85 * error
+adjustment     = clamp(adjustment, -(delayBeforeThisFrame + R), 6000 us - R)
+smoothedBasis  = raw + R + adjustment         # cadence_smoothing_us = R + adjustment
 ```
+
+`R` is applied to every timestamp-playout frame while smoothing is enabled,
+including frames the smoother cannot currently place, so a cadence reset does
+not step the schedule by `R`. It is learned only from frames the smoother
+placed: `min(readyOffset - playoutDelay, 0) - adjustment` is the lateness caused
+by moving that frame before its raw slot, and `R` tracks its p98 over the last
+128 placed frames minus 500 us, capped at 3 ms. See the 2026-09-22 Reduce judder
+section above for why and for its evidence.
 
 The actual integer implementation also reseeds from the authoritative fitted
 period when necessary and resets smoothing on rebases, rate/phase changes,
@@ -1544,11 +1680,12 @@ not a later actual execution time. Otherwise one late frame would move later
 frames and turn a temporary miss into persistent added delay. Older replay modes
 retain execution-anchored smoothing and the retired metronome for compatibility.
 
-The 4 ms cap bounds positive retiming, not total client latency. Readiness,
-queue capacity, timing-preset buffer caps and applicable presentation floors
-still constrain the schedule. Smoothing does not add a queued-frame allowance.
-Its readiness calibration key includes `|frame-smoothing=150-25-4000|cadence=2-0` so profiles
-from the period when the saved checkbox was inactive cannot cross-seed it.
+The 6 ms cap bounds positive retiming including the reserve, not total client
+latency. Readiness, queue capacity, timing-preset buffer caps and applicable
+presentation floors still constrain the schedule. Smoothing does not add a
+queued-frame allowance. Its readiness calibration key gains
+`|frame-smoothing=150-25-6000|cadence=2-0|catchup=20|smoothing-reserve=3000-500-980-500|period-feedback=20000`
+so profiles from earlier smoothing policies cannot cross-seed it.
 Unchecked sessions keep their existing calibration identity. Historical traces
 retain their recorded parameters and need no schema change.
 
@@ -1877,6 +2014,13 @@ effectiveMin    = min(1000 us, queueDelayLimit, modeAllowance)
 effectiveMax    = min(maximumInput, queueDelayLimit, modeAllowance)
 ```
 
+`maximumSmoothingLag` is `playout_smoothing_max_lag_us` (6 ms in production
+since 2026-09-22, 2 ms before), which also contains the smoothing readiness
+reserve. With Reduce judder on, 120 FPS therefore leaves a 16 ms queue delay
+limit after a 3 ms render lead (unchanged in practice, because the 16 ms input
+binds), while 144 FPS drops from 15.8 to 11.8 ms. Total buffering plus positive
+retiming stays within the same three-period capacity.
+
 The cold start first takes `max(6000 us, 0.95 * sourcePeriod)`, caps that by
 `max(displayPeriod, renderLead)` for history mode, then clamps to effective
 minimum/maximum. Consequently neither “the buffer always starts at 6 ms” nor
@@ -1897,7 +2041,9 @@ rather than presenting the capped policy as able to absorb all observed work.
 display identity, stream FPS, display refresh, smoothing settings,
 and session context, including the active native presenter. Balanced Target and
 Low Latency add distinct timing-mode suffixes. Enabled smoothing also appends
-`|frame-smoothing=150-25-2000|cadence=2-0` to isolate its readiness history.
+`|frame-smoothing=150-25-6000|cadence=2-0|catchup=20` and, when the reserve or
+period feedback is active, `|smoothing-reserve=3000-500-980-500|period-feedback=20000`
+to isolate its readiness history.
 Profiles expire after 14 days; saves require at least
 240 observations, use locking/atomic replacement, and cap storage at 16 profiles.
 
@@ -1945,29 +2091,45 @@ decode-to-render fence when a decoder output is handed off. Rendering waits for
 that exact value, so it need not wait for newer decode work. Render-to-decode
 ordering protects texture reuse. The purpose is both correctness and avoiding
 accidental waits for work belonging to subsequent frames.
-The worker's Windows decode check is nonblocking except for device-removal
-detection. `renderVideo()` queues `ID3D11DeviceContext4::Wait` for the captured
-boundary before any copy or shader read, letting controller scheduling and CPU
-command recording overlap the decoder tail. A zero CPU decode-wait measurement
-therefore does not mean the decode dependency was already complete.
+`renderVideo()` queues `ID3D11DeviceContext4::Wait` for the captured boundary
+before any copy or shader read; that GPU dependency is the correctness mechanism.
+With monitored fences, the worker's `waitForDecode()` also blocks until the
+exact captured value completes, taking no context lock and using its own event
+with the 50 ms / fence-value-verified wait described below. That post-wait clock
+is `decodeCompleteUs`, which production source mapping requires to absorb
+hardware decode time (the Linux `vaSyncSurface()` equivalent). Between
+`78b99f1c` and 2026-09-22 this check was nonblocking, which left Windows mapped
+from decoder output while Linux mapped from completion. Non-monitored fences and
+shared devices remain nonblocking; there, a zero CPU decode-wait measurement
+does not mean the decode dependency was already complete.
+
+Two mutexes serialize this renderer. FFmpeg's D3D11VA lock (`m_ContextLock`)
+guards the decode device's immediate context; FFmpeg holds it for each frame's
+entire decode submission. A separate presentation lock guards the render
+context, swapchain and prepared VRR frame against window-change callbacks. The
+presentation lock includes FFmpeg's lock only when decode and render share one
+immediate context. On separate devices, preparation and `Present` never hold
+FFmpeg's lock; `renderVideo()` and `captureDecodeBoundary()` take it only
+around decode-context `Signal`/`Wait`/`Flush`. Lock order is presentation, then
+context.
 
 Preparation binds and clears the backbuffer, renders video and overlays, and sets
 colorspace/HDR state. Direct decoder texture binding follows stock Moonlight on
 Intel and on separate decode/render devices. AMD/NVIDIA single-device sessions
 keep the compatibility copy below 4K; 4K streams bind when the GPU has Feature
-Level 11.1+ or D3D11 fences. It uses the D3D/FFmpeg context lock while manipulating
-shared state. Immediately after recording the frame, preparation signals and
+Level 11.1+ or D3D11 fences. It holds the presentation lock while manipulating
+render state. Immediately after recording the frame, preparation signals and
 flushes a present-ready fence, arms its event, and performs one nonblocking value
 poll. It publishes the prepared frame without waiting for completion, reports
-`sourceFrameReusable=false`, and releases the shared context lock before the
+`sourceFrameReusable=false`, and releases the presentation lock before the
 worker's cadence hold. The source `AVFrame` remains owned through presentation;
 on the separate-device path, the render-to-decode fence also protects decoder-
 surface reuse.
 
-At the target boundary `presentAdaptive()` reacquires the context lock and verifies
-that exact present-ready value before calling `Present`. It releases the shared
-lock while waiting, so subsequent decode can continue, then reacquires and
-revalidates the prepared frame, display state and device. Usually the cadence hold
+At the target boundary `presentAdaptive()` reacquires the presentation lock and
+verifies that exact present-ready value before calling `Present`. It releases
+that lock while waiting (on a shared device this also lets decode continue), then
+reacquires and revalidates the prepared frame, display state and device. Usually the cadence hold
 has already covered the GPU work and this is a completed-value poll. A late frame
 pays only the residual wait at the target. The complete fence wait has a 50 ms
 bound, blocks on the event in 1 ms slices, and checks the fence value between

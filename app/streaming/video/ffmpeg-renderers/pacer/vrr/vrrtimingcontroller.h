@@ -109,6 +109,13 @@
     /* 0: historical pair gate; 1: window; 2: window and compensated bursts. */ \
     X(uint64_t, playout_smoothing_windowed_cadence, playoutSmoothingWindowedCadence, 0) \
     X(uint64_t, playout_smoothing_recovery_us, playoutSmoothingRecoveryUs, 200000) \
+    /* Zero maximum disables the learned smoothed-cadence readiness reserve. */ \
+    X(uint64_t, playout_smoothing_reserve_max_us, playoutSmoothingReserveMaxUs, 0) \
+    X(uint64_t, playout_smoothing_reserve_tolerance_us, playoutSmoothingReserveToleranceUs, 0) \
+    X(uint64_t, playout_smoothing_reserve_percentile_per_mille, playoutSmoothingReservePercentilePerMille, 0) \
+    X(uint64_t, playout_smoothing_reserve_release_us_per_second, playoutSmoothingReserveReleaseUsPerSecond, 0) \
+    /* Zero retains interval-EMA-only period tracking for smoothed cadence. */ \
+    X(uint64_t, playout_smoothing_period_feedback_per_million, playoutSmoothingPeriodFeedbackPerMillion, 0) \
     X(uint64_t, playout_metronome_enabled, playoutMetronomeEnabled, 0) \
     X(uint64_t, playout_delay_start_period_per_mille, playoutDelayStartPeriodPerMille, 0) \
     X(uint64_t, playout_delay_maximum_period_per_mille, playoutDelayMaximumPeriodPerMille, 0) \
@@ -363,6 +370,9 @@ public:
     // belongs to (fitted source rate divided by the band width), and how many
     // lateness samples that band has admitted.
     uint64_t playoutDelayUs() const;
+    // Learned Reduce judder readiness reserve; already included in each
+    // decision's cadenceSmoothingUs, never in playoutDelayUs.
+    uint64_t smoothingReserveUs() const { return m_SmoothingReserveUs; }
     unsigned int playoutBandIndex() const;
     uint64_t playoutBandSamples() const;
     const VrrTimingParameters& parameters() const;
@@ -461,7 +471,14 @@ private:
     // toward the raw slot by the configured gain. Resets on discontinuities.
     int64_t cadenceSmoothingAdjustUs(const CadenceObservation& cadence,
                                      bool rebased, uint64_t rawBasisUs,
-                                     uint64_t playoutDelayUs);
+                                     uint64_t playoutDelayUs,
+                                     uint64_t reserveUs = 0);
+    // Smoothed cadence is only useful where frames can be ready. The reserve
+    // moves the smoothed schedule later by the recent shortfall that exceeds
+    // the tolerated lateness; it is zero unless its parameters enable it.
+    bool smoothingReserveEnabled() const;
+    void observeSmoothingReserve(bool engaged, int64_t shortfallUs,
+                                 uint64_t nowUs);
     // Metronome: the schedule advances from the last presented slot by the
     // fitted source period and corrects phase toward the raw slot by a
     // bounded step per frame. Returns the lag of that tick behind the raw
@@ -639,6 +656,17 @@ private:
     uint64_t m_MetronomePeriodUsQ16 = 0;
     uint64_t m_SmoothedPeriodUs = 0;
     int64_t m_SmoothedPeriodRemainder = 0;
+    int64_t m_SmoothedPeriodFeedbackRemainder = 0;
+    // Whether this frame's slot came from the smoother rather than a reset.
+    bool m_SmoothingEngaged = false;
+    // Learned smoothed-cadence reserve and the recent lateness the smoother
+    // caused by placing frames before their raw slots, which it is chosen from.
+    uint64_t m_SmoothingReserveUs = 0;
+    uint64_t m_SmoothingReserveReleaseRemainder = 0;
+    uint64_t m_LastSmoothingReserveUpdateUs = 0;
+    std::array<int64_t, 128> m_SmoothingShortfalls{};
+    size_t m_SmoothingShortfallCount = 0;
+    size_t m_SmoothingShortfallIndex = 0;
     // Recent magnitudes of the stamp's deviation from the metronome grid
     // once known debt is excluded. Their upper percentile is the capture
     // jitter the grid absorbs; a deviation beyond it is motion timing the

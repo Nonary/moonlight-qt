@@ -14,6 +14,7 @@ private slots:
     void defaultsRoundTrip();
     void initialCalibrationPolicyRoundTrip();
     void windowedSmoothingPolicyRoundTrip();
+    void judderReservePolicyRoundTrip();
     void offsetRecoveryPolicyRoundTrip();
     void nativeHitchPolicyRoundTrip();
     void displayEventPolicyRoundTrip();
@@ -95,6 +96,51 @@ void VrrReplayConfigTest::windowedSmoothingPolicyRoundTrip()
     QVERIFY2(applyVrrReplayControllerSnapshot(historical, parameters, error), qPrintable(error));
     QCOMPARE(parameters.playoutSmoothingWindowedCadence, uint64_t(0));
     QCOMPARE(parameters.playoutSmoothingRecoveryUs, uint64_t(200000));
+}
+
+void VrrReplayConfigTest::judderReservePolicyRoundTrip()
+{
+    VrrTimingParameters parameters;
+    QCOMPARE(parameters.playoutSmoothingReserveMaxUs, uint64_t(0));
+    QCOMPARE(parameters.playoutSmoothingPeriodFeedbackPerMillion, uint64_t(0));
+    QString error;
+    const auto production = vrrTimingParametersForSession(VrrSessionConfig{});
+    QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(production), parameters, error), qPrintable(error));
+    QCOMPARE(parameters.playoutSmoothingMaxLagUs, uint64_t(6000));
+    QCOMPARE(parameters.playoutSmoothingReserveMaxUs, uint64_t(3000));
+    QCOMPARE(parameters.playoutSmoothingReserveToleranceUs, uint64_t(500));
+    QCOMPARE(parameters.playoutSmoothingReservePercentilePerMille, uint64_t(980));
+    QCOMPARE(parameters.playoutSmoothingReserveReleaseUsPerSecond, uint64_t(500));
+    QCOMPARE(parameters.playoutSmoothingPeriodFeedbackPerMillion, uint64_t(20000));
+    // The reserve shares the positive retiming budget and cannot exceed it.
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        {{"playout_smoothing_reserve_max_us", 6001}}, parameters, error));
+    QCOMPARE(parameters.playoutSmoothingReserveMaxUs, uint64_t(3000));
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        {{"playout_smoothing_reserve_percentile_per_mille", 499}}, parameters, error));
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        {{"playout_smoothing_period_feedback_per_million", 100001}}, parameters, error));
+    QVERIFY2(applyVrrReplayControllerSnapshot(
+        {{"playout_smoothing_max_lag_us", 2000}, {"playout_smoothing_reserve_max_us", 0}},
+        parameters, error), qPrintable(error));
+    QCOMPARE(parameters.playoutSmoothingReserveMaxUs, uint64_t(0));
+    // Captures made before these controls replay with them disabled.
+    auto historical = vrrTimingParametersToJson(production);
+    historical.remove("playout_smoothing_max_lag_us");
+    historical.remove("playout_smoothing_reserve_max_us");
+    historical.remove("playout_smoothing_reserve_tolerance_us");
+    historical.remove("playout_smoothing_reserve_percentile_per_mille");
+    historical.remove("playout_smoothing_reserve_release_us_per_second");
+    historical.remove("playout_smoothing_period_feedback_per_million");
+    parameters = VrrTimingParameters{};
+    QVERIFY2(applyVrrReplayControllerSnapshot(historical, parameters, error), qPrintable(error));
+    QCOMPARE(parameters.playoutSmoothingReserveMaxUs, uint64_t(0));
+    QCOMPARE(parameters.playoutSmoothingPeriodFeedbackPerMillion, uint64_t(0));
+    VrrSessionConfig unchecked;
+    unchecked.smoothFrameTiming = false;
+    const auto disabled = vrrTimingParametersForSession(unchecked);
+    QCOMPARE(disabled.playoutSmoothingReserveMaxUs, uint64_t(0));
+    QCOMPARE(disabled.playoutSmoothingPeriodFeedbackPerMillion, uint64_t(0));
 }
 
 void VrrReplayConfigTest::defaultsRoundTrip()

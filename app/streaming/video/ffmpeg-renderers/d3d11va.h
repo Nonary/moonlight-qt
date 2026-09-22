@@ -58,6 +58,8 @@ public:
 private:
     static void lockContext(void* lock_ctx);
     static void unlockContext(void* lock_ctx);
+    void lockPresentation();
+    void unlockPresentation();
 
     bool setupRenderingResources();
     bool m_CompositionRequested = false;
@@ -73,7 +75,7 @@ private:
                                 uint64_t decodeBoundary = 0);
     bool initializeVrrPresentReadyFence();
     bool beginVrrPresentReady();
-    bool finishVrrPresentReady(bool releaseContextWhileWaiting);
+    bool finishVrrPresentReady(bool releasePresentationWhileWaiting);
     HRESULT presentPreparedFrame(const DxgiPresentParameters& parameters);
     UINT legacyPresentFlags() const;
     void initializeVrrPresentationState(SDL_Window* window,
@@ -162,7 +164,12 @@ private:
     UINT64 m_D2RFenceValue;
     Microsoft::WRL::ComPtr<ID3D11Fence> m_DecodeR2DFence, m_RenderR2DFence;
     UINT64 m_R2DFenceValue;
+    // FFmpeg's D3D11VA lock for the decode device's immediate context.
     SDL_mutex* m_ContextLock;
+    // Render context, swapchain and prepared VRR frame state. It includes
+    // m_ContextLock only when decode and render share one immediate context.
+    // Lock order: m_PresentationLock, then m_ContextLock.
+    SDL_mutex* m_PresentationLock;
     bool m_BindDecoderOutputTextures;
 
     DECODER_PARAMETERS m_DecoderParams;
@@ -200,10 +207,11 @@ private:
     VrrFallbackReason m_VrrFallbackReason;
     bool m_VrrFramePrepared;
     uint64_t m_VrrPreparedDecodeBoundary;
-    bool m_VrrContextLocked;
+    bool m_VrrPresentationLocked;
     Microsoft::WRL::ComPtr<ID3D11Fence> m_VrrPresentReadyFence;
     UINT64 m_VrrPresentReadyFenceValue;
     HANDLE m_VrrPresentReadyFenceEvent;
+    HANDLE m_VrrDecodeReadyEvent;
     bool m_VrrPresentReadyAvailable;
     bool m_VrrGpuReadyAttempted;
     bool m_VrrGpuReadySignalResultValid;

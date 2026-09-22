@@ -967,24 +967,23 @@ candidates.
 
 With smoothing enabled, production uses the gain smoother: it advances by a
 tracked source period and pulls 15 percent toward the mapped timestamp slot,
-with a 2.5-percent period EMA and a 4 ms positive adjustment cap. The cap does
-not bound total client latency. The metronome remains disabled. The production
-controller test covers approximately 77 FPS host jitter in all three timing
-presets, smoothing off/on, a host stall, a late wake, and a change to 60 FPS.
-It requires reduced interval jerk, bounded latency and queue occupancy, and
-settling at the new rate without persistent smoothing debt.
-
-The stronger correction allowance retains the same checkbox and filter gain.
-`testStrongerSmoothingTradeoff` compares the previous 2 ms policy with the live
-resolver across all presets at 60, 77, 90, 120 and 240 FPS, using clean,
-alternating and four-frame timing patterns. It requires improvement on severe
-60 FPS jitter, no material cadence regression, at most 2.5 ms additional mean
-latency, no standing-delay increase on clean cadence, and bounded latency and
-queue use. Queue capacity reserves the full positive correction allowance;
-raising the allowance does not create an additional frame slot.
-Worker capture fixtures set trace variables through `qputenv`, matching the
-production Qt environment reader. The checkbox test deliberately retains its
-SDL cache setup to verify that current Qt values take precedence.
+with a 2.5-percent period EMA plus 2-percent phase-error period feedback
+(`playout_smoothing_period_feedback_per_million=20000`) and a 6 ms positive
+adjustment cap. A learned readiness reserve
+(`playout_smoothing_reserve_*`: at most 3 ms, p98, 0.5 ms tolerance, 0.5 ms/s
+release) delays the smoothed schedule by the recent lateness the smoother itself
+caused by moving frames before their raw slots; delivery that misses the raw
+slot remains playout-buffer evidence. The reserve is included in
+`cadence_smoothing_us`, never in `playout_delay_us`. Captures without these
+fields replay with them disabled. The caps do not bound total client latency.
+The metronome remains disabled. The production controller tests cover
+approximately 77 FPS host jitter in all three timing presets, smoothing off/on,
+a host stall, a late wake, and a change to 60 FPS; 90 FPS quantized to a 120 Hz
+host with normal and tight buffers; even stamps with delivery spikes, which must
+not acquire a reserve; reserve release after pacing becomes even; and a 70-100
+FPS rate ramp. `configs/judder-reserve-variants.json` compares the session
+policy with the previous 2 ms policy, each new control removed, alternative
+tolerances and caps, and Reduce judder off in one batch.
 
 The retired metronome policy is available for replay with
 `controller.timestamp_playout_enabled` and
