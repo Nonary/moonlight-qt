@@ -4200,7 +4200,7 @@ void testProductionSmoothFrameTiming()
             expect(policy.playoutSmoothingGainPerMille == (enabled ? 150 : 0) &&
                        policy.playoutSmoothingPeriodAlphaPerMille == 25 &&
                        policy.playoutSmoothingRecoveryUs == 0 &&
-                       policy.playoutSmoothingMaxLagUs == 2000 &&
+                       policy.playoutSmoothingMaxLagUs == 4000 &&
                        policy.playoutMetronomeEnabled == 0,
                    "the preference must select bounded smoothing independently of the timing preset");
             VrrTimingController controller(session, true, policy);
@@ -4220,7 +4220,7 @@ void testProductionSmoothFrameTiming()
                 controller.notePreparationDuration(1000);
                 controller.noteSchedulerDelays(lateWake, 0, true);
                 controller.noteSubmission(true, false, submitted);
-                expect(d.cadenceSmoothingUs <= 2000 &&
+                expect(d.cadenceSmoothingUs <= int64_t(policy.playoutSmoothingMaxLagUs) &&
                            (enabled || d.cadenceSmoothingUs == 0),
                        "smoothing must respect its positive retiming cap and the off switch");
                 expect(submitted >= decoded && submitted - decoded <= 30000 &&
@@ -4661,6 +4661,79 @@ void testLatencyPresetsBoundHitchesThroughCadenceChanges()
     }
 }
 
+void testStrongerSmoothingTradeoff()
+{
+    // Compare against the previous live strength, not smoothing disabled.
+    // Several source cadences and non-alternating patterns exercise clipping,
+    // cumulative phase correction and the shared three-frame queue budget.
+    for (int mode : {0, 1, 2}) for (int fps : {60, 77, 90, 120, 240}) {
+        for (const auto& pattern : std::vector<std::vector<unsigned>>{
+                 {100}, {80, 120}, {60, 140}, {70, 110, 130, 90}}) {
+            struct Result {
+                uint64_t jerk = 0;
+                uint64_t latency = 0;
+                unsigned samples = 0;
+            } results[2];
+            for (int stronger : {0, 1}) {
+                auto session = config(fps, fps <= 90 ? 120 : fps == 120 ? 144 : 240);
+                session.latencyMode = mode;
+                auto policy = vrrTimingParametersForSession(session);
+                if (!stronger) {
+                    policy.playoutSmoothingGainPerMille = 150;
+                    policy.playoutSmoothingMaxLagUs = 2000;
+                }
+                VrrTimingController controller(session, true, policy);
+                uint64_t tickNumerator = 0, last = 0, previousInterval = 0;
+                for (int i = 0; i < 2400; ++i) {
+                    tickNumerator += 90000ULL * pattern[i % pattern.size()];
+                    const auto ticks = uint32_t(tickNumerator / (fps * 100));
+                    const auto decoded = decodedTimeForRtp(1000000, ticks);
+                    const auto now = std::max(last, decoded);
+                    const auto d = controller.schedule(frame(i, ticks, true, decoded), now);
+                    const auto submitted = std::max(d.targetUs,
+                        std::max(now, d.renderStartUs) + 1000);
+                    const bool bounded = submitted >= decoded && submitted - decoded <= 30000 &&
+                               d.playoutDelayUs <= controller.playoutQueueLimitUs() &&
+                               d.cadenceSmoothingUs <= int64_t(policy.playoutSmoothingMaxLagUs) &&
+                               d.targetUs >= d.sourceTimeUs;
+                    expect(bounded,
+                           "stronger smoothing must retain latency, retiming and queue limits");
+                    controller.notePreparationDuration(1000);
+                    controller.noteSchedulerDelays(0, 0, true);
+                    controller.noteSubmission(true, false, submitted);
+                    const auto interval = submitted - last;
+                    if (i >= 600) {
+                        results[stronger].jerk += interval > previousInterval ?
+                            interval - previousInterval : previousInterval - interval;
+                        results[stronger].latency += submitted - decoded;
+                        ++results[stronger].samples;
+                    }
+                    last = submitted;
+                    previousInterval = interval;
+                }
+            }
+            std::printf("stronger mode=%d fps=%d pattern=%u jerk=%llu -> %llu latency=%llu -> %llu us\n",
+                mode, fps, pattern[0],
+                (unsigned long long)(results[0].jerk / results[0].samples),
+                (unsigned long long)(results[1].jerk / results[1].samples),
+                (unsigned long long)(results[0].latency / results[0].samples),
+                (unsigned long long)(results[1].latency / results[1].samples));
+            expect(results[1].jerk <= results[0].jerk + results[1].samples * 50ULL,
+                   "stronger smoothing must not materially worsen recurring source jitter");
+            expect(results[1].latency <= results[0].latency + results[1].samples * 2500ULL,
+                   "stronger smoothing must cost at most 2.5 ms additional mean latency");
+            if (fps == 60 && (pattern[0] == 60 || pattern[0] == 70)) {
+                expect(results[1].jerk * 100 <= results[0].jerk * 85,
+                       "wider correction must reduce severe recurring jitter by at least 15 percent");
+            }
+            if (pattern.size() == 1) {
+                expect(results[1].latency <= results[0].latency + results[1].samples * 50ULL,
+                       "clean cadence must not acquire standing delay from the larger allowance");
+            }
+        }
+    }
+}
+
 void testResponsiveSmoothingWithWideJitter()
 {
     for (int mode : {0, 1, 2}) {
@@ -4742,7 +4815,7 @@ void testWindowedSmoothingQuantizedCadence()
                         interval - previousInterval : previousInterval - interval;
                     latency[windowed] += submitted - decoded;
                 }
-                expect(d.cadenceSmoothingUs <= 2000 &&
+                expect(d.cadenceSmoothingUs <= int64_t(policy.playoutSmoothingMaxLagUs) &&
                            d.cadenceSmoothingUs >= -int64_t(d.playoutDelayUs) &&
                            d.playoutDelayUs <= controller.playoutQueueLimitUs() &&
                            submitted - decoded <= 22000,
@@ -5528,6 +5601,7 @@ int main()
     testMeanMissBuffer();
     testThresholdedReadinessGrowth();
     testPresetReadinessTargets();
+    testStrongerSmoothingTradeoff();
     testResponsiveSmoothingWithWideJitter();
     testWindowedSmoothingQuantizedCadence();
     testCompensatedHalfPeriodCadence();

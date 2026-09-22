@@ -967,12 +967,24 @@ candidates.
 
 With smoothing enabled, production uses the gain smoother: it advances by a
 tracked source period and pulls 15 percent toward the mapped timestamp slot,
-with a 2.5-percent period EMA and a 2 ms positive adjustment cap. The cap does
+with a 2.5-percent period EMA and a 4 ms positive adjustment cap. The cap does
 not bound total client latency. The metronome remains disabled. The production
 controller test covers approximately 77 FPS host jitter in all three timing
 presets, smoothing off/on, a host stall, a late wake, and a change to 60 FPS.
 It requires reduced interval jerk, bounded latency and queue occupancy, and
 settling at the new rate without persistent smoothing debt.
+
+The stronger correction allowance retains the same checkbox and filter gain.
+`testStrongerSmoothingTradeoff` compares the previous 2 ms policy with the live
+resolver across all presets at 60, 77, 90, 120 and 240 FPS, using clean,
+alternating and four-frame timing patterns. It requires improvement on severe
+60 FPS jitter, no material cadence regression, at most 2.5 ms additional mean
+latency, no standing-delay increase on clean cadence, and bounded latency and
+queue use. Queue capacity reserves the full positive correction allowance;
+raising the allowance does not create an additional frame slot.
+Worker capture fixtures set trace variables through `qputenv`, matching the
+production Qt environment reader. The checkbox test deliberately retains its
+SDL cache setup to verify that current Qt values take precedence.
 
 The retired metronome policy is available for replay with
 `controller.timestamp_playout_enabled` and

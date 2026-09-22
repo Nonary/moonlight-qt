@@ -953,7 +953,7 @@ Flickable {
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
                     ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Gently adjusts when frames are displayed to reduce uneven timing, using existing buffering to keep added latency low. Does not blend images or eliminate game stalls.") + "\n\n" +
+                    ToolTip.text: qsTr("Adjusts when frames are displayed to reduce uneven timing, allowing up to 4 ms of extra timing correction. May increase latency. Does not blend images or eliminate game stalls.") + "\n\n" +
                                   qsTr("Reconnect the stream after changing this setting.")
                 }
 

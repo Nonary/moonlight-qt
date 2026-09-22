@@ -1427,7 +1427,7 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | Capacity telemetry | `playout_capacity_telemetry=1` exposes unclamped demand and cap pressure in live decisions |
 | Smoothing gain | 150 when Reduce judder is checked; 0 when unchecked |
 | Smoothing period EMA | 25 per mille with fractional carry; active only with smoothing enabled |
-| Positive smoothing lag cap | 2,000 us; active only with smoothing enabled |
+| Positive smoothing lag cap | 4,000 us; active only with smoothing enabled |
 | Render lead floor | 3,000 us |
 | Preparation start | Use the existing playout interval (`playout_prepare_on_arrival=1`), with no additional post-submission delay |
 | Minimum preparation lead input | 2,500 us |
@@ -1478,6 +1478,34 @@ timestamp production behavior.
 
 ### 8.3 Cadence smoothing
 
+Strength follow-up, based on `26675aa8`: the enabled option now permits 4 ms
+of positive retiming instead of 2 ms. The gain, period tracking, cadence
+qualification and recovery rules are unchanged. The three-frame capacity
+calculation reserves the full 4 ms before allowing adaptive queue delay;
+the timing presets' existing ceilings still apply. This is an allowance,
+not a fixed extra 4 ms wait, and it is not a bound on total client latency.
+The existing checkbox remains the only smoothing control. Captured parameters
+preserve historical exact replay, and the parameter-derived calibration key
+automatically separates the new enabled policy from the old 2 ms policy.
+
+Validation: all six required VRR/backend suites and replay help pass. The new
+60-case controller comparison spans three presets, five rates (60 through
+240 FPS) and four timing patterns. Severe 60 FPS patterns improve mean interval
+jerk by about 20-50%, with under 1 ms additional mean delay in those fixtures;
+clean cadence gains no standing delay. The latest local completed capture,
+`Moonlight-vrr-full-20260917-000310-518.vrrtrace` (365141 bytes, SHA-256
+`3659041c29f16d30c9bb12d7b71f745d12f001a8b332ab8c6c94ecb757fcc1dc`),
+passes fresh exact replay and sequence integrity. It has no matching launcher
+JSON and its workload is unidentified, so it is supplemental timing evidence,
+not proof about the reported difficult games. In its 16.63-second replay,
+submission-proxy jerk over 2 ms falls from 12.7% to 8.3%; p90 jerk falls from
+2.503 to 1.524 ms, while p99 remains 7.455 ms. Mean decode-to-submission grows
+by 0.495 ms and p95 by 1.032 ms. Both policies retain the capture's two source
+stall pairs. Nominal, periodic decision/preparation/submission and scheduler
+burst scenarios pass interval-safety and 30 ms p99 latency assertions without
+worker saturation. These models retain recorded admission and service; live
+motion and physical scanout still need a gameplay retest.
+
 The **Reduce judder** checkbox controls cadence smoothing
 independently of the three VRR timing presets. It defaults on and preserves
 existing saved choices. Session startup snapshots it, including across decoder
@@ -1501,7 +1529,7 @@ Conceptually, with `raw = sourceTime + delayBeforeThisFrame`:
 trackedPeriod += 0.025 * (eligibleSourceInterval - trackedPeriod)
 predicted      = previousSmoothedBasis + trackedPeriod
 adjustment     = 0.85 * (predicted - raw)
-adjustment     = clamp(adjustment, -delayBeforeThisFrame, 2000 us)
+adjustment     = clamp(adjustment, -delayBeforeThisFrame, 4000 us)
 smoothedBasis  = raw + adjustment
 ```
 
@@ -1516,10 +1544,10 @@ not a later actual execution time. Otherwise one late frame would move later
 frames and turn a temporary miss into persistent added delay. Older replay modes
 retain execution-anchored smoothing and the retired metronome for compatibility.
 
-The 2 ms cap bounds positive retiming, not total client latency. Readiness,
+The 4 ms cap bounds positive retiming, not total client latency. Readiness,
 queue capacity, timing-preset buffer caps and applicable presentation floors
 still constrain the schedule. Smoothing does not add a queued-frame allowance.
-Its readiness calibration key gains `|frame-smoothing=150-25-2000|cadence=2-0` so profiles
+Its readiness calibration key includes `|frame-smoothing=150-25-4000|cadence=2-0` so profiles
 from the period when the saved checkbox was inactive cannot cross-seed it.
 Unchecked sessions keep their existing calibration identity. Historical traces
 retain their recorded parameters and need no schema change.

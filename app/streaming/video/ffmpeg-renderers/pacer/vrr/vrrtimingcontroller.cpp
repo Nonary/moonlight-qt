@@ -36,13 +36,14 @@ constexpr uint64_t kPlayoutPercentilePerMille = 1000;
 constexpr uint64_t kPlayoutBurstExclusionPerMille = 750;
 // Reduce judder keeps 85% of the predicted slot and 15% of the raw mapped
 // timestamp. Track gradual source-rate changes with a 2.5-percent period EMA
-// and cap positive retiming at 2 ms. Reuse the existing playout headroom for
+// and cap positive retiming at 4 ms so wider recurring jitter is not clipped
+// at the former 2 ms limit. Reuse the existing playout headroom for
 // early retiming; the adjustment cap is not a bound on total client latency.
 // Unchecked sessions retain timestamp-following playout. Schema defaults and
 // explicit captured parameters preserve historical replay behavior.
 constexpr uint64_t kPlayoutSmoothingGainPerMille = 150;
 constexpr uint64_t kPlayoutSmoothingPeriodAlphaPerMille = 25;
-constexpr uint64_t kPlayoutSmoothingMaxLagUs = 2000;
+constexpr uint64_t kPlayoutSmoothingMaxLagUs = 4000;
 // Retired metronome playout, kept reachable for replay. It advances the
 // presented slot by the fitted source period, corrects phase toward the mapped
 // sender clock by a bounded step, and moves a frame that cannot make its tick
