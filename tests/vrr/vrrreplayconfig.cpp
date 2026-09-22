@@ -529,6 +529,17 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutSmoothingRecoveryUs > 1000000) {
         return fail("playout_smoothing_recovery_us must be in 0..1000000");
     }
+    if (value.playoutSmoothingReserveMaxUs > value.playoutSmoothingMaxLagUs ||
+            value.playoutSmoothingReserveToleranceUs > 10000 ||
+            value.playoutSmoothingReservePercentilePerMille > 1000 ||
+            (value.playoutSmoothingReserveMaxUs != 0 &&
+             value.playoutSmoothingReservePercentilePerMille < 500) ||
+            value.playoutSmoothingReserveReleaseUsPerSecond > 100000) {
+        return fail("playout_smoothing_reserve must not exceed the smoothing lag cap; tolerance 0..10000, percentile 500..1000 per mille when enabled, release 0..100000 us/s");
+    }
+    if (value.playoutSmoothingPeriodFeedbackPerMillion > 100000) {
+        return fail("playout_smoothing_period_feedback_per_million must be in 0..100000");
+    }
     if (value.playoutDelayMinimumSamples == 0 ||
             value.playoutDelayReservoirSamples == 0 ||
             value.playoutBandWidthHz == 0 ||

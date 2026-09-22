@@ -64,6 +64,11 @@ VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
     policy.playoutSmoothingWindowedCadence = 0;
     policy.playoutSmoothingRecoveryUs = 200000;
     policy.playoutSmoothingMaxLagUs = 6000;
+    policy.playoutSmoothingPeriodFeedbackPerMillion = 0;
+    policy.playoutSmoothingReserveMaxUs = 0;
+    policy.playoutSmoothingReserveToleranceUs = 0;
+    policy.playoutSmoothingReservePercentilePerMille = 0;
+    policy.playoutSmoothingReserveReleaseUsPerSecond = 0;
     policy.playoutDelayMaximumUs = 8000;
     policy.playoutDelayMaximumPeriodPerMille = 950;
     policy.playoutDelayAttackUs = 50;
@@ -86,6 +91,11 @@ VrrTimingParameters legacyFeedbackParameters(const VrrSessionConfig& session)
     policy.playoutDelayMarginUs = 300;
     policy.playoutSmoothingGainPerMille = 0;
     policy.playoutSmoothingMaxLagUs = 6000;
+    policy.playoutSmoothingPeriodFeedbackPerMillion = 0;
+    policy.playoutSmoothingReserveMaxUs = 0;
+    policy.playoutSmoothingReserveToleranceUs = 0;
+    policy.playoutSmoothingReservePercentilePerMille = 0;
+    policy.playoutSmoothingReserveReleaseUsPerSecond = 0;
     policy.playoutDelayMaximumUs = 16000;
     return policy;
 }
@@ -4200,7 +4210,12 @@ void testProductionSmoothFrameTiming()
             expect(policy.playoutSmoothingGainPerMille == (enabled ? 150 : 0) &&
                        policy.playoutSmoothingPeriodAlphaPerMille == 25 &&
                        policy.playoutSmoothingRecoveryUs == 0 &&
-                       policy.playoutSmoothingMaxLagUs == 2000 &&
+                       policy.playoutSmoothingMaxLagUs == 6000 &&
+                       policy.playoutSmoothingPeriodFeedbackPerMillion == (enabled ? 20000U : 0U) &&
+                       policy.playoutSmoothingReserveMaxUs == (enabled ? 3000U : 0U) &&
+                       policy.playoutSmoothingReserveToleranceUs == (enabled ? 500U : 0U) &&
+                       policy.playoutSmoothingReservePercentilePerMille == (enabled ? 980U : 0U) &&
+                       policy.playoutSmoothingReserveReleaseUsPerSecond == (enabled ? 500U : 0U) &&
                        policy.playoutMetronomeEnabled == 0,
                    "the preference must select bounded smoothing independently of the timing preset");
             VrrTimingController controller(session, true, policy);
@@ -4220,7 +4235,7 @@ void testProductionSmoothFrameTiming()
                 controller.notePreparationDuration(1000);
                 controller.noteSchedulerDelays(lateWake, 0, true);
                 controller.noteSubmission(true, false, submitted);
-                expect(d.cadenceSmoothingUs <= 2000 &&
+                expect(d.cadenceSmoothingUs <= int64_t(policy.playoutSmoothingMaxLagUs) &&
                            (enabled || d.cadenceSmoothingUs == 0),
                        "smoothing must respect its positive retiming cap and the off switch");
                 expect(submitted >= decoded && submitted - decoded <= 30000 &&
@@ -4742,7 +4757,7 @@ void testWindowedSmoothingQuantizedCadence()
                         interval - previousInterval : previousInterval - interval;
                     latency[windowed] += submitted - decoded;
                 }
-                expect(d.cadenceSmoothingUs <= 2000 &&
+                expect(d.cadenceSmoothingUs <= int64_t(policy.playoutSmoothingMaxLagUs) &&
                            d.cadenceSmoothingUs >= -int64_t(d.playoutDelayUs) &&
                            d.playoutDelayUs <= controller.playoutQueueLimitUs() &&
                            submitted - decoded <= 22000,
@@ -4860,6 +4875,231 @@ void testWindowedSmoothingResetsOnDiscontinuity()
             last = submitted;
         }
         expect(recovered > 180, "windowed cadence must recover after genuine discontinuities");
+    }
+}
+
+// Reduce judder fixtures: host present stamps and client delivery, both in
+// integer arithmetic so every compiler replays the same frames.
+struct JudderResult {
+    uint64_t pairs = 0, jerkOver2ms = 0, jerkSumUs = 0, latencySumUs = 0, frames = 0;
+    uint64_t retimingSumUs = 0;
+    int64_t maximumSmoothingUs = 0;
+    uint64_t maximumReserveUs = 0, finalReserveUs = 0;
+    double jerkShare() const { return pairs ? double(jerkOver2ms) / pairs : 0; }
+    uint64_t meanJerkUs() const { return pairs ? jerkSumUs / pairs : 0; }
+    uint64_t meanLatencyUs() const { return frames ? latencySumUs / frames : 0; }
+    // Mean distance of the smoothed slot from the raw slot, reserve excluded.
+    uint64_t meanRetimingUs() const { return frames ? retimingSumUs / frames : 0; }
+};
+
+// Deterministic delivery: sub-millisecond network/decode variation with a
+// 2.5 ms spike on every 97th frame.
+uint64_t judderDeliveryJitterUs(int i)
+{
+    return static_cast<uint64_t>((static_cast<uint64_t>(i) * 7919ULL) % 700ULL) +
+        (i % 97 == 0 ? 2500 : 0);
+}
+
+template<typename TicksFor>
+JudderResult runJudderFixture(const VrrSessionConfig& session,
+                              const VrrTimingParameters& policy,
+                              int frames, int measureFrom, TicksFor ticksFor,
+                              VrrTimingController** observe = nullptr)
+{
+    VrrTimingController controller(session, true, policy);
+    if (observe != nullptr) *observe = nullptr;
+    JudderResult result;
+    uint64_t last = 0, previousInterval = 0;
+    for (int i = 0; i < frames; ++i) {
+        const uint32_t ticks = ticksFor(i);
+        const uint64_t decoded = decodedTimeForRtp(1000000, ticks) + judderDeliveryJitterUs(i);
+        const uint64_t now = std::max(last, decoded);
+        // The reserve applied to this decision is the one learned before it.
+        const uint64_t reserve = controller.smoothingReserveUs();
+        const auto d = controller.schedule(frame(i, ticks, true, decoded), now);
+        const uint64_t ready = std::max(now, d.renderStartUs) + 1000;
+        const uint64_t submitted = std::max(d.targetUs, ready);
+        controller.notePreparationDuration(1000, 0, ready);
+        controller.noteSchedulerDelays(0, 0, true);
+        controller.noteSubmission(true, false, submitted);
+        const uint64_t interval = submitted - last;
+        if (i >= measureFrom) {
+            const uint64_t jerk = interval > previousInterval ?
+                interval - previousInterval : previousInterval - interval;
+            ++result.pairs;
+            result.jerkOver2ms += jerk > 2000;
+            result.jerkSumUs += jerk;
+            result.latencySumUs += submitted - decoded;
+            const int64_t retiming = d.cadenceSmoothingUs - static_cast<int64_t>(reserve);
+            result.retimingSumUs += static_cast<uint64_t>(retiming < 0 ? -retiming : retiming);
+            ++result.frames;
+        }
+        result.maximumSmoothingUs = std::max(result.maximumSmoothingUs, d.cadenceSmoothingUs);
+        result.maximumReserveUs = std::max(result.maximumReserveUs, controller.smoothingReserveUs());
+        previousInterval = interval;
+        last = submitted;
+    }
+    result.finalReserveUs = controller.smoothingReserveUs();
+    return result;
+}
+
+// A game presenting at `gameFps` on a fixed-refresh host is captured on the
+// next host vblank, so its RTP intervals alternate between whole vblanks.
+uint32_t hostQuantizedTicks(int i, int gameFps, int hostHz)
+{
+    const uint64_t vblank = (static_cast<uint64_t>(i + 1) * hostHz + gameFps - 1) / gameFps;
+    return static_cast<uint32_t>(vblank * 90000ULL / static_cast<uint64_t>(hostHz));
+}
+
+VrrTimingParameters withoutJudderReserve(VrrTimingParameters policy)
+{
+    policy.playoutSmoothingReserveMaxUs = 0;
+    policy.playoutSmoothingReserveToleranceUs = 0;
+    policy.playoutSmoothingReservePercentilePerMille = 0;
+    policy.playoutSmoothingReserveReleaseUsPerSecond = 0;
+    return policy;
+}
+
+// The production Reduce judder policy before its reserve, feedback and wider cap.
+VrrTimingParameters previousJudderPolicy(VrrTimingParameters policy)
+{
+    policy = withoutJudderReserve(policy);
+    policy.playoutSmoothingPeriodFeedbackPerMillion = 0;
+    policy.playoutSmoothingMaxLagUs = 2000;
+    return policy;
+}
+
+void testReduceJudderReserveCoversQuantizedCadence()
+{
+    // 90 FPS presented on a fixed 120 Hz host arrives as 8.3/8.3/16.7 ms
+    // stamps. Evening it out needs frames several milliseconds earlier and
+    // later than their raw slots. With a tight playout buffer the early ones
+    // cannot be ready, and the readiness clamp restores most of the judder.
+    for (int mode : {0, 1, 2}) for (bool tight : {false, true}) {
+        auto session = config(120, 120);
+        session.latencyMode = mode;
+        auto production = vrrTimingParametersForSession(session);
+        if (tight) production.playoutDelayMaximumUs = production.playoutDelayMinimumUs;
+        const auto ticks = [](int i) { return hostQuantizedTicks(i, 90, 120); };
+        const auto previous = runJudderFixture(session, previousJudderPolicy(production), 3600, 1200, ticks);
+        const auto noReserve = runJudderFixture(session, withoutJudderReserve(production), 3600, 1200, ticks);
+        const auto current = runJudderFixture(session, production, 3600, 1200, ticks);
+        std::printf("quantized judder mode=%d tight=%d >2ms %.1f%% -> %.1f%% (no reserve %.1f%%) mean jerk %llu -> %llu us latency %llu -> %llu us (no reserve %llu) reserve max %llu us\n",
+            mode, int(tight), previous.jerkShare() * 100, current.jerkShare() * 100, noReserve.jerkShare() * 100,
+            (unsigned long long)previous.meanJerkUs(), (unsigned long long)current.meanJerkUs(),
+            (unsigned long long)previous.meanLatencyUs(), (unsigned long long)current.meanLatencyUs(),
+            (unsigned long long)noReserve.meanLatencyUs(), (unsigned long long)current.maximumReserveUs);
+        if (tight) {
+            expect(previous.jerkShare() > 0.2 && current.jerkShare() * 10 < previous.jerkShare() &&
+                       current.jerkShare() * 5 < noReserve.jerkShare() &&
+                       current.maximumReserveUs >= 1000,
+                   "with a tight buffer the readiness reserve must remove host-quantized judder the clamp restored");
+        }
+        expect(current.jerkShare() <= previous.jerkShare() + 0.005 &&
+                   current.meanJerkUs() < previous.meanJerkUs(),
+               "Reduce judder must even out host-quantized cadence more than the 2 ms policy");
+        expect(current.jerkShare() <= noReserve.jerkShare() + 0.005,
+               "the readiness reserve must not add judder");
+        expect(current.meanLatencyUs() <= previous.meanLatencyUs() + 2000,
+               "evening out quantized cadence must cost at most 2 ms mean latency");
+        expect(current.maximumSmoothingUs <= int64_t(production.playoutSmoothingMaxLagUs) &&
+                   current.maximumReserveUs <= production.playoutSmoothingReserveMaxUs,
+               "retiming and its reserve must respect their caps");
+    }
+}
+
+void testReduceJudderReserveIgnoresDeliveryJitter()
+{
+    // Even stamps with uneven delivery: missing the raw slot is the playout
+    // buffer's evidence. The smoother caused none of it, so it must not charge
+    // every frame a reserve.
+    for (int mode : {0, 1, 2}) {
+        auto session = config(120, 120);
+        session.latencyMode = mode;
+        const auto production = vrrTimingParametersForSession(session);
+        const auto ticks = [](int i) { return static_cast<uint32_t>((i + 1) * 750); };
+        const auto without = runJudderFixture(session, withoutJudderReserve(production), 3600, 1200, ticks);
+        const auto with = runJudderFixture(session, production, 3600, 1200, ticks);
+        expect(with.maximumReserveUs == 0 && with.meanLatencyUs() <= without.meanLatencyUs() + 50,
+               "delivery jitter on even stamps must not acquire a smoothing reserve");
+    }
+}
+
+void testReduceJudderReserveReleases()
+{
+    // Quantized judder acquires a reserve; once the game is paced evenly the
+    // reserve must drain instead of remaining as standing latency.
+    auto session = config(120, 120);
+    session.latencyMode = 1;
+    auto production = vrrTimingParametersForSession(session);
+    production.playoutDelayMaximumUs = production.playoutDelayMinimumUs;
+    uint64_t reserveDuringJudder = 0;
+    const auto ticks = [](int i) {
+        return i < 1800 ? hostQuantizedTicks(i, 90, 120) :
+            hostQuantizedTicks(1799, 90, 120) + static_cast<uint32_t>(i - 1799) * 1000;
+    };
+    VrrTimingController controller(session, true, production);
+    uint64_t last = 0, previousReserve = 0;
+    for (int i = 0; i < 3600; ++i) {
+        const uint32_t t = ticks(i);
+        const uint64_t decoded = decodedTimeForRtp(1000000, t) + judderDeliveryJitterUs(i);
+        const uint64_t now = std::max(last, decoded);
+        const auto d = controller.schedule(frame(i, t, true, decoded), now);
+        const uint64_t ready = std::max(now, d.renderStartUs) + 1000;
+        const uint64_t submitted = std::max(d.targetUs, ready);
+        controller.notePreparationDuration(1000, 0, ready);
+        controller.noteSchedulerDelays(0, 0, true);
+        controller.noteSubmission(true, false, submitted);
+        const uint64_t reserve = controller.smoothingReserveUs();
+        expect(reserve <= previousReserve + 250,
+               "the smoothing reserve must be acquired gradually");
+        if (i == 1799) reserveDuringJudder = reserve;
+        previousReserve = reserve;
+        last = submitted;
+    }
+    std::printf("judder reserve release: %llu us during judder, %llu us after even pacing\n",
+                (unsigned long long)reserveDuringJudder, (unsigned long long)previousReserve);
+    expect(reserveDuringJudder >= 1000, "quantized judder must acquire a readiness reserve");
+    expect(previousReserve == 0, "even pacing must release the whole smoothing reserve");
+}
+
+void testReduceJudderFollowsRateDrift()
+{
+    // An uncapped game drifting between 100 and 70 FPS on a VRR host. The
+    // interval average alone trails a ramp, leaving the smoothed slot late or
+    // early by a standing offset; phase feedback keeps it on the stamps.
+    for (int mode : {0, 1, 2}) {
+        auto session = config(120, 120);
+        session.latencyMode = mode;
+        const auto production = vrrTimingParametersForSession(session);
+        auto noFeedback = production;
+        noFeedback.playoutSmoothingPeriodFeedbackPerMillion = 0;
+        const auto ticks = [](int i) {
+            // Triangle wave over 540 frames between 900 and 1286 ticks per
+            // frame, plus a small deterministic present jitter.
+            uint64_t total = 0;
+            for (int k = 0; k <= i; ++k) {
+                const int phase = k % 540;
+                const int ramp = phase < 270 ? phase : 540 - phase;
+                total += 900 + static_cast<uint64_t>(ramp) * 386 / 270;
+            }
+            const int64_t jitter = static_cast<int64_t>((static_cast<uint64_t>(i) * 104729ULL) % 91ULL) - 45;
+            return static_cast<uint32_t>(static_cast<int64_t>(total) + jitter);
+        };
+        std::vector<uint32_t> stamps(3600);
+        for (int i = 0; i < 3600; ++i) stamps[i] = ticks(i);
+        const auto lookup = [&stamps](int i) { return stamps[i]; };
+        const auto without = runJudderFixture(session, noFeedback, 3600, 1200, lookup);
+        const auto with = runJudderFixture(session, production, 3600, 1200, lookup);
+        std::printf("rate drift mode=%d >2ms %.1f%% -> %.1f%% mean retiming %llu -> %llu us latency %llu -> %llu us\n", mode,
+                    without.jerkShare() * 100, with.jerkShare() * 100,
+                    (unsigned long long)without.meanRetimingUs(), (unsigned long long)with.meanRetimingUs(),
+                    (unsigned long long)without.meanLatencyUs(), (unsigned long long)with.meanLatencyUs());
+        expect(with.meanRetimingUs() * 3 < without.meanRetimingUs() * 2,
+               "phase feedback must shrink the standing offset a drifting rate leaves behind");
+        expect(with.jerkShare() <= without.jerkShare() + 0.002 &&
+                   with.meanLatencyUs() <= without.meanLatencyUs() + 500,
+               "phase feedback must follow a drifting rate without adding judder or material latency");
     }
 }
 
@@ -5548,6 +5788,10 @@ int main()
     testDelayedDisplayEventsAgreeAcrossBackends();
     testProductionPreservesRelativeGameSpacing();
     testProductionSmoothFrameTiming();
+    testReduceJudderReserveCoversQuantizedCadence();
+    testReduceJudderReserveIgnoresDeliveryJitter();
+    testReduceJudderReserveReleases();
+    testReduceJudderFollowsRateDrift();
     testReadinessDrivenPadding();
     testStableNativeSmoothnessReference();
     testPreparationKeepsLearnedLead();

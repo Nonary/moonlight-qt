@@ -36,13 +36,26 @@ constexpr uint64_t kPlayoutPercentilePerMille = 1000;
 constexpr uint64_t kPlayoutBurstExclusionPerMille = 750;
 // Reduce judder keeps 85% of the predicted slot and 15% of the raw mapped
 // timestamp. Track gradual source-rate changes with a 2.5-percent period EMA
-// and cap positive retiming at 2 ms. Reuse the existing playout headroom for
-// early retiming; the adjustment cap is not a bound on total client latency.
-// Unchecked sessions retain timestamp-following playout. Schema defaults and
-// explicit captured parameters preserve historical replay behavior.
+// plus 2-percent phase-error feedback, so a drifting game rate does not leave
+// the smoothed slot trailing its stamps. Positive retiming may reach 6 ms: a
+// host-refresh-quantized game (for example 90 FPS captured at 120 Hz) needs
+// several milliseconds to even out, and the old 2 ms cap left most of that
+// judder in place while biasing the schedule early. The cap is not a bound on
+// total client latency. Unchecked sessions retain timestamp-following playout.
+// Schema defaults and explicit captured parameters preserve historical replay.
 constexpr uint64_t kPlayoutSmoothingGainPerMille = 150;
 constexpr uint64_t kPlayoutSmoothingPeriodAlphaPerMille = 25;
-constexpr uint64_t kPlayoutSmoothingMaxLagUs = 2000;
+constexpr uint64_t kPlayoutSmoothingMaxLagUs = 6000;
+constexpr uint64_t kPlayoutSmoothingPeriodFeedbackPerMillion = 20000;
+// A smoothed slot earlier than the frame's raw slot is only useful if the frame
+// can be ready by then; otherwise the readiness clamp restores the judder. Move
+// the smoothed schedule later by the p98 of recent smoother-caused shortfall,
+// leaving 0.5 ms uncovered (a sub-millisecond miss stays under a 2 ms step),
+// at most 3 ms, released at 0.5 ms per second once the shortfall subsides.
+constexpr uint64_t kPlayoutSmoothingReserveMaxUs = 3000;
+constexpr uint64_t kPlayoutSmoothingReserveToleranceUs = 500;
+constexpr uint64_t kPlayoutSmoothingReservePercentilePerMille = 980;
+constexpr uint64_t kPlayoutSmoothingReserveReleaseUsPerSecond = 500;
 // Retired metronome playout, kept reachable for replay. It advances the
 // presented slot by the fitted source period, corrects phase toward the mapped
 // sender clock by a bounded step, and moves a frame that cannot make its tick
@@ -243,6 +256,15 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutSmoothingPeriodAlphaPerMille =
         kPlayoutSmoothingPeriodAlphaPerMille;
     parameters.playoutSmoothingMaxLagUs = kPlayoutSmoothingMaxLagUs;
+    parameters.playoutSmoothingPeriodFeedbackPerMillion =
+        kPlayoutSmoothingPeriodFeedbackPerMillion;
+    parameters.playoutSmoothingReserveMaxUs = kPlayoutSmoothingReserveMaxUs;
+    parameters.playoutSmoothingReserveToleranceUs =
+        kPlayoutSmoothingReserveToleranceUs;
+    parameters.playoutSmoothingReservePercentilePerMille =
+        kPlayoutSmoothingReservePercentilePerMille;
+    parameters.playoutSmoothingReserveReleaseUsPerSecond =
+        kPlayoutSmoothingReserveReleaseUsPerSecond;
     parameters.playoutSmoothingWindowedCadence = 2;
     // Four consecutive intervals qualify the new window. Source-rate changes
     // already have their own confirmation gate; another 200 ms without
@@ -279,6 +301,11 @@ VrrTimingParameters vrrTimingParametersForSession(
         // gain smoother and the replay-compatible metronome.
         parameters.playoutMetronomeEnabled = 0;
         parameters.playoutSmoothingGainPerMille = 0;
+        parameters.playoutSmoothingPeriodFeedbackPerMillion = 0;
+        parameters.playoutSmoothingReserveMaxUs = 0;
+        parameters.playoutSmoothingReserveToleranceUs = 0;
+        parameters.playoutSmoothingReservePercentilePerMille = 0;
+        parameters.playoutSmoothingReserveReleaseUsPerSecond = 0;
     }
     return parameters;
 }
@@ -405,12 +432,19 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_PlayoutBandValid = false;
         m_AppliedPlayoutDelayUs = 0;
         m_AppliedPlayoutDelayValid = false;
+        m_SmoothingReserveUs = 0;
+        m_SmoothingReserveReleaseRemainder = 0;
+        m_LastSmoothingReserveUpdateUs = 0;
+        m_SmoothingShortfallCount = 0;
+        m_SmoothingShortfallIndex = 0;
     }
+    m_SmoothingEngaged = false;
     m_HaveLastDecodeComplete = false;
     m_LastDecodeCompleteUs = 0;
     resetCadenceSmoothing();
     m_SmoothedPeriodUs = 0;
     m_SmoothedPeriodRemainder = 0;
+    m_SmoothedPeriodFeedbackRemainder = 0;
     m_MotionResiduals.clear();
     m_FutureProjectionFrames = 0;
     m_BurstExclusionFrames = 0;
@@ -500,6 +534,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                                                  uint64_t nowUs)
 {
     m_Pending = PendingFrame {};
+    m_SmoothingEngaged = false;
 
     CadenceObservation cadence;
     bool rebased = false;
@@ -569,6 +604,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         rtpTicksToUs(m_UnwrappedRtpTicks) : 0;
     int64_t readyOffsetUs = 0;
     int64_t smoothingUs = 0;
+    uint64_t smoothingReserveUs = 0;
     uint64_t missedTicks = 0;
     uint64_t delayBeforeUs = 0;
     const uint64_t leadUs = saturatingAdd(m_Parameters.playoutPredictionEnabled ? typicalRenderUs() : m_RenderLeadUs,
@@ -607,8 +643,15 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                 missedTicks, remainingDebtUs);
         }
         else {
+            // The reserve delays the whole smoothed schedule while Reduce
+            // judder is enabled, including frames it cannot smooth, so the
+            // schedule does not step by the reserve at every cadence reset.
+            smoothingReserveUs = smoothingReserveEnabled() ?
+                m_SmoothingReserveUs : 0;
             smoothingUs = cadenceSmoothingAdjustUs(
-                cadence, rebased, rawBasisUs, delayBeforeUs);
+                cadence, rebased, saturatingAdd(rawBasisUs, smoothingReserveUs),
+                delayBeforeUs, smoothingReserveUs) +
+                static_cast<int64_t>(smoothingReserveUs);
         }
         // The calibrator sees lateness against the slot the schedule is
         // trying to reach, not the slot it currently occupies: while the
@@ -776,6 +819,21 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                 playoutDelayUs,
                 saturatingAdd(m_RenderLeadUs,
                               m_Parameters.presentationSafetyUs)));
+    }
+    if (timestampPlayout && !metronomeEnabled() && smoothingReserveEnabled()) {
+        // This frame has already arrived, so its own readiness against the
+        // raw slot is known. Charge the reserve only for lateness the smoother
+        // caused by moving the frame before that slot. Delivery that misses
+        // the raw slot is the playout buffer's evidence. Worker backlog is not
+        // measured here: it follows the previous (already reserved) target,
+        // shifts with the reserve, and would otherwise feed it back into itself.
+        const int64_t rawLatenessUs = readyOffsetUs -
+            static_cast<int64_t>(playoutDelayUs);
+        const int64_t retimingUs = smoothingUs -
+            static_cast<int64_t>(smoothingReserveUs);
+        observeSmoothingReserve(m_SmoothingEngaged && !reseedPhase,
+                                std::min<int64_t>(rawLatenessUs, 0) - retimingUs,
+                                nowUs);
     }
 
     if (m_Parameters.playoutAdaptiveOnly != 0) {
@@ -1285,7 +1343,7 @@ int64_t VrrTimingController::metronomeAdjustUs(
 
 int64_t VrrTimingController::cadenceSmoothingAdjustUs(
     const CadenceObservation& cadence, bool rebased, uint64_t rawBasisUs,
-    uint64_t playoutDelayUs)
+    uint64_t playoutDelayUs, uint64_t reserveUs)
 {
     // A half-period interval is 375 RTP ticks at 120 FPS: converting it to
     // whole microseconds alternates 4166/4167. Do not turn that rounding into
@@ -1381,6 +1439,7 @@ int64_t VrrTimingController::cadenceSmoothingAdjustUs(
             m_SmoothedPeriodUs + fittedPeriodUs / 4 < fittedPeriodUs) {
         m_SmoothedPeriodUs = fittedPeriodUs;
         m_SmoothedPeriodRemainder = 0;
+        m_SmoothedPeriodFeedbackRemainder = 0;
     }
     if (!boundedInterval) {
         // A host stall or burst is not cadence. Keep the period estimate,
@@ -1417,11 +1476,95 @@ int64_t VrrTimingController::cadenceSmoothingAdjustUs(
         resetCadenceSmoothing();
         return 0;
     }
+    if (m_Parameters.playoutSmoothingPeriodFeedbackPerMillion != 0) {
+        // A drifting game rate leaves the interval average behind, and the
+        // phase blend turns that period error into a standing offset from
+        // the raw slots. Integrate the phase error into the period as well,
+        // so the smoothed slot follows a rate ramp instead of lagging it.
+        const int64_t feedback = -errorUs * static_cast<int64_t>(std::min<uint64_t>(
+                m_Parameters.playoutSmoothingPeriodFeedbackPerMillion, 1000000)) +
+            m_SmoothedPeriodFeedbackRemainder;
+        const int64_t periodUs = static_cast<int64_t>(m_SmoothedPeriodUs) +
+            feedback / 1000000;
+        m_SmoothedPeriodFeedbackRemainder = feedback % 1000000;
+        m_SmoothedPeriodUs = static_cast<uint64_t>(std::max<int64_t>(1, periodUs));
+    }
     int64_t adjustUs = errorUs * static_cast<int64_t>(1000 - gainPerMille) / 1000;
+    // The reserve already occupies part of the positive retiming budget. Never
+    // present before the mapped source slot, reserve or not.
     adjustUs = std::min(adjustUs, static_cast<int64_t>(
-        m_Parameters.playoutSmoothingMaxLagUs));
-    adjustUs = std::max(adjustUs, -static_cast<int64_t>(playoutDelayUs));
+        m_Parameters.playoutSmoothingMaxLagUs -
+        std::min(m_Parameters.playoutSmoothingMaxLagUs, reserveUs)));
+    adjustUs = std::max(adjustUs, -static_cast<int64_t>(
+        saturatingAdd(playoutDelayUs, reserveUs)));
+    m_SmoothingEngaged = true;
     return adjustUs;
+}
+
+bool VrrTimingController::smoothingReserveEnabled() const
+{
+    return m_Parameters.playoutSmoothingReserveMaxUs != 0 &&
+        m_Parameters.playoutSmoothingGainPerMille != 0 &&
+        m_Parameters.playoutSmoothingReservePercentilePerMille != 0;
+}
+
+void VrrTimingController::observeSmoothingReserve(bool engaged,
+                                                  int64_t shortfallUs,
+                                                  uint64_t nowUs)
+{
+    // Attack gradually so one step cannot jump an unsmoothed schedule, and
+    // require enough placed frames that a single late arrival is not a
+    // percentile. Release is time-based so it is independent of FPS.
+    constexpr uint64_t kAttackPerFrameUs = 250;
+    constexpr size_t kMinimumSamples = 32;
+    const uint64_t elapsedUs = m_LastSmoothingReserveUpdateUs != 0 &&
+            nowUs > m_LastSmoothingReserveUpdateUs ?
+        std::min<uint64_t>(nowUs - m_LastSmoothingReserveUpdateUs, 100000) : 0;
+    m_LastSmoothingReserveUpdateUs = nowUs;
+    const uint64_t maximumUs = std::min(m_Parameters.playoutSmoothingReserveMaxUs,
+                                        m_Parameters.playoutSmoothingMaxLagUs);
+    uint64_t desiredUs = 0;
+    if (engaged) {
+        m_SmoothingShortfalls[m_SmoothingShortfallIndex] = shortfallUs;
+        m_SmoothingShortfallIndex = (m_SmoothingShortfallIndex + 1) %
+            m_SmoothingShortfalls.size();
+        m_SmoothingShortfallCount = std::min(m_SmoothingShortfallCount + 1,
+                                             m_SmoothingShortfalls.size());
+        if (m_SmoothingShortfallCount >= kMinimumSamples) {
+            std::array<int64_t, 128> ordered;
+            std::copy_n(m_SmoothingShortfalls.begin(), m_SmoothingShortfallCount,
+                        ordered.begin());
+            const uint64_t perMille = std::min<uint64_t>(
+                1000, m_Parameters.playoutSmoothingReservePercentilePerMille);
+            const size_t rank = std::max<size_t>(
+                1, (m_SmoothingShortfallCount * perMille + 999) / 1000);
+            std::nth_element(ordered.begin(), ordered.begin() + (rank - 1),
+                             ordered.begin() + m_SmoothingShortfallCount);
+            const int64_t quantileUs = ordered[rank - 1];
+            const int64_t toleranceUs = static_cast<int64_t>(std::min<uint64_t>(
+                m_Parameters.playoutSmoothingReserveToleranceUs,
+                std::numeric_limits<int64_t>::max()));
+            desiredUs = quantileUs > toleranceUs ?
+                std::min(static_cast<uint64_t>(quantileUs - toleranceUs), maximumUs) : 0;
+        }
+        else {
+            desiredUs = m_SmoothingReserveUs;
+        }
+    }
+    if (desiredUs > m_SmoothingReserveUs) {
+        m_SmoothingReserveUs = std::min(desiredUs,
+            saturatingAdd(m_SmoothingReserveUs, kAttackPerFrameUs));
+        m_SmoothingReserveReleaseRemainder = 0;
+    }
+    else if (desiredUs < m_SmoothingReserveUs) {
+        const uint64_t numerator = saturatingAdd(
+            m_Parameters.playoutSmoothingReserveReleaseUsPerSecond * elapsedUs,
+            m_SmoothingReserveReleaseRemainder);
+        const uint64_t releaseUs = numerator / kMicrosecondsPerSecond;
+        m_SmoothingReserveReleaseRemainder = numerator % kMicrosecondsPerSecond;
+        m_SmoothingReserveUs -= std::min(m_SmoothingReserveUs - desiredUs, releaseUs);
+    }
+    m_SmoothingReserveUs = std::min(m_SmoothingReserveUs, maximumUs);
 }
 
 VrrTimingController::CadenceObservation

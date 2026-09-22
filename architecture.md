@@ -5,6 +5,13 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
+Reduce judder follow-up (2026-09-22), based on `e053b5cb`: the smoother's
+positive retiming cap rises from 2 ms to 6 ms, a learned readiness reserve
+delays the smoothed schedule by the lateness the smoother itself causes, and
+phase-error feedback lets its period follow drifting game rates. All three are
+new zero-default controller parameters, so older captures replay unchanged.
+See the section below and section 8.3.
+
 Windows high-bitrate follow-up (2026-09-22), based on `26675aa8`: D3D11 VRR
 presentation no longer holds FFmpeg's decode lock on separate devices, and a
 monitored decode fence now supplies the decode-completion observation that
@@ -151,6 +158,93 @@ composition guard and passes repaint=false to the decoder. Dormant renderer
 helpers and their deterministic tests remain available for development.
 Production retains its Immediate/WSI FIFO selection; adaptive presentation
 permission is owned by the VRR backend rather than a user preference.
+
+### Reduce judder readiness reserve and wider retiming (2026-09-22)
+
+Written on the Sunshine host (Ambidex), which has no client toolchain, traces or
+share access. Evidence is a synthetic harness around the real controller
+(g++ with FFmpeg/SDL stubs) plus new deterministic tests; no capture replay,
+application build or live test accompanied it.
+
+Two defects limited what Reduce judder could correct:
+
+1. **Readiness clamps undid the smoothing.** Centering a smoothed schedule on
+   uneven stamps moves late-stamped frames earlier than their raw slot. Because
+   arrival follows the stamp, those frames are frequently not ready: the target
+   clamp presents them late and restores the step. The negative bound was the
+   whole playout delay, i.e. down to the mapped source slot itself. The
+   interval-quality buffer does not respond, because 1-2 ms errors on 5-17% of
+   frames average under its 0.5 ms tolerance. The 2026-09-10 SteamOS capture
+   showed the same thing live: 0.4% of intended pairs over 2 ms jerk, 13.8%
+   after readiness clamps.
+2. **The 2 ms positive cap was too small** for host-refresh quantization. A
+   game at 90 FPS captured from a fixed 120 Hz host arrives as 8.3/8.3/16.7 ms
+   stamps, needing roughly ±2.8 ms of retiming; 100 or 110 FPS need more. The
+   cap also clipped only one side, pulling the schedule early.
+
+A third limitation affected drifting rates: the period followed a 2.5% interval
+EMA only, so a game ramping between 70 and 100 FPS left the smoothed slot
+several milliseconds from its stamps (≈2.7 ms mean in the new drift fixture).
+
+Changes, all active only with Reduce judder enabled:
+
+- `playout_smoothing_max_lag_us` 2000 → 6000.
+- `playout_smoothing_reserve_*` (max 3000 us, p980, tolerance 500 us, release
+  500 us/s): for each frame the smoother placed, the controller records
+  `min(readyOffset - playoutDelay, 0) - retiming`, the lateness caused by moving
+  the frame before its raw slot. Delivery that misses the raw slot remains
+  playout-buffer evidence. Worker backlog is excluded because it follows the
+  previous, already-reserved target and would feed the reserve back into
+  itself. The reserve is the p98 of the last 128 such values minus the
+  tolerance, acquired at most 250 us per frame after 32 samples, and it is
+  applied to every timestamp-playout frame while smoothing is enabled, so
+  cadence resets do not step by the reserve. It shares the 6 ms positive
+  retiming budget and is reported inside `cadence_smoothing_us`, never
+  `playout_delay_us`. The controller exposes it as `smoothingReserveUs()`;
+  there is no dedicated trace column.
+- `playout_smoothing_period_feedback_per_million=20000`: the smoothed period
+  also integrates 2% of each frame's phase error (a second-order tracking loop,
+  damping about 0.5 with the 15% phase gain).
+
+Synthetic results (60 s, three seeds, host-present stamps plus delivery jitter
+of 0.35 ms mean with 1% 2-5 ms spikes; per mille of pairs over 2 ms jerk,
+mean decode-to-submission change against Reduce judder off). The harness lets
+Balanced release to its 1 ms floor, so its row is a small-buffer worst case:
+
+| Content | Balanced previous → new | Low Latency previous → new | Smooth previous → new |
+| --- | --- | --- | --- |
+| 90 FPS on a 120 Hz host | 442 → 50‰, +0.34 → +1.31 ms | 194 → 28‰, -0.25 → +0.42 ms | 47 → 2‰, -0.53 → +0.00 ms |
+| 70 FPS on a 120 Hz host | 458 → 39‰, -0.23 → +1.39 ms | 231 → 23‰, -0.64 → +0.45 ms | 71 → 2‰, -0.86 → +0.00 ms |
+| 70-100 FPS ramp on a 120 Hz host | 562 → 86‰, +0.11 → +1.54 ms | 370 → 44‰, -0.59 → +0.63 ms | 201 → 8‰, -0.56 → +0.03 ms |
+| Paced 90 FPS, 2 ms stamp jitter | 80 → 25‰, -0.37 → +0.08 ms | 70 → 21‰, -0.40 → +0.03 ms | 67 → 20‰, -0.42 → +0.01 ms |
+| Even 120 FPS | 18 → 17‰, +0.00 → +0.00 ms | 5 → 5‰, 0 → 0 ms | 0 → 0‰, 0 → 0 ms |
+
+The previous policy's negative latency deltas are the early bias the one-sided
+cap introduced, not free smoothing. Random-walk frame pacing (a game whose own
+frame times vary by 2-3 ms) improves less and costs more (Balanced 60 FPS,
+3 ms: 352 → 182‰ for +1.9 ms), because no smooth line stays close to it.
+
+The new deterministic fixtures (`testReduceJudder*`) cover 90 FPS on a 120 Hz
+host with production and tight buffers (tight: 68.1% → 1.0% of pairs over 2 ms,
++0.9 ms), even stamps with delivery spikes (no reserve may be acquired), reserve
+release once pacing becomes even, and a 70-100 FPS ramp (standing retiming
+offset about 2.7 → 0.56 ms). All existing controller fixtures pass unchanged
+except the assertions that named the old 2 ms cap. The replay-config round trip
+test was added but not compiled here (it needs Qt).
+
+Still required on ALLYTWO: the Qt suites, exact replay of the newest capture
+(captured parameters lack the new fields, so it should still reproduce), a
+`configs/judder-reserve-variants.json` batch on real captures, and a live
+comparison. The synthetic harness does not model GPU render variance, the
+decode wait, stale-frame dropping or native presentation.
+
+Not addressed: with a 120 FPS stream, a sub-60 FPS game on a 60 Hz host
+(16.7/33.3 ms stamps) never fits its source period. Each 33 ms interval is a
+major cadence departure at the 8.3 ms negotiated period, and the following
+16.7 ms interval counts as a return to stable cadence, clearing the cadence
+window. The fitted period stays at 8.3 ms, every long interval is a phase
+discontinuity, and smoothing never engages. This is a rate-detection issue
+(section 8.2), not a smoother setting.
 
 ### Windows decode/presentation decoupling (2026-09-22)
 
@@ -1484,8 +1578,9 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | GPU readiness ceiling | `min(12,000 us, fitted source period)`; target/deadline unchanged |
 | Capacity telemetry | `playout_capacity_telemetry=1` exposes unclamped demand and cap pressure in live decisions |
 | Smoothing gain | 150 when Reduce judder is checked; 0 when unchecked |
-| Smoothing period EMA | 25 per mille with fractional carry; active only with smoothing enabled |
-| Positive smoothing lag cap | 2,000 us; active only with smoothing enabled |
+| Smoothing period EMA | 25 per mille with fractional carry, plus 20,000 per million phase-error feedback; active only with smoothing enabled |
+| Positive smoothing lag cap | 6,000 us, shared with the readiness reserve; active only with smoothing enabled |
+| Smoothing readiness reserve | p98 of the last 128 smoother-caused shortfalls minus 500 us, at most 3,000 us, +250 us per frame, released at 500 us/s; zero when unchecked |
 | Render lead floor | 3,000 us |
 | Preparation start | Use the existing playout interval (`playout_prepare_on_arrival=1`), with no additional post-submission delay |
 | Minimum preparation lead input | 2,500 us |
@@ -1553,15 +1648,26 @@ mapped slot. This redistributes available waiting time to reduce adjacent
 short/long intervals, at the expense of timestamp fidelity. It cannot guarantee
 uniform motion between irregularly sampled images or prevent compositor jitter.
 RTP values remain unchanged; their arbitrary epoch must not change scheduling.
-Conceptually, with `raw = sourceTime + delayBeforeThisFrame`:
+Conceptually, with `raw = sourceTime + delayBeforeThisFrame` and the learned
+readiness reserve `R` (zero for captures without the reserve parameters):
 
 ```text
 trackedPeriod += 0.025 * (eligibleSourceInterval - trackedPeriod)
 predicted      = previousSmoothedBasis + trackedPeriod
-adjustment     = 0.85 * (predicted - raw)
-adjustment     = clamp(adjustment, -delayBeforeThisFrame, 2000 us)
-smoothedBasis  = raw + adjustment
+error          = predicted - (raw + R)
+trackedPeriod -= 0.02 * error                 # phase feedback, next frame
+adjustment     = 0.85 * error
+adjustment     = clamp(adjustment, -(delayBeforeThisFrame + R), 6000 us - R)
+smoothedBasis  = raw + R + adjustment         # cadence_smoothing_us = R + adjustment
 ```
+
+`R` is applied to every timestamp-playout frame while smoothing is enabled,
+including frames the smoother cannot currently place, so a cadence reset does
+not step the schedule by `R`. It is learned only from frames the smoother
+placed: `min(readyOffset - playoutDelay, 0) - adjustment` is the lateness caused
+by moving that frame before its raw slot, and `R` tracks its p98 over the last
+128 placed frames minus 500 us, capped at 3 ms. See the 2026-09-22 Reduce judder
+section above for why and for its evidence.
 
 The actual integer implementation also reseeds from the authoritative fitted
 period when necessary and resets smoothing on rebases, rate/phase changes,
@@ -1574,11 +1680,12 @@ not a later actual execution time. Otherwise one late frame would move later
 frames and turn a temporary miss into persistent added delay. Older replay modes
 retain execution-anchored smoothing and the retired metronome for compatibility.
 
-The 2 ms cap bounds positive retiming, not total client latency. Readiness,
-queue capacity, timing-preset buffer caps and applicable presentation floors
-still constrain the schedule. Smoothing does not add a queued-frame allowance.
-Its readiness calibration key gains `|frame-smoothing=150-25-2000|cadence=2-0` so profiles
-from the period when the saved checkbox was inactive cannot cross-seed it.
+The 6 ms cap bounds positive retiming including the reserve, not total client
+latency. Readiness, queue capacity, timing-preset buffer caps and applicable
+presentation floors still constrain the schedule. Smoothing does not add a
+queued-frame allowance. Its readiness calibration key gains
+`|frame-smoothing=150-25-6000|cadence=2-0|catchup=20|smoothing-reserve=3000-500-980-500|period-feedback=20000`
+so profiles from earlier smoothing policies cannot cross-seed it.
 Unchecked sessions keep their existing calibration identity. Historical traces
 retain their recorded parameters and need no schema change.
 
@@ -1907,6 +2014,13 @@ effectiveMin    = min(1000 us, queueDelayLimit, modeAllowance)
 effectiveMax    = min(maximumInput, queueDelayLimit, modeAllowance)
 ```
 
+`maximumSmoothingLag` is `playout_smoothing_max_lag_us` (6 ms in production
+since 2026-09-22, 2 ms before), which also contains the smoothing readiness
+reserve. With Reduce judder on, 120 FPS therefore leaves a 16 ms queue delay
+limit after a 3 ms render lead (unchanged in practice, because the 16 ms input
+binds), while 144 FPS drops from 15.8 to 11.8 ms. Total buffering plus positive
+retiming stays within the same three-period capacity.
+
 The cold start first takes `max(6000 us, 0.95 * sourcePeriod)`, caps that by
 `max(displayPeriod, renderLead)` for history mode, then clamps to effective
 minimum/maximum. Consequently neither “the buffer always starts at 6 ms” nor
@@ -1927,7 +2041,9 @@ rather than presenting the capped policy as able to absorb all observed work.
 display identity, stream FPS, display refresh, smoothing settings,
 and session context, including the active native presenter. Balanced Target and
 Low Latency add distinct timing-mode suffixes. Enabled smoothing also appends
-`|frame-smoothing=150-25-2000|cadence=2-0` to isolate its readiness history.
+`|frame-smoothing=150-25-6000|cadence=2-0|catchup=20` and, when the reserve or
+period feedback is active, `|smoothing-reserve=3000-500-980-500|period-feedback=20000`
+to isolate its readiness history.
 Profiles expire after 14 days; saves require at least
 240 observations, use locking/atomic replacement, and cap storage at 16 profiles.
 
