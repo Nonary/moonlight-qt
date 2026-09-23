@@ -25,6 +25,23 @@ does not change video timing or replay policy.
 Reference baseline: `06fae71f` (vrr17 branch), plus the client-warning and
 gradual backlog-recovery follow-up described below. This includes source ownership,
 buffer attribution and decode-wait starvation prevention (2026-09-20).
+The Windows buffer-retention follow-up is based on `e1df34b7` (2026-09-21).
+Production now records `playout_recent_pressure_release=2`: only a fresh,
+readiness-attributed interval error with absorbable service renews the existing
+clean-time hold. Submission jitter after readiness and sustained service
+overload still lower the timing score, but cannot indefinitely retain previously
+acquired buffer. The preset hold durations, release rates, growth law and caps
+are unchanged. Revisions 0/1 retain their historical replay behavior. This is a
+shared-policy correction, not evidence that Windows GPU execution became faster.
+The selected Windows capture ends with zero attributed readiness lateness yet
+revision 1 renews its full eight-second hold. Its recorded submissions and
+controller diagnostics reproduce. The 2026-09-22 replay audit now recognizes
+the D3D11 fence poll recorded at the final Present boundary, after preparation,
+while retaining support for older preparation-poll traces. With that audit fix,
+the selected `20260922-184032-168` capture passes exact controller/worker
+replay. Its display model remains uncalibrated and cannot prove optical tearing
+or tear freedom. Live improvement from the buffer change still requires a fresh
+test.
 The 2026-09-21 preparation-stage follow-up is based on `18602b1c`, including
 Gemini's decode-completion source mapping and preparation-on-arrival changes.
 Linux VAAPI/Mailbox has experimental offscreen preparation independently of the
@@ -231,6 +248,30 @@ release once pacing becomes even, and a 70-100 FPS ramp (standing retiming
 offset about 2.7 → 0.56 ms). All existing controller fixtures pass unchanged
 except the assertions that named the old 2 ms cap. The replay-config round trip
 test was added but not compiled here (it needs Qt).
+
+**Cadence-reset easing (2026-09-22 evening, ALLYTWO).** Capture
+`20260922-193211-380` (116 FPS on the 120 Hz LG, game at 112-116 FPS, host
+stamps on a ~2.15 ms grid) showed that a four-interval slowdown of the game
+(10.7-12.9 ms frames) fails the windowed stability gate, and the reset dropped
+the accumulated retiming (often -5 ms) to zero in one frame, so a 10.7 ms host
+interval was presented as 13.8-15.9 ms. The smoothing value logged in
+`cadence_smoothing_us` includes the reserve, so resets never read as zero there;
+identify them by a step in retiming, not by a zero value.
+`playout_smoothing_reset_slew_us` (production 1000 with Reduce judder, 0
+otherwise and in older captures) now eases the previous frame's retiming toward
+the raw slot by at most that much per frame when the smoother resets, within the
+same positive cap and negative `-(playout delay + reserve)` bound. A new clock
+epoch (`rebased`) and a phase reseed still jump. The eased slot becomes the next
+smoothed basis, so a re-engaged smoother continues from it. Replay of 193211
+with a display model (latched presents queue behind the previous flip, adaptive
+presents flip at call + 1.28 ms): steady-state distinct snaps (displayed jerk
+over 4 ms) 36 → 27 in 59 s, client-stretched snaps 10 → 4, latency unchanged,
+0 modelled tears. The remaining 21 are host intervals of 12-21 ms passed through.
+The earlier 97 FPS capture `184032-168` is neutral (71 → 73). Fixture
+`testReduceJudderEasesCadenceResets`: >2 ms pairs 2.7% → 2.0%. Not a
+calibration-key change. Also from that capture: the first 7 s had 205 GPU
+fence waits over 3 ms (none afterwards) where the CPU decode-completion wait
+was short and rendering queued behind decode, a startup transient.
 
 Still required on ALLYTWO: the Qt suites, exact replay of the newest capture
 (captured parameters lack the new fields, so it should still reproduce), a
@@ -1193,6 +1234,17 @@ Packet size is aligned down to a 16-byte multiple for FEC. Connection setup
 also applies route-dependent packet-size limits. These are transport decisions,
 not VRR scheduling parameters.
 
+When VRR presentation qualifies for the session
+(`m_PresentationSettings.enableVrr`, decided before launch), `NvHTTP::startApp`
+adds `clientVrrRequested=1` to the launch/resume query. Hosts that do not know
+it ignore it. Vibeshine uses it for a low-latency WGC buffer and, in its
+Automatic virtual-display capture mode (`vibe-test` 09b09ae8), holds the
+virtual display at 1000 Hz. WGC stamps frames at DWM composition, which lands
+on the virtual display's refresh grid; a 4x display at 116 FPS put every RTP
+timestamp on a 2.156 ms grid (capture 20260922-195738 deep trace), while 1000 Hz
+bounds that to 1 ms. Vibeshine also refines stamps from the game's DXGI Present
+events at send time. This is host behavior the client only requests.
+
 The client source proves which values it sends and how it interprets the
 response. It does not prove how a particular Sunshine/GFE version captures,
 timestamps, paces, or encodes in response. A refresh hint is not host/client
@@ -1731,6 +1783,24 @@ DXGI uses `Present(1, 0)` for protected slots and
 provides native ordering; its protection capability likewise permits a slot
 without the extra CPU floor. It does not expose DXGI tearing flags.
 
+`lastSubmission` in that rule is the spacing anchor, not always the previous
+Present call (`latched_flip_anchor=1` in production since 2026-09-22). A
+latched present waits in the flip queue until the previous flip plus one
+display period, so its anchor is `max(call, previous anchor + displayPeriod)`.
+Anchoring to the call let the next tearing present flip inside the panel's
+minimum period after a late or compressed frame; capture
+`20260922-184032-168` modelled 68 such tears in 91 s at 116/120 (PresentMon on
+the 09-21 sandbox capture confirmed the queue model). The worker's final
+recheck and replay's recheck mirror use `untornReferenceUs()`: the anchor for
+a tearing present, the call for a latched one. Production also latches the
+first present whose target is at least `vrr_floor_latch_gap_us=20000` after
+the anchor, since the panel may be repeating the previous frame below its VRR
+range. Both parameters default to 0, so older captures replay exactly. The
+replay's `tear_risks` does not model the flip queue and cannot score this.
+Remaining known tear source: AMD present-to-flip latency (PresentMon
+msUntilDisplayed p50 1.3 / p99 4.7 ms) can squeeze adaptive pairs spaced just
+above the panel minimum.
+
 This allows source-rate changes and recovery from late work without permanently
 carrying a refresh-plus-guard delay into every subsequent frame. The explicit
 adaptive-only policy remains replayable and takes precedence over latch flags.
@@ -2144,9 +2214,12 @@ Decode-to-render and render-to-decode Signal/Wait failures likewise abort frame
 preparation and request device recovery; an unsynchronized frame is never
 submitted as a fallback.
 `gpu_ready_wait_result` records the aggregate fence-wait status in Win32 wait
-codes; individual slice timeouts are not whole-fence failures. The initial poll
-and final readiness timestamp retain conservative completion bounds. Historical
-captures retain their original single-event-wait observations unchanged.
+codes; individual slice timeouts are not whole-fence failures. The trace's poll
+fields describe the first poll at the final Present-boundary check, replacing
+the nonblocking preparation poll when that check runs. A cancelled frame before
+the final check can still carry the preparation poll. Poll and final readiness
+timestamps retain conservative completion bounds. Historical captures retain
+their original single-event-wait observations unchanged.
 
 When the target-boundary check completes successfully, the VRR worker records its
 residual verified wait as `gpu_readiness_applied_us` and the next controller
@@ -2158,12 +2231,14 @@ existing failure/recovery and presentation path, and the current source target
 is never moved to hide the stall.
 
 Fence completion proves the prepared backbuffer work has finished before Present.
-If the initial preparation poll found the value complete, its poll end is the
-completion upper bound. Otherwise the target-boundary observation is the upper
-bound and may overstate service because the fence could have completed earlier
-during the cadence hold. The controller uses that uncertainty conservatively for
-the serial-service gate. CPU poll/event brackets are not an exact hardware
-timestamp or a measurement of total GPU execution time.
+If the recorded poll found the value complete, its end is the completion upper
+bound; otherwise the successful final wait is the upper bound. A final-boundary
+poll may overstate service because the fence could have completed earlier during
+the cadence hold. Replay accepts either a preparation poll or a final poll and
+anchors counterfactual upper-bound mapping according to that poll's placement.
+The controller uses the resulting uncertainty conservatively for the serial-
+service gate. CPU poll/event brackets are not an exact hardware timestamp or a
+measurement of total GPU execution time.
 
 ### 10.2 Native Present parameters and telemetry
 

@@ -403,9 +403,15 @@ uint64_t mapVrrGpuReadyUpperBound(
     uint64_t simulatedPreparationStartUs,
     uint64_t simulatedPreparationEndUs,
     uint64_t recordedUpperBoundUs,
-    bool completedBeforeWait);
+    bool completionObservedDuringPreparation);
+
+bool isVrrGpuReadyPollDuringPreparation(
+    uint64_t pollStartUs, uint64_t pollEndUs,
+    uint64_t preparationEndUs, uint64_t presentStartUs,
+    uint64_t waitStartUs);
 
 bool isVrrDeferredGpuReadyOrderValid(
+    uint64_t pollStartUs, uint64_t pollEndUs,
     uint64_t waitStartUs, uint64_t waitReturnUs,
     uint64_t preparationEndUs,
     uint64_t presentStartUs, uint64_t presentEndUs,

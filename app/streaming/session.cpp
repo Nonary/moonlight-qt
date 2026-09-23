@@ -1780,6 +1780,7 @@ bool Session::startConnectionAsync()
                       m_InputHandler->getAttachedGamepadMask(),
                       m_InputHandler->getAttachedPlayStationGamepadMask(),
                       !m_Preferences->multiController,
+                      m_PresentationSettings.enableVrr,
                       rtspSessionUrl);
     } catch (const GfeHttpResponseException& e) {
         emit displayLaunchError(tr("Host returned error: %1").arg(e.toQString()));

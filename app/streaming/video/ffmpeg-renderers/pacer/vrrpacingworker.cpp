@@ -755,7 +755,10 @@ int VrrPacingWorker::run()
             telemetry.presentSpacingUs =
                 telemetry.presentStartUs >= priorSubmissionUs ?
                     telemetry.presentStartUs - priorSubmissionUs : 0;
-            const uint64_t minimumUntornUs = priorSubmissionUs +
+            // A tearing present must clear the previous frame's flip, which
+            // for a latched predecessor can be later than its Present call.
+            const uint64_t minimumUntornUs =
+                m_TimingController->untornReferenceUs() +
                 m_TimingController->displayPeriodUs();
             telemetry.spacingMarginUs = signedDifference(
                 telemetry.presentStartUs, minimumUntornUs);

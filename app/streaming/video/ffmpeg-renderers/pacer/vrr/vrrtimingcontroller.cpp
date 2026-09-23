@@ -56,6 +56,11 @@ constexpr uint64_t kPlayoutSmoothingReserveMaxUs = 3000;
 constexpr uint64_t kPlayoutSmoothingReserveToleranceUs = 500;
 constexpr uint64_t kPlayoutSmoothingReservePercentilePerMille = 980;
 constexpr uint64_t kPlayoutSmoothingReserveReleaseUsPerSecond = 500;
+// A cadence reset (a few slow game frames, a burst, a stall) used to drop the
+// accumulated retiming in one frame: up to a 6 ms step on screen, the most
+// common client-made snap at 116/120 in capture 20260922-193211. Ease it back
+// to the raw slot instead; 1 ms per frame keeps each step under 2 ms of jerk.
+constexpr uint64_t kPlayoutSmoothingResetSlewUs = 1000;
 // Retired metronome playout, kept reachable for replay. It advances the
 // presented slot by the fitted source period, corrects phase toward the mapped
 // sender clock by a bounded step, and moves a frame that cannot make its tick
@@ -190,8 +195,8 @@ VrrTimingParameters vrrTimingParametersForSession(
     // even when readiness-lead learning excludes them from generic render cost.
     parameters.playoutSerialServiceGate = parameters.playoutResponsiveBuffer ? 2 : 0;
     // Keep the preset's long quality history for reporting and future attack,
-    // while allowing genuinely clean recent operation to shed old latency.
-    parameters.playoutRecentPressureRelease = parameters.playoutResponsiveBuffer ? 1 : 0;
+    // while only absorbable readiness misses renew the standing-delay hold.
+    parameters.playoutRecentPressureRelease = parameters.playoutResponsiveBuffer ? 2 : 0;
     // Qualify initial learning sooner with enough observations, without
     // increasing attack speed or rearming fast calibration on FPS changes.
     parameters.playoutIntervalInitialWarmupUs = 500000;
@@ -224,6 +229,8 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutAdaptiveOnly = 0;
     // Match vrr14's planned-slot protection. Keep revision 2 available for
     // exact replay; native-rate/tight slots still request synchronized output.
+    // Revision 2 latches every 116/120 frame; latchedFlipAnchor instead
+    // closes the latched-then-tearing gap that its headroom papered over.
     parameters.playoutPerFrameLatch = 1;
     parameters.playoutRateProtectionEnabled = 0;
     parameters.playoutHistoryEnabled = 1;
@@ -265,6 +272,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         kPlayoutSmoothingReservePercentilePerMille;
     parameters.playoutSmoothingReserveReleaseUsPerSecond =
         kPlayoutSmoothingReserveReleaseUsPerSecond;
+    parameters.playoutSmoothingResetSlewUs = kPlayoutSmoothingResetSlewUs;
     parameters.playoutSmoothingWindowedCadence = 2;
     // Four consecutive intervals qualify the new window. Source-rate changes
     // already have their own confirmation gate; another 200 ms without
@@ -293,6 +301,14 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.rateCandidateMinimumUs = kRateCandidateMinimumUs;
     parameters.playoutStallBurstExclusion = 1;
     parameters.latchedFloorDisabled = 1;
+    // A latched present flips no earlier than one display period after the
+    // previous flip, not at its call. Anchoring the next tearing present to
+    // the call let it flip inside the panel's minimum period after a late or
+    // compressed frame.
+    parameters.latchedFlipAnchor = 1;
+    // Beyond ~50 Hz the panel may be repeating the last frame (LFC); an
+    // immediate tearing present can then land mid-repeat.
+    parameters.vrrFloorLatchGapUs = 20000;
     parameters.pacingLatencyQueueModeExtra = 0;
     if (!config.smoothFrameTiming) {
         // Preserve the mapped RTP intervals instead of regularizing the
@@ -306,6 +322,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         parameters.playoutSmoothingReserveToleranceUs = 0;
         parameters.playoutSmoothingReservePercentilePerMille = 0;
         parameters.playoutSmoothingReserveReleaseUsPerSecond = 0;
+        parameters.playoutSmoothingResetSlewUs = 0;
     }
     return parameters;
 }
@@ -341,6 +358,7 @@ void VrrTimingController::reset()
     m_HaveLastSubmission = false;
     m_CatchupActive = false;
     m_LastSubmissionUs = 0;
+    m_SpacingAnchorUs = 0;
     m_CleanSpacingFrames = 0;
     m_PhaseErrorFrames = 0;
     clearTimeline(false);
@@ -439,6 +457,7 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_SmoothingShortfallIndex = 0;
     }
     m_SmoothingEngaged = false;
+    m_LastSmoothingRetimingUs = 0;
     m_HaveLastDecodeComplete = false;
     m_LastDecodeCompleteUs = 0;
     resetCadenceSmoothing();
@@ -648,10 +667,29 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             // schedule does not step by the reserve at every cadence reset.
             smoothingReserveUs = smoothingReserveEnabled() ?
                 m_SmoothingReserveUs : 0;
-            smoothingUs = cadenceSmoothingAdjustUs(
+            int64_t retimingUs = cadenceSmoothingAdjustUs(
                 cadence, rebased, saturatingAdd(rawBasisUs, smoothingReserveUs),
-                delayBeforeUs, smoothingReserveUs) +
-                static_cast<int64_t>(smoothingReserveUs);
+                delayBeforeUs, smoothingReserveUs);
+            const int64_t slewUs = static_cast<int64_t>(
+                m_Parameters.playoutSmoothingResetSlewUs);
+            if (slewUs != 0 && !m_SmoothingEngaged && !rebased &&
+                    m_Parameters.playoutSmoothingGainPerMille != 0) {
+                // The smoother reset this frame onto its raw slot. Ease the
+                // retiming the previous frame carried back to it instead of
+                // stepping the whole difference into one presented interval.
+                // A new clock epoch has no comparable raw slot and still jumps.
+                retimingUs = m_LastSmoothingRetimingUs > slewUs ?
+                    m_LastSmoothingRetimingUs - slewUs :
+                    m_LastSmoothingRetimingUs < -slewUs ?
+                    m_LastSmoothingRetimingUs + slewUs : 0;
+                retimingUs = std::min(retimingUs, static_cast<int64_t>(
+                    m_Parameters.playoutSmoothingMaxLagUs -
+                    std::min(m_Parameters.playoutSmoothingMaxLagUs, smoothingReserveUs)));
+                retimingUs = std::max(retimingUs, -static_cast<int64_t>(
+                    saturatingAdd(delayBeforeUs, smoothingReserveUs)));
+            }
+            m_LastSmoothingRetimingUs = retimingUs;
+            smoothingUs = retimingUs + static_cast<int64_t>(smoothingReserveUs);
         }
         // The calibrator sees lateness against the slot the schedule is
         // trying to reach, not the slot it currently occupies: while the
@@ -664,6 +702,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     }
     else {
         resetCadenceSmoothing();
+        m_LastSmoothingRetimingUs = 0;
         if (m_Parameters.playoutSmoothingWindowedCadence) {
             m_SmoothingCadenceCount = 0;
             m_SmoothingCadenceIndex = 0;
@@ -782,6 +821,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     if (reseedPhase) {
         m_FutureProjectionFrames = 0;
         smoothingUs = 0;
+        m_LastSmoothingRetimingUs = 0;
         missedTicks = 0;
         resetCadenceSmoothing();
         // The metronome restarts on the re-seeded slot; the grid tick this
@@ -855,11 +895,16 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         const uint64_t safetyHeadroomUs = m_Parameters.playoutPerFrameLatch >= 2 ?
             (m_LatchedPresentation ? latchedPresentationExitHeadroomUs() :
                                      latchedPresentationHeadroomUs()) : 0;
-        const uint64_t safeAdaptiveUs = saturatingAdd(m_LastSubmissionUs,
+        const uint64_t safeAdaptiveUs = saturatingAdd(spacingAnchorUs(),
             saturatingAdd(saturatingAdd(m_DisplayPeriodUs, m_GuardUs),
                           safetyHeadroomUs));
+        // After a gap past the VRR range the driver may be mid-repeat of the
+        // previous frame; let the flip queue place this one.
+        const bool beyondVrrFloor = m_Parameters.vrrFloorLatchGapUs != 0 &&
+            m_HaveLastSubmission &&
+            targetUs >= saturatingAdd(spacingAnchorUs(), m_Parameters.vrrFloorLatchGapUs);
         m_LatchedPresentation = m_CanLatchPresentation && m_HaveLastSubmission &&
-                                targetUs < safeAdaptiveUs;
+                                (targetUs < safeAdaptiveUs || beyondVrrFloor);
     }
     const uint64_t unflooredTargetUs = targetUs;
     if (m_Parameters.playoutPredictionEnabled && !m_Parameters.playoutPredictionOnly &&
@@ -2081,7 +2126,7 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 intervalQualityWindowUs(m_Parameters),
                 m_Parameters.playoutIntervalInitialWarmupUs,
                 m_Parameters.playoutIntervalInitialMinimumSamples,
-                m_Parameters.playoutRecentPressureRelease != 0,
+                m_Parameters.playoutRecentPressureRelease,
                 m_Parameters.playoutSerialServiceGate);
         }
         else m_MeanMissBuffer.observe(submissionUs, ready > deadline ? ready - deadline : 0,
@@ -2150,6 +2195,11 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
     if (submitted) {
         // Cancellation is a reason, not proof that nothing reached the native
         // presentation queue (Vulkan must submit some abandoned images).
+        // A latched present waits in the flip queue for the panel's minimum
+        // period after the previous flip; it cannot reach scanout sooner.
+        m_SpacingAnchorUs = m_HaveLastSubmission && m_LatchedPresentation ?
+            std::max(submissionUs, saturatingAdd(spacingAnchorUs(), m_DisplayPeriodUs)) :
+            submissionUs;
         m_HaveLastSubmission = true;
         m_LastSubmissionUs = submissionUs;
 
@@ -2551,7 +2601,7 @@ uint64_t VrrTimingController::earliestSubmissionUs() const
     const uint64_t safetyHeadroomUs = m_Parameters.playoutPerFrameLatch >= 2 ?
         latchedPresentationHeadroomUs() : 0;
     return saturatingAdd(
-        m_LastSubmissionUs,
+        spacingAnchorUs(),
         saturatingAdd(saturatingAdd(m_DisplayPeriodUs, m_GuardUs),
                       safetyHeadroomUs));
 }
@@ -2559,6 +2609,17 @@ uint64_t VrrTimingController::earliestSubmissionUs() const
 uint64_t VrrTimingController::lastSubmissionUs() const
 {
     return m_LastSubmissionUs;
+}
+
+uint64_t VrrTimingController::spacingAnchorUs() const
+{
+    return m_Parameters.latchedFlipAnchor != 0 ?
+        std::max(m_SpacingAnchorUs, m_LastSubmissionUs) : m_LastSubmissionUs;
+}
+
+uint64_t VrrTimingController::untornReferenceUs() const
+{
+    return m_LatchedPresentation ? m_LastSubmissionUs : spacingAnchorUs();
 }
 
 bool VrrTimingController::hasLastSubmission() const

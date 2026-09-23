@@ -69,6 +69,7 @@ VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
     policy.playoutSmoothingReserveToleranceUs = 0;
     policy.playoutSmoothingReservePercentilePerMille = 0;
     policy.playoutSmoothingReserveReleaseUsPerSecond = 0;
+    policy.playoutSmoothingResetSlewUs = 0;
     policy.playoutDelayMaximumUs = 8000;
     policy.playoutDelayMaximumPeriodPerMille = 950;
     policy.playoutDelayAttackUs = 50;
@@ -2885,6 +2886,67 @@ void testPerFrameLatchAtNativeMaximum()
     }
 }
 
+void testTearingPresentClearsLatchedFlip()
+{
+    // A latched present flips no sooner than one display period after the
+    // previous flip. A tearing present anchored only to that latched call
+    // could flip inside the panel's minimum period after a late frame.
+    const auto run = [](uint64_t anchor, uint64_t perFrameLatch) {
+        auto session = config(116, 120);
+        auto policy = vrrTimingParametersForSession(session);
+        policy.latchedFlipAnchor = anchor;
+        policy.playoutPerFrameLatch = perFrameLatch;
+        VrrTimingController controller(session, true, policy);
+        uint64_t flipUs = 0, violations = 0, adaptive = 0;
+        bool haveFlip = false;
+        for (int i = 0; i < 2000; ++i) {
+            const uint32_t rtp = uint32_t(uint64_t(i) * 90000 / 116);
+            const uint64_t at = 1000000 + uint64_t(rtp) * 1000 / 90;
+            const auto d = controller.schedule(frame(i, rtp, true, at), at);
+            // Every 7th frame's Present is late by 0.6-2.4 ms.
+            const uint64_t call = d.targetUs + (i % 7 == 3 ? 600 + (i % 4) * 600 : 0);
+            if (!d.latchedPresentation) {
+                ++adaptive;
+                if (haveFlip && call < flipUs + controller.displayPeriodUs()) ++violations;
+                flipUs = call;
+            }
+            else flipUs = haveFlip ? std::max(call, flipUs + controller.displayPeriodUs()) : call;
+            haveFlip = true;
+            controller.noteSubmission(true, false, call);
+        }
+        return std::array<uint64_t, 2>{violations, adaptive};
+    };
+    expect(run(0, 1)[0] > 0,
+           "call-anchored spacing must reproduce tearing presents after late latched frames");
+    expect(run(1, 1)[0] == 0 && run(1, 2)[0] == 0,
+           "tearing presents must clear the predicted flip of a latched predecessor");
+    const auto production = vrrTimingParametersForSession(config(116, 120));
+    expect(production.latchedFlipAnchor == 1 && production.vrrFloorLatchGapUs == 20000,
+           "production must anchor spacing to latched flips and latch after VRR-floor gaps");
+}
+
+void testFirstPresentAfterVrrFloorGapLatches()
+{
+    auto session = config(116, 120);
+    auto policy = vrrTimingParametersForSession(session);
+    VrrTimingController controller(session, true, policy);
+    uint64_t at = 1000000;
+    uint32_t rtp = 0;
+    for (int i = 0; i < 300; ++i) {
+        rtp += 90000 / 116;
+        at += 1000000 / 116;
+        const auto d = controller.schedule(frame(i, rtp, true, at), at);
+        controller.noteSubmission(true, false, d.targetUs);
+    }
+    // A 60 ms host stall leaves the panel below its VRR range.
+    rtp += 90000 * 60 / 1000;
+    at += 60000;
+    const auto d = controller.schedule(frame(300, rtp, true, at), at);
+    expect(d.latchedPresentation,
+           "the first present after a gap beyond the VRR floor must use the flip queue");
+    controller.noteSubmission(true, false, d.targetUs);
+}
+
 void testExplicitAdaptiveOnlyPolicy()
 {
     for (int refresh : {60, 120, 144, 240}) {
@@ -4966,7 +5028,50 @@ VrrTimingParameters previousJudderPolicy(VrrTimingParameters policy)
     policy = withoutJudderReserve(policy);
     policy.playoutSmoothingPeriodFeedbackPerMillion = 0;
     policy.playoutSmoothingMaxLagUs = 2000;
+    policy.playoutSmoothingResetSlewUs = 0;
     return policy;
+}
+
+// 116 FPS near a 120 Hz ceiling, stamped on a ~2.15 ms host capture grid, with
+// a four-frame game slowdown (12.9 ms frames) every 150 frames. Capture
+// 20260922-193211 showed each slowdown resetting the smoother and stepping its
+// accumulated retiming into one presented interval.
+uint32_t slowdownTicks(int i)
+{
+    uint64_t ticks = 0;
+    for (int k = 0; k <= i; ++k) {
+        const int phase = k % 150;
+        if (phase >= 100 && phase < 104) ticks += 1161;
+        else ticks += 776 + static_cast<uint64_t>((k * 7) % 3) * 194 - 194;
+    }
+    return static_cast<uint32_t>(ticks);
+}
+
+void testReduceJudderEasesCadenceResets()
+{
+    for (int mode : {0, 1, 2}) {
+        auto session = config(116, 120);
+        session.latencyMode = mode;
+        const auto production = vrrTimingParametersForSession(session);
+        auto stepped = production;
+        stepped.playoutSmoothingResetSlewUs = 0;
+        const auto eased = runJudderFixture(session, production, 3000, 600, slowdownTicks);
+        const auto step = runJudderFixture(session, stepped, 3000, 600, slowdownTicks);
+        std::printf("cadence reset mode=%d >2ms %.1f%% -> %.1f%% mean jerk %llu -> %llu us latency %llu -> %llu us\n",
+            mode, step.jerkShare() * 100, eased.jerkShare() * 100,
+            (unsigned long long)step.meanJerkUs(), (unsigned long long)eased.meanJerkUs(),
+            (unsigned long long)step.meanLatencyUs(), (unsigned long long)eased.meanLatencyUs());
+        expect(production.playoutSmoothingResetSlewUs == 1000,
+               "Reduce judder must ease cadence resets by 1 ms per frame");
+        expect(eased.jerkShare() < step.jerkShare() && eased.meanJerkUs() < step.meanJerkUs(),
+               "easing a cadence reset must remove the retiming step it put on screen");
+        expect(eased.meanLatencyUs() <= step.meanLatencyUs() + 1000,
+               "easing a cadence reset must not add standing latency");
+    }
+    auto session = config(116, 120);
+    session.smoothFrameTiming = false;
+    expect(vrrTimingParametersForSession(session).playoutSmoothingResetSlewUs == 0,
+           "timestamp-following playout has no retiming to ease");
 }
 
 void testReduceJudderReserveCoversQuantizedCadence()
@@ -5339,7 +5444,7 @@ void testMeanMissBuffer()
         expect(policy.playoutResponsiveBuffer == 7 &&
             policy.playoutSourceMappingDecoderOutput == 0 &&
             policy.playoutSerialServiceGate == 2 &&
-            policy.playoutRecentPressureRelease == 1 &&
+            policy.playoutRecentPressureRelease == 2 &&
             policy.playoutMeanMissHoldUs == (mode == 2 ? 6000000 : mode == 1 ? 8000000 : 10000000) &&
             policy.playoutMeanMissReleaseUsPerSecond == (mode == 0 ? 50 : mode == 2 ? 125 : 250),
             "every preset must select the production interval queue and record its release policy");
@@ -5525,6 +5630,39 @@ void testIntervalBufferReleaseIgnoresReportingDebt()
            "clean recent operation must release reserve while long reporting history stays below target");
     expect(historical[0] > 1000,
            "historical score-held behavior must remain replayable when the release revision is disabled");
+}
+
+void testIntervalBufferHoldRequiresAbsorbableReadiness()
+{
+    const auto run = [](uint64_t revision, bool lateReadiness, bool overloaded) {
+        Vrr13::IntervalBuffer buffer;
+        uint64_t applied = 6000;
+        for (uint64_t i = 1; i <= 4000; ++i) {
+            const uint64_t source = 1000000 + i * 10000;
+            const uint64_t deadline = source + applied;
+            const uint64_t jitter = i % 2 ? 3000 : 0;
+            // A ready image can still suffer native/scheduler submission
+            // jitter. That error must remain in quality reporting without
+            // retaining delay that cannot move readiness any earlier.
+            buffer.observe({i, source, deadline + jitter, deadline,
+                            lateReadiness ? deadline + jitter : source,
+                            applied, true, true, overloaded ? 11000ULL : 500ULL, 0},
+                           1000, 6000, 8000000, 250, true, 995000,
+                           500, 120000000, 500000, 32, revision, 2);
+            applied = buffer.demand(applied);
+        }
+        return std::array<double, 2>{double(applied), buffer.stats().qualityPercent()};
+    };
+    const auto historical = run(1, false, false);
+    const auto corrected = run(2, false, false);
+    expect(historical[0] == 6000 && corrected[0] == 1000,
+           "post-readiness jitter must release old buffer after the normal hold; revision 1 remains reproducible");
+    expect(corrected[1] < 99.5,
+           "unabsorbable submission jitter must still count against reported timing quality");
+    expect(run(2, true, false)[0] == 6000,
+           "recurring absorbable readiness misses must retain useful protection");
+    expect(run(2, true, true)[0] == 1000,
+           "sustained service overload must not perpetually renew standing delay");
 }
 
 void testProductionCalibrationSurvivesFpsChanges()
@@ -5757,6 +5895,7 @@ int main()
     }
 
     testIntervalBufferReleaseIgnoresReportingDebt();
+    testIntervalBufferHoldRequiresAbsorbableReadiness();
     testIntervalBufferTransientServiceRecovery();
     testIntervalBufferSeparatesDeliveryFromSerialService();
     testProductionCalibrationSurvivesFpsChanges();
@@ -5791,6 +5930,7 @@ int main()
     testReduceJudderReserveCoversQuantizedCadence();
     testReduceJudderReserveIgnoresDeliveryJitter();
     testReduceJudderReserveReleases();
+    testReduceJudderEasesCadenceResets();
     testReduceJudderFollowsRateDrift();
     testReadinessDrivenPadding();
     testStableNativeSmoothnessReference();
@@ -5802,6 +5942,8 @@ int main()
     testVrr14Prediction();
     testProcessingEpisodeClassification();
     testPerFrameLatchAtNativeMaximum();
+    testTearingPresentClearsLatchedFlip();
+    testFirstPresentAfterVrrFloorGapLatches();
     testExplicitAdaptiveOnlyPolicy();
     testProductionAdaptiveProtectionRecoversWithoutDrift();
     testPerFrameLatchIncludesSafetyHeadroom();

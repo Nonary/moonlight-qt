@@ -487,8 +487,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.playoutSourceMappingDecoderOutput > 1 ||
             value.playoutSerialServiceGate > 2 ||
-            value.playoutRecentPressureRelease > 1) {
-        return fail("source mapping and recent pressure flags must be 0 or 1; serial service revision must be 0..2");
+            value.playoutRecentPressureRelease > 2) {
+        return fail("source mapping flag must be 0 or 1; recent pressure and serial service revisions must be 0..2");
     }
     if ((value.playoutSerialServiceGate || value.playoutRecentPressureRelease) &&
             value.playoutResponsiveBuffer < 6) {
@@ -539,6 +539,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.playoutSmoothingPeriodFeedbackPerMillion > 100000) {
         return fail("playout_smoothing_period_feedback_per_million must be in 0..100000");
+    }
+    if (value.playoutSmoothingResetSlewUs > 100000) {
+        return fail("playout_smoothing_reset_slew_us must be in 0..100000");
     }
     if (value.playoutDelayMinimumSamples == 0 ||
             value.playoutDelayReservoirSamples == 0 ||

@@ -80,7 +80,7 @@ public:
                  uint64_t scoreWindowUs = 30000000,
                  uint64_t initialWarmupUs = 1000000,
                  size_t initialMinimumSamples = 2,
-                 bool recentPressureRelease = false,
+                 uint64_t recentPressureRelease = 0,
                  uint64_t serialServiceGate = 0) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -169,14 +169,27 @@ public:
         // without current, attributable error outside the preset's allowance.
         const bool historicalPressure = severityWeighted && belowTarget;
         const bool historyHolds = !recentPressureRelease && historicalPressure;
-        const bool holdProtection = currentPressure ||
+        const auto& delayed = actual >= intended ? s : previous;
+        const auto lateness = delayed.ready > delayed.deadline ? delayed.ready - delayed.deadline : 0;
+        const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
+        const bool windowAbsorbable = service <= intendedTime && decoderQueue <= intendedTime;
+        const bool delayedAbsorbable = delayed.absorbable &&
+            (!serialServiceGate ||
+             (serialServiceGate >= 2 ? windowAbsorbable :
+              (delayed.serialService <= intended && delayed.decoderQueue <= intended)));
+        // Revision 2 applies growth's causal evidence to hold renewal too.
+        // Native presentation/scheduler jitter after readiness, or sustained
+        // service overload, cannot be repaired by retaining standing delay.
+        // Keep the normal hold between attributable misses; do not change the
+        // long quality score, attack qualification, or gradual release rate.
+        const bool pressureHolds = currentPressure &&
+            (recentPressureRelease < 2 || (freshError && delayedAbsorbable && lateness));
+        const bool holdProtection = pressureHolds ||
             historyHolds;
         if (holdProtection) {
             m_LastPressure = s.submitted;
             if (severityWeighted) m_ReleaseFraction = 0;
         }
-        const auto& delayed = actual >= intended ? s : previous;
-        const auto lateness = delayed.ready > delayed.deadline ? delayed.ready - delayed.deadline : 0;
         update.attributedFrame = delayed.frame;
         update.latenessUs = lateness;
         const auto remaining = [](uint64_t elapsed, uint64_t duration) {
@@ -186,9 +199,8 @@ public:
             m_LastPressure ? remaining(s.submitted - m_LastPressure, hold) : 0);
         update.cooldownRemainingUs = m_LastAttack ?
             remaining(s.submitted - m_LastAttack, 250000) : 0;
-        update.action = currentPressure ? Action::CurrentPressure :
+        update.action = pressureHolds ? Action::CurrentPressure :
             historyHolds ? Action::HistoryHold : Action::RecoveryHold;
-        const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
         const bool grow = currentPressure && (!severityWeighted || belowTarget);
         // Revision 1 mistook every slow frame for sustained overload. A
         // jitter buffer can cover a transient dependency stall when subsequent
@@ -196,12 +208,6 @@ public:
         // window as interval pressure, not the single late/catch-up pair.
         // Sequence breaks discard this evidence, preventing stale headroom
         // from authorizing growth across missing frames or source epochs.
-        const bool windowAbsorbable = service <= intendedTime && decoderQueue <= intendedTime;
-        const bool delayedAbsorbable = delayed.absorbable &&
-            (!serialServiceGate ||
-             (serialServiceGate >= 2 ? windowAbsorbable :
-              (delayed.serialService <= intended &&
-               delayed.decoderQueue <= intended)));
         if (grow && freshError && delayedAbsorbable && lateness &&
                 (!m_LastAttack || s.submitted - m_LastAttack >= 250000)) {
             const auto excess = severityWeighted ?

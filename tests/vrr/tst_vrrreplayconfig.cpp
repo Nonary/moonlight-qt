@@ -295,7 +295,7 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     QCOMPARE(restored.playoutOffsetMaximumStepUs, uint64_t(100));
     QCOMPARE(restored.playoutSourceMappingDecoderOutput, uint64_t(0));
     QCOMPARE(restored.playoutSerialServiceGate, uint64_t(2));
-    QCOMPARE(restored.playoutRecentPressureRelease, uint64_t(1));
+    QCOMPARE(restored.playoutRecentPressureRelease, uint64_t(2));
     QVERIFY(vrrReplayParameterNames().contains("controller.playout_offset_cadence_gate"));
     QVERIFY(vrrReplayParameterNames().contains("controller.playout_offset_slew_us_per_second"));
     QVERIFY(vrrReplayParameterNames().contains("controller.playout_offset_source_clock"));
@@ -360,6 +360,8 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     QVERIFY(!validateVrrTimingParameters(invalid, error));
     invalid = restored;
     invalid.playoutRecentPressureRelease = 2;
+    QVERIFY(validateVrrTimingParameters(invalid, error));
+    invalid.playoutRecentPressureRelease = 3;
     QVERIFY(!validateVrrTimingParameters(invalid, error));
 }
 
@@ -1610,6 +1612,29 @@ void VrrReplayConfigTest::gpuCompletionBounds()
     QCOMPARE(bounds.lowerBoundUs, uint64_t(120));
     QCOMPARE(bounds.upperBoundUs, uint64_t(850));
 
+    // Current D3D11 telemetry replaces the preparation poll with the first
+    // poll at Present. Both a completed fence and a residual wait remain
+    // causal completion brackets.
+    bounds = evaluateVrrGpuCompletionBounds(
+        100, 300, 110, 800, 801, 5, 5, true, 801, 805, true);
+    QVERIFY(bounds.valid);
+    QCOMPARE(bounds.lowerBoundUs, uint64_t(110));
+    QCOMPARE(bounds.upperBoundUs, uint64_t(801));
+    bounds = evaluateVrrGpuCompletionBounds(
+        100, 300, 110, 800, 801, 5, 4, false, 801, 805, true);
+    QVERIFY(bounds.valid);
+    QCOMPARE(bounds.lowerBoundUs, uint64_t(800));
+    QCOMPARE(bounds.upperBoundUs, uint64_t(805));
+    bounds = evaluateVrrGpuCompletionBounds(
+        100, 300, 110, 800, 801, 5, 5, true, 801, 805);
+    QVERIFY(!bounds.valid);
+    bounds = evaluateVrrGpuCompletionBounds(
+        100, 300, 110, 299, 301, 5, 5, true, 301, 805, true);
+    QVERIFY(!bounds.valid);
+    bounds = evaluateVrrGpuCompletionBounds(
+        100, 300, 110, 800, 801, 5, 5, true, 802, 805, true);
+    QVERIFY(!bounds.valid);
+
     bounds = evaluateVrrGpuCompletionBounds(
         100, 300, 110, 120, 301, 5, 4, false, 800, 850, true);
     QVERIFY(!bounds.valid);
@@ -1710,30 +1735,43 @@ void VrrReplayConfigTest::gpuReadyStageTimingAudit()
     // Without D3D's submitted fence/event stages it remains prepare-time work.
     QVERIFY(!isVrrGpuReadyWaitDeferred(true, false, true, 300, 300));
 
-    // Completion found by the preparation poll follows preparation start;
-    // completion first bounded after preparation follows preparation end.
+    // Poll placement selects the mapping anchor. A final poll can find
+    // completion after the cadence hold without waiting on an event.
     QCOMPARE(mapVrrGpuReadyUpperBound(100, 300, 1000, 1400, 120, true),
              uint64_t(1020));
     QCOMPARE(mapVrrGpuReadyUpperBound(100, 300, 1000, 1400, 300, true),
              uint64_t(1200));
     QCOMPARE(mapVrrGpuReadyUpperBound(100, 300, 1000, 1400, 350, false),
              uint64_t(1450));
+    QCOMPARE(mapVrrGpuReadyUpperBound(100, 300, 1000, 1400, 801, false),
+             uint64_t(1901));
     QCOMPARE(mapVrrGpuReadyUpperBound(100, 300, 1000, 1400, 99, true),
              uint64_t(0));
     QCOMPARE(mapVrrGpuReadyUpperBound(100, 300, 1000, 1400, 299, false),
              uint64_t(0));
 
-    QVERIFY(isVrrDeferredGpuReadyOrderValid(
-        800, 850, 300, 790, 900, true, 860));
-    QVERIFY(!isVrrDeferredGpuReadyOrderValid(
-        780, 850, 300, 790, 900, true, 860));
-    QVERIFY(!isVrrDeferredGpuReadyOrderValid(
-        800, 870, 300, 790, 900, true, 860));
-    QVERIFY(isVrrDeferredGpuReadyOrderValid(
-        800, 870, 300, 790, 900, false, 0));
+    QVERIFY(isVrrGpuReadyPollDuringPreparation(120, 121, 300, 790, 800));
+    QVERIFY(!isVrrGpuReadyPollDuringPreparation(800, 801, 300, 790, 801));
+    QVERIFY(!isVrrGpuReadyPollDuringPreparation(300, 300, 300, 300, 300));
+    QVERIFY(isVrrGpuReadyPollDuringPreparation(299, 300, 300, 300, 300));
 
-    // The initial poll exists regardless of whether the later wait completes.
-    // These relationships therefore cover pending-cancel and timeout rows too.
+    QVERIFY(isVrrDeferredGpuReadyOrderValid(
+        120, 121, 800, 850, 300, 790, 900, true, 860));
+    QVERIFY(!isVrrDeferredGpuReadyOrderValid(
+        120, 121, 780, 850, 300, 790, 900, true, 860));
+    QVERIFY(!isVrrDeferredGpuReadyOrderValid(
+        120, 121, 800, 870, 300, 790, 900, true, 860));
+    QVERIFY(isVrrDeferredGpuReadyOrderValid(
+        120, 121, 800, 870, 300, 790, 900, false, 0));
+    QVERIFY(isVrrDeferredGpuReadyOrderValid(
+        800, 801, 801, 805, 300, 790, 900, true, 860));
+    QVERIFY(!isVrrDeferredGpuReadyOrderValid(
+        700, 701, 701, 805, 300, 790, 900, true, 860));
+    QVERIFY(!isVrrDeferredGpuReadyOrderValid(
+        800, 801, 802, 805, 300, 790, 900, true, 860));
+
+    // The retained poll may be the preparation or final check. Both
+    // relationships cover pending cancellation and timeout rows.
     QVERIFY(isVrrGpuFencePollRelationshipValid(5, 4, false));
     QVERIFY(isVrrGpuFencePollRelationshipValid(5, 5, true));
     QVERIFY(!isVrrGpuFencePollRelationshipValid(5, 4, true));
@@ -1795,6 +1833,27 @@ void VrrReplayConfigTest::gpuReadyStageTimingAudit()
         110, 112, 113, 120, 121, 122,
         123, 124, 800, 850, deferredTimeout);
     QVERIFY(audit.relationshipValid);
+
+    audit = evaluateVrrGpuReadyStageTiming(
+        100, 300, true, true, true,
+        110, 112, 113, 120, 121, 122,
+        800, 801, 801, 805, true);
+    QVERIFY(audit.relationshipValid);
+    audit = evaluateVrrGpuReadyStageTiming(
+        100, 300, true, true, true,
+        110, 112, 113, 120, 121, 122,
+        800, 801, 801, 805);
+    QVERIFY(!audit.relationshipValid);
+    audit = evaluateVrrGpuReadyStageTiming(
+        100, 300, true, true, true,
+        110, 112, 113, 120, 121, 122,
+        800, 801, 0, 0, true);
+    QVERIFY(!audit.relationshipValid);
+    audit = evaluateVrrGpuReadyStageTiming(
+        100, 300, true, true, true,
+        110, 112, 113, 120, 121, 122,
+        800, 801, 802, 805, true);
+    QVERIFY(!audit.relationshipValid);
 
     audit = evaluateVrrGpuReadyStageTiming(
         100, 300, true, true, true,

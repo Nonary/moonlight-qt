@@ -206,6 +206,7 @@ NvHTTP::startApp(QString verb,
                  int gamepadMask,
                  int playStationGamepadMask,
                  bool persistGameControllersOnDisconnect,
+                 bool clientVrrRequested,
                  QString& rtspSessionUrl)
 {
     int riKeyId;
@@ -236,6 +237,11 @@ NvHTTP::startApp(QString verb,
                                    "&gcmap="+QString::number(gamepadMask)+
                                    "&psmap="+QString::number(playStationGamepadMask)+
                                    "&gcpersist="+QString::number(persistGameControllersOnDisconnect ? 1 : 0)+
+                                   // Tells VRR-aware hosts that this client paces playback from
+                                   // RTP timestamps, so they can capture with precise frame timing
+                                   // (Vibeshine: 1000 Hz virtual display in its Automatic mode).
+                                   // Other hosts ignore unknown launch parameters.
+                                   (clientVrrRequested ? "&clientVrrRequested=1" : "")+
                                    LiGetLaunchUrlQueryParameters(),
                                    LAUNCH_TIMEOUT_MS);
 

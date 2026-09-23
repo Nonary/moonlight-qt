@@ -1001,14 +1001,14 @@ uint64_t mapVrrGpuReadyUpperBound(
     uint64_t simulatedPreparationStartUs,
     uint64_t simulatedPreparationEndUs,
     uint64_t recordedUpperBoundUs,
-    bool completedBeforeWait)
+    bool completionObservedDuringPreparation)
 {
-    // The initial poll is part of preparation even when its end and the
-    // preparation boundary round to the same microsecond. Only completion
-    // first observed by the final present-boundary wait follows prep end.
-    const uint64_t recordedBase = completedBeforeWait ?
+    // completedBeforeWait can also describe the final poll after the cadence
+    // hold. Use the poll's placement, rather than its fence result, to select
+    // the preparation or presentation-side mapping anchor.
+    const uint64_t recordedBase = completionObservedDuringPreparation ?
         recordedPreparationStartUs : recordedPreparationEndUs;
-    const uint64_t simulatedBase = completedBeforeWait ?
+    const uint64_t simulatedBase = completionObservedDuringPreparation ?
         simulatedPreparationStartUs : simulatedPreparationEndUs;
     if (recordedUpperBoundUs < recordedBase) {
         return 0;
@@ -1018,14 +1018,35 @@ uint64_t mapVrrGpuReadyUpperBound(
         std::numeric_limits<uint64_t>::max() : simulatedBase + offset;
 }
 
+bool isVrrGpuReadyPollDuringPreparation(
+    uint64_t pollStartUs, uint64_t pollEndUs,
+    uint64_t preparationEndUs, uint64_t presentStartUs,
+    uint64_t waitStartUs)
+{
+    // Microsecond timestamps can make the final poll and preparation end
+    // equal. The final poll begins inside Present and hands off directly to
+    // the residual wait; that operation order resolves the boundary tie.
+    return pollEndUs <= preparationEndUs &&
+        !(presentStartUs != 0 && pollStartUs >= presentStartUs &&
+          waitStartUs == pollEndUs);
+}
+
 bool isVrrDeferredGpuReadyOrderValid(
+    uint64_t pollStartUs, uint64_t pollEndUs,
     uint64_t waitStartUs, uint64_t waitReturnUs,
     uint64_t preparationEndUs,
     uint64_t presentStartUs, uint64_t presentEndUs,
     bool nativePresentTimingValid,
     uint64_t nativePresentStartUs)
 {
-    return waitStartUs != 0 &&
+    // The current D3D11 final poll runs inside Present/cancellation and its
+    // end is the start of the residual wait. Older preparation polls retain
+    // their earlier placement and may precede the Present operation.
+    const bool finalPollOrderValid = pollEndUs <= preparationEndUs ||
+        (pollStartUs >= presentStartUs &&
+         pollStartUs >= preparationEndUs &&
+         waitStartUs == pollEndUs);
+    return finalPollOrderValid && waitStartUs != 0 &&
         waitReturnUs >= waitStartUs &&
         waitStartUs >= preparationEndUs &&
         presentStartUs != 0 &&
@@ -1071,7 +1092,10 @@ VrrGpuCompletionBounds evaluateVrrGpuCompletionBounds(
             signalStartUs < preparationStartUs ||
             pollStartUs < signalStartUs ||
             pollEndUs < pollStartUs ||
-            pollEndUs > preparationEndUs ||
+            !(pollEndUs <= preparationEndUs ||
+              (completionMayFollowPreparation &&
+               pollStartUs >= preparationEndUs &&
+               waitStartUs == pollEndUs)) ||
             waitStartUs < pollEndUs ||
             waitReturnUs < waitStartUs ||
             (!completionMayFollowPreparation &&
@@ -1204,11 +1228,19 @@ VrrGpuReadyStageTimingAudit evaluateVrrGpuReadyStageTiming(
         return result;
     }
 
+    // Older traces retain the preparation poll. The current D3D11 path
+    // replaces its trace fields with the first poll at the Present boundary.
+    // A cancelled frame without a final wait can only carry the former.
+    const bool pollPlacementValid =
+        pollEndUs <= preparationEndUs ||
+        (completionMayFollowPreparation && waitStartUs != 0 &&
+         pollStartUs >= preparationEndUs &&
+         waitStartUs == pollEndUs);
     const bool pollWaitTimingValid =
         pollStartUs != 0 &&
         pollEndUs >= pollStartUs &&
         pollStartUs >= setEventEndUs &&
-        pollEndUs <= preparationEndUs &&
+        pollPlacementValid &&
         ((completionMayFollowPreparation &&
           waitStartUs == 0 && waitReturnUs == 0) ||
          (waitStartUs >= pollEndUs &&

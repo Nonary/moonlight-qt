@@ -6856,7 +6856,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     readiness["display_calibration_scope"] =
         "calibration_confirmed is an operator assertion covering the SyncQPCTime-to-first-active-line offset, Present-to-display transport, and phase uncertainty; replay cannot measure panel transport or output. Optional microsecond period and active-duration overrides must agree with the captured physical refresh rational and active/total pixel geometry; zero means derive them from that signal. The tear-exposure interval ends at the final active pixel rather than including the last line's trailing horizontal blank. Raster classification and counterfactual propagation use an explicit scanout_period_ps override or the exact captured physical-signal rational, and reject disagreement beyond one picosecond. D3DKMT validation separately uses the complete vertically-active line interval, compares every definite active prediction with the recorded scan-line index, and reports its phase-derived error and tolerance for later calibration sweeps. Raster readiness requires at least 100 such active scan-line comparisons and requires phase_uncertainty_us to cover at least the captured QPC-correlation half-span plus one microsecond of timestamp quantization";
     readiness["gpu_ready_scope"] =
-        "D3D11 records Signal, Flush, SetEventOnCompletion and the initial completed-value poll during preparation. The final bounded fence wait may run inside present or cancellation after preparation. Native results and target/completed fence values validate stage progression, the producer's completed-before-wait bit, and reject device removal or impossible lag. Successful bounds prove completion within the derived interval and before a recorded Present; they are not exact GPU completion timestamps";
+        "D3D11 records Signal, Flush, SetEventOnCompletion and a nonblocking completed-value poll during preparation. A final check inside Present or cancellation replaces the recorded poll fields with its first poll and may perform a bounded residual wait. Native results and target/completed fence values validate stage progression, the producer's completed-before-wait bit, and reject device removal or impossible lag. Successful bounds prove completion within the derived interval and before a recorded Present; they are not exact GPU completion timestamps";
     readiness["post_present_query_scope"] =
         "deep traces bracket GetLastPresentCount and GetFrameStatistics after native Present and any observation-only after-Present raster query. Replay requires their exact order before presenter return; ordinary traces retain result codes but deliberately leave the optional timing brackets zero";
     readiness["spacing_scope"] =
@@ -13444,7 +13444,13 @@ int main(int argc, char* argv[])
                         simulatedPreparationStartUs,
                         simulatedPreparationEndUs,
                         recordedGpuReadyUpperBoundUs,
-                        gpuReadyCompletedBeforeWait);
+                        gpuReadyCompletedBeforeWait &&
+                            isVrrGpuReadyPollDuringPreparation(
+                                gpuReadyPollStartUs,
+                                gpuReadyPollEndUs,
+                                recordedPreparationEndUs,
+                                recordedPresentStartUs,
+                                gpuReadyWaitStartUs));
                 referenceController->noteDeferredGpuReady(
                     gpuReadyWaitUs, true, recordedGpuReadyUpperBoundUs,
                     recordedGpuReadyUpperBoundUs >= recordedPreparationStartUs ?
@@ -13466,7 +13472,7 @@ int main(int argc, char* argv[])
         const bool spacingHadPriorSubmission =
             referenceController->hasLastSubmission();
         const uint64_t spacingPriorSubmissionUs =
-            referenceController->lastSubmissionUs();
+            referenceController->untornReferenceUs();
         const uint64_t spacingEarliestBeforeCleanUs =
             referenceController->earliestSubmissionUs();
         uint64_t derivedSpacingGuardFeedbackUs =
@@ -13765,15 +13771,27 @@ int main(int argc, char* argv[])
                 gpuReadyWaitResultDeclared : gpuReadyTimingValid;
         if (metrics.gpuReadyBoundsTelemetryAvailable &&
                 !gpuReadyVulkanPoll && gpuReadySetEventSucceeded) {
-            // Signal/Event success always produces the preparation-time poll,
-            // even when the final wait is pending, times out, or fails. Audit
-            // its fence relationship independently of successful timing.
+            // A final check replaces the preparation poll in current D3D11
+            // traces. Audit either observation independently of a successful
+            // completion, including a failed final poll on device removal.
+            const bool finalPollDeviceRemoval =
+                !presented &&
+                (disposition == "output_dropped" ||
+                 disposition == "interrupted") &&
+                deferredGpuReadyWait &&
+                gpuReadyWaitResultDeclared &&
+                gpuReadyWaitResult ==
+                    std::numeric_limits<uint32_t>::max() &&
+                !gpuReadyTimingValid &&
+                gpuReadyPollStartUs >= recordedPreparationEndUs &&
+                gpuReadyWaitStartUs == gpuReadyPollEndUs;
             const bool deviceRemovalSentinelAllowed =
                 gpuReadyPollCompletedValue ==
                     std::numeric_limits<uint64_t>::max() &&
-                !gpuReadyWaitResultDeclared &&
                 !gpuReadyTimingValid &&
-                disposition == "preparation_failed";
+                ((!gpuReadyWaitResultDeclared &&
+                  disposition == "preparation_failed") ||
+                 finalPollDeviceRemoval);
             metrics.gpuReadyFenceRelationshipMismatchRows +=
                 isVrrGpuFencePollRelationshipValid(
                     gpuReadyFenceValue,
@@ -13788,6 +13806,8 @@ int main(int argc, char* argv[])
                 gpuReadyWaitStartUs >= recordedPreparationStartUs &&
                 (deferredGpuReadyWait ?
                      isVrrDeferredGpuReadyOrderValid(
+                         gpuReadyPollStartUs,
+                         gpuReadyPollEndUs,
                          gpuReadyWaitStartUs,
                          gpuReadyTimeUs,
                          recordedPreparationEndUs,

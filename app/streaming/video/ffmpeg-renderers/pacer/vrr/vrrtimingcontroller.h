@@ -116,6 +116,9 @@
     X(uint64_t, playout_smoothing_reserve_release_us_per_second, playoutSmoothingReserveReleaseUsPerSecond, 0) \
     /* Zero retains interval-EMA-only period tracking for smoothed cadence. */ \
     X(uint64_t, playout_smoothing_period_feedback_per_million, playoutSmoothingPeriodFeedbackPerMillion, 0) \
+    /* Zero drops the retiming to the raw slot at a cadence reset; nonzero */ \
+    /* eases it there by at most this many microseconds per frame. */ \
+    X(uint64_t, playout_smoothing_reset_slew_us, playoutSmoothingResetSlewUs, 0) \
     X(uint64_t, playout_metronome_enabled, playoutMetronomeEnabled, 0) \
     X(uint64_t, playout_delay_start_period_per_mille, playoutDelayStartPeriodPerMille, 0) \
     X(uint64_t, playout_delay_maximum_period_per_mille, playoutDelayMaximumPeriodPerMille, 0) \
@@ -139,6 +142,12 @@
     X(uint64_t, render_start_minimum_lead_us, renderStartMinimumLeadUs, 1500) \
     X(uint64_t, playout_stall_burst_exclusion, playoutStallBurstExclusion, 0) \
     X(uint64_t, latched_floor_disabled, latchedFloorDisabled, 0) \
+    /* Zero anchors display spacing at every Present call; one anchors a */ \
+    /* latched present at its predicted flip (prior anchor + display period). */ \
+    X(uint64_t, latched_flip_anchor, latchedFlipAnchor, 0) \
+    /* Nonzero latches the first present after a gap at least this long, so */ \
+    /* it cannot tear against the driver's below-VRR-range frame repeat. */ \
+    X(uint64_t, vrr_floor_latch_gap_us, vrrFloorLatchGapUs, 0) \
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
     X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
     X(uint64_t, cold_start_readiness_demand_us, coldStartReadinessDemandUs, 1500) \
@@ -361,6 +370,11 @@ public:
     uint64_t targetWakeLeadUs() const;
     uint64_t earliestSubmissionUs() const;
     uint64_t lastSubmissionUs() const;
+    // Display-spacing reference for the next present (see latchedFlipAnchor).
+    uint64_t spacingAnchorUs() const;
+    // Reference the pending present must clear by one display period to be
+    // untorn: the predecessor's flip for a tearing present, its call otherwise.
+    uint64_t untornReferenceUs() const;
     bool hasLastSubmission() const;
     // Timestamp playout: the applied sender-to-local clock offset and whether
     // the last scheduled frame used the fixed-delay timestamp path.
@@ -594,6 +608,9 @@ private:
     bool m_HaveLastSubmission = false;
     bool m_CatchupActive = false;
     uint64_t m_LastSubmissionUs = 0;
+    // Earliest time the last submission can reach scanout; equals
+    // m_LastSubmissionUs unless latchedFlipAnchor projects a latched flip.
+    uint64_t m_SpacingAnchorUs = 0;
     unsigned int m_CleanSpacingFrames = 0;
     unsigned int m_PhaseErrorFrames = 0;
 
@@ -659,6 +676,9 @@ private:
     int64_t m_SmoothedPeriodFeedbackRemainder = 0;
     // Whether this frame's slot came from the smoother rather than a reset.
     bool m_SmoothingEngaged = false;
+    // Retiming (excluding the reserve) given to the last scheduled frame; a
+    // cadence reset eases from here when playoutSmoothingResetSlewUs is set.
+    int64_t m_LastSmoothingRetimingUs = 0;
     // Learned smoothed-cadence reserve and the recent lateness the smoother
     // caused by placing frames before their raw slots, which it is chosen from.
     uint64_t m_SmoothingReserveUs = 0;
