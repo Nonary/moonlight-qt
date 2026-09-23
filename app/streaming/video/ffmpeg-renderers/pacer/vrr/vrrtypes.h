@@ -12,6 +12,9 @@
 // Three waiting frames plus the one owned by preparation/presentation.
 // Both admission and the delay budget use this same ownership contract.
 constexpr size_t VrrMaximumQueuedFrames = 3;
+// Largest waiting-frame capacity any timing profile may select (Smooth). The
+// decoder surface pool reserves the difference beyond the classic pacer.
+constexpr size_t VrrLargestQueuedFrames = 4;
 
 extern "C" {
 #include <libavutil/frame.h>

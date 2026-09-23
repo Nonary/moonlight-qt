@@ -637,8 +637,11 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     m_VideoDecoderCtx->pkt_timebase.num = 1;
     m_VideoDecoderCtx->pkt_timebase.den = 90000;
 
-    // Allocate enough extra frames for Pacer to avoid stalling the decoder
-    m_VideoDecoderCtx->extra_hw_frames = PACER_MAX_OUTSTANDING_FRAMES;
+    // Allocate enough extra frames for Pacer to avoid stalling the decoder.
+    // The VRR worker's Smooth profile may hold one more waiting frame than the
+    // classic pacer.
+    m_VideoDecoderCtx->extra_hw_frames = PACER_MAX_OUTSTANDING_FRAMES +
+        static_cast<int>(VrrLargestQueuedFrames - VrrMaximumQueuedFrames);
 
     // For non-hwaccel decoders, set the pix_fmt to hint to the decoder which
     // format should be used. This is necessary for certain decoders like the

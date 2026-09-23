@@ -222,6 +222,12 @@ private:
 
     QMutex m_FrameQueueLock;
     QWaitCondition m_FrameQueueNotEmpty;
+    // Keep enough decoded successors to absorb the short gap-then-burst
+    // delivery pattern seen near the panel ceiling. Capacity stays bounded and
+    // evicts the oldest queued successor under sustained pressure, so it cannot
+    // accumulate an unbounded latency backlog. Fixed per session (the timing
+    // profile's playoutQueueFrames) before any producer runs.
+    size_t m_QueueCapacity = VrrMaximumQueuedFrames;
     std::deque<QueuedFrame> m_FrameQueue;
     std::atomic_size_t m_FrameQueueDepth { 0 };
     PacedFrame m_DeferredFrame;

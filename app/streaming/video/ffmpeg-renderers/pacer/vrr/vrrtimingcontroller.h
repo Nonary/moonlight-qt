@@ -145,6 +145,9 @@
     /* Zero anchors display spacing at every Present call; one anchors a */ \
     /* latched present at its predicted flip (prior anchor + display period). */ \
     X(uint64_t, latched_flip_anchor, latchedFlipAnchor, 0) \
+    /* Waiting-frame capacity for admission and the delay budget; 0 keeps */ \
+    /* the historical three (VrrMaximumQueuedFrames). */ \
+    X(uint64_t, playout_queue_frames, playoutQueueFrames, 0) \
     /* Nonzero latches the first present after a gap at least this long, so */ \
     /* it cannot tear against the driver's below-VRR-range frame repeat. */ \
     X(uint64_t, vrr_floor_latch_gap_us, vrrFloorLatchGapUs, 0) \
@@ -370,6 +373,8 @@ public:
     uint64_t targetWakeLeadUs() const;
     uint64_t earliestSubmissionUs() const;
     uint64_t lastSubmissionUs() const;
+    // Frames that may wait in the pacing queue (admission and delay budget).
+    size_t queuedFrameCapacity() const;
     // Display-spacing reference for the next present (see latchedFlipAnchor).
     uint64_t spacingAnchorUs() const;
     // Reference the pending present must clear by one display period to be

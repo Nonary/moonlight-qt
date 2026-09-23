@@ -22,11 +22,6 @@ extern "C" {
 
 namespace {
 
-// Keep enough decoded successors to absorb the short gap-then-burst delivery
-// pattern seen near the panel ceiling. Capacity remains bounded and evicts the
-// oldest queued successor under sustained pressure, so it cannot accumulate
-// an unbounded latency backlog.
-constexpr size_t kMaximumQueuedFrames = VrrMaximumQueuedFrames;
 // ~64 seconds of rows at 120 FPS. When the writer thread cannot keep up the
 // pacing thread drops rows rather than ever waiting on diagnostics.
 // Each compressed chunk covers only a few seconds, limiting crash loss while
@@ -176,6 +171,7 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
     // Settings enables tracing after SDL initialization. SDL2-compat may cache
     // its environment, so read the current process value just like the path.
     m_DeepTraceEnabled = qEnvironmentVariable("MOONLIGHT_VRR_DEEP_TRACE").startsWith(QLatin1Char('1'));
+    m_QueueCapacity = m_TimingController->queuedFrameCapacity();
 
     VrrTargetWaiterHooks hooks;
     hooks.nowUs = []() {
@@ -291,7 +287,7 @@ void VrrPacingWorker::submit(PacedFrame&& frame)
             droppedFrame = std::move(incoming);
         }
         else {
-            if (m_FrameQueue.size() >= kMaximumQueuedFrames) {
+            if (m_FrameQueue.size() >= m_QueueCapacity) {
                 droppedFrame = std::move(m_FrameQueue.front());
                 m_FrameQueue.pop_front();
                 droppedDisposition = TraceDisposition::QueueCapacity;

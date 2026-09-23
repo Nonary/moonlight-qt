@@ -437,31 +437,31 @@ void testEmptyQueueDoesNotRepeatFrames()
            "a new frame must wake the idle worker");
 }
 
-void testQueueCapacityAndDrops()
+void testQueueCapacityAndDrops(int latencyMode, size_t capacity)
 {
     resetFakeClock();
     FakeVrrFramePresenter backend;
     backend.blockPreparation();
     PacerTelemetry telemetry;
-    TrackedFrameLifetime first;
-    TrackedFrameLifetime second;
-    TrackedFrameLifetime third;
-    TrackedFrameLifetime fourth;
-    TrackedFrameLifetime freshest;
+    // Active frame, `capacity` queued successors, and one freshest arrival.
+    std::vector<TrackedFrameLifetime> lifetimes(capacity + 2);
+    VrrSessionConfig config = enabledConfig();
+    config.latencyMode = latencyMode;
 
     {
-        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        VrrPacingWorker worker(&backend, config, &telemetry);
         expect(worker.start(), "worker must start for a capable backend");
-        worker.submit(frame(1, first));
+        worker.submit(frame(1, lifetimes[0]));
         expect(backend.waitForPrepareCount(1),
                "first worker frame must enter the preparation gate");
 
-        // The active frame and three successors absorb a short decoder burst.
-        // A fourth successor evicts only the oldest queued frame.
-        worker.submit(frame(2, second));
-        worker.submit(frame(3, third));
-        worker.submit(frame(4, fourth));
-        worker.submit(frame(50, freshest));
+        // The active frame and `capacity` successors (three; Smooth: four)
+        // absorb a short decoder burst. One more successor evicts only the
+        // oldest queued frame.
+        for (size_t i = 1; i <= capacity; ++i) {
+            worker.submit(frame(static_cast<int>(i) + 1, lifetimes[i]));
+        }
+        worker.submit(frame(50, lifetimes[capacity + 1]));
         const PacerTelemetrySnapshot stats = telemetryStats(telemetry);
         expect(stats.vrrPacingDroppedFrames == 1 &&
                    stats.pacerDroppedFrames == 1,
@@ -474,14 +474,19 @@ void testQueueCapacityAndDrops()
         backend.releasePreparation();
         expect(backend.waitForPresentCount(1),
                "releasing preparation must present the active frame");
-        expect(backend.waitForPresentCount(4),
+        expect(backend.waitForPresentCount(static_cast<int>(capacity) + 1),
                "overflow recovery must drain every retained successor");
 
+        std::vector<int> expectedFrames {1};
+        for (size_t i = 3; i <= capacity + 1; ++i) {
+            expectedFrames.push_back(static_cast<int>(i));
+        }
+        expectedFrames.push_back(50);
         const std::vector<int> presentedFrames = backend.presentedFrames();
-        expect(presentedFrames.size() >= 4 && presentedFrames[0] == 1 &&
-                   presentedFrames[1] == 3 && presentedFrames[2] == 4 &&
-                   presentedFrames[3] == 50,
-               "queue overflow must retain the three freshest successors in cadence order");
+        expect(presentedFrames.size() >= expectedFrames.size() &&
+                   std::equal(expectedFrames.begin(), expectedFrames.end(),
+                              presentedFrames.begin()),
+               "queue overflow must retain the freshest successors in cadence order");
         const std::vector<uint64_t> calls = backend.presentCallTimesUs();
         expect(calls.size() >= 2 && calls[1] >= releaseUs &&
                    calls[1] - releaseUs < 100000,
@@ -490,7 +495,7 @@ void testQueueCapacityAndDrops()
 
     expect(backend.cancelCount() == 1,
            "worker shutdown must release the presenter exactly once");
-    expect(telemetryStats(telemetry).vrrReadiness.samples == 5 &&
+    expect(telemetryStats(telemetry).vrrReadiness.samples == capacity + 2 &&
                telemetryStats(telemetry).vrrReadiness.dropped == 1,
            "completion accounting must count each presented or evicted frame once");
 }
@@ -1646,8 +1651,11 @@ void testTraceCapturesEveryDeliveredFrame()
     backend.blockPreparation();
     PacerTelemetry telemetry;
     TrackedFrameLifetime lifetimes[10];
+    // The burst below overflows a three-frame queue; Smooth holds four.
+    VrrSessionConfig traceConfig = enabledConfig();
+    traceConfig.latencyMode = 1;
     {
-        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        VrrPacingWorker worker(&backend, traceConfig, &telemetry);
         expect(worker.start(), "worker must start for replay tracing");
         worker.submit(frame(1, lifetimes[0]));
         expect(backend.waitForPrepareCount(1),
@@ -2611,7 +2619,9 @@ int main()
     testCapabilityRejection();
     testPresentationRequestSelectedBeforePreparation();
     testEmptyQueueDoesNotRepeatFrames();
-    testQueueCapacityAndDrops();
+    testQueueCapacityAndDrops(1, VrrMaximumQueuedFrames);
+    testQueueCapacityAndDrops(2, VrrMaximumQueuedFrames);
+    testQueueCapacityAndDrops(0, VrrLargestQueuedFrames);
     testLatePreparedFramePresentsImmediately();
     testQueuedStaleFrameYieldsToFreshSuccessor();
     testExpiredQueueSkipsBlockingDecode();

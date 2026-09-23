@@ -3056,6 +3056,38 @@ void testPerFrameLatchIncludesSafetyHeadroom()
     }
 }
 
+void testSmoothQueueReachesItsCeilingNearRefresh()
+{
+    // At 116/120 with Reduce judder, three waiting frames minus the render
+    // lead and the 6 ms retiming budget clipped Smooth to ~16.9 ms (about two
+    // frames). Smooth's fourth waiting frame restores its 24 ms ceiling; the
+    // other profiles keep the historical three.
+    for (int mode : {0, 1, 2}) {
+        auto session = config(116, 120);
+        session.latencyMode = mode;
+        VrrTimingController controller(session, true, vrrTimingParametersForSession(session));
+        VrrTimingDecision d;
+        for (int i = 0; i < 240; ++i) {
+            const uint32_t rtp = uint32_t(uint64_t(i) * 90000 / 116);
+            const uint64_t at = 1000000 + uint64_t(rtp) * 1000 / 90;
+            d = controller.schedule(frame(i, rtp, true, at), at);
+            controller.noteSubmission(true, false, d.targetUs);
+        }
+        expect(controller.queuedFrameCapacity() == (mode == 0 ? 4u : 3u),
+               "only Smooth may hold a fourth waiting frame");
+        if (mode == 0) {
+            expect(d.playoutDelayMaximumUs >= 23500,
+                   "Smooth must reach its 24 ms ceiling at 116 FPS with Reduce judder enabled");
+        }
+        expect(d.playoutDelayMaximumUs <= controller.playoutQueueLimitUs(),
+               "the delay ceiling must stay inside the queue budget");
+    }
+    VrrTimingParameters historical;
+    VrrTimingController replayed(config(116, 120), true, historical);
+    expect(replayed.queuedFrameCapacity() == VrrMaximumQueuedFrames,
+           "captures without the parameter keep the historical three waiting frames");
+}
+
 void testProductionMatchesVrr14NearRefresh()
 {
     for (int mode : {0, 1, 2}) {
@@ -5931,6 +5963,7 @@ int main()
     testReduceJudderReserveIgnoresDeliveryJitter();
     testReduceJudderReserveReleases();
     testReduceJudderEasesCadenceResets();
+    testSmoothQueueReachesItsCeilingNearRefresh();
     testReduceJudderFollowsRateDrift();
     testReadinessDrivenPadding();
     testStableNativeSmoothnessReference();

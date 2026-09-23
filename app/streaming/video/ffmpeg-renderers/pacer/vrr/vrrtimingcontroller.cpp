@@ -20,10 +20,12 @@ constexpr uint64_t kPlayoutStartUs = 6000;
 constexpr uint64_t kPlayoutMinimumUs = 1000;
 constexpr uint64_t kPlayoutMaximumUs = 8000;
 // Smooth is intentionally allowed to retain more protection than the other
-// profiles. Keep it below the three-frame ownership limit while allowing the
-// requested extra padding to be observable at ordinary stream rates.
+// profiles. Its 24 ms ceiling needs a fourth waiting frame near 120 FPS: with
+// three, the queue budget (3 periods minus render lead and the 6 ms Reduce
+// judder retiming) clipped it to ~16.9 ms at 116 FPS, about two frames.
 constexpr uint64_t kSmoothPlayoutMaximumUs = 24000;
 constexpr uint64_t kSmoothPlayoutCapSourcePeriodPerMille = 4000;
+constexpr uint64_t kSmoothPlayoutQueueFrames = 4;
 // Smooth's tighter cadence target is intentionally a separate policy value;
 // keep the historical default below unchanged for old captures and direct
 // IntervalBuffer callers.
@@ -180,6 +182,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     // needed more room. New live sessions use the fitted source period;
     // captured policies retain the old nominal-period behavior by default.
     parameters.playoutDelayCapUsesObservedPeriod = 1;
+    parameters.playoutQueueFrames = latencyMode == 0 ? kSmoothPlayoutQueueFrames : VrrMaximumQueuedFrames;
     parameters.playoutCapacityTelemetry = 1;
     parameters.playoutCatchupPerMille = config.smoothFrameTiming ? 20 : 0;
     parameters.playoutGpuReadinessAdaptation = 1;
@@ -2617,6 +2620,13 @@ uint64_t VrrTimingController::spacingAnchorUs() const
         std::max(m_SpacingAnchorUs, m_LastSubmissionUs) : m_LastSubmissionUs;
 }
 
+size_t VrrTimingController::queuedFrameCapacity() const
+{
+    return m_Parameters.playoutQueueFrames != 0 ?
+        static_cast<size_t>(std::min<uint64_t>(m_Parameters.playoutQueueFrames, VrrLargestQueuedFrames)) :
+        VrrMaximumQueuedFrames;
+}
+
 uint64_t VrrTimingController::untornReferenceUs() const
 {
     return m_LatchedPresentation ? m_LastSubmissionUs : spacingAnchorUs();
@@ -2892,10 +2902,11 @@ void VrrTimingController::updateLatencyFixState()
 
 uint64_t VrrTimingController::playoutQueueLimitUs() const
 {
-    // One frame is active, three can wait, and the next arrival needs a slot.
-    // Use the faster of fitted and negotiated cadence during rate transitions.
+    // One frame is active, three (Smooth: four) can wait, and the next arrival
+    // needs a slot. Use the faster of fitted and negotiated cadence during rate
+    // transitions.
     const uint64_t period = std::min(m_SourcePeriodUs, m_ConfiguredStreamPeriodUs);
-    const uint64_t capacity = period * VrrMaximumQueuedFrames;
+    const uint64_t capacity = period * queuedFrameCapacity();
     const uint64_t work = saturatingAdd(m_RenderLeadUs, m_Parameters.presentationSafetyUs);
     const uint64_t smoothing = m_Parameters.playoutSmoothingGainPerMille != 0 ?
         m_Parameters.playoutSmoothingMaxLagUs : 0;

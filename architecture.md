@@ -1399,7 +1399,15 @@ contract; it does not replace network assembly or codec reference handling.
 
 ### 7.1 Queue ownership and backpressure
 
-The VRR queue admits three waiting frames plus one active frame. This is a
+The VRR queue admits three waiting frames plus one active frame; the Smooth
+profile admits four (`playout_queue_frames`, 0 = the historical three in older
+captures). The same count sets the delay budget in `playoutQueueLimitUs()`:
+waiting frames x period, minus render lead and the full Reduce judder retiming
+budget. With three frames at 116 FPS that budget was ~16.9 ms once the retiming
+cap rose to 6 ms, so Smooth's 24 ms ceiling was unreachable and live overlays
+showed "limit 16.86 ms" (capture 20260922-221707). The decoder pool reserves
+the extra surface (`extra_hw_frames` = classic pacer outstanding frames +
+`VrrLargestQueuedFrames` - `VrrMaximumQueuedFrames`). This is a
 decoded-frame queue, separate from the 15-unit compressed queue and native
 swapchain buffers. Do not add these counts and treat the result as a fixed
 latency: the queues have different owners, lifetimes, and service rates.
