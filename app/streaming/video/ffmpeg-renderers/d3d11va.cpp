@@ -2868,11 +2868,51 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         return feedback;
     }
 
+    // Native flip protection. The controller anchors a tearing present's flip
+    // at its call, but DXGI can take several milliseconds to flip it, so a
+    // latched successor reaches scanout later than anchored and this tearing
+    // present would land inside that scanout. Ask DXGI instead: if the
+    // predecessor is not on screen yet, or its refresh began less than the
+    // window ago, latch. The flip queue then shows this frame at the first
+    // untorn refresh, and a panel already idle in its VRR blank flips a
+    // latched present at once, so an unneeded latch costs almost nothing.
+    bool latchedPresentation = request.latchedPresentation;
+    if (!latchedPresentation && request.flipProtectionWindowUs != 0 &&
+            m_VrrPriorPresentCountValid) {
+        DXGI_FRAME_STATISTICS guardStats = {};
+        feedback.flipProtectionChecked = true;
+        feedback.flipProtectionQueryStartUs = LiGetMicroseconds();
+        const HRESULT guardResult =
+            m_SwapChain->GetFrameStatistics(&guardStats);
+        feedback.flipProtectionQueryEndUs = LiGetMicroseconds();
+        feedback.flipProtectionQueryResult =
+            static_cast<int64_t>(guardResult);
+        uint64_t refreshUs = 0;
+        uint64_t qpcFrequency = 0;
+        // A failed query (for example FRAME_STATISTICS_DISJOINT after a mode
+        // change) proves nothing and keeps the planned mode.
+        if (guardResult == S_OK) {
+            if (guardStats.PresentCount < m_VrrPriorPresentCount) {
+                feedback.flipProtectionPending = true;
+                latchedPresentation = true;
+            }
+            else if (translateVrrSyncQpcTime(guardStats.SyncQPCTime,
+                                             refreshUs, qpcFrequency)) {
+                feedback.flipProtectionReferenceUs = refreshUs;
+                latchedPresentation =
+                    feedback.flipProtectionQueryEndUs - refreshUs <
+                        request.flipProtectionWindowUs ||
+                    feedback.flipProtectionQueryEndUs < refreshUs;
+            }
+        }
+        feedback.flipProtectionLatched = latchedPresentation;
+    }
+
     // The risk decision is per frame. Sync interval 1 protects risky frames;
     // other frames retain interval-zero replacement semantics. Active DXGI
     // VRR always permits tearing for those adaptive submissions.
     const auto presentParameters = DxgiPresentParameters::adaptive(
-        request.latchedPresentation, DXGI_PRESENT_ALLOW_TEARING);
+        latchedPresentation, DXGI_PRESENT_ALLOW_TEARING);
     feedback.nativeBackendValid = true;
     feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
     feedback.nativePresentParametersValid = true;

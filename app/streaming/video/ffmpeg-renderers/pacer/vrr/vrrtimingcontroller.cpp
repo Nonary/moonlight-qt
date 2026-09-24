@@ -312,6 +312,12 @@ VrrTimingParameters vrrTimingParametersForSession(
     // Beyond ~50 Hz the panel may be repeating the last frame (LFC); an
     // immediate tearing present can then land mid-repeat.
     parameters.vrrFloorLatchGapUs = 20000;
+    // The flip anchor assumes a tearing present flips at its call, but DXGI
+    // can take several milliseconds, so a latched successor flips later than
+    // anchored and the next tearing present landed inside its scanout. Let the
+    // presenter latch that present from live frame statistics instead; the
+    // flip queue then shows it at the earliest untorn refresh.
+    parameters.nativeFlipProtection = 1;
     parameters.pacingLatencyQueueModeExtra = 0;
     if (!config.smoothFrameTiming) {
         // Preserve the mapped RTP intervals instead of regularizing the
@@ -362,6 +368,8 @@ void VrrTimingController::reset()
     m_CatchupActive = false;
     m_LastSubmissionUs = 0;
     m_SpacingAnchorUs = 0;
+    m_NativeLatchPending = false;
+    m_NativeLatchFlipUs = 0;
     m_CleanSpacingFrames = 0;
     m_PhaseErrorFrames = 0;
     clearTimeline(false);
@@ -2195,12 +2203,18 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         }
         else m_SubmissionSmoothness.breakSequence();
     }
+    const bool nativeLatch = m_NativeLatchPending;
+    m_NativeLatchPending = false;
     if (submitted) {
         // Cancellation is a reason, not proof that nothing reached the native
         // presentation queue (Vulkan must submit some abandoned images).
         // A latched present waits in the flip queue for the panel's minimum
         // period after the previous flip; it cannot reach scanout sooner.
-        m_SpacingAnchorUs = m_HaveLastSubmission && m_LatchedPresentation ?
+        // A native latch queues behind the observed refresh when available.
+        if (nativeLatch) {
+            m_SpacingAnchorUs = std::max(m_SpacingAnchorUs, m_NativeLatchFlipUs);
+        }
+        m_SpacingAnchorUs = m_HaveLastSubmission && (m_LatchedPresentation || nativeLatch) ?
             std::max(submissionUs, saturatingAdd(spacingAnchorUs(), m_DisplayPeriodUs)) :
             submissionUs;
         m_HaveLastSubmission = true;
@@ -2630,6 +2644,17 @@ size_t VrrTimingController::queuedFrameCapacity() const
 uint64_t VrrTimingController::untornReferenceUs() const
 {
     return m_LatchedPresentation ? m_LastSubmissionUs : spacingAnchorUs();
+}
+
+void VrrTimingController::noteNativeFlipProtection(uint64_t observedFlipUs)
+{
+    if (m_Parameters.nativeFlipProtection == 0) {
+        return;
+    }
+    // Deliberately leaves m_LatchedPresentation (the planned decision and its
+    // entry/exit hysteresis) alone; only the flip anchor learns the latch.
+    m_NativeLatchPending = true;
+    m_NativeLatchFlipUs = observedFlipUs;
 }
 
 bool VrrTimingController::hasLastSubmission() const

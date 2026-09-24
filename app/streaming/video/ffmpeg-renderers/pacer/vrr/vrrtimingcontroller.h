@@ -151,6 +151,9 @@
     /* Nonzero latches the first present after a gap at least this long, so */ \
     /* it cannot tear against the driver's below-VRR-range frame repeat. */ \
     X(uint64_t, vrr_floor_latch_gap_us, vrrFloorLatchGapUs, 0) \
+    /* Nonzero lets the presenter latch a planned tearing present when native */ \
+    /* frame statistics show its predecessor still pending or scanning out. */ \
+    X(uint64_t, native_flip_protection, nativeFlipProtection, 0) \
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
     X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
     X(uint64_t, cold_start_readiness_demand_us, coldStartReadinessDemandUs, 1500) \
@@ -380,6 +383,11 @@ public:
     // Reference the pending present must clear by one display period to be
     // untorn: the predecessor's flip for a tearing present, its call otherwise.
     uint64_t untornReferenceUs() const;
+    // The presenter latched the pending (planned tearing) present because
+    // native statistics showed its predecessor still pending or scanning out.
+    // observedFlipUs is the predecessor's refresh start, zero while pending.
+    // Call immediately before noteSubmission() for that same present.
+    void noteNativeFlipProtection(uint64_t observedFlipUs);
     bool hasLastSubmission() const;
     // Timestamp playout: the applied sender-to-local clock offset and whether
     // the last scheduled frame used the fixed-delay timestamp path.
@@ -616,6 +624,9 @@ private:
     // Earliest time the last submission can reach scanout; equals
     // m_LastSubmissionUs unless latchedFlipAnchor projects a latched flip.
     uint64_t m_SpacingAnchorUs = 0;
+    // Pending native latch of the next submission (nativeFlipProtection).
+    bool m_NativeLatchPending = false;
+    uint64_t m_NativeLatchFlipUs = 0;
     unsigned int m_CleanSpacingFrames = 0;
     unsigned int m_PhaseErrorFrames = 0;
 

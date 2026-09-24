@@ -293,9 +293,13 @@ bool validateTraceRowSyntax(const QList<QByteArray>& header,
         "frame_stats_query_result",
         "gpu_ready_signal_result",
         "gpu_ready_set_event_result",
+        "flip_protection_query_result",
     };
     static const QSet<QByteArray> booleanColumns {
         "prepared_ahead",
+        "flip_protection_checked",
+        "flip_protection_pending",
+        "flip_protection_latched",
         "rtp_valid",
         "queue_accepted",
         "queue_discontinuity",
@@ -8841,6 +8845,13 @@ int main(int argc, char* argv[])
 
         const QByteArray disposition = fields[columns.disposition];
         const QByteArray recordedTear = fields[columns.tearClassification];
+        // nativeFlipProtection: the presenter latched a planned tearing present
+        // from live frame statistics. That native observation is recorded
+        // execution evidence; replay applies it rather than simulating DXGI.
+        const bool rowFlipProtectionLatched = optionalUnsignedField(
+            fields, traceHeader.indexOf("flip_protection_latched")) != 0;
+        const uint64_t rowFlipProtectionReferenceUs = optionalUnsignedField(
+            fields, traceHeader.indexOf("flip_protection_reference_us"));
         const bool rowAllowTearing = columns.sessionAllowTearing < 0 ||
             unsignedField(fields, columns.sessionAllowTearing) != 0;
         const bool deepTraceRow = optionalUnsignedField(
@@ -9349,7 +9360,7 @@ int main(int argc, char* argv[])
                 nativeDisplaySignalActiveScanoutPs;
         }
         const bool rowLatchedPresent = optionalUnsignedField(
-            fields, columns.latchedPresent) != 0;
+            fields, columns.latchedPresent) != 0 || rowFlipProtectionLatched;
         const bool submissionIdQueryResultDeclared =
             optionalUnsignedField(
                 fields, columns.submissionIdQueryResultValid) != 0;
@@ -10600,7 +10611,8 @@ int main(int argc, char* argv[])
                 unsignedField(fields, columns.displayPeriodUs),
                 recordedSubmissionUs,
                 nativePresentStartUs,
-                optionalUnsignedField(fields, columns.latchedPresent) != 0 &&
+                (optionalUnsignedField(fields, columns.latchedPresent) != 0 ||
+                 rowFlipProtectionLatched) &&
                     unsignedField(fields, columns.canLatch) != 0,
             };
             if (haveLatch && submissionBand.id < priorLatchSubmission) {
@@ -12137,8 +12149,8 @@ int main(int argc, char* argv[])
             presenterSubmissionTimeUs;
         timelineDetails.recordedPresenterSubmissionTimeUsed =
             presenterSubmissionTimeUsed;
-        timelineDetails.recordedLatched = optionalUnsignedField(
-            fields, columns.latchedPresent) != 0 &&
+        timelineDetails.recordedLatched = (optionalUnsignedField(
+            fields, columns.latchedPresent) != 0 || rowFlipProtectionLatched) &&
             unsignedField(fields, columns.canLatch) != 0;
         timelineDetails.latchValid = unsignedField(
             fields, columns.latchValid) != 0;
@@ -13588,7 +13600,8 @@ int main(int argc, char* argv[])
             signedField(fields, columns.spacingMarginUs) !=
                 expectedSpacingMarginUs ? 1 : 0;
         const bool recordedLatchedRequest =
-            unsignedField(fields, columns.latchedPresent) != 0;
+            unsignedField(fields, columns.latchedPresent) != 0 ||
+            rowFlipProtectionLatched;
         const QByteArray expectedRecordedTear =
             simulatedTearClassification(
                 presented, recordedLatchedRequest, rowCanLatch,
@@ -14185,7 +14198,8 @@ int main(int argc, char* argv[])
                 disposition != "presented");
         }
         const QByteArray simulatedTear = simulatedTearClassification(
-            presented, simulatedDecision.latchedPresentation,
+            presented,
+            simulatedDecision.latchedPresentation || rowFlipProtectionLatched,
             simulatedCanLatch, hadPriorSimulatedSubmission,
             simulatedSubmissionUs, priorSimulatedSubmissionUs,
             periodForRate(simulatedConfig.displayRefreshHz));
@@ -14730,6 +14744,12 @@ int main(int argc, char* argv[])
             }
         }
         else {
+            if (rowFlipProtectionLatched) {
+                referenceController->noteNativeFlipProtection(
+                    rowFlipProtectionReferenceUs);
+                simulatedController->noteNativeFlipProtection(
+                    rowFlipProtectionReferenceUs);
+            }
             referenceController->noteSubmission(presented, cancelled,
                                                  recordedSubmissionUs);
             simulatedController->noteSubmission(presented, cancelled,
@@ -14749,7 +14769,8 @@ int main(int argc, char* argv[])
             observation.submission = recordedSubmissionUs;
             observation.ready = field("prepare_end_us");
             observation.deadline = referenceDecision.originalScanoutUs;
-            observation.latched = referenceDecision.latchedPresentation;
+            observation.latched = referenceDecision.latchedPresentation ||
+                rowFlipProtectionLatched;
             observation.dxgi = field("native_backend") == kNativeBackendDxgi;
             const bool fixedPresentationMode = traceHeader.contains("presentation_uncertainty_us") &&
                 (field("native_backend") == kNativeBackendVulkan ||

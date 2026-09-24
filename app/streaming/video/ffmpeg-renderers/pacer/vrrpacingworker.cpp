@@ -85,6 +85,8 @@ constexpr char kTraceHeader[] =
     ",buffer_attempted_increase_us,buffer_clipped_increase_us,buffer_hold_remaining_us,buffer_cooldown_remaining_us"
     ",buffer_calibration_complete,buffer_calibration_samples,buffer_calibration_coverage_us"
     ",prepared_ahead,stage_start_us,stage_decode_ready_us,stage_decode_wait_us,stage_render_start_us,stage_render_end_us,stage_ready_us"
+    ",flip_protection_checked,flip_protection_query_result,flip_protection_query_start_us,flip_protection_query_end_us"
+    ",flip_protection_pending,flip_protection_reference_us,flip_protection_latched"
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
 constexpr uint32_t kVrrWindowStateMask =
@@ -828,6 +830,13 @@ int VrrPacingWorker::run()
             targetWait.schedulerDelayUs,
             targetWait.schedulerDelayValid);
 
+        // Let the backend confirm from native statistics that a planned
+        // tearing present will not land inside its predecessor's scanout.
+        presentRequest.flipProtectionWindowUs =
+            m_TimingController->parameters().nativeFlipProtection != 0 &&
+                m_CanLatchPresentation && hadPriorSubmission &&
+                !decision.latchedPresentation ?
+            m_TimingController->displayPeriodUs() : 0;
         telemetry.presentStartUs = LiGetMicroseconds();
         VrrPresentFeedback feedback =
             m_Presenter->presentAdaptive(presentRequest);
@@ -895,7 +904,8 @@ int VrrPacingWorker::run()
                 sample.gpuReadyWaitUs += positiveDifference(stage.readyUs, stage.renderEndUs);
                 sample.gpuReadyWaitValid = true;
             }
-            sample.latched = decision.latchedPresentation;
+            sample.latched = decision.latchedPresentation ||
+                feedback.flipProtectionLatched;
             sample.bufferCapUs = decision.playoutDelayMaximumUs;
             sample.gpuReadinessLeadUs = decision.gpuReadinessLeadUs;
             const uint64_t readinessDeadlineUs =
@@ -1143,6 +1153,10 @@ void VrrPacingWorker::recordSubmission(
         }
     }
 
+    if (feedback.flipProtectionLatched) {
+        m_TimingController->noteNativeFlipProtection(
+            feedback.flipProtectionReferenceUs);
+    }
     m_TimingController->noteSubmission(
         feedback.presented, feedback.cancelled,
         telemetry.submissionBoundaryUs);
@@ -1158,7 +1172,7 @@ void VrrPacingWorker::recordSubmission(
     // latch transition must not reset their feedback matching history.
     observation.latched = (feedback.nativeBackend == VrrNativePresentationBackend::Vulkan ||
                            feedback.nativeBackend == VrrNativePresentationBackend::Composition) ?
-        false : decision.latchedPresentation;
+        false : decision.latchedPresentation || feedback.flipProtectionLatched;
     observation.dxgi = feedback.nativeBackend == VrrNativePresentationBackend::Dxgi;
     observation.sampleValid = feedback.latchSampleValid &&
         (!observation.dxgi || (feedback.latchQpcCorrelationValid && feedback.latchRawSyncQpcFrequency));
@@ -1471,6 +1485,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addBool(telemetry.hadPriorSubmission);
     addText(tearClassification(row));
     addBool(feedback.presented && !decision.latchedPresentation &&
+            !feedback.flipProtectionLatched &&
             telemetry.hadPriorSubmission && telemetry.spacingMarginUs < 0);
     addUnsigned(row.completionQueueDepth);
     addText(traceDispositionName(row.disposition));
@@ -1734,6 +1749,13 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(row.telemetry.preparationStage.renderStartUs);
     addUnsigned(row.telemetry.preparationStage.renderEndUs);
     addUnsigned(row.telemetry.preparationStage.readyUs);
+    addBool(feedback.flipProtectionChecked);
+    addSigned(feedback.flipProtectionQueryResult);
+    addUnsigned(feedback.flipProtectionQueryStartUs);
+    addUnsigned(feedback.flipProtectionQueryEndUs);
+    addBool(feedback.flipProtectionPending);
+    addUnsigned(feedback.flipProtectionReferenceUs);
+    addBool(feedback.flipProtectionLatched);
     line.append('\n');
 
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {
@@ -1845,7 +1867,8 @@ const char* VrrPacingWorker::tearClassification(const TraceRow& row) const
     if (!row.feedback.presented) {
         return "not_presented";
     }
-    if (row.decision.latchedPresentation && m_CanLatchPresentation) {
+    if ((row.decision.latchedPresentation ||
+         row.feedback.flipProtectionLatched) && m_CanLatchPresentation) {
         return "confirmed_safe_latched";
     }
     if (!row.telemetry.hadPriorSubmission) {

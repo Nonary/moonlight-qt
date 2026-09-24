@@ -5,6 +5,26 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
+Native flip protection (2026-09-23), based on `5c5ba95b`: the flip anchor
+assumes a tearing present flips at its call, but on the Radeon 890M DXGI took
+p50 ~3.2 ms / p95 ~6.7 ms. A latched successor therefore flipped 2-8 ms later
+than anchored, and in capture `20260922-224404-796` 68% of adaptive presents
+following a latched frame were issued inside its scanout (its SyncQPCTime
+refresh start, recorded in the latch/frame-stats fields). Production now sets
+`native_flip_protection=1`. Immediately before an unlatched DXGI Present the
+worker passes one display period as `VrrPresentRequest::flipProtectionWindowUs`;
+D3D11 queries `GetFrameStatistics` (~6 us) and presents `Present(1, 0)` instead
+when the predecessor is not yet displayed or the last refresh began less than
+one period earlier. The controller keeps its planned latch decision and
+hysteresis; `noteNativeFlipProtection()` only advances the flip anchor from
+the observed refresh. Frames that were safe keep their adaptive flip; a latch
+on a panel already idle in its VRR blank flips at once. Trace rows append
+`flip_protection_*` columns (still schema 5); replay applies the recorded
+latch as execution evidence rather than simulating DXGI, so older captures
+reproduce unchanged (verified on `224404-796`: all submissions, targets, tear
+classes and controller state exact, as before). Vulkan and composition
+presenters ignore the request. Needs a live capture to confirm tear removal.
+
 Reduce judder follow-up (2026-09-22), based on `e053b5cb`: the smoother's
 positive retiming cap rises from 2 ms to 6 ms, a learned readiness reserve
 delays the smoothed schedule by the lateness the smoother itself causes, and

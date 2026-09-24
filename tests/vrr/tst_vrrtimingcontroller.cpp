@@ -2925,6 +2925,66 @@ void testTearingPresentClearsLatchedFlip()
            "production must anchor spacing to latched flips and latch after VRR-floor gaps");
 }
 
+void testNativeFlipProtectionPreventsScanoutTears()
+{
+    // DXGI can flip a tearing present milliseconds after its call, so the
+    // call-anchored model underestimates when the predecessor's scanout
+    // ends. The presenter's frame-statistics check latches instead; this
+    // models it: pending predecessor, or a refresh begun under one period ago.
+    const auto run = [](uint64_t protection) {
+        auto session = config(105, 120);
+        auto policy = vrrTimingParametersForSession(session);
+        policy.nativeFlipProtection = protection;
+        VrrTimingController controller(session, true, policy);
+        const uint64_t periodUs = controller.displayPeriodUs();
+        uint64_t flipUs = 0, tears = 0, nativeLatches = 0, adaptive = 0;
+        uint64_t displayLatencyUs = 0;
+        bool haveFlip = false;
+        for (int i = 0; i < 3000; ++i) {
+            const uint32_t rtp = uint32_t(uint64_t(i) * 90000 / 105);
+            const uint64_t at = 1000000 + uint64_t(rtp) * 1000 / 90 + (i % 5) * 400;
+            const auto d = controller.schedule(frame(i, rtp, true, at), at);
+            const uint64_t call = d.targetUs;
+            bool latched = d.latchedPresentation;
+            if (protection != 0 && !latched && haveFlip &&
+                    (flipUs > call || call - flipUs < periodUs)) {
+                latched = true;
+                ++nativeLatches;
+                controller.noteNativeFlipProtection(flipUs > call ? 0 : flipUs);
+            }
+            if (latched) {
+                flipUs = haveFlip ? std::max(call + 500, flipUs + periodUs) : call + 500;
+            }
+            else {
+                // Tearing-present flip latency of 0.5-4.5 ms.
+                const uint64_t lagUs = 500 +
+                    uint64_t(((uint32_t(i) * 2654435761u) >> 16) % 9) * 500;
+                ++adaptive;
+                if (haveFlip && call + lagUs < flipUs + periodUs) ++tears;
+                flipUs = call + lagUs;
+            }
+            displayLatencyUs += flipUs - call;
+            haveFlip = true;
+            controller.noteSubmission(true, false, call);
+        }
+        return std::array<uint64_t, 4>{tears, nativeLatches, adaptive, displayLatencyUs / 3000};
+    };
+    const auto unprotected = run(0);
+    const auto protectedRun = run(1);
+    std::printf("native flip protection tears %llu -> %llu, native latches %llu, adaptive %llu -> %llu, "
+                "mean call-to-flip %llu -> %llu us\n",
+                (unsigned long long) unprotected[0], (unsigned long long) protectedRun[0],
+                (unsigned long long) protectedRun[1], (unsigned long long) unprotected[2],
+                (unsigned long long) protectedRun[2], (unsigned long long) unprotected[3],
+                (unsigned long long) protectedRun[3]);
+    expect(unprotected[0] > 0,
+           "call-anchored spacing must reproduce tears from late tearing flips");
+    expect(protectedRun[0] == 0 && protectedRun[1] > 0 && protectedRun[2] > 0,
+           "native flip protection must latch every present that would tear");
+    expect(vrrTimingParametersForSession(config(116, 120)).nativeFlipProtection == 1,
+           "production must enable native flip protection");
+}
+
 void testFirstPresentAfterVrrFloorGapLatches()
 {
     auto session = config(116, 120);
@@ -5976,6 +6036,7 @@ int main()
     testProcessingEpisodeClassification();
     testPerFrameLatchAtNativeMaximum();
     testTearingPresentClearsLatchedFlip();
+    testNativeFlipProtectionPreventsScanoutTears();
     testFirstPresentAfterVrrFloorGapLatches();
     testExplicitAdaptiveOnlyPolicy();
     testProductionAdaptiveProtectionRecoversWithoutDrift();

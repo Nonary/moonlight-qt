@@ -266,6 +266,19 @@ struct VrrPresentFeedback {
     bool gpuReadyCompletedBeforeWait = false;
     uint64_t gpuReadyWaitStartUs = 0;
     uint64_t gpuReadyTimeUs = 0;
+
+    // Native flip protection (VrrPresentRequest::flipProtectionWindowUs).
+    // Unlike the observation fields above, this pre-Present frame-statistics
+    // query does gate the native mode: a planned tearing present is sent
+    // latched when the predecessor has not reached the screen (pending) or
+    // its refresh began less than the window before the query (reference).
+    bool flipProtectionChecked = false;
+    int64_t flipProtectionQueryResult = 0;
+    uint64_t flipProtectionQueryStartUs = 0;
+    uint64_t flipProtectionQueryEndUs = 0;
+    bool flipProtectionPending = false;
+    uint64_t flipProtectionReferenceUs = 0;
+    bool flipProtectionLatched = false;
 };
 
 // Per-present request from the platform-neutral controller. When the learned
@@ -278,6 +291,10 @@ struct VrrPresentFeedback {
 struct VrrPresentRequest {
     bool latchedPresentation = false;
     bool collectDiagnostics = false;
+    // Nonzero on an unlatched request asks a latch-capable backend to latch
+    // anyway if the predecessor is not yet displayed or its refresh started
+    // less than this long ago. Only presentAdaptive() consults it.
+    uint64_t flipProtectionWindowUs = 0;
 };
 
 struct VrrPrepareResult {
