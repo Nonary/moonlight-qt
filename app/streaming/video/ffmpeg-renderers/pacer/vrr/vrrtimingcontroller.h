@@ -50,6 +50,12 @@
     X(size_t, playout_interval_initial_minimum_samples, playoutIntervalInitialMinimumSamples, 2) \
     X(uint64_t, playout_mean_miss_hold_us, playoutMeanMissHoldUs, 4000000) \
     X(uint64_t, playout_mean_miss_release_us_per_second, playoutMeanMissReleaseUsPerSecond, 200) \
+    /* Nonzero floors the adaptive playout delay at this per-mille percentile */ \
+    /* of recent timestamp-playout ready offsets (decode completion after the */ \
+    /* mapped source slot), so release cannot drain below what current frames */ \
+    /* need; rare stalls cannot raise a percentile, and it follows load down. */ \
+    X(uint64_t, playout_readiness_floor_per_mille, playoutReadinessFloorPerMille, 0) \
+    X(uint64_t, playout_readiness_floor_window_us, playoutReadinessFloorWindowUs, 10000000) \
     X(uint64_t, playout_on_time_target_per_million, playoutOnTimeTargetPerMillion, 990000) \
     X(uint64_t, playout_readiness_window_us, playoutReadinessWindowUs, 3000000) \
     X(uint64_t, playout_readiness_hitch_threshold_us, playoutReadinessHitchThresholdUs, 0) \
@@ -522,6 +528,7 @@ private:
     void resetCadenceSmoothing();
     uint64_t playoutDelayStartUs() const;
     uint64_t playoutDelayMinimumUs() const;
+    void noteReadinessFloorSample(uint64_t submissionUs, int64_t readyOffsetUs);
     uint64_t playoutDelayMaximumUs() const;
     void updatePlayoutHistory(const PacedFrame& frame,
                               const CadenceObservation& cadence,
@@ -718,6 +725,10 @@ private:
     std::deque<CadenceSample> m_CadenceSamples;
     std::deque<CadenceSample> m_RateCandidateSamples;
     std::deque<int64_t> m_ReadyOffsets;
+    // playoutReadinessFloorPerMille: (submission, ready offset) window.
+    std::deque<std::pair<uint64_t, int64_t>> m_ReadinessFloorSamples;
+    uint64_t m_ReadinessFloorUs = 0;
+    uint64_t m_ReadinessFloorUpdatedUs = 0;
     std::deque<uint64_t> m_PreparationDurations;
     std::deque<uint64_t> m_RenderSchedulerDelays;
     std::deque<uint64_t> m_TargetSchedulerDelays;

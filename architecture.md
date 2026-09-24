@@ -5,6 +5,30 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
+Balanced readiness floor (2026-09-24), based on `fae3eefe`: the interval-quality
+score averages absolute interval error over one second, which dilutes an
+isolated 4 ms late frame ~100x. Capture `20260923-232347-186` (116 FPS Balanced,
+4K HEVC on the 890M) scored 99.77% against the 99.5% target while visibly
+hitching every few seconds, so the buffer never grew and released 8.2 -> 6.9 ms
+although decode waits ran 6.4 ms p50 and 8.7-11.4 ms on the hitching frames.
+Production Balanced now sets `playout_readiness_floor_per_mille=500` and
+`playout_readiness_floor_window_us=10000000`: `playoutDelayMinimumUs()` is at
+least the median ready offset (decode completion after the mapped source slot)
+of the last ten seconds of timestamp-playout frames, recomputed ten times per
+second. It rises with sustained decode/network load, cannot be inflated by rare
+stalls, and falls within the window, after which the normal hold/release
+drains the buffer. Replay: `232347-186` >2 ms jerk 81 -> 44 per mille for
++1.0 ms median decode-to-submission; its startup connection 86 -> 78 for
++0.25 ms; the 19-minute `20260922-224404-796` session 372 -> 366 for +0.17 ms,
+draining to 8.3-10 ms in clean 116 FPS stretches; Smooth `221707-518` neutral.
+Rejected alternative: scoring each interval individually. At 0.5-1 ms
+tolerance it pinned Balanced and Smooth at their caps for whole sessions (the
+two-minute score remembers bad periods and late frames keep renewing the
+hold); at 2 ms it drained below today's policy. Smooth and Low Latency are
+unchanged. `tests/vrr/configs/latency-presets-stress.json` fails identically
+with the previous replay binary because its assertions name metrics the
+replay no longer emits; it needs updating before it can gate changes.
+
 Native flip protection (2026-09-23), based on `5c5ba95b`: the flip anchor
 assumes a tearing present flips at its call, but on the Radeon 890M DXGI took
 p50 ~3.2 ms / p95 ~6.7 ms. A latched successor therefore flipped 2-8 ms later

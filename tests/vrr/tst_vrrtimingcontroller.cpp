@@ -2985,6 +2985,53 @@ void testNativeFlipProtectionPreventsScanoutTears()
            "production must enable native flip protection");
 }
 
+void testBalancedReadinessFloorFollowsLoad()
+{
+    // Balanced floors its delay at the recent median ready offset. Slow
+    // decode on most frames must raise the delay; once decode recovers the
+    // floor must fall away within its window rather than pin the buffer.
+    auto session = config(116, 120);
+    session.latencyMode = 1;
+    const auto production = vrrTimingParametersForSession(session);
+    expect(production.playoutReadinessFloorPerMille == 500 &&
+               production.playoutReadinessFloorWindowUs == 10000000,
+           "Balanced must floor its delay at the recent median ready offset");
+    for (int mode : {0, 2}) {
+        auto other = config(116, 120);
+        other.latencyMode = mode;
+        expect(vrrTimingParametersForSession(other).playoutReadinessFloorPerMille == 0,
+               "Smooth and Low Latency must keep their existing delay policy");
+    }
+    const auto run = [&](uint64_t perMille) {
+        auto policy = production;
+        policy.playoutReadinessFloorPerMille = perMille;
+        VrrTimingController controller(session, true, policy);
+        uint64_t loadedUs = 0, relievedUs = 0;
+        constexpr int kFrames = 116 * 70;
+        for (int i = 0; i < kFrames; ++i) {
+            const uint32_t rtp = uint32_t(uint64_t(i) * 90000 / 116);
+            // For 30 s, three of five frames finish decoding 6 ms late.
+            const bool slow = i < 116 * 30 && i % 5 < 3;
+            const uint64_t at = decodedTimeForRtp(1000000, rtp) + (slow ? 6000 : 0);
+            const auto d = controller.schedule(frame(i, rtp, true, at), at);
+            controller.notePreparationDuration(1000);
+            controller.noteSubmission(true, false, std::max(d.targetUs, at + 1000));
+            if (i == 116 * 30 - 1) loadedUs = d.playoutDelayUs;
+            relievedUs = d.playoutDelayUs;
+        }
+        return std::array<uint64_t, 2>{loadedUs, relievedUs};
+    };
+    const auto without = run(0);
+    const auto with = run(500);
+    std::printf("readiness floor delay loaded %llu -> %llu us, relieved %llu -> %llu us\n",
+                (unsigned long long) without[0], (unsigned long long) with[0],
+                (unsigned long long) without[1], (unsigned long long) with[1]);
+    expect(with[0] >= 5500 && with[0] > without[0] + 1000,
+           "the floor must follow a slow median ready offset up");
+    expect(with[1] + 1000 < with[0] && with[1] <= without[1] + 500,
+           "the floor must release once decode recovers");
+}
+
 void testFirstPresentAfterVrrFloorGapLatches()
 {
     auto session = config(116, 120);
@@ -6037,6 +6084,7 @@ int main()
     testPerFrameLatchAtNativeMaximum();
     testTearingPresentClearsLatchedFlip();
     testNativeFlipProtectionPreventsScanoutTears();
+    testBalancedReadinessFloorFollowsLoad();
     testFirstPresentAfterVrrFloorGapLatches();
     testExplicitAdaptiveOnlyPolicy();
     testProductionAdaptiveProtectionRecoversWithoutDrift();
