@@ -15,6 +15,11 @@ public:
     Q_INVOKABLE static int
     getDefaultBitrate(int width, int height, int fps, bool yuv444);
 
+    // PyroWave needs roughly an order of magnitude more bandwidth than the
+    // other codecs; see docs/pyrowave-protocol.md.
+    Q_INVOKABLE static int
+    getDefaultPyroWaveBitrate(int width, int height, int fps, bool yuv444);
+
     Q_INVOKABLE void save();
 
     void reload();
@@ -33,7 +38,8 @@ public:
         VCC_FORCE_H264,
         VCC_FORCE_HEVC,
         VCC_FORCE_HEVC_HDR_DEPRECATED, // Kept for backwards compatibility
-        VCC_FORCE_AV1
+        VCC_FORCE_AV1,
+        VCC_FORCE_PYROWAVE
     };
     Q_ENUM(VideoCodecConfig)
 

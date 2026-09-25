@@ -1001,6 +1001,16 @@ bool Session::initialize(QQuickWindow* qtWindow)
         // straight to H.264 if the user asked for AV1 and the host doesn't support it.
         m_SupportedVideoFormats.removeByMask(~(VIDEO_FORMAT_MASK_AV1 | VIDEO_FORMAT_MASK_H265));
         break;
+    case StreamingPreferences::VCC_FORCE_PYROWAVE:
+        // PyroWave is only ever used on request, since it needs a wired link with
+        // hundreds of Mbps to spare. H.264 remains the fallback for other hosts.
+        // The 4:4:4 and 10-bit profiles are masked below like the other codecs'.
+        m_SupportedVideoFormats.removeByMask(~VIDEO_FORMAT_MASK_H264);
+        m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE);
+        m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE_444);
+        m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE_HDR10);
+        m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE_HDR10_444);
+        break;
     }
 
     // NB: Since deprioritization puts codecs in reverse order (at the bottom of the list),
@@ -1138,6 +1148,22 @@ bool Session::validateLaunch(SDL_Window* testWindow)
 
     if (m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_FORCE_SOFTWARE) {
         emitLaunchWarning(tr("Your settings selection to force software decoding may cause poor streaming performance."));
+    }
+
+    if (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) {
+        if (!(m_Computer->serverCodecModeSupport & SCM_PYROWAVE)) {
+            emitLaunchWarning(tr("Your host PC doesn't support PyroWave. Using H.264 instead."));
+            m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_PYROWAVE);
+        }
+        else if (getDecoderAvailability(testWindow,
+                                        StreamingPreferences::VDS_FORCE_HARDWARE,
+                                        m_SupportedVideoFormats.front(),
+                                        m_StreamConfig.width,
+                                        m_StreamConfig.height,
+                                        m_StreamConfig.fps) == DecoderAvailability::None) {
+            emitLaunchWarning(tr("This PC's GPU driver can't decode PyroWave. Using H.264 instead."));
+            m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_PYROWAVE);
+        }
     }
 
     if (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_AV1) {
@@ -1860,6 +1886,20 @@ bool Session::startConnectionAsync()
                                                                           m_StreamConfig.height,
                                                                           m_StreamConfig.fps,
                                                                           true)) {
+        m_StreamConfig.bitrate = StreamingPreferences::getDefaultBitrate(m_StreamConfig.width,
+                                                                         m_StreamConfig.height,
+                                                                         m_StreamConfig.fps,
+                                                                         false);
+    }
+
+    // Likewise, a PyroWave default bitrate is far too high for the H.264
+    // fallback used when the host or this PC can't do PyroWave.
+    if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_PYROWAVE &&
+        !(m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) &&
+        m_StreamConfig.bitrate == StreamingPreferences::getDefaultPyroWaveBitrate(m_StreamConfig.width,
+                                                                                  m_StreamConfig.height,
+                                                                                  m_StreamConfig.fps,
+                                                                                  m_Preferences->enableYUV444)) {
         m_StreamConfig.bitrate = StreamingPreferences::getDefaultBitrate(m_StreamConfig.width,
                                                                          m_StreamConfig.height,
                                                                          m_StreamConfig.fps,

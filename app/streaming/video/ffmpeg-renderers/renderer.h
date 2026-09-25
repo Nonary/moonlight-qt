@@ -138,6 +138,7 @@ private:
 #define RENDERER_ATTRIBUTE_FORCE_PACING 0x10
 
 class IVrrFramePresenter;
+class IPyroWaveSurfacePool;
 
 class GpuTrace;
 class IFFmpegRenderer : public Overlay::IOverlayRenderer {
@@ -266,6 +267,13 @@ public:
     // renderFrame().  The ordinary fixed and unpaced paths continue to call
     // renderFrame() exactly as before.
     virtual IVrrFramePresenter* getVrrFramePresenter() {
+        return nullptr;
+    }
+
+    // Renderers that can display PyroWave frames expose the surface pool the
+    // PyroWave decoder writes into. Only valid after initialize() succeeded
+    // for a PyroWave video format.
+    virtual IPyroWaveSurfacePool* getPyroWaveSurfacePool() {
         return nullptr;
     }
 

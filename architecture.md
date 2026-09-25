@@ -5,6 +5,30 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
+PyroWave decode path (2026-09-24, `pyrowave` branch): the `PyroWave` codec choice
+negotiates Themaister's intra-only wavelet codec (protocol in
+[docs/pyrowave-protocol.md](docs/pyrowave-protocol.md)). It reuses
+`FFmpegVideoDecoder`, the pacer, VRR worker, stats and `D3D11VARenderer`, but no
+FFmpeg decoder: `initializePyroWave()` creates the D3D11 renderer on one device
+(PyroWave requires monitored fences) and a `PyroWaveDecoder`, whose Vulkan device
+is created by the renderer adapter's LUID. `submitDecodeUnit()` parses the frame
+(`PyroWaveFraming`, record or length-prefixed framing), pushes it and submits the
+Vulkan decode into one of ten D3D11-owned surfaces (three R8/R16 planes each, UAV +
+SRV, NT-shared), then `receiveFrame()` hands the pacer an `AVFrame` tagged with a
+software planar format (for CSC normalization) whose `buf[0]` is a
+`PyroWaveFrameRef` (surface, decode fence value). Two shared D3D11 fences carry
+the synchronization: Vulkan signals the decode fence; `renderPyroWaveVideo()`
+queues `Wait()` on it, draws with `d3d11_yuv_planar_pixel` and signals the
+release fence (with a `Flush`), whose value the decoder's next use of that surface
+waits for on the GPU. `decoderOutputUs` is the submission time, as for D3D11VA;
+VRR `waitForDecode()` blocks on the decode fence value from the frame, so decode
+completion lands in the existing readiness observation. `captureDecodeBoundary()`
+stays 0 (single device). Frames are never partial yet: an incomplete or rejected
+frame is dropped without an IDR request, since the next frame is independent.
+Verified on the Radeon 890M by `tests/pyrowave` (framing rules, real-encoder
+round trip, and 40-frame D3D11 surface/fence cycles at 4:2:0/4:4:4, R8/R16);
+no live host session yet. VRR policy and replay are unchanged.
+
 Balanced readiness floor (2026-09-24), based on `fae3eefe`: the interval-quality
 score averages absolute interval error over one second, which dilutes an
 isolated 4 ms late frame ~100x. Capture `20260923-232347-186` (116 FPS Balanced,
