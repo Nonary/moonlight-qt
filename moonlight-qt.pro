@@ -16,6 +16,13 @@ win32:!winrt {
     app.depends += h264bitstream
 }
 
+# PyroWave codec library (see pyrowave/VENDOR.txt). Must match the condition
+# in app/app.pro.
+win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
+    SUBDIRS += pyrowave
+    app.depends += pyrowave
+}
+
 # Support debug and release builds from command line for CI
 CONFIG += debug_and_release
 
