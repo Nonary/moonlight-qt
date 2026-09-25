@@ -104,11 +104,20 @@ The host keeps sending the usual HDR mode and metadata control messages.
 ## Frames
 
 PyroWave frames ride the stock Sunshine video path unchanged: RTP, the
-`NV_VIDEO_PACKET` header, Reed-Solomon FEC (up to four FEC blocks; frames needing
-more are sent without FEC), optional AES-GCM, and the 8-byte short frame header in
-front of the first payload. The frame header `frameType` is always `2` (IDR).
-moonlight-common-c trims the last payload to `lastPayloadLen` as it does for AV1.
-The host ignores IDR and reference-invalidation requests for PyroWave sessions.
+`NV_VIDEO_PACKET` header and FEC block layout (up to four blocks), optional
+AES-GCM, and the 8-byte short frame header in front of the first payload. The frame
+header `frameType` is always `2` (IDR). moonlight-common-c trims the last payload
+to `lastPayloadLen` as it does for AV1. The host ignores IDR and
+reference-invalidation requests for PyroWave sessions.
+
+The host sends PyroWave without FEC (0% parity in `fecInfo`, whatever its
+`fec_percentage`). Every frame is independent, so a lost packet costs that frame
+only, while parity would add bytes, send time and encode time to every frame; it
+is meant for wired LANs where loss is rare. The frame is split into at most four
+blocks of at most 1023 shards, and the host caps a frame at 4000 shards (about
+5.5 MB with 1392-byte packets). It paces PyroWave packets at its
+`pyrowave_send_rate_mbps` setting, by default twice the stream bitrate and at least
+800 Mbps; the other codecs keep FEC and the stock 800 Mbps.
 
 ### Record framing (host default for PyroWave-aware clients)
 
@@ -184,12 +193,19 @@ Output planes are three single-channel UNORM images (R8 for 8-bit streams, R16 f
 ## Rate control
 
 The client's configured bitrate (`x-ml-video.configuredBitrateKbps`) is used exactly
-as for the other codecs; the host subtracts FEC, audio and control overhead. The
+as for the other codecs; the host subtracts audio and control overhead (not FEC,
+which PyroWave does not use). The
 per-frame byte budget is `bitrate / capture rate / 8`, where the capture rate is
 measured (a game at 60 fps in a 120 fps stream gets twice the bytes per frame),
 bounded to at most twice the nominal per-frame budget. PyroWave's rate control never
 exceeds that budget. Padding records are counted against the wire bitrate, not the
 budget.
+
+When no new capture arrives, the host re-encodes the last image at the minimum FPS
+target (`minimum_fps_target`, by default a fifth of the stream rate and at least 10
+fps), so a static screen recovers from a lost frame. Repeats do not count as captures,
+and the default is low enough that a game rendering below the stream rate is never
+padded out with repeats at its enlarged per-frame budget.
 
 Guidance: about 1.6 bits per pixel is visually clean for 4:2:0 SDR (Themaister's
 reference point, 200 Mbps at 1080p60). 4:4:4 costs about 1.6x, and 10-bit about
