@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace PyroWaveFraming {
 
@@ -25,21 +26,234 @@ int alignedExtent(int extent)
     return std::max(aligned, k_MinimumImageSize);
 }
 
-// Walks one run of records. With allowPadding, padding records split the run
-// into spans; otherwise any padding magic is an error (length-prefixed packets
-// never contain padding).
-bool walkRecords(const uint8_t* data, size_t base, size_t size,
-                 const StreamGeometry& geometry, uint32_t maxBlocks,
-                 bool allowPadding, Frame& frame, std::string& error)
+// The frame's packets, looked up by byte offset. Without segments, the frame
+// is one received packet of unknown boundaries.
+class SegmentMap
 {
+public:
+    explicit SegmentMap(const std::vector<Segment>& segments)
+        : m_Segments(segments)
+    {
+    }
+
+    bool anyLost() const
+    {
+        return std::any_of(m_Segments.begin(), m_Segments.end(),
+                           [](const Segment& segment) { return segment.lost; });
+    }
+
+    // Whether any byte of [start, end) was lost
+    bool lost(size_t start, size_t end) const
+    {
+        for (size_t i = indexOf(start); i < m_Segments.size() && m_Segments[i].offset < end; i++) {
+            if (m_Segments[i].lost) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether [start, end) came in a single packet
+    bool withinOnePacket(size_t start, size_t end) const
+    {
+        const size_t i = indexOf(start);
+        return i < m_Segments.size() && end <= m_Segments[i].offset + m_Segments[i].size;
+    }
+
+    // Frame bytes a full RTP packet carries: the first packet is full whenever
+    // another follows, and also carries the 8-byte frame header. SIZE_MAX when
+    // unknown (a single packet, or no packet map).
+    size_t payloadSize() const
+    {
+        return m_Segments.size() >= 2 ? m_Segments[0].size + 8 : std::numeric_limits<size_t>::max();
+    }
+
+    // Start of the first received packet after pos, or SIZE_MAX
+    size_t nextReceivedStart(size_t pos) const
+    {
+        for (size_t i = indexOf(pos) + 1; i < m_Segments.size(); i++) {
+            if (!m_Segments[i].lost) {
+                return m_Segments[i].offset;
+            }
+        }
+        return std::numeric_limits<size_t>::max();
+    }
+
+private:
+    // Index of the segment holding pos (segments tile the frame)
+    size_t indexOf(size_t pos) const
+    {
+        auto it = std::upper_bound(m_Segments.begin(), m_Segments.end(), pos,
+                                   [](size_t value, const Segment& segment) { return value < segment.offset; });
+        return it == m_Segments.begin() ? m_Segments.size() : size_t(it - m_Segments.begin()) - 1;
+    }
+
+    const std::vector<Segment>& m_Segments;
+};
+
+bool checkSequenceHeader(uint32_t word0, uint32_t word1, const StreamGeometry& geometry,
+                         uint32_t maxBlocks, Frame& frame, std::string& error)
+{
+    const int width = int(word0 & 0x3FFF) + 1;
+    const int height = int((word0 >> 14) & 0x3FFF) + 1;
+    const uint32_t totalBlocks = word1 & 0xFFFFFF;
+    const uint32_t code = (word1 >> 24) & 0x3;
+    const bool chroma444 = ((word1 >> 26) & 0x1) != 0;
+
+    if (code != 0) {
+        // Code 1 is the Solarflare "keep previous coefficients" frame,
+        // which upstream PyroWave cannot decode.
+        error = "unsupported sequence header code " + std::to_string(code);
+        return false;
+    }
+    if (width != geometry.width || height != geometry.height) {
+        error = "sequence header size " + std::to_string(width) + "x" + std::to_string(height) +
+                " differs from the stream";
+        return false;
+    }
+    if (chroma444 != geometry.chroma444) {
+        error = "sequence header chroma subsampling differs from the stream";
+        return false;
+    }
+    if (totalBlocks > maxBlocks) {
+        error = "sequence header announces more blocks than the frame can hold";
+        return false;
+    }
+
+    frame.sequenceHeaderSeen = true;
+    frame.announcedBlocks = totalBlocks;
+    return true;
+}
+
+// Walks a record-framed frame, skipping records that lost bytes with their
+// packets. The host sends the oversized records (too large to share a packet
+// with a padding record) right after the sequence header, then packs the rest
+// so that none crosses a packet boundary. Once a record of ordinary size shows
+// the oversized ones are behind, a lost record header is recovered from at the
+// next received packet. Until then, and for hosts that let ordinary records
+// straddle packets, the rest of the frame is lost.
+bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segments,
+                     const StreamGeometry& geometry, uint32_t maxBlocks,
+                     Frame& frame, std::string& error)
+{
+    const uint32_t coarseBlocks = coarseBlockCount(geometry);
+    const size_t payloadSize = segments.payloadSize();
     size_t pos = 0;
     size_t spanStart = 0;
+    uint32_t sequence = 0;
+    // Every later packet starts with a record
+    bool aligned = false;
+    // Every coarsest-level block has been passed
+    bool pastCoarseLevel = false;
 
-    auto closeSpan = [&](size_t end) {
-        if (end > spanStart) {
-            frame.spans.push_back({base + spanStart, end - spanStart});
+    auto skipTo = [&](size_t next) {
+        if (pos > spanStart) {
+            frame.spans.push_back({spanStart, pos - spanStart});
+        }
+        pos = spanStart = next;
+    };
+
+    auto noteLoss = [&]() {
+        frame.partial = true;
+        if (!pastCoarseLevel) {
+            frame.coarseLevelIntact = false;
         }
     };
+
+    while (pos < size) {
+        if (segments.lost(pos, std::min(pos + k_HeaderBytes, size))) {
+            noteLoss();
+            skipTo(aligned ? std::min(segments.nextReceivedStart(pos), size) : size);
+            continue;
+        }
+
+        if (size - pos < k_HeaderBytes) {
+            error = "trailing bytes shorter than a record header";
+            return false;
+        }
+
+        const uint32_t word0 = readU32(data + pos);
+        const uint32_t word1 = readU32(data + pos + 4);
+
+        if (word0 == k_PaddingMagic) {
+            const uint64_t padBytes = k_HeaderBytes + uint64_t(word1) * 4;
+            if (padBytes > size - pos) {
+                error = "padding record runs past the end of the frame";
+                return false;
+            }
+
+            frame.paddingBytes += uint32_t(padBytes);
+            skipTo(pos + size_t(padBytes));
+            continue;
+        }
+
+        if (word0 & 0x80000000u) {
+            if (frame.sequenceHeaderSeen) {
+                error = "second sequence header";
+                return false;
+            }
+            if (!checkSequenceHeader(word0, word1, geometry, maxBlocks, frame, error)) {
+                return false;
+            }
+            sequence = (word0 >> 28) & 0x7;
+            pos += k_HeaderBytes;
+            continue;
+        }
+
+        // BitstreamHeader
+        const uint32_t payloadWords = (word0 >> 16) & 0xFFF;
+        const uint32_t blockIndex = word1 >> 8;
+
+        if (!frame.sequenceHeaderSeen) {
+            error = "block record before the sequence header";
+            return false;
+        }
+        if (((word0 >> 28) & 0x7) != sequence) {
+            error = "block record from another frame";
+            return false;
+        }
+        if (payloadWords < k_HeaderWords) {
+            error = "block record shorter than its header";
+            return false;
+        }
+        if (uint64_t(payloadWords) * 4 > size - pos) {
+            error = "block record runs past the end of the frame";
+            return false;
+        }
+        if (blockIndex >= maxBlocks) {
+            error = "block index " + std::to_string(blockIndex) + " is out of range";
+            return false;
+        }
+
+        const size_t end = pos + size_t(payloadWords) * 4;
+        if (segments.lost(pos, end)) {
+            // Only a record that spans packets can lose its payload but not its header
+            noteLoss();
+            aligned = false;
+            skipTo(end);
+            continue;
+        }
+
+        const bool ordinary = end - pos + k_HeaderBytes <= payloadSize;
+        aligned = ordinary && segments.withinOnePacket(pos, end);
+        // The coarsest level precedes every finer block of ordinary size
+        if (aligned && blockIndex >= coarseBlocks) {
+            pastCoarseLevel = true;
+        }
+        frame.blockRecords++;
+        pos = end;
+    }
+
+    skipTo(pos);
+    return true;
+}
+
+// Walks one length-prefixed packet, which never contains padding.
+bool walkPacket(const uint8_t* data, size_t base, size_t size,
+                const StreamGeometry& geometry, uint32_t maxBlocks,
+                Frame& frame, std::string& error)
+{
+    size_t pos = 0;
 
     while (pos < size) {
         if (size - pos < k_HeaderBytes) {
@@ -51,54 +265,14 @@ bool walkRecords(const uint8_t* data, size_t base, size_t size,
         const uint32_t word1 = readU32(data + base + pos + 4);
 
         if (word0 == k_PaddingMagic) {
-            if (!allowPadding) {
-                error = "padding record inside a length-prefixed packet";
-                return false;
-            }
-
-            const uint64_t padBytes = k_HeaderBytes + uint64_t(word1) * 4;
-            if (padBytes > size - pos) {
-                error = "padding record runs past the end of the frame";
-                return false;
-            }
-
-            closeSpan(pos);
-            pos += size_t(padBytes);
-            spanStart = pos;
-            frame.paddingBytes += uint32_t(padBytes);
-            continue;
+            error = "padding record inside a length-prefixed packet";
+            return false;
         }
 
         if (word0 & 0x80000000u) {
-            // BitstreamSequenceHeader
-            const int width = int(word0 & 0x3FFF) + 1;
-            const int height = int((word0 >> 14) & 0x3FFF) + 1;
-            const uint32_t totalBlocks = word1 & 0xFFFFFF;
-            const uint32_t code = (word1 >> 24) & 0x3;
-            const bool chroma444 = ((word1 >> 26) & 0x1) != 0;
-
-            if (code != 0) {
-                // Code 1 is the Solarflare "keep previous coefficients" frame,
-                // which upstream PyroWave cannot decode.
-                error = "unsupported sequence header code " + std::to_string(code);
+            if (!checkSequenceHeader(word0, word1, geometry, maxBlocks, frame, error)) {
                 return false;
             }
-            if (width != geometry.width || height != geometry.height) {
-                error = "sequence header size " + std::to_string(width) + "x" + std::to_string(height) +
-                        " differs from the stream";
-                return false;
-            }
-            if (chroma444 != geometry.chroma444) {
-                error = "sequence header chroma subsampling differs from the stream";
-                return false;
-            }
-            if (totalBlocks > maxBlocks) {
-                error = "sequence header announces more blocks than the frame can hold";
-                return false;
-            }
-
-            frame.sequenceHeaderSeen = true;
-            frame.announcedBlocks = totalBlocks;
             pos += k_HeaderBytes;
             continue;
         }
@@ -124,10 +298,21 @@ bool walkRecords(const uint8_t* data, size_t base, size_t size,
         pos += size_t(payloadWords) * 4;
     }
 
-    closeSpan(pos);
+    if (size != 0) {
+        frame.spans.push_back({base, size});
+    }
     return true;
 }
+}
 
+uint32_t coarseBlockCount(const StreamGeometry& geometry)
+{
+    const int bandWidth = alignedExtent(geometry.width) >> k_DecompositionLevels;
+    const int bandHeight = alignedExtent(geometry.height) >> k_DecompositionLevels;
+    const uint32_t perBand = uint32_t((bandWidth + k_BlockSize - 1) / k_BlockSize) *
+                             uint32_t((bandHeight + k_BlockSize - 1) / k_BlockSize);
+    // Four bands of three components (only level 0 drops 4:2:0 chroma)
+    return perBand * 4 * 3;
 }
 
 uint32_t maxBlockCount(const StreamGeometry& geometry)
@@ -152,6 +337,12 @@ uint32_t maxBlockCount(const StreamGeometry& geometry)
 bool parse(const uint8_t* data, size_t size, const StreamGeometry& geometry,
            Frame& frame, std::string& error)
 {
+    return parse(data, size, {}, geometry, frame, error);
+}
+
+bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segments,
+           const StreamGeometry& geometry, Frame& frame, std::string& error)
+{
     frame = Frame();
 
     if (data == nullptr || size < k_HeaderBytes || (size % 4) != 0) {
@@ -159,19 +350,45 @@ bool parse(const uint8_t* data, size_t size, const StreamGeometry& geometry,
         return false;
     }
 
+    size_t tiled = 0;
+    for (const auto& segment : segments) {
+        if (segment.offset != tiled || segment.size == 0) {
+            error = "packet map does not tile the frame";
+            return false;
+        }
+        tiled += segment.size;
+    }
+    if (!segments.empty() && tiled != size) {
+        error = "packet map does not tile the frame";
+        return false;
+    }
+
+    const SegmentMap packets(segments);
     const uint32_t maxBlocks = maxBlockCount(geometry);
+
+    // The first packet carries the sequence header; without it nothing decodes
+    if (packets.lost(0, k_HeaderBytes)) {
+        error = "the frame's first packet was lost";
+        return false;
+    }
+
     const uint32_t firstWord = readU32(data);
 
     // A record-framed frame starts with a sequence header (extended bit set,
     // which a padding record also has); a packet count never sets bit 31.
     if (firstWord & 0x80000000u) {
         frame.framing = Framing::Records;
-        if (!walkRecords(data, 0, size, geometry, maxBlocks, true, frame, error)) {
+        if (!walkRecordFrame(data, size, packets, geometry, maxBlocks, frame, error)) {
             return false;
         }
     }
     else {
         frame.framing = Framing::LengthPrefixed;
+        if (packets.anyLost()) {
+            // Packet lengths cannot be recovered once one is lost
+            error = "packet loss in a length-prefixed frame";
+            return false;
+        }
         const uint32_t count = firstWord;
         if (count == 0 || count > (size - 4) / 8) {
             error = "invalid packet count " + std::to_string(count);
@@ -190,7 +407,7 @@ bool parse(const uint8_t* data, size_t size, const StreamGeometry& geometry,
                 error = "invalid packet length " + std::to_string(packetSize);
                 return false;
             }
-            if (!walkRecords(data, pos, packetSize, geometry, maxBlocks, false, frame, error)) {
+            if (!walkPacket(data, pos, packetSize, geometry, maxBlocks, frame, error)) {
                 return false;
             }
             pos += packetSize;
@@ -206,7 +423,8 @@ bool parse(const uint8_t* data, size_t size, const StreamGeometry& geometry,
         error = "frame has no sequence header";
         return false;
     }
-    if (frame.blockRecords != frame.announcedBlocks) {
+    // A partial frame is decoded if the decoder finds enough of it intact
+    if (!frame.partial && frame.blockRecords != frame.announcedBlocks) {
         error = "frame carries " + std::to_string(frame.blockRecords) + " of " +
                 std::to_string(frame.announcedBlocks) + " announced blocks";
         return false;

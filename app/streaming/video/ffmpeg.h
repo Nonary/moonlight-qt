@@ -11,6 +11,7 @@
 #include "clientpacingwarning.h"
 #include "ffmpeg-renderers/renderer.h"
 #include "ffmpeg-renderers/pacer/pacer.h"
+#include "pyrowave/pyrowaveframing.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -169,7 +170,10 @@ private:
 #endif
     bool m_PyroWaveActive = false;
     QQueue<AVFrame*> m_PyroWaveOutput;
+    // The current frame's RTP packets, and which were lost
+    std::vector<PyroWaveFraming::Segment> m_PyroWavePackets;
     uint32_t m_PyroWaveRejectedFrames = 0;
+    uint32_t m_PyroWavePartialFrames = 0;
     uint64_t m_PyroWaveLastErrorLogUs = 0;
 
     static const uint8_t k_H264TestFrame[];

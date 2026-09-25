@@ -371,11 +371,17 @@ void FFmpegVideoDecoder::reset()
                         "PyroWave rejected %u frames this session",
                         m_PyroWaveRejectedFrames);
         }
+        if (m_PyroWavePartialFrames != 0) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "PyroWave decoded %u frames with lost packets this session",
+                        m_PyroWavePartialFrames);
+        }
         m_PyroWave.reset();
     }
 #endif
     m_PyroWaveActive = false;
     m_PyroWaveRejectedFrames = 0;
+    m_PyroWavePartialFrames = 0;
 
     if (m_CurrentTestMode != TestMode::TestFrameOnly) {
         Session::get()->getOverlayManager().setOverlayRenderer(nullptr);
@@ -2272,7 +2278,8 @@ int FFmpegVideoDecoder::sendPyroWaveFrame(int length)
         return DR_OK;
     }
 
-    if (!m_PyroWave->decode(reinterpret_cast<const uint8_t*>(m_DecodeBuffer.constData()), length, frame)) {
+    if (!m_PyroWave->decode(reinterpret_cast<const uint8_t*>(m_DecodeBuffer.constData()), length,
+                            m_PyroWavePackets, frame)) {
         av_frame_free(&frame);
         m_PyroWaveRejectedFrames++;
 
@@ -2287,6 +2294,10 @@ int FFmpegVideoDecoder::sendPyroWaveFrame(int length)
                         m_PyroWaveRejectedFrames);
         }
         return DR_OK;
+    }
+
+    if (m_PyroWave->lastFramePartial()) {
+        m_PyroWavePartialFrames++;
     }
 
     // Colour follows the negotiation; PyroWave carries none in its bitstream
@@ -2872,8 +2883,15 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     m_DecodeBuffer.reserve(requiredBufferSize + AV_INPUT_BUFFER_PADDING_SIZE);
 
     int offset = 0;
+    m_PyroWavePackets.clear();
     while (entry != nullptr) {
+        const int entryOffset = offset;
         writeBuffer(entry, offset);
+        if (m_PyroWaveActive) {
+            // Each buffer is one RTP packet's payload
+            m_PyroWavePackets.push_back({size_t(entryOffset), size_t(offset - entryOffset),
+                                         entry->bufferType == BUFFER_TYPE_LOST});
+        }
         entry = entry->next;
     }
 

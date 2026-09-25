@@ -36,10 +36,17 @@ public:
     // submitted: the frame's PyroWaveFrameRef carries the decode fence value
     // to wait for. On success, frame receives the surface reference and its
     // format/size/colour metadata. Returns false if the frame was dropped.
-    bool decode(const uint8_t* data, size_t size, AVFrame* frame);
+    // packets maps the frame's RTP packets and which of them were lost (empty
+    // for a frame that arrived whole); what survived is decoded when enough of
+    // the frame's low-frequency bands did.
+    bool decode(const uint8_t* data, size_t size,
+                const std::vector<PyroWaveFraming::Segment>& packets, AVFrame* frame);
 
     // Why the last call failed, for logging.
     const std::string& lastError() const { return m_LastError; }
+
+    // Whether the last decoded frame was missing records
+    bool lastFramePartial() const { return m_LastFramePartial; }
 
     // Framing seen in the most recent successfully parsed frame.
     PyroWaveFraming::Framing lastFraming() const { return m_LastFraming; }
@@ -49,4 +56,5 @@ private:
     std::unique_ptr<Impl> m_Impl;
     std::string m_LastError;
     PyroWaveFraming::Framing m_LastFraming = PyroWaveFraming::Framing::Records;
+    bool m_LastFramePartial = false;
 };

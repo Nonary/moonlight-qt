@@ -8,6 +8,7 @@
 #include <vulkan/vulkan.h>
 #include <pyrowave.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -104,25 +105,59 @@ void putU32(std::vector<uint8_t>& out, uint32_t value)
     }
 }
 
-// Strict-order record framing: pad to the next payload whenever the next packet
-// does not fit. The host packs more tightly; the parser must accept both.
+void putPadding(std::vector<uint8_t>& out, size_t bytes)
+{
+    putU32(out, 0xFFFFFFFFu);
+    putU32(out, uint32_t((bytes - 8) / 4));
+    out.resize(out.size() + (bytes - 8), 0);
+}
+
+// Record framing with the host's layout guarantees but strict packet order
+// otherwise: packets too large to share a payload with a padding record first
+// (a payload less 4 bytes could never be placed alone), then the rest padded so that
+// none crosses a payload boundary and no 4-byte remainder (too small for a
+// padding record) is left. Every payload after the oversized ones then starts
+// with a record, and the coarsest level (the first packets) precedes the rest.
+// The host packs more tightly; the parser must accept both.
 std::vector<uint8_t> recordFrame(const std::vector<uint8_t>& bitstream,
                                  const std::vector<pyrowave_packet>& packets,
                                  size_t shard)
 {
-    std::vector<uint8_t> out;
-    size_t boundary = shard - 8; // the first payload also carries the frame header
+    // Split the encoder's packets into the sequence header and block records
+    std::vector<pyrowave_packet> records;
     for (const auto& packet : packets) {
-        const size_t remaining = boundary - out.size();
-        if (packet.size > remaining && packet.size <= shard && remaining >= 8) {
-            putU32(out, 0xFFFFFFFFu);
-            putU32(out, uint32_t((remaining - 8) / 4));
-            out.resize(out.size() + (remaining - 8), 0);
+        for (size_t pos = packet.offset; pos < packet.offset + packet.size;) {
+            uint32_t word0;
+            std::memcpy(&word0, bitstream.data() + pos, 4);
+            const size_t size = (word0 & 0x80000000u) ? 8 : size_t((word0 >> 16) & 0xFFF) * 4;
+            records.push_back({pos, size});
+            pos += size;
         }
-        out.insert(out.end(), bitstream.begin() + packet.offset,
-                   bitstream.begin() + packet.offset + packet.size);
-        while (boundary <= out.size()) {
-            boundary += shard;
+    }
+
+    std::vector<uint8_t> out;
+    // Bytes left in the current payload; the first also carries the frame header
+    auto remaining = [&]() { return shard - (out.size() + 8) % shard; };
+    auto place = [&](const pyrowave_packet& record) {
+        out.insert(out.end(), bitstream.begin() + record.offset,
+                   bitstream.begin() + record.offset + record.size);
+    };
+
+    place(records.front());
+    for (size_t i = 1; i < records.size(); i++) {
+        if (records[i].size + 8 > shard) {
+            if (records[i].size % shard == remaining() - 4) {
+                putPadding(out, 8);
+            }
+            place(records[i]);
+        }
+    }
+    for (size_t i = 1; i < records.size(); i++) {
+        if (records[i].size + 8 <= shard) {
+            if (records[i].size > remaining() || remaining() - records[i].size == 4) {
+                putPadding(out, remaining());
+            }
+            place(records[i]);
         }
     }
     return out;
@@ -170,6 +205,55 @@ bool decodeFramed(pyrowave_decoder decoder, const std::vector<uint8_t>& framed,
         expect(false, name + ": decode failed");
         return false;
     }
+    return true;
+}
+
+// Loses one RTP payload of a record-framed frame the way moonlight-common-c
+// delivers it (zero-filled, marked lost) and decodes what the parser salvages.
+// Returns whether the decoder accepted the partial frame; its luma PSNR goes
+// to quality.
+bool decodeWithLostPayload(pyrowave_decoder decoder, std::vector<uint8_t> framed, size_t shard,
+                           size_t lostPayload, const PyroWaveFraming::StreamGeometry& geometry,
+                           const Planes& source, Planes& output, double& quality, const std::string& name)
+{
+    std::vector<PyroWaveFraming::Segment> segments;
+    for (size_t offset = 0, index = 0; offset < framed.size(); index++) {
+        const size_t size = std::min(framed.size() - offset, index == 0 ? shard - 8 : shard);
+        if (index == lostPayload) {
+            std::fill(framed.begin() + offset, framed.begin() + offset + size, uint8_t(0));
+        }
+        segments.push_back({offset, size, index == lostPayload});
+        offset += size;
+    }
+
+    PyroWaveFraming::Frame frame;
+    std::string error;
+    if (!PyroWaveFraming::parse(framed.data(), framed.size(), segments, geometry, frame, error)) {
+        expect(false, name + ": parse failed: " + error);
+        return false;
+    }
+    expect(frame.partial, name + ": the frame is partial");
+    expect(frame.blockRecords < frame.announcedBlocks, name + ": records were lost");
+
+    pyrowave_decoder_clear(decoder);
+    for (const auto& span : frame.spans) {
+        if (pyrowave_decoder_push_packet(decoder, framed.data() + span.offset, span.size) != PYROWAVE_SUCCESS) {
+            expect(false, name + ": push_packet rejected a span");
+            return false;
+        }
+    }
+    // As PyroWaveDecoder does: the parser vouches for the coarsest level
+    if (!frame.coarseLevelIntact ||
+            !pyrowave_decoder_decode_is_ready_with_sideband(decoder, true, 0, 0.9f, nullptr, 0)) {
+        return false;
+    }
+
+    auto buffer = output.buffer();
+    if (pyrowave_decoder_decode_cpu_buffer_synchronous(decoder, &buffer) != PYROWAVE_SUCCESS) {
+        expect(false, name + ": decode failed");
+        return false;
+    }
+    quality = psnr(source.y, output.y);
     return true;
 }
 
@@ -244,6 +328,30 @@ void runCase(pyrowave_device device, int width, int height, bool chroma444, size
             std::string error;
             PyroWaveFraming::parse(records.data(), records.size(), geometry, frame, error);
             paddingBytes += frame.paddingBytes;
+
+            // Lose one payload at a time across the frame: the lowest-frequency
+            // blocks come first and must survive, everything else only blurs
+            const size_t payloads = (records.size() + 8 + shard - 1) / shard;
+            int salvaged = 0, tried = 0;
+            double worstQuality = 99;
+            for (size_t lost = 1; lost < payloads; lost += std::max<size_t>(1, payloads / 16)) {
+                const std::string lossName = name + " lost payload " + std::to_string(lost) +
+                                             " of " + std::to_string(payloads);
+                double lossyQuality = 0;
+                tried++;
+                if (decodeWithLostPayload(decoder, records, shard, lost, geometry, source, decoded,
+                                          lossyQuality, lossName)) {
+                    salvaged++;
+                    worstQuality = std::min(worstQuality, lossyQuality);
+                    expect(lossyQuality > 25.0 && lossyQuality <= quality + 0.01,
+                           lossName + ": luma PSNR " + std::to_string(lossyQuality) +
+                           " against " + std::to_string(quality) + " whole");
+                }
+            }
+            std::printf("%s frame %d: %d of %d single-payload losses decoded, luma PSNR %.1f dB whole, "
+                        "%.1f dB worst salvaged\n",
+                        name.c_str(), frameIndex, salvaged, tried, quality, worstQuality);
+            expect(salvaged * 4 >= tried * 3, name + ": most single-payload losses decode");
         }
 
         // Re-packetize with the compatibility boundary for length-prefixed framing

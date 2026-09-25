@@ -1,7 +1,9 @@
 #include "../../app/streaming/video/pyrowave/pyrowaveframing.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace {
@@ -58,6 +60,33 @@ bool parse(const std::vector<uint8_t>& data, const StreamGeometry& geometry, Fra
 {
     std::string error;
     return PyroWaveFraming::parse(data.data(), data.size(), geometry, frame, error);
+}
+
+// Splits a frame into RTP payloads of `shard` bytes (the first one 8 bytes
+// shorter, as it also carries the frame header) and zero-fills the lost ones
+// the way moonlight-common-c does.
+std::vector<PyroWaveFraming::Segment> losePackets(std::vector<uint8_t>& data, size_t shard,
+                                                  const std::vector<size_t>& lost)
+{
+    std::vector<PyroWaveFraming::Segment> segments;
+    for (size_t offset = 0, index = 0; offset < data.size(); index++) {
+        const size_t size = std::min(data.size() - offset, index == 0 ? shard - 8 : shard);
+        const bool isLost = std::find(lost.begin(), lost.end(), index) != lost.end();
+        if (isLost) {
+            std::fill(data.begin() + offset, data.begin() + offset + size, uint8_t(0));
+        }
+        segments.push_back({offset, size, isLost});
+        offset += size;
+    }
+    return segments;
+}
+
+bool parseWithLoss(std::vector<uint8_t> data, size_t shard, const std::vector<size_t>& lost,
+                   const StreamGeometry& geometry, Frame& frame)
+{
+    const auto segments = losePackets(data, shard, lost);
+    std::string error;
+    return PyroWaveFraming::parse(data.data(), data.size(), segments, geometry, frame, error);
 }
 
 void testBlockCounts()
@@ -201,6 +230,127 @@ void testRejections()
         data.push_back(0);
         expect(!parse(data, geometry, frame), "a frame that is not word aligned is rejected");
     }
+    {
+        std::vector<uint8_t> data;
+        putSequenceHeader(data, 1920, 1080, 1, false, 0, 1);
+        putBlock(data, 5, 2, 2);
+        expect(!parse(data, geometry, frame), "a block from another frame's sequence is rejected");
+    }
+    {
+        std::vector<uint8_t> data;
+        putSequenceHeader(data, 1920, 1080, 2, false);
+        putBlock(data, 5, 2);
+        putSequenceHeader(data, 1920, 1080, 2, false);
+        putBlock(data, 6, 2);
+        expect(!parse(data, geometry, frame), "a second sequence header is rejected");
+    }
+}
+
+// Payloads of 64 bytes; the first holds 56 frame bytes after the frame header.
+constexpr size_t k_Shard = 64;
+
+void testPartialFrames()
+{
+    const StreamGeometry geometry {1920, 1080, false};
+    Frame frame;
+
+    // Aligned: every payload starts with a record, so a lost payload costs only
+    // its own records and parsing resumes at the next one. 1080p has 48
+    // coarsest-level blocks (indices 0-47), which come first.
+    //   payload 0 [0, 56):    sequence header, A (48 bytes, coarse)
+    //   payload 1 [56, 120):  B (56), padding (8)
+    //   payload 2 [120, 184): C (32), D (32)
+    //   payload 3 [184, 248): E (56), padding (8)
+    std::vector<uint8_t> aligned;
+    putSequenceHeader(aligned, 1920, 1080, 5, false);
+    putBlock(aligned, 0, 12);
+    putBlock(aligned, 100, 14);
+    putPadding(aligned, 0);
+    putBlock(aligned, 101, 8);
+    putBlock(aligned, 102, 8);
+    putBlock(aligned, 103, 14);
+    putPadding(aligned, 0);
+
+    expect(parseWithLoss(aligned, k_Shard, {}, geometry, frame) && !frame.partial && frame.blockRecords == 5,
+           "a frame without loss is not partial");
+
+    expect(parseWithLoss(aligned, k_Shard, {2}, geometry, frame), "a frame with a lost payload parses");
+    expect(frame.partial, "a lost payload marks the frame partial");
+    expect(frame.coarseLevelIntact, "a loss after the coarsest level leaves it intact");
+    expect(frame.blockRecords == 3, "only the lost payload's records are missing");
+    expect(frame.spans.size() == 2 && frame.spans[0].offset == 0 && frame.spans[0].size == 112 &&
+           frame.spans[1].offset == 184 && frame.spans[1].size == 56,
+           "parsing resumes at the next received payload");
+
+    expect(parseWithLoss(aligned, k_Shard, {3}, geometry, frame) && frame.blockRecords == 4 &&
+           frame.coarseLevelIntact && frame.spans.size() == 2 && frame.spans[1].offset == 120 &&
+           frame.spans[1].size == 64,
+           "a lost last payload drops only its records");
+
+    expect(parseWithLoss(aligned, k_Shard, {1}, geometry, frame) && frame.blockRecords == 4 &&
+           !frame.coarseLevelIntact,
+           "a loss before the first finer block may have taken coarsest-level blocks");
+
+    expect(!parseWithLoss(aligned, k_Shard, {0}, geometry, frame), "a lost first payload drops the frame");
+
+    // An oversized record (too large to share a payload with padding) comes
+    // first and spans payloads. Its header arrived, so its end is known even
+    // when its body was lost.
+    //   payload 0-1 [8, 120): X (112)
+    //   payload 2 [120, 184): C (32), D (32)
+    //   payload 3 [184, 248): E (56), padding (8)
+    //   payload 4 [248, 312): F (56), padding (8)
+    std::vector<uint8_t> head;
+    putSequenceHeader(head, 1920, 1080, 5, false);
+    putBlock(head, 0, 28);
+    putBlock(head, 101, 8);
+    putBlock(head, 102, 8);
+    putBlock(head, 103, 14);
+    putPadding(head, 0);
+    putBlock(head, 104, 14);
+    putPadding(head, 0);
+
+    expect(parseWithLoss(head, k_Shard, {1}, geometry, frame) && frame.partial && frame.blockRecords == 4 &&
+           !frame.coarseLevelIntact && frame.spans.size() == 3 && frame.spans[0].size == 8 &&
+           frame.spans[1].offset == 120,
+           "an oversized record that lost its body is skipped");
+    expect(parseWithLoss(head, k_Shard, {3}, geometry, frame) && frame.blockRecords == 4 &&
+           frame.coarseLevelIntact && frame.spans.size() == 2 && frame.spans[0].size == 184 &&
+           frame.spans[1].offset == 248,
+           "parsing resumes after the oversized records");
+
+    // A record header lost while oversized records may still follow: the next
+    // payload could continue one, so the rest of the frame is given up.
+    //   payload 0-1 [8, 120):   X (112)
+    //   payload 2-3 [120, 248): Y (128)
+    //   payload 4 [248, 312):   Z (56), padding (8)
+    std::vector<uint8_t> unaligned;
+    putSequenceHeader(unaligned, 1920, 1080, 3, false);
+    putBlock(unaligned, 0, 28);
+    putBlock(unaligned, 1, 32);
+    putBlock(unaligned, 2, 14);
+    putPadding(unaligned, 0);
+
+    expect(parseWithLoss(unaligned, k_Shard, {2}, geometry, frame) && frame.partial &&
+           frame.blockRecords == 1 && frame.spans.size() == 1 && frame.spans[0].size == 120,
+           "no resynchronization before the oversized records end");
+    // Length-prefixed packets cannot be delimited once one is lost
+    std::vector<uint8_t> body;
+    putSequenceHeader(body, 1920, 1080, 1, false);
+    putBlock(body, 0, 40);
+    std::vector<uint8_t> prefixed;
+    putU32(prefixed, 1);
+    putU32(prefixed, uint32_t(body.size()));
+    prefixed.insert(prefixed.end(), body.begin(), body.end());
+    expect(parseWithLoss(prefixed, k_Shard, {}, geometry, frame), "a whole length-prefixed frame parses");
+    expect(!parseWithLoss(prefixed, k_Shard, {1}, geometry, frame),
+           "a length-prefixed frame with a lost payload is rejected");
+
+    // The packet map must describe the frame exactly
+    std::vector<PyroWaveFraming::Segment> gap {{0, 56, false}, {60, 64, false}};
+    std::string error;
+    expect(!PyroWaveFraming::parse(aligned.data(), 124, gap, geometry, frame, error),
+           "a packet map with a gap is rejected");
 }
 
 }
@@ -211,6 +361,7 @@ int main()
     testRecordFraming();
     testLengthPrefixedFraming();
     testRejections();
+    testPartialFrames();
 
     if (g_Failures == 0) {
         std::printf("PyroWave framing: all checks passed\n");

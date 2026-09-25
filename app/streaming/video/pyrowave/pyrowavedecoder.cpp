@@ -328,17 +328,19 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
     return true;
 }
 
-bool PyroWaveDecoder::decode(const uint8_t* data, size_t size, AVFrame* frame)
+bool PyroWaveDecoder::decode(const uint8_t* data, size_t size,
+                             const std::vector<PyroWaveFraming::Segment>& packets, AVFrame* frame)
 {
     Impl& impl = *m_Impl;
 
-    if (!PyroWaveFraming::parse(data, size, impl.geometry, impl.parsed, m_LastError)) {
+    m_LastFramePartial = false;
+    if (!PyroWaveFraming::parse(data, size, packets, impl.geometry, impl.parsed, m_LastError)) {
         return false;
     }
     m_LastFraming = impl.parsed.framing;
 
-    // Every frame is complete and independent. Clearing first keeps the 3-bit
-    // sequence counter from treating a frame after a long drop as stale.
+    // Every frame is independent. Clearing first keeps the 3-bit sequence
+    // counter from treating a frame after a long drop as stale.
     pyrowave_decoder_clear(impl.decoder);
     for (const auto& span : impl.parsed.spans) {
         const pyrowave_result result = pyrowave_decoder_push_packet(impl.decoder, data + span.offset, span.size);
@@ -348,10 +350,28 @@ bool PyroWaveDecoder::decode(const uint8_t* data, size_t size, AVFrame* frame)
         }
     }
 
-    if (!pyrowave_decoder_decode_is_ready(impl.decoder, false)) {
-        m_LastError = "frame is incomplete";
-        return false;
+    if (!impl.parsed.partial) {
+        if (!pyrowave_decoder_decode_is_ready(impl.decoder, false)) {
+            m_LastError = "frame is incomplete";
+            return false;
+        }
     }
+    else {
+        // A partial frame decodes if its coarsest wavelet level is intact and
+        // more than 90% of its blocks arrived; missing detail decodes as blur.
+        // The parser checks the coarsest level: PyroWave's own check cannot tell
+        // a lost block from an all-zero one that was never sent.
+        if (!impl.parsed.coarseLevelIntact) {
+            m_LastError = "part of the coarsest wavelet level was lost";
+            return false;
+        }
+        if (!pyrowave_decoder_decode_is_ready_with_sideband(impl.decoder, true, 0, 0.9f, nullptr, 0)) {
+            m_LastError = "too little of the frame arrived (" + std::to_string(impl.parsed.blockRecords) +
+                          " of " + std::to_string(impl.parsed.announcedBlocks) + " blocks)";
+            return false;
+        }
+    }
+    m_LastFramePartial = impl.parsed.partial;
 
     int surface;
     uint64_t releaseValue;

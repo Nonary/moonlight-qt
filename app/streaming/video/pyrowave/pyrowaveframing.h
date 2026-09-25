@@ -12,6 +12,18 @@
 // shorter than its header, a record running past the frame, a sequence header
 // for another size or chroma mode, or an out-of-range block index rejects the
 // whole frame. Frames are independent, so the next frame simply replaces it.
+//
+// A record-framed frame may arrive with packets missing (zero-filled by
+// moonlight-common-c). Records that lost any byte are skipped. When a record
+// header itself was lost, parsing resumes at the start of the next packet that
+// arrived, which the host guarantees is a record boundary once the frame's
+// oversized records (larger than a packet, sent first) are behind. The frame is
+// then marked partial.
+//
+// A partial frame is only worth decoding if every block of the coarsest wavelet
+// level arrived. The host sends those blocks (block indices below
+// coarseBlockCount()) before any other block that fits in a packet, so they are
+// known to be intact when no loss precedes the first finer block.
 
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +43,14 @@ struct Span {
     size_t size;
 };
 
+// The part of the frame one RTP packet carried, and whether that packet was
+// lost (its bytes are then zero-filled and meaningless).
+struct Segment {
+    size_t offset;
+    size_t size;
+    bool lost;
+};
+
 struct StreamGeometry {
     int width;
     int height;
@@ -40,12 +60,16 @@ struct StreamGeometry {
 struct Frame {
     Framing framing = Framing::Records;
     std::vector<Span> spans;
-    // Number of block records (excluding sequence headers and padding)
+    // Number of block records passed on (excluding sequence headers and padding)
     uint32_t blockRecords = 0;
     // total_blocks from the sequence header, or 0 if none was present
     uint32_t announcedBlocks = 0;
     bool sequenceHeaderSeen = false;
     uint32_t paddingBytes = 0;
+    // Some records were lost with their packets
+    bool partial = false;
+    // Every coarsest-level block that was sent arrived (always true when not partial)
+    bool coarseLevelIntact = true;
 };
 
 constexpr uint32_t k_PaddingMagic = 0xFFFFFFFFu;
@@ -53,6 +77,16 @@ constexpr uint32_t k_PaddingMagic = 0xFFFFFFFFu;
 // Number of 32x32 blocks a frame of this geometry can index (bitstream spec:
 // five wavelet levels of each component, 4:2:0 omits chroma level 0).
 uint32_t maxBlockCount(const StreamGeometry& geometry);
+
+// Number of blocks in the coarsest wavelet level (all four bands of every
+// component), which PyroWave indexes first. A frame missing any of them decodes
+// with extreme artifacts.
+uint32_t coarseBlockCount(const StreamGeometry& geometry);
+
+// segments must tile [0, size) in order, or be empty for a frame that arrived
+// whole and whose packet boundaries are unknown.
+bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segments,
+           const StreamGeometry& geometry, Frame& frame, std::string& error);
 
 bool parse(const uint8_t* data, size_t size, const StreamGeometry& geometry,
            Frame& frame, std::string& error);
