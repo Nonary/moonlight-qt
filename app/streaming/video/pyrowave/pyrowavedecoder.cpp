@@ -329,12 +329,13 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
 }
 
 bool PyroWaveDecoder::decode(const uint8_t* data, size_t size,
-                             const std::vector<PyroWaveFraming::Segment>& packets, AVFrame* frame)
+                             const std::vector<PyroWaveFraming::Segment>& packets, size_t criticalPackets,
+                             AVFrame* frame)
 {
     Impl& impl = *m_Impl;
 
     m_LastFramePartial = false;
-    if (!PyroWaveFraming::parse(data, size, packets, impl.geometry, impl.parsed, m_LastError)) {
+    if (!PyroWaveFraming::parse(data, size, packets, criticalPackets, impl.geometry, impl.parsed, m_LastError)) {
         return false;
     }
     m_LastFraming = impl.parsed.framing;

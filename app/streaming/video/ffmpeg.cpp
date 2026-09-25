@@ -2279,7 +2279,7 @@ int FFmpegVideoDecoder::sendPyroWaveFrame(int length)
     }
 
     if (!m_PyroWave->decode(reinterpret_cast<const uint8_t*>(m_DecodeBuffer.constData()), length,
-                            m_PyroWavePackets, frame)) {
+                            m_PyroWavePackets, m_PyroWaveCriticalPackets, frame)) {
         av_frame_free(&frame);
         m_PyroWaveRejectedFrames++;
 
@@ -2884,13 +2884,15 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
 
     int offset = 0;
     m_PyroWavePackets.clear();
+    m_PyroWaveCriticalPackets = du->pyrowaveCriticalPackets;
     while (entry != nullptr) {
         const int entryOffset = offset;
         writeBuffer(entry, offset);
         if (m_PyroWaveActive) {
             // Each buffer is one RTP packet's payload
             m_PyroWavePackets.push_back({size_t(entryOffset), size_t(offset - entryOffset),
-                                         entry->bufferType == BUFFER_TYPE_LOST});
+                                         entry->bufferType == BUFFER_TYPE_LOST,
+                                         entry->bufferType == BUFFER_TYPE_RECORD_START});
         }
         entry = entry->next;
     }

@@ -15,15 +15,19 @@
 //
 // A record-framed frame may arrive with packets missing (zero-filled by
 // moonlight-common-c). Records that lost any byte are skipped. When a record
-// header itself was lost, parsing resumes at the start of the next packet that
-// arrived, which the host guarantees is a record boundary once the frame's
-// oversized records (larger than a packet, sent first) are behind. The frame is
-// then marked partial.
+// header itself was lost, parsing resumes at the next received packet that the
+// host flagged as starting with a record. Without flags, it resumes at the next
+// received packet once the finer levels' oversized records (larger than a
+// packet, sent before their other records) are behind, since the host packs
+// every other record without crossing a packet boundary. The frame is then
+// marked partial.
 //
 // A partial frame is only worth decoding if every block of the coarsest wavelet
 // level arrived. The host sends those blocks (block indices below
-// coarseBlockCount()) before any other block that fits in a packet, so they are
-// known to be intact when no loss precedes the first finer block.
+// coarseBlockCount()) first, right after the sequence header, protects the
+// packets holding them with parity, and announces how many packets that is in
+// the frame header. Hosts that do not announce it still send them first, so
+// they are known to be intact when no loss precedes the first finer block.
 
 #include <cstddef>
 #include <cstdint>
@@ -43,12 +47,14 @@ struct Span {
     size_t size;
 };
 
-// The part of the frame one RTP packet carried, and whether that packet was
-// lost (its bytes are then zero-filled and meaningless).
+// The part of the frame one RTP packet carried, whether that packet was lost
+// (its bytes are then zero-filled and meaningless), and whether the host
+// flagged it as starting with a record.
 struct Segment {
     size_t offset;
     size_t size;
     bool lost;
+    bool recordStart = false;
 };
 
 struct StreamGeometry {
@@ -84,7 +90,11 @@ uint32_t maxBlockCount(const StreamGeometry& geometry);
 uint32_t coarseBlockCount(const StreamGeometry& geometry);
 
 // segments must tile [0, size) in order, or be empty for a frame that arrived
-// whole and whose packet boundaries are unknown.
+// whole and whose packet boundaries are unknown. criticalPackets is the number
+// of leading packets the host announced as holding the coarsest level, or 0.
+bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segments,
+           size_t criticalPackets, const StreamGeometry& geometry, Frame& frame, std::string& error);
+
 bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segments,
            const StreamGeometry& geometry, Frame& frame, std::string& error);
 

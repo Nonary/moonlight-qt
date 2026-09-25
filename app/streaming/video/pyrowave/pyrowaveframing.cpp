@@ -68,11 +68,19 @@ public:
         return m_Segments.size() >= 2 ? m_Segments[0].size + 8 : std::numeric_limits<size_t>::max();
     }
 
-    // Start of the first received packet after pos, or SIZE_MAX
-    size_t nextReceivedStart(size_t pos) const
+    // Whether the host flags the packets that start with a record (it always
+    // flags the first, which starts with the sequence header)
+    bool recordStartsFlagged() const
+    {
+        return !m_Segments.empty() && m_Segments[0].recordStart;
+    }
+
+    // Start of the first received packet after pos (flagged as starting with a
+    // record when flagRequired), or SIZE_MAX
+    size_t nextReceivedStart(size_t pos, bool flagRequired) const
     {
         for (size_t i = indexOf(pos) + 1; i < m_Segments.size(); i++) {
-            if (!m_Segments[i].lost) {
+            if (!m_Segments[i].lost && (m_Segments[i].recordStart || !flagRequired)) {
                 return m_Segments[i].offset;
             }
         }
@@ -126,18 +134,20 @@ bool checkSequenceHeader(uint32_t word0, uint32_t word1, const StreamGeometry& g
 }
 
 // Walks a record-framed frame, skipping records that lost bytes with their
-// packets. The host sends the oversized records (too large to share a packet
-// with a padding record) right after the sequence header, then packs the rest
-// so that none crosses a packet boundary. Once a record of ordinary size shows
-// the oversized ones are behind, a lost record header is recovered from at the
-// next received packet. Until then, and for hosts that let ordinary records
-// straddle packets, the rest of the frame is lost.
+// packets. The host sends the sequence header, the coarsest wavelet level, then
+// the finer levels: first their oversized records (too large to share a packet
+// with a padding record), then the rest packed so that none crosses a packet
+// boundary. Once a finer record of ordinary size shows the oversized ones are
+// behind, a lost record header is recovered from at the next received packet.
+// Before that, and for hosts that let ordinary records straddle packets, the
+// rest of the frame is lost.
 bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segments,
-                     const StreamGeometry& geometry, uint32_t maxBlocks,
+                     bool coarseLevelKnown, const StreamGeometry& geometry, uint32_t maxBlocks,
                      Frame& frame, std::string& error)
 {
     const uint32_t coarseBlocks = coarseBlockCount(geometry);
     const size_t payloadSize = segments.payloadSize();
+    const bool flagged = segments.recordStartsFlagged();
     size_t pos = 0;
     size_t spanStart = 0;
     uint32_t sequence = 0;
@@ -155,7 +165,7 @@ bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segment
 
     auto noteLoss = [&]() {
         frame.partial = true;
-        if (!pastCoarseLevel) {
+        if (!pastCoarseLevel && !coarseLevelKnown) {
             frame.coarseLevelIntact = false;
         }
     };
@@ -163,7 +173,7 @@ bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segment
     while (pos < size) {
         if (segments.lost(pos, std::min(pos + k_HeaderBytes, size))) {
             noteLoss();
-            skipTo(aligned ? std::min(segments.nextReceivedStart(pos), size) : size);
+            skipTo(flagged || aligned ? std::min(segments.nextReceivedStart(pos, flagged), size) : size);
             continue;
         }
 
@@ -225,6 +235,11 @@ bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segment
             return false;
         }
 
+        // The whole coarsest level precedes the first finer block
+        if (blockIndex >= coarseBlocks) {
+            pastCoarseLevel = true;
+        }
+
         const size_t end = pos + size_t(payloadWords) * 4;
         if (segments.lost(pos, end)) {
             // Only a record that spans packets can lose its payload but not its header
@@ -234,12 +249,10 @@ bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segment
             continue;
         }
 
+        // Only the finer level's ordinary records are packed so that none crosses a
+        // packet boundary; its oversized ones come first.
         const bool ordinary = end - pos + k_HeaderBytes <= payloadSize;
-        aligned = ordinary && segments.withinOnePacket(pos, end);
-        // The coarsest level precedes every finer block of ordinary size
-        if (aligned && blockIndex >= coarseBlocks) {
-            pastCoarseLevel = true;
-        }
+        aligned = ordinary && blockIndex >= coarseBlocks && segments.withinOnePacket(pos, end);
         frame.blockRecords++;
         pos = end;
     }
@@ -337,11 +350,17 @@ uint32_t maxBlockCount(const StreamGeometry& geometry)
 bool parse(const uint8_t* data, size_t size, const StreamGeometry& geometry,
            Frame& frame, std::string& error)
 {
-    return parse(data, size, {}, geometry, frame, error);
+    return parse(data, size, {}, 0, geometry, frame, error);
 }
 
 bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segments,
            const StreamGeometry& geometry, Frame& frame, std::string& error)
+{
+    return parse(data, size, segments, 0, geometry, frame, error);
+}
+
+bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segments,
+           size_t criticalPackets, const StreamGeometry& geometry, Frame& frame, std::string& error)
 {
     frame = Frame();
 
@@ -378,7 +397,17 @@ bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segment
     // which a padding record also has); a packet count never sets bit 31.
     if (firstWord & 0x80000000u) {
         frame.framing = Framing::Records;
-        if (!walkRecordFrame(data, size, packets, geometry, maxBlocks, frame, error)) {
+
+        // With the count announced, the coarsest level is intact exactly when its
+        // packets are; parity has usually repaired them already.
+        const bool coarseLevelKnown = criticalPackets != 0 && !segments.empty();
+        if (coarseLevelKnown) {
+            const size_t count = std::min(criticalPackets, segments.size());
+            frame.coarseLevelIntact = std::none_of(segments.begin(), segments.begin() + count,
+                                                   [](const Segment& segment) { return segment.lost; });
+        }
+
+        if (!walkRecordFrame(data, size, packets, coarseLevelKnown, geometry, maxBlocks, frame, error)) {
             return false;
         }
     }

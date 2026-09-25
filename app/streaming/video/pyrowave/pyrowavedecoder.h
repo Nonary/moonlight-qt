@@ -37,10 +37,12 @@ public:
     // to wait for. On success, frame receives the surface reference and its
     // format/size/colour metadata. Returns false if the frame was dropped.
     // packets maps the frame's RTP packets and which of them were lost (empty
-    // for a frame that arrived whole); what survived is decoded when enough of
-    // the frame's low-frequency bands did.
+    // for a frame that arrived whole); what survived is decoded when the
+    // coarsest wavelet level did, which the host announces as the first
+    // criticalPackets packets (0 if it did not).
     bool decode(const uint8_t* data, size_t size,
-                const std::vector<PyroWaveFraming::Segment>& packets, AVFrame* frame);
+                const std::vector<PyroWaveFraming::Segment>& packets, size_t criticalPackets,
+                AVFrame* frame);
 
     // Why the last call failed, for logging.
     const std::string& lastError() const { return m_LastError; }

@@ -172,6 +172,8 @@ private:
     QQueue<AVFrame*> m_PyroWaveOutput;
     // The current frame's RTP packets, and which were lost
     std::vector<PyroWaveFraming::Segment> m_PyroWavePackets;
+    // Leading packets of the current frame that hold its coarsest wavelet level
+    size_t m_PyroWaveCriticalPackets = 0;
     uint32_t m_PyroWaveRejectedFrames = 0;
     uint32_t m_PyroWavePartialFrames = 0;
     uint64_t m_PyroWaveLastErrorLogUs = 0;

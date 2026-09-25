@@ -112,25 +112,33 @@ void putPadding(std::vector<uint8_t>& out, size_t bytes)
     out.resize(out.size() + (bytes - 8), 0);
 }
 
-// Record framing with the host's layout guarantees but strict packet order
-// otherwise: packets too large to share a payload with a padding record first
-// (a payload less 4 bytes could never be placed alone), then the rest padded so that
-// none crosses a payload boundary and no 4-byte remainder (too small for a
-// padding record) is left. Every payload after the oversized ones then starts
-// with a record, and the coarsest level (the first packets) precedes the rest.
-// The host packs more tightly; the parser must accept both.
+// Record framing with the host's layout guarantees but strict record order
+// otherwise: the sequence header, the coarsest level, then the rest. In each
+// group, records too large to share a payload with a padding record come first
+// (a payload less 4 bytes could never be placed alone), then the others padded
+// so that none crosses a payload boundary and no 4-byte remainder (too small for
+// a padding record) is left. criticalBytes receives the end of the coarsest
+// level, whose payloads the host protects with parity. The host packs more
+// tightly; the parser must accept both.
 std::vector<uint8_t> recordFrame(const std::vector<uint8_t>& bitstream,
                                  const std::vector<pyrowave_packet>& packets,
-                                 size_t shard)
+                                 size_t shard, uint32_t coarseBlocks, size_t& criticalBytes)
 {
     // Split the encoder's packets into the sequence header and block records
-    std::vector<pyrowave_packet> records;
+    struct Record {
+        size_t offset;
+        size_t size;
+        bool coarse;
+    };
+    std::vector<Record> records;
     for (const auto& packet : packets) {
         for (size_t pos = packet.offset; pos < packet.offset + packet.size;) {
-            uint32_t word0;
+            uint32_t word0, word1;
             std::memcpy(&word0, bitstream.data() + pos, 4);
-            const size_t size = (word0 & 0x80000000u) ? 8 : size_t((word0 >> 16) & 0xFFF) * 4;
-            records.push_back({pos, size});
+            std::memcpy(&word1, bitstream.data() + pos + 4, 4);
+            const bool header = (word0 & 0x80000000u) != 0;
+            const size_t size = header ? 8 : size_t((word0 >> 16) & 0xFFF) * 4;
+            records.push_back({pos, size, header || (word1 >> 8) < coarseBlocks});
             pos += size;
         }
     }
@@ -138,26 +146,32 @@ std::vector<uint8_t> recordFrame(const std::vector<uint8_t>& bitstream,
     std::vector<uint8_t> out;
     // Bytes left in the current payload; the first also carries the frame header
     auto remaining = [&]() { return shard - (out.size() + 8) % shard; };
-    auto place = [&](const pyrowave_packet& record) {
+    auto place = [&](const Record& record) {
         out.insert(out.end(), bitstream.begin() + record.offset,
                    bitstream.begin() + record.offset + record.size);
     };
 
     place(records.front());
-    for (size_t i = 1; i < records.size(); i++) {
-        if (records[i].size + 8 > shard) {
-            if (records[i].size % shard == remaining() - 4) {
-                putPadding(out, 8);
+    for (bool coarse : {true, false}) {
+        for (size_t i = 1; i < records.size(); i++) {
+            if (records[i].coarse == coarse && records[i].size + 8 > shard) {
+                if (records[i].size % shard == remaining() - 4) {
+                    putPadding(out, 8);
+                }
+                place(records[i]);
             }
-            place(records[i]);
         }
-    }
-    for (size_t i = 1; i < records.size(); i++) {
-        if (records[i].size + 8 <= shard) {
-            if (records[i].size > remaining() || remaining() - records[i].size == 4) {
-                putPadding(out, remaining());
+        for (size_t i = 1; i < records.size(); i++) {
+            if (records[i].coarse == coarse && records[i].size + 8 <= shard) {
+                if (records[i].size > remaining() || remaining() - records[i].size == 4) {
+                    putPadding(out, remaining());
+                }
+                place(records[i]);
             }
-            place(records[i]);
+        }
+        if (coarse) {
+            // Padding is only ever placed before a record, so this is the coarse end
+            criticalBytes = out.size();
         }
     }
     return out;
@@ -209,26 +223,38 @@ bool decodeFramed(pyrowave_decoder decoder, const std::vector<uint8_t>& framed,
 }
 
 // Loses one RTP payload of a record-framed frame the way moonlight-common-c
-// delivers it (zero-filled, marked lost) and decodes what the parser salvages.
-// Returns whether the decoder accepted the partial frame; its luma PSNR goes
-// to quality.
+// delivers it (zero-filled, marked lost), with the payloads that start with a
+// record flagged and the critical payloads announced as vibeshine does, and
+// decodes what the parser salvages. Returns whether the decoder accepted the
+// partial frame; its luma PSNR goes to quality.
 bool decodeWithLostPayload(pyrowave_decoder decoder, std::vector<uint8_t> framed, size_t shard,
-                           size_t lostPayload, const PyroWaveFraming::StreamGeometry& geometry,
+                           size_t lostPayload, size_t criticalPayloads,
+                           const PyroWaveFraming::StreamGeometry& geometry,
                            const Planes& source, Planes& output, double& quality, const std::string& name)
 {
+    std::vector<bool> recordStart(framed.size(), false);
+    for (size_t pos = 0; pos + 8 <= framed.size();) {
+        recordStart[pos] = true;
+        uint32_t word0, word1;
+        std::memcpy(&word0, framed.data() + pos, 4);
+        std::memcpy(&word1, framed.data() + pos + 4, 4);
+        pos += word0 == 0xFFFFFFFFu ? 8 + size_t(word1) * 4 :
+               (word0 & 0x80000000u) ? 8 : size_t((word0 >> 16) & 0xFFF) * 4;
+    }
+
     std::vector<PyroWaveFraming::Segment> segments;
     for (size_t offset = 0, index = 0; offset < framed.size(); index++) {
         const size_t size = std::min(framed.size() - offset, index == 0 ? shard - 8 : shard);
+        segments.push_back({offset, size, index == lostPayload, bool(recordStart[offset])});
         if (index == lostPayload) {
             std::fill(framed.begin() + offset, framed.begin() + offset + size, uint8_t(0));
         }
-        segments.push_back({offset, size, index == lostPayload});
         offset += size;
     }
 
     PyroWaveFraming::Frame frame;
     std::string error;
-    if (!PyroWaveFraming::parse(framed.data(), framed.size(), segments, geometry, frame, error)) {
+    if (!PyroWaveFraming::parse(framed.data(), framed.size(), segments, criticalPayloads, geometry, frame, error)) {
         expect(false, name + ": parse failed: " + error);
         return false;
     }
@@ -319,7 +345,9 @@ void runCase(pyrowave_device device, int width, int height, bool chroma444, size
         }
         packets.resize(written);
 
-        const auto records = recordFrame(bitstream, packets, shard);
+        size_t criticalBytes = 0;
+        const auto records = recordFrame(bitstream, packets, shard,
+                                         PyroWaveFraming::coarseBlockCount(geometry), criticalBytes);
         recordBytes += records.size();
         if (decodeFramed(decoder, records, geometry, PyroWaveFraming::Framing::Records, decoded, name + " records")) {
             const double quality = psnr(source.y, decoded.y);
@@ -329,29 +357,35 @@ void runCase(pyrowave_device device, int width, int height, bool chroma444, size
             PyroWaveFraming::parse(records.data(), records.size(), geometry, frame, error);
             paddingBytes += frame.paddingBytes;
 
-            // Lose one payload at a time across the frame: the lowest-frequency
-            // blocks come first and must survive, everything else only blurs
+            // Lose one payload at a time across the frame. The payloads holding the
+            // coarsest level carry parity (moonlight-common-c recovers them), so only
+            // the others can reach the parser with a hole; each only blurs its area.
             const size_t payloads = (records.size() + 8 + shard - 1) / shard;
+            const size_t criticalPayloads = (criticalBytes + 8 + shard - 1) / shard;
             int salvaged = 0, tried = 0;
             double worstQuality = 99;
-            for (size_t lost = 1; lost < payloads; lost += std::max<size_t>(1, payloads / 16)) {
+            for (size_t lost = criticalPayloads; lost < payloads;
+                 lost += std::max<size_t>(1, (payloads - criticalPayloads) / 24)) {
                 const std::string lossName = name + " lost payload " + std::to_string(lost) +
                                              " of " + std::to_string(payloads);
                 double lossyQuality = 0;
                 tried++;
-                if (decodeWithLostPayload(decoder, records, shard, lost, geometry, source, decoded,
-                                          lossyQuality, lossName)) {
+                if (decodeWithLostPayload(decoder, records, shard, lost, criticalPayloads, geometry, source,
+                                          decoded, lossyQuality, lossName)) {
                     salvaged++;
                     worstQuality = std::min(worstQuality, lossyQuality);
-                    expect(lossyQuality > 25.0 && lossyQuality <= quality + 0.01,
+                    // Losing the next-coarsest level right after the critical payloads
+                    // blurs a large area for the frame (about 22 dB at 4:4:4 here)
+                    expect(lossyQuality > 20.0 && lossyQuality <= quality + 0.01,
                            lossName + ": luma PSNR " + std::to_string(lossyQuality) +
                            " against " + std::to_string(quality) + " whole");
                 }
             }
-            std::printf("%s frame %d: %d of %d single-payload losses decoded, luma PSNR %.1f dB whole, "
-                        "%.1f dB worst salvaged\n",
-                        name.c_str(), frameIndex, salvaged, tried, quality, worstQuality);
-            expect(salvaged * 4 >= tried * 3, name + ": most single-payload losses decode");
+            std::printf("%s frame %d: %zu of %zu payloads critical (%.1f%% of the frame); %d of %d "
+                        "single-payload losses elsewhere decoded, luma PSNR %.1f dB whole, %.1f dB worst salvaged\n",
+                        name.c_str(), frameIndex, criticalPayloads, payloads,
+                        100.0 * double(criticalBytes) / double(records.size()), salvaged, tried, quality, worstQuality);
+            expect(salvaged == tried, name + ": every loss outside the critical payloads decodes");
         }
 
         // Re-packetize with the compatibility boundary for length-prefixed framing

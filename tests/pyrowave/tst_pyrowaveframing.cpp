@@ -89,6 +89,20 @@ bool parseWithLoss(std::vector<uint8_t> data, size_t shard, const std::vector<si
     return PyroWaveFraming::parse(data.data(), data.size(), segments, geometry, frame, error);
 }
 
+// As parseWithLoss, from a host that flags the payloads starting with a record
+// and announces how many leading payloads hold the coarsest level.
+bool parseWithFlags(std::vector<uint8_t> data, size_t shard, const std::vector<size_t>& lost,
+                    const std::vector<size_t>& recordStarts, size_t criticalPackets,
+                    const StreamGeometry& geometry, Frame& frame)
+{
+    auto segments = losePackets(data, shard, lost);
+    for (size_t index : recordStarts) {
+        segments[index].recordStart = true;
+    }
+    std::string error;
+    return PyroWaveFraming::parse(data.data(), data.size(), segments, criticalPackets, geometry, frame, error);
+}
+
 void testBlockCounts()
 {
     // Values from the bitstream's block-index formula (see the PyroWave
@@ -287,8 +301,10 @@ void testPartialFrames()
            frame.spans[1].size == 64,
            "a lost last payload drops only its records");
 
-    expect(parseWithLoss(aligned, k_Shard, {1}, geometry, frame) && frame.blockRecords == 4 &&
-           !frame.coarseLevelIntact,
+    // Right after the coarsest level, finer oversized records could follow, so the
+    // rest is given up; and the lost header could have been a coarse block.
+    expect(parseWithLoss(aligned, k_Shard, {1}, geometry, frame) && frame.blockRecords == 1 &&
+           !frame.coarseLevelIntact && frame.spans.size() == 1 && frame.spans[0].size == 56,
            "a loss before the first finer block may have taken coarsest-level blocks");
 
     expect(!parseWithLoss(aligned, k_Shard, {0}, geometry, frame), "a lost first payload drops the frame");
@@ -334,6 +350,50 @@ void testPartialFrames()
     expect(parseWithLoss(unaligned, k_Shard, {2}, geometry, frame) && frame.partial &&
            frame.blockRecords == 1 && frame.spans.size() == 1 && frame.spans[0].size == 120,
            "no resynchronization before the oversized records end");
+
+    // The finer level's oversized records follow the coarsest level. Once a finer
+    // header was read, a later loss cannot have taken coarsest-level blocks.
+    //   payload 0 [0, 56):      sequence header, A (48, coarse)
+    //   payload 1-2 [56, 176):  W (120, finer, oversized)
+    //   payload 2 [176, 184):   G (8)
+    //   payload 3 [184, 248):   H (56), padding (8)
+    //   payload 4 [248, 312):   I (56), padding (8)
+    std::vector<uint8_t> fineHead;
+    putSequenceHeader(fineHead, 1920, 1080, 5, false);
+    putBlock(fineHead, 0, 12);
+    putBlock(fineHead, 100, 30);
+    putBlock(fineHead, 101, 2);
+    putBlock(fineHead, 102, 14);
+    putPadding(fineHead, 0);
+    putBlock(fineHead, 103, 14);
+    putPadding(fineHead, 0);
+
+    expect(parseWithLoss(fineHead, k_Shard, {2}, geometry, frame) && frame.partial &&
+           frame.coarseLevelIntact && frame.blockRecords == 1,
+           "a finer oversized record that lost its body leaves the coarsest level intact");
+    expect(parseWithLoss(fineHead, k_Shard, {3}, geometry, frame) && frame.coarseLevelIntact &&
+           frame.blockRecords == 4 && frame.spans.size() == 2 && frame.spans[0].size == 184 &&
+           frame.spans[1].offset == 248,
+           "parsing resumes once a finer ordinary record was read");
+
+    // A host that flags the payloads starting with a record lets parsing resume
+    // anywhere: payloads 0, 1, 3 and 4 start with a record, payload 2 continues W.
+    expect(parseWithFlags(fineHead, k_Shard, {2}, {0, 1, 3, 4}, 1, geometry, frame) &&
+           frame.coarseLevelIntact && frame.blockRecords == 3 && frame.spans.size() == 3 &&
+           frame.spans[1].offset == 184,
+           "a flagged payload after a finer oversized record is a resume point");
+    // In the unaligned frame, payloads 0, 2 and 4 start with a record
+    expect(parseWithFlags(unaligned, k_Shard, {2}, {0, 2, 4}, 0, geometry, frame) &&
+           frame.blockRecords == 2 && frame.spans.size() == 2 && frame.spans[1].offset == 248,
+           "parsing skips unflagged payloads that continue an oversized record");
+
+    // The announced count settles whether the coarsest level arrived
+    expect(parseWithFlags(aligned, k_Shard, {1}, {0, 1, 2, 3}, 1, geometry, frame) &&
+           frame.coarseLevelIntact && frame.blockRecords == 4,
+           "a loss after the announced critical payloads leaves the coarsest level intact");
+    expect(parseWithFlags(aligned, k_Shard, {1}, {0, 1, 2, 3}, 2, geometry, frame) &&
+           !frame.coarseLevelIntact,
+           "a loss among the announced critical payloads is a lost coarsest level");
     // Length-prefixed packets cannot be delimited once one is lost
     std::vector<uint8_t> body;
     putSequenceHeader(body, 1920, 1080, 1, false);

@@ -223,7 +223,7 @@ void runCase(int width, int height, bool chroma444, bool tenBit)
         const auto framed = encodeFrame(encoder, source, budget);
 
         AVFrame* frame = av_frame_alloc();
-        if (!decoder.decode(framed.data(), framed.size(), {}, frame)) {
+        if (!decoder.decode(framed.data(), framed.size(), {}, 0, frame)) {
             expect(false, name + ": decode frame " + std::to_string(frameIndex) + ": " + decoder.lastError());
             av_frame_free(&frame);
             continue;
