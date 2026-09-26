@@ -151,6 +151,7 @@ public:
     Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
     Q_PROPERTY(int vrrLatencyMode MEMBER vrrLatencyMode NOTIFY vrrLatencyModeChanged)
     Q_PROPERTY(bool smoothVrrFrameTiming MEMBER smoothVrrFrameTiming NOTIFY smoothVrrFrameTimingChanged)
+    Q_PROPERTY(bool vrrRenderAhead MEMBER vrrRenderAhead NOTIFY vrrRenderAheadChanged)
     Q_PROPERTY(bool traceVrrFrames MEMBER traceVrrFrames NOTIFY traceVrrFramesChanged)
     Q_PROPERTY(bool exportingDiagnostics MEMBER m_ExportingDiagnostics NOTIFY diagnosticsChanged)
     Q_PROPERTY(QString diagnosticsStatus MEMBER m_DiagnosticsStatus NOTIFY diagnosticsChanged)
@@ -209,6 +210,9 @@ public:
     // adaptive-refresh floor, so the panel never engages its own
     // low-framerate compensation.
     bool smoothVrrFrameTiming;
+    // Linux Vulkan: render each VRR frame on a separate thread as it arrives,
+    // leaving only a copy to the swapchain at its presentation time.
+    bool vrrRenderAhead;
     bool traceVrrFrames;
     bool gameOptimizations;
     bool playAudioOnHost;
@@ -252,6 +256,7 @@ signals:
     void enableVrrChanged();
     void vrrLatencyModeChanged();
     void smoothVrrFrameTimingChanged();
+    void vrrRenderAheadChanged();
     void traceVrrFramesChanged();
     void diagnosticsChanged();
     void gameOptimizationsChanged();

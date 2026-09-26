@@ -282,7 +282,8 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             bool testOnly, IVideoDecoder*& chosenDecoder,
                             bool enableVrr, bool preferVrrRenderer, int vrrDisplayRefreshHz,
                             [[maybe_unused]] bool* effectiveVrr, bool smoothVrrFrameTiming,
-                            bool gamescopeMailbox, int vrrLatencyMode, bool gamescopeRepaint)
+                            bool gamescopeMailbox, int vrrLatencyMode, bool gamescopeRepaint,
+                            bool vrrRenderAhead)
 {
     DECODER_PARAMETERS params = {};
 
@@ -307,6 +308,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.gamescopeMailbox = gamescopeMailbox;
     params.gamescopeRepaint = gamescopeRepaint;
     params.smoothVrrFrameTiming = smoothVrrFrameTiming;
+    params.vrrRenderAhead = vrrRenderAhead;
     params.vrrDisplayRefreshHz = vrrDisplayRefreshHz;
     params.testOnly = testOnly;
     params.vds = vds;
@@ -675,6 +677,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
     m_PresentationSettings.gamescopeRepaint = false; // Retired repaint experiment.
     m_PresentationSettings.gamescopeMailbox = false; // Retired Mailbox experiment.
     m_PresentationSettings.smoothVrrFrameTiming = m_Preferences->smoothVrrFrameTiming;
+    m_PresentationSettings.vrrRenderAhead = m_Preferences->vrrRenderAhead;
 
     if (requestedVrr) {
         const bool hasAdaptiveHeadroom = hasStrictRefreshRate &&
@@ -2506,7 +2509,8 @@ void Session::exec()
                                m_PresentationSettings.smoothVrrFrameTiming,
                                m_PresentationSettings.gamescopeMailbox,
                                m_PresentationSettings.vrrLatencyMode,
-                               m_PresentationSettings.gamescopeRepaint)) {
+                               m_PresentationSettings.gamescopeRepaint,
+                               m_PresentationSettings.vrrRenderAhead)) {
                 SDL_UnlockMutex(m_DecoderLock);
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "Failed to recreate decoder after reset");

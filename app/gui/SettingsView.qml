@@ -1163,6 +1163,22 @@ Flickable {
                 }
 
                 CheckBox {
+                    hoverEnabled: true
+                    text: qsTr("Render frames ahead (experimental)")
+                    font.pointSize: 12
+                    visible: StreamingPreferences.enableVrr && Qt.platform.os === "linux"
+                    enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                    checked: StreamingPreferences.vrrRenderAhead
+                    onCheckedChanged: StreamingPreferences.vrrRenderAhead = checked
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Renders each frame on a separate thread as soon as it is decoded, so only a quick copy is left when it is shown. Can reduce late frames when GPU work varies, but adds a full-resolution copy per frame, which may lower throughput at 4K. Applies to the Vulkan renderer with VAAPI or PyroWave decoding.") + "\n\n" +
+                                  qsTr("Reconnect the stream after changing this setting.")
+                }
+
+                CheckBox {
                     id: enableHdr
                     width: parent.width
                     text: qsTr("Enable HDR")

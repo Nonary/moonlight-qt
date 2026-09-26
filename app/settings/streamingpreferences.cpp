@@ -32,6 +32,7 @@
 #define SER_VRRLATENCYFIX "vrrlatencyfix"
 #define SER_VRRLATENCYMODE "vrrlatencymode"
 #define SER_SMOOTHVRRFRAMETIMING "smoothvrrframetiming"
+#define SER_VRRRENDERAHEAD "vrrrenderahead"
 #define SER_TRACEVRRFRAMES "tracevrrframes"
 #define SER_GAMEOPTS "gameopts"
 #define SER_HOSTAUDIO "hostaudio"
@@ -161,6 +162,7 @@ void StreamingPreferences::reload()
         vrrLatencyMode = settings.value(SER_VRRLATENCYFIX).toBool() ? VLM_BALANCED_TARGET : VLM_SMOOTH;
     }
     smoothVrrFrameTiming = settings.value(SER_SMOOTHVRRFRAMETIMING, true).toBool();
+    vrrRenderAhead = settings.value(SER_VRRRENDERAHEAD, false).toBool();
     traceVrrFrames = settings.value(SER_TRACEVRRFRAMES, false).toBool();
     settings.remove("vrrdiagnosticmode"); // Retired, unpublished timing comparison selector.
     gameOptimizations = settings.value(SER_GAMEOPTS, true).toBool();
@@ -370,6 +372,7 @@ void StreamingPreferences::save()
     settings.remove("gamescoperepaint");
     settings.remove("gamescopeforcecomposition");
     settings.setValue(SER_SMOOTHVRRFRAMETIMING, smoothVrrFrameTiming);
+    settings.setValue(SER_VRRRENDERAHEAD, vrrRenderAhead);
     settings.setValue(SER_TRACEVRRFRAMES, traceVrrFrames);
     settings.remove("v2queue"); // The interval queue is now the production policy.
     settings.setValue(SER_GAMEOPTS, gameOptimizations);

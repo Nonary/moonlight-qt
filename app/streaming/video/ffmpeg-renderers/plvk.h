@@ -219,6 +219,7 @@ private:
     // the main thread only mark the atomic resize flag; the worker then safely
     // abandons a prepared image before resizing the swapchain.
     bool m_VrrRequested = false;
+    bool m_VrrRenderAhead = false;
     bool m_VrrSuspended = false;
     std::atomic<VrrFallbackReason> m_VrrFallbackReason { VrrFallbackReason::InitializationFailed };
     std::atomic<bool> m_VrrWindowChangePending { false };
