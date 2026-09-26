@@ -73,12 +73,16 @@ The Linux Settings page can run a quick PyroWave calibration at the selected
 FPS. A background worker tests 4K, 1440p, 1080p, Deck-native 800p, and 720p,
 each in all four 4:2:0/4:4:4 and SDR/HDR decode-output combinations, with up
 to 24 paced synthetic frames per option. Obvious overload stops after eight. It
-generates a host-style record frame at a 1.6 bits/pixel 4:2:0 SDR starting
-budget (matching the existing PyroWave default bitrate), then tries one lower
-bitrate for borderline formats that miss the decode or
-link budget. The codec author's roughly 1.5 bits/pixel visual reference for
-4:2:0 SDR is shown as a warning, with locally estimated multipliers for 4:4:4
-and HDR; it never vetoes a decoder-fit choice. The displayed bitrate is the
+generates a host-style record frame at the codec author's good-quality bitrate
+(the same curve as the PyroWave default bitrate, `pyrowavebitrate.h`), then tries
+one lower bitrate for borderline formats that miss the decode or link budget.
+That curve is the author's objective regression
+(`pyrowave/pyrowave/eval-results/objective-bitrate-evaluation.md`) at 35 dB
+PSNR-HVS-M-H and a viewing distance of twice the screen height, scaled linearly
+with frame rate, with his 1.2x HDR10 allowance. Bits per pixel fall as resolution
+rises (at 60 fps, 4:2:0 SDR needs about 2.45 bpp at 720p, 1.77 at 1080p, 1.31 at
+1440p and 0.58 at 4K) and 4:4:4 costs 8-21% more. A tested bitrate below the curve
+is shown as a warning; it never vetoes a decoder-fit choice. The displayed bitrate is the
 tested bitrate; the algorithm does not find a global optimum or measure visual
 quality. It
 decodes into shared surfaces on a headless libplacebo device and measures each

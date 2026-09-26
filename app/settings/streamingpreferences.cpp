@@ -1,4 +1,5 @@
 #include "streamingpreferences.h"
+#include "streaming/video/pyrowave/pyrowavebitrate.h"
 #include "utils.h"
 #include "streaming/vrrratepolicy.h"
 #include "diagnostics/diagnosticcapture.h"
@@ -543,18 +544,10 @@ int StreamingPreferences::getDefaultBitrate(int width, int height, int fps, bool
     return qRound(resolutionFactor * frameRateFactor) * 1000;
 }
 
-int StreamingPreferences::getDefaultPyroWaveBitrate(int width, int height, int fps, bool yuv444)
+int StreamingPreferences::getDefaultPyroWaveBitrate(int width, int height, int fps, bool yuv444, bool hdr)
 {
-    // PyroWave spends a fixed budget per pixel. 1.6 bits per pixel is the
-    // codec author's visually clean point for 4:2:0 (200 Mbps at 1080p60);
-    // 4:4:4 costs about 1.6x as much.
-    double bitsPerPixel = 1.6;
-    if (yuv444) {
-        bitsPerPixel *= 1.625;
-    }
-
     // Keep the default within what a gigabit link carries after FEC and
     // audio. Faster links can raise the slider.
-    const double kbps = double(width) * height * fps * bitsPerPixel / 1000.0;
-    return int(qBound(20000.0, kbps, 900000.0)) / 1000 * 1000;
+    const int kbps = pyroWaveRecommendedKbps(width, height, fps, yuv444, hdr);
+    return std::clamp(kbps, 20000, 900000) / 1000 * 1000;
 }

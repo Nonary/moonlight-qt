@@ -1903,7 +1903,8 @@ bool Session::startConnectionAsync()
         m_StreamConfig.bitrate == StreamingPreferences::getDefaultPyroWaveBitrate(m_StreamConfig.width,
                                                                                   m_StreamConfig.height,
                                                                                   m_StreamConfig.fps,
-                                                                                  m_Preferences->enableYUV444)) {
+                                                                                  m_Preferences->enableYUV444,
+                                                                                  m_Preferences->enableHdr)) {
         m_StreamConfig.bitrate = StreamingPreferences::getDefaultBitrate(m_StreamConfig.width,
                                                                          m_StreamConfig.height,
                                                                          m_StreamConfig.fps,

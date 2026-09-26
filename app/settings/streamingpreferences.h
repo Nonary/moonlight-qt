@@ -18,7 +18,7 @@ public:
     // PyroWave needs roughly an order of magnitude more bandwidth than the
     // other codecs; see docs/pyrowave-protocol.md.
     Q_INVOKABLE static int
-    getDefaultPyroWaveBitrate(int width, int height, int fps, bool yuv444);
+    getDefaultPyroWaveBitrate(int width, int height, int fps, bool yuv444, bool hdr);
 
     Q_INVOKABLE void save();
 

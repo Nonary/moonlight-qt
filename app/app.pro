@@ -254,6 +254,7 @@ HEADERS += \
     streaming/session.h \
     streaming/video/amddecodepolicy.h \
     streaming/video/pyrowave/pyrowavecalibrator.h \
+    streaming/video/pyrowave/pyrowavebitrate.h \
     streaming/gamescopecomposition.h \
     streaming/audio/renderers/renderer.h \
     streaming/audio/renderers/sdl.h \

@@ -681,7 +681,8 @@ Flickable {
                                 return StreamingPreferences.getDefaultPyroWaveBitrate(StreamingPreferences.width,
                                                                                       StreamingPreferences.height,
                                                                                       StreamingPreferences.fps,
-                                                                                      StreamingPreferences.enableYUV444)
+                                                                                      StreamingPreferences.enableYUV444,
+                                                                                      StreamingPreferences.enableHdr)
                             }
                             return StreamingPreferences.getDefaultBitrate(StreamingPreferences.width,
                                                                           StreamingPreferences.height,
@@ -896,7 +897,7 @@ Flickable {
                                 width: parent.width
                                 wrapMode: Text.Wrap
                                 font.pointSize: 9
-                                text: qsTr("Local GPU decode test · passes with a quarter of each frame left for rendering · 1 Gbps wired assumed · 900 Mbps cap. The 4:2:0 SDR visual guide is about 1.5 bits/pixel; 4:4:4/HDR scaling is estimated. Live FPS is not measured.")
+                                text: qsTr("Local GPU decode test · passes with a quarter of each frame left for rendering · 1 Gbps wired assumed · 900 Mbps cap. Bitrates follow the PyroWave author's good-quality curve (viewing distance twice the screen height), plus 20% for HDR. Live FPS is not measured.")
                             }
 
                             Row {
@@ -1220,7 +1221,14 @@ Flickable {
                     enabled: SystemProperties.supportsHdr
                     checked: enabled && StreamingPreferences.enableHdr
                     onCheckedChanged: {
-                        StreamingPreferences.enableHdr = checked
+                        if (StreamingPreferences.enableHdr != checked) {
+                            StreamingPreferences.enableHdr = checked
+                            // PyroWave's default bitrate depends on HDR
+                            if (slider.pyroWave && StreamingPreferences.autoAdjustBitrate) {
+                                StreamingPreferences.bitrateKbps = slider.defaultBitrate();
+                                slider.value = StreamingPreferences.bitrateKbps
+                            }
+                        }
                     }
 
                     // Updating StreamingPreferences.videoCodecConfig is handled above

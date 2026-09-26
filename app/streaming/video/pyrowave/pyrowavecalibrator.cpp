@@ -1,6 +1,7 @@
 #include "pyrowavecalibrator.h"
 
 #include "streaming/session.h"
+#include "streaming/video/pyrowave/pyrowavebitrate.h"
 
 #include <QMetaObject>
 
@@ -46,21 +47,10 @@ struct Sweep {
     QString error;
 };
 
-double targetBpp(bool chroma444, bool hdr)
-{
-    return 1.6 * (chroma444 ? 1.625 : 1.0) * (hdr ? 1.15 : 1.0);
-}
-
-double referenceBpp(bool chroma444, bool hdr)
-{
-    // The codec author's visual reference is about 1.5 bpp for 4:2:0 SDR.
-    // The chroma/HDR multipliers are local estimates, not measured thresholds.
-    return 1.5 * (chroma444 ? 1.625 : 1.0) * (hdr ? 1.15 : 1.0);
-}
-
+// The codec author's good-quality bitrate, rounded up to 5 Mbps steps
 int targetBitrateKbps(int width, int height, int fps, bool chroma444, bool hdr)
 {
-    return int(std::ceil(double(width) * height * fps * targetBpp(chroma444, hdr) / 1000.0 / 5000.0)) * 5000;
+    return int(std::ceil(pyroWaveRecommendedKbps(width, height, fps, chroma444, hdr) / 5000.0)) * 5000;
 }
 
 #if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
@@ -229,8 +219,7 @@ Sample runSample(pyrowave_device device, Renderer& renderer, int width, int heig
     sample.bitrateKbps = bitrateKbps;
     // This flag is only a UI warning. A short synthetic decode test cannot
     // decide whether a lower bitrate looks good for the user's game.
-    sample.qualityFit = double(bitrateKbps) * 1000.0 >=
-                        double(width) * height * fps * referenceBpp(chroma444, hdr);
+    sample.qualityFit = bitrateKbps >= pyroWaveRecommendedKbps(width, height, fps, chroma444, hdr);
 
     pyrowave_encoder_create_info info = {};
     info.device = device;

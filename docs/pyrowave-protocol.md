@@ -274,9 +274,11 @@ fps), so a static screen recovers from a lost frame. Repeats do not count as cap
 and the default is low enough that a game rendering below the stream rate is never
 padded out with repeats at its enlarged per-frame budget.
 
-Guidance: about 1.6 bits per pixel is visually clean for 4:2:0 SDR (Themaister's
-reference point, 200 Mbps at 1080p60). 4:4:4 costs about 1.6x, and 10-bit about
-1.15x.
+Guidance: the client's default bitrate follows Themaister's objective regression
+(`eval-results/objective-bitrate-evaluation.md` in the PyroWave repository) at 35 dB
+PSNR-HVS-M-H and a viewing distance of twice the screen height, plus his 1.2x for
+HDR10. At 60 fps that is about 220 Mbps for 1080p and 290 Mbps for 1440p and 4K in
+4:2:0 SDR; 4:4:4 costs 8-21% more, and bitrate scales linearly with frame rate.
 
 ## Compatibility
 
