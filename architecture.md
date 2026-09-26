@@ -5,29 +5,87 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-PyroWave decode path (2026-09-24, `pyrowave` branch): the `PyroWave` codec choice
-negotiates Themaister's intra-only wavelet codec (protocol in
-[docs/pyrowave-protocol.md](docs/pyrowave-protocol.md)). It reuses
-`FFmpegVideoDecoder`, the pacer, VRR worker, stats and `D3D11VARenderer`, but no
-FFmpeg decoder: `initializePyroWave()` creates the D3D11 renderer on one device
-(PyroWave requires monitored fences) and a `PyroWaveDecoder`, whose Vulkan device
-is created by the renderer adapter's LUID. `submitDecodeUnit()` parses the frame
-(`PyroWaveFraming`, record or length-prefixed framing), pushes it and submits the
-Vulkan decode into one of ten D3D11-owned surfaces (three R8/R16 planes each, UAV +
-SRV, NT-shared), then `receiveFrame()` hands the pacer an `AVFrame` tagged with a
-software planar format (for CSC normalization) whose `buf[0]` is a
-`PyroWaveFrameRef` (surface, decode fence value). Two shared D3D11 fences carry
-the synchronization: Vulkan signals the decode fence; `renderPyroWaveVideo()`
-queues `Wait()` on it, draws with `d3d11_yuv_planar_pixel` and signals the
-release fence (with a `Flush`), whose value the decoder's next use of that surface
-waits for on the GPU. `decoderOutputUs` is the submission time, as for D3D11VA;
-VRR `waitForDecode()` blocks on the decode fence value from the frame, so decode
-completion lands in the existing readiness observation. `captureDecodeBoundary()`
-stays 0 (single device). Frames are never partial yet: an incomplete or rejected
-frame is dropped without an IDR request, since the next frame is independent.
-Verified on the Radeon 890M by `tests/pyrowave` (framing rules, real-encoder
-round trip, and 40-frame D3D11 surface/fence cycles at 4:2:0/4:4:4, R8/R16);
-no live host session yet. VRR policy and replay are unchanged.
+PyroWave decode path (2026-09-25, source baseline `5f9ce4a4` plus Linux changes):
+the `PyroWave` codec choice negotiates Themaister's intra-only wavelet codec
+(protocol in [docs/pyrowave-protocol.md](docs/pyrowave-protocol.md)). It reuses
+`FFmpegVideoDecoder`, the pacer, VRR worker and stats, but no FFmpeg decoder.
+`submitDecodeUnit()` parses each record- or length-prefixed frame through
+`PyroWaveFraming`, pushes the wavelet packets and decodes on Vulkan. An eligible
+partial frame can render with missing detail as blur; a rejected frame is dropped
+without an IDR request because the next frame is independent.
+
+On Windows, `initializePyroWave()` creates `D3D11VARenderer` and a PyroWave
+Vulkan device matched by adapter LUID. Decode submits into one of ten D3D11-owned
+three-plane R8/R16 surfaces. The software-planar-format `AVFrame` holds a
+`PyroWaveFrameRef` with the surface and decode fence value; two shared D3D11
+fences carry decode completion and renderer release. `renderPyroWaveVideo()`
+queues `Wait()` on the decode fence, draws the planes and signals the release
+fence. `decoderOutputUs` is decode submission time, while VRR `waitForDecode()`
+observes completion. `captureDecodeBoundary()` stays 0 (single device).
+
+On Linux x86-64 with libplacebo, `initializePyroWave()` uses `PlVkRenderer`,
+which requests the decoder's Vulkan 1.2/1.3 features (subgroup size control,
+timeline semaphores) and owns a `PyroWavePlaceboPool`. The decoder creates its
+PyroWave device on the renderer's own `VkDevice` (`pyrowave_create_device`,
+graphics family only, queue submissions serialized through libplacebo's queue
+locks) and decodes into R8/R16 plane textures lent by the pool. For each frame
+the pool calls `pl_vulkan_hold_ex()` into `VK_IMAGE_LAYOUT_GENERAL`, signalling
+a timeline value the decode waits for; the decode signals the next value, and
+`pl_vulkan_release_ex()` makes libplacebo wait for it before sampling. The
+decoder thread only submits work. The `AVFrame` carries the pool reference in
+`buf[0]` with a `YUV420P`/`YUV444P` (8-bit) or `YUV420P16`/`YUV444P16` (10-bit)
+format for colour metadata; `mapAvFrameToPlacebo()` builds the `pl_frame` from
+the pool textures instead of `pl_map_avframe_ex()`. Freeing the frame returns
+the surface; the next hold orders the rewrite after libplacebo's pending reads.
+Up to eight surfaces exist; with none free the frame is dropped. If the device
+lacks the features or sharing fails, the decoder falls back to a private device
+and synchronous readback into 16-bit planar frames that libplacebo uploads.
+Linux `decoderOutputUs` is decode submission time on the shared path. The
+round-trip test decodes through both paths (shared planes read back with
+`pl_tex_download()`) and checks PSNR in 4:2:0/4:4:4 at 8/10 bits; it does not
+establish live-stream cadence or physical scanout. VRR policy and replay are
+unchanged.
+
+The "Average decoding time" statistic runs from the reassembled frame's
+enqueue in moonlight-common-c to decoder output, so it includes time waiting in
+the 15-frame decode-unit queue; the wait is shown separately. When that queue
+overflows it is flushed and an IDR is requested, which restarts cadence.
+
+The Linux Settings page can run a quick PyroWave calibration at the selected
+FPS. A background worker tests 4K, 1440p, 1080p, Deck-native 800p, and 720p,
+each in all four 4:2:0/4:4:4 and SDR/HDR decode-output combinations, with up
+to 24 paced synthetic frames per option. Obvious overload stops after eight. It
+generates a host-style record frame at a 1.6 bits/pixel 4:2:0 SDR starting
+budget (matching the existing PyroWave default bitrate), then tries one lower
+bitrate for borderline formats that miss the decode or
+link budget. The codec author's roughly 1.5 bits/pixel visual reference for
+4:2:0 SDR is shown as a warning, with locally estimated multipliers for 4:4:4
+and HDR; it never vetoes a decoder-fit choice. The displayed bitrate is the
+tested bitrate; the algorithm does not find a global optimum or measure visual
+quality. It
+decodes into shared surfaces on a headless libplacebo device and measures each
+frame until a one-pixel download confirms GPU completion, and requires p95
+service within 75% of the source period, leaving time for the renderer on the
+same GPU and for bursty arrival, without significant local queue growth.
+Recommendations cap the selected bitrate at
+900 Mbps on an assumed 1 Gbps wired link; synthetic encoded size and guessed
+FEC overhead do not veto a decoder result. This is a nominal link assumption,
+not a throughput test. The synthetic source is 8-bit even for
+the HDR-output path, so it cannot grade HDR fidelity or host encoding. Rendering,
+live network, host capture, and display remain unmeasured.
+The worker refuses to run during an active session. A dialog shows resolution
+rows with 4:4:4 and 4:2:0 columns, each containing HDR and SDR choices. A
+choice with a valid decoder result can apply its resolution, chroma, HDR, and
+bitrate together even when dimmed for slow decode, so the user can try it live.
+Unsupported display HDR stays unavailable. Other stream settings remain
+selected. The compact dialog keeps decode p95 on each button and exposes mean
+and peak local queue in a tooltip. Other platforms do not offer this
+calibration.
+
+`HAVE_PYROWAVE` adds a member to `FFmpegVideoDecoder`, so changing that qmake
+option requires `make -C build/app clean` before rebuilding the app. An
+incremental link with pre-option objects (such as `session.o`) can compile and
+pass `--help`, then corrupt the heap during the startup decoder probe.
 
 Balanced readiness floor (2026-09-24), based on `fae3eefe`: the interval-quality
 score averages absolute interval error over one second, which dilutes an

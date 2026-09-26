@@ -36,6 +36,11 @@ unix {
     QMAKE_CFLAGS += -fvisibility=hidden
     QMAKE_CXXFLAGS += -fvisibility=hidden -fvisibility-inlines-hidden
 }
+linux:contains(QT_ARCH, x86_64) {
+    # Granite's x86 math implementation requires SSE4.1. The target Deck CPU
+    # supports it; without this flag the vendored source hits "Implement me".
+    QMAKE_CXXFLAGS += -msse4.1
+}
 
 SOURCES += \
     $$PW_DIR/pyrowave_c.cpp \

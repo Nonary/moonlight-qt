@@ -11,9 +11,11 @@ extern "C" {
 #include <libavutil/frame.h>
 }
 
-// Decodes PyroWave frames on a private Vulkan device into shared surfaces owned
-// by the renderer (see IPyroWaveSurfacePool). Not thread safe: decode() must be
-// called from one thread. Frames it produces may be freed from any thread.
+// Decodes PyroWave frames on Vulkan. Windows shares GPU surfaces with the
+// renderer. Linux decodes on the renderer's own VkDevice into planes it lends
+// (IPyroWaveVulkanPool), or without one reads planar frames back to the CPU.
+// Not thread safe: decode() must be called from one thread. Frames it produces
+// may be freed from any thread.
 class PyroWaveDecoder
 {
 public:
@@ -22,6 +24,10 @@ public:
         int height = 0;
         bool chroma444 = false;
         bool tenBit = false;
+#ifndef _WIN32
+        // Optional; without it frames are read back into system memory
+        IPyroWaveVulkanPool* vulkanPool = nullptr;
+#endif
     };
 
     PyroWaveDecoder();
@@ -32,10 +38,10 @@ public:
 
     bool initialize(const Config& config, IPyroWaveSurfacePool* pool);
 
-    // Parses and decodes one frame into a free surface. The GPU work is only
-    // submitted: the frame's PyroWaveFrameRef carries the decode fence value
-    // to wait for. On success, frame receives the surface reference and its
-    // format/size/colour metadata. Returns false if the frame was dropped.
+    // Parses and decodes one frame. With shared surfaces the GPU work is only
+    // submitted and the renderer orders its reads after it; the readback path
+    // waits and returns a planar AVFrame in system memory. Returns false if
+    // the frame was dropped.
     // packets maps the frame's RTP packets and which of them were lost (empty
     // for a frame that arrived whole); what survived is decoded when the
     // coarsest wavelet level did, which the host announces as the first

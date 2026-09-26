@@ -104,8 +104,8 @@ SystemProperties::SystemProperties()
     hasDiscordIntegration = false;
 #endif
 
-    // PyroWave decoding currently presents through the D3D11 renderer only
-#if defined(HAVE_PYROWAVE) && defined(Q_OS_WIN32)
+    // PyroWave has a D3D11 path on Windows and a Vulkan path on Linux.
+#if defined(HAVE_PYROWAVE) && (defined(Q_OS_WIN32) || defined(Q_OS_LINUX))
     hasPyroWave = true;
 #else
     hasPyroWave = false;

@@ -988,6 +988,7 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     }
     dst.totalReassemblyTimeUs += src.totalReassemblyTimeUs;
     dst.totalDecodeTimeUs += src.totalDecodeTimeUs;
+    dst.totalDecodeQueueTimeUs += src.totalDecodeQueueTimeUs;
     dst.totalClientProcessingTimeUs += src.totalClientProcessingTimeUs;
     dst.totalQueuePacingTimeUs += src.totalQueuePacingTimeUs;
     dst.totalRenderingTimeUs += src.totalRenderingTimeUs;
@@ -1353,11 +1354,12 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                        "Frames dropped by your network connection: %.2f%%\n"
                        "Frames dropped by client pacing: %.2f%%\n"
                        "Average network latency: %s\n"
-                       "Average decoding time: %.2f ms\n",
+                       "Average decoding time: %.2f ms (waiting for the decoder %.2f ms)\n",
                        (float)stats.networkDroppedFrames / stats.totalFrames * 100,
                        (float)stats.pacerDroppedFrames / stats.decodedFrames * 100,
                        rttString,
-                       (double)(stats.totalDecodeTimeUs / 1000.0) / stats.decodedFrames);
+                       (double)(stats.totalDecodeTimeUs / 1000.0) / stats.decodedFrames,
+                       (double)(stats.totalDecodeQueueTimeUs / 1000.0) / stats.decodedFrames);
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);
             return;
@@ -2214,14 +2216,22 @@ bool FFmpegVideoDecoder::tryInitializeNonHwAccelDecoder(PDECODER_PARAMETERS para
 
 bool FFmpegVideoDecoder::initializePyroWave(PDECODER_PARAMETERS params)
 {
-#if defined(HAVE_PYROWAVE) && defined(Q_OS_WIN32)
+#ifdef HAVE_PYROWAVE
     // PyroWave is a GPU codec with no software fallback
     if (params->vds == StreamingPreferences::VDS_FORCE_SOFTWARE) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "PyroWave requires GPU decoding; ignoring the software decoding preference");
     }
 
+#ifdef Q_OS_WIN32
     m_BackendRenderer = new D3D11VARenderer(0);
+#elif defined(Q_OS_LINUX) && defined(HAVE_LIBPLACEBO_VULKAN)
+    m_BackendRenderer = new PlVkRenderer();
+#else
+    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                 "PyroWave has no video renderer on this platform");
+    return false;
+#endif
     if (!initializeRendererInternal(m_BackendRenderer, params)) {
         delete m_BackendRenderer;
         m_BackendRenderer = nullptr;
@@ -2229,16 +2239,21 @@ bool FFmpegVideoDecoder::initializePyroWave(PDECODER_PARAMETERS params)
     }
 
     IPyroWaveSurfacePool* pool = m_BackendRenderer->getPyroWaveSurfacePool();
+#ifdef Q_OS_WIN32
     if (pool == nullptr) {
         reset();
         return false;
     }
+#endif
 
     PyroWaveDecoder::Config config;
     config.width = params->width;
     config.height = params->height;
     config.chroma444 = (params->videoFormat & VIDEO_FORMAT_MASK_YUV444) != 0;
     config.tenBit = (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) != 0;
+#ifndef Q_OS_WIN32
+    config.vulkanPool = m_BackendRenderer->getPyroWaveVulkanPool();
+#endif
 
     m_PyroWave = std::make_unique<PyroWaveDecoder>();
     if (!m_PyroWave->initialize(config, pool)) {
@@ -2715,6 +2730,11 @@ void FFmpegVideoDecoder::decoderThreadProc()
 
                         m_ActiveWndVideoStats.totalDecodeTimeUs +=
                             (LiGetMicroseconds() - du.enqueueTimeUs);
+                        if (!m_FrameSubmitTimeQueue.isEmpty() &&
+                                m_FrameSubmitTimeQueue.head() > du.enqueueTimeUs) {
+                            m_ActiveWndVideoStats.totalDecodeQueueTimeUs +=
+                                m_FrameSubmitTimeQueue.head() - du.enqueueTimeUs;
+                        }
 
                         // Store the presentation time (90 kHz timebase) for
                         // existing renderers. VRR uses PacedFrame instead.

@@ -23,6 +23,10 @@
 #include "vulkantiming.h"
 #endif
 
+#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+#include "streaming/video/pyrowave/pyrowaveplacebo.h"
+#endif
+
 #ifdef HAS_WAYLAND
 #include "waylandfeedback/wayland.h"
 #ifdef Q_OS_LINUX
@@ -93,6 +97,9 @@ public:
     virtual int getDecoderCapabilities() override;
     virtual bool isPixelFormatSupported(int videoFormat, enum AVPixelFormat pixelFormat) override;
     virtual AVPixelFormat getPreferredPixelFormat(int videoFormat) override;
+#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+    IPyroWaveVulkanPool* getPyroWaveVulkanPool() override { return m_PyroWavePool.get(); }
+#endif
 
 private:
     static void lockQueue(AVHWDeviceContext *dev_ctx, uint32_t queue_family, uint32_t index);
@@ -112,6 +119,7 @@ private:
     bool acquirePendingSwapchainFrame(const char* earlyRenderFailureMessage);
     bool acquireVrrSwapchainFrame();
     bool submitPendingSwapchainFrame();
+    bool submitSwapchainFrame();
     void finishVrrRenderTiming();
     bool cancelVrrFrame();
     bool waitForVrrGpuReady(VrrPresentFeedback& feedback);
@@ -169,6 +177,9 @@ private:
     pl_renderer m_Renderer = nullptr;
     pl_tex m_Textures[PL_MAX_PLANES] = {};
     pl_color_space m_LastColorspace = {};
+#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+    std::unique_ptr<PyroWavePlaceboPool> m_PyroWavePool;
+#endif
 
 #ifdef Q_OS_LINUX
     struct PreparedImage;

@@ -55,6 +55,7 @@
 #include "backend/systemproperties.h"
 #include "streaming/session.h"
 #include "settings/streamingpreferences.h"
+#include "streaming/video/pyrowave/pyrowavecalibrator.h"
 #include "gui/sdlgamepadkeynavigation.h"
 #include "windowsvblankvirtualization.h"
 
@@ -1010,6 +1011,11 @@ int main(int argc, char *argv[])
                                                    [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
                                                        return StreamingPreferences::get(qmlEngine);
                                                    });
+    qmlRegisterSingletonType<PyroWaveCalibrator>("PyroWaveCalibrator", 1, 0,
+                                                  "PyroWaveCalibrator",
+                                                  [](QQmlEngine*, QJSEngine*) -> QObject* {
+                                                      return new PyroWaveCalibrator();
+                                                  });
 
     // Create the identity manager on the main thread
     IdentityManager::get();

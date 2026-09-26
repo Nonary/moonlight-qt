@@ -13,3 +13,7 @@ win32:contains(QT_ARCH, x86_64) {
     d3d11.file = $$PWD/d3d11.pro
     SUBDIRS += d3d11
 }
+linux:contains(QT_ARCH, x86_64) {
+    roundtrip.file = $$PWD/roundtrip.pro
+    SUBDIRS += roundtrip
+}

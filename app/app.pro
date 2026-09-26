@@ -216,6 +216,7 @@ SOURCES += \
     gui/sdlgamepadkeynavigation.cpp \
     streaming/video/overlaymanager.cpp \
     streaming/vrrratepolicy.cpp \
+    streaming/video/pyrowave/pyrowavecalibrator.cpp \
     backend/systemproperties.cpp \
     wm.cpp
 
@@ -251,6 +252,7 @@ HEADERS += \
     streaming/input/input.h \
     streaming/session.h \
     streaming/video/amddecodepolicy.h \
+    streaming/video/pyrowave/pyrowavecalibrator.h \
     streaming/gamescopecomposition.h \
     streaming/audio/renderers/renderer.h \
     streaming/audio/renderers/sdl.h \
@@ -520,9 +522,13 @@ wayland {
     DEFINES += HAVE_H264BITSTREAM
 }
 
-# PyroWave decoding (Vulkan compute) presents through the D3D11 renderer, so it
-# is Windows-only for now. Granite has no MSVC ARM64 SIMD path.
+# PyroWave decoding runs on Vulkan. Windows shares D3D11 surfaces; Linux
+# presents the decoded planes through the libplacebo Vulkan renderer.
 win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
+    message(PyroWave decoder enabled)
+    CONFIG += pyrowave
+}
+linux:contains(QT_ARCH, x86_64):!disable-pyrowave:contains(CONFIG, libplacebo) {
     message(PyroWave decoder enabled)
     CONFIG += pyrowave
 }
@@ -536,6 +542,10 @@ pyrowave {
         streaming/video/pyrowave/pyrowavedecoder.h \
         streaming/video/pyrowave/pyrowaveframing.h \
         streaming/video/pyrowave/pyrowavesurfaces.h
+    linux {
+        SOURCES += streaming/video/pyrowave/pyrowaveplacebo.cpp
+        HEADERS += streaming/video/pyrowave/pyrowaveplacebo.h
+    }
 
     # Only pyrowave.h is included from the vendored tree
     INCLUDEPATH += $$PWD/../pyrowave/pyrowave

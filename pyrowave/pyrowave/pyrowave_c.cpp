@@ -1702,9 +1702,16 @@ pyrowave_decoder_decode_cpu_buffer_synchronous(pyrowave_decoder decoder, const p
 	if (buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_NV12)
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
-	if (decoder->chroma == ChromaSubsampling::Chroma420 && buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_YUV444P)
+	const bool chroma444 = buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_YUV444P ||
+	                      buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_YUV444P16;
+	const bool sixteen_bit = buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_YUV420P16 ||
+	                         buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_YUV444P16;
+	if (decoder->chroma == ChromaSubsampling::Chroma420 && chroma444)
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
-	if (decoder->chroma == ChromaSubsampling::Chroma444 && buffers->format != PYROWAVE_CPU_BUFFER_FORMAT_YUV444P)
+	if (decoder->chroma == ChromaSubsampling::Chroma444 && !chroma444)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	if (buffers->format != PYROWAVE_CPU_BUFFER_FORMAT_YUV420P &&
+	    buffers->format != PYROWAVE_CPU_BUFFER_FORMAT_YUV444P && !sixteen_bit)
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
 	for (int plane = 0; plane < 3; plane++)
@@ -1718,9 +1725,11 @@ pyrowave_decoder_decode_cpu_buffer_synchronous(pyrowave_decoder decoder, const p
 			plane_height /= 2;
 		}
 
-		const size_t plane_bpp = 1;
+		const size_t plane_bpp = sixteen_bit ? 2 : 1;
 
 		if (buffers->row_stride_in_bytes[plane] < plane_width * plane_bpp)
+			return PYROWAVE_ERROR_INVALID_ARGUMENT;
+		if (buffers->row_stride_in_bytes[plane] % plane_bpp != 0)
 			return PYROWAVE_ERROR_INVALID_ARGUMENT;
 		if (buffers->row_stride_in_bytes[plane] * plane_height > buffers->plane_size_in_bytes[plane])
 			return PYROWAVE_ERROR_INVALID_ARGUMENT;
@@ -1732,7 +1741,8 @@ pyrowave_decoder_decode_cpu_buffer_synchronous(pyrowave_decoder decoder, const p
 
 		if (!img)
 		{
-			auto info = ImageCreateInfo::immutable_2d_image(buffers->width, buffers->height, VK_FORMAT_R8_UNORM);
+			auto info = ImageCreateInfo::immutable_2d_image(buffers->width, buffers->height,
+			                                                  sixteen_bit ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM);
 			info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 			if (decoder->fragment_path)
 			{
@@ -1822,7 +1832,7 @@ pyrowave_decoder_decode_cpu_buffer_synchronous(pyrowave_decoder decoder, const p
 
 		cmd->copy_image_to_buffer(*readback_buffers[plane], *decoder->planes[plane], 0, {},
 		                          {decoder->planes[plane]->get_width(), decoder->planes[plane]->get_height(), 1},
-		                          buffers->row_stride_in_bytes[plane], 0,
+		                          buffers->row_stride_in_bytes[plane] / (sixteen_bit ? 2 : 1), 0,
 		                          {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
 	}
 

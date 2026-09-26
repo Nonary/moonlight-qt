@@ -78,3 +78,58 @@ struct PyroWaveFrameRef {
         }
     }
 };
+
+#ifdef __linux__
+#include <vulkan/vulkan.h>
+
+// Linux contract: the renderer shares its own VkDevice with the decoder and
+// lends it plane images it owns. Timeline semaphores order the renderer's
+// transition into VK_IMAGE_LAYOUT_GENERAL, the decode, and the renderer's
+// later reads, so neither side waits on the CPU.
+struct PyroWaveVulkanDevice {
+    PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    // The create infos describe what is enabled on the shared handles and
+    // stay valid for the lifetime of the pool.
+    const VkInstanceCreateInfo* instanceInfo = nullptr;
+    const VkDeviceCreateInfo* deviceInfo = nullptr;
+    // Serializes the decoder's queue submissions with the renderer's.
+    void (*lockQueues)(void* userdata) = nullptr;
+    void (*unlockQueues)(void* userdata) = nullptr;
+    void* userdata = nullptr;
+};
+
+struct PyroWaveVulkanSurface {
+    int index = -1;
+    VkImage images[3] = {};
+    uint32_t widths[3] = {};
+    uint32_t heights[3] = {};
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    // Write the planes once ready reaches readyValue; signal doneValue on done
+    // when they are decoded. Each semaphore has a single signaller.
+    VkSemaphore ready = VK_NULL_HANDLE;
+    uint64_t readyValue = 0;
+    VkSemaphore done = VK_NULL_HANDLE;
+    uint64_t doneValue = 0;
+};
+
+class IPyroWaveVulkanPool {
+public:
+    virtual ~IPyroWaveVulkanPool() = default;
+
+    virtual bool pyroWaveVulkanDevice(PyroWaveVulkanDevice& device) = 0;
+
+    // Lends the planes of a free surface. Returns false if every surface is
+    // still referenced by a frame.
+    virtual bool holdPyroWaveSurface(int width, int height, bool chroma444, bool sixteenBit,
+                                     PyroWaveVulkanSurface& surface) = 0;
+
+    // Returns the planes to the renderer. When decoded is true, frame receives
+    // format, size and a reference that keeps the surface in use until freed;
+    // otherwise the surface goes straight back to the pool.
+    virtual bool releasePyroWaveSurface(const PyroWaveVulkanSurface& surface, bool decoded,
+                                        AVFrame* frame) = 0;
+};
+#endif

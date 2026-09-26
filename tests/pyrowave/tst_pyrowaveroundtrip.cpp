@@ -8,6 +8,13 @@
 #include <vulkan/vulkan.h>
 #include <pyrowave.h>
 
+#ifdef __linux__
+#include "../../app/streaming/video/pyrowave/pyrowavedecoder.h"
+#include "../../app/streaming/video/pyrowave/pyrowaveplacebo.h"
+#include <chrono>
+#include <memory>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -19,6 +26,10 @@
 namespace {
 
 int g_Failures = 0;
+#ifdef __linux__
+struct SharedRenderer;
+SharedRenderer* g_Shared = nullptr;
+#endif
 
 void expect(bool condition, const std::string& description)
 {
@@ -97,6 +108,159 @@ double psnr(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b)
     const double mse = sum / double(a.size());
     return mse == 0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
 }
+
+#ifdef __linux__
+// A headless libplacebo device standing in for the Vulkan renderer
+struct SharedRenderer {
+    pl_log log = nullptr;
+    pl_vk_inst instance = nullptr;
+    pl_vulkan vulkan = nullptr;
+    std::unique_ptr<PyroWavePlaceboPool> pool;
+
+    bool create()
+    {
+        log = pl_log_create(PL_API_VER, nullptr);
+        pl_vk_inst_params instanceParams = pl_vk_inst_default_params;
+        instance = pl_vk_inst_create(log, &instanceParams);
+        if (!instance) return false;
+        pl_vulkan_params params = pl_vulkan_default_params;
+        params.instance = instance->instance;
+        params.get_proc_addr = instance->get_proc_addr;
+        params.features = PyroWavePlaceboPool::requestedFeatures();
+        vulkan = pl_vulkan_create(log, &params);
+        if (!vulkan || !PyroWavePlaceboPool::supported(vulkan)) return false;
+        pool = std::make_unique<PyroWavePlaceboPool>(instance, vulkan);
+        return true;
+    }
+
+    ~SharedRenderer()
+    {
+        pool.reset();
+        pl_vulkan_destroy(&vulkan);
+        pl_vk_inst_destroy(&instance);
+        pl_log_destroy(&log);
+    }
+};
+
+// Reads a decoded plane as 8-bit samples, from system memory or from the
+// shared texture.
+std::vector<uint8_t> planeSamples(const AVFrame* frame, SharedRenderer* shared, int plane,
+                                  int width, int height, bool sixteenBit)
+{
+    const size_t bytesPerSample = sixteenBit ? 2 : 1;
+    std::vector<uint8_t> raw;
+    size_t pitch = 0;
+    const uint8_t* base = nullptr;
+    if (shared) {
+        pl_frame mapped = {};
+        if (!shared->pool->mapFrame(frame, &mapped)) return {};
+        pitch = size_t(width) * bytesPerSample;
+        raw.resize(pitch * height);
+        pl_tex_transfer_params transfer = {};
+        transfer.tex = mapped.planes[plane].texture;
+        transfer.row_pitch = pitch;
+        transfer.ptr = raw.data();
+        if (!pl_tex_download(shared->vulkan->gpu, &transfer)) return {};
+        base = raw.data();
+    }
+    else {
+        pitch = size_t(frame->linesize[plane]);
+        base = frame->data[plane];
+    }
+    std::vector<uint8_t> samples(size_t(width) * height);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const uint8_t* sample = base + y * pitch + x * bytesPerSample;
+            uint16_t value16 = 0;
+            if (sixteenBit) std::memcpy(&value16, sample, 2);
+            samples[size_t(y) * width + x] = sixteenBit ? uint8_t(value16 >> 8) : *sample;
+        }
+    }
+    return samples;
+}
+
+void checkLinuxClientDecode(const std::vector<uint8_t>& records, const Planes& source,
+                            const std::string& name, bool tenBit, SharedRenderer* shared)
+{
+    const std::string label = name + (shared ? " shared" : " readback") + (tenBit ? " 10-bit" : " 8-bit");
+    PyroWaveDecoder client;
+    PyroWaveDecoder::Config config;
+    config.width = source.width;
+    config.height = source.height;
+    config.chroma444 = source.chroma444;
+    config.tenBit = tenBit;
+    config.vulkanPool = shared ? shared->pool.get() : nullptr;
+    if (!client.initialize(config, nullptr)) {
+        expect(false, label + ": Linux client initialization");
+        return;
+    }
+
+    // Warm up, then time decode calls; with shared surfaces also time until
+    // the GPU finished, which a one-pixel download waits for.
+    constexpr int k_Timed = 20;
+    double submitMs = 0, completeMs = 0;
+    AVFrame* frame = nullptr;
+    for (int i = 0; i < 3 + k_Timed; ++i) {
+        av_frame_free(&frame);
+        frame = av_frame_alloc();
+        const auto start = std::chrono::steady_clock::now();
+        const bool decoded = client.decode(records.data(), records.size(), {}, 0, frame);
+        const auto submitted = std::chrono::steady_clock::now();
+        if (!decoded) {
+            expect(false, label + ": Linux client decode: " + client.lastError());
+            av_frame_free(&frame);
+            return;
+        }
+        if (shared) {
+            pl_frame mapped = {};
+            uint16_t pixel = 0;
+            shared->pool->mapFrame(frame, &mapped);
+            pl_tex_transfer_params transfer = {};
+            transfer.tex = mapped.planes[2].texture;
+            transfer.rc = { 0, 0, 0, 1, 1, 1 };
+            transfer.ptr = &pixel;
+            pl_tex_download(shared->vulkan->gpu, &transfer);
+        }
+        const auto complete = std::chrono::steady_clock::now();
+        if (i >= 3) {
+            submitMs += std::chrono::duration<double, std::milli>(submitted - start).count();
+            completeMs += std::chrono::duration<double, std::milli>(complete - start).count();
+        }
+    }
+
+    const int expected = tenBit ?
+        (source.chroma444 ? AV_PIX_FMT_YUV444P16 : AV_PIX_FMT_YUV420P16) :
+        (source.chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P);
+    expect(frame->format == expected, label + ": pixel format");
+    expect(frame->width == source.width && frame->height == source.height, label + ": frame size");
+    if (shared) {
+        expect(shared->pool->ownsFrame(frame), label + ": frame references a shared surface");
+    }
+    else {
+        expect(frame->data[0] && frame->data[1] && frame->data[2], label + ": planar output");
+    }
+
+    const std::vector<uint8_t>* sourcePlanes[] = { &source.y, &source.cb, &source.cr };
+    const char* planeNames[] = { "luma", "Cb", "Cr" };
+    double quality[3] = {};
+    for (int plane = 0; plane < 3; ++plane) {
+        const int width = plane == 0 ? source.width : source.chromaWidth();
+        const int height = plane == 0 ? source.height : source.chromaHeight();
+        const auto samples = planeSamples(frame, shared, plane, width, height, tenBit);
+        if (samples.empty()) {
+            expect(false, label + ": read " + planeNames[plane]);
+            continue;
+        }
+        quality[plane] = psnr(*sourcePlanes[plane], samples);
+        expect(quality[plane] > (plane == 0 ? 30.0 : 25.0),
+               label + ": " + planeNames[plane] + " PSNR " + std::to_string(quality[plane]));
+    }
+    std::printf("%s: decode call %.2f ms, GPU done %.2f ms, Y/Cb/Cr PSNR %.1f/%.1f/%.1f dB\n",
+                label.c_str(), submitMs / k_Timed, completeMs / k_Timed,
+                quality[0], quality[1], quality[2]);
+    av_frame_free(&frame);
+}
+#endif
 
 void putU32(std::vector<uint8_t>& out, uint32_t value)
 {
@@ -348,6 +512,16 @@ void runCase(pyrowave_device device, int width, int height, bool chroma444, size
         size_t criticalBytes = 0;
         const auto records = recordFrame(bitstream, packets, shard,
                                          PyroWaveFraming::coarseBlockCount(geometry), criticalBytes);
+#ifdef __linux__
+        if (frameIndex == 0) {
+            for (bool tenBit : { false, true }) {
+                checkLinuxClientDecode(records, source, name, tenBit, nullptr);
+                if (g_Shared) {
+                    checkLinuxClientDecode(records, source, name, tenBit, g_Shared);
+                }
+            }
+        }
+#endif
         recordBytes += records.size();
         if (decodeFramed(decoder, records, geometry, PyroWaveFraming::Framing::Records, decoded, name + " records")) {
             const double quality = psnr(source.y, decoded.y);
@@ -417,6 +591,16 @@ int main()
         std::printf("No Vulkan device for PyroWave; skipping the round trip\n");
         return 0;
     }
+
+#ifdef __linux__
+    SharedRenderer shared;
+    if (shared.create()) {
+        g_Shared = &shared;
+    }
+    else {
+        expect(false, "libplacebo device for shared PyroWave surfaces");
+    }
+#endif
 
     // Budgets around 1.6 bits per pixel
     runCase(device, 1280, 720, false, 180 * 1024);
