@@ -23,7 +23,12 @@ public:
     // Whether vulkan was created with the features the decoder needs.
     static bool supported(pl_vulkan vulkan);
 
-    PyroWavePlaceboPool(pl_vk_inst instance, pl_vulkan vulkan);
+    // pl_swapchain_submit_frame() takes libplacebo's pending graphics command
+    // outside the lock that guards command recording, so a command begun on
+    // another thread at that moment corrupts the queue's sync value. The pool
+    // records its holds under commandLock, which the owner must also hold
+    // around every swapchain submit.
+    PyroWavePlaceboPool(pl_vk_inst instance, pl_vulkan vulkan, std::mutex& commandLock);
     ~PyroWavePlaceboPool() override;
 
     bool pyroWaveVulkanDevice(PyroWaveVulkanDevice& device) override;
@@ -33,12 +38,6 @@ public:
                                 AVFrame* frame) override;
 
     bool ownsFrame(const AVFrame* frame) const;
-
-    // pl_swapchain_submit_frame() takes libplacebo's pending graphics command
-    // outside the lock that guards command recording, so a hold recorded on
-    // another thread at that moment corrupts the queue's sync value. Callers
-    // must hold this around every swapchain submit.
-    std::mutex& swapchainSubmitLock() { return m_SwapchainSubmitLock; }
 
     // Fills out with the frame's planes if the frame came from this pool.
     bool mapFrame(const AVFrame* frame, pl_frame* out) const;
@@ -79,5 +78,5 @@ private:
     uint64_t m_DoneValue = 0;
     std::vector<Surface> m_Surfaces;
     std::shared_ptr<FreeList> m_FreeList = std::make_shared<FreeList>();
-    std::mutex m_SwapchainSubmitLock;
+    std::mutex& m_CommandLock;
 };

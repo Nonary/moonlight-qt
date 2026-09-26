@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <deque>
+#include <mutex>
 #include <QMutex>
 #include <QWaitCondition>
 
@@ -177,6 +178,12 @@ private:
     pl_renderer m_Renderer = nullptr;
     pl_tex m_Textures[PL_MAX_PLANES] = {};
     pl_color_space m_LastColorspace = {};
+    // pl_swapchain_submit_frame() takes libplacebo's pending graphics command
+    // outside the lock that guards command recording. Work recorded on other
+    // threads (overlay uploads, offscreen preparation, PyroWave surface holds)
+    // must not begin a command inside that window, so it and every swapchain
+    // submit hold this lock. Texture creation records nothing and stays out.
+    std::mutex m_CommandLock;
 #if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
     std::unique_ptr<PyroWavePlaceboPool> m_PyroWavePool;
 #endif

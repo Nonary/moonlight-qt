@@ -67,8 +67,8 @@ bool PyroWavePlaceboPool::supported(pl_vulkan vulkan)
            pl_find_named_fmt(vulkan->gpu, "r8") && pl_find_named_fmt(vulkan->gpu, "r16");
 }
 
-PyroWavePlaceboPool::PyroWavePlaceboPool(pl_vk_inst instance, pl_vulkan vulkan)
-    : m_Instance(instance), m_Vulkan(vulkan)
+PyroWavePlaceboPool::PyroWavePlaceboPool(pl_vk_inst instance, pl_vulkan vulkan, std::mutex& commandLock)
+    : m_Instance(instance), m_Vulkan(vulkan), m_CommandLock(commandLock)
 {
     m_AppInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     m_AppInfo.apiVersion = instance->api_version;
@@ -228,8 +228,10 @@ bool PyroWavePlaceboPool::holdPyroWaveSurface(int width, int height, bool chroma
     }
 
     // The holds are submitted in order on libplacebo's queue, so the last
-    // value also covers the transitions of the earlier planes.
-    std::lock_guard<std::mutex> submitLock(m_SwapchainSubmitLock);
+    // value also covers the transitions of the earlier planes. Texture
+    // creation above records no commands and can be slow, so it stays
+    // outside the command lock.
+    std::lock_guard<std::mutex> commandLock(m_CommandLock);
     int held = 0;
     for (; held < 3; held++) {
         pl_vulkan_hold_params hold = {};

@@ -571,7 +571,7 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
 #if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
     if (pyroWave) {
         if (PyroWavePlaceboPool::supported(m_Vulkan)) {
-            m_PyroWavePool = std::make_unique<PyroWavePlaceboPool>(m_PlVkInstance, m_Vulkan);
+            m_PyroWavePool = std::make_unique<PyroWavePlaceboPool>(m_PlVkInstance, m_Vulkan, m_CommandLock);
         }
         else {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -1313,12 +1313,7 @@ void PlVkRenderer::finishVrrRenderTiming()
 
 bool PlVkRenderer::submitSwapchainFrame()
 {
-#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
-    if (m_PyroWavePool) {
-        std::lock_guard<std::mutex> lock(m_PyroWavePool->swapchainSubmitLock());
-        return pl_swapchain_submit_frame(m_Swapchain);
-    }
-#endif
+    std::lock_guard<std::mutex> lock(m_CommandLock);
     return pl_swapchain_submit_frame(m_Swapchain);
 }
 
@@ -1878,15 +1873,19 @@ void PlVkRenderer::prepareImage(const std::shared_ptr<PreparedImage>& image)
     }
     image->target.fbo = image->texture;
     pl_frame source = {}, target = {};
-    if (!mapAvFrameToPlacebo(image->source, &source, m_PreparationTextures)) {
-        image->complete(false);
-        return;
+    bool rendered;
+    {
+        std::lock_guard<std::mutex> commandLock(m_CommandLock);
+        if (!mapAvFrameToPlacebo(image->source, &source, m_PreparationTextures)) {
+            image->complete(false);
+            return;
+        }
+        image->sourceColor = source.color;
+        pl_frame_from_swapchain(&target, &image->target);
+        rendered = renderMappedImage(m_PreparationRenderer, source, target,
+                                     pl_render_fast_params);
+        pl_gpu_flush(m_Vulkan->gpu);
     }
-    image->sourceColor = source.color;
-    pl_frame_from_swapchain(&target, &image->target);
-    const bool rendered = renderMappedImage(m_PreparationRenderer, source, target,
-                                             pl_render_fast_params);
-    pl_gpu_flush(m_Vulkan->gpu);
     image->timing.renderEndUs = LiGetMicroseconds();
     bool pending = true;
     while ((pending = pl_tex_poll(m_Vulkan->gpu, image->texture, 1000000))) {
@@ -2717,6 +2716,7 @@ bool PlVkRenderer::createOverlay(pl_overlay* overlay, SDL_Surface* surface)
     xferParams.ptr = surface->pixels;
     xferParams.callback = overlayUploadComplete;
     xferParams.priv = surface;
+    std::lock_guard<std::mutex> commandLock(m_CommandLock);
     if (!pl_tex_upload(m_Vulkan->gpu, &xferParams)) {
         pl_tex_destroy(m_Vulkan->gpu, &overlay->tex);
         SDL_zerop(overlay);

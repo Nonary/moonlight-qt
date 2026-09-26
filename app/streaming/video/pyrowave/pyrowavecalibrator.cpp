@@ -71,6 +71,7 @@ struct Renderer {
     pl_log log = nullptr;
     pl_vk_inst instance = nullptr;
     pl_vulkan vulkan = nullptr;
+    std::mutex commandLock;
     std::unique_ptr<PyroWavePlaceboPool> pool;
 
     bool create()
@@ -85,7 +86,7 @@ struct Renderer {
         params.features = PyroWavePlaceboPool::requestedFeatures();
         vulkan = pl_vulkan_create(log, &params);
         if (!vulkan || !PyroWavePlaceboPool::supported(vulkan)) return false;
-        pool = std::make_unique<PyroWavePlaceboPool>(instance, vulkan);
+        pool = std::make_unique<PyroWavePlaceboPool>(instance, vulkan, commandLock);
         return true;
     }
 
