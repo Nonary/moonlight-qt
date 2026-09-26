@@ -91,7 +91,7 @@ GPU nanosecond durations from absolute CPU timestamps.
 | source_teardown | 0 | unused |
 | output_status_before_present | presentation ID | 1 = output pending, 0 = complete |
 | present | presentation ID | submission success |
-| stage_render | 0 | experimental offscreen render submission succeeded; begin/end bracket import, rendering and flush (requires the "Render frames ahead" setting) |
+| stage_render | 0 | experimental offscreen render submission succeeded; begin/end bracket import, rendering and flush (requires `MOONLIGHT_VRR_OFFSCREEN_PREPARATION=1`) |
 | stage_output_ready | 0 | 1 = completed within the bound; begin=render flush completion, end=CPU output-completion observation |
 | stage_copy | 0 | copy/readiness succeeded; pacing-thread copy and its completion wait, or rerender after an output-format change |
 

@@ -897,7 +897,6 @@ void PlVkRenderer::selectLegacyPresentMode(PDECODER_PARAMETERS params)
 void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
 {
     m_VrrRequested = params->enableVrr;
-    m_VrrRenderAhead = params->vrrRenderAhead;
     m_VrrSuspended = false;
     m_VrrWindowChangePending.store(false);
     m_VrrFramePrepared = false;
@@ -1795,11 +1794,10 @@ void PlVkRenderer::updatePreparationTarget()
     // Only VAAPI and PyroWave frames on the Mailbox path opt into offscreen staging.
     // Other backends retain their existing synchronization and native policy.
     const auto texture = m_SwapchainFrame.fbo;
-    // Experimental and off by default ("Render frames ahead" in Settings): the
-    // extra render/copy completion waits regressed 4K VAAPI throughput. The
-    // direct asynchronous retained-source path stays the default until staged
-    // preparation demonstrates a live benefit.
-    m_PreparationTargetValid = m_VrrRenderAhead &&
+    // Experimental: the extra render/copy completion waits regress 4K
+    // throughput. Keep the direct asynchronous retained-source path as the
+    // default until staged preparation demonstrates a live benefit.
+    m_PreparationTargetValid = qEnvironmentVariableIntValue("MOONLIGHT_VRR_OFFSCREEN_PREPARATION") == 1 &&
         m_VrrRequested && !m_PreparationStopping &&
         m_VrrAdaptivePresentMode == VK_PRESENT_MODE_MAILBOX_KHR &&
         m_Vulkan->gpu->limits.thread_safe && texture && texture->params.format &&

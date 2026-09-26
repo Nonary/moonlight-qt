@@ -179,7 +179,7 @@ The 2026-09-21 preparation-stage follow-up is based on `18602b1c`, including
 Gemini's decode-completion source mapping and preparation-on-arrival changes.
 Linux VAAPI/Mailbox has experimental offscreen preparation independently of the
 pacing thread, as described in section 7.2. Following live 4K throughput
-regressions, this requires the "Render frames ahead" setting (off by default); the default
+regressions, this requires `MOONLIGHT_VRR_OFFSCREEN_PREPARATION=1`; the default
 retains the direct asynchronous hardware-source path. Other backends retain their
 existing execution path. This changes execution overlap, not buffer ceilings
 or source cadence policy; physical smoothness still requires a live retest.
@@ -1602,7 +1602,7 @@ resetting the codec merely because an image was not presented.
 12. Trace the outcome and retain/defer frame ownership as required by the presenter.
    Backend source retirement may continue after this worker step.
 
-With "Render frames ahead" enabled on Linux VAAPI or PyroWave/Mailbox,
+With `MOONLIGHT_VRR_OFFSCREEN_PREPARATION=1` on Linux VAAPI or PyroWave/Mailbox,
 after the first ordinary frame establishes the real
 swapchain format, admitted frames also receive cancellable preparation tickets.
 A separate thread performs decode synchronization, source import, rendering
