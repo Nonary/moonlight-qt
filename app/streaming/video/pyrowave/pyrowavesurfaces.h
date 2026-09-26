@@ -99,6 +99,9 @@ struct PyroWaveVulkanDevice {
     void (*lockQueues)(void* userdata) = nullptr;
     void (*unlockQueues)(void* userdata) = nullptr;
     void* userdata = nullptr;
+    // The device info includes a compute family separate from graphics, so
+    // decoding can run alongside rendering.
+    bool asyncCompute = false;
 };
 
 struct PyroWaveVulkanSurface {

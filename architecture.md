@@ -32,7 +32,14 @@ locks) and decodes into R8/R16 plane textures lent by the pool. For each frame
 the pool calls `pl_vulkan_hold_ex()` into `VK_IMAGE_LAYOUT_GENERAL`, signalling
 a timeline value the decode waits for; the decode signals the next value, and
 `pl_vulkan_release_ex()` makes libplacebo wait for it before sampling. The
-decoder thread only submits work. The `AVFrame` carries the pool reference in
+decoder thread only submits work. When libplacebo has a separate compute queue
+family (its default), the pool shares it and the compute-path decoder submits on
+it, so decode work is not queued ahead of rendering on the graphics queue; plane
+textures are created with concurrent sharing across libplacebo's families, so
+no ownership transfer is needed. A headless A/B at 4K 4:2:0 10-bit on the Deck
+(decode every 10 ms, render the previous frame alongside) showed no measurable
+render-completion difference between the two queues: decode and render compete
+for the same shader cores either way. The `AVFrame` carries the pool reference in
 `buf[0]` with a `YUV420P`/`YUV444P` (8-bit) or `YUV420P16`/`YUV444P16` (10-bit)
 format for colour metadata; `mapAvFrameToPlacebo()` builds the `pl_frame` from
 the pool textures instead of `pl_map_avframe_ex()`. Freeing the frame returns
@@ -1595,7 +1602,7 @@ resetting the codec merely because an image was not presented.
 12. Trace the outcome and retain/defer frame ownership as required by the presenter.
    Backend source retirement may continue after this worker step.
 
-With `MOONLIGHT_VRR_OFFSCREEN_PREPARATION=1` on Linux VAAPI/Mailbox,
+With `MOONLIGHT_VRR_OFFSCREEN_PREPARATION=1` on Linux VAAPI or PyroWave/Mailbox,
 after the first ordinary frame establishes the real
 swapchain format, admitted frames also receive cancellable preparation tickets.
 A separate thread performs decode synchronization, source import, rendering

@@ -1796,7 +1796,7 @@ struct PlVkRenderer::PreparedImage : VrrPreparedFrame {
 void PlVkRenderer::updatePreparationTarget()
 {
     QMutexLocker lock(&m_PreparationLock);
-    // Only the VAAPI Mailbox path diagnosed here opts into offscreen staging.
+    // Only VAAPI and PyroWave frames on the Mailbox path opt into offscreen staging.
     // Other backends retain their existing synchronization and native policy.
     const auto texture = m_SwapchainFrame.fbo;
     // Experimental: the extra render/copy completion waits regress 4K
@@ -1904,7 +1904,7 @@ void PlVkRenderer::prepareImage(const std::shared_ptr<PreparedImage>& image)
         queueRenderDeviceReset();
     }
     image->timing.readyUs = LiGetMicroseconds();
-    pl_unmap_avframe(m_Vulkan->gpu, &source);
+    unmapAvFrameFromPlacebo(image->source, &source);
     if (m_GpuTrace) {
         m_GpuTrace->record({"stage_render", image->source->pts,
             uint64_t(image->source->pkt_dts), image->timing.renderStartUs,
@@ -1924,7 +1924,12 @@ void PlVkRenderer::prepareImage(const std::shared_ptr<PreparedImage>& image)
 std::shared_ptr<VrrPreparedFrame> PlVkRenderer::queueFramePreparation(AVFrame* frame, uint64_t)
 {
 #ifdef Q_OS_LINUX
-    if (!frame || frame->format != AV_PIX_FMT_VAAPI || frame->pkt_dts <= 0) return {};
+    if (!frame || frame->pkt_dts <= 0) return {};
+    bool preparable = frame->format == AV_PIX_FMT_VAAPI;
+#ifdef HAVE_PYROWAVE
+    preparable = preparable || (m_PyroWavePool && m_PyroWavePool->ownsFrame(frame));
+#endif
+    if (!preparable) return {};
     std::shared_ptr<PreparedImage> evicted;
     auto image = std::make_shared<PreparedImage>(this);
     {

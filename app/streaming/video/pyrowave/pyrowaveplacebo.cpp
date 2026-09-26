@@ -2,6 +2,8 @@
 
 #include <SDL.h>
 
+#include <algorithm>
+
 extern "C" {
 #include <libavutil/pixdesc.h>
 }
@@ -75,17 +77,29 @@ PyroWavePlaceboPool::PyroWavePlaceboPool(pl_vk_inst instance, pl_vulkan vulkan)
     m_InstanceInfo.enabledExtensionCount = uint32_t(instance->num_extensions);
     m_InstanceInfo.ppEnabledExtensionNames = instance->extensions;
 
-    // Only the graphics family is shared, so the decoder submits to the
-    // queues that lockQueues() serializes.
-    m_QueuePriorities.assign(size_t(vulkan->queue_graphics.count), 1.0f);
-    m_QueueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    m_QueueInfo.queueFamilyIndex = uint32_t(vulkan->queue_graphics.index);
-    m_QueueInfo.queueCount = uint32_t(vulkan->queue_graphics.count);
-    m_QueueInfo.pQueuePriorities = m_QueuePriorities.data();
+    // The decoder sees the graphics family and, when libplacebo has one, its
+    // separate compute family. Those are the queues lockQueues() serializes.
+    m_SharedQueues.push_back(vulkan->queue_graphics);
+    if (vulkan->queue_compute.count > 0 && vulkan->queue_compute.index != vulkan->queue_graphics.index) {
+        m_SharedQueues.push_back(vulkan->queue_compute);
+    }
+    uint32_t maxQueues = 0;
+    for (const auto& queue : m_SharedQueues) {
+        maxQueues = std::max(maxQueues, uint32_t(queue.count));
+    }
+    m_QueuePriorities.assign(size_t(maxQueues), 1.0f);
+    for (const auto& queue : m_SharedQueues) {
+        VkDeviceQueueCreateInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        info.queueFamilyIndex = uint32_t(queue.index);
+        info.queueCount = uint32_t(queue.count);
+        info.pQueuePriorities = m_QueuePriorities.data();
+        m_QueueInfos.push_back(info);
+    }
     m_DeviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     m_DeviceInfo.pNext = vulkan->features;
-    m_DeviceInfo.queueCreateInfoCount = 1;
-    m_DeviceInfo.pQueueCreateInfos = &m_QueueInfo;
+    m_DeviceInfo.queueCreateInfoCount = uint32_t(m_QueueInfos.size());
+    m_DeviceInfo.pQueueCreateInfos = m_QueueInfos.data();
     m_DeviceInfo.enabledExtensionCount = uint32_t(vulkan->num_extensions);
     m_DeviceInfo.ppEnabledExtensionNames = vulkan->extensions;
 
@@ -110,17 +124,21 @@ PyroWavePlaceboPool::~PyroWavePlaceboPool()
 
 void PyroWavePlaceboPool::lockQueues(void* opaque)
 {
-    auto vulkan = static_cast<pl_vulkan>(opaque);
-    for (uint32_t i = 0; i < uint32_t(vulkan->queue_graphics.count); i++) {
-        vulkan->lock_queue(vulkan, uint32_t(vulkan->queue_graphics.index), i);
+    auto pool = static_cast<PyroWavePlaceboPool*>(opaque);
+    for (const auto& queue : pool->m_SharedQueues) {
+        for (uint32_t i = 0; i < uint32_t(queue.count); i++) {
+            pool->m_Vulkan->lock_queue(pool->m_Vulkan, uint32_t(queue.index), i);
+        }
     }
 }
 
 void PyroWavePlaceboPool::unlockQueues(void* opaque)
 {
-    auto vulkan = static_cast<pl_vulkan>(opaque);
-    for (int i = int(vulkan->queue_graphics.count) - 1; i >= 0; i--) {
-        vulkan->unlock_queue(vulkan, uint32_t(vulkan->queue_graphics.index), uint32_t(i));
+    auto pool = static_cast<PyroWavePlaceboPool*>(opaque);
+    for (auto queue = pool->m_SharedQueues.rbegin(); queue != pool->m_SharedQueues.rend(); ++queue) {
+        for (int i = int(queue->count) - 1; i >= 0; i--) {
+            pool->m_Vulkan->unlock_queue(pool->m_Vulkan, uint32_t(queue->index), uint32_t(i));
+        }
     }
 }
 
@@ -137,7 +155,8 @@ bool PyroWavePlaceboPool::pyroWaveVulkanDevice(PyroWaveVulkanDevice& device)
     device.deviceInfo = &m_DeviceInfo;
     device.lockQueues = lockQueues;
     device.unlockQueues = unlockQueues;
-    device.userdata = const_cast<pl_vulkan_t*>(m_Vulkan);
+    device.userdata = this;
+    device.asyncCompute = m_SharedQueues.size() > 1;
     return true;
 }
 

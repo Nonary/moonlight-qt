@@ -68,8 +68,9 @@ private:
     pl_vulkan m_Vulkan;
     VkApplicationInfo m_AppInfo = {};
     VkInstanceCreateInfo m_InstanceInfo = {};
+    std::vector<pl_vulkan_queue> m_SharedQueues;
     std::vector<float> m_QueuePriorities;
-    VkDeviceQueueCreateInfo m_QueueInfo = {};
+    std::vector<VkDeviceQueueCreateInfo> m_QueueInfos;
     VkDeviceCreateInfo m_DeviceInfo = {};
 
     VkSemaphore m_Ready = VK_NULL_HANDLE;
