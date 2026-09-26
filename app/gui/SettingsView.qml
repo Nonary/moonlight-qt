@@ -8,6 +8,7 @@ import ComputerManager 1.0
 import SdlGamepadKeyNavigation 1.0
 import SystemProperties 1.0
 import PyroWaveCalibrator 1.0
+import NetworkBuffers 1.0
 
 Flickable {
     id: settingsPage
@@ -729,6 +730,54 @@ Flickable {
                     width: parent.width
                     spacing: 5
                     visible: slider.pyroWave && Qt.platform.os === "linux"
+
+                    Component.onCompleted: NetworkBuffers.refresh()
+
+                    Label {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        visible: NetworkBuffers.needsFix
+                        color: "#ffb74d"
+                        text: qsTr("Linux limits this PC's network receive buffer to %1 KB. PyroWave needs about %2 MB, or frames arrive with missing packets.")
+                              .arg(NetworkBuffers.currentKb).arg(NetworkBuffers.recommendedMb)
+                    }
+
+                    Row {
+                        spacing: 8
+                        visible: NetworkBuffers.needsFix
+
+                        Button {
+                            text: qsTr("Fix it")
+                            visible: NetworkBuffers.canApply
+                            enabled: !NetworkBuffers.busy
+                            onClicked: NetworkBuffers.apply()
+
+                            ToolTip.delay: 1000
+                            ToolTip.timeout: 10000
+                            ToolTip.visible: hovered
+                            ToolTip.text: qsTr("Raises net.core.rmem_max now and saves it for future boots. Asks for your password.")
+                        }
+
+                        Button {
+                            text: qsTr("Copy command")
+                            onClicked: NetworkBuffers.copyCommand()
+                        }
+                    }
+
+                    Label {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        visible: NetworkBuffers.needsFix && !NetworkBuffers.canApply
+                        font.pointSize: 9
+                        text: qsTr("Run this in a terminal (Konsole on Steam Deck):") + "\n" + NetworkBuffers.manualCommand
+                    }
+
+                    Label {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        visible: NetworkBuffers.message !== ""
+                        text: NetworkBuffers.message
+                    }
 
                     Button {
                         text: qsTr("Calibrate PyroWave")

@@ -7,6 +7,7 @@
 #include "streaming/streamutils.h"
 #include "streaming/vrrratepolicy.h"
 #include "backend/richpresencemanager.h"
+#include "backend/networkbuffers.h"
 
 #include <Limelight.h>
 #include "SDL_compat.h"
@@ -1163,6 +1164,9 @@ bool Session::validateLaunch(SDL_Window* testWindow)
                                         m_StreamConfig.fps) == DecoderAvailability::None) {
             emitLaunchWarning(tr("This PC's GPU driver can't decode PyroWave. Using H.264 instead."));
             m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_PYROWAVE);
+        }
+        else if (NetworkBuffers::receiveBufferTooSmall()) {
+            emitLaunchWarning(tr("Linux limits this PC's network receive buffer, so PyroWave frames may lose packets. Fix it in Settings, below the video codec."));
         }
     }
 

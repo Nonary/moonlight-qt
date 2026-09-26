@@ -53,6 +53,17 @@ round-trip test decodes through both paths (shared planes read back with
 establish live-stream cadence or physical scanout. VRR policy and replay are
 unchanged.
 
+moonlight-common-c asks for an 8192-packet receive buffer on PyroWave video
+sockets. Linux silently clamps SO_RCVBUF to `net.core.rmem_max` (208 KB by
+default on SteamOS), and the kernel drops packets that overflow it; the library
+logs a warning when the buffer falls short. `NetworkBuffers` reads the limit:
+Settings shows a warning under the PyroWave codec options with a button that
+runs `pkexec` on the host (through `distrobox-host-exec`/`host-spawn` inside a
+container) to set 32 MB now and in `/etc/sysctl.d/60-moonlight-pyrowave.conf`,
+plus a copyable command. Flatpak builds cannot run host commands, so they offer
+only the command. Launching a PyroWave stream with the low limit adds a launch
+warning.
+
 The "Average decoding time" statistic runs from the reassembled frame's
 enqueue in moonlight-common-c to decoder output, so it includes time waiting in
 the 15-frame decode-unit queue; the wait is shown separately. When that queue

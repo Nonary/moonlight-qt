@@ -218,6 +218,7 @@ SOURCES += \
     streaming/vrrratepolicy.cpp \
     streaming/video/pyrowave/pyrowavecalibrator.cpp \
     backend/systemproperties.cpp \
+    backend/networkbuffers.cpp \
     wm.cpp
 
 HEADERS += \
@@ -269,6 +270,7 @@ HEADERS += \
     streaming/video/overlaymanager.h \
     streaming/video/clientpacingwarning.h \
     backend/systemproperties.h \
+    backend/networkbuffers.h \
     windowsvblankvirtualization.h
 
 # Platform-specific renderers and decoders
