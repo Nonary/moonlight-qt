@@ -225,7 +225,16 @@ Our client decodes a record-framed frame that lost packets. moonlight-common-c
 first repairs what parity can (the critical packets). It does not drop a PyroWave
 frame whose FEC block cannot complete: once the next block or frame starts
 arriving, each missing data packet is replaced by zeros and delivered as a
-`BUFFER_TYPE_LOST` buffer. The frame is still dropped when its first packet
+`BUFFER_TYPE_LOST` buffer. A final block without parity can also complete after
+1 ms of packet silence, without waiting for the next frame. This requires a
+record-start flag, the short frame header's nonzero critical packet count, and
+all packets in that critical prefix to be present. Unique arrivals renew the
+deadline, including reordered packets; duplicates do not. The receiver drains
+queued socket data before expiring the deadline. Missing EOF is handled by the
+same silence deadline. Optional detail arriving later is discarded, trading a
+bounded reorder allowance for prompt partial-frame delivery. Parity-bearing
+blocks and unknown or incomplete critical prefixes retain boundary-based
+recovery. The frame is still dropped when its first packet
 (sequence header) or a whole FEC block is missing, which parity on the critical
 block makes rare. Packets flagged `0x80` arrive as `BUFFER_TYPE_RECORD_START`
 buffers, and the critical packet count as `DECODE_UNIT.pyrowaveCriticalPackets`.

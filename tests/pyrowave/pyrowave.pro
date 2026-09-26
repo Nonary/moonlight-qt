@@ -17,3 +17,9 @@ linux:contains(QT_ARCH, x86_64) {
     roundtrip.file = $$PWD/roundtrip.pro
     SUBDIRS += roundtrip
 }
+
+rtpqueue.file = $$PWD/rtpqueue.pro
+SUBDIRS += rtpqueue
+
+udpreceive.file = $$PWD/udpreceive.pro
+SUBDIRS += udpreceive

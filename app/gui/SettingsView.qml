@@ -693,7 +693,7 @@ Flickable {
                         value: StreamingPreferences.bitrateKbps
 
                         stepSize: pyroWave ? 5000 : 500
-                        from : 500
+                        from : pyroWave ? 5000 : 500
                         to: pyroWave ? 3000000 : (StreamingPreferences.unlockBitrate ? 500000 : 150000)
 
                         snapMode: "SnapOnRelease"
@@ -779,6 +779,12 @@ Flickable {
                         visible: NetworkBuffers.message !== ""
                         text: NetworkBuffers.message
                     }
+                }
+
+                Column {
+                    width: parent.width
+                    spacing: 5
+                    visible: SystemProperties.hasPyroWave
 
                     Button {
                         text: qsTr("Calibrate PyroWave")
@@ -792,24 +798,29 @@ Flickable {
                     Label {
                         width: parent.width
                         wrapMode: Text.Wrap
-                        text: qsTr("Compare resolutions, 4:4:4 and 4:2:0, and HDR/SDR at the selected FPS.")
+                        text: qsTr("Click a format to apply it. The test measures local GPU decode, not the host, network, rendering, or picture quality.")
                     }
                 }
 
                 NavigableDialog {
                     id: calibrationDialog
-                    title: qsTr("PyroWave calibration — %1 FPS").arg(StreamingPreferences.fps)
+                    title: qsTr("PyroWave local decode test — %1 FPS").arg(StreamingPreferences.fps)
                     width: Math.min(settingsPage.width - 24, 860)
                     height: Math.min(settingsPage.height - 24, 560)
                     standardButtons: Dialog.Close
 
-                    readonly property var rows: [
+                    readonly property var rows: (Qt.platform.os === "linux" ? [
                         { name: "4K", width: 3840, height: 2160 },
                         { name: "1440p", width: 2560, height: 1440 },
                         { name: "1080p", width: 1920, height: 1080 },
                         { name: "800p", width: 1280, height: 800 },
                         { name: "720p", width: 1280, height: 720 }
-                    ]
+                    ] : [
+                        { name: "4K", width: 3840, height: 2160 },
+                        { name: "1440p", width: 2560, height: 1440 },
+                        { name: "1080p", width: 1920, height: 1080 },
+                        { name: "720p", width: 1280, height: 720 }
+                    ])
                     readonly property var samples: PyroWaveCalibrator.results
 
                     function sample(row, mode) {
@@ -817,40 +828,46 @@ Flickable {
                         return offset < samples.length ? samples[offset] : null
                     }
 
-                    function canApply(option) {
-                        return option && option.valid &&
-                               (!option.hdr || SystemProperties.supportsHdr)
-                    }
-
-                    function optionText(option, hdr) {
-                        var prefix = hdr ? qsTr("HDR") : qsTr("SDR")
+                    function optionText(option, tenBit) {
+                        var prefix = tenBit ? qsTr("10-bit") : qsTr("8-bit")
                         if (!option) return prefix + " · " + (PyroWaveCalibrator.running ? qsTr("testing…") : "—")
                         if (!option.valid) return prefix + " · " + option.error
-                        var summary = qsTr("%1 · %2 ms decode · %3 Mbps").arg(prefix).arg(option.p95Ms.toFixed(1)).arg(option.bitrateKbps / 1000)
-                        if (hdr && !SystemProperties.supportsHdr) return summary + " · " + qsTr("no HDR")
-                        if (!option.linkFit) return summary + " · " + qsTr("link")
-                        if (!option.sustainable) return summary + " · " + qsTr("slow")
-                        if (!option.qualityFit) return summary + " · " + qsTr("below guide")
-                        return summary
+                        return qsTr("%1 · %2 ms GPU · Apply").arg(prefix).arg(option.p95Ms.toFixed(1))
+                    }
+
+                    function canApply(option) {
+                        return option && option.valid && (!option.hdr || SystemProperties.supportsHdr)
                     }
 
                     function optionDetail(option) {
                         if (!option || !option.valid) return ""
-                        return qsTr("Decode mean %1 ms; p95 %2 ms; peak local queue %3 ms. %4")
+                        return qsTr("GPU decode mean %1 ms; p95 %2 ms. Synthetic payload %3 Mbps; author's quality guide %4 Mbps. Host, LAN, rendering, and live FPS were not tested.")
                                 .arg(option.meanMs.toFixed(1)).arg(option.p95Ms.toFixed(1))
-                                .arg(option.queueMaxMs.toFixed(1))
-                                .arg(option.sustainable ? qsTr("Decoder kept up in the short test.") : qsTr("Decoder fell behind in the short test; you can still try it."))
+                                .arg((option.wireKbps / 1000).toFixed(0))
+                                .arg((option.requiredKbps / 1000).toFixed(0))
                     }
 
                     function applyChoice(option) {
                         if (!canApply(option)) return
-                        StreamingPreferences.autoAdjustBitrate = false
+                        var wasPyroWave = slider.pyroWave
+                        var previousBitrate = StreamingPreferences.bitrateKbps
+                        StreamingPreferences.videoCodecConfig = StreamingPreferences.VCC_FORCE_PYROWAVE
+                        for (var codecIndex = 0; codecIndex < codecListModel.count; codecIndex++) {
+                            if (codecListModel.get(codecIndex).val === StreamingPreferences.VCC_FORCE_PYROWAVE) {
+                                codecComboBox.currentIndex = codecIndex
+                                break
+                            }
+                        }
                         StreamingPreferences.width = option.width
                         StreamingPreferences.height = option.height
                         StreamingPreferences.enableYUV444 = option.chroma444
                         StreamingPreferences.enableHdr = option.hdr
-                        StreamingPreferences.bitrateKbps = option.bitrateKbps
-                        slider.value = option.bitrateKbps
+                        StreamingPreferences.bitrateKbps = wasPyroWave ? previousBitrate :
+                            StreamingPreferences.getDefaultPyroWaveBitrate(option.width, option.height,
+                                                                           StreamingPreferences.fps,
+                                                                           option.chroma444, option.hdr)
+                        StreamingPreferences.autoAdjustBitrate = false
+                        slider.value = StreamingPreferences.bitrateKbps
 
                         var found = false
                         for (var i = 0; i < resolutionListModel.count; i++) {
@@ -897,7 +914,7 @@ Flickable {
                                 width: parent.width
                                 wrapMode: Text.Wrap
                                 font.pointSize: 9
-                                text: qsTr("Local GPU decode test · passes with a quarter of each frame left for rendering · 1 Gbps wired assumed · 900 Mbps cap. Bitrates follow the PyroWave author's good-quality curve (viewing distance twice the screen height), plus 20% for HDR. Live FPS is not measured.")
+                                text: qsTr("The sample payload comes from one synthetic image and is not a recommended stream bitrate. Selecting a format keeps your current PyroWave bitrate, or uses the normal default when switching codecs. Adjust bitrate for your host and network.")
                             }
 
                             Row {
@@ -934,7 +951,6 @@ Flickable {
                                                 readonly property var option: calibrationDialog.sample(calibrationRow.rowIndex, modelData)
                                                 text: calibrationDialog.optionText(option, modelData === 0)
                                                 enabled: calibrationDialog.canApply(option)
-                                                opacity: option && option.valid && (!option.sustainable || !option.linkFit) ? 0.55 : 1.0
                                                 ToolTip.delay: 400
                                                 ToolTip.visible: hovered
                                                 ToolTip.text: calibrationDialog.optionDetail(option)
@@ -955,7 +971,6 @@ Flickable {
                                                 readonly property var option: calibrationDialog.sample(calibrationRow.rowIndex, modelData)
                                                 text: calibrationDialog.optionText(option, modelData === 2)
                                                 enabled: calibrationDialog.canApply(option)
-                                                opacity: option && option.valid && (!option.sustainable || !option.linkFit) ? 0.55 : 1.0
                                                 ToolTip.delay: 400
                                                 ToolTip.visible: hovered
                                                 ToolTip.text: calibrationDialog.optionDetail(option)

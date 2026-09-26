@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0"
+  Author="Moonlight"
+  Company="Nonary"
+  Copyright="Moonlight diagnostic profile">
+  <Profiles>
+    <SystemCollector Id="MoonlightVrrSystemCollector" Name="NT Kernel Logger">
+      <BufferSize Value="1024" />
+      <Buffers Value="384" />
+    </SystemCollector>
+    <EventCollector Id="MoonlightVrrEventCollector" Name="Moonlight VRR events">
+      <BufferSize Value="1024" />
+      <Buffers Value="128" />
+    </EventCollector>
+    <SystemProvider Id="MoonlightVrrSystemProvider">
+      <Keywords>
+        <Keyword Value="ProcessThread" />
+        <Keyword Value="CSwitch" />
+        <Keyword Value="ReadyThread" />
+        <Keyword Value="ThreadPriority" />
+        <Keyword Value="DPC" />
+        <Keyword Value="Interrupt" />
+        <Keyword Value="Power" />
+      </Keywords>
+    </SystemProvider>
+    <EventProvider Id="DxgKrnlProvider"
+      Name="Microsoft-Windows-DxgKrnl"
+      NonPagedMemory="true" Strict="true" Level="5">
+      <!-- Present, GPU scheduling and object lifetime events; deliberately
+           omit the broad Performance keyword (PresentMon does the same). -->
+      <Keywords><Keyword Value="0x0C308A77" /></Keywords>
+      <CaptureStateOnStart><Keyword Value="0x2090BFFF" /></CaptureStateOnStart>
+      <CaptureStateOnSave><Keyword Value="0x90BFFF" /></CaptureStateOnSave>
+    </EventProvider>
+    <EventProvider Id="Win32kProvider"
+      Name="Microsoft-Windows-Win32k"
+      NonPagedMemory="true" Strict="true" Level="5">
+      <Keywords><Keyword Value="0x1000" /></Keywords>
+    </EventProvider>
+    <EventProvider Id="DxgiProvider"
+      Name="Microsoft-Windows-DXGI"
+      Level="5" />
+    <EventProvider Id="DwmCoreProvider"
+      Name="Microsoft-Windows-Dwm-Core"
+      Level="5" />
+    <EventProvider Id="DesktopCompositionProvider"
+      Name="Microsoft-Windows-DesktopWindowManager-Diag"
+      Level="5" />
+    <Profile Id="MoonlightVrrFull.Verbose.File"
+      Name="MoonlightVrrFull"
+      Description="Moonlight VRR scheduler and graphics correlation"
+      LoggingMode="File"
+      DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="MoonlightVrrSystemCollector">
+          <SystemProviderId Value="MoonlightVrrSystemProvider" />
+        </SystemCollectorId>
+        <EventCollectorId Value="MoonlightVrrEventCollector">
+          <EventProviders>
+
+            <EventProviderId Value="DxgKrnlProvider" />
+            <EventProviderId Value="Win32kProvider" />
+            <EventProviderId Value="DxgiProvider" />
+            <EventProviderId Value="DwmCoreProvider" />
+            <EventProviderId Value="DesktopCompositionProvider" />
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

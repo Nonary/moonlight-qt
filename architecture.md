@@ -5,7 +5,27 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-PyroWave decode path (2026-09-25, source baseline `5f9ce4a4` plus Linux changes):
+The first live Windows PyroWave retry negotiated H.264 because the common library
+had format constants without DESCRIBE selection or ANNOUNCE attributes. The
+2026-09-25 4K/116 FPS PyroWave session subsequently confirmed live streaming.
+Its Smooth buffer began at 8.189 ms (95% of the source period) and reached
+14.343 ms: 72 recorded late-readiness growth decisions added 6.205 ms and only
+0.051 ms was released. Smooth requires 10 seconds of uninterrupted eligible
+observations before release, then drains at only 50 us/s. This capture had 411
+presented interval-sequence breaks (249 frame-number gaps, 112 phase changes,
+49 other breaks, plus the initial row); only five spans reached 10 seconds.
+The retained growth was largely a client release-policy effect, not a measured
+14 ms decode or render cost. Growth frames had a 2.26 ms median first-packet
+offset after the mapped source slot versus -5.20 ms in a regular-frame sample,
+and 9.81 ms median packet assembly versus 8.33 ms; GPU completion after decoder
+output was 1.81 ms versus 1.17 ms. The 900 Mbps session had 0.44% network
+frame loss. This points to delivery/reassembly timing as the main cause of the
+extra buffer without separating host send pacing from network transit. The
+trace has a valid clean-close sequence and exact controller diagnostics, but
+fails the strict replay baseline/raster readiness gate; it cannot support
+strict counterfactual A/B claims.
+
+PyroWave decode path (2026-09-26, source baseline `afd4aebb`):
 the `PyroWave` codec choice negotiates Themaister's intra-only wavelet codec
 (protocol in [docs/pyrowave-protocol.md](docs/pyrowave-protocol.md)). It reuses
 `FFmpegVideoDecoder`, the pacer, VRR worker and stats, but no FFmpeg decoder.
@@ -13,6 +33,29 @@ the `PyroWave` codec choice negotiates Themaister's intra-only wavelet codec
 `PyroWaveFraming`, pushes the wavelet packets and decodes on Vulkan. An eligible
 partial frame can render with missing detail as blur; a rejected frame is dropped
 without an IDR request because the next frame is independent.
+
+PyroWave partial-frame delivery (2026-09-26, `afd4aebb` plus the receive fix):
+the RTP queue previously held an incomplete final block until the next frame
+arrived. In capture `20260926-061208`, all 66 buffer increases in the first
+90 seconds were attributed to final-block-loss frames; their median assembly
+time was 8.806 ms versus 3.785 ms for intact frames. This is delivery lateness,
+not a packet-loss counter in the VRR controller. The controller parameters
+matched the earlier capture.
+
+For PyroWave only, a final block without parity now has a 1 ms packet-silence
+deadline, renewed by unique accepted packets. The receive thread drains the
+nonblocking socket before servicing that deadline. On expiry it can fill holes
+and deliver only when the record-framing header announces a nonzero critical
+packet count and that entire prefix is present, including FEC-recovered data.
+Unknown framing, missing critical data, parity-bearing blocks and absent whole
+blocks retain boundary-based recovery. The same deadline handles a missing EOF;
+it deliberately bounds reordering of optional detail, so packets arriving after
+the deadline may contribute blur instead of additional waiting. Reassembly and
+decode timestamps remain actual event times. Other codecs and VRR calibration
+thresholds are unchanged. Queue and native UDP tests cover completion, reordering,
+critical-data protection and draining buffered datagrams. A fresh live capture
+is needed to measure the resulting buffer behavior; existing replay starts
+after reassembly and cannot simulate this receive-policy change.
 
 On Windows, `initializePyroWave()` creates `D3D11VARenderer` and a PyroWave
 Vulkan device matched by adapter LUID. Decode submits into one of ten D3D11-owned
@@ -69,40 +112,26 @@ enqueue in moonlight-common-c to decoder output, so it includes time waiting in
 the 15-frame decode-unit queue; the wait is shown separately. When that queue
 overflows it is flushed and an IDR is requested, which restarts cadence.
 
-The Linux Settings page can run a quick PyroWave calibration at the selected
-FPS. A background worker tests 4K, 1440p, 1080p, Deck-native 800p, and 720p,
-each in all four 4:2:0/4:4:4 and SDR/HDR decode-output combinations, with up
-to 24 paced synthetic frames per option. Obvious overload stops after eight. It
-generates a host-style record frame at the codec author's good-quality bitrate
-(the same curve as the PyroWave default bitrate, `pyrowavebitrate.h`), then tries
-one lower bitrate for borderline formats that miss the decode or link budget.
-That curve is the author's objective regression
-(`pyrowave/pyrowave/eval-results/objective-bitrate-evaluation.md`) at 35 dB
-PSNR-HVS-M-H and a viewing distance of twice the screen height, scaled linearly
-with frame rate, with his 1.2x HDR10 allowance. Bits per pixel fall as resolution
-rises (at 60 fps, 4:2:0 SDR needs about 2.45 bpp at 720p, 1.77 at 1080p, 1.31 at
-1440p and 0.58 at 4K) and 4:4:4 costs 8-21% more. A tested bitrate below the curve
-is shown as a warning; it never vetoes a decoder-fit choice. The displayed bitrate is the
-tested bitrate; the algorithm does not find a global optimum or measure visual
-quality. It
-decodes into shared surfaces on a headless libplacebo device and measures each
-frame until a one-pixel download confirms GPU completion, and requires p95
-service within 75% of the source period, leaving time for the renderer on the
-same GPU and for bursty arrival, without significant local queue growth.
-Recommendations cap the selected bitrate at
-900 Mbps on an assumed 1 Gbps wired link; synthetic encoded size and guessed
-FEC overhead do not veto a decoder result. This is a nominal link assumption,
-not a throughput test. The synthetic source is 8-bit even for
-the HDR-output path, so it cannot grade HDR fidelity or host encoding. Rendering,
-live network, host capture, and display remain unmeasured.
-The worker refuses to run during an active session. A dialog shows resolution
-rows with 4:4:4 and 4:2:0 columns, each containing HDR and SDR choices. A
-choice with a valid decoder result can apply its resolution, chroma, HDR, and
-bitrate together even when dimmed for slow decode, so the user can try it live.
-Unsupported display HDR stays unavailable. Other stream settings remain
-selected. The compact dialog keeps decode p95 on each button and exposes mean
-and peak local queue in a tooltip. Other platforms do not offer this
-calibration.
+The Windows and Linux Settings pages can run a short PyroWave GPU decode test
+at the selected FPS. Windows tests 4K, 1440p, 1080p, and 720p;
+Linux also tests Deck-native 800p. Each resolution has 4:2:0/4:4:4 and
+8-bit/10-bit output cases. The worker refuses to run during an active stream.
+It encodes one synthetic 8-bit image at the codec author's good-quality rate
+ceiling, then decodes 24 paced repetitions through the stream's GPU surface
+path. The tooltip distinguishes the compressed payload for that synthetic
+image from the author's quality-guide bitrate. Neither is a measured network capacity or a reliable picture
+quality score for a game. The GPU completion check reads one pixel through
+libplacebo on Linux or D3D11 on Windows. The dialog reports mean and p95 GPU
+service without a pass/fail or "slow" label: one short synthetic sample cannot
+certify a format's live cadence. Clicking a valid format selects PyroWave,
+resolution, chroma, and HDR output. It keeps the current PyroWave bitrate or
+uses the normal PyroWave default when switching codecs. Host encoding, network throughput, rendering,
+presented cadence, and HDR fidelity remain unmeasured. Earlier versions used
+a fixed 900 Mbps assumed link cap and treated `sleep_until()` wakeup lateness
+as decoder backlog; this could mark every Windows format slow and substitute
+a 25% lower bitrate even when live decode took under 1 ms. A later modeled
+backlog heuristic still called 4K 4:2:0 10-bit "slow" at 5.08 ms p95 while
+accepting 4K 4:4:4 10-bit at 5.14 ms p95, so the binary label was removed.
 
 `HAVE_PYROWAVE` adds a member to `FFmpegVideoDecoder`, so changing that qmake
 option requires `make -C build/app clean` before rebuilding the app. An

@@ -4,6 +4,7 @@
 #include "streaming/video/pyrowave/pyrowavebitrate.h"
 
 #include <QMetaObject>
+#include <SDL.h>
 
 #include <algorithm>
 #include <chrono>
@@ -11,13 +12,21 @@
 #include <cstring>
 #include <numeric>
 #include <thread>
+#include <utility>
 #include <vector>
 
-#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+#if defined(HAVE_PYROWAVE) && (defined(Q_OS_LINUX) || defined(Q_OS_WIN32))
 #include "streaming/video/pyrowave/pyrowavedecoder.h"
-#include "streaming/video/pyrowave/pyrowaveplacebo.h"
-
+#include "streaming/video/pyrowave/pyrowaveframing.h"
 #include <vulkan/vulkan.h>
+#ifdef Q_OS_LINUX
+#include "streaming/video/pyrowave/pyrowaveplacebo.h"
+#else
+#include "streaming/video/ffmpeg-renderers/d3d11pyrowave.h"
+#include <d3d11_4.h>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+#endif
 #include <pyrowave.h>
 #endif
 
@@ -29,16 +38,12 @@ struct Sample {
     bool chroma444 = false;
     bool hdr = false;
     bool valid = false;
-    bool sustainable = false;
-    bool linkFit = false;
-    bool qualityFit = false;
     int requiredKbps = 0;
     int bitrateKbps = 0;
     int wireKbps = 0;
     int frames = 0;
     double meanMs = 0;
     double p95Ms = 0;
-    double queueMaxMs = 0;
     QString error;
 };
 
@@ -53,8 +58,9 @@ int targetBitrateKbps(int width, int height, int fps, bool chroma444, bool hdr)
     return int(std::ceil(pyroWaveRecommendedKbps(width, height, fps, chroma444, hdr) / 5000.0)) * 5000;
 }
 
-#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+#if defined(HAVE_PYROWAVE) && (defined(Q_OS_LINUX) || defined(Q_OS_WIN32))
 
+#ifdef Q_OS_LINUX
 // A headless libplacebo device, so the sweep decodes into the same shared
 // surfaces a stream's Vulkan renderer uses.
 struct Renderer {
@@ -80,6 +86,8 @@ struct Renderer {
         return true;
     }
 
+    bool prepare(int, int, bool, bool) { return true; }
+
     // Returns once the GPU finished writing the frame's planes
     bool waitForFrame(const AVFrame* frame)
     {
@@ -101,6 +109,100 @@ struct Renderer {
         pl_log_destroy(&log);
     }
 };
+#else
+// Use the same D3D11 texture and fence sharing as a Windows stream. A one-pixel
+// D3D11 readback waits for decode completion and verifies renderer access.
+struct Renderer {
+    Microsoft::WRL::ComPtr<ID3D11Device5> device;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+    LUID adapterLuid = {};
+    std::unique_ptr<D3D11PyroWaveSurfaces> pool;
+    HANDLE event = nullptr;
+
+    bool create()
+    {
+        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+        for (UINT index = 0;; ++index) {
+            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+            if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_ADAPTER_DESC1 description = {};
+            if (FAILED(adapter->GetDesc1(&description)) ||
+                    (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
+            Microsoft::WRL::ComPtr<ID3D11Device> baseDevice;
+            Microsoft::WRL::ComPtr<ID3D11DeviceContext> baseContext;
+            const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+            if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+                                         levels, 2, D3D11_SDK_VERSION, &baseDevice,
+                                         nullptr, &baseContext)) ||
+                    FAILED(baseDevice.As(&device)) || FAILED(baseContext.As(&context))) {
+                device.Reset();
+                context.Reset();
+                continue;
+            }
+            static_assert(sizeof(pyrowave_luid) == sizeof(LUID), "LUID size mismatch");
+            pyrowave_device decodeDevice = nullptr;
+            const bool compatible = pyrowave_create_device_by_compat(
+                0, 0, nullptr, nullptr,
+                reinterpret_cast<const pyrowave_luid*>(&description.AdapterLuid),
+                &decodeDevice) == PYROWAVE_SUCCESS;
+            const bool interop = compatible && pyrowave_device_confirm_interop_support(decodeDevice);
+            if (decodeDevice) pyrowave_device_destroy(decodeDevice);
+            if (!interop) {
+                device.Reset();
+                context.Reset();
+                continue;
+            }
+            adapterLuid = description.AdapterLuid;
+            event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            return event != nullptr;
+        }
+        return false;
+    }
+
+    bool prepare(int width, int height, bool chroma444, bool hdr)
+    {
+        pool.reset();
+        staging.Reset();
+        pool = std::make_unique<D3D11PyroWaveSurfaces>();
+        if (!pool->initialize(device.Get(), adapterLuid, width, height, chroma444, hdr)) return false;
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = desc.Height = 1;
+        desc.MipLevels = desc.ArraySize = 1;
+        desc.Format = hdr ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        return SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &staging));
+    }
+
+    bool waitForFrame(const AVFrame* frame)
+    {
+        auto* ref = PyroWaveFrameRef::fromFrame(frame);
+        if (!ref || !pool || !pool->decodeFence() ||
+                FAILED(pool->decodeFence()->SetEventOnCompletion(ref->decodeFenceValue, event)) ||
+                WaitForSingleObject(event, 2000) != WAIT_OBJECT_0 ||
+                !pool->waitForDecode(context.Get(), ref)) return false;
+        const auto* views = pool->planeViews(ref->surface);
+        if (!views) return false;
+        Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+        (*views)[2]->GetResource(&resource);
+        const D3D11_BOX box = {0, 0, 0, 1, 1, 1};
+        context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, resource.Get(), 0, &box);
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+        context->Unmap(staging.Get(), 0);
+        return pool->signalRelease(context.Get(), ref);
+    }
+
+    ~Renderer()
+    {
+        pool.reset();
+        if (event) CloseHandle(event);
+    }
+};
+#endif
 
 struct Planes {
     int width;
@@ -217,10 +319,6 @@ Sample runSample(pyrowave_device device, Renderer& renderer, int width, int heig
     sample.hdr = hdr;
     sample.requiredKbps = targetBitrateKbps(width, height, fps, chroma444, hdr);
     sample.bitrateKbps = bitrateKbps;
-    // This flag is only a UI warning. A short synthetic decode test cannot
-    // decide whether a lower bitrate looks good for the user's game.
-    sample.qualityFit = bitrateKbps >= pyroWaveRecommendedKbps(width, height, fps, chroma444, hdr);
-
     pyrowave_encoder_create_info info = {};
     info.device = device;
     info.width = width;
@@ -263,18 +361,25 @@ Sample runSample(pyrowave_device device, Renderer& renderer, int width, int heig
     if (framed.empty()) return sample;
 
     sample.wireKbps = int(double(framed.size()) * 8.0 * fps / 1000.0);
-    // The user asked for decoder calibration with a nominal 1 Gbps link.
-    // Bound the selected bitrate, but do not reject based on a synthetic
-    // frame's encoded size or an assumed host/FEC overhead percentage.
-    sample.linkFit = sample.bitrateKbps <= 900000;
+    // This synthetic source usually compresses far below the encoder's rate
+    // ceiling. Neither number measures what a host or LAN can sustain.
     PyroWaveDecoder decoder;
     PyroWaveDecoder::Config config;
     config.width = width;
     config.height = height;
     config.chroma444 = chroma444;
     config.tenBit = hdr;
+    if (!renderer.prepare(width, height, chroma444, hdr)) {
+        sample.error = QStringLiteral("Could not create renderer surfaces");
+        return sample;
+    }
+#ifdef Q_OS_LINUX
     config.vulkanPool = renderer.pool.get();
-    if (!decoder.initialize(config, nullptr)) {
+    const bool initialized = decoder.initialize(config, nullptr);
+#else
+    const bool initialized = decoder.initialize(config, renderer.pool.get());
+#endif
+    if (!initialized) {
         sample.error = QStringLiteral("Could not initialize decoder");
         return sample;
     }
@@ -302,44 +407,19 @@ Sample runSample(pyrowave_device device, Renderer& renderer, int width, int heig
         const auto arrival = origin + std::chrono::duration_cast<Clock::duration>(period * i);
         std::this_thread::sleep_until(arrival);
         const auto start = Clock::now();
-        sample.queueMaxMs = std::max(sample.queueMaxMs,
-                                     std::chrono::duration<double, std::milli>(start - arrival).count());
         if (!decodeOne()) {
             sample.error = QString::fromStdString(decoder.lastError());
             return sample;
         }
-        service.push_back(std::chrono::duration<double, std::milli>(Clock::now() - start).count());
+        const double serviceMs = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        service.push_back(serviceMs);
         sample.frames++;
-        // Obvious overload needs no longer run. This also bounds the UI wait.
-        if (i >= 7 && sample.queueMaxMs > 3.0 * period.count()) break;
     }
     sample.meanMs = std::accumulate(service.begin(), service.end(), 0.0) / service.size();
     std::sort(service.begin(), service.end());
     sample.p95Ms = service[size_t(std::ceil(service.size() * .95) - 1)];
     sample.valid = true;
-    // The stream's renderer shares this GPU and frames arrive in bursts, so
-    // decode must leave a quarter of each frame period to spare.
-    sample.sustainable = sample.p95Ms <= period.count() * 0.75 &&
-                         sample.queueMaxMs < period.count() / 2.0;
     return sample;
-}
-
-Sample calibrateSample(pyrowave_device device, Renderer& renderer, int width, int height, int fps,
-                       bool chroma444, bool hdr)
-{
-    const int startingKbps = targetBitrateKbps(width, height, fps, chroma444, hdr);
-    Sample first = runSample(device, renderer, width, height, fps, chroma444, hdr,
-                             std::min(startingKbps, 900000));
-    if (!first.valid || (first.sustainable && first.linkFit)) return first;
-
-    const double periodMs = 1000.0 / fps;
-    if (first.p95Ms > 2.0 * periodMs) return first;
-
-    // One lower-rate probe is enough to find a useful fallback without
-    // turning calibration into a long bitrate search.
-    const int lowerKbps = (first.bitrateKbps * 3 / 4) / 5000 * 5000;
-    if (lowerKbps >= first.bitrateKbps) return first;
-    return runSample(device, renderer, width, height, fps, chroma444, hdr, lowerKbps);
 }
 
 Sweep runSweep(int fps)
@@ -353,16 +433,30 @@ Sweep runSweep(int fps)
     Renderer renderer;
     if (!renderer.create()) {
         pyrowave_device_destroy(device);
-        result.error = QStringLiteral("The Vulkan device cannot decode into renderer surfaces");
+        result.error = QStringLiteral("Could not create a GPU renderer for PyroWave calibration");
         return result;
     }
     const int resolutions[][2] = {{3840, 2160}, {2560, 1440}, {1920, 1080},
-                                  {1280, 800}, {1280, 720}};
+#ifdef Q_OS_LINUX
+                                  {1280, 800},
+#endif
+                                  {1280, 720}};
     for (const auto& resolution : resolutions) {
         for (bool chroma444 : {true, false}) {
             for (bool hdr : {true, false}) {
-                result.samples.push_back(calibrateSample(device, renderer, resolution[0], resolution[1], fps,
-                                                         chroma444, hdr));
+                Sample sample = runSample(device, renderer, resolution[0], resolution[1], fps,
+                                          chroma444, hdr,
+                                          targetBitrateKbps(resolution[0], resolution[1], fps,
+                                                            chroma444, hdr));
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "PyroWave decode test: %dx%d %s %d-bit %d FPS, payload %d kbps, guide %d kbps, "
+                            "p95 %.2f ms, valid %d%s%s",
+                            sample.width, sample.height, sample.chroma444 ? "4:4:4" : "4:2:0",
+                            sample.hdr ? 10 : 8, fps, sample.wireKbps, sample.requiredKbps,
+                            sample.p95Ms, sample.valid,
+                            sample.error.isEmpty() ? "" : ", error: ",
+                            sample.error.isEmpty() ? "" : sample.error.toUtf8().constData());
+                result.samples.push_back(std::move(sample));
             }
         }
     }
@@ -379,16 +473,12 @@ QVariantMap toMap(const Sample& sample)
             {QStringLiteral("chroma444"), sample.chroma444},
             {QStringLiteral("hdr"), sample.hdr},
             {QStringLiteral("valid"), sample.valid},
-            {QStringLiteral("sustainable"), sample.sustainable},
-            {QStringLiteral("linkFit"), sample.linkFit},
-            {QStringLiteral("qualityFit"), sample.qualityFit},
             {QStringLiteral("requiredKbps"), sample.requiredKbps},
             {QStringLiteral("bitrateKbps"), sample.bitrateKbps},
             {QStringLiteral("wireKbps"), sample.wireKbps},
             {QStringLiteral("frames"), sample.frames},
             {QStringLiteral("meanMs"), sample.meanMs},
             {QStringLiteral("p95Ms"), sample.p95Ms},
-            {QStringLiteral("queueMaxMs"), sample.queueMaxMs},
             {QStringLiteral("error"), sample.error}};
 }
 
@@ -419,9 +509,9 @@ void PyroWaveCalibrator::start(int fps)
         emit changed();
         return;
     }
-#if !defined(HAVE_PYROWAVE) || !defined(Q_OS_LINUX)
+#if !defined(HAVE_PYROWAVE) || (!defined(Q_OS_LINUX) && !defined(Q_OS_WIN32))
     m_Results.clear();
-    m_Message = tr("Local PyroWave calibration is available on Linux with Vulkan decoding.");
+    m_Message = tr("Local PyroWave calibration requires a supported GPU decoder.");
     emit changed();
 #else
     m_Running = true;
@@ -438,7 +528,7 @@ void PyroWaveCalibrator::start(int fps)
                 m_Message = sweep.error;
             }
             else {
-                m_Message = tr("Dimmed options missed the short decode test. You can still select one and check its live frame rate.");
+                m_Message = tr("Local decode test complete. Results do not certify a streaming profile or change settings.");
             }
             emit changed();
         }, Qt::QueuedConnection);
