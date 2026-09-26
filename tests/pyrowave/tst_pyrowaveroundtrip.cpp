@@ -434,7 +434,7 @@ bool decodeWithLostPayload(pyrowave_decoder decoder, std::vector<uint8_t> framed
     }
     // As PyroWaveDecoder does: the parser vouches for the coarsest level
     if (!frame.coarseLevelIntact ||
-            !pyrowave_decoder_decode_is_ready_with_sideband(decoder, true, 0, 0.9f, nullptr, 0)) {
+            !pyrowave_decoder_decode_is_ready_with_sideband(decoder, true, 0, 0.0f, nullptr, 0)) {
         return false;
     }
 

@@ -240,9 +240,9 @@ above makes a record boundary; before that the rest of the frame is given up.
 
 The coarsest level is intact when none of the announced critical packets was lost
 (without an announcement: when no loss came before the first finer record). The
-frame is then decoded if more than 90% of its records arrived
-(`pyrowave_decoder_decode_is_ready_with_sideband` with no pristine-band
-requirement); missing finer blocks decode as zero coefficients, which blurs their
+frame is then decoded however many finer records were lost
+(`pyrowave_decoder_decode_is_ready_with_sideband` with no pristine-band or
+received-ratio requirement); missing finer blocks decode as zero coefficients, which blurs their
 area for that frame. Losing the packets right after the critical ones blurs the
 most, since they hold the next-coarsest level. PyroWave's own pristine-band check
 is not used because it cannot tell a lost block from an all-zero block that was

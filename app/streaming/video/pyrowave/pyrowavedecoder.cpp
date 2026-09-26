@@ -417,16 +417,17 @@ bool PyroWaveDecoder::decode(const uint8_t* data, size_t size,
         }
     }
     else {
-        // A partial frame decodes if its coarsest wavelet level is intact and
-        // more than 90% of its blocks arrived; missing detail decodes as blur.
+        // A partial frame decodes whenever its coarsest wavelet level is
+        // intact. The host protects that level with parity and nothing else,
+        // so every other loss decodes as blur over the area it covered.
         // The parser checks the coarsest level: PyroWave's own check cannot tell
         // a lost block from an all-zero one that was never sent.
         if (!impl.parsed.coarseLevelIntact) {
             m_LastError = "part of the coarsest wavelet level was lost";
             return false;
         }
-        if (!pyrowave_decoder_decode_is_ready_with_sideband(impl.decoder, true, 0, 0.9f, nullptr, 0)) {
-            m_LastError = "too little of the frame arrived (" + std::to_string(impl.parsed.blockRecords) +
+        if (!pyrowave_decoder_decode_is_ready_with_sideband(impl.decoder, true, 0, 0.0f, nullptr, 0)) {
+            m_LastError = "no decodable blocks arrived (" + std::to_string(impl.parsed.blockRecords) +
                           " of " + std::to_string(impl.parsed.announcedBlocks) + " blocks)";
             return false;
         }
