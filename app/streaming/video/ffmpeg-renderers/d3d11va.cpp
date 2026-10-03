@@ -2,6 +2,8 @@
 #include <initguid.h>
 
 #include "d3d11va.h"
+#include "d3d11bindpolicy.h"
+#include "d3d11fencewait.h"
 #include "dxutil.h"
 #include "path.h"
 #include "utils.h"
@@ -17,6 +19,7 @@
 
 #include <cwchar>
 #include <limits>
+#include <thread>
 
 using Microsoft::WRL::ComPtr;
 
@@ -58,6 +61,7 @@ static const std::array<const char*, D3D11VARenderer::PixelShaders::_COUNT> k_Vi
     "d3d11_yuv420_pixel.fxc",
     "d3d11_ayuv_pixel.fxc",
     "d3d11_y410_pixel.fxc",
+    "d3d11_yuv_planar_pixel.fxc",
 };
 
 namespace {
@@ -218,9 +222,11 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_VrrSuspended(false),
       m_VrrFallbackReason(VrrFallbackReason::InitializationFailed),
       m_VrrFramePrepared(false),
-      m_VrrContextLocked(false),
+      m_VrrPreparedDecodeBoundary(0),
+      m_VrrPresentationLocked(false),
       m_VrrPresentReadyFenceValue(0),
       m_VrrPresentReadyFenceEvent(nullptr),
+      m_VrrDecodeReadyEvent(nullptr),
       m_VrrPresentReadyAvailable(false),
       m_VrrGpuReadyAttempted(false),
       m_VrrGpuReadySignalResultValid(false),
@@ -254,6 +260,7 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_HwDeviceContext(nullptr)
 {
     m_ContextLock = SDL_CreateMutex();
+    m_PresentationLock = SDL_CreateMutex();
     DwmEnableMMCSS(TRUE);
 }
 
@@ -262,10 +269,11 @@ D3D11VARenderer::~D3D11VARenderer()
     DwmEnableMMCSS(FALSE);
 
     // The VRR worker may be cancelled after preparation but before Present.
-    // Release the retained D3D context lock before destroying it or any
+    // Release the retained presentation lock before destroying it or any
     // back-buffer objects.
     cancelFrame();
     closeVrrRasterSource();
+    SDL_DestroyMutex(m_PresentationLock);
     SDL_DestroyMutex(m_ContextLock);
 
     m_VideoVertexBuffer.Reset();
@@ -303,13 +311,20 @@ D3D11VARenderer::~D3D11VARenderer()
     m_RenderD2RFence.Reset();
     m_RenderR2DFence.Reset();
 
+    m_PyroWaveSurfaces.reset();
+
     m_VrrPresentReadyFence.Reset();
     if (m_VrrPresentReadyFenceEvent != nullptr) {
         CloseHandle(m_VrrPresentReadyFenceEvent);
         m_VrrPresentReadyFenceEvent = nullptr;
     }
+    if (m_VrrDecodeReadyEvent != nullptr) {
+        CloseHandle(m_VrrDecodeReadyEvent);
+        m_VrrDecodeReadyEvent = nullptr;
+    }
 
     m_RenderTargetView.Reset();
+    m_CompositionPresenter.reset();
     m_SwapChain.Reset();
 
     m_RenderSharedTextureArray.Reset();
@@ -447,6 +462,7 @@ Exit:
 bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapterNotFound)
 {
     const D3D_FEATURE_LEVEL supportedFeatureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    const bool tryComposition = m_CompositionRequested && D3D11CompositionPresenter::runtimeSupported();
     bool success = false;
     ComPtr<IDXGIAdapter1> adapter;
     DXGI_ADAPTER_DESC1 adapterDesc;
@@ -496,6 +512,8 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
                            D3D_DRIVER_TYPE_UNKNOWN,
                            nullptr,
                            D3D11_CREATE_DEVICE_VIDEO_SUPPORT
+                               | (tryComposition ? D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                                  D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS : 0)
                                | (m_DebugLayer ? D3D11_CREATE_DEVICE_DEBUG : 0),
                            supportedFeatureLevels,
                            ARRAYSIZE(supportedFeatureLevels),
@@ -503,6 +521,16 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
                            &device,
                            &featureLevel,
                            &deviceContext);
+    if (tryComposition && (FAILED(hr) || !D3D11CompositionPresenter::deviceSupported(device.Get()))) {
+        // A Windows 11 version alone does not establish driver support. The
+        // legacy device should retain its normal driver threading policy.
+        deviceContext.Reset();
+        device.Reset();
+        hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                              D3D11_CREATE_DEVICE_VIDEO_SUPPORT | (m_DebugLayer ? D3D11_CREATE_DEVICE_DEBUG : 0),
+                              supportedFeatureLevels, ARRAYSIZE(supportedFeatureLevels), D3D11_SDK_VERSION,
+                              &device, &featureLevel, &deviceContext);
+    }
     if (FAILED(hr)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "D3D11CreateDevice() failed: %x",
@@ -556,6 +584,27 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
         }
     }
 
+    if (isPyroWave()) {
+        // PyroWave decodes in Vulkan into textures owned by this device, and
+        // the two APIs synchronize through shared monitored fences.
+        if (m_FenceType != SupportedFenceType::Monitored || featureLevel < D3D_FEATURE_LEVEL_11_0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "PyroWave needs monitored D3D11 fences on this GPU");
+            goto Exit;
+        }
+
+        m_DecodeDevice = m_RenderDevice;
+        m_DecodeDeviceContext = m_RenderDeviceContext;
+        m_BindDecoderOutputTextures = false;
+        m_DevicesWithCodecSupport++;
+        m_RenderAdapterIndex = adapterIndex;
+        m_RenderAdapterLuid = adapterDesc.AdapterLuid;
+        m_VrrRenderAdapterLuidValid = true;
+        m_VrrRenderAdapterLuid = packLuid(adapterDesc.AdapterLuid);
+        success = true;
+        goto Exit;
+    }
+
     bool separateDevices;
     if (Utils::getEnvironmentVariableOverride("D3D11VA_FORCE_SEPARATE_DEVICES", &separateDevices)) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -600,22 +649,19 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
                     "Using D3D11VA_FORCE_BIND to override default bind/copy logic");
     }
     else {
-        // Skip copying to our own internal texture on Intel GPUs due to
-        // significant performance impact of the extra copy. See:
-        // https://github.com/moonlight-stream/moonlight-qt/issues/1304
-        //
-        // Also bind SRVs when using separate decoding and rendering
-        // devices as this improves render times by about 2x on my
-        // Ryzen 3300U system. The fences we use between decoding
-        // and rendering contexts should hopefully avoid any of the
-        // synchronization issues we've seen between decoder and SRVs.
-        m_BindDecoderOutputTextures = adapterDesc.VendorId == 0x8086 || separateDevices;
+        // Preserve existing Intel/separate-device binding; avoid the extra
+        // full-frame copy on eligible single-device streams only at 4K+.
+        m_BindDecoderOutputTextures = d3d11ShouldBindDecoderOutputTextures(
+            adapterDesc.VendorId == 0x8086, separateDevices,
+            m_FenceType != SupportedFenceType::None ||
+                featureLevel >= D3D_FEATURE_LEVEL_11_1,
+            m_DecoderParams.width, m_DecoderParams.height);
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Decoder texture access: %s (fence: %s)",
                 m_BindDecoderOutputTextures ? "bind" : "copy",
-                 m_FenceType == SupportedFenceType::Monitored ? "monitored" :
+                m_FenceType == SupportedFenceType::Monitored ? "monitored" :
                     (m_FenceType == SupportedFenceType::NonMonitored ? "non-monitored" : "unsupported"));
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -654,6 +700,11 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     HRESULT hr;
 
     m_DecoderParams = *params;
+    // The composition API supplies display events, but it does not implement
+    // the controller's per-frame tearing/synchronized presentation choice.
+    // Keep it available for capture comparisons without replacing DXGI VRR.
+    m_CompositionRequested = params->enableVrr &&
+        qgetenv("MOONLIGHT_VRR_COMPOSITION") == "1";
 
     if (qgetenv("D3D11VA_ENABLED") == "0") {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -774,7 +825,7 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
 
     // DXVA2 may let us take over for FSE V-sync off cases. However, if we don't have DXGI_FEATURE_PRESENT_ALLOW_TEARING
     // then we should not attempt to do this unless there's no other option (HDR, DXVA2 failed in pass 1, etc).
-    if (!m_AllowTearing && !params->enableVsync && m_DecoderSelectionPass == 0 && !(params->videoFormat & VIDEO_FORMAT_MASK_10BIT) &&
+    if (!isPyroWave() && !m_AllowTearing && !params->enableVsync && m_DecoderSelectionPass == 0 && !(params->videoFormat & VIDEO_FORMAT_MASK_10BIT) &&
             (SDL_GetWindowFlags(params->window) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "Defaulting to DXVA2 for FSE without DXGI_FEATURE_PRESENT_ALLOW_TEARING support");
@@ -827,13 +878,40 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     // of the capability evidence and must be settled before VRR starts.
     refreshVrrDisplayState();
 
-    if (m_DecoderParams.enableVrr && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
+    if (m_CompositionRequested &&
+            m_VrrFallbackReason == VrrFallbackReason::NoFallback && m_VrrDisplayTiming.pathValid) {
+        LUID adapter = {};
+        adapter.LowPart = static_cast<DWORD>(m_VrrDisplayTiming.sourceAdapterLuid);
+        adapter.HighPart = static_cast<LONG>(m_VrrDisplayTiming.sourceAdapterLuid >> 32);
+        const HRESULT compositionResult = m_CompositionPresenter.initialize(
+            m_RenderDevice.Get(), info.info.win.window, swapChainDesc.Width, swapChainDesc.Height,
+            swapChainDesc.Format, adapter, m_VrrDisplayTiming.sourceId);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "D3D11 VRR backend enabled: refresh=%d Hz",
-                    m_DecoderParams.vrrDisplayRefreshHz);
+                    "Windows presentation timing: %s (result: %x)",
+                    SUCCEEDED(compositionResult) ? "composition manager active" : "DXGI estimate fallback",
+                    compositionResult);
     }
 
-    {
+    if (m_DecoderParams.enableVrr && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR backend enabled: refresh=%d Hz, presentation=%s",
+                    m_DecoderParams.vrrDisplayRefreshHz,
+                    m_CompositionPresenter.active() ? "composition diagnostic (native ordering)" :
+                        "DXGI (per-frame tearing/synchronized, estimated timing)");
+    }
+
+    if (isPyroWave()) {
+        // The PyroWave decoder writes into these surfaces; FFmpeg is not involved.
+        m_PyroWaveSurfaces = std::make_unique<D3D11PyroWaveSurfaces>();
+        if (!m_PyroWaveSurfaces->initialize(m_RenderDevice.Get(), m_RenderAdapterLuid,
+                                            params->width, params->height,
+                                            (params->videoFormat & VIDEO_FORMAT_MASK_YUV444) != 0,
+                                            (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) != 0)) {
+            m_PyroWaveSurfaces.reset();
+            return false;
+        }
+    }
+    else {
         m_HwDeviceContext = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
         if (!m_HwDeviceContext) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -928,21 +1006,16 @@ bool D3D11VARenderer::prepareDecoderContextInGetFormat(AVCodecContext *context, 
 
 void D3D11VARenderer::renderFrame(AVFrame* frame)
 {
-    // Acquire the context lock for rendering to prevent concurrent
-    // access from inside FFmpeg's decoding code
-    if (m_DecodeDevice == m_RenderDevice) {
-        lockContext(this);
-    }
+    // Serialize with swapchain resizing. On a shared device this also
+    // excludes FFmpeg's decoder from the common immediate context.
+    lockPresentation();
 
     // Keep the existing fixed/unpaced behavior intact while sharing the same
     // preparation and final Present helpers used by the opt-in VRR backend.
     bool prepared = prepareFrameForPresent(frame);
-    HRESULT hr = prepared ? presentPreparedFrame(legacyPresentFlags()) : E_FAIL;
+    HRESULT hr = prepared ? presentPreparedFrame({0, legacyPresentFlags()}) : E_FAIL;
 
-    if (m_DecodeDevice == m_RenderDevice) {
-        // Release the context lock
-        unlockContext(this);
-    }
+    unlockPresentation();
 
     if (FAILED(hr)) {
         if (prepared) {
@@ -1019,10 +1092,15 @@ void D3D11VARenderer::bindVideoVertexBuffer(bool frameChanged, AVFrame* frame)
         SDL_FRect renderRect;
         StreamUtils::screenSpaceToNormalizedDeviceCoords(&dst, &renderRect, m_DisplayWidth, m_DisplayHeight);
 
-        // Don't sample from the alignment padding area
-        auto framesContext = (AVHWFramesContext*)frame->hw_frames_ctx->data;
-        float uMax = (float)frame->width / framesContext->width;
-        float vMax = (float)frame->height / framesContext->height;
+        // Don't sample from the alignment padding area. PyroWave planes have
+        // no padding and no FFmpeg frames context.
+        float uMax = 1.0f;
+        float vMax = 1.0f;
+        if (frame->hw_frames_ctx != nullptr) {
+            auto framesContext = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+            uMax = (float)frame->width / framesContext->width;
+            vMax = (float)frame->height / framesContext->height;
+        }
 
         VERTEX verts[] =
         {
@@ -1061,9 +1139,21 @@ void D3D11VARenderer::bindVideoVertexBuffer(bool frameChanged, AVFrame* frame)
 void D3D11VARenderer::bindColorConversion(bool frameChanged, AVFrame* frame)
 {
     bool yuv444 = (m_DecoderParams.videoFormat & VIDEO_FORMAT_MASK_YUV444);
-    auto framesContext = (AVHWFramesContext*)frame->hw_frames_ctx->data;
 
-    if (yuv444) {
+    // PyroWave planes are exactly the frame size; D3D11VA surfaces may be padded
+    int textureWidth = frame->width;
+    int textureHeight = frame->height;
+    if (frame->hw_frames_ctx != nullptr) {
+        auto framesContext = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+        textureWidth = framesContext->width;
+        textureHeight = framesContext->height;
+    }
+
+    if (isPyroWave()) {
+        // Separate Y, Cb and Cr planes at 4:2:0 or 4:4:4
+        m_RenderDeviceContext->PSSetShader(m_VideoPixelShaders[PixelShaders::GENERIC_YUV_PLANAR].Get(), nullptr, 0);
+    }
+    else if (yuv444) {
         // We'll need to use one of the 4:4:4 shaders for this pixel format
         switch (m_TextureFormat)
         {
@@ -1111,14 +1201,14 @@ void D3D11VARenderer::bindColorConversion(bool frameChanged, AVFrame* frame)
 
     std::array<float, 2> chromaOffset;
     getFrameChromaCositingOffsets(frame, chromaOffset);
-    constBuf.chromaOffset[0] = chromaOffset[0] / framesContext->width;
-    constBuf.chromaOffset[1] = chromaOffset[1] / framesContext->height;
+    constBuf.chromaOffset[0] = chromaOffset[0] / textureWidth;
+    constBuf.chromaOffset[1] = chromaOffset[1] / textureHeight;
 
     // Limit chroma texcoords to avoid sampling from alignment texels
-    constBuf.chromaUVMax[0] = frame->width != framesContext->width ?
-                                  ((float)(frame->width - 1) / framesContext->width) : 1.0f;
-    constBuf.chromaUVMax[1] = frame->height != (int)framesContext->height ?
-                                  ((float)(frame->height - 1) / framesContext->height) : 1.0f;
+    constBuf.chromaUVMax[0] = frame->width != textureWidth ?
+                                  ((float)(frame->width - 1) / textureWidth) : 1.0f;
+    constBuf.chromaUVMax[1] = frame->height != textureHeight ?
+                                  ((float)(frame->height - 1) / textureHeight) : 1.0f;
 
     D3D11_SUBRESOURCE_DATA constData = {};
     constData.pSysMem = &constBuf;
@@ -1151,6 +1241,14 @@ uint64_t D3D11VARenderer::captureDecodeBoundary()
     const UINT64 fenceValue = m_D2RFenceValue++;
     const HRESULT hr = m_DecodeDeviceContext->Signal(
         m_DecodeD2RFence.Get(), fenceValue);
+    if (SUCCEEDED(hr)) {
+        // Signal belongs to the decoder's immediate context. Flushing the
+        // render context cannot dispatch it. Submit the boundary now so the
+        // GPU-side render wait can progress without another compressed frame
+        // arriving to flush decoder commands. Flush submits; it does not wait
+        // for decode completion on the CPU.
+        m_DecodeDeviceContext->Flush();
+    }
     unlockContext(this);
 
     if (FAILED(hr)) {
@@ -1162,8 +1260,196 @@ uint64_t D3D11VARenderer::captureDecodeBoundary()
     return fenceValue;
 }
 
-void D3D11VARenderer::renderVideo(AVFrame* frame, uint64_t decodeBoundary)
+uint64_t D3D11VARenderer::waitForDecode(AVFrame* frame, uint64_t decodeBoundary)
 {
+    if (auto* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
+        return waitForPyroWaveDecode(pyroWaveRef);
+    }
+
+    if (decodeBoundary == 0 || m_DecodeD2RFence == nullptr) {
+        return 0;
+    }
+
+    const uint64_t startUs = LiGetMicroseconds();
+    const auto completed = m_DecodeD2RFence->GetCompletedValue();
+    if (completed == (std::numeric_limits<UINT64>::max)()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "D3D11 VRR decode-ready fence reported device removal (target=%llu device=%x)",
+            static_cast<unsigned long long>(decodeBoundary),
+            m_DecodeDevice->GetDeviceRemovedReason());
+        m_VrrPresentReadyAvailable = false;
+        m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+        queueRenderDeviceReset();
+        return 0;
+    }
+    if (completed >= decodeBoundary) {
+        return 0;
+    }
+
+    // renderVideo() still queues an ID3D11DeviceContext4::Wait for this
+    // boundary, which is the correctness mechanism. This CPU wait supplies
+    // the decode-completion observation that production source mapping is
+    // anchored to, as vaSyncSurface() does on Linux. Without it the mapping
+    // falls back to decoder output, which precedes the hardware decode, and
+    // the whole decode duration must fit inside the capped playout buffer.
+    // Only a monitored fence reports GPU progress to the CPU.
+    if (m_FenceType != SupportedFenceType::Monitored ||
+            m_VrrDecodeReadyEvent == nullptr) {
+        return 0;
+    }
+
+    // The decoder thread already signalled and flushed this value. Fence
+    // completion needs neither immediate context, so take no context lock:
+    // FFmpeg keeps submitting the next frame while this worker waits.
+    const HRESULT eventResult = m_DecodeD2RFence->SetEventOnCompletion(
+        decodeBoundary, m_VrrDecodeReadyEvent);
+    DWORD lastEventResult = WAIT_TIMEOUT;
+    const auto result = D3D11FenceWait::wait(decodeBoundary, LiGetMicroseconds,
+        [&] { return m_DecodeD2RFence->GetCompletedValue(); },
+        [&](unsigned timeoutMs) {
+            if (FAILED(eventResult)) {
+                Sleep(timeoutMs);
+                return true;
+            }
+            lastEventResult = WaitForSingleObject(m_VrrDecodeReadyEvent, timeoutMs);
+            return lastEventResult == WAIT_OBJECT_0 || lastEventResult == WAIT_TIMEOUT;
+        });
+    if (result.status != D3D11FenceWait::Status::Complete) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "D3D11 VRR decode-ready fence wait failed (target=%llu completed=%llu device=%x)",
+            static_cast<unsigned long long>(decodeBoundary),
+            static_cast<unsigned long long>(result.completedValue),
+            m_DecodeDevice->GetDeviceRemovedReason());
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "D3D11 VRR decode-ready wait detail: stop=%s elapsed_us=%llu wait_calls=%u event_setup=%x event=%lu render_device=%x",
+            D3D11FenceWait::stopReasonName(result.stopReason),
+            static_cast<unsigned long long>(result.elapsedUs), result.waitCalls,
+            eventResult, static_cast<unsigned long>(lastEventResult),
+            m_RenderDevice->GetDeviceRemovedReason());
+        m_VrrPresentReadyAvailable = false;
+        m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+        queueRenderDeviceReset();
+        return 0; // Failure must never advertise GPU readiness.
+    }
+    return LiGetMicroseconds() - startUs;
+}
+
+bool D3D11VARenderer::renderPyroWaveVideo(AVFrame* frame, PyroWaveFrameRef* ref)
+{
+    const auto* views = m_PyroWaveSurfaces ? m_PyroWaveSurfaces->planeViews(ref->surface) : nullptr;
+    if (views == nullptr) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave frame references unknown surface %d", ref->surface);
+        return false;
+    }
+
+    // The GPU-side wait is the correctness mechanism; the CPU wait in
+    // waitForDecode() only provides the VRR readiness observation.
+    if (!m_PyroWaveSurfaces->waitForDecode(m_RenderDeviceContext.Get(), ref)) {
+        if (m_DecoderParams.enableVrr) {
+            m_VrrPresentReadyAvailable = false;
+            m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+        }
+        queueRenderDeviceReset();
+        return false;
+    }
+
+    bool frameChanged = hasFrameFormatChanged(frame);
+    bindVideoVertexBuffer(frameChanged, frame);
+    bindColorConversion(frameChanged, frame);
+
+    ID3D11ShaderResourceView* frameSrvs[] = { (*views)[0].Get(), (*views)[1].Get(), (*views)[2].Get() };
+    m_RenderDeviceContext->PSSetShaderResources(0, 3, frameSrvs);
+    m_RenderDeviceContext->DrawIndexed(6, 0, 0);
+
+    ID3D11ShaderResourceView* nullSrvs[3] = {};
+    m_RenderDeviceContext->PSSetShaderResources(0, 3, nullSrvs);
+
+    // Hand the surface back once this read retires on the GPU
+    if (!m_PyroWaveSurfaces->signalRelease(m_RenderDeviceContext.Get(), ref)) {
+        queueRenderDeviceReset();
+        return false;
+    }
+
+    return true;
+}
+
+uint64_t D3D11VARenderer::waitForPyroWaveDecode(const PyroWaveFrameRef* ref)
+{
+    ID3D11Fence* fence = m_PyroWaveSurfaces ? m_PyroWaveSurfaces->decodeFence() : nullptr;
+    if (fence == nullptr || m_VrrDecodeReadyEvent == nullptr) {
+        return 0;
+    }
+
+    const uint64_t target = ref->decodeFenceValue;
+    const uint64_t startUs = LiGetMicroseconds();
+    const auto completed = fence->GetCompletedValue();
+    if (completed == (std::numeric_limits<UINT64>::max)()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave decode fence reported device removal (target=%llu)",
+                     static_cast<unsigned long long>(target));
+        m_VrrPresentReadyAvailable = false;
+        m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+        queueRenderDeviceReset();
+        return 0;
+    }
+    if (completed >= target) {
+        return 0;
+    }
+
+    // Vulkan signals this fence when the decode finishes; no D3D11 context
+    // lock is involved.
+    const HRESULT eventResult = fence->SetEventOnCompletion(target, m_VrrDecodeReadyEvent);
+    const auto result = D3D11FenceWait::wait(target, LiGetMicroseconds,
+        [&] { return fence->GetCompletedValue(); },
+        [&](unsigned timeoutMs) {
+            if (FAILED(eventResult)) {
+                Sleep(timeoutMs);
+                return true;
+            }
+            const DWORD waitResult = WaitForSingleObject(m_VrrDecodeReadyEvent, timeoutMs);
+            return waitResult == WAIT_OBJECT_0 || waitResult == WAIT_TIMEOUT;
+        });
+    if (result.status != D3D11FenceWait::Status::Complete) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave decode fence wait failed (target=%llu completed=%llu stop=%s elapsed_us=%llu)",
+                     static_cast<unsigned long long>(target),
+                     static_cast<unsigned long long>(result.completedValue),
+                     D3D11FenceWait::stopReasonName(result.stopReason),
+                     static_cast<unsigned long long>(result.elapsedUs));
+        m_VrrPresentReadyAvailable = false;
+        m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+        queueRenderDeviceReset();
+        return 0; // Failure must never advertise GPU readiness.
+    }
+    return LiGetMicroseconds() - startUs;
+}
+
+IPyroWaveSurfacePool* D3D11VARenderer::getPyroWaveSurfacePool()
+{
+    return m_PyroWaveSurfaces.get();
+}
+
+bool D3D11VARenderer::renderVideo(AVFrame* frame, uint64_t decodeBoundary)
+{
+    if (auto* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
+        return renderPyroWaveVideo(frame, pyroWaveRef);
+    }
+
+    const auto failGpuSynchronization = [this]() {
+        // The asynchronous VRR path has no CPU decode wait to fall back on.
+        // Once an ordering primitive fails, presenting this frame could read
+        // an unfinished decoder surface or let the decoder recycle a surface
+        // still used by rendering. Force normal device recovery instead.
+        if (m_DecoderParams.enableVrr) {
+            m_VrrPresentReadyAvailable = false;
+            m_VrrFallbackReason =
+                VrrFallbackReason::AdaptivePresentationUnavailable;
+            queueRenderDeviceReset();
+        }
+        return false;
+    };
+
     // Insert a fence to force the render context to wait for the decode context to finish writing
     if (m_DecodeDevice != m_RenderDevice) {
         SDL_assert(m_DecodeD2RFence);
@@ -1172,25 +1458,48 @@ void D3D11VARenderer::renderVideo(AVFrame* frame, uint64_t decodeBoundary)
         if (decodeBoundary != 0) {
             // captureDecodeBoundary() inserted this signal before any later
             // frame could add decoder work. Wait for this frame only.
-            m_RenderDeviceContext->Wait(m_RenderD2RFence.Get(),
-                                        decodeBoundary);
+            const HRESULT hr = m_RenderDeviceContext->Wait(m_RenderD2RFence.Get(),
+                                                           decodeBoundary);
+            if (FAILED(hr)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 decode-to-render Wait() failed: %x (target=%llu)",
+                    hr, static_cast<unsigned long long>(decodeBoundary));
+                return failGpuSynchronization();
+            }
         }
         else {
             // Legacy rendering and a failed boundary capture retain the
-            // conservative render-time signal.
-            bool acquiredContextLock = false;
-            if (!m_VrrContextLocked) {
-                lockContext(this);
-                acquiredContextLock = true;
-            }
+            // conservative render-time signal. Only these decode-context calls
+            // need FFmpeg's lock; separate-device presentation never holds it.
+            lockContext(this);
             const UINT64 fenceValue = m_D2RFenceValue++;
-            if (SUCCEEDED(m_DecodeDeviceContext->Signal(
-                    m_DecodeD2RFence.Get(), fenceValue))) {
-                m_RenderDeviceContext->Wait(m_RenderD2RFence.Get(),
-                                            fenceValue);
+            const HRESULT signalResult = m_DecodeDeviceContext->Signal(
+                m_DecodeD2RFence.Get(), fenceValue);
+            bool synchronized = false;
+            if (SUCCEEDED(signalResult)) {
+                // The fallback signal needs the same producer submission as
+                // the exact per-frame boundary above, before the other device
+                // can wait on it. This does not wait for the GPU to finish.
+                m_DecodeDeviceContext->Flush();
+                const HRESULT waitResult = m_RenderDeviceContext->Wait(
+                    m_RenderD2RFence.Get(), fenceValue);
+                if (FAILED(waitResult)) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                        "D3D11 decode-to-render Wait() failed: %x (target=%llu)",
+                        waitResult, static_cast<unsigned long long>(fenceValue));
+                }
+                else {
+                    synchronized = true;
+                }
             }
-            if (acquiredContextLock) {
-                unlockContext(this);
+            else {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 decode-to-render Signal() failed: %x (target=%llu)",
+                    signalResult, static_cast<unsigned long long>(fenceValue));
+            }
+            unlockContext(this);
+            if (!synchronized) {
+                return failGpuSynchronization();
             }
         }
     }
@@ -1205,7 +1514,7 @@ void D3D11VARenderer::renderVideo(AVFrame* frame, uint64_t decodeBoundary)
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                          "Unexpected texture index: %u",
                          srvIndex);
-            return;
+            return false;
         }
     }
     else {
@@ -1247,20 +1556,32 @@ void D3D11VARenderer::renderVideo(AVFrame* frame, uint64_t decodeBoundary)
         // we insert a wait for the previous frame's fence value rather than the current one.
         // This means the fence should generally not cause a pipeline bubble for the decoder
         // unless rendering is taking much longer than expected.
-        if (SUCCEEDED(m_RenderDeviceContext->Signal(m_RenderR2DFence.Get(), m_R2DFenceValue))) {
-            bool acquiredContextLock = false;
-            if (!m_VrrContextLocked) {
-                lockContext(this);
-                acquiredContextLock = true;
-            }
+        const HRESULT signalResult = m_RenderDeviceContext->Signal(m_RenderR2DFence.Get(), m_R2DFenceValue);
+        if (SUCCEEDED(signalResult)) {
+            lockContext(this);
             SDL_assert(m_R2DFenceValue > 0);
-            m_DecodeDeviceContext->Wait(m_DecodeR2DFence.Get(), m_R2DFenceValue - 1);
-            if (acquiredContextLock) {
-                unlockContext(this);
+            const HRESULT waitResult = m_DecodeDeviceContext->Wait(
+                m_DecodeR2DFence.Get(), m_R2DFenceValue - 1);
+            if (FAILED(waitResult)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 render-to-decode Wait() failed: %x (target=%llu)",
+                    waitResult, static_cast<unsigned long long>(m_R2DFenceValue - 1));
             }
+            unlockContext(this);
             m_R2DFenceValue++;
+            if (FAILED(waitResult)) {
+                return failGpuSynchronization();
+            }
+        }
+        else {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "D3D11 render-to-decode Signal() failed: %x (target=%llu)",
+                signalResult, static_cast<unsigned long long>(m_R2DFenceValue));
+            return failGpuSynchronization();
         }
     }
+
+    return true;
 }
 
 // This function must NOT use any DXGI or ID3D11DeviceContext methods
@@ -1400,6 +1721,11 @@ bool D3D11VARenderer::createOverlayVertexBuffer(Overlay::OverlayType type, int w
 bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
 {
     if (stateInfo->stateChangeFlags & WINDOW_STATE_CHANGE_DISPLAY) {
+        if (m_CompositionPresenter.active()) {
+            // Recreate the manager for the new output. Its statistics identity
+            // and directly displayable allocations belong to the old output.
+            return false;
+        }
         int adapterIndex, outputIndex;
         if (!SDL_DXGIGetOutputInfo(stateInfo->displayIndex,
                                    &adapterIndex, &outputIndex)) {
@@ -1423,15 +1749,13 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
 
         // A same-GPU display move keeps this renderer alive. Serialize the
         // refreshed swapchain eligibility with VRR preparation and Present.
-        lockContext(this);
-        if (m_VrrFramePrepared) {
-            // The worker may be waiting with a prepared back buffer while the
-            // decoder-facing context is intentionally unlocked. Discard that
-            // image before changing the display epoch.
-            releasePreparedVrrFrame();
+        lockPresentation();
+        if (!retirePreparedVrrFrameForMutation()) {
+            unlockPresentation();
+            return false;
         }
         refreshVrrDisplayState();
-        unlockContext(this);
+        unlockPresentation();
 
         // We've handled this state change
         stateInfo->stateChangeFlags &= ~WINDOW_STATE_CHANGE_DISPLAY;
@@ -1443,14 +1767,12 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         DXGI_SWAP_CHAIN_DESC1 swapchainDesc;
         m_SwapChain->GetDesc1(&swapchainDesc);
 
-        // Lock the context to avoid concurrent rendering
-        lockContext(this);
+        // Exclude concurrent rendering and presentation
+        lockPresentation();
 
-        if (m_VrrFramePrepared) {
-            // ResizeBuffers requires every back-buffer binding to be released.
-            // The worker will observe the missing prepared frame and cancel
-            // its stale presentation decision.
-            releasePreparedVrrFrame();
+        if (!retirePreparedVrrFrameForMutation()) {
+            unlockPresentation();
+            return false;
         }
 
         m_DisplayWidth = stateInfo->width;
@@ -1481,13 +1803,21 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                          "IDXGISwapChain::ResizeBuffers() failed: %x",
                          hr);
-            unlockContext(this);
+            unlockPresentation();
             return false;
+        }
+
+        if (m_CompositionPresenter.active()) {
+            hr = m_CompositionPresenter.resize(stateInfo->width, stateInfo->height, swapchainDesc.Format);
+            if (FAILED(hr)) {
+                unlockPresentation();
+                return false;
+            }
         }
 
         // Reset swapchain-dependent resources (RTV, viewport, etc)
         if (!setupSwapchainDependentResources()) {
-            unlockContext(this);
+            unlockPresentation();
             return false;
         }
 
@@ -1498,7 +1828,7 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         // new mode.
         refreshVrrDisplayState();
 
-        unlockContext(this);
+        unlockPresentation();
 
         // We've handled this state change
         stateInfo->stateChangeFlags &= ~WINDOW_STATE_CHANGE_SIZE;
@@ -1738,6 +2068,30 @@ void D3D11VARenderer::unlockContext(void *lock_ctx)
     SDL_UnlockMutex(me->m_ContextLock);
 }
 
+void D3D11VARenderer::lockPresentation()
+{
+    SDL_LockMutex(m_PresentationLock);
+
+    // A shared device has one immediate context for decoding and rendering,
+    // so rendering must also exclude FFmpeg. Separate devices must not take
+    // FFmpeg's lock here: holding it across Present serialized decode
+    // submission behind presentation, and the collisions line up with the
+    // cadence because the next frame's submission lands near this frame's
+    // target. renderVideo() locks the decode context only for its own calls.
+    if (m_DecodeDevice == m_RenderDevice) {
+        lockContext(this);
+    }
+}
+
+void D3D11VARenderer::unlockPresentation()
+{
+    if (m_DecodeDevice == m_RenderDevice) {
+        unlockContext(this);
+    }
+
+    SDL_UnlockMutex(m_PresentationLock);
+}
+
 void D3D11VARenderer::initializeVrrPresentationState(SDL_Window* window,
                                                        DXGI_SWAP_CHAIN_DESC1* swapChainDesc)
 {
@@ -1768,6 +2122,11 @@ void D3D11VARenderer::initializeVrrPresentationState(SDL_Window* window,
         rasterSamplingEnv != nullptr &&
         rasterSamplingEnv[0] == '1' &&
         rasterSamplingEnv[1] == '\0';
+    const char* syncFlipsEnv = SDL_getenv("MOONLIGHT_VRR_SYNC_FLIPS");
+    m_VrrSyncFlips = syncFlipsEnv != nullptr &&
+        syncFlipsEnv[0] == '1' && syncFlipsEnv[1] == '\0';
+    m_VrrRasterGuardDisabled = false;
+    m_VrrRasterGuardTimeouts = 0;
     SDL_SysWMinfo windowInfo;
     SDL_VERSION(&windowInfo.version);
     if (window != nullptr &&
@@ -2001,15 +2360,17 @@ VrrFallbackReason D3D11VARenderer::evaluateVrrEligibility(
 
 void D3D11VARenderer::releasePreparedVrrFrame()
 {
+    m_CompositionPresenter.cancel();
     // Present() unbinds the render target itself.  A cancellation does not,
     // so explicitly remove the context's reference to the back buffer before
     // a resize/device reset can tear it down.
-    if ((m_VrrFramePrepared || m_VrrContextLocked) &&
+    if ((m_VrrFramePrepared || m_VrrPresentationLocked) &&
             m_RenderDeviceContext != nullptr) {
         m_RenderDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
     }
 
     m_VrrFramePrepared = false;
+    m_VrrPreparedDecodeBoundary = 0;
     m_VrrGpuReadyAttempted = false;
     m_VrrGpuReadySignalResultValid = false;
     m_VrrGpuReadySignalResult = 0;
@@ -2032,10 +2393,36 @@ void D3D11VARenderer::releasePreparedVrrFrame()
     m_VrrGpuReadyWaitStartUs = 0;
     m_VrrGpuReadyTimeUs = 0;
 
-    if (m_VrrContextLocked) {
-        unlockContext(this);
-        m_VrrContextLocked = false;
+    if (m_VrrPresentationLocked) {
+        // Publish that this path no longer owns the mutex before releasing
+        // it. A window callback can acquire the same mutex immediately after
+        // unlock and must never mistake its own ownership for ours.
+        m_VrrPresentationLocked = false;
+        unlockPresentation();
     }
+}
+
+bool D3D11VARenderer::retirePreparedVrrFrameForMutation()
+{
+    if (!m_VrrFramePrepared) {
+        return true;
+    }
+
+    // ResizeBuffers and composition/display replacement may not invalidate a
+    // back buffer while this frame's GPU writes are outstanding. These state
+    // changes are rare and already hold the presentation mutex, so drain the
+    // bounded fence without releasing that mutex. The ordinary per-frame
+    // path remains asynchronous with decode during its cadence hold.
+    const bool completed = finishVrrPresentReady(false);
+    if (!completed) {
+        m_VrrFallbackReason =
+            VrrFallbackReason::AdaptivePresentationUnavailable;
+    }
+    releasePreparedVrrFrame();
+    if (!completed) {
+        queueRenderDeviceReset();
+    }
+    return completed;
 }
 
 void D3D11VARenderer::populateVrrGpuReadyFeedback(
@@ -2086,6 +2473,16 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame,
         return false;
     }
 
+    if (m_CompositionPresenter.active()) {
+        ComPtr<ID3D11RenderTargetView> view;
+        const HRESULT acquireResult = m_CompositionPresenter.acquire(&view);
+        if (acquireResult != S_OK) {
+            if (FAILED(acquireResult)) queueRenderDeviceReset();
+            return false;
+        }
+        m_RenderTargetView = view;
+    }
+
     // Clear the back buffer.
     const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     m_RenderDeviceContext->ClearRenderTargetView(m_RenderTargetView.Get(), clearColor);
@@ -2096,7 +2493,10 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame,
 
     // Render the video and overlays.  This is the complete preparation phase
     // shared by the legacy and VRR paths; only the final Present is split out.
-    renderVideo(frame, decodeBoundary);
+    if (!renderVideo(frame, decodeBoundary)) {
+        m_RenderDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+        return false;
+    }
     for (int i = 0; i < Overlay::OverlayMax; i++) {
         renderOverlay((Overlay::OverlayType)i);
     }
@@ -2104,7 +2504,9 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame,
     if (frame->color_trc != m_LastColorTrc) {
         HRESULT hr;
         if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
-            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+            hr = m_CompositionPresenter.active() ?
+                m_CompositionPresenter.setColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) :
+                m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
             if (FAILED(hr)) {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) failed: %x",
@@ -2112,7 +2514,9 @@ bool D3D11VARenderer::prepareFrameForPresent(AVFrame* frame,
             }
         }
         else {
-            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+            hr = m_CompositionPresenter.active() ?
+                m_CompositionPresenter.setColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) :
+                m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
             if (FAILED(hr)) {
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) failed: %x",
@@ -2134,6 +2538,18 @@ bool D3D11VARenderer::initializeVrrPresentReadyFence()
         m_VrrPresentReadyFenceEvent = nullptr;
     }
     m_VrrPresentReadyFenceValue = 0;
+
+    // waitForDecode() keeps its own wake event so a stale present-ready
+    // notification never costs the decode wait an extra poll, and vice versa.
+    // Without it, the decode wait stays GPU-side only.
+    if (m_VrrDecodeReadyEvent == nullptr) {
+        m_VrrDecodeReadyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (m_VrrDecodeReadyEvent == nullptr) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "D3D11 VRR could not create the decode-ready event: %lu",
+                        GetLastError());
+        }
+    }
 
     HRESULT hr = m_RenderDevice->CreateFence(
         0, D3D11_FENCE_FLAG_NONE,
@@ -2158,7 +2574,7 @@ bool D3D11VARenderer::initializeVrrPresentReadyFence()
     return true;
 }
 
-bool D3D11VARenderer::waitForVrrPresentReady()
+bool D3D11VARenderer::beginVrrPresentReady()
 {
     m_VrrGpuReadyAttempted = false;
     m_VrrGpuReadySignalResultValid = false;
@@ -2187,12 +2603,11 @@ bool D3D11VARenderer::waitForVrrPresentReady()
         return false;
     }
 
-    // A tearing Present does not become scanout-visible until all GPU work
-    // targeting its back buffer is complete. vrr8's PresentMon diagnosis
-    // measured roughly 2.4 ms between the CPU call and display when this
-    // fence was absent, which made timing the CPU call itself insufficient.
-    // Finish the frame first so the worker's later target hold operates on an
-    // actual flip-ready boundary.
+    // Queue a completion marker immediately after this frame's rendering.
+    // The pacing worker will spend any remaining lead time waiting for its
+    // cadence target while the GPU runs. presentAdaptive() verifies this exact
+    // value at the target boundary before issuing Present, so GPU completion
+    // is not serialized in front of the deliberate cadence hold.
     const UINT64 fenceValue = ++m_VrrPresentReadyFenceValue;
     m_VrrGpuReadyAttempted = true;
     m_VrrGpuReadyFenceValue = fenceValue;
@@ -2226,45 +2641,146 @@ bool D3D11VARenderer::waitForVrrPresentReady()
         return false;
     }
 
-    // This mutex is also FFmpeg's decode-device lock. The GPU fence no longer
-    // needs CPU access to either immediate context, so never hold the mutex
-    // while waiting. On separate devices, retaining it would prevent the
-    // decoder thread from capturing the next frame's boundary and collapse
-    // the intended decode/render overlap.
-    const bool releaseContextWhileWaiting = m_VrrContextLocked;
-    if (releaseContextWhileWaiting) {
-        unlockContext(this);
-        m_VrrContextLocked = false;
-    }
-
     // GetCompletedValue() is a nonblocking observation. If the target value
     // is still incomplete, its call start is a conservative lower bound for
     // the eventual completion. If it is already complete, Signal() call start
-    // remains the only defensible lower bound and the poll end is the upper
-    // bound. In both cases the later event wait preserves the existing
-    // synchronization behavior.
+    // remains the only defensible lower bound and this poll end is the upper
+    // bound. The later target-boundary poll/wait supplies the completion upper
+    // bound when rendering is still outstanding here.
     m_VrrGpuReadyPollStartUs = LiGetMicroseconds();
     const UINT64 completedValue =
         m_VrrPresentReadyFence->GetCompletedValue();
     m_VrrGpuReadyPollCompletedValue = completedValue;
     m_VrrGpuReadyPollEndUs = LiGetMicroseconds();
+    if (completedValue == (std::numeric_limits<UINT64>::max)()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR present-ready fence reported device removal after Signal() (target=%llu device=%x)",
+                     static_cast<unsigned long long>(fenceValue),
+                     m_RenderDevice->GetDeviceRemovedReason());
+        m_VrrPresentReadyAvailable = false;
+        return false;
+    }
     m_VrrGpuReadyCompletedBeforeWait = completedValue >= fenceValue;
-    m_VrrGpuReadyWaitStartUs = LiGetMicroseconds();
-    const DWORD waitResult = WaitForSingleObject(
-        m_VrrPresentReadyFenceEvent, 50);
-    m_VrrGpuReadyWaitResultValid = true;
-    m_VrrGpuReadyWaitResult = waitResult;
-    m_VrrGpuReadyTimeUs = LiGetMicroseconds();
+    return true;
+}
 
-    if (releaseContextWhileWaiting) {
-        lockContext(this);
-        m_VrrContextLocked = true;
+bool D3D11VARenderer::finishVrrPresentReady(
+    bool releasePresentationWhileWaiting)
+{
+    if (!m_VrrGpuReadyAttempted ||
+            !m_VrrGpuReadySignalResultValid ||
+            FAILED(static_cast<HRESULT>(m_VrrGpuReadySignalResult)) ||
+            !m_VrrGpuReadySetEventResultValid ||
+            FAILED(static_cast<HRESULT>(m_VrrGpuReadySetEventResult)) ||
+            m_VrrPresentReadyFence == nullptr ||
+            m_VrrPresentReadyFenceEvent == nullptr ||
+            m_VrrGpuReadyFenceValue == 0) {
+        return false;
     }
 
+    const UINT64 fenceValue = m_VrrGpuReadyFenceValue;
+    const ComPtr<ID3D11Fence> fence = m_VrrPresentReadyFence;
+    const HANDLE fenceEvent = m_VrrPresentReadyFenceEvent;
+
+    // Once the completion marker has been submitted, checking it needs
+    // neither immediate context. Release presentation (and, on a shared
+    // device, FFmpeg's lock with it) so window changes and decoding can
+    // continue while a genuinely late GPU frame consumes the bounded
+    // residual wait at the cadence boundary.
+    const bool presentationReleased =
+        releasePresentationWhileWaiting && m_VrrPresentationLocked;
+    if (presentationReleased) {
+        m_VrrPresentationLocked = false;
+        unlockPresentation();
+    }
+
+    // Keep every wait result local while the mutex is released. A UI
+    // display/resize callback may cancel the prepared frame in that interval;
+    // it resets the member telemetry under the same mutex. Publishing after
+    // reacquisition avoids racing that reset or attaching this completion to
+    // a replacement frame.
+    const uint64_t waitStartUs = LiGetMicroseconds();
+    DWORD lastEventResult = WAIT_TIMEOUT;
+    uint64_t initialPollStartUs = 0, initialPollEndUs = 0, initialCompletedValue = 0;
+    bool sampledInitialPoll = false;
+    const auto fenceWait = D3D11FenceWait::wait(fenceValue, LiGetMicroseconds,
+        [&] {
+            const auto pollStartUs = LiGetMicroseconds();
+            const auto value = fence->GetCompletedValue();
+            if (!sampledInitialPoll) {
+                initialPollStartUs = pollStartUs;
+                initialPollEndUs = LiGetMicroseconds();
+                initialCompletedValue = value;
+                sampledInitialPoll = true;
+            }
+            return value;
+        },
+        [&](unsigned timeoutMs) {
+            lastEventResult = WaitForSingleObject(fenceEvent, timeoutMs);
+            return lastEventResult == WAIT_OBJECT_0 || lastEventResult == WAIT_TIMEOUT;
+        });
+    // This is the result of the complete fence wait, including completion
+    // polling. An individual event timeout is not a fence timeout.
+    const DWORD waitResult = fenceWait.status == D3D11FenceWait::Status::Complete ? WAIT_OBJECT_0 :
+        fenceWait.status == D3D11FenceWait::Status::Timeout ? WAIT_TIMEOUT : WAIT_FAILED;
+    const uint64_t readyTimeUs = LiGetMicroseconds();
+
+    if (presentationReleased) {
+        lockPresentation();
+        m_VrrPresentationLocked = true;
+    }
+
+    if (!m_VrrFramePrepared || m_VrrGpuReadyFenceValue != fenceValue) {
+        // A window-state callback cancelled or replaced the frame while this
+        // thread was outside the presentation mutex. Its reset is authoritative.
+        return false;
+    }
+
+    m_VrrGpuReadyWaitStartUs = initialPollEndUs;
+    // Readiness before the residual wait must describe this check, not the
+    // earlier prepare-time poll. Work often completes during the cadence hold.
+    m_VrrGpuReadyPollStartUs = initialPollStartUs;
+    m_VrrGpuReadyPollEndUs = initialPollEndUs;
+    m_VrrGpuReadyPollCompletedValue = initialCompletedValue;
+    m_VrrGpuReadyCompletedBeforeWait =
+        fenceWait.status == D3D11FenceWait::Status::Complete && fenceWait.waitCalls == 0;
+    m_VrrGpuReadyWaitResultValid = true;
+    m_VrrGpuReadyWaitResult = waitResult;
+    m_VrrGpuReadyTimeUs = readyTimeUs;
+
     if (waitResult != WAIT_OBJECT_0) {
+        const uint64_t lockReacquireUs = LiGetMicroseconds() - readyTimeUs;
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "D3D11 VRR present-ready fence wait failed or timed out: %lu",
-                     static_cast<unsigned long>(waitResult));
+                     "D3D11 VRR present-ready fence wait failed or timed out: %lu (target=%llu completed=%llu event=%lu device=%x)",
+                     static_cast<unsigned long>(waitResult),
+                     static_cast<unsigned long long>(fenceValue),
+                     static_cast<unsigned long long>(fenceWait.completedValue),
+                     static_cast<unsigned long>(lastEventResult),
+                     m_RenderDevice->GetDeviceRemovedReason());
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "D3D11 VRR present-ready wait detail: stop=%s elapsed_us=%llu wait_calls=%u signal_us=%llu flush_us=%llu event_setup_us=%llu lock_reacquire_us=%llu decode_device=%x separate=%d bind=%d frame_decode_target=%llu",
+            D3D11FenceWait::stopReasonName(fenceWait.stopReason),
+            static_cast<unsigned long long>(fenceWait.elapsedUs), fenceWait.waitCalls,
+            static_cast<unsigned long long>(m_VrrGpuReadySignalEndUs - m_VrrGpuReadySignalStartUs),
+            static_cast<unsigned long long>(m_VrrGpuReadyFlushEndUs - m_VrrGpuReadyFlushStartUs),
+            static_cast<unsigned long long>(m_VrrGpuReadySetEventEndUs - m_VrrGpuReadySetEventStartUs),
+            static_cast<unsigned long long>(lockReacquireUs),
+            m_DecodeDevice->GetDeviceRemovedReason(), m_DecodeDevice != m_RenderDevice,
+            m_BindDecoderOutputTextures,
+            static_cast<unsigned long long>(m_VrrPreparedDecodeBoundary));
+        if (m_DecodeDevice != m_RenderDevice) {
+            // Failure-only snapshots, observed after reacquiring presentation.
+            // These are not simultaneous GPU observations. A newer decode signal
+            // may already be queued; next_signal is not this frame's dependency.
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                "D3D11 VRR fence snapshot: d2r_decode=%llu d2r_render=%llu d2r_next_signal=%llu r2d_render=%llu r2d_decode=%llu r2d_next_signal=%llu",
+                static_cast<unsigned long long>(m_DecodeD2RFence->GetCompletedValue()),
+                static_cast<unsigned long long>(m_RenderD2RFence->GetCompletedValue()),
+                static_cast<unsigned long long>(m_D2RFenceValue),
+                static_cast<unsigned long long>(m_RenderR2DFence->GetCompletedValue()),
+                static_cast<unsigned long long>(m_DecodeR2DFence->GetCompletedValue()),
+                static_cast<unsigned long long>(m_R2DFenceValue));
+        }
         m_VrrPresentReadyAvailable = false;
         return false;
     }
@@ -2273,13 +2789,17 @@ bool D3D11VARenderer::waitForVrrPresentReady()
     return true;
 }
 
-HRESULT D3D11VARenderer::presentPreparedFrame(UINT flags)
+HRESULT D3D11VARenderer::presentPreparedFrame(
+    const DxgiPresentParameters& parameters)
 {
     if (m_SwapChain == nullptr) {
         return E_FAIL;
     }
 
-    return m_SwapChain->Present(0, flags);
+    if (m_CompositionPresenter.active()) {
+        return m_CompositionPresenter.present(m_CompositionPresentId);
+    }
+    return parameters.present(*m_SwapChain.Get());
 }
 
 UINT D3D11VARenderer::legacyPresentFlags() const
@@ -2317,7 +2837,7 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame,
     }
 
     // The contract guarantees one worker, but make an accidental second
-    // preparation recoverable instead of leaking a retained context lock.
+    // preparation recoverable instead of leaking a retained presentation lock.
     if (m_VrrFramePrepared) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "D3D11 VRR discarded an unpresented prepared frame");
@@ -2325,11 +2845,11 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame,
         return result;
     }
 
-    // Serialize rendering preparation with decode and swap-chain state.
-    // renderVideo() recognizes this retained lock for the separate-device
-    // fence calls, so it never recursively locks the SDL mutex.
-    lockContext(this);
-    m_VrrContextLocked = true;
+    // Serialize rendering preparation with swap-chain state (and with decode
+    // on a shared device). With separate devices, renderVideo() takes FFmpeg's
+    // lock only around its own decode-context fence calls.
+    lockPresentation();
+    m_VrrPresentationLocked = true;
 
     // Display-state changes share this lock with preparation through Present.
     // Check eligibility only after taking it so a UI callback cannot replace
@@ -2344,7 +2864,8 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame,
         return result;
     }
 
-    if (!waitForVrrPresentReady()) {
+    m_VrrPreparedDecodeBoundary = decodeBoundary;
+    if (!beginVrrPresentReady()) {
         m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
         populateVrrGpuReadyFeedback(result.feedback);
         result.feedback.cancelled = true;
@@ -2353,8 +2874,8 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame,
         return result;
     }
 
-    // The shared-device fence wait temporarily releases the renderer lock.
-    // Revalidate state after reacquiring it before publishing this frame.
+    // Signal/flush above is nonblocking, but it may still expose synchronous
+    // device removal. Revalidate before publishing this prepared frame.
     if (m_VrrSuspended || checkSupport() != VrrFallbackReason::NoFallback) {
         populateVrrGpuReadyFeedback(result.feedback);
         result.feedback.cancelled = true;
@@ -2376,16 +2897,19 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame,
 
     m_VrrFramePrepared = true;
     result.prepared = true;
-    // waitForVrrPresentReady() proves that rendering has finished reading the
-    // decoder surface. Present() consumes only the prepared back buffer, so
-    // let the worker recycle the source AVFrame before its target wait.
-    result.sourceFrameReusable = true;
+    // Preparation reports the submitted marker without claiming completion.
+    // presentAdaptive() returns the completed wait after the cadence hold.
+    populateVrrGpuReadyFeedback(result.feedback);
+    // GPU reads are still allowed to be in flight here. Keep the AVFrame
+    // alive through presentation; the worker's deferred-frame ownership and
+    // the D3D11 render-to-decode fence protect decoder-surface reuse.
+    result.sourceFrameReusable = false;
 
-    // Never hold the FFmpeg/D3D context mutex while the pacing worker waits
-    // for its presentation target. Keeping it here serializes D3D11VA decode
-    // behind pacing and is especially damaging at 4K high refresh rates.
-    unlockContext(this);
-    m_VrrContextLocked = false;
+    // Never hold the presentation mutex while the pacing worker waits for its
+    // presentation target. On a shared device it includes FFmpeg's lock, and
+    // keeping it here serializes D3D11VA decode behind pacing.
+    m_VrrPresentationLocked = false;
+    unlockPresentation();
     return result;
 }
 
@@ -2394,13 +2918,57 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
 {
     VrrPresentFeedback feedback;
 
-    if (!m_VrrContextLocked) {
-        lockContext(this);
-        m_VrrContextLocked = true;
+    if (!m_VrrPresentationLocked) {
+        lockPresentation();
+        m_VrrPresentationLocked = true;
     }
 
     if (!m_VrrFramePrepared || m_VrrSuspended) {
         return cancelFrame();
+    }
+
+    // Preparation queued this frame's marker before the worker's cadence
+    // wait. Usually it is complete now and this is only a fence-value poll.
+    // A late GPU consumes only the residual bounded wait instead of adding
+    // its full render time in front of the cadence hold.
+    if (!finishVrrPresentReady(true)) {
+        // A display/resize callback may have cancelled this frame while the
+        // completion wait temporarily released the presentation mutex.
+        // That is an ordinary interrupted frame, not a fence failure.
+        const bool frameCancelled = !m_VrrFramePrepared || m_VrrSuspended;
+        if (!frameCancelled) {
+            m_VrrFallbackReason =
+                VrrFallbackReason::AdaptivePresentationUnavailable;
+        }
+        populateVrrGpuReadyFeedback(feedback);
+        feedback.cancelled = true;
+        releasePreparedVrrFrame();
+        if (!frameCancelled) {
+            queueRenderDeviceReset();
+        }
+        return feedback;
+    }
+
+    // The completion wait releases the presentation mutex. A window
+    // transition can run in that interval, so revalidate the prepared image
+    // after the mutex has been reacquired and before touching native state.
+    if (m_VrrSuspended || checkSupport() != VrrFallbackReason::NoFallback) {
+        populateVrrGpuReadyFeedback(feedback);
+        feedback.cancelled = true;
+        releasePreparedVrrFrame();
+        return feedback;
+    }
+
+    const HRESULT deviceReason = m_RenderDevice->GetDeviceRemovedReason();
+    if (FAILED(deviceReason)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "D3D11 VRR presentation detected device loss: %x",
+                     deviceReason);
+        populateVrrGpuReadyFeedback(feedback);
+        feedback.cancelled = true;
+        releasePreparedVrrFrame();
+        queueRenderDeviceReset();
+        return feedback;
     }
 
     populateVrrGpuReadyFeedback(feedback);
@@ -2425,19 +2993,150 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         }
     }
 
-    // A latched near-refresh request omits ALLOW_TEARING, selecting DXGI's
-    // non-tearing path. Sync interval 0 still has flip-queue semantics and
-    // does not prove which v-blank displays the image; frame statistics below
-    // remain the authority for that observation. The flag is a per-present
-    // choice on this swapchain, so no recreation is involved.
-    constexpr UINT presentSyncInterval = 0;
-    const UINT presentFlags = request.latchedPresentation ?
-        0 : DXGI_PRESENT_ALLOW_TEARING;
+    if (m_CompositionPresenter.active()) {
+        feedback.nativeBackendValid = true;
+        feedback.nativeBackend = VrrNativePresentationBackend::Composition;
+        feedback.nativePresentTimingValid = true;
+        feedback.nativePresentStartUs = LiGetMicroseconds();
+        const HRESULT hr = m_CompositionPresenter.present(m_CompositionPresentId);
+        feedback.nativePresentEndUs = LiGetMicroseconds();
+        feedback.nativePresentResultValid = true;
+        feedback.nativePresentResult = static_cast<int64_t>(hr);
+        feedback.presented = hr == S_OK;
+        feedback.cancelled = !feedback.presented;
+        feedback.submissionTimeValid = feedback.presented;
+        feedback.submissionTimeUs = feedback.presented ? feedback.nativePresentStartUs : 0;
+        feedback.submissionIdValid = feedback.presented;
+        feedback.submissionId = feedback.presented ? m_CompositionPresentId : 0;
+        D3D11CompositionPresenter::DisplayedFrame displayed;
+        if (m_CompositionPresenter.pollDisplayedFrame(LiGetMicroseconds, displayed)) {
+            feedback.latchSampleValid = true;
+            feedback.latchTimeKind = Vrr13::PresentationTimeKind::DisplayEvent;
+            feedback.latchSubmissionId = displayed.id;
+            feedback.latchTimeUs = displayed.clock.timeUs;
+            feedback.presentationUncertaintyUs = displayed.clock.uncertaintyUs;
+        }
+        if (!m_CompositionModeLogged && (m_CompositionPresenter.independentFrames() ||
+                                        m_CompositionPresenter.composedFrames() >= 120)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Windows presentation timing observed: %llu independent-flip events, %llu composed events, %llu rejected timestamps (QPC clock)",
+                        static_cast<unsigned long long>(m_CompositionPresenter.independentFrames()),
+                        static_cast<unsigned long long>(m_CompositionPresenter.composedFrames()),
+                        static_cast<unsigned long long>(m_CompositionPresenter.rejectedDisplayFrames()));
+            m_CompositionModeLogged = true;
+        }
+        releasePreparedVrrFrame();
+        if (FAILED(hr)) queueRenderDeviceReset();
+        return feedback;
+    }
+
+    // Native flip protection. The controller anchors a tearing present's flip
+    // at its call, but DXGI can take several milliseconds to flip it, so a
+    // latched successor reaches scanout later than anchored and this tearing
+    // present would land inside that scanout. Ask DXGI instead: if the
+    // predecessor is not on screen yet, or its refresh began less than the
+    // window ago, latch. The flip queue then shows this frame at the first
+    // untorn refresh, and a panel already idle in its VRR blank flips a
+    // latched present at once, so an unneeded latch costs almost nothing.
+    //
+    // DXGI's refresh time for a tearing predecessor is often credited to a
+    // refresh that began before its flip, so that check alone let a flip land
+    // inside the previous scanout. Where the scanout state can be read, wait
+    // for it instead: with nothing queued ahead and the panel in its
+    // (VRR-extended) vertical blank, a tearing flip cannot tear. The wait ends
+    // where a latched present would have flipped anyway, without depending on
+    // how a given driver implements sync-interval presents. Latch only if the
+    // blank does not arrive within two display periods.
+    //
+    // MOONLIGHT_VRR_SYNC_FLIPS=1 skips all of that and synchronizes every flip,
+    // as Linux's Mailbox/FIFO presentation does, reporting it as a protection
+    // latch so the controller anchors the flip queue. It is opt-in: on the
+    // 890M, all-synchronized sessions sometimes took a slow flip path (Present
+    // to screen p50 6-10 ms instead of ~1 ms), blocking Present calls and
+    // juddering far worse than the occasional tear it avoided.
+    bool latchedPresentation = request.latchedPresentation;
+    if (!latchedPresentation && m_VrrSyncFlips) {
+        latchedPresentation = true;
+        feedback.flipProtectionLatched = true;
+    }
+    else if (!latchedPresentation && request.flipProtectionWindowUs != 0 &&
+            m_VrrPriorPresentCountValid) {
+        feedback.flipProtectionChecked = true;
+        feedback.flipProtectionQueryStartUs = LiGetMicroseconds();
+        const auto predecessorPending = [&](HRESULT& result,
+                                            DXGI_FRAME_STATISTICS& stats) {
+            stats = {};
+            result = m_SwapChain->GetFrameStatistics(&stats);
+            feedback.flipProtectionQueryResult = static_cast<int64_t>(result);
+            // A failed query (for example FRAME_STATISTICS_DISJOINT after a
+            // mode change) proves nothing and keeps the planned mode.
+            const bool pending = result == S_OK &&
+                stats.PresentCount < m_VrrPriorPresentCount;
+            feedback.flipProtectionPending |= pending;
+            return pending;
+        };
+        HRESULT guardResult = S_OK;
+        DXGI_FRAME_STATISTICS guardStats = {};
+        bool rasterDecided = false;
+        if (m_VrrRasterSourceValid && !m_VrrRasterGuardDisabled) {
+            const uint64_t limitUs = feedback.flipProtectionQueryStartUs +
+                2 * request.flipProtectionWindowUs;
+            for (;;) {
+                const bool pending = predecessorPending(guardResult, guardStats);
+                const VrrNativeRasterSample raster = queryVrrRaster();
+                if (!raster.queryResultValid || raster.queryResult != 0) {
+                    break;
+                }
+                rasterDecided = true;
+                if (!pending && raster.inVerticalBlank) {
+                    m_VrrRasterGuardTimeouts = 0;
+                    break;
+                }
+                if (LiGetMicroseconds() >= limitUs) {
+                    latchedPresentation = true;
+                    // A scanout never lasts two periods. A driver whose raster
+                    // does not report the VRR blank would make every frame
+                    // wait; fall back to the frame-statistics check instead.
+                    if (++m_VrrRasterGuardTimeouts >= 3) {
+                        m_VrrRasterGuardDisabled = true;
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                    "VRR flip protection: the display raster never reported a vertical blank; using frame statistics instead");
+                    }
+                    break;
+                }
+                std::this_thread::yield();
+            }
+        }
+        if (!rasterDecided) {
+            uint64_t refreshUs = 0;
+            uint64_t qpcFrequency = 0;
+            if (predecessorPending(guardResult, guardStats)) {
+                latchedPresentation = true;
+            }
+            else if (guardResult == S_OK &&
+                     translateVrrSyncQpcTime(guardStats.SyncQPCTime,
+                                             refreshUs, qpcFrequency)) {
+                feedback.flipProtectionReferenceUs = refreshUs;
+                const uint64_t nowUs = LiGetMicroseconds();
+                latchedPresentation =
+                    nowUs - refreshUs < request.flipProtectionWindowUs ||
+                    nowUs < refreshUs;
+            }
+        }
+        feedback.flipProtectionQueryEndUs = LiGetMicroseconds();
+        feedback.flipProtectionLatched = latchedPresentation;
+    }
+
+    // The risk decision is per frame. Sync interval 1 protects risky frames;
+    // other frames retain interval-zero replacement semantics. Active DXGI
+    // VRR always permits tearing for those adaptive submissions.
+    const auto presentParameters = DxgiPresentParameters::adaptive(
+        latchedPresentation, DXGI_PRESENT_ALLOW_TEARING);
     feedback.nativeBackendValid = true;
     feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
     feedback.nativePresentParametersValid = true;
-    feedback.nativePresentSyncInterval = presentSyncInterval;
-    feedback.nativePresentFlags = presentFlags;
+    feedback.nativePresentSyncInterval = presentParameters.syncInterval;
+    feedback.nativePresentFlags = presentParameters.flags;
     feedback.nativeVrrStateValid = true;
     feedback.nativeTearingSupported = m_VrrTearingSupported;
     feedback.nativeBorderlessFlipModel = m_VrrBorderlessFlipModel;
@@ -2552,7 +3251,7 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         feedback.nativeRasterBeforePresent = sampleVrrRaster();
     }
     const uint64_t submissionTimeUs = LiGetMicroseconds();
-    HRESULT hr = presentPreparedFrame(presentFlags);
+    HRESULT hr = presentPreparedFrame(presentParameters);
     const uint64_t nativePresentEndUs = LiGetMicroseconds();
     if (request.collectDiagnostics &&
             m_VrrRasterSamplingRequested &&
@@ -2668,6 +3367,7 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
     }
     if (syncQpcTranslated) {
         feedback.latchSampleValid = true;
+        feedback.latchTimeKind = Vrr13::PresentationTimeKind::RefreshReference;
         // Retain the schema-5 field name for compatibility. Its DXGI
         // semantics are the SyncRefreshCount clock sample documented above.
         feedback.latchTimeUs = syncSampleTimeUs;
@@ -2696,12 +3396,21 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
 VrrPresentFeedback D3D11VARenderer::cancelFrame()
 {
     VrrPresentFeedback feedback;
-    if (!m_VrrContextLocked) {
-        lockContext(this);
-        m_VrrContextLocked = true;
+    if (!m_VrrPresentationLocked) {
+        lockPresentation();
+        m_VrrPresentationLocked = true;
     }
+    // A cancelled present still owns queued GPU reads. Drain its marker
+    // before the worker may replace its deferred AVFrame or submit another
+    // marker on this fence. No native Present is needed for cancellation.
+    const bool completionFailed = m_VrrFramePrepared &&
+        !finishVrrPresentReady(false);
     populateVrrGpuReadyFeedback(feedback);
     releasePreparedVrrFrame();
+    if (completionFailed) {
+        m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+        queueRenderDeviceReset();
+    }
     feedback.cancelled = true;
     return feedback;
 }
@@ -2713,6 +3422,14 @@ bool D3D11VARenderer::restoreFixedPresentation(VrrFallbackReason reason)
     // not a requirement for every Present, so the existing swapchain safely
     // supports the legacy fixed path with Present(0, 0).  Do not recreate it.
     cancelFrame();
+    if (m_CompositionPresenter.active()) {
+        m_CompositionPresenter.reset();
+        m_RenderTargetView.Reset();
+        if (!setupSwapchainDependentResources()) {
+            return false;
+        }
+        m_LastColorTrc = AVCOL_TRC_UNSPECIFIED;
+    }
     m_VrrSuspended = false;
     m_DecoderParams.enableVrr = false;
     m_VrrFallbackReason = reason == VrrFallbackReason::NoFallback ?
@@ -2751,7 +3468,10 @@ void D3D11VARenderer::refreshVrrDisplayTiming()
         return;
     }
 
-    if (m_VrrRasterSamplingRequested) {
+    // Always open the raster source: flip protection reads the live scanout
+    // state before every tearing present. Only diagnostic sampling of it into
+    // the trace stays behind MOONLIGHT_VRR_ALIGN.
+    {
         D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME openAdapter = {};
         wcsncpy_s(openAdapter.DeviceName, monitorInfo.szDevice, _TRUNCATE);
         const NTSTATUS openResult =
@@ -2924,9 +3644,16 @@ void D3D11VARenderer::closeVrrRasterSource()
 
 VrrNativeRasterSample D3D11VARenderer::sampleVrrRaster() const
 {
+    if (!m_VrrRasterSamplingRequested) {
+        return {};
+    }
+    return queryVrrRaster();
+}
+
+VrrNativeRasterSample D3D11VARenderer::queryVrrRaster() const
+{
     VrrNativeRasterSample sample;
-    if (!m_VrrRasterSamplingRequested ||
-            !m_VrrRasterSourceValid) {
+    if (!m_VrrRasterSourceValid) {
         return sample;
     }
 
@@ -3328,4 +4055,22 @@ bool D3D11VARenderer::setupTexturePoolViews(AVHWFramesContext* framesContext)
     }
 
     return true;
+}
+
+QString D3D11VARenderer::getCalibrationIdentity()
+{
+    ComPtr<IDXGIDevice> device;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC desc{};
+    LARGE_INTEGER driver{};
+    if (!m_RenderDevice || FAILED(m_RenderDevice.As(&device)) ||
+        FAILED(device->GetAdapter(&adapter)) || FAILED(adapter->GetDesc(&desc)) ||
+        FAILED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver))) return {};
+    // Retain the historical enabled-policy identity so existing calibration
+    // from the former default setting remains applicable.
+    return QString("D3D11|%1|%2|%3|%4|%5|%6|%7|allow-tearing=%8")
+        .arg(desc.VendorId).arg(desc.DeviceId).arg(desc.SubSysId).arg(desc.Revision)
+        .arg(driver.QuadPart).arg(m_DecodeDevice == m_RenderDevice)
+        .arg(m_CompositionPresenter.active() ? "composition" : "dxgi")
+        .arg(1);
 }

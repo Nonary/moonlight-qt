@@ -17,6 +17,10 @@ namespace WMUtils {
 }
 
 namespace Utils {
+    // Session boundaries only: never drain the logger from a logging task or
+    // the frame delivery path.
+    void flushLogs();
+
     template <typename T>
     bool getEnvironmentVariableOverride(const char* name, T* value) {
         bool ok;

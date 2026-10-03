@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ivrrframepresenter.h"
+#include "vrrpreparedframe.h"
 #include "renderer.h"
 
 #ifdef Q_OS_WIN32
@@ -10,8 +11,29 @@
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
 #include <libplacebo/vulkan.h>
+#include "overlaycompletion.h"
+#include "diagnostics/gputrace.h"
 
 #include <atomic>
+#include <deque>
+#include <mutex>
+#include <QMutex>
+#include <QWaitCondition>
+
+#ifdef Q_OS_LINUX
+#include "vulkantiming.h"
+#endif
+
+#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+#include "streaming/video/pyrowave/pyrowaveplacebo.h"
+#endif
+
+#ifdef HAS_WAYLAND
+#include "waylandfeedback/wayland.h"
+#ifdef Q_OS_LINUX
+#include "gamescoperepaint.h"
+#endif
+#endif
 
 #ifdef Q_OS_DARWIN
 class MetalVulkanTextureFactory {
@@ -40,6 +62,7 @@ private:
 
 class PlVkRenderer : public IFFmpegRenderer, public IVrrFramePresenter {
 public:
+    QString getCalibrationIdentity() override;
     PlVkRenderer(AVHWDeviceType hwDeviceType = AV_HWDEVICE_TYPE_NONE, IFFmpegRenderer *backendRenderer = nullptr);
     virtual ~PlVkRenderer() override;
     virtual bool initialize(PDECODER_PARAMETERS params) override;
@@ -47,8 +70,18 @@ public:
     virtual void renderFrame(AVFrame* frame) override;
     virtual IVrrFramePresenter* getVrrFramePresenter() override;
     virtual VrrFallbackReason checkSupport() const override;
+    virtual bool canLatchAdaptivePresent() const override;
+    virtual uint64_t waitForDecode(AVFrame* frame) override;
+    std::shared_ptr<VrrPreparedFrame> queueFramePreparation(AVFrame*, uint64_t) override;
+    VrrPrepareResult activatePreparedFrame(const std::shared_ptr<VrrPreparedFrame>&,
+        AVFrame*, uint64_t, const VrrPresentRequest&) override;
+    void stopFramePreparation() override;
+    GpuTrace* gpuDiagnosticTrace() override { return m_GpuTrace.get(); }
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
                                           uint64_t decodeBoundary) override;
+    virtual VrrPrepareResult prepareFrame(AVFrame* frame,
+                                          uint64_t decodeBoundary,
+                                          const VrrPresentRequest& request) override;
     virtual VrrPresentFeedback presentAdaptive(
         const VrrPresentRequest& request) override;
     virtual VrrPresentFeedback cancelFrame() override;
@@ -65,11 +98,20 @@ public:
     virtual int getDecoderCapabilities() override;
     virtual bool isPixelFormatSupported(int videoFormat, enum AVPixelFormat pixelFormat) override;
     virtual AVPixelFormat getPreferredPixelFormat(int videoFormat) override;
+#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+    IPyroWaveVulkanPool* getPyroWaveVulkanPool() override { return m_PyroWavePool.get(); }
+#endif
 
 private:
     static void lockQueue(AVHWDeviceContext *dev_ctx, uint32_t queue_family, uint32_t index);
     static void unlockQueue(AVHWDeviceContext *dev_ctx, uint32_t queue_family, uint32_t index);
     static void overlayUploadComplete(void* opaque);
+    static void gpuRenderInfo(void* opaque, const pl_render_info* info);
+    bool renderMappedImage(pl_renderer renderer, const pl_frame& source,
+                           pl_frame target, const pl_render_params& params);
+    std::unique_ptr<GpuTrace> m_GpuTrace;
+    int64_t m_GpuTracePts = -1;
+    uint64_t m_GpuTraceOutputUs = 0;
 
     void beginRenderTiming();
     void endRenderTiming();
@@ -78,13 +120,23 @@ private:
     bool acquirePendingSwapchainFrame(const char* earlyRenderFailureMessage);
     bool acquireVrrSwapchainFrame();
     bool submitPendingSwapchainFrame();
+    bool submitSwapchainFrame();
     void finishVrrRenderTiming();
     bool cancelVrrFrame();
+    bool waitForVrrGpuReady(VrrPresentFeedback& feedback);
     void queueRenderDeviceReset();
+#ifdef Q_OS_LINUX
+    bool ensureVrrSourceRetentionSlot();
+    bool vrrSourceFrameBusy(const pl_frame& frame) const;
+    void retireCompletedVrrSourceFrames();
+    void retainVrrSourceFrame(pl_frame& frame);
+    void releaseAllVrrSourceFrames();
+#endif
 
     bool createSwapchain(int depth);
     bool createOverlay(pl_overlay* overlay, SDL_Surface* surface);
-    bool mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
+    bool mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFrame,
+                            pl_tex* textures = nullptr);
     void unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
     bool populateQueues(int videoFormat);
     bool chooseVulkanDevice(PDECODER_PARAMETERS params, bool hdrOutputRequired);
@@ -120,11 +172,54 @@ private:
     VkSurfaceKHR m_VkSurface = VK_NULL_HANDLE;
     int m_SwapchainDepth = 0;
     VkPresentModeKHR m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR m_VrrAdaptivePresentMode = VK_PRESENT_MODE_FIFO_KHR;
     pl_vulkan m_Vulkan = nullptr;
     pl_swapchain m_Swapchain = nullptr;
     pl_renderer m_Renderer = nullptr;
     pl_tex m_Textures[PL_MAX_PLANES] = {};
     pl_color_space m_LastColorspace = {};
+    // pl_swapchain_submit_frame() takes libplacebo's pending graphics command
+    // outside the lock that guards command recording. Work recorded on other
+    // threads (overlay uploads, offscreen preparation, PyroWave surface holds)
+    // must not begin a command inside that window, so it and every swapchain
+    // submit hold this lock. Texture creation records nothing and stays out.
+    std::mutex m_CommandLock;
+#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+    std::unique_ptr<PyroWavePlaceboPool> m_PyroWavePool;
+#endif
+
+#ifdef Q_OS_LINUX
+    struct PreparedImage;
+    static int preparationThreadProc(void* opaque);
+    void prepareImage(const std::shared_ptr<PreparedImage>& image);
+    void updatePreparationTarget();
+    QMutex m_PreparationLock;
+    QWaitCondition m_PreparationChanged;
+    std::deque<std::shared_ptr<PreparedImage>> m_PreparationQueue;
+    std::shared_ptr<PreparedImage> m_PreparingImage;
+    SDL_Thread* m_PreparationThread = nullptr;
+    bool m_PreparationStopping = false;
+    bool m_PreparationTargetValid = false;
+    pl_swapchain_frame m_PreparationTarget = {};
+    pl_tex_params m_PreparationTextureParams = {};
+    pl_renderer m_PreparationRenderer = nullptr;
+    pl_tex m_PreparationTextures[PL_MAX_PLANES] = {};
+    std::vector<pl_tex> m_PreparationFreeTextures;
+    // Deferred acquisition: render into a renderer-owned texture at
+    // preparation and acquire, copy and present the swapchain image only at
+    // the target. A held swapchain image keeps its buffer on the GPU's
+    // residency list, so the next decode can delay its flip.
+    bool m_DeferredAcquireEnabled = false;
+    bool m_DeferredTemplateValid = false;
+    pl_swapchain_frame m_DeferredTemplate = {};
+    pl_tex_params m_DeferredTextureParams = {};
+    pl_tex m_DeferredTextures[2] = {};
+    int m_DeferredIndex = 0;
+    pl_tex m_DeferredPreparedTexture = nullptr;
+    // The ordinary renderer can still handle an incompatible output epoch.
+    // Serialize the shared overlay snapshot while either renderer records it.
+    QMutex m_ImageRenderLock;
+#endif
 
 #ifdef PLVK_USE_EARLY_RENDER_TO_WAIT
     pl_overlay m_EmptyOverlay = {};
@@ -143,12 +238,51 @@ private:
     // abandons a prepared image before resizing the swapchain.
     bool m_VrrRequested = false;
     bool m_VrrSuspended = false;
-    VrrFallbackReason m_VrrFallbackReason = VrrFallbackReason::InitializationFailed;
+    std::atomic<VrrFallbackReason> m_VrrFallbackReason { VrrFallbackReason::InitializationFailed };
     std::atomic<bool> m_VrrWindowChangePending { false };
     bool m_VrrPreparingFrame = false;
+    // renderFrame() targets a deferred-acquisition texture (Linux Mailbox).
+    bool m_VrrRenderIntoDeferred = false;
     bool m_VrrFramePrepared = false;
     bool m_VrrRenderSucceeded = false;
     bool m_VrrRenderTimingActive = false;
+#ifdef Q_OS_LINUX
+    // pl_map_avframe_ex() retains its own AVFrame reference. Keep that mapping
+    // alive after swapchain submission until every imported source plane has
+    // retired its GPU reads. This lets presentation use libplacebo's existing
+    // render-complete semaphore without allowing the decoder to recycle a VA
+    // surface underneath an in-flight Vulkan command.
+    struct RetainedSource {
+        pl_frame frame;
+        int64_t pts;
+        uint64_t outputUs;
+        uint64_t lastBusyUs;
+    };
+    std::deque<RetainedSource> m_VrrRetainedSourceFrames;
+    bool m_VrrCurrentSourceRetained = false;
+    uint64_t m_VrrRetainedSourceFrameTotal = 0;
+    uint64_t m_VrrSourceRetirementWaits = 0;
+    uint64_t m_VrrSourceRetirementWaitUs = 0;
+    size_t m_VrrSourceRetentionHighWater = 0;
+#endif
+    // Readiness evidence from the current prepared frame is copied into the
+    // eventual present or cancellation result. Vulkan may have to submit an
+    // acquired image to abandon it, and the worker must not lose the GPU wait
+    // that happened before that neutral submission.
+    VrrPresentFeedback m_VrrGpuReadyFeedback;
+    uint64_t m_PresentationId = 0;
+    bool m_LoggedPresentationFeedback = false;
+#ifdef Q_OS_LINUX
+    std::unique_ptr<VulkanTiming> m_GamescopeTiming;
+#endif
+#ifdef HAS_WAYLAND
+    std::unique_ptr<Vrr13::WaylandFeedback> m_PresentationFeedback;
+#ifdef Q_OS_LINUX
+    std::unique_ptr<GamescopeRepaint> m_GamescopeRepaint;
+#endif
+#endif
+
+    std::unique_ptr<OverlayCompletion> m_OverlayCompletion;
 
     // Overlay state
     SDL_SpinLock m_OverlayLock = 0;

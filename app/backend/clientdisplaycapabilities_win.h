@@ -97,10 +97,6 @@ struct ProfileProbe
     DisplayColorMode displayColorMode = DisplayColorMode::Standard;
     QString profileName;
     QByteArray bytes;
-    // Windows collectors parse associated profiles before returning and clear
-    // bytes. Test providers may leave bytes populated for the collector to
-    // parse, so raw profile data remains provider-owned in either case.
-    std::optional<int> parsedMhc2PeakNits;
     bool readCompleted = false;
     qint64 elapsedMs = 0;
 };
@@ -137,8 +133,6 @@ struct CollectorProvider
     std::function<SelectedDisplay(const QScreen *, quintptr)> resolveSelectedDisplay;
     std::function<DisplayMapping(const SelectedDisplay &)> mapDisplayConfig;
     std::function<ProfileProbe(const DisplayMapping &, qint64 budgetMs)> readColorProfile;
-    std::function<std::vector<ProfileProbe>(const DisplayMapping &, qint64 budgetMs)>
-        readAssociatedColorProfiles;
     std::function<DxgiOutputProbe(const DisplayMapping &)> readDxgiOutput;
     std::function<bool(const DisplayMapping &, const DxgiOutputProbe &)> revalidate;
     std::function<bool(
@@ -150,8 +144,8 @@ struct CollectorProvider
 };
 
 // Resolve a Qt-selected display against SDL's native desktop bounds. The
-// hidden SDL probe identity is authoritative when available because Qt and
-// SDL may report different rectangle sizes under Windows DPI scaling.
+// unique top-left origin identifies the selected display; the hidden SDL
+// probe must agree. Rectangle sizes may differ under Windows DPI scaling.
 std::optional<int> resolveDisplayIndex(
     const QRect &screenGeometry,
     int hiddenDisplayIndex,

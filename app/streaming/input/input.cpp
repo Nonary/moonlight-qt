@@ -2,6 +2,7 @@
 #include "SDL_compat.h"
 #include "streaming/session.h"
 #include "settings/mappingmanager.h"
+#include "streaming/input/dualsensehaptics.h"
 #include "path.h"
 #include "utils.h"
 
@@ -65,6 +66,9 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     // want this behavior, they can override it with the environment variable.
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+#ifdef SDL_HINT_JOYSTICK_ENHANCED_REPORTS
+    SDL_SetHint(SDL_HINT_JOYSTICK_ENHANCED_REPORTS, "1");
+#endif
 
     // Populate special key combo configuration
     m_SpecialKeyCombos[KeyComboQuit].keyCombo = KeyComboQuit;
@@ -216,6 +220,7 @@ SdlInputHandler::~SdlInputHandler()
         }
 #endif
         if (m_GamepadState[i].controller != nullptr) {
+            if (m_GamepadState[i].hapticsAttached) DualSenseHaptics::detach(m_GamepadState[i].index);
             SDL_GameControllerClose(m_GamepadState[i].controller);
         }
     }

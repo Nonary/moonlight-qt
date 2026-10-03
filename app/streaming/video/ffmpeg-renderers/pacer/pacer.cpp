@@ -1,4 +1,6 @@
 #include "pacer.h"
+#include "path.h"
+#include <QCryptographicHash>
 #include "vrrpacingworker.h"
 #include "../ivrrframepresenter.h"
 #include "streaming/streamutils.h"
@@ -293,7 +295,8 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
 bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                        bool enablePacing, bool enableVsync,
                        bool enableVrr, int vrrDisplayRefreshHz,
-                       bool vrrSmoothness)
+                       bool smoothVrrFrameTiming, const QString& calibrationKey,
+                       int vrrLatencyMode)
 {
     m_MaxVideoFps = maxVideoFps;
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
@@ -303,10 +306,55 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
     // rejection continues through the original fixed path below.
     if (enableVrr) {
         VrrSessionConfig config;
-        VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
+        // The production queue policy is shared across native backends.
+        config.readinessHitchFeedback = false;
+        config.latencyMode = vrrLatencyMode >= 0 && vrrLatencyMode <= 2 ? vrrLatencyMode : 1;
         config.streamRateHz = maxVideoFps;
         config.displayRefreshHz = vrrDisplayRefreshHz;
-        config.allowAdditionalQueuedFrame = vrrSmoothness;
+        config.smoothFrameTiming = smoothVrrFrameTiming;
+        VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
+        if (!calibrationKey.isEmpty()) {
+            const QString display = QString::fromUtf8(SDL_GetDisplayName(SDL_GetWindowDisplayIndex(window)));
+            auto context = calibrationKey + QString("|%1|%2|%3|%4")
+                .arg(display).arg(maxVideoFps).arg(vrrDisplayRefreshHz)
+                .arg(smoothVrrFrameTiming);
+#ifdef Q_OS_LINUX
+            // Do not seed the shared policy with retired Linux hitch-policy history.
+            context += QStringLiteral("|shared-readiness-policy-v18");
+#endif
+            if (config.latencyMode != 0) {
+                context += QStringLiteral("|latency-mode=%1").arg(config.latencyMode);
+            }
+            // Preserve the historical V2 calibration identity now that its
+            // queue policy is unconditional rather than a live preference.
+            context += QStringLiteral("|mean-miss-queue-v2");
+            if (smoothVrrFrameTiming) {
+                // The saved flag previously selected timestamp-following
+                // playout too. Do not cross-seed its readiness calibration.
+                const auto policy = vrrTimingParametersForSession(config);
+                context += QStringLiteral("|frame-smoothing=%1-%2-%3|cadence=%4-%5")
+                    .arg(policy.playoutSmoothingGainPerMille)
+                    .arg(policy.playoutSmoothingPeriodAlphaPerMille)
+                    .arg(policy.playoutSmoothingMaxLagUs)
+                    .arg(policy.playoutSmoothingWindowedCadence)
+                    .arg(policy.playoutSmoothingRecoveryUs);
+                context += QStringLiteral("|catchup=%1").arg(policy.playoutCatchupPerMille);
+                if (policy.playoutSmoothingReserveMaxUs != 0 ||
+                        policy.playoutSmoothingPeriodFeedbackPerMillion != 0) {
+                    context += QStringLiteral("|smoothing-reserve=%1-%2-%3-%4|period-feedback=%5")
+                        .arg(policy.playoutSmoothingReserveMaxUs)
+                        .arg(policy.playoutSmoothingReserveToleranceUs)
+                        .arg(policy.playoutSmoothingReservePercentilePerMille)
+                        .arg(policy.playoutSmoothingReserveReleaseUsPerSecond)
+                        .arg(policy.playoutSmoothingPeriodFeedbackPerMillion);
+                }
+            }
+            config.calibrationKey = QCryptographicHash::hash(context.toUtf8(), QCryptographicHash::Sha256).toHex().toStdString();
+            config.calibrationPath = Path::getCacheFileInfo("vrr13-calibration.json").absoluteFilePath().toStdString();
+        }
+        // The retired extra-queue flag remains only for historical replay;
+        // the timing profile controls delay and stale-frame replacement.
+        config.allowAdditionalQueuedFrame = false;
 
         if (!enableVsync) {
             fallbackReason = VrrFallbackReason::IneffectiveVsync;
@@ -341,10 +389,11 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                     if (m_VrrWorker->start()) {
                         m_DisplayFps = config.displayRefreshHz;
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "VRR pacing: target %d Hz with %d FPS stream (%s queue)",
+                                    "VRR pacing: target %d Hz with %d FPS stream (adaptive timestamp playout, frame timing %s, timing profile %s)",
                                     m_DisplayFps, m_MaxVideoFps,
-                                    config.allowAdditionalQueuedFrame ?
-                                        "one-frame smoothness" : "low-latency");
+                                    config.smoothFrameTiming ? "smoothed" : "follows host timestamps",
+                                    config.latencyMode == 2 ? "low latency" :
+                                    config.latencyMode == 1 ? "balanced target" : "smooth");
                         return true;
                     }
 
@@ -453,15 +502,17 @@ void Pacer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
 
 void Pacer::renderFrame(AVFrame* frame)
 {
-    // Count time spent in Pacer's queues
-    uint64_t beforeRender = LiGetMicroseconds();
+    const uint64_t decoderOutputUs =
+        static_cast<uint64_t>(frame->pkt_dts);
+    const uint64_t beforeRender = LiGetMicroseconds();
     // Render it
     m_VsyncRenderer->renderFrame(frame);
-    uint64_t afterRender = LiGetMicroseconds();
+    const uint64_t afterRender = LiGetMicroseconds();
 
     m_Telemetry.recordLegacyFrame(
-        beforeRender - static_cast<uint64_t>(frame->pkt_dts),
-        afterRender - beforeRender);
+        afterRender >= decoderOutputUs ?
+            afterRender - decoderOutputUs : 0,
+        afterRender >= beforeRender ? afterRender - beforeRender : 0);
 
     // Wait until after next frame to free this one to ensure the GPU
     // doesn't stall or read garbage if the backing buffer gets returned

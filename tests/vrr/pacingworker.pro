@@ -44,3 +44,13 @@ unix:!macx {
     CONFIG += link_pkgconfig
     PKGCONFIG += libavutil sdl2
 }
+
+SOURCES += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profile.cpp
+
+# Track the header-only feedback models in incremental builds.
+HEADERS += \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/recentreadiness.h \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h

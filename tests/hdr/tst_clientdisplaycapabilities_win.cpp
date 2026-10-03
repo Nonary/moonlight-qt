@@ -10,7 +10,7 @@ namespace {
 
 QByteArray mhc2Profile(double peakNits)
 {
-    QByteArray profile(164, '\0');
+    QByteArray profile(180, '\0');
 
     auto writeU32 = [&profile](int offset, quint32 value) {
         profile[offset] = static_cast<char>((value >> 24) & 0xff);
@@ -19,13 +19,15 @@ QByteArray mhc2Profile(double peakNits)
         profile[offset + 3] = static_cast<char>(value & 0xff);
     };
 
+    writeU32(0, static_cast<quint32>(profile.size()));
+    profile.replace(36, 4, "acsp");
     writeU32(128, 1);
     profile[132] = 'M';
     profile[133] = 'H';
     profile[134] = 'C';
     profile[135] = '2';
     writeU32(136, 144);
-    writeU32(140, 20);
+    writeU32(140, 36);
     profile[144] = 'M';
     profile[145] = 'H';
     profile[146] = 'C';
@@ -55,9 +57,6 @@ struct Fixture
         provider.readColorProfile = [fixture](const DisplayMapping &, qint64) {
             return fixture->profile;
         };
-        provider.readAssociatedColorProfiles = [fixture](const DisplayMapping &, qint64) {
-            return fixture->associatedProfiles;
-        };
         provider.readDxgiOutput = [fixture](const DisplayMapping &) {
             return fixture->output;
         };
@@ -73,7 +72,6 @@ struct Fixture
         return provider;
     }
 
-    std::vector<ProfileProbe> associatedProfiles;
 };
 
 Fixture validFixture()
@@ -145,11 +143,12 @@ private slots:
     void nonPqDetachedOrCloneOutputIsOmitted();
     void identityMutationInvalidatesBothSources();
     void bothSourcesAreNormalizedAndReturned();
-    void advancedColorUsesAssociatedMhc2ProfileWhenDefaultIsUnavailable();
-    void ambiguousAssociatedProfilesAreIgnored();
-    void nonExtendedAssociatedProfileIsIgnored();
-    void failedDefaultDoesNotUseAssociatedProfile();
+    void missingExtendedDefaultKeepsIndependentDxgi();
     void scaledQtGeometryUsesHiddenDisplayIdentity();
+    void wrongHiddenDisplayIsRejected();
+    void ambiguousDisplayOriginsAreRejected();
+    void truncatedMhc2HeaderIsRejected();
+    void invalidIccHeaderIsRejected();
 };
 
 void ClientDisplayCapabilitiesWinTest::nullSelectedScreenIsFailClosed()
@@ -300,79 +299,22 @@ void ClientDisplayCapabilitiesWinTest::bothSourcesAreNormalizedAndReturned()
     QCOMPARE(*result->edidPeakNits, 1200);
 }
 
-void ClientDisplayCapabilitiesWinTest::advancedColorUsesAssociatedMhc2ProfileWhenDefaultIsUnavailable()
+void ClientDisplayCapabilitiesWinTest::missingExtendedDefaultKeepsIndependentDxgi()
 {
-    Fixture fixture = validFixture();
-    ProfileProbe associated = fixture.profile;
-    associated.profileName = QStringLiteral("HDR Calibrated Profile.icc");
-    associated.bytes = mhc2Profile(2100.0);
-    fixture.profile = {};
-    fixture.profile.lookupStatus = ProfileLookupStatus::NoExtendedDefault;
-    fixture.associatedProfiles = {associated};
+    for (const auto status : {ProfileLookupStatus::NoExtendedDefault,
+                              ProfileLookupStatus::Failed,
+                              ProfileLookupStatus::Unknown}) {
+        Fixture fixture = validFixture();
+        // Even well-formed MHC2 bytes are unusable without an explicit WCS
+        // extended-default result tied to the selected display.
+        fixture.profile.lookupStatus = status;
 
-    const auto result = collectCapabilities(fixture.selected, fixture.provider());
+        const auto result = collectCapabilities(fixture.selected, fixture.provider());
 
-    QVERIFY(result.has_value());
-    QVERIFY(result->calibratedPeakNits.has_value());
-    QCOMPARE(*result->calibratedPeakNits, 2100);
-}
-
-void ClientDisplayCapabilitiesWinTest::ambiguousAssociatedProfilesAreIgnored()
-{
-    Fixture fixture = validFixture();
-    ProfileProbe first = fixture.profile;
-    first.profileName = QStringLiteral("HDR Calibrated Profile A.icc");
-    first.bytes = mhc2Profile(1000.0);
-    ProfileProbe second = fixture.profile;
-    second.profileName = QStringLiteral("HDR Calibrated Profile B.icc");
-    second.bytes = mhc2Profile(2100.0);
-    fixture.profile = {};
-    fixture.profile.lookupStatus = ProfileLookupStatus::NoExtendedDefault;
-    fixture.associatedProfiles = {first, second};
-
-    const auto result = collectCapabilities(fixture.selected, fixture.provider());
-
-    QVERIFY(result.has_value());
-    QVERIFY(!result->calibratedPeakNits.has_value());
-    QVERIFY(result->edidPeakNits.has_value());
-    QCOMPARE(*result->edidPeakNits, 1200);
-}
-
-void ClientDisplayCapabilitiesWinTest::nonExtendedAssociatedProfileIsIgnored()
-{
-    Fixture fixture = validFixture();
-    ProfileProbe associated = fixture.profile;
-    associated.profileName = QStringLiteral("SDR Profile.icc");
-    associated.displayColorMode = DisplayColorMode::Standard;
-    associated.bytes = mhc2Profile(2100.0);
-    fixture.profile = {};
-    fixture.profile.lookupStatus = ProfileLookupStatus::NoExtendedDefault;
-    fixture.associatedProfiles = {associated};
-
-    const auto result = collectCapabilities(fixture.selected, fixture.provider());
-
-    QVERIFY(result.has_value());
-    QVERIFY(!result->calibratedPeakNits.has_value());
-    QVERIFY(result->edidPeakNits.has_value());
-    QCOMPARE(*result->edidPeakNits, 1200);
-}
-
-void ClientDisplayCapabilitiesWinTest::failedDefaultDoesNotUseAssociatedProfile()
-{
-    Fixture fixture = validFixture();
-    ProfileProbe associated = fixture.profile;
-    associated.profileName = QStringLiteral("HDR Calibrated Profile.icc");
-    associated.bytes = mhc2Profile(2100.0);
-    fixture.profile = {};
-    fixture.profile.lookupStatus = ProfileLookupStatus::Failed;
-    fixture.associatedProfiles = {associated};
-
-    const auto result = collectCapabilities(fixture.selected, fixture.provider());
-
-    QVERIFY(result.has_value());
-    QVERIFY(!result->calibratedPeakNits.has_value());
-    QVERIFY(result->edidPeakNits.has_value());
-    QCOMPARE(*result->edidPeakNits, 1200);
+        QVERIFY(result.has_value());
+        QVERIFY(!result->calibratedPeakNits.has_value());
+        QCOMPARE(result->edidPeakNits, std::optional<int> {1200});
+    }
 }
 
 void ClientDisplayCapabilitiesWinTest::scaledQtGeometryUsesHiddenDisplayIdentity()
@@ -388,6 +330,44 @@ void ClientDisplayCapabilitiesWinTest::scaledQtGeometryUsesHiddenDisplayIdentity
 
     QVERIFY(result.has_value());
     QCOMPARE(*result, 0);
+}
+
+void ClientDisplayCapabilitiesWinTest::wrongHiddenDisplayIsRejected()
+{
+    const std::vector<QRect> bounds = {
+        QRect(0, 0, 3840, 2160),
+        QRect(-2560, -1440, 2560, 1440),
+    };
+    QVERIFY(!resolveDisplayIndex(QRect(-2560, -1440, 1280, 720), 0, bounds));
+    QCOMPARE(resolveDisplayIndex(QRect(-2560, -1440, 1280, 720), 1, bounds),
+             std::optional<int> {1});
+    QCOMPARE(resolveDisplayIndex(QRect(-2560, -1440, 1280, 720), -1, bounds),
+             std::optional<int> {1});
+}
+
+void ClientDisplayCapabilitiesWinTest::ambiguousDisplayOriginsAreRejected()
+{
+    const std::vector<QRect> bounds = {
+        QRect(0, 0, 3840, 2160), QRect(0, 0, 1920, 1080),
+    };
+    QVERIFY(!resolveDisplayIndex(QRect(0, 0, 1920, 1080), 0, bounds));
+}
+
+void ClientDisplayCapabilitiesWinTest::truncatedMhc2HeaderIsRejected()
+{
+    auto profile = mhc2Profile(1000);
+    profile[143] = 20;
+    QVERIFY(!parseMhc2PeakNits(profile));
+}
+
+void ClientDisplayCapabilitiesWinTest::invalidIccHeaderIsRejected()
+{
+    auto profile = mhc2Profile(1000);
+    profile[36] = '\0';
+    QVERIFY(!parseMhc2PeakNits(profile));
+    profile = mhc2Profile(1000);
+    profile[3] = static_cast<char>(profile.size() - 1);
+    QVERIFY(!parseMhc2PeakNits(profile));
 }
 
 QTEST_APPLESS_MAIN(ClientDisplayCapabilitiesWinTest)

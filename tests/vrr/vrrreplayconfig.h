@@ -96,6 +96,11 @@ struct VrrReplayScenario {
     QString name = "candidate";
     QString mode = "fixed";
     VrrTimingParameters controller;
+    bool controllerCustomized = false;
+    // "base": "session" layers controllerOverrides on the session policy the
+    // replay resolves for the capture instead of on historical defaults.
+    bool controllerFromSession = false;
+    QJsonObject controllerOverrides;
     VrrReplayWorkerParameters worker;
     VrrReplayDisplayParameters display;
     VrrReplayExecutionParameters execution;
@@ -104,6 +109,8 @@ struct VrrReplayScenario {
 
 struct VrrReplayConfiguration {
     VrrTimingParameters commonController;
+    bool commonControllerCustomized = false;
+    QJsonObject commonControllerOverrides;
     VrrReplayWorkerParameters commonWorker;
     VrrReplayDisplayParameters commonDisplay;
     VrrReplayExecutionParameters commonExecution;
@@ -124,6 +131,9 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
 bool applyVrrReplayOverride(const QString& expression,
                             VrrReplayScenario& scenario,
                             QString& error);
+bool applyVrrReplayControllerSnapshot(const QJsonObject& object,
+                                      VrrTimingParameters& parameters,
+                                      QString& error);
 bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error);
 bool validateVrrWorkerParameters(const VrrReplayWorkerParameters& value,

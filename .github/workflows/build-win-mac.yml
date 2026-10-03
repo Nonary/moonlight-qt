@@ -9,6 +9,21 @@ on:
       ci_version:
         required: true
         type: string
+      build_macos:
+        required: false
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      ci_version:
+        description: Version string used for the release artifacts
+        required: true
+        type: string
+      build_macos:
+        description: Include the macOS build
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -17,13 +32,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Windows
-          - os: windows-2025
-            qt_version: 6.11.1
-          # macOS
-          - os: macos-26
-            qt_version: 6.11.1
+        os: ${{ fromJSON(inputs.build_macos && '["windows-2025", "macos-26"]' || '["windows-2025"]') }}
+        qt_version: ['6.11.1']
 
     runs-on: ${{ matrix.os }}
 
@@ -72,6 +82,105 @@ jobs:
         env:
           QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
 
+      - name: Build VRR diagnostics (Windows x64)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`scripts\vswhere.exe -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+          set "PATH=%QT_PATH%;%PATH%"
+          mkdir build\tests-vrr
+          cd build\tests-vrr
+          qmake ..\..\tests\tests.pro CONFIG+=tests CONFIG+=release
+          if errorlevel 1 exit /b 1
+          nmake
+          if errorlevel 1 exit /b 1
+        env:
+          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
+
+      - name: Test VRR diagnostics (Windows x64)
+        timeout-minutes: 5
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
+          MOONLIGHT_VRR_TEST_EXPORT_TRACE: ${{ github.workspace }}/build/replay-fixture.vrrtrace
+          MOONLIGHT_VRR_TEST_EXPORT_WARM_TRACE: ${{ github.workspace }}/build/replay-warm-fixture.vrrtrace
+          MOONLIGHT_DIAGNOSTICS_TEST_EXPORT: ${{ github.workspace }}/build/diagnostic-fixture.zip
+        run: |
+          $deploy = (Resolve-Path build/deploy-x64-release).Path
+          $env:Path = "$deploy;$env:QT_PATH;$env:Path"
+          $tests = Get-ChildItem build/tests-vrr/vrr/release/tst_*.exe
+          if ($tests.Count -lt 9 -or -not ($tests.Name -contains 'tst_vrrdiagnostics.exe')) { throw "Missing VRR test executables" }
+          foreach ($test in $tests) {
+            Write-Host "Running $($test.Name)"
+            if ($test.Name -eq 'tst_overlay.exe') {
+              & $test.FullName (Resolve-Path app).Path
+            } elseif ($test.Name -in @('tst_vrrratepolicy.exe', 'tst_vrrreplayconfig.exe', 'tst_vrrdiagnostics.exe')) {
+              & $test.FullName -o '-,txt'
+            } else {
+              & $test.FullName
+            }
+            if ($LASTEXITCODE -ne 0) { throw "$($test.Name) failed: $LASTEXITCODE" }
+            Write-Host "Passed $($test.Name)"
+          }
+          python tests/vrr/check_diagnostic_zip.py build/diagnostic-fixture.zip
+          if ($LASTEXITCODE -ne 0) { throw "Diagnostic export ZIP validation failed" }
+
+      - name: Test DualSense haptics (Windows x64)
+        timeout-minutes: 2
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $deploy = (Resolve-Path build/deploy-x64-release).Path
+          $env:Path = "$deploy;$env:Path"
+          & ./build/tests-vrr/haptics/release/tst_dualsensehaptics.exe
+          if ($LASTEXITCODE -ne 0) { throw "DualSense haptics tests failed: $LASTEXITCODE" }
+
+      - name: Stage and smoke-test VRR replay (Windows x64)
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        shell: pwsh
+        env:
+          QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES: '1'
+        run: |
+          $deploy = (Resolve-Path build/deploy-x64-release).Path
+          Copy-Item build/tests-vrr/vrr/release/vrrreplay.exe $deploy
+          Copy-Item scripts/decode-vrr-trace.py $deploy
+          & "$deploy/vrrreplay.exe" --help > build/vrrreplay-help.txt
+          if ($LASTEXITCODE -ne 0 -or (Get-Item build/vrrreplay-help.txt).Length -eq 0) {
+            throw "Packaged replay smoke test failed"
+          }
+          Get-Content build/vrrreplay-help.txt
+
+      - name: Verify exact replay of production captures (Windows x64)
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES: '1'
+        run: |
+          $replay = (Resolve-Path build/deploy-x64-release/vrrreplay.exe).Path
+          foreach ($fixture in @('replay-fixture', 'replay-warm-fixture')) {
+            & $replay "build/$fixture.vrrtrace" --require-exact-baseline --output "build/$fixture.json"
+            if ($LASTEXITCODE -ne 0) { throw "$fixture exact replay failed: $LASTEXITCODE" }
+            $result = Get-Content "build/$fixture.json" -Raw | ConvertFrom-Json
+            if (!$result.capture.recorded_sequence_integrity_valid -or !$result.fidelity.baseline_exact) {
+              throw "$fixture has incomplete sequence or inexact baseline"
+            }
+          }
+
+      - name: Recreate Windows portable ZIP with diagnostics
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $deploy = (Resolve-Path build/deploy-x64-release).Path
+          if (!(Test-Path "$deploy/portable.dat.inactive") -or (Test-Path "$deploy/portable.dat")) {
+            throw "Incorrect portable settings marker"
+          }
+          Compress-Archive -Path "$deploy/*" -CompressionLevel Optimal -Force `
+            -DestinationPath "build/installer-x64-release/MoonlightPortable-x64-$env:CI_VERSION.zip"
+
       - name: Build ARM64 binaries (Windows)
         if: runner.os == 'Windows'
         shell: cmd
@@ -89,6 +198,38 @@ jobs:
           } else {
             bash scripts/generate-dmg.sh Release
           }
+
+      - name: Stage Windows installer bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ci = $Env:CI_VERSION
+          $bundle = "build/installer-release/MoonlightSetup-$ci.exe"
+          if (!(Test-Path $bundle)) { throw "Missing installer bundle $bundle" }
+          if ($ci -match '-vrr\d+') {
+            $expected = & ./scripts/vrr-pe-version.ps1 -CiVersion $ci
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($expected)) {
+              throw "Could not map CI_VERSION '$ci' to a Windows PE/MSI version"
+            }
+            $exe = "build/build-x64-release/app/release/Moonlight.exe"
+            $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path $exe))
+            if ($info.FileVersion -notlike "$expected*") {
+              throw "Moonlight.exe FileVersion is '$($info.FileVersion)', expected $expected"
+            }
+            Write-Host "Windows PE/MSI version $($info.FileVersion)"
+          }
+          Copy-Item $bundle "build/installer-x64-release/MoonlightSetup-$ci.exe"
+
+      - name: Upload Windows release packages
+        uses: actions/upload-artifact@v6
+        if: runner.os == 'Windows'
+        with:
+          name: Moonlight-Windows-Release-${{ env.CI_VERSION }}
+          path: |
+            build/installer-x64-release/MoonlightSetup-${{ env.CI_VERSION }}.exe
+            build/installer-x64-release/MoonlightPortable-x64-${{ env.CI_VERSION }}.zip
+          compression-level: 0
+          if-no-files-found: error
 
       - name: Upload Binaries (Windows x64)
         uses: actions/upload-artifact@v6

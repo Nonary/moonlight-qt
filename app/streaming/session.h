@@ -10,6 +10,7 @@
 #include "video/decoder.h"
 #include "audio/renderers/renderer.h"
 #include "video/overlaymanager.h"
+#include "diagnostics/diagnosticcapture.h"
 
 class SupportedVideoFormatList : public QList<int>
 {
@@ -72,6 +73,10 @@ public:
             {SCM_AV1_MAIN10, VIDEO_FORMAT_AV1_MAIN10},
             {SCM_AV1_HIGH8_444, VIDEO_FORMAT_AV1_HIGH8_444},
             {SCM_AV1_HIGH10_444, VIDEO_FORMAT_AV1_HIGH10_444},
+            {SCM_PYROWAVE, VIDEO_FORMAT_PYROWAVE},
+            {SCM_PYROWAVE_444, VIDEO_FORMAT_PYROWAVE_444},
+            {SCM_PYROWAVE_HDR10, VIDEO_FORMAT_PYROWAVE_HDR10},
+            {SCM_PYROWAVE_HDR10_444, VIDEO_FORMAT_PYROWAVE_HDR10_444},
         };
 
         for (QMap<int, int>::const_iterator it = mapping.cbegin(); it != mapping.cend(); ++it) {
@@ -120,6 +125,16 @@ public:
     {
         return m_OverlayManager;
     }
+
+    bool clientPacingWarningsEnabled() const { return m_Preferences->connectionWarnings; }
+    bool hevcPacingAlternative() const { return m_HevcPacingAlternative; }
+
+    int streamColorRange() const
+    {
+        return m_StreamConfig.colorRange;
+    }
+
+    QString vrrCalibrationContext() const;
 
     void flushWindowEvents();
 
@@ -194,9 +209,11 @@ private:
                        SDL_Window* window, int videoFormat, int width, int height,
                        int frameRate, bool enableVsync, bool enableFramePacing,
                        bool testOnly, IVideoDecoder*& chosenDecoder,
-                       bool enableVrr = false, int vrrDisplayRefreshHz = 0,
-                       bool vrrSmoothness = false,
-                       bool* effectiveVrr = nullptr);
+                       bool enableVrr = false, bool preferVrrRenderer = false,
+                       int vrrDisplayRefreshHz = 0,
+                       bool* effectiveVrr = nullptr, bool smoothVrrFrameTiming = true,
+                       bool gamescopeMailbox = false, int vrrLatencyMode = 0,
+                       bool gamescopeRepaint = false);
 
     static
     void clStageStarting(int stage);
@@ -255,8 +272,11 @@ private:
         bool effectiveVsync = false;
         bool enableFramePacing = false;
         bool enableVrr = false;
+        int vrrLatencyMode = 0;
+        bool gamescopeMailbox = false;
+        bool gamescopeRepaint = false;
+        bool smoothVrrFrameTiming = true;
         int refreshRate = 0;
-        bool vrrSmoothness = false;
         StreamingPreferences::WindowMode effectiveWindowMode = StreamingPreferences::WM_WINDOWED;
         StreamingPreferences::VideoDecoderSelection decoderSelection = StreamingPreferences::VDS_AUTO;
         StreamingPreferences::RendererSelection rendererSelection = StreamingPreferences::RS_AUTO;
@@ -264,7 +284,9 @@ private:
 
     StreamingPreferences* m_Preferences;
     PresentationSettings m_PresentationSettings;
+    std::unique_ptr<DiagnosticCapture> m_DiagnosticCapture;
     bool m_IsFullScreen;
+    bool m_HevcPacingAlternative = false;
     SupportedVideoFormatList m_SupportedVideoFormats; // Sorted in order of descending priority
     STREAM_CONFIGURATION m_StreamConfig;
     DECODER_RENDERER_CALLBACKS m_VideoCallbacks;
@@ -285,6 +307,7 @@ private:
     QStringList m_LaunchWarnings;
     bool m_ShouldExit;
 
+    bool m_SendClientHdrPeak = false;
     int m_ClientHdrPeakCalibratedNits = 0;
     int m_ClientHdrPeakEdidNits = 0;
 

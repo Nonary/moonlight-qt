@@ -1,11 +1,16 @@
 #pragma once
 
+#include "dxgipresent.h"
+#include "d3d11composition.h"
+#include "d3d11pyrowave.h"
 #include "ivrrframepresenter.h"
 #include "renderer.h"
 
 #include <d3d11_4.h>
 #include <d3dkmthk.h>
 #include <dxgi1_6.h>
+
+#include <memory>
 
 extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
@@ -17,6 +22,7 @@ extern "C" {
 class D3D11VARenderer : public IFFmpegRenderer, public IVrrFramePresenter
 {
 public:
+    QString getCalibrationIdentity() override;
     D3D11VARenderer(int decoderSelectionPass);
     virtual ~D3D11VARenderer() override;
     virtual bool initialize(PDECODER_PARAMETERS params) override;
@@ -25,9 +31,12 @@ public:
     virtual void renderFrame(AVFrame* frame) override;
     virtual IVrrFramePresenter* getVrrFramePresenter() override;
 
+    // DXGI can switch to interval one; composition always provides native
+    // presentation ordering. Both can honor a protected slot without a CPU floor.
     virtual bool canLatchAdaptivePresent() const override { return true; }
     virtual VrrFallbackReason checkSupport() const override;
     virtual uint64_t captureDecodeBoundary() override;
+    uint64_t waitForDecode(AVFrame* frame, uint64_t decodeBoundary) override;
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
                                           uint64_t decodeBoundary) override;
     virtual VrrPresentFeedback presentAdaptive(
@@ -41,19 +50,27 @@ public:
     virtual int getRendererAttributes() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
+    virtual IPyroWaveSurfacePool* getPyroWaveSurfacePool() override;
 
     enum PixelShaders {
         GENERIC_YUV_420,
         GENERIC_AYUV,
         GENERIC_Y410,
+        GENERIC_YUV_PLANAR,
         _COUNT
     };
 
 private:
     static void lockContext(void* lock_ctx);
     static void unlockContext(void* lock_ctx);
+    void lockPresentation();
+    void unlockPresentation();
 
     bool setupRenderingResources();
+    bool m_CompositionRequested = false;
+    D3D11CompositionPresenter m_CompositionPresenter;
+    uint64_t m_CompositionPresentId = 0;
+    bool m_CompositionModeLogged = false;
     std::vector<DXGI_FORMAT> getVideoTextureSRVFormats();
     bool setupFrameRenderingResources(AVHWFramesContext* framesContext);
     bool setupSwapchainDependentResources();
@@ -62,8 +79,9 @@ private:
     bool prepareFrameForPresent(AVFrame* frame,
                                 uint64_t decodeBoundary = 0);
     bool initializeVrrPresentReadyFence();
-    bool waitForVrrPresentReady();
-    HRESULT presentPreparedFrame(UINT flags);
+    bool beginVrrPresentReady();
+    bool finishVrrPresentReady(bool releasePresentationWhileWaiting);
+    HRESULT presentPreparedFrame(const DxgiPresentParameters& parameters);
     UINT legacyPresentFlags() const;
     void initializeVrrPresentationState(SDL_Window* window,
                                         DXGI_SWAP_CHAIN_DESC1* swapChainDesc);
@@ -71,16 +89,21 @@ private:
     void refreshVrrDisplayTiming();
     void closeVrrRasterSource();
     VrrNativeRasterSample sampleVrrRaster() const;
+    VrrNativeRasterSample queryVrrRaster() const;
     void populateVrrGpuReadyFeedback(VrrPresentFeedback& feedback) const;
     VrrFallbackReason evaluateVrrEligibility(
         bool prioritizeOutputCompatibility);
+    bool retirePreparedVrrFrameForMutation();
     void releasePreparedVrrFrame();
     void queueRenderDeviceReset();
     void renderOverlay(Overlay::OverlayType type);
     bool createOverlayVertexBuffer(Overlay::OverlayType type, int width, int height, Microsoft::WRL::ComPtr<ID3D11Buffer>& newVertexBuffer);
     void bindColorConversion(bool frameChanged, AVFrame* frame);
     void bindVideoVertexBuffer(bool frameChanged, AVFrame* frame);
-    void renderVideo(AVFrame* frame, uint64_t decodeBoundary = 0);
+    bool renderVideo(AVFrame* frame, uint64_t decodeBoundary = 0);
+    bool renderPyroWaveVideo(AVFrame* frame, PyroWaveFrameRef* ref);
+    uint64_t waitForPyroWaveDecode(const PyroWaveFrameRef* ref);
+    bool isPyroWave() const { return (m_DecoderParams.videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) != 0; }
     bool checkDecoderSupport(IDXGIAdapter* adapter);
     bool createDeviceByAdapterIndex(int adapterIndex, bool* adapterNotFound = nullptr);
     bool setupSharedDevice(IDXGIAdapter1* adapter);
@@ -150,7 +173,12 @@ private:
     UINT64 m_D2RFenceValue;
     Microsoft::WRL::ComPtr<ID3D11Fence> m_DecodeR2DFence, m_RenderR2DFence;
     UINT64 m_R2DFenceValue;
+    // FFmpeg's D3D11VA lock for the decode device's immediate context.
     SDL_mutex* m_ContextLock;
+    // Render context, swapchain and prepared VRR frame state. It includes
+    // m_ContextLock only when decode and render share one immediate context.
+    // Lock order: m_PresentationLock, then m_ContextLock.
+    SDL_mutex* m_PresentationLock;
     bool m_BindDecoderOutputTextures;
 
     DECODER_PARAMETERS m_DecoderParams;
@@ -179,6 +207,13 @@ private:
     HWND m_VrrWindowHandle;
     VrrDisplayTimingSnapshot m_VrrDisplayTiming;
     bool m_VrrRasterSamplingRequested;
+    // MOONLIGHT_VRR_SYNC_FLIPS=1 synchronizes every VRR flip instead of
+    // per-frame tearing presents (see presentAdaptive).
+    bool m_VrrSyncFlips = false;
+    // Flip protection's raster wait; disabled for the session if the raster
+    // never reports a vertical blank (see presentAdaptive).
+    bool m_VrrRasterGuardDisabled = false;
+    unsigned m_VrrRasterGuardTimeouts = 0;
     bool m_VrrRasterOpenResultValid;
     int64_t m_VrrRasterOpenResult;
     bool m_VrrRasterSourceValid;
@@ -187,10 +222,12 @@ private:
     bool m_VrrSuspended;
     VrrFallbackReason m_VrrFallbackReason;
     bool m_VrrFramePrepared;
-    bool m_VrrContextLocked;
+    uint64_t m_VrrPreparedDecodeBoundary;
+    bool m_VrrPresentationLocked;
     Microsoft::WRL::ComPtr<ID3D11Fence> m_VrrPresentReadyFence;
     UINT64 m_VrrPresentReadyFenceValue;
     HANDLE m_VrrPresentReadyFenceEvent;
+    HANDLE m_VrrDecodeReadyEvent;
     bool m_VrrPresentReadyAvailable;
     bool m_VrrGpuReadyAttempted;
     bool m_VrrGpuReadySignalResultValid;
@@ -237,4 +274,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_OverlayPixelShader;
 
     AVBufferRef* m_HwDeviceContext;
+
+    // PyroWave: planes written by the Vulkan decoder (null for other codecs)
+    LUID m_RenderAdapterLuid = {};
+    std::unique_ptr<D3D11PyroWaveSurfaces> m_PyroWaveSurfaces;
 };

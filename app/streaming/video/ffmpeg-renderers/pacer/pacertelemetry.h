@@ -6,6 +6,7 @@
 #include <cstdint>
 
 #include <QMutex>
+#include "vrr/readinesswindow.h"
 
 // Pacer work can happen on the decoder, render, V-sync, and VRR worker
 // threads. Keep its cumulative measurements separate from VIDEO_STATS, which
@@ -17,13 +18,30 @@ struct PacerTelemetrySnapshot {
 
     uint64_t renderedFrames = 0;
     uint64_t pacerDroppedFrames = 0;
-    uint64_t totalPacerTimeUs = 0;
-    uint64_t totalRenderTimeUs = 0;
+    uint64_t totalClientProcessingTimeUs = 0;
+    uint64_t totalQueuePacingTimeUs = 0;
+    uint64_t totalRenderingTimeUs = 0;
 
     bool vrrActive = false;
     uint64_t vrrPacingDroppedFrames = 0;
     uint64_t vrrEligibleFrames = 0;
     uint64_t vrrPrepareLateFrames = 0;
+    Vrr13::ReadinessWindow::Snapshot vrrReadiness;
+    uint64_t vrrOnTimeTargetPerMillion = 0;
+    bool vrrBufferAtLimit = false;
+    uint64_t vrrQueueResidenceUs = 0;
+    uint64_t vrrDecodeWaitUs = 0;
+    uint64_t vrrBufferUs = 0;
+    uint64_t vrrPreparationUs = 0, vrrPresentCallUs = 0, vrrGpuReadyWaitUs = 0;
+    uint64_t vrrGpuReadyWaitFrames = 0;
+    uint64_t vrrPresentedFrames = 0, vrrQueuePacingUs = 0;
+    uint64_t vrrLatchedFrames = 0;
+    uint64_t vrrMotionPairs = 0;
+    uint64_t vrrMotionHitches = 0;
+    uint64_t vrrCadenceIntervals = 0;
+    uint64_t vrrCadenceHitches = 0;
+    uint64_t vrrEstimatedCadenceIntervals = 0;
+    uint64_t vrrEstimatedCadenceHitches = 0;
     uint64_t vrrTargetWaitEntryLateFrames = 0;
     uint64_t vrrPresentFailedFrames = 0;
     uint64_t vrrPresentCancelledFrames = 0;
@@ -48,13 +66,29 @@ struct PacerTelemetrySnapshot {
     uint64_t vrrTargetWakeLeadUs = 0;
     uint64_t vrrGuardUs = 0;
     uint64_t vrrSourcePeriodUs = 0;
+    uint64_t vrrAppliedBufferUs = 0, vrrBufferCapUs = 0, vrrGpuReadinessLeadUs = 0;
 };
 
 struct VrrTelemetrySample {
+    uint64_t queueResidenceUs = 0;
+    uint64_t decodeWaitUs = 0;
+    uint64_t bufferUs = 0;
+    uint64_t submissionUs = 0;
+    // Reset only at a real presentation epoch boundary. Local drops and host
+    // stalls affect motion and must not erase the following interval.
+    bool motionDiscontinuity = false;
     uint64_t decisionTimeUs = 0;
-    uint64_t pacerTimeUs = 0;
-    uint64_t renderTimeUs = 0;
+    uint64_t clientProcessingTimeUs = 0;
+    uint64_t renderingTimeUs = 0;
+    uint64_t preparationUs = 0, presentCallUs = 0, gpuReadyWaitUs = 0;
+    bool gpuReadyWaitValid = false;
+    bool latched = false;
     uint64_t preparationLatenessUs = 0;
+    // Cumulative verified display-interval counters from the controller.
+    uint64_t cadenceIntervals = 0;
+    uint64_t cadenceHitches = 0;
+    uint64_t estimatedCadenceIntervals = 0;
+    uint64_t estimatedCadenceHitches = 0;
     int64_t submitErrorUs = 0;
 
     bool prepareLate = false;
@@ -70,6 +104,7 @@ struct VrrTelemetrySample {
     uint64_t targetWakeLeadUs = 0;
     uint64_t guardUs = 0;
     uint64_t sourcePeriodUs = 0;
+    uint64_t bufferCapUs = 0, gpuReadinessLeadUs = 0;
 };
 
 class PacerTelemetry {
@@ -97,13 +132,12 @@ public:
         touchLocked();
     }
 
-    void recordLegacyFrame(uint64_t pacerTimeUs,
-                           uint64_t renderTimeUs)
+    void recordLegacyFrame(uint64_t clientProcessingTimeUs,
+                           uint64_t renderingTimeUs)
     {
         QMutexLocker lock(&m_Lock);
-        m_Snapshot.totalPacerTimeUs += pacerTimeUs;
-        m_Snapshot.totalRenderTimeUs += renderTimeUs;
-        ++m_Snapshot.renderedFrames;
+        recordPresentedTimingLocked(clientProcessingTimeUs,
+                                    renderingTimeUs);
         touchLocked();
     }
 
@@ -112,6 +146,24 @@ public:
         QMutexLocker lock(&m_Lock);
         ++m_Snapshot.pacerDroppedFrames;
         ++m_Snapshot.vrrPacingDroppedFrames;
+        touchLocked();
+    }
+
+    void recordVrrReadiness(uint64_t atUs, uint64_t latenessUs, bool dropped,
+                           uint64_t targetPerMillion, bool capacityLimited,
+                           bool decisionValid, bool thresholdedMissPolicy,
+                           bool meaningfulMissesOnly = false, bool intervalPolicy = false,
+                           const Vrr13::IntervalBuffer::Stats* interval = nullptr)
+    {
+        QMutexLocker lock(&m_Lock);
+        m_ReadinessWindow.record(atUs, latenessUs, dropped);
+        const auto intervalStats = interval ? *interval : m_Snapshot.vrrReadiness.interval;
+        m_Snapshot.vrrReadiness = m_ReadinessWindow.snapshot(
+            0, thresholdedMissPolicy, meaningfulMissesOnly);
+        m_Snapshot.vrrReadiness.intervalPolicy = intervalPolicy;
+        m_Snapshot.vrrReadiness.interval = intervalStats;
+        m_Snapshot.vrrOnTimeTargetPerMillion = targetPerMillion;
+        if (decisionValid) m_Snapshot.vrrBufferAtLimit = capacityLimited;
         touchLocked();
     }
 
@@ -126,9 +178,30 @@ public:
     {
         QMutexLocker lock(&m_Lock);
 
+        if (sample.motionDiscontinuity) {
+            m_LastMotionSubmissionUs = m_LastMotionIntervalUs = 0;
+        }
+        if (sample.presented && !sample.cancelled && sample.submissionUs) {
+            if (m_LastMotionSubmissionUs && sample.submissionUs > m_LastMotionSubmissionUs) {
+                const uint64_t interval = sample.submissionUs - m_LastMotionSubmissionUs;
+                if (m_LastMotionIntervalUs) {
+                    ++m_Snapshot.vrrMotionPairs;
+                    const uint64_t jerk = std::max(interval, m_LastMotionIntervalUs) -
+                        std::min(interval, m_LastMotionIntervalUs);
+                    m_Snapshot.vrrMotionHitches += jerk > 2000;
+                }
+                m_LastMotionIntervalUs = interval;
+            }
+            else {
+                m_LastMotionIntervalUs = 0;
+            }
+            m_LastMotionSubmissionUs = sample.submissionUs;
+        }
         ++m_Snapshot.vrrEligibleFrames;
-        m_Snapshot.totalPacerTimeUs += sample.pacerTimeUs;
-        m_Snapshot.totalRenderTimeUs += sample.renderTimeUs;
+        m_Snapshot.vrrCadenceIntervals = sample.cadenceIntervals;
+        m_Snapshot.vrrCadenceHitches = sample.cadenceHitches;
+        m_Snapshot.vrrEstimatedCadenceIntervals = sample.estimatedCadenceIntervals;
+        m_Snapshot.vrrEstimatedCadenceHitches = sample.estimatedCadenceHitches;
         if (sample.prepareLate) {
             ++m_Snapshot.vrrPrepareLateFrames;
             addPrepareLatenessLocked(sample.preparationLatenessUs);
@@ -146,7 +219,21 @@ public:
         }
         recordVrrOutcomeLocked(sample.presented, sample.cancelled);
         if (sample.presented && !sample.cancelled) {
-            ++m_Snapshot.renderedFrames;
+            m_Snapshot.vrrQueueResidenceUs += sample.queueResidenceUs;
+            m_Snapshot.vrrDecodeWaitUs += sample.decodeWaitUs;
+            m_Snapshot.vrrBufferUs += sample.bufferUs;
+            m_Snapshot.vrrPreparationUs += sample.preparationUs;
+            m_Snapshot.vrrPresentCallUs += sample.presentCallUs;
+            if (sample.gpuReadyWaitValid) {
+                m_Snapshot.vrrGpuReadyWaitUs += sample.gpuReadyWaitUs;
+                ++m_Snapshot.vrrGpuReadyWaitFrames;
+            }
+            m_Snapshot.vrrLatchedFrames += sample.latched;
+            const uint64_t priorQueueUs = m_Snapshot.totalQueuePacingTimeUs;
+            recordPresentedTimingLocked(sample.clientProcessingTimeUs,
+                                        sample.renderingTimeUs, sample.decodeWaitUs);
+            m_Snapshot.vrrQueuePacingUs += m_Snapshot.totalQueuePacingTimeUs - priorQueueUs;
+            ++m_Snapshot.vrrPresentedFrames;
         }
 
         touchLocked();
@@ -159,9 +246,13 @@ public:
         m_Snapshot.vrrTargetWakeLeadUs = sample.targetWakeLeadUs;
         m_Snapshot.vrrGuardUs = sample.guardUs;
         m_Snapshot.vrrSourcePeriodUs = sample.sourcePeriodUs;
+        m_Snapshot.vrrAppliedBufferUs = sample.bufferUs;
+        m_Snapshot.vrrBufferCapUs = sample.bufferCapUs;
+        m_Snapshot.vrrGpuReadinessLeadUs = sample.gpuReadinessLeadUs;
     }
 
 private:
+    Vrr13::ReadinessWindow m_ReadinessWindow;
     static constexpr size_t kPrepareLatenessSampleCount = 128;
     static constexpr size_t kSubmitErrorSampleCount = 128;
 
@@ -184,6 +275,22 @@ private:
         else if (!presented) {
             ++m_Snapshot.vrrPresentFailedFrames;
         }
+    }
+
+    void recordPresentedTimingLocked(uint64_t clientProcessingTimeUs,
+                                     uint64_t renderingTimeUs,
+                                     uint64_t decodeWaitUs = 0)
+    {
+        // GPU decode synchronization remains in internal client timing, but
+        // is neither rendering nor the queue delay shown in the overlay.
+        const uint64_t boundedRenderingTimeUs = std::min(
+            renderingTimeUs, clientProcessingTimeUs);
+        m_Snapshot.totalClientProcessingTimeUs += clientProcessingTimeUs;
+        m_Snapshot.totalRenderingTimeUs += boundedRenderingTimeUs;
+        m_Snapshot.totalQueuePacingTimeUs +=
+            clientProcessingTimeUs - boundedRenderingTimeUs -
+            std::min(decodeWaitUs, clientProcessingTimeUs - boundedRenderingTimeUs);
+        ++m_Snapshot.renderedFrames;
     }
 
     void addPrepareLatenessLocked(uint64_t latenessUs)
@@ -246,6 +353,8 @@ private:
 
     mutable QMutex m_Lock;
     PacerTelemetrySnapshot m_Snapshot;
+    uint64_t m_LastMotionSubmissionUs = 0;
+    uint64_t m_LastMotionIntervalUs = 0;
     std::array<uint64_t, kPrepareLatenessSampleCount> m_PrepareLatenessSamples {};
     size_t m_NextPrepareLatenessSample = 0;
     size_t m_PrepareLatenessSampleSize = 0;

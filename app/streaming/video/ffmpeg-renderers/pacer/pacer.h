@@ -57,7 +57,9 @@ public:
     bool initialize(SDL_Window* window, int maxVideoFps,
                     bool enablePacing, bool enableVsync,
                     bool enableVrr, int vrrDisplayRefreshHz,
-                    bool vrrSmoothness);
+                    bool smoothVrrFrameTiming = true,
+                    const QString& calibrationKey = QString(),
+                    int vrrLatencyMode = 0);
 
     void notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info);
 

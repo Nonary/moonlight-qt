@@ -16,4 +16,9 @@ struct ClientDisplayCapabilities
     std::optional<ClientDisplayCapabilitySource> edid;
 
     static std::optional<int> normalizePeakLuminance(double nits);
+
+    // Only normalized peak values enter the launch/resume wire extension.
+    static QString hdrPeakQueryArguments(const QString& verb, int hostVersion,
+                                         bool hdrEnabled, int calibratedNits,
+                                         int edidNits);
 };

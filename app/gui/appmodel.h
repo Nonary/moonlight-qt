@@ -9,6 +9,10 @@
 class AppModel : public QAbstractListModel
 {
     Q_OBJECT
+    Q_PROPERTY(bool frameLimiterSupported READ frameLimiterSupported NOTIFY frameLimiterChanged)
+    Q_PROPERTY(bool frameLimiterEnabled READ frameLimiterEnabled NOTIFY frameLimiterChanged)
+    Q_PROPERTY(bool virtualDisplayFrameLimiterEnabled READ virtualDisplayFrameLimiterEnabled NOTIFY frameLimiterChanged)
+    Q_PROPERTY(double frameLimiterFpsLimit READ frameLimiterFpsLimit NOTIFY frameLimiterChanged)
 
     enum Roles
     {
@@ -23,6 +27,10 @@ class AppModel : public QAbstractListModel
 
 public:
     explicit AppModel(QObject *parent = nullptr);
+    bool frameLimiterSupported() const;
+    bool frameLimiterEnabled() const;
+    bool virtualDisplayFrameLimiterEnabled() const;
+    double frameLimiterFpsLimit() const;
 
     // Must be called before any QAbstractListModel functions
     Q_INVOKABLE void initialize(ComputerManager* computerManager, int computerIndex, bool showHiddenGames);
@@ -54,6 +62,7 @@ private slots:
 
 signals:
     void computerLost();
+    void frameLimiterChanged();
 
 private:
     void updateAppList(QVector<NvApp> newList);
@@ -62,7 +71,12 @@ private:
 
     bool isAppCurrentlyVisible(const NvApp& app);
 
-    NvComputer* m_Computer;
+    void updateFrameLimiterCapabilities();
+    bool m_FrameLimiterSupported = false;
+    bool m_FrameLimiterEnabled = false;
+    bool m_VirtualDisplayFrameLimiterEnabled = false;
+    double m_FrameLimiterFpsLimit = 0;
+    NvComputer* m_Computer = nullptr;
     BoxArtManager m_BoxArtManager;
     ComputerManager* m_ComputerManager;
     QVector<NvApp> m_VisibleApps, m_AllApps;

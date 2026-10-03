@@ -43,6 +43,8 @@ public:
 
     Q_INVOKABLE void renameComputer(int computerIndex, QString name);
 
+    Q_INVOKABLE QString uuidAt(int computerIndex) const;
+
     Q_INVOKABLE Session* createSessionForCurrentGame(int computerIndex);
 
 signals:

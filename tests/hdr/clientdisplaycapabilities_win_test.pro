@@ -15,5 +15,12 @@ contains(QT_ARCH, x86_64) {
     INCLUDEPATH += $$PWD/../../libs/windows/include/x64 \
                    $$PWD/../../libs/windows/include/x64/SDL2
     LIBS += -L$$PWD/../../libs/windows/lib/x64 \
-            -lSDL2 dxgi.lib d3d11.lib gdi32.lib user32.lib advapi32.lib
+            -lSDL2
 }
+contains(QT_ARCH, arm64) {
+    INCLUDEPATH += $$PWD/../../libs/windows/include/arm64 \
+                   $$PWD/../../libs/windows/include/arm64/SDL2
+    LIBS += -L$$PWD/../../libs/windows/lib/arm64 -lSDL2
+}
+
+win32: LIBS += dxgi.lib d3d11.lib gdi32.lib user32.lib advapi32.lib

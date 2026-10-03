@@ -1,4 +1,5 @@
 #include <QGuiApplication>
+#include "streaming/video/amddecodepolicy.h"
 #include <QStyleHints>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -46,6 +47,7 @@
 #include "cli/commandlineparser.h"
 #include "path.h"
 #include "utils.h"
+#include "diagnostics/diagnosticcapture.h"
 #include "gui/computermodel.h"
 #include "gui/appmodel.h"
 #include "backend/autoupdatechecker.h"
@@ -53,6 +55,8 @@
 #include "backend/systemproperties.h"
 #include "streaming/session.h"
 #include "settings/streamingpreferences.h"
+#include "streaming/video/pyrowave/pyrowavecalibrator.h"
+#include "backend/networkbuffers.h"
 #include "gui/sdlgamepadkeynavigation.h"
 #include "windowsvblankvirtualization.h"
 
@@ -95,7 +99,7 @@ extern "C" bool g_DisableDrmHooks;
 class LoggerTask : public QRunnable
 {
 public:
-    LoggerTask(const QString& msg) : m_Msg(msg)
+    LoggerTask(const QString& msg, bool normalOutput = true) : m_Msg(msg), m_NormalOutput(normalOutput)
     {
         setAutoDelete(true);
     }
@@ -107,13 +111,24 @@ public:
         // between synchronous and asynchronous. Asynchronous won't contend in
         // the common case because we only have a single logging thread.
         QMutexLocker locker(&s_SyncLoggerMutex);
-        s_LoggerStream << m_Msg;
-        s_LoggerStream.flush();
+        if (m_NormalOutput) {
+            s_LoggerStream << m_Msg;
+            s_LoggerStream.flush();
+        }
+        DiagnosticCapture::appendLog(m_Msg);
     }
 
 private:
     QString m_Msg;
+    bool m_NormalOutput;
 };
+
+void Utils::flushLogs()
+{
+    s_LoggerThread.waitForDone();
+    QMutexLocker locker(&s_SyncLoggerMutex);
+    s_LoggerStream.flush();
+}
 
 void logToLoggerStream(QString& message)
 {
@@ -133,10 +148,12 @@ void logToLoggerStream(QString& message)
     message.replace(k_RikeyRegex, "&rikey=REDACTED");
     message.replace(k_RikeyIdRegex, "&rikeyid=REDACTED");
 
+    bool normalOutput = true;
 #ifdef LOG_TO_FILE
     auto oldLogSize = s_LogBytesWritten.fetchAndAddRelaxed(message.size());
     if (oldLogSize >= k_MaxLogSizeBytes) {
-        return;
+        if (!DiagnosticCapture::isActive()) return;
+        normalOutput = false;
     }
     else if (oldLogSize >= k_MaxLogSizeBytes - message.size()) {
         // Write one final message
@@ -146,11 +163,11 @@ void logToLoggerStream(QString& message)
 
     if (g_AsyncLoggingEnabled) {
         // Queue the log message to be written asynchronously
-        s_LoggerThread.start(new LoggerTask(message));
+        s_LoggerThread.start(new LoggerTask(message, normalOutput));
     }
     else {
         // Log the message immediately
-        LoggerTask(message).run();
+        LoggerTask(message, normalOutput).run();
     }
 }
 
@@ -421,6 +438,18 @@ void configureSignalHandlers()
 
 int main(int argc, char *argv[])
 {
+    // Available headlessly from every package; includes the exact covered source.
+    if (argc == 2 && strcmp(argv[1], "--haptics-license") == 0) {
+        for (const char* name : {"PROVENANCE.md", "LICENSE-MPL-2.0", "LICENSE-GPL-3.0", "SAxense.c", "packet.h", "README.md"}) {
+            QFile file(QStringLiteral(":/haptics/") + QString::fromLatin1(name));
+            if (!file.open(QIODevice::ReadOnly)) return 1;
+            const auto contents = file.readAll();
+            fprintf(stdout, "\n%s\n", name);
+            if (fwrite(contents.constData(), 1, size_t(contents.size()), stdout) != size_t(contents.size())) return 1;
+        }
+        return fflush(stdout) == 0 ? 0 : 1;
+    }
+
     SDL_SetMainReady();
 
     // Set the app version for the QCommandLineParser's showVersion() command
@@ -487,6 +516,20 @@ int main(int argc, char *argv[])
     SDL_LogSetOutputFunction(sdlLogToDiskHandler, nullptr);
 #endif
     qInstallMessageHandler(qtLogToDiskHandler);
+
+#if defined(Q_OS_LINUX) && defined(HAVE_LIBVA)
+    // Mesa snapshots driver options when its screen is first created, which
+    // may happen in Qt/SDL before VAAPI decoder probing. Request low-latency
+    // VCN decode here, before any graphics initialization. This changes only
+    // this process; it neither modifies system power policy nor skips fences.
+    if (qgetenv("MOONLIGHT_AMD_LOW_LATENCY_DECODE") != "0") {
+        const QByteArray flags = qEnvironmentVariableIsSet("AMD_DEBUG") ?
+            qgetenv("AMD_DEBUG") : qgetenv("R600_DEBUG");
+        qputenv("AMD_DEBUG", withAmdLowLatencyDecode(flags));
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "AMD VAAPI: requested Mesa low-latency decode (driver support required)");
+    }
+#endif
 #ifdef HAVE_FFMPEG
     av_log_set_callback(ffmpegLogToDiskHandler);
 #endif
@@ -969,6 +1012,16 @@ int main(int argc, char *argv[])
                                                    [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
                                                        return StreamingPreferences::get(qmlEngine);
                                                    });
+    qmlRegisterSingletonType<PyroWaveCalibrator>("PyroWaveCalibrator", 1, 0,
+                                                  "PyroWaveCalibrator",
+                                                  [](QQmlEngine*, QJSEngine*) -> QObject* {
+                                                      return new PyroWaveCalibrator();
+                                                  });
+    qmlRegisterSingletonType<NetworkBuffers>("NetworkBuffers", 1, 0,
+                                             "NetworkBuffers",
+                                             [](QQmlEngine*, QJSEngine*) -> QObject* {
+                                                 return new NetworkBuffers();
+                                             });
 
     // Create the identity manager on the main thread
     IdentityManager::get();

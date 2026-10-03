@@ -2,10 +2,13 @@
 
 #include "../../decoder.h"
 #include "../ivrrframepresenter.h"
+#include "../vrrpreparedframe.h"
 #include "pacertelemetry.h"
+#include "vrr/receivedeadline.h"
 #include "vrr/vrrtargetwaiter.h"
 #include "vrr/vrrtypes.h"
 #include "vrr/vrrtimingcontroller.h"
+#include "vrr/tracequeue.h"
 
 #include <atomic>
 #include <cstdio>
@@ -20,9 +23,10 @@
 
 class VrrTimingController;
 
-// The complete greenfield VRR execution path lives in this one worker.  It
-// owns a bounded queue and the renderer context from preparation through
-// presentation; fixed-VSync and unpaced Pacer behavior never enter it.
+// Owns bounded admission, controller state and native presentation. A backend
+// may prepare independent offscreen images through cancellable tickets, but
+// swapchain activation/presentation remains on this worker. Fixed-VSync and
+// unpaced Pacer behavior never enter it.
 class VrrPacingWorker {
 public:
     VrrPacingWorker(IVrrFramePresenter* presenter,
@@ -46,6 +50,7 @@ private:
         Presented,
         OutputDropped,
         QueueCapacity,
+        QueueStale,
         ArrivalRejected,
         SuspensionDiscard,
         ShutdownDiscard,
@@ -67,6 +72,12 @@ private:
     struct QueuedFrame {
         PacedFrame frame;
         FrameTraceContext trace;
+        std::shared_ptr<VrrPreparedFrame> preparation;
+
+        QueuedFrame() = default;
+        QueuedFrame(QueuedFrame&&) = default;
+        QueuedFrame& operator=(QueuedFrame&&) = default;
+        ~QueuedFrame() { if (preparation) preparation->cancel(); }
 
         explicit operator bool() const
         {
@@ -75,6 +86,8 @@ private:
     };
 
     struct FrameTelemetry {
+        bool preparedAhead = false;
+        VrrPreparedFrame::Timing preparationStage;
         uint64_t decisionTimeUs = 0;
         uint64_t decisionEndUs = 0;
         bool externalRebaseApplied = false;
@@ -92,6 +105,12 @@ private:
         uint64_t preparationStartUs = 0;
         uint64_t preparationEndUs = 0;
         uint64_t preparationDurationUs = 0;
+        uint64_t decodeSyncWaitUs = 0;
+        bool prepareTimingValid = false;
+        uint64_t prepareDecodeSyncUs = 0;
+        uint64_t prepareAcquireUs = 0;
+        uint64_t prepareRenderUs = 0;
+        uint64_t prepareFlushUs = 0;
         uint64_t targetWaitEntryUs = 0;
         uint64_t targetWaitOvershootUs = 0;
         uint64_t targetWaitFinalUs = 0;
@@ -127,9 +146,20 @@ private:
         uint32_t rtpTimestamp = 0;
         bool timestampValid = false;
         uint64_t decodeCompleteUs = 0;
+        uint64_t decoderOutputUs = 0;
+        int latencyMode = 0;
+        uint64_t historySamples = 0;
+        uint64_t historyMisses = 0;
+        uint64_t historyDurationUs = 0;
+        bool historyCanRelease = false;
+        uint64_t receiveUs = 0;
+        uint64_t reassembledUs = 0;
+        uint64_t decodeSubmitUs = 0;
+        uint64_t decodeHoldUs = 0;
         FrameTraceContext input;
         VrrTimingDecision decision;
         VrrTimingDiagnostics diagnostics;
+        Vrr13::IntervalBuffer::Stats bufferStats;
         VrrPresentFeedback feedback;
         FrameTelemetry telemetry;
         size_t completionQueueDepth = 0;
@@ -163,7 +193,9 @@ private:
                           FrameTelemetry& telemetry);
     void deferFrame(PacedFrame&& frame);
     void noteDrop();
-    void writeTrace(const QueuedFrame& frame,
+    void publishReceiveDeadline(const PacedFrame& frame,
+                                const VrrTimingDecision& decision);
+    void recordFrameCompletion(const QueuedFrame& frame,
                     const VrrTimingDecision& decision,
                     const VrrPresentFeedback& feedback,
                     const FrameTelemetry& telemetry,
@@ -182,15 +214,40 @@ private:
     PacerTelemetry* m_Telemetry;
     VrrSessionConfig m_Config;
     bool m_CanLatchPresentation = false;
+    bool m_WorkerStarted = false;
+    std::atomic_bool m_CalibrationInvalidated { false };
+    QByteArray m_InitialPlayoutProfile;
+    bool m_CalibrationLoaded = false;
+    QString startDelayPath() const;
+    void noteSettledDelay(uint64_t nowUs, uint64_t delayUs);
+    static constexpr uint64_t kSettledDelayWarmupUs = 30000000;
+    static constexpr size_t kMinimumSettledDelaySamples = 60;
+    uint64_t m_StartDelaySeedUs = 0;
+    uint64_t m_FirstDecisionUs = 0;
+    uint64_t m_LastSettledDelaySampleUs = 0;
+    std::vector<uint64_t> m_SettledDelaySamples;
+    uint64_t m_InitialCachedSamples = 0;
+    int m_HistoryVersion = 0;
 
     std::unique_ptr<VrrTimingController> m_TimingController;
+    VrrReceiveDeadline::RecentDuration m_RecentDuration;
+    VrrReceiveDeadline::RecentDuration m_DecodeGpuCost;
+    VrrReceiveDeadline::RecentDuration m_PresentCallCost;
+    VrrReceiveDeadline::RecentDuration m_PreparationCost;
     std::unique_ptr<VrrTargetWaiter> m_TargetWaiter;
 
     QMutex m_FrameQueueLock;
     QWaitCondition m_FrameQueueNotEmpty;
+    // Keep enough decoded successors to absorb the short gap-then-burst
+    // delivery pattern seen near the panel ceiling. Capacity stays bounded and
+    // evicts the oldest queued successor under sustained pressure, so it cannot
+    // accumulate an unbounded latency backlog. Fixed per session (the timing
+    // profile's playoutQueueFrames) before any producer runs.
+    size_t m_QueueCapacity = VrrMaximumQueuedFrames;
     std::deque<QueuedFrame> m_FrameQueue;
     std::atomic_size_t m_FrameQueueDepth { 0 };
     PacedFrame m_DeferredFrame;
+    // The last presented image, re-presented inside a host gap.
     SDL_Thread* m_WorkerThread = nullptr;
     std::atomic_bool m_Stopping { false };
     std::atomic_bool m_Suspended { false };
@@ -204,10 +261,9 @@ private:
     bool m_DeepTraceEnabled = false;
     std::FILE* m_TraceFile = nullptr;
     SDL_Thread* m_TraceThread = nullptr;
-    QMutex m_TraceLock;
-    QWaitCondition m_TraceQueueNotEmpty;
-    std::vector<TraceRow> m_TraceQueue;
+    std::unique_ptr<Vrr13::TraceQueue<TraceRow, 8192>> m_TraceQueue;
     std::atomic_bool m_TraceStopping { false };
+    std::atomic_uint m_TraceProducersActive { 0 };
     std::atomic_bool m_TraceAcceptingRows { false };
     std::atomic_uint64_t m_TraceArrivalSequence { 0 };
     std::atomic_size_t m_TraceDroppedRows { 0 };

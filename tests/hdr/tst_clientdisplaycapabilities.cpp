@@ -12,6 +12,8 @@ private slots:
     void normalizationRoundsToWholeNits();
     void normalizationRejectsInvalidValues();
     void sourceValuesRemainLocalValueOnlyData();
+    void launchAndResumeQueryGating_data();
+    void launchAndResumeQueryGating();
 };
 
 void ClientDisplayCapabilitiesTest::normalizationRoundsToWholeNits()
@@ -52,6 +54,51 @@ void ClientDisplayCapabilitiesTest::sourceValuesRemainLocalValueOnlyData()
     QCOMPARE(capabilities.calibrated->peakLuminanceNits, 1600.0);
     QCOMPARE(capabilities.edid->source, QStringLiteral("dxgi-output"));
     QCOMPARE(capabilities.edid->peakLuminanceNits, 1200.0);
+}
+
+void ClientDisplayCapabilitiesTest::launchAndResumeQueryGating_data()
+{
+    QTest::addColumn<QString>("verb");
+    QTest::addColumn<int>("version");
+    QTest::addColumn<bool>("hdr");
+    QTest::addColumn<int>("calibrated");
+    QTest::addColumn<int>("edid");
+    QTest::addColumn<QString>("expected");
+
+    for (const auto& verb : {QStringLiteral("launch"), QStringLiteral("resume")}) {
+        const auto row = [&verb](const char* name, int version, bool hdr,
+                                 int calibrated, int edid, const QString& expected) {
+            const QByteArray label = verb.toLatin1() + '-' + name;
+            QTest::newRow(label.constData()) << verb << version << hdr << calibrated << edid << expected;
+        };
+        row("both", 1, true, 1600, 1200,
+            QStringLiteral("&clientHdrPeakCalibrated=1600&clientHdrPeakEdid=1200"));
+        row("boundaries", 1, true, 1, 100000,
+            QStringLiteral("&clientHdrPeakCalibrated=1&clientHdrPeakEdid=100000"));
+        row("missing-version", 0, true, 1600, 1200, {});
+        row("future-version", 2, true, 1600, 1200, {});
+        row("negative-version", -1, true, 1600, 1200, {});
+        row("sdr", 1, false, 1600, 1200, {});
+        row("absent", 1, true, 0, 0, {});
+        row("invalid", 1, true, -1, 100001, {});
+        row("calibrated-only", 1, true, 1600, 100001,
+            QStringLiteral("&clientHdrPeakCalibrated=1600"));
+        row("edid-only", 1, true, -1, 1200,
+            QStringLiteral("&clientHdrPeakEdid=1200"));
+    }
+    QTest::newRow("other-verb") << QStringLiteral("quit") << 1 << true << 1600 << 1200 << QString();
+}
+
+void ClientDisplayCapabilitiesTest::launchAndResumeQueryGating()
+{
+    QFETCH(QString, verb);
+    QFETCH(int, version);
+    QFETCH(bool, hdr);
+    QFETCH(int, calibrated);
+    QFETCH(int, edid);
+    QFETCH(QString, expected);
+    QCOMPARE(ClientDisplayCapabilities::hdrPeakQueryArguments(verb, version, hdr, calibrated, edid),
+             expected);
 }
 
 QTEST_APPLESS_MAIN(ClientDisplayCapabilitiesTest)

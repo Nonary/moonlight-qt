@@ -1,8 +1,13 @@
+#include "streaming/input/dualsensehaptics.h"
+#include <QNetworkInterface>
+#include <QSysInfo>
+#include <QDir>
 #include "session.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
 #include "streaming/vrrratepolicy.h"
 #include "backend/richpresencemanager.h"
+#include "backend/networkbuffers.h"
 
 #include <Limelight.h>
 #include "SDL_compat.h"
@@ -10,6 +15,7 @@
 
 #ifdef HAVE_FFMPEG
 #include "video/ffmpeg.h"
+#include "video/ffmpeg-renderers/pacer/vrr/receivedeadline.h"
 #endif
 
 #ifdef HAVE_SLVIDEO
@@ -62,7 +68,12 @@ CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
     Session::clRumbleTriggers,
     Session::clSetMotionEventState,
     Session::clSetControllerLED,
-    Session::clSetAdaptiveTriggers
+    Session::clSetAdaptiveTriggers,
+#if defined(Q_OS_LINUX) && SDL_VERSION_ATLEAST(2, 24, 0)
+    DualSenseHaptics::receive
+#else
+    nullptr
+#endif
 };
 
 Session* Session::s_ActiveSession;
@@ -181,21 +192,15 @@ void Session::clConnectionStatusUpdate(int connectionStatus)
         return;
     }
 
-    if (s_ActiveSession->m_MouseEmulationRefCount > 0) {
-        // Don't display the overlay if mouse emulation is already using it
-        return;
-    }
-
     switch (connectionStatus)
     {
     case CONN_STATUS_POOR:
-        s_ActiveSession->m_OverlayManager.updateOverlayText(Overlay::OverlayStatusUpdate,
+        s_ActiveSession->m_OverlayManager.setStatusMessage(Overlay::StatusSource::Network,
                                                             s_ActiveSession->m_StreamConfig.bitrate > 5000 ?
                                                                 "Slow connection to PC\nReduce your bitrate" : "Poor connection to PC");
-        s_ActiveSession->m_OverlayManager.setOverlayState(Overlay::OverlayStatusUpdate, true);
         break;
     case CONN_STATUS_OKAY:
-        s_ActiveSession->m_OverlayManager.setOverlayState(Overlay::OverlayStatusUpdate, false);
+        s_ActiveSession->m_OverlayManager.setStatusMessage(Overlay::StatusSource::Network, "");
         break;
     }
 }
@@ -254,6 +259,7 @@ void Session::clSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g
 }
 
 void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right){
+    if (controllerNumber >= MAX_GAMEPADS || !left || !right) return;
     // We push an event for the main thread to handle in order to properly synchronize
     // with the removal of game controllers that could result in our game controller
     // going away during this callback.
@@ -265,26 +271,21 @@ void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlag
     // Based on the following SDL code:
     // https://github.com/libsdl-org/SDL/blob/120c76c84bbce4c1bfed4e9eb74e10678bd83120/test/testgamecontroller.c#L286-L307
     DualSenseOutputReport *state = (DualSenseOutputReport *) SDL_malloc(sizeof(DualSenseOutputReport));
-    SDL_zero(*state);
-    state->validFlag0 = (eventFlags & DS_EFFECT_RIGHT_TRIGGER) | (eventFlags & DS_EFFECT_LEFT_TRIGGER);
-    state->rightTriggerEffectType = typeRight;
-    SDL_memcpy(state->rightTriggerEffect, right, sizeof(state->rightTriggerEffect));
-    state->leftTriggerEffectType = typeLeft;
-    SDL_memcpy(state->leftTriggerEffect, left, sizeof(state->leftTriggerEffect));
+    if (!state) return;
+    *state = makeDualSenseTriggerReport(eventFlags, typeLeft, typeRight, left, right);
 
     setControllerLEDEvent.user.data2 = (void *) state;
-    SDL_PushEvent(&setControllerLEDEvent);
+    if (SDL_PushEvent(&setControllerLEDEvent) <= 0) SDL_free(state);
 }
-
 
 bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             StreamingPreferences::RendererSelection renderer,
                             SDL_Window* window, int videoFormat, int width, int height,
                             int frameRate, bool enableVsync, bool enableFramePacing,
                             bool testOnly, IVideoDecoder*& chosenDecoder,
-                            bool enableVrr, int vrrDisplayRefreshHz,
-                            bool vrrSmoothness,
-                            [[maybe_unused]] bool* effectiveVrr)
+                            bool enableVrr, bool preferVrrRenderer, int vrrDisplayRefreshHz,
+                            [[maybe_unused]] bool* effectiveVrr, bool smoothVrrFrameTiming,
+                            bool gamescopeMailbox, int vrrLatencyMode, bool gamescopeRepaint)
 {
     DECODER_PARAMETERS params = {};
 
@@ -302,8 +303,14 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.enableVsync = enableVsync;
     params.enableFramePacing = enableFramePacing;
     params.enableVrr = enableVrr;
+    // Playback already sets enableVrr; the probe uses preferVrrRenderer alone so
+    // it can match that renderer/color policy without starting VRR presentation.
+    params.preferVrrRenderer = preferVrrRenderer || enableVrr;
+    params.vrrLatencyMode = vrrLatencyMode;
+    params.gamescopeMailbox = gamescopeMailbox;
+    params.gamescopeRepaint = gamescopeRepaint;
+    params.smoothVrrFrameTiming = smoothVrrFrameTiming;
     params.vrrDisplayRefreshHz = vrrDisplayRefreshHz;
-    params.vrrSmoothness = enableVrr && vrrSmoothness;
     params.testOnly = testOnly;
     params.vds = vds;
     params.renderer = renderer;
@@ -314,6 +321,10 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "VRR %s",
                 enableVrr ? "enabled" : "disabled");
+    if (params.preferVrrRenderer && !enableVrr) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "VRR renderer policy active for probe; VRR presentation disabled");
+    }
 
 #ifdef HAVE_SLVIDEO
     // SLVideo owns its own presentation path and has no VRR backend. Try it
@@ -323,7 +334,6 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     DECODER_PARAMETERS slVideoParams = params;
     slVideoParams.enableVrr = false;
     slVideoParams.vrrDisplayRefreshHz = 0;
-    slVideoParams.vrrSmoothness = false;
     chosenDecoder = new SLVideoDecoder(testOnly);
     if (chosenDecoder->initialize(&slVideoParams)) {
         if (enableVrr) {
@@ -547,6 +557,9 @@ bool Session::populateDecoderProperties(SDL_Window* window)
     // here because this is operating on the real streaming window, and
     // instantiating Metal or AVSBDL renderers can interfere with MoltenVK's
     // attempt to change the window's colorspace, causing washed out colors.
+    // Match playback's Linux Vulkan preference so the host color-range request
+    // is valid for the renderer that will actually present. Do not pass
+    // enableVrr here: test-only probing must not start VRR presentation.
     if (!chooseDecoder(m_PresentationSettings.decoderSelection,
                        m_PresentationSettings.rendererSelection,
                        window,
@@ -554,7 +567,9 @@ bool Session::populateDecoderProperties(SDL_Window* window)
                        m_StreamConfig.width,
                        m_StreamConfig.height,
                        m_StreamConfig.fps,
-                       false, false, true, decoder)) {
+                       false, false, true, decoder,
+                       false,
+                       m_PresentationSettings.enableVrr)) {
         return false;
     }
 
@@ -584,6 +599,11 @@ bool Session::populateDecoderProperties(SDL_Window* window)
     else {
         m_StreamConfig.colorRange = decoder->getDecoderColorRange();
     }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Negotiated host color range: %s (VRR renderer policy %s)",
+                m_StreamConfig.colorRange == COLOR_RANGE_FULL ? "full" : "limited",
+                m_PresentationSettings.enableVrr ? "active" : "inactive");
 
     if (decoder->isAlwaysFullScreen()) {
         m_IsFullScreen = true;
@@ -654,7 +674,10 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
     m_PresentationSettings.enableFramePacing = m_PresentationSettings.effectiveVsync &&
                                                m_Preferences->framePacing;
     m_PresentationSettings.enableVrr = false;
-    m_PresentationSettings.vrrSmoothness = false;
+    m_PresentationSettings.vrrLatencyMode = m_Preferences->vrrLatencyMode;
+    m_PresentationSettings.gamescopeRepaint = false; // Retired repaint experiment.
+    m_PresentationSettings.gamescopeMailbox = false; // Retired Mailbox experiment.
+    m_PresentationSettings.smoothVrrFrameTiming = m_Preferences->smoothVrrFrameTiming;
 
     if (requestedVrr) {
         const bool hasAdaptiveHeadroom = hasStrictRefreshRate &&
@@ -671,14 +694,12 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
         if (hasStrictRefreshRate && m_PresentationSettings.effectiveVsync &&
                 !hasAdaptiveHeadroom) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "VRR disabled: %d FPS leaves insufficient adaptive-refresh headroom at %d Hz",
+                        "VRR disabled: %d FPS exceeds the display maximum of %d Hz",
                         m_StreamConfig.fps, strictRefreshRate);
         }
         if (hasStrictRefreshRate && m_PresentationSettings.effectiveVsync &&
                 hasAdaptiveHeadroom) {
             m_PresentationSettings.enableVrr = true;
-            m_PresentationSettings.vrrSmoothness =
-                m_Preferences->vrrSmoothness;
             m_PresentationSettings.effectiveWindowMode = StreamingPreferences::WM_FULLSCREEN_DESKTOP;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "VRR requested at %d Hz; forcing borderless desktop fullscreen for this session",
@@ -983,6 +1004,16 @@ bool Session::initialize(QQuickWindow* qtWindow)
         // straight to H.264 if the user asked for AV1 and the host doesn't support it.
         m_SupportedVideoFormats.removeByMask(~(VIDEO_FORMAT_MASK_AV1 | VIDEO_FORMAT_MASK_H265));
         break;
+    case StreamingPreferences::VCC_FORCE_PYROWAVE:
+        // PyroWave is only ever used on request, since it needs a wired link with
+        // hundreds of Mbps to spare. H.264 remains the fallback for other hosts.
+        // The 4:4:4 and 10-bit profiles are masked below like the other codecs'.
+        m_SupportedVideoFormats.removeByMask(~VIDEO_FORMAT_MASK_H264);
+        m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE);
+        m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE_444);
+        m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE_HDR10);
+        m_SupportedVideoFormats.prepend(VIDEO_FORMAT_PYROWAVE_HDR10_444);
+        break;
     }
 
     // NB: Since deprioritization puts codecs in reverse order (at the bottom of the list),
@@ -1065,6 +1096,16 @@ bool Session::initialize(QQuickWindow* qtWindow)
     }
 #endif
 
+    // Snapshot an alternative codec before force-AV1 validation removes it.
+    // Match HDR/chroma and require hardware decoding at this stream size.
+    m_HevcPacingAlternative = (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_AV1) &&
+        m_Computer->maxLumaPixelsHEVC != 0 &&
+        getDecoderAvailability(testWindow, m_Preferences->videoDecoderSelection,
+            m_Preferences->enableYUV444 ?
+                (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_REXT10_444 : VIDEO_FORMAT_H265_REXT8_444) :
+                (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_MAIN10 : VIDEO_FORMAT_H265),
+            m_StreamConfig.width, m_StreamConfig.height, m_StreamConfig.fps) == DecoderAvailability::Hardware;
+
     // Check for validation errors/warnings and emit
     // signals for them, if appropriate
     bool ret = validateLaunch(testWindow);
@@ -1110,6 +1151,39 @@ bool Session::validateLaunch(SDL_Window* testWindow)
 
     if (m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_FORCE_SOFTWARE) {
         emitLaunchWarning(tr("Your settings selection to force software decoding may cause poor streaming performance."));
+    }
+
+    if (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) {
+        if (!(m_Computer->serverCodecModeSupport & SCM_PYROWAVE)) {
+            emitLaunchWarning(tr("Your host PC doesn't support PyroWave. Using H.264 instead."));
+            m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_PYROWAVE);
+        }
+        else if (getDecoderAvailability(testWindow,
+                                        StreamingPreferences::VDS_FORCE_HARDWARE,
+                                        m_SupportedVideoFormats.front(),
+                                        m_StreamConfig.width,
+                                        m_StreamConfig.height,
+                                        m_StreamConfig.fps) == DecoderAvailability::None) {
+            emitLaunchWarning(tr("This PC's GPU driver can't decode PyroWave. Using H.264 instead."));
+            m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_PYROWAVE);
+        }
+        else {
+            const int hostLinkMbps = int(m_Computer->pyrowaveHostLinkMbps);
+            if (hostLinkMbps > 0 && m_StreamConfig.bitrate > hostLinkMbps * 800) {
+                emitLaunchWarning(tr("PyroWave is set to %1 Mbps, but the host's %2 Mbps wired link leaves room for only about %3 Mbps of video. Lower the bitrate or run calibration.")
+                                  .arg(m_StreamConfig.bitrate / 1000).arg(hostLinkMbps).arg(hostLinkMbps * 8 / 10));
+            }
+            const int clientLinkMbps = NetworkBuffers::routedWiredLinkMbps(
+                QHostAddress(m_Computer->activeAddress.address()));
+            if (clientLinkMbps > 0 && m_StreamConfig.bitrate > clientLinkMbps * 800) {
+                emitLaunchWarning(tr("PyroWave is set to %1 Mbps, but this PC's %2 Mbps wired link leaves room for only about %3 Mbps of video. Lower the bitrate or run calibration.")
+                                  .arg(m_StreamConfig.bitrate / 1000).arg(clientLinkMbps).arg(clientLinkMbps * 8 / 10));
+            }
+            const QString bufferWarning = NetworkBuffers::launchWarning();
+            if (!bufferWarning.isEmpty()) {
+                emitLaunchWarning(bufferWarning);
+            }
+        }
     }
 
     if (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_AV1) {
@@ -1435,6 +1509,11 @@ private:
         }
 
         // Exit the entire program if requested
+        if (m_Session->m_DiagnosticCapture) {
+            Utils::flushLogs();
+            m_Session->m_DiagnosticCapture.reset();
+        }
+
         if (m_Session->m_ShouldExit) {
             QCoreApplication::instance()->quit();
         }
@@ -1678,11 +1757,11 @@ void Session::notifyMouseEmulationMode(bool enabled)
 
     // We re-use the status update overlay for mouse mode notification
     if (m_MouseEmulationRefCount > 0) {
-        m_OverlayManager.updateOverlayText(Overlay::OverlayStatusUpdate, "Gamepad mouse mode active\nLong press Start to deactivate");
-        m_OverlayManager.setOverlayState(Overlay::OverlayStatusUpdate, true);
+        m_OverlayManager.setStatusMessage(Overlay::StatusSource::Mouse,
+                                         "Gamepad mouse mode active\nLong press Start to deactivate");
     }
     else {
-        m_OverlayManager.setOverlayState(Overlay::OverlayStatusUpdate, false);
+        m_OverlayManager.setStatusMessage(Overlay::StatusSource::Mouse, "");
     }
 }
 
@@ -1745,8 +1824,10 @@ bool Session::startConnectionAsync()
                       enableGameOptimizations,
                       m_Preferences->playAudioOnHost,
                       m_InputHandler->getAttachedGamepadMask(),
+                      m_InputHandler->getAttachedPlayStationGamepadMask(),
                       !m_Preferences->multiController,
-                      m_Computer->clientHdrPeakVersion == NvComputer::kClientHdrPeakVersion,
+                      m_PresentationSettings.enableVrr,
+                      m_SendClientHdrPeak,
                       m_ClientHdrPeakCalibratedNits,
                       m_ClientHdrPeakEdidNits,
                       rtspSessionUrl);
@@ -1834,6 +1915,29 @@ bool Session::startConnectionAsync()
                                                                          false);
     }
 
+    // Likewise, a PyroWave default bitrate is far too high for the H.264
+    // fallback used when the host or this PC can't do PyroWave.
+    if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_PYROWAVE &&
+        !(m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) &&
+        m_StreamConfig.bitrate == StreamingPreferences::getDefaultPyroWaveBitrate(m_StreamConfig.width,
+                                                                                  m_StreamConfig.height,
+                                                                                  m_StreamConfig.fps,
+                                                                                  m_Preferences->enableYUV444,
+                                                                                  m_Preferences->enableHdr)) {
+        m_StreamConfig.bitrate = StreamingPreferences::getDefaultBitrate(m_StreamConfig.width,
+                                                                         m_StreamConfig.height,
+                                                                         m_StreamConfig.fps,
+                                                                         false);
+    }
+
+    // PyroWave partial frames: let the receive thread release a frame that
+    // lost optional detail by its VRR slot instead of after a fixed silence.
+    // Nothing is published unless the VRR pacer runs timestamp playout.
+    VrrReceiveDeadline::clear();
+    LiSetVideoReassemblyDeadlineCallback([](uint32_t rtpTimestamp) {
+        return VrrReceiveDeadline::deadlineUs(rtpTimestamp, LiGetMicroseconds());
+    });
+
     int err = LiStartConnection(&hostInfo, &m_StreamConfig, &k_ConnCallbacks,
                                 &m_VideoCallbacks, &m_AudioCallbacks,
                                 NULL, 0, NULL, 0);
@@ -1885,9 +1989,41 @@ void Session::start()
     // We're now active
     s_ActiveSession = this;
 
+    // Freeze the ephemeral host capability before handing off to the connection
+    // thread. The display collector and request must use the same snapshot.
+    {
+        QReadLocker lock(&m_Computer->lock);
+        m_SendClientHdrPeak =
+            m_Computer->clientHdrPeakVersion == NvComputer::kClientHdrPeakVersion;
+    }
 #ifdef Q_OS_WIN32
     prepareClientHdrPeakReport();
 #endif
+    if (m_Preferences->traceVrrFrames) {
+        Utils::flushLogs();
+        const QJsonObject metadata{
+            {"requested_width", m_StreamConfig.width},
+            {"requested_height", m_StreamConfig.height},
+            {"requested_fps", m_StreamConfig.fps},
+            {"bitrate_kbps", m_StreamConfig.bitrate},
+            {"vrr_requested", m_Preferences->enableVrr},
+            {"vrr_qualified", m_PresentationSettings.enableVrr},
+            {"display_refresh_hz", m_PresentationSettings.refreshRate},
+            {"latency_mode", m_PresentationSettings.vrrLatencyMode},
+            {"reduce_judder", m_PresentationSettings.smoothVrrFrameTiming}
+        };
+        QString error;
+        m_DiagnosticCapture = DiagnosticCapture::begin(DiagnosticCapture::rootDirectory(), metadata, error);
+        if (m_DiagnosticCapture) {
+            m_Preferences->setDiagnosticsStatus(tr("Recording folder: %1. Disconnect before exporting.")
+                .arg(QDir::toNativeSeparators(m_DiagnosticCapture->directory())));
+            qInfo() << "VRR diagnostic capture:" << m_DiagnosticCapture->directory();
+        }
+        else {
+            m_Preferences->setDiagnosticsStatus(error);
+            qWarning() << "Settings diagnostics not enabled:" << error;
+        }
+    }
 
     // Initialize the gamepad code with our preferences
     // NB: m_InputHandler must be initialize before starting the connection.
@@ -1908,7 +2044,7 @@ void Session::prepareClientHdrPeakReport()
 
     if (!m_Preferences->enableHdr ||
             !(m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) ||
-            m_Computer->clientHdrPeakVersion != NvComputer::kClientHdrPeakVersion ||
+            !m_SendClientHdrPeak ||
             !m_QtWindow || !m_QtWindow->screen()) {
         return;
     }
@@ -2140,6 +2276,8 @@ void Session::exec()
 
     // Switch to async logging mode when we enter the SDL loop
     StreamUtils::enterAsyncLoggingMode();
+
+    m_InputHandler->initializeControllers();
 
     // Hijack this thread to be the SDL main thread. We have to do this
     // because we want to suspend all Qt processing until the stream is over.
@@ -2450,9 +2588,13 @@ void Session::exec()
                                false,
                                s_ActiveSession->m_VideoDecoder,
                                m_PresentationSettings.enableVrr,
+                               m_PresentationSettings.enableVrr,
                                m_PresentationSettings.refreshRate,
-                               m_PresentationSettings.vrrSmoothness,
-                               &m_PresentationSettings.enableVrr)) {
+                               &m_PresentationSettings.enableVrr,
+                               m_PresentationSettings.smoothVrrFrameTiming,
+                               m_PresentationSettings.gamescopeMailbox,
+                               m_PresentationSettings.vrrLatencyMode,
+                               m_PresentationSettings.gamescopeRepaint)) {
                 SDL_UnlockMutex(m_DecoderLock);
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "Failed to recreate decoder after reset");
@@ -2612,4 +2754,22 @@ DispatchDeferredCleanup:
     // When it is complete, it will release our s_ActiveSessionSemaphore
     // reference.
     QThreadPool::globalInstance()->start(new DeferredSessionCleanupTask(this));
+}
+
+QString Session::vrrCalibrationContext() const
+{
+    QStringList networks;
+    for (const auto& iface : QNetworkInterface::allInterfaces()) {
+        if (!(iface.flags() & QNetworkInterface::IsUp) ||
+            !(iface.flags() & QNetworkInterface::IsRunning) ||
+            (iface.flags() & QNetworkInterface::IsLoopBack)) continue;
+        QStringList addresses;
+        for (const auto& entry : iface.addressEntries()) addresses << entry.ip().toString();
+        addresses.sort();
+        networks << iface.hardwareAddress() + ":" + addresses.join(",");
+    }
+    networks.sort();
+    return QString("vrr13-history-1|%1|%2|%3|%4|%5")
+        .arg(m_Computer->uuid).arg(m_App.id).arg(m_StreamConfig.bitrate)
+        .arg(QSysInfo::kernelVersion()).arg(networks.join(";"));
 }

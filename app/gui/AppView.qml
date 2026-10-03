@@ -2,6 +2,7 @@ import QtQuick 2.9
 import QtQuick.Controls 2.2
 import QtQuick.Controls.Material 2.2
 
+import StreamingPreferences 1.0
 import AppModel 1.0
 import ComputerManager 1.0
 import SdlGamepadKeyNavigation 1.0
@@ -63,7 +64,8 @@ CenteredGridView {
 
     function createModel()
     {
-        var model = Qt.createQmlObject('import AppModel 1.0; AppModel {}', parent, '')
+        var model = Qt.createQmlObject('import StreamingPreferences 1.0
+import AppModel 1.0; AppModel {}', parent, '')
         model.initialize(ComputerManager, computerIndex, showHiddenGames)
         return model
     }

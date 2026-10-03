@@ -1,7 +1,6 @@
 #include "clientdisplaycapabilities_win.h"
 
 #include <QElapsedTimer>
-#include <QSettings>
 
 #include <cmath>
 #include <cstddef>
@@ -283,18 +282,11 @@ struct DynamicColorProfileApi
         COLORPROFILETYPE,
         COLORPROFILESUBTYPE,
         LPWSTR *);
-    using GetDisplayList = HRESULT(WINAPI *)(
-        WCS_PROFILE_MANAGEMENT_SCOPE,
-        LUID,
-        UINT32,
-        LPWSTR **,
-        PDWORD);
     using GetColorDirectory = BOOL(WINAPI *)(PCWSTR, PWSTR, PDWORD);
 
     HMODULE module = nullptr;
     GetDisplayUserScope getDisplayUserScope = nullptr;
     GetDisplayDefault getDisplayDefault = nullptr;
-    GetDisplayList getDisplayList = nullptr;
     GetColorDirectory getColorDirectory = nullptr;
 
     ~DynamicColorProfileApi()
@@ -314,14 +306,10 @@ struct DynamicColorProfileApi
             GetProcAddress(module, "ColorProfileGetDisplayUserScope"));
         getDisplayDefault = reinterpret_cast<GetDisplayDefault>(
             GetProcAddress(module, "ColorProfileGetDisplayDefault"));
-        getDisplayList = reinterpret_cast<GetDisplayList>(
-            GetProcAddress(module, "ColorProfileGetDisplayList"));
         getColorDirectory = reinterpret_cast<GetColorDirectory>(
             GetProcAddress(module, "GetColorDirectoryW"));
         // GetColorDirectoryW is optional on older supported Windows builds;
         // colorDirectory() has a bounded system-directory fallback.
-        // ColorProfileGetDisplayList is optional so the default-profile path
-        // remains available on older Windows builds.
         return getDisplayUserScope && getDisplayDefault;
     }
 };
@@ -726,32 +714,6 @@ bool isNoExtendedDefaultResult(HRESULT result)
            result == HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
 }
 
-QStringList readAdvancedColorProfileNames(
-    const DisplayMapping &mapping,
-    WCS_PROFILE_MANAGEMENT_SCOPE scope)
-{
-    const QString sourceKey = QString::number(mapping.sourceId).rightJustified(
-        4, QChar('0'));
-    const QString keyPath = scope == WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER
-        ? QStringLiteral(
-              "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows NT\\CurrentVersion\\"
-              "ICM\\ProfileAssociations\\Display\\{4d36e96e-e325-11ce-bfc1-08002be10318}\\")
-        : QStringLiteral(
-              "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-              "{4d36e96e-e325-11ce-bfc1-08002be10318}\\");
-    const QSettings settings(keyPath + sourceKey, QSettings::NativeFormat);
-    const QVariant value = settings.value(QStringLiteral("ICMProfileAC"));
-
-    QStringList names = value.toStringList();
-    if (names.isEmpty()) {
-        const QString scalar = value.toString();
-        if (!scalar.isEmpty()) {
-            names.push_back(scalar);
-        }
-    }
-    names.removeAll(QString());
-    return names;
-}
 
 ProfileProbe readColorProfile(const DisplayMapping &mapping, qint64 budgetMs)
 {
@@ -806,117 +768,6 @@ ProfileProbe readColorProfile(const DisplayMapping &mapping, qint64 budgetMs)
     return result;
 }
 
-std::vector<ProfileProbe> readAssociatedColorProfiles(
-    const DisplayMapping &mapping,
-    qint64 budgetMs)
-{
-    constexpr DWORD kMaxAssociatedProfiles = 8;
-
-    std::vector<ProfileProbe> result;
-    QElapsedTimer timer;
-    timer.start();
-    if (budgetMs <= 0) {
-        return result;
-    }
-
-    DynamicColorProfileApi api;
-    const bool exportsAvailable = api.load();
-    if (!exportsAvailable || !api.getDisplayList) {
-        return result;
-    }
-
-    const LUID targetLuid = unpackLuid(mapping.targetAdapterLuid);
-    WCS_PROFILE_MANAGEMENT_SCOPE scope = WCS_PROFILE_MANAGEMENT_SCOPE_SYSTEM_WIDE;
-    if (FAILED(api.getDisplayUserScope(targetLuid, mapping.sourceId, &scope))) {
-        return result;
-    }
-
-    QStringList activeNames = readAdvancedColorProfileNames(mapping, scope);
-    QStringList uniqueActiveNames;
-    for (const QString &activeName : activeNames) {
-        if (!activeName.isEmpty() && !uniqueActiveNames.contains(activeName, Qt::CaseInsensitive)) {
-            uniqueActiveNames.push_back(activeName);
-        }
-    }
-    if (uniqueActiveNames.isEmpty() || uniqueActiveNames.size() > kMaxAssociatedProfiles) {
-        return result;
-    }
-
-    LPWSTR *profileList = nullptr;
-    DWORD profileCount = 0;
-    const HRESULT listResult = api.getDisplayList(
-            scope,
-            targetLuid,
-            mapping.sourceId,
-            &profileList,
-            &profileCount);
-    if (FAILED(listResult)) {
-        if (profileList) {
-            LocalFree(profileList);
-        }
-        return result;
-    }
-
-    if (profileList == nullptr || profileCount == 0 ||
-        profileCount > kMaxAssociatedProfiles) {
-        if (profileList) {
-            LocalFree(profileList);
-        }
-        return result;
-    }
-
-    if (timer.elapsed() >= budgetMs) {
-        LocalFree(profileList);
-        return result;
-    }
-
-    QStringList matchedNames;
-    bool complete = true;
-    for (DWORD index = 0; index < profileCount; ++index) {
-        if (profileList[index] == nullptr || timer.elapsed() >= budgetMs) {
-            complete = false;
-            break;
-        }
-
-        const QString profileName = QString::fromWCharArray(profileList[index]);
-        if (!uniqueActiveNames.contains(profileName, Qt::CaseInsensitive) ||
-            matchedNames.contains(profileName, Qt::CaseInsensitive)) {
-            continue;
-        }
-        matchedNames.push_back(profileName);
-
-        ProfileProbe profile = readProfileFile(api, profileName, timer, budgetMs);
-        profile.exportsAvailable = true;
-        profile.osSupported = true;
-        profile.scopeSupported = true;
-        profile.displayColorMode = DisplayColorMode::Extended;
-
-        if (!profile.readCompleted || profile.elapsedMs < 0 ||
-            profile.elapsedMs > budgetMs || !isSafeProfileBasename(profile.profileName)) {
-            continue;
-        }
-        const auto peak = parseMhc2PeakNits(profile.bytes);
-        if (!peak.has_value()) {
-            continue;
-        }
-
-        profile.parsedMhc2PeakNits = *peak;
-        profile.bytes.clear();
-        if (!result.empty()) {
-            // More than one active Advanced Color profile is ambiguous.
-            result.clear();
-            complete = false;
-            break;
-        }
-        result.push_back(std::move(profile));
-    }
-
-    LocalFree(profileList);
-    if (!complete || matchedNames.size() != uniqueActiveNames.size()) {
-        result.clear();
-    }
-    return result;
-}
 
 DxgiOutputProbe readDxgiOutput(const DisplayMapping &mapping)
 {
@@ -1041,13 +892,6 @@ std::optional<int> resolveDisplayIndex(
     int hiddenDisplayIndex,
     const std::vector<QRect> &displayBounds)
 {
-    if (hiddenDisplayIndex >= 0 &&
-        hiddenDisplayIndex < static_cast<int>(displayBounds.size()) &&
-        displayBounds[hiddenDisplayIndex].width() > 0 &&
-        displayBounds[hiddenDisplayIndex].height() > 0) {
-        return hiddenDisplayIndex;
-    }
-
     std::optional<int> topLeftMatch;
     for (int index = 0; index < static_cast<int>(displayBounds.size()); ++index) {
         if (displayBounds[index].width() <= 0 || displayBounds[index].height() <= 0 ||
@@ -1059,12 +903,24 @@ std::optional<int> resolveDisplayIndex(
         }
         topLeftMatch = index;
     }
+    // Qt preserves native desktop positions but scales rectangle sizes on
+    // Windows. A probe window must agree with the unique selected origin.
+    if (hiddenDisplayIndex >= 0 && topLeftMatch != hiddenDisplayIndex) {
+        return std::nullopt;
+    }
     return topLeftMatch;
 }
 
 std::optional<int> parseMhc2PeakNits(const QByteArray &profileBytes)
 {
     if (profileBytes.size() < 132 || profileBytes.size() > kMaxMhc2ProfileBytes) {
+        return std::nullopt;
+    }
+
+    // ICC profiles have a 128-byte header with a declared size and 'acsp'
+    // signature. Never treat arbitrary bytes as a calibration profile.
+    if (readBe32(profileBytes, 0) != static_cast<quint32>(profileBytes.size()) ||
+        profileBytes.mid(36, 4) != QByteArrayLiteral("acsp")) {
         return std::nullopt;
     }
 
@@ -1083,7 +939,9 @@ std::optional<int> parseMhc2PeakNits(const QByteArray &profileBytes)
 
         const quint32 offset = readBe32(profileBytes, entry + 4);
         const quint32 size = readBe32(profileBytes, entry + 8);
-        if (size < 20 || offset > static_cast<quint32>(profileBytes.size()) ||
+        const quint32 tableEnd = 132 + tagCount * 12;
+        if (size < 36 || offset < tableEnd || offset % 4 != 0 ||
+            offset > static_cast<quint32>(profileBytes.size()) ||
             size > static_cast<quint32>(profileBytes.size()) - offset) {
             return std::nullopt;
         }
@@ -1128,20 +986,13 @@ bool isSafeProfileBasename(const QString &profileName)
 bool isUsableProfileProbe(const ProfileProbe &profile, qint64 measuredElapsedMs)
 {
     return profile.exportsAvailable && profile.osSupported && profile.scopeSupported &&
+           profile.lookupStatus == ProfileLookupStatus::ExtendedDefaultAvailable &&
            profile.profileType == ProfileType::Icc &&
            profile.displayColorMode == DisplayColorMode::Extended &&
            profile.readCompleted && profile.elapsedMs >= 0 &&
            profile.elapsedMs <= kProfileReadBudgetMs && measuredElapsedMs >= 0 &&
            measuredElapsedMs <= kProfileReadBudgetMs &&
            isSafeProfileBasename(profile.profileName);
-}
-
-std::optional<int> profilePeakNits(const ProfileProbe &profile)
-{
-    if (profile.parsedMhc2PeakNits.has_value()) {
-        return profile.parsedMhc2PeakNits;
-    }
-    return parseMhc2PeakNits(profile.bytes);
 }
 
 std::optional<ClientDisplayPreparation> collectClientDisplayPreparation(
@@ -1165,58 +1016,12 @@ std::optional<ClientDisplayPreparation> collectClientDisplayPreparation(
     const DxgiOutputProbe output = provider.readDxgiOutput(mapping);
 
     ClientDisplayCapabilities capabilities;
-    bool calibratedProfileFound = false;
     if (isUsableProfileProbe(profile, measuredProfileMs)) {
-        if (const auto peak = profilePeakNits(profile)) {
+        if (const auto peak = parseMhc2PeakNits(profile.bytes)) {
             setSource(capabilities.calibrated, "windows-icc-mhc2", *peak);
-            calibratedProfileFound = true;
         }
     }
 
-    if (!calibratedProfileFound &&
-        profile.lookupStatus == ProfileLookupStatus::NoExtendedDefault &&
-        provider.readAssociatedColorProfiles) {
-        const qint64 remainingBudgetMs = kProfileReadBudgetMs - profileTimer.elapsed();
-        if (remainingBudgetMs > 0) {
-            const std::vector<ProfileProbe> associatedProfiles =
-                provider.readAssociatedColorProfiles(mapping, remainingBudgetMs);
-            const qint64 measuredAssociatedProfileMs = profileTimer.elapsed();
-
-            std::vector<QString> validProfileNames;
-            std::optional<int> associatedPeakNits;
-            for (const ProfileProbe &associated : associatedProfiles) {
-                if (!isUsableProfileProbe(associated, measuredAssociatedProfileMs)) {
-                    continue;
-                }
-                const auto peak = profilePeakNits(associated);
-                if (!peak.has_value()) {
-                    continue;
-                }
-
-                bool duplicate = false;
-                for (const QString &validProfileName : validProfileNames) {
-                    if (sameName(validProfileName, associated.profileName)) {
-                        duplicate = true;
-                        break;
-                    }
-                }
-                if (duplicate) {
-                    continue;
-                }
-
-                validProfileNames.push_back(associated.profileName);
-                associatedPeakNits = *peak;
-            }
-
-            // Advanced Color can make the default-profile API return no
-            // profile. Only inherit an active associated profile when there
-            // is exactly one valid MHC2 candidate; otherwise leave the source
-            // unset so DXGI remains the next deterministic fallback.
-            if (validProfileNames.size() == 1 && associatedPeakNits.has_value()) {
-                setSource(capabilities.calibrated, "windows-icc-mhc2", *associatedPeakNits);
-            }
-        }
-    }
 
     if (outputIsUsable(mapping, output)) {
         if (const auto peak = normalizePeakNits(output.maxLuminance)) {
@@ -1337,7 +1142,9 @@ CollectorProvider makeWindowsCollectorProvider()
         return mapping.value_or(DisplayMapping {});
     };
     provider.readColorProfile = readColorProfile;
-    provider.readAssociatedColorProfiles = readAssociatedColorProfiles;
+    // Associated registry profiles cannot be tied reliably to this display's
+    // adapter/target identity. Use only the WCS extended default; if absent,
+    // DXGI remains an independent fallback.
     provider.readDxgiOutput = readDxgiOutput;
     provider.revalidate = [](const DisplayMapping &mapping, const DxgiOutputProbe &captured) {
         const SelectedDisplay selected {

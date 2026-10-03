@@ -1,4 +1,5 @@
 #include "nvcomputer.h"
+#include "clientdisplaycapabilities.h"
 #include <Limelight.h>
 
 #include <QDebug>
@@ -6,6 +7,7 @@
 #include <QtNetwork/QNetworkReply>
 #include <QEventLoop>
 #include <QTimer>
+#include <QElapsedTimer>
 #include <QXmlStreamReader>
 #include <QSslKey>
 #include <QImageReader>
@@ -196,6 +198,26 @@ NvHTTP::getServerInfo(NvLogLevel logLevel, bool fastFail)
     return serverInfo;
 }
 
+int NvHTTP::probePyroWaveDownloadMbps()
+{
+    constexpr qint64 expectedBytes = 32LL * 1024 * 1024;
+    if (m_ServerCert.isNull() || httpsPort() == 0) {
+        throw QtNetworkReplyException(QNetworkReply::AuthenticationRequiredError,
+                                      "A paired HTTPS host is required for PyroWave calibration");
+    }
+    QElapsedTimer clock;
+    clock.start();
+    QNetworkReply* reply = openConnection(m_BaseUrlHttps, "pyrowave-bandwidth-probe", nullptr,
+                                         10000, NVLL_ERROR);
+    const qint64 bytes = reply->readAll().size();
+    delete reply;
+    if (bytes != expectedBytes || clock.elapsed() <= 0) {
+        throw QtNetworkReplyException(QNetworkReply::UnknownContentError,
+                                      "Incomplete PyroWave bandwidth probe");
+    }
+    return qRound(bytes * 8.0 / clock.elapsed() / 1000.0);
+}
+
 void
 NvHTTP::startApp(QString verb,
                  bool isGfe,
@@ -204,7 +226,9 @@ NvHTTP::startApp(QString verb,
                  bool sops,
                  bool localAudio,
                  int gamepadMask,
+                 int playStationGamepadMask,
                  bool persistGameControllersOnDisconnect,
+                 bool clientVrrRequested,
                  bool sendClientHdrPeak,
                  int clientHdrPeakCalibratedNits,
                  int clientHdrPeakEdidNits,
@@ -215,17 +239,12 @@ NvHTTP::startApp(QString verb,
     memcpy(&riKeyId, streamConfig->remoteInputAesIv, sizeof(riKeyId));
     riKeyId = qFromBigEndian(riKeyId);
 
-    QString clientHdrPeakArguments;
-    if (sendClientHdrPeak && (streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT)) {
-        if (clientHdrPeakCalibratedNits > 0) {
-            clientHdrPeakArguments += QStringLiteral("&clientHdrPeakCalibrated=") +
-                                      QString::number(clientHdrPeakCalibratedNits);
-        }
-        if (clientHdrPeakEdidNits > 0) {
-            clientHdrPeakArguments += QStringLiteral("&clientHdrPeakEdid=") +
-                                      QString::number(clientHdrPeakEdidNits);
-        }
-    }
+    const QString clientHdrPeakArguments = ClientDisplayCapabilities::hdrPeakQueryArguments(
+        verb,
+        sendClientHdrPeak ? NvComputer::kClientHdrPeakVersion : 0,
+        (streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) != 0,
+        clientHdrPeakCalibratedNits,
+        clientHdrPeakEdidNits);
 
     QString response =
             openConnectionToString(m_BaseUrlHttps,
@@ -249,7 +268,13 @@ NvHTTP::startApp(QString verb,
                                    "&surroundAudioInfo="+QString::number(SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(streamConfig->audioConfiguration))+
                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+
                                    "&gcmap="+QString::number(gamepadMask)+
+                                   "&psmap="+QString::number(playStationGamepadMask)+
                                    "&gcpersist="+QString::number(persistGameControllersOnDisconnect ? 1 : 0)+
+                                   // Tells VRR-aware hosts that this client paces playback from
+                                   // RTP timestamps, so they can capture with precise frame timing
+                                   // (Vibeshine: 1000 Hz virtual display in its Automatic mode).
+                                   // Other hosts ignore unknown launch parameters.
+                                   (clientVrrRequested ? "&clientVrrRequested=1" : "")+
                                    LiGetLaunchUrlQueryParameters(),
                                    LAUNCH_TIMEOUT_MS);
 

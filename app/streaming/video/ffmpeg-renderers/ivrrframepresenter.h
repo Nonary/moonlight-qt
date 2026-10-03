@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include "pacer/vrr/presentationtiming.h"
 
 struct AVFrame;
+class VrrPreparedFrame;
 
 // Renderer-facing VRR contract. Pacing timestamps and sender metadata never
 // cross this boundary: the presenter only prepares, adaptively presents, or
@@ -23,6 +26,7 @@ enum class VrrNativePresentationBackend : uint8_t {
     Unknown,
     Dxgi,
     Vulkan,
+    Composition,
 };
 
 // Observation-only D3DKMT raster sample bracketed on the Moonlight clock.
@@ -187,8 +191,11 @@ struct VrrPresentFeedback {
     uint64_t submissionIdQueryStartUs = 0;
     uint64_t submissionIdQueryEndUs = 0;
     bool latchSampleValid = false;
+    Vrr13::PresentationTimeKind latchTimeKind = Vrr13::PresentationTimeKind::Unavailable;
     uint64_t latchSubmissionId = 0;
     uint64_t latchTimeUs = 0;
+    // Clock conversion uncertainty for non-DXGI presentation timestamps.
+    uint64_t presentationUncertaintyUs = 0;
     // DXGI PresentRefreshCount (when available) identifies the v-blank at
     // which this image reached the monitor. It is distinct from the periodic
     // SyncRefreshCount/QPC clock sample below.
@@ -227,14 +234,17 @@ struct VrrPresentFeedback {
     uint64_t frameStatsBeforePresentRefreshSequence = 0;
     uint64_t frameStatsBeforeRefreshSequence = 0;
     // Optional renderer-readiness timing. A backend that queues GPU work in
-    // prepareFrame() reports the CPU wait around its completion fence. The
+    // prepareFrame() reports the CPU wait around its completion primitive. The
     // wait return is only an upper bound on the actual GPU completion instant.
     // The signal/poll bracket below lets replay derive a conservative lower
     // bound too, rather than pretending the CPU wake timestamp is exact. The
-    // exact target/completed fence values make the completed-before-wait
-    // interpretation independently auditable. Exact native operation results
-    // remain available on failed preparation rows too, so a fence setup
-    // failure cannot collapse into an unexplained generic cancellation.
+    // D3D11 signal/event and fence-value fields are populated only by its
+    // native fence path; Vulkan uses the poll timestamps and leaves those
+    // fields unavailable. Exact native operation results remain available on
+    // failed preparation rows too, so a readiness failure cannot collapse into
+    // an unexplained generic cancellation. `gpuReadyTimingValid` is true only
+    // for a completed readiness sample; failed attempts may retain their raw
+    // observation timestamps while leaving the bit clear.
     bool gpuReadyAttempted = false;
     bool gpuReadySignalResultValid = false;
     int64_t gpuReadySignalResult = 0;
@@ -256,17 +266,35 @@ struct VrrPresentFeedback {
     bool gpuReadyCompletedBeforeWait = false;
     uint64_t gpuReadyWaitStartUs = 0;
     uint64_t gpuReadyTimeUs = 0;
+
+    // Native flip protection (VrrPresentRequest::flipProtectionWindowUs).
+    // Unlike the observation fields above, this pre-Present frame-statistics
+    // query does gate the native mode: a planned tearing present is sent
+    // latched when the predecessor has not reached the screen (pending) or
+    // its refresh began less than the window before the query (reference).
+    bool flipProtectionChecked = false;
+    int64_t flipProtectionQueryResult = 0;
+    uint64_t flipProtectionQueryStartUs = 0;
+    uint64_t flipProtectionQueryEndUs = 0;
+    bool flipProtectionPending = false;
+    uint64_t flipProtectionReferenceUs = 0;
+    bool flipProtectionLatched = false;
 };
 
 // Per-present request from the platform-neutral controller. When the learned
 // source cadence leaves too little adaptive-refresh headroom for safe
 // immediate flips, the controller asks for a latched (non-tearing) present:
 // at near-refresh rates the cadence cost of latching is a few repeated frames
-// per second while immediate flips tear. Backends whose presentation mode is
-// immutable after swapchain creation may ignore the preference.
+// per second while immediate flips tear. The same request is supplied before
+// preparation so swapchain-based backends can select the mode before acquiring
+// an image. Backends must advertise latch support only when they honor it.
 struct VrrPresentRequest {
     bool latchedPresentation = false;
     bool collectDiagnostics = false;
+    // Nonzero on an unlatched request asks a latch-capable backend to latch
+    // anyway if the predecessor is not yet displayed or its refresh started
+    // less than this long ago. Only presentAdaptive() consults it.
+    uint64_t flipProtectionWindowUs = 0;
 };
 
 struct VrrPrepareResult {
@@ -279,6 +307,14 @@ struct VrrPrepareResult {
     // Some acquired images (notably Vulkan swapchain frames) can only be
     // abandoned by submitting them. The worker owns any required wait.
     bool cancellationMaySubmit = false;
+    // Where the preparation spent its time, when the backend can split it:
+    // waiting for the decoder's GPU work, acquiring the presentation image,
+    // rendering (including source import), and flushing the GPU queue.
+    bool timingValid = false;
+    uint64_t decodeSyncUs = 0;
+    uint64_t acquireUs = 0;
+    uint64_t renderUs = 0;
+    uint64_t flushUs = 0;
     VrrPresentFeedback feedback;
 };
 
@@ -286,9 +322,29 @@ class IVrrFramePresenter {
 public:
     virtual ~IVrrFramePresenter() = default;
 
-    // Some adaptive backends can select a fixed-vsync latch for an individual
-    // present. Vulkan WSI modes are immutable for the swapchain lifetime, so
-    // cadence-following Mailbox/Immediate implementations leave this false.
+    // Optional bounded offscreen preparation. Called by the decoder producer;
+    // must only enqueue work, never wait for rendering or acquire a swapchain.
+    virtual std::shared_ptr<VrrPreparedFrame> queueFramePreparation(AVFrame*, uint64_t)
+    {
+        return {};
+    }
+
+    // Called on the pacing thread after a successful ticket wait. Backends
+    // must revalidate the current output format/epoch before using the image.
+    virtual VrrPrepareResult activatePreparedFrame(
+        const std::shared_ptr<VrrPreparedFrame>&, AVFrame* frame,
+        uint64_t decodeBoundary, const VrrPresentRequest& request)
+    {
+        return prepareFrame(frame, decodeBoundary, request);
+    }
+
+    // Join preparation before renderer teardown. Must also cancel queued work.
+    virtual void stopFramePreparation() {}
+
+    // Some backends select native protection per present; persistent Vulkan
+    // Mailbox already provides it. Vulkan Immediate/FIFO return false and keep
+    // the controller's software floor. A latch request must never recreate the
+    // swapchain or replace an acquired image to change presentation mode.
     virtual bool canLatchAdaptivePresent() const
     {
         return false;
@@ -297,6 +353,24 @@ public:
     // Startup eligibility only. NoFallback means the presenter supports a worker-
     // thread split prepare/present path using its adaptive presentation mode.
     virtual VrrFallbackReason checkSupport() const = 0;
+
+    // Establish the decoder dependency for this frame before preparation.
+    // A backend may block until the dependency completes or observe/queue it
+    // without blocking when its rendering API can wait on the GPU. Returns
+    // only CPU time actually spent waiting; zero for an asynchronous
+    // dependency, an unavailable observation, or an already-complete frame.
+    virtual uint64_t waitForDecode(AVFrame*)
+    {
+        return 0;
+    }
+
+    // Fence-based backends need the boundary captured for this particular
+    // output, rather than a later decoder signal. Existing frame-based
+    // implementations retain their readiness handling through this overload.
+    virtual uint64_t waitForDecode(AVFrame* frame, uint64_t)
+    {
+        return waitForDecode(frame);
+    }
 
     // May acquire a swapchain image and submit rendering work, but must not
     // intentionally pace or wait for the worker's presentation target.
@@ -312,8 +386,19 @@ public:
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
                                           uint64_t decodeBoundary) = 0;
 
+    // Mode selection belongs inside the measured preparation interval, before
+    // image acquisition. Backends that select at Present keep the existing
+    // two-argument preparation path.
+    virtual VrrPrepareResult prepareFrame(AVFrame* frame,
+                                          uint64_t decodeBoundary,
+                                          const VrrPresentRequest&)
+    {
+        return prepareFrame(frame, decodeBoundary);
+    }
+
     // Presents the prepared image using the backend's adaptive presentation
-    // path without intentionally waiting.
+    // path. A backend may finish a completion dependency here after the
+    // worker's cadence hold, so only its residual wait delays submission.
     virtual VrrPresentFeedback presentAdaptive(
         const VrrPresentRequest& request) = 0;
 

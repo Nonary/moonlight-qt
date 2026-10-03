@@ -355,11 +355,23 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
+    if (value.playoutPredictionOnly > 1 || value.playoutSubmissionEstimateFallback > 1 ||
+            value.playoutRequireDisplayEvents > 1 ||
+            value.playoutNativeHitchAdaptation > 1 || value.playoutReadinessDrivenAdaptation > 1 ||
+            value.playoutStableSmoothnessReference > 1 ||
+            value.renderStartPreserveLearnedLead > 1 ||
+            value.playoutDelayCapUsesObservedPeriod > 1 ||
+            value.playoutCapacityTelemetry > 1 ||
+            value.playoutGpuReadinessAdaptation > 1) {
+        return fail("prediction-only, display event requirement, native hitch adaptation, readiness adaptation, stable smoothness reference, learned preparation lead, observed-period cap, capacity telemetry, and GPU readiness flags must be 0 or 1");
+    }
     if (value.baseGuardDivisor == 0 ||
+            value.pacingLatencyExtraPeriodDenominator == 0 ||
             value.majorCadenceRatioDenominator == 0 ||
             value.candidateCadenceRatioDenominator == 0 ||
             value.readinessAttackDenominator == 0 ||
             value.readinessReleaseDenominator == 0 ||
+            value.readinessPeriodFloorDenominator == 0 ||
             value.usableHeadroomDenominator == 0 ||
             value.latchedPresentationHeadroomPeriodDenominator == 0 ||
             value.latchedPresentationExitHeadroomPeriodDenominator == 0) {
@@ -395,11 +407,167 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.latchedPresentationBaseGuardExit > 1) {
         return fail("latch_base_guard_exit must be 0 or 1");
     }
+    if (value.retainReadinessOnPhaseReset > 1) {
+        return fail("retain_readiness_on_phase_reset must be 0 or 1");
+    }
+    if (value.timestampPlayoutEnabled > 1) {
+        return fail("timestamp_playout_enabled must be 0 or 1");
+    }
+    if (value.playoutOffsetWindowUs == 0) {
+        return fail("playout_offset_window_us must be non-zero");
+    }
+    if (value.playoutOffsetCadenceGate > 1) {
+        return fail("playout_offset_cadence_gate must be 0 or 1");
+    }
+    if (value.playoutOffsetSourceClock > 1) {
+        return fail("playout_offset_source_clock must be 0 or 1");
+    }
+    if (value.playoutOffsetSlewUsPerSecond > 1000000 ||
+        value.playoutOffsetMaximumStepUs == 0 ||
+        value.playoutOffsetMaximumStepUs > 1000000) {
+        return fail("offset slew rate must be in 0..1000000 and maximum step in 1..1000000");
+    }
+    if (value.playoutDelayAdaptive > 1) {
+        return fail("playout_delay_adaptive must be 0 or 1");
+    }
+    if (value.playoutAdaptiveOnly > 1) {
+        return fail("playout_adaptive_only must be 0 or 1");
+    }
+    if (value.latencyFixEnabled > 1 || value.latencyFixAllRates > 1 || value.latencyFixDelayPeriodPerMille > 1000) {
+        return fail("latency_fix_enabled and latency_fix_all_rates must be 0 or 1 and latency_fix_delay_period_per_mille must be in 0..1000");
+    }
+    if (value.playoutDelayCapSourcePeriodPerMille > 4000) {
+        return fail("playout_delay_cap_source_period_per_mille must be in 0..4000");
+    }
+    if (value.playoutGpuReadinessWindowUs == 0 ||
+            value.playoutGpuReadinessMaximumUs == 0 ||
+            value.playoutGpuReadinessPercentile > 100) {
+        return fail("GPU readiness window and ceiling must be non-zero and its percentile must be in 0..100");
+    }
+    if (value.latencyFixAllRates && !value.latencyFixEnabled) {
+        return fail("latency_fix_all_rates requires latency_fix_enabled");
+    }
+    if (value.latencyFixEnabled && (!value.timestampPlayoutEnabled ||
+                                    !value.playoutDelayAdaptive || !value.playoutHistoryEnabled)) {
+        return fail("latency_fix_enabled requires adaptive timestamp history playout");
+    }
+    if (value.playoutRateProtectionEnabled > 1) {
+        return fail("playout_rate_protection_enabled must be 0 or 1");
+    }
+    if (value.playoutPerFrameLatch > 2) {
+        return fail("playout_per_frame_latch must be 0, 1 or 2");
+    }
+    if (value.playoutSmoothnessFeedbackEnabled > 1 || value.playoutHistoryEnabled > 1 || value.playoutPredictionEnabled > 1) {
+        return fail("history, prediction and smoothness feedback flags must be 0 or 1");
+    }
+    if (value.playoutSmoothnessFeedbackEnabled && !value.playoutPredictionEnabled) {
+        return fail("playout_smoothness_feedback_enabled requires playout_prediction_enabled");
+    }
+    if (value.playoutReadinessDrivenAdaptation && !value.playoutPredictionEnabled) {
+        return fail("playout_readiness_driven_adaptation requires playout_prediction_enabled");
+    }
+    if (value.playoutPredictionOnly &&
+            (!value.playoutReadinessDrivenAdaptation || value.playoutNativeHitchAdaptation)) {
+        return fail("playout_prediction_only requires readiness adaptation without native hitch adaptation");
+    }
+    if (value.playoutMeanMissHoldUs < 1000000 || value.playoutMeanMissHoldUs > 60000000 ||
+            value.playoutMeanMissReleaseUsPerSecond > 1000) {
+        error = QStringLiteral("Mean-miss hold must be 1-60 seconds and release at most 1000 us per second");
+        return false;
+    }
+    if (value.playoutIntervalInitialWarmupUs < 250000 ||
+            value.playoutIntervalInitialWarmupUs > 1000000 ||
+            value.playoutIntervalInitialMinimumSamples < 2 ||
+            value.playoutIntervalInitialMinimumSamples > 512) {
+        return fail("initial interval calibration requires 250000..1000000 us and 2..512 samples");
+    }
+    if (value.playoutResponsiveBuffer > 8 || (value.playoutResponsiveBuffer &&
+            (!value.playoutPredictionOnly || value.playoutReadinessHitchThresholdUs))) {
+        return fail("playout_responsive_buffer requires prediction-only playout without historical hitch feedback");
+    }
+    if (value.playoutSourceMappingDecoderOutput > 1 ||
+            value.playoutSerialServiceGate > 2 ||
+            value.playoutRecentPressureRelease > 3) {
+        return fail("source mapping flag must be 0 or 1; serial service revision must be 0..2 and recent pressure revision 0..3");
+    }
+    if ((value.playoutSerialServiceGate || value.playoutRecentPressureRelease) &&
+            value.playoutResponsiveBuffer < 6) {
+        return fail("serial service and recent pressure policies require the interval buffer");
+    }
+    if (value.playoutOnTimeTargetPerMillion < 900000 || value.playoutOnTimeTargetPerMillion > 1000000)
+        return fail("playout_on_time_target_per_million must be in 900000..1000000");
+    if (value.playoutReadinessWindowUs < 3000000 || value.playoutReadinessWindowUs > 300000000 ||
+            value.playoutReadinessWindowUs % 100000 != 0)
+        return fail("playout_readiness_window_us must be a multiple of 100000 in 3000000..300000000");
+    if (value.playoutReadinessHitchThresholdUs &&
+            (!value.playoutPredictionOnly || value.playoutReadinessHitchThresholdUs > 10000)) {
+        return fail("playout_readiness_hitch_threshold_us requires prediction-only playout and must be in 1..10000");
+    }
+    if (value.playoutNativeHitchAdaptation &&
+            (!value.playoutSmoothnessFeedbackEnabled || !value.playoutReadinessDrivenAdaptation)) {
+        return fail("playout_native_hitch_adaptation requires smoothness feedback and readiness prediction");
+    }
+    if (value.playoutPredictionEnabled && (!value.playoutHistoryEnabled || !value.timestampPlayoutEnabled || !value.playoutDelayAdaptive)) {
+        return fail("playout_prediction_enabled requires adaptive timestamp history playout");
+    }
+    if (value.playoutDelayMinimumUs > value.playoutDelayMaximumUs) {
+        return fail("playout_delay_minimum_us must not exceed playout_delay_maximum_us");
+    }
+    if (value.playoutDelayPercentilePerMille > 1000) {
+        return fail("playout_delay_percentile_per_mille must be in 0..1000");
+    }
+    if (value.playoutSmoothingGainPerMille > 1000 ||
+            value.playoutSmoothingPeriodAlphaPerMille > 1000) {
+        return fail("playout_smoothing gain and period alpha must be in 0..1000");
+    }
+    if (value.playoutCatchupPerMille > 100) {
+        return fail("playout_catchup_per_mille must be in 0..100");
+    }
+    if (value.playoutSmoothingWindowedCadence > 2) {
+        return fail("playout_smoothing_windowed_cadence must be in 0..2");
+    }
+    if (value.playoutSmoothingRecoveryUs > 1000000) {
+        return fail("playout_smoothing_recovery_us must be in 0..1000000");
+    }
+    if (value.playoutSmoothingReserveMaxUs > value.playoutSmoothingMaxLagUs ||
+            value.playoutSmoothingReserveToleranceUs > 10000 ||
+            value.playoutSmoothingReservePercentilePerMille > 1000 ||
+            (value.playoutSmoothingReserveMaxUs != 0 &&
+             value.playoutSmoothingReservePercentilePerMille < 500) ||
+            value.playoutSmoothingReserveReleaseUsPerSecond > 100000) {
+        return fail("playout_smoothing_reserve must not exceed the smoothing lag cap; tolerance 0..10000, percentile 500..1000 per mille when enabled, release 0..100000 us/s");
+    }
+    if (value.playoutSmoothingPeriodFeedbackPerMillion > 100000) {
+        return fail("playout_smoothing_period_feedback_per_million must be in 0..100000");
+    }
+    if (value.playoutSmoothingResetSlewUs > 100000) {
+        return fail("playout_smoothing_reset_slew_us must be in 0..100000");
+    }
+    if (value.playoutQueueFrames > VrrLargestQueuedFrames) {
+        return fail("playout_queue_frames must be 0 (historical three) or at most the decoder-backed limit");
+    }
+    if (value.playoutDelayMinimumSamples == 0 ||
+            value.playoutDelayReservoirSamples == 0 ||
+            value.playoutBandWidthHz == 0 ||
+            value.playoutStallExclusionUs == 0) {
+        return fail("playout delay sample counts, band width and stall exclusion must be non-zero");
+    }
+    if (value.playoutMotionDeadbandEnabled > 1 ||
+            value.playoutDelaySlewAcrossBands > 1 ||
+            value.playoutPrepareOnArrival > 1) {
+        return fail("playout_motion_deadband_enabled, playout_delay_slew_across_bands and playout_prepare_on_arrival must be 0 or 1");
+    }
+    if (value.playoutMotionWindowFrames == 0 ||
+            value.playoutMotionMinimumSamples == 0 ||
+            value.playoutMotionCeilingPeriodPerMille > 1000) {
+        return fail("playout motion window and minimum samples must be non-zero and the ceiling in 0..1000 per mille");
+    }
     const unsigned int percents[] = {
         value.materialRateChangePercent, value.renderBaselinePercentile,
         value.preparationPercentile,
         value.schedulerPercentile, value.readinessLowPercentile,
         value.readinessTightPercentile, value.readinessLoosePercentile,
+        value.playoutMotionPercentile,
     };
     for (unsigned int percent : percents) {
         if (percent > 100) return fail("percentiles and percentages must be in 0..100");
@@ -563,8 +731,10 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
     }
     configuration = VrrReplayConfiguration {};
     if (root.contains("parameters")) {
+        const QJsonObject parameterObject =
+            root.value("parameters").toObject();
         if (!root.value("parameters").isObject() ||
-                !applyParametersObject(root.value("parameters").toObject(),
+                !applyParametersObject(parameterObject,
                                        configuration.commonController,
                                        configuration.commonWorker,
                                        configuration.commonDisplay,
@@ -572,6 +742,11 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
                                        error)) {
             return false;
         }
+        configuration.commonControllerCustomized =
+            parameterObject.value("controller").isObject() &&
+            !parameterObject.value("controller").toObject().isEmpty();
+        configuration.commonControllerOverrides =
+            parameterObject.value("controller").toObject();
     }
     const QJsonValue scenariosValue = root.value("scenarios");
     if (!scenariosValue.isArray() || scenariosValue.toArray().isEmpty()) {
@@ -583,18 +758,26 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
         if (!item.isObject()) { error = "each scenario must be an object"; return false; }
         const QJsonObject object = item.toObject();
         for (auto it = object.constBegin(); it != object.constEnd(); ++it) {
-            if (it.key() != "name" && it.key() != "mode" &&
+            if (it.key() != "name" && it.key() != "mode" && it.key() != "base" &&
                     it.key() != "parameters" && it.key() != "assertions") {
                 error = "unknown scenario key: " + it.key(); return false;
             }
         }
         VrrReplayScenario scenario;
         scenario.controller = configuration.commonController;
+        scenario.controllerCustomized =
+            configuration.commonControllerCustomized;
         scenario.worker = configuration.commonWorker;
         scenario.display = configuration.commonDisplay;
         scenario.execution = configuration.commonExecution;
+        scenario.controllerOverrides = configuration.commonControllerOverrides;
         scenario.name = object.value("name").toString();
         scenario.mode = object.value("mode").toString("fixed");
+        const QString base = object.value("base").toString("generic");
+        if (base != "generic" && base != "session") {
+            error = "scenario base must be generic or session"; return false;
+        }
+        scenario.controllerFromSession = base == "session";
         if (scenario.name.isEmpty() || names.contains(scenario.name)) {
             error = "scenario names must be non-empty and unique"; return false;
         }
@@ -602,12 +785,25 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
         if (scenario.mode != "fixed" && scenario.mode != "worker") {
             error = "scenario mode must be fixed or worker"; return false;
         }
-        if (object.contains("parameters") &&
-                (!object.value("parameters").isObject() ||
-                 !applyParametersObject(object.value("parameters").toObject(),
+        if (object.contains("parameters")) {
+            const QJsonObject parameterObject =
+                object.value("parameters").toObject();
+            if (!object.value("parameters").isObject() ||
+                 !applyParametersObject(parameterObject,
                                         scenario.controller, scenario.worker,
                                         scenario.display, scenario.execution,
-                                        error))) return false;
+                                        error)) return false;
+            scenario.controllerCustomized =
+                scenario.controllerCustomized ||
+                (parameterObject.value("controller").isObject() &&
+                 !parameterObject.value("controller").toObject().isEmpty());
+            const QJsonObject controllerObject =
+                parameterObject.value("controller").toObject();
+            for (auto it = controllerObject.constBegin();
+                    it != controllerObject.constEnd(); ++it) {
+                scenario.controllerOverrides.insert(it.key(), it.value());
+            }
+        }
         if (object.contains("assertions")) {
             if (!object.value("assertions").isArray()) {
                 error = "scenario assertions must be an array"; return false;
@@ -666,7 +862,18 @@ bool applyVrrReplayOverride(const QString& expression,
     QJsonObject section;
     section[path.section('.', 1, 1)] = static_cast<double>(number);
     if (path.startsWith("controller.")) {
-        return applyControllerObject(section, scenario.controller, error);
+        if (scenario.controllerFromSession) {
+            // Validated as one snapshot on top of the session policy later.
+            scenario.controllerOverrides.insert(section.constBegin().key(),
+                                                section.constBegin().value());
+            scenario.controllerCustomized = true;
+            return true;
+        }
+        if (!applyControllerObject(section, scenario.controller, error)) {
+            return false;
+        }
+        scenario.controllerCustomized = true;
+        return true;
     }
     if (path.startsWith("worker.")) {
         return applyWorkerObject(section, scenario.worker, error);
@@ -680,4 +887,19 @@ bool applyVrrReplayOverride(const QString& expression,
     error = "override must start with controller., worker., display., or execution.: " +
         expression;
     return false;
+}
+
+bool applyVrrReplayControllerSnapshot(const QJsonObject& object,
+                                      VrrTimingParameters& parameters,
+                                      QString& error)
+{
+    // Captured parameters are one coherent controller snapshot. Applying
+    // interdependent fields one at a time can temporarily invert a valid
+    // floor/ceiling or hysteresis pair against the current defaults.
+    VrrTimingParameters candidate = parameters;
+    if (!applyControllerObject(object, candidate, error)) {
+        return false;
+    }
+    parameters = candidate;
+    return true;
 }

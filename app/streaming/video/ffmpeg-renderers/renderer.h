@@ -138,7 +138,10 @@ private:
 #define RENDERER_ATTRIBUTE_FORCE_PACING 0x10
 
 class IVrrFramePresenter;
+class IPyroWaveSurfacePool;
+class IPyroWaveVulkanPool;
 
+class GpuTrace;
 class IFFmpegRenderer : public Overlay::IOverlayRenderer {
 public:
     enum class RendererType {
@@ -162,6 +165,7 @@ public:
     virtual bool initialize(PDECODER_PARAMETERS params) = 0;
     virtual bool prepareDecoderContext(AVCodecContext* context, AVDictionary** options) = 0;
     virtual void renderFrame(AVFrame* frame) = 0;
+    virtual GpuTrace* gpuDiagnosticTrace() { return nullptr; }
 
     enum class InitFailureReason
     {
@@ -267,6 +271,18 @@ public:
         return nullptr;
     }
 
+    // Renderers that can display PyroWave frames expose the surface pool the
+    // PyroWave decoder writes into. Only valid after initialize() succeeded
+    // for a PyroWave video format.
+    virtual IPyroWaveSurfacePool* getPyroWaveSurfacePool() {
+        return nullptr;
+    }
+
+    // Linux renderers on Vulkan lend planes on their own VkDevice instead
+    virtual IPyroWaveVulkanPool* getPyroWaveVulkanPool() {
+        return nullptr;
+    }
+
     virtual bool isDirectRenderingSupported() {
         // The renderer can render directly to the display
         return true;
@@ -313,6 +329,8 @@ public:
     RendererType getRendererType() {
         return m_Type;
     }
+
+    virtual QString getCalibrationIdentity() { return {}; }
 
     const char *getRendererName() {
         switch (m_Type) {

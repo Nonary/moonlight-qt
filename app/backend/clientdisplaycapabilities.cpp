@@ -17,3 +17,22 @@ std::optional<int> ClientDisplayCapabilities::normalizePeakLuminance(const doubl
 
     return static_cast<int>(std::round(nits));
 }
+
+QString ClientDisplayCapabilities::hdrPeakQueryArguments(
+    const QString& verb, int hostVersion, bool hdrEnabled,
+    int calibratedNits, int edidNits)
+{
+    if (hostVersion != 1 || !hdrEnabled ||
+        (verb != QStringLiteral("launch") && verb != QStringLiteral("resume"))) {
+        return {};
+    }
+
+    QString arguments;
+    if (normalizePeakLuminance(calibratedNits)) {
+        arguments += QStringLiteral("&clientHdrPeakCalibrated=") + QString::number(calibratedNits);
+    }
+    if (normalizePeakLuminance(edidNits)) {
+        arguments += QStringLiteral("&clientHdrPeakEdid=") + QString::number(edidNits);
+    }
+    return arguments;
+}

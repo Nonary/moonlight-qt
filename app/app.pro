@@ -35,6 +35,12 @@ DEFINES += QT_DEPRECATED_WARNINGS
 # You can also select to disable deprecated APIs only up to a certain version of Qt.
 DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
+BASE_VERSION = $$cat(version.txt)
+MOONLIGHT_VERSION = $$(CI_VERSION)
+isEmpty(MOONLIGHT_VERSION) {
+    MOONLIGHT_VERSION = $$BASE_VERSION
+}
+
 win32 {
     !exists($$PWD/../libs/windows) {
         error("Missing dependencies. Please run 'powershell .\setup-deps.ps1' to fetch prebuilt libraries.")
@@ -50,7 +56,7 @@ win32 {
     }
 
     INCLUDEPATH += $$PWD/../libs/windows/include
-    LIBS += ws2_32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib
+    LIBS += dcomp.lib advapi32.lib ws2_32.lib iphlpapi.lib shell32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib hid.lib
 }
 macx:!disable-prebuilts {
     !exists($$PWD/../libs/mac) {
@@ -186,13 +192,19 @@ SOURCES += \
     settings/compatfetcher.cpp \
     settings/mappingfetcher.cpp \
     settings/streamingpreferences.cpp \
+    diagnostics/diagnosticcapture.cpp \
+    diagnostics/gputrace.cpp \
+    diagnostics/diagnosticzip.cpp \
     streaming/input/abstouch.cpp \
     streaming/input/gamepad.cpp \
+    streaming/input/dualsensehaptics.cpp \
+    streaming/input/dualsensehid.cpp \
     streaming/input/input.cpp \
     streaming/input/keyboard.cpp \
     streaming/input/mouse.cpp \
     streaming/input/reltouch.cpp \
     streaming/session.cpp \
+    streaming/gamescopecomposition.cpp \
     streaming/audio/audio.cpp \
     streaming/audio/renderers/sdlaud.cpp \
     gui/computermodel.cpp \
@@ -205,10 +217,15 @@ SOURCES += \
     gui/sdlgamepadkeynavigation.cpp \
     streaming/video/overlaymanager.cpp \
     streaming/vrrratepolicy.cpp \
+    streaming/video/pyrowave/pyrowavecalibrator.cpp \
     backend/systemproperties.cpp \
+    backend/networkbuffers.cpp \
     wm.cpp
 
 HEADERS += \
+    streaming/input/dualsensehid.h \
+    streaming/input/dualsensetriggers.h \
+    ../third-party/saxense/packet.h \
     SDL_compat.h \
     backend/nvaddress.h \
     backend/nvapp.h \
@@ -219,6 +236,7 @@ HEADERS += \
     backend/computerseeker.h \
     backend/identitymanager.h \
     backend/nvcomputer.h \
+    backend/framelimitercapabilities.h \
     backend/nvhttp.h \
     backend/clientdisplaycapabilities.h \
     backend/nvpairingmanager.h \
@@ -230,8 +248,16 @@ HEADERS += \
     cli/quitstream.h \
     cli/startstream.h \
     settings/streamingpreferences.h \
+    diagnostics/diagnosticcapture.h \
+    diagnostics/gputrace.h \
+    diagnostics/diagnosticzip.h \
+    streaming/input/dualsensehaptics.h \
     streaming/input/input.h \
     streaming/session.h \
+    streaming/video/amddecodepolicy.h \
+    streaming/video/pyrowave/pyrowavecalibrator.h \
+    streaming/video/pyrowave/pyrowavebitrate.h \
+    streaming/gamescopecomposition.h \
     streaming/audio/renderers/renderer.h \
     streaming/audio/renderers/sdl.h \
     gui/computermodel.h \
@@ -245,7 +271,9 @@ HEADERS += \
     settings/mappingmanager.h \
     gui/sdlgamepadkeynavigation.h \
     streaming/video/overlaymanager.h \
+    streaming/video/clientpacingwarning.h \
     backend/systemproperties.h \
+    backend/networkbuffers.h \
     windowsvblankvirtualization.h
 
 # Platform-specific renderers and decoders
@@ -265,6 +293,7 @@ ffmpeg {
 
     HEADERS += \
         streaming/video/ffmpeg.h \
+        streaming/video/incomingframetiming.h \
         streaming/video/ffmpeg-renderers/renderer.h \
         streaming/video/ffmpeg-renderers/genhwaccel.h \
         streaming/video/ffmpeg-renderers/sdlvid.h \
@@ -274,7 +303,16 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h \
         streaming/video/ffmpeg-renderers/ivrrframepresenter.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/recentreadiness.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/readinesswindow.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/readinessfeedback.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/vrrcatchup.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/receivedeadline.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h
 }
 libva {
@@ -363,7 +401,14 @@ libplacebo {
         streaming/video/ffmpeg-renderers/plvk.cpp \
         streaming/video/ffmpeg-renderers/plvk_c.c
     HEADERS += \
-        streaming/video/ffmpeg-renderers/plvk.h
+        streaming/video/ffmpeg-renderers/plvk.h \
+        streaming/video/ffmpeg-renderers/vrrpreparedframe.h \
+        streaming/video/ffmpeg-renderers/plvkpresentation.h \
+        streaming/video/ffmpeg-renderers/plvkswapchain.h
+    linux {
+        SOURCES += streaming/video/ffmpeg-renderers/vulkantiming.cpp
+        HEADERS += streaming/video/ffmpeg-renderers/vulkantiming.h
+    }
 
     macx {
         SOURCES += streaming/video/ffmpeg-renderers/plvk_objc.mm
@@ -412,12 +457,20 @@ win32:!winrt {
         backend/clientdisplaycapabilities_win.cpp \
         streaming/video/ffmpeg-renderers/dxva2.cpp \
         streaming/video/ffmpeg-renderers/d3d11va.cpp \
+        streaming/video/ffmpeg-renderers/d3d11composition.cpp \
+        streaming/video/ffmpeg-renderers/d3d11pyrowave.cpp \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.cpp
 
     HEADERS += \
         backend/clientdisplaycapabilities_win.h \
         streaming/video/ffmpeg-renderers/dxva2.h \
         streaming/video/ffmpeg-renderers/d3d11va.h \
+        streaming/video/ffmpeg-renderers/d3d11composition.h \
+        streaming/video/ffmpeg-renderers/d3d11pyrowave.h \
+        streaming/video/pyrowave/pyrowavesurfaces.h \
+        streaming/video/ffmpeg-renderers/presentationclock.h \
+        streaming/video/ffmpeg-renderers/dxgipresent.h \
+        streaming/video/ffmpeg-renderers/d3d11fencewait.h \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.h
 }
 macx {
@@ -458,14 +511,57 @@ gpuslow {
     DEFINES += GL_IS_SLOW VULKAN_IS_SLOW
 }
 wayland {
+    linux {
+        SOURCES += streaming/video/ffmpeg-renderers/gamescoperepaint.cpp \
+                   streaming/video/ffmpeg-renderers/protocols/gamescope-private-protocol.c
+        HEADERS += streaming/video/ffmpeg-renderers/gamescoperepaint.h \
+                   streaming/video/ffmpeg-renderers/protocols/gamescope-private-client-protocol.h
+    }
     message(Wayland extensions enabled)
 
     DEFINES += HAS_WAYLAND
     SOURCES += streaming/video/ffmpeg-renderers/pacer/waylandvsyncsource.cpp
+    SOURCES += streaming/video/ffmpeg-renderers/waylandfeedback/wayland.cpp \
+               streaming/video/ffmpeg-renderers/protocols/presentation-time-protocol.c
+    HEADERS += streaming/video/ffmpeg-renderers/waylandfeedback/wayland.h
     HEADERS += streaming/video/ffmpeg-renderers/pacer/waylandvsyncsource.h
 }
 !disable-h264bitstream {
     DEFINES += HAVE_H264BITSTREAM
+}
+
+# PyroWave decoding runs on Vulkan. Windows shares D3D11 surfaces; Linux
+# presents the decoded planes through the libplacebo Vulkan renderer.
+win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
+    message(PyroWave decoder enabled)
+    CONFIG += pyrowave
+}
+linux:contains(QT_ARCH, x86_64):!disable-pyrowave:contains(CONFIG, libplacebo) {
+    message(PyroWave decoder enabled)
+    CONFIG += pyrowave
+}
+pyrowave {
+    DEFINES += HAVE_PYROWAVE
+
+    SOURCES += \
+        streaming/video/pyrowave/pyrowavedecoder.cpp \
+        streaming/video/pyrowave/pyrowaveframing.cpp
+    HEADERS += \
+        streaming/video/pyrowave/pyrowavedecoder.h \
+        streaming/video/pyrowave/pyrowaveframing.h \
+        streaming/video/pyrowave/pyrowavesurfaces.h
+    linux {
+        SOURCES += streaming/video/pyrowave/pyrowaveplacebo.cpp
+        HEADERS += streaming/video/pyrowave/pyrowaveplacebo.h
+    }
+
+    # Only pyrowave.h is included from the vendored tree
+    INCLUDEPATH += $$PWD/../pyrowave/pyrowave
+
+    win32:CONFIG(release, debug|release): LIBS += -L$$OUT_PWD/../pyrowave/release/ -lpyrowave
+    else:win32:CONFIG(debug, debug|release): LIBS += -L$$OUT_PWD/../pyrowave/debug/ -lpyrowave
+    else:unix: LIBS += -L$$OUT_PWD/../pyrowave/ -lpyrowave
+    win32: LIBS += -luser32
 }
 
 RESOURCES += \
@@ -575,7 +671,7 @@ win32 {
 macx {
     # Create Info.plist in object dir with the correct version string
     system(cp $$PWD/Info.plist $$OUT_PWD/Info.plist)
-    system(sed -i -e 's/VERSION/$$cat(version.txt)/g' $$OUT_PWD/Info.plist)
+    system(sed -i -e 's/VERSION/$$BASE_VERSION/g' $$OUT_PWD/Info.plist)
 
     QMAKE_INFO_PLIST = $$OUT_PWD/Info.plist
 
@@ -597,5 +693,15 @@ macx {
     }
 }
 
-VERSION = "$$cat(version.txt)"
-DEFINES += VERSION_STR=\\\"$$cat(version.txt)\\\"
+# Displayed version stays CI_VERSION (e.g. 6.1.0-vrr17.1). Windows PE/MSI
+# ProductVersion can only use three numeric fields and must increase past
+# stock Moonlight 6.1.0, so VRR builds map 6.1.0-vrrN to 6.2.N and
+# 6.1.0-vrrN.P to 6.2.(N*10+P).
+VERSION = "$$BASE_VERSION"
+PE_VERSION = $$(MOONLIGHT_PE_VERSION)
+!isEmpty(PE_VERSION) {
+    VERSION = "$$PE_VERSION"
+}
+DEFINES += VERSION_STR=\\\"$$MOONLIGHT_VERSION\\\"
+
+SOURCES += $$PWD/streaming/video/ffmpeg-renderers/pacer/vrr/profile.cpp
