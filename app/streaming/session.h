@@ -195,6 +195,7 @@ private:
                        int frameRate, bool enableVsync, bool enableFramePacing,
                        bool testOnly, IVideoDecoder*& chosenDecoder,
                        bool enableVrr = false, int vrrDisplayRefreshHz = 0,
+                       bool vrrSmoothness = false,
                        bool* effectiveVrr = nullptr);
 
     static
@@ -255,6 +256,7 @@ private:
         bool enableFramePacing = false;
         bool enableVrr = false;
         int refreshRate = 0;
+        bool vrrSmoothness = false;
         StreamingPreferences::WindowMode effectiveWindowMode = StreamingPreferences::WM_WINDOWED;
         StreamingPreferences::VideoDecoderSelection decoderSelection = StreamingPreferences::VDS_AUTO;
         StreamingPreferences::RendererSelection rendererSelection = StreamingPreferences::RS_AUTO;

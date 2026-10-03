@@ -47,7 +47,8 @@ public:
     virtual void renderFrame(AVFrame* frame) override;
     virtual IVrrFramePresenter* getVrrFramePresenter() override;
     virtual VrrFallbackReason checkSupport() const override;
-    virtual VrrPrepareResult prepareFrame(AVFrame* frame) override;
+    virtual VrrPrepareResult prepareFrame(AVFrame* frame,
+                                          uint64_t decodeBoundary) override;
     virtual VrrPresentFeedback presentAdaptive(
         const VrrPresentRequest& request) override;
     virtual VrrPresentFeedback cancelFrame() override;

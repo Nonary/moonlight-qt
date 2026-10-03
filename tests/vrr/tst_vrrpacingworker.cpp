@@ -242,6 +242,46 @@ void testQueuedStaleFrameYieldsToFreshSuccessor()
     }
 }
 
+void testSmoothnessRetainsOneAdditionalFrame()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.blockPreparation();
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime first;
+    TrackedFrameLifetime retained;
+    TrackedFrameLifetime fresh;
+    VrrSessionConfig smoothnessConfig = enabledConfig();
+    smoothnessConfig.streamRateHz = 30;
+    smoothnessConfig.allowAdditionalQueuedFrame = true;
+
+    {
+        VrrPacingWorker worker(&backend, smoothnessConfig, &telemetry);
+        expect(worker.start(), "worker must start in VRR smoothness mode");
+        worker.submit(frame(1, first));
+        expect(backend.waitForPrepareCount(1),
+               "active smoothness frame must enter preparation");
+
+        worker.submit(frame(2, retained));
+        worker.submit(frame(3, fresh));
+        // At 30 FPS this is older than the default one-period threshold but
+        // younger than the explicit two-period smoothness threshold.
+        std::this_thread::sleep_for(std::chrono::milliseconds(45));
+        backend.releasePreparation();
+
+        expect(backend.waitForPresentCount(3),
+               "smoothness mode must retain the one-period-old successor");
+        const std::vector<int> presentedFrames = backend.presentedFrames();
+        expect(presentedFrames.size() >= 3 &&
+                   presentedFrames[0] == 1 &&
+                   presentedFrames[1] == 2 &&
+                   presentedFrames[2] == 3,
+               "smoothness mode must preserve the bounded three-frame order");
+        expect(telemetryStats(telemetry).vrrPacingDroppedFrames == 0,
+               "the additional smoothness interval must avoid a stale drop");
+    }
+}
+
 void testTelemetrySnapshotsRemainCumulative()
 {
     PacerTelemetry telemetry;
@@ -383,6 +423,53 @@ void testDeferredSurfaceLifetime()
 
     expect(second.releases.load() == 1,
            "worker destruction must release the final deferred surface");
+}
+
+void testReusableSurfaceReleasedWithoutSuccessor()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.setSourceFrameReusable(true);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime reusable;
+
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "worker must start for reusable lifetime testing");
+        worker.submit(frame(1, reusable));
+        expect(backend.waitForPresentCount(1), "reusable frame must present");
+        expect(waitFor([&reusable] { return reusable.releases.load() == 1; }),
+               "a GPU-complete decoder surface must release without a successor");
+        const std::vector<int> presented = backend.presentedFrames();
+        expect(presented.size() == 1 && presented.front() == 1,
+               "presentation must not depend on the released source frame");
+    }
+
+    expect(reusable.releases.load() == 1,
+           "worker destruction must not release a reusable surface twice");
+}
+
+void testDecodeBoundaryCapturedBeforeQueueAndPreparedExactly()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.setDecodeBoundary(73);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime;
+
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "worker must start for decode-boundary testing");
+        worker.submit(frame(1, lifetime));
+        expect(backend.waitForPresentCount(1),
+               "decode-boundary frame must present");
+        const std::vector<uint64_t> boundaries =
+            backend.preparedDecodeBoundaries();
+        expect(backend.decodeBoundaryCaptureCount() == 1,
+               "each submitted frame must capture one decoder boundary");
+        expect(boundaries.size() == 1 && boundaries.front() == 73,
+               "preparation must receive the submitted frame's exact boundary");
+    }
 }
 
 void testCancelledPresentationCountsAsDroppedOutput()
@@ -683,6 +770,8 @@ void testTraceCapturesEveryDeliveredFrame()
     const int arrivalColumn = columns.indexOf("pacer_arrival_us");
     const int decisionValidColumn = columns.indexOf("decision_valid");
     const int dispositionColumn = columns.indexOf("disposition");
+    const int additionalQueuedFrameColumn =
+        columns.indexOf("additional_queued_frame");
     const int externalRebaseColumn =
         columns.indexOf("external_rebase_applied");
     const int externalRebaseFlagsColumn =
@@ -693,6 +782,9 @@ void testTraceCapturesEveryDeliveredFrame()
         "readiness_phase_us",
         "readiness_demand_us",
         "applied_readiness_reserve_us",
+        "render_baseline_us",
+        "render_insurance_us",
+        "pacing_latency_budget_us",
         "cadence_sample_count",
         "rate_candidate_sample_count",
         "readiness_sample_count",
@@ -846,6 +938,7 @@ void testTraceCapturesEveryDeliveredFrame()
     }
     expect(frameColumn >= 0 && rtpColumn >= 0 && arrivalColumn >= 0 &&
                decisionValidColumn >= 0 && dispositionColumn >= 0 &&
+               additionalQueuedFrameColumn >= 0 &&
                externalRebaseColumn >= 0 &&
                externalRebaseFlagsColumn >= 0 &&
                midframeWindowStateFlagsColumn >= 0 &&
@@ -913,6 +1006,8 @@ void testTraceCapturesEveryDeliveredFrame()
                "replay trace must preserve each raw RTP timestamp");
         expect(fields[arrivalColumn].toULongLong() != 0,
                "replay trace must capture the pacer arrival instant");
+        expect(fields[additionalQueuedFrameColumn] == "0",
+               "default trace rows must record low-latency queue policy");
         if (fields[decisionValidColumn] == "0") {
             for (int diagnosticColumn : controllerDiagnosticColumns) {
                 expect(fields[diagnosticColumn] == "0",
@@ -1222,9 +1317,12 @@ int main()
     testQueueCapacityAndDrops();
     testLatePreparedFramePresentsImmediately();
     testQueuedStaleFrameYieldsToFreshSuccessor();
+    testSmoothnessRetainsOneAdditionalFrame();
     testTelemetrySnapshotsRemainCumulative();
     testSuspendDiscardAndFreshFrame();
     testDeferredSurfaceLifetime();
+    testReusableSurfaceReleasedWithoutSuccessor();
+    testDecodeBoundaryCapturedBeforeQueueAndPreparedExactly();
     testCancelledPresentationCountsAsDroppedOutput();
     testPresentCallSpacingSetsDisplayFloor();
     testBlockingPresentUsesWorkerCallBoundary();

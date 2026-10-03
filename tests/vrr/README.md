@@ -25,12 +25,16 @@ learning for every integer rate from 30 through 116 FPS on a 120 Hz-quantized
 capture clock, a continuous one-FPS-per-second sweep in both directions,
 isolated hitch rejection, rapid 30 FPS cutscene transitions, high-rate
 recovery, and smooth projected targets from mixed 8.33/16.67 ms timestamp
-intervals.
+intervals in the explicit smoothness mode. It also verifies that low-latency
+mode counts only p99-minus-p50 render-tail insurance and readiness against a
+half-scanout budget, while stable render work remains outside that ceiling.
 
 `tst_vrrpacingworker` supplies a fake frame presenter and a test-owned
 `LiGetMicroseconds()` epoch. It verifies the bounded worker queue,
 drop accounting, minimize/restore discard and fresh-frame behavior, deferred
 AVFrame lifetime, presenter eligibility rejection, display-period spacing,
+one-source-period low-latency staleness and the opt-in additional smoothness
+period,
 native submission timing across pre-submit work and blocking
 returns, clean-close trace accounting, explicit window-state rebase
 provenance, and the minimal prepare/present/cancel contract. D3D11 completes
@@ -75,6 +79,7 @@ controller parameter set, controller call duration and learned-model state,
 stale-check age, render/target wait boundaries, both spacing-floor checks,
 correction-wait boundaries, explicit worker-requested rebase cause, and
 terminal time. Header-resolved schema-5 extensions also record the native
+queue policy, render baseline, render-tail insurance, pacing-latency budget,
 presentation backend/result, signed `GetLastPresentCount()` and
 `GetFrameStatistics()` results, the exact DXGI Present sync interval/flags,
 the renderer's VRR eligibility snapshot, desktop monitor count, the startup
@@ -90,6 +95,11 @@ before-state, native-call, and GPU-ready observations remain opt-in because
 they can perturb the renderer; the essential post-Present submission/latch
 queries are collected in both modes, while their extra timing brackets remain
 deep-only.
+
+New captures use `controller.pacing_latency_budget_divisor=2`. A value of zero
+is a replay-only compatibility mode that disables the baseline/tail ceiling;
+older schema-5 headers missing this field resolve to zero and keep their
+captured absolute render-lead ceiling. Production defaults never select zero.
 
 `MOONLIGHT_VRR_ALIGN=1` adds observation-only Windows raster sampling to a
 deep trace. It opens the GDI display's D3DKMT source once per display epoch and
@@ -580,7 +590,7 @@ silently joining observations from two display timelines. An explicit external
 rebase starts a new epoch, discards its ambiguous cached before-state anchor,
 and begins again with post-Present evidence.
 The readiness gate compares all numeric and boolean decision fields
-and all schema-5 learned-state counters after every `decision_valid` worker
+and all schema-5 learned-state values and counters after every `decision_valid` worker
 row. Producer-side queue/suspension terminal rows
 carry zero controller diagnostics so tracing never reads worker-owned learned
 state concurrently.
@@ -697,15 +707,42 @@ duration, but
 the flag is the operator's assertion that the complete model is calibrated;
 it cannot turn an assumption into a measurement.
 
-The latch protection window is also display-rate-scaled. The
-`controller.latch_enter_headroom_period_*` numerator/denominator pairs define
-the entry window in physical display periods, and the corresponding
-`latch_exit_*` pair defines its hysteresis. The absolute
-`latch_*_headroom_us` values remain minimum floors. Current defaults protect
-cadences with less than three display periods of spare headroom and exit at
-3.25 periods, so the same policy boundary scales across 60, 120, 144, and
-165 Hz instead of naming stream FPS values. Older schema-5 traces that predate
-these columns replay with the captured absolute-only semantics.
+The latch protection window defaults to a narrow absolute-headroom policy:
+enter below 225 us and exit at 400 us. Headroom already excludes one physical
+display period and the controller's learned spacing guard. At 120 Hz, 115 FPS
+starts adaptive with roughly 263 us of headroom while the proven near-ceiling
+116 FPS path remains latched at roughly 188 us. The wider exit threshold keeps
+small cadence or guard fluctuations from bouncing a borderline stream between
+the two modes.
+
+At 120 Hz, the former three-period default latched the useful 30--116 FPS
+range. With the narrow absolute default, 30 through 115 FPS initially take the
+adaptive path; only the near-ceiling 116 FPS recommendation remains latched.
+The same correction applies across display refresh rates rather than being a
+special case for any one stream rate.
+
+Production requires the full exit threshold after entering latch. The
+`controller.latch_base_guard_exit` compatibility parameter restores the older
+behavior of exiting at the entry threshold as soon as the learned guard reaches
+its base value. It defaults to zero in production and is supplied as one when
+replaying an older schema-5 trace that lacks the field. Schema-3/4 replay also
+restores the historical 1.5 ms entry, 2 ms exit, zero period ratios, and
+base-guard exit behavior explicitly because those traces contain no resolved
+controller parameters.
+
+The `controller.latch_enter_headroom_period_*` numerator/denominator pairs and
+the corresponding `latch_exit_*` pair remain available for replay experiments
+and exact reproduction of captures made with display-scaled protection. Their
+production numerators are zero, so the absolute `latch_*_headroom_us` values
+set the live boundary. Older schema-5 traces that predate the period columns
+replay with their original absolute-only semantics, while traces containing
+non-zero period ratios retain those captured ratios.
+
+The fixed microsecond thresholds are intentionally a bounded first correction.
+A future policy should derive them from measured scheduler wake error,
+present-ready uncertainty, and native presentation/scanout evidence so latch
+selection reflects whether the current system can reliably use its available
+headroom.
 
 `display.present_transport_us` is also the deterministic phase-sweep control.
 Sweep it from zero through one scanout period to test whether a candidate

@@ -27,7 +27,56 @@ The Start Menu `Moonlight.lnk` points to `Moonlight.exe` in that portable
 directory. Keep the `vrr-lite` destination name stable even when the internal
 diagnostic implementation changes.
 
-### Build prerequisites
+### Choose the build path
+
+Updating the existing ChaseShare gaming build is normally an iterative
+deployment, not a new published release. For an app-only source change at the
+same version, use the fast incremental path below. Do **not** run
+`scripts\build-arch.bat`, clean the build directories, redeploy Qt, build the
+MSI, or regenerate the symbol archive for a routine ChaseShare update.
+
+Use the full clean release pipeline only when the user explicitly requests a
+new published release. If an iterative update unexpectedly requires a clean
+build or package/dependency regeneration, explain why and get direction before
+switching to the full pipeline.
+
+### Fast iterative ChaseShare update
+
+Run the incremental Windows release helper from the repository root. It reuses
+the configured `build\build-x64-release` tree and compiles and links only
+changed targets:
+
+```powershell
+cmd /c .\scripts\build-fast-windows.cmd
+```
+
+For an app-only change, stage the newly linked executable into the existing
+deploy tree. Preserve all other deployed dependencies, diagnostic tools, and
+the inactive portable marker, then recreate the portable ZIP:
+
+```powershell
+Copy-Item .\build\build-x64-release\app\release\Moonlight.exe `
+    .\build\deploy-x64-release\ -Force
+
+if (-not (Test-Path .\build\deploy-x64-release\portable.dat.inactive)) {
+    throw "Fast deploy tree is missing portable.dat.inactive"
+}
+if (Test-Path .\build\deploy-x64-release\portable.dat) {
+    throw "Fast deploy tree unexpectedly contains portable.dat"
+}
+
+Compress-Archive -Path .\build\deploy-x64-release\* `
+    -DestinationPath .\build\installer-x64-release\MoonlightPortable-x64-6.1.0-vrr-lite.zip `
+    -CompressionLevel Optimal -Force
+```
+
+Before using this path, confirm the existing deploy tree belongs to the current
+`vrr-lite` build and already contains `vrrreplay.exe` and
+`decode-vrr-trace.py`. Rebuild and restage the VRR utilities only when their
+sources or dependencies changed. Use the process checks and hash verification
+under **Publish safely** for every iterative deployment.
+
+### Full build for a new published release
 
 Run commands from the repository root. The known-good local toolchain is:
 
@@ -64,8 +113,10 @@ the ChaseShare build's current settings behavior; do not silently change it to
 ### Build and stage the VRR diagnostics
 
 The regular application build does not build the opt-in VRR tests or replay
-utility. From an x64 Native Tools for Visual Studio 2022 command prompt, build
-them separately:
+utility. Build them separately for a new published release or when VRR pacing,
+controller, trace, replay, or diagnostic code changes. A routine app-only
+update does not require rebuilding unchanged VRR utilities. From an x64 Native
+Tools for Visual Studio 2022 command prompt:
 
 ```bat
 mkdir build\tests-vrr
@@ -74,12 +125,14 @@ C:\Users\Chase\sources\.tools\Qt\6.11.1\msvc2022_64\bin\qmake.exe ..\..\tests\te
 nmake
 ```
 
-Run all deterministic tests before publishing:
+Run all deterministic tests before deploying a VRR-related change or creating
+a new published release:
 
 ```bat
 vrr\release\tst_vrrtimingcontroller.exe
 vrr\release\tst_vrrratepolicy.exe
 vrr\release\tst_vrrpacingworker.exe
+vrr\release\tst_vrrreplayconfig.exe
 vrr\release\vrrreplay.exe --help
 ```
 
@@ -98,9 +151,10 @@ with `--compare .\build\vrr-baseline.json --output candidate.json`. Use
 `--timeline candidate.csv` only when per-frame deltas are needed because a
 full-session timeline is intentionally much larger than the JSON summary.
 
-Then add the replay and decoder tools to the deploy tree. These copies must
-happen before recreating the share ZIP, or the portable directory and ZIP will
-not contain the same diagnostic tools:
+After rebuilding the diagnostics, add the replay and decoder tools to the
+deploy tree. A full clean release build also requires these copies because it
+recreates the deploy tree. They must happen before recreating the share ZIP, or
+the portable directory and ZIP will not contain the same diagnostic tools:
 
 ```powershell
 Copy-Item .\build\tests-vrr\vrr\release\vrrreplay.exe .\build\deploy-x64-release\ -Force

@@ -27,7 +27,9 @@ public:
 
     virtual bool canLatchAdaptivePresent() const override { return true; }
     virtual VrrFallbackReason checkSupport() const override;
-    virtual VrrPrepareResult prepareFrame(AVFrame* frame) override;
+    virtual uint64_t captureDecodeBoundary() override;
+    virtual VrrPrepareResult prepareFrame(AVFrame* frame,
+                                          uint64_t decodeBoundary) override;
     virtual VrrPresentFeedback presentAdaptive(
         const VrrPresentRequest& request) override;
     virtual VrrPresentFeedback cancelFrame() override;
@@ -57,7 +59,8 @@ private:
     bool setupSwapchainDependentResources();
     bool setupVideoTexture(AVHWFramesContext* framesContext); // for !m_BindDecoderOutputTextures
     bool setupTexturePoolViews(AVHWFramesContext* framesContext); // for m_BindDecoderOutputTextures
-    bool prepareFrameForPresent(AVFrame* frame);
+    bool prepareFrameForPresent(AVFrame* frame,
+                                uint64_t decodeBoundary = 0);
     bool initializeVrrPresentReadyFence();
     bool waitForVrrPresentReady();
     HRESULT presentPreparedFrame(UINT flags);
@@ -77,7 +80,7 @@ private:
     bool createOverlayVertexBuffer(Overlay::OverlayType type, int width, int height, Microsoft::WRL::ComPtr<ID3D11Buffer>& newVertexBuffer);
     void bindColorConversion(bool frameChanged, AVFrame* frame);
     void bindVideoVertexBuffer(bool frameChanged, AVFrame* frame);
-    void renderVideo(AVFrame* frame);
+    void renderVideo(AVFrame* frame, uint64_t decodeBoundary = 0);
     bool checkDecoderSupport(IDXGIAdapter* adapter);
     bool createDeviceByAdapterIndex(int adapterIndex, bool* adapterNotFound = nullptr);
     bool setupSharedDevice(IDXGIAdapter1* adapter);

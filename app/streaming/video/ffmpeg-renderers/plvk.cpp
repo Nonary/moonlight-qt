@@ -1249,8 +1249,10 @@ VrrFallbackReason PlVkRenderer::checkSupport() const
         VrrFallbackReason::InitializationFailed;
 }
 
-VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame)
+VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
+                                            uint64_t decodeBoundary)
 {
+    (void) decodeBoundary;
     VrrPrepareResult result;
     if (frame == nullptr || checkSupport() != VrrFallbackReason::NoFallback ||
             m_VrrSuspended) {
