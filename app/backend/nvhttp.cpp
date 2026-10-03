@@ -1,4 +1,6 @@
 #include "nvcomputer.h"
+#include "identitymanager.h"
+#include "profilemanager.h"
 #include <Limelight.h>
 
 #include <QDebug>
@@ -28,8 +30,15 @@
 NvHTTP::NvHTTP(NvAddress address, uint16_t httpsPort, QSslCertificate serverCert, bool useTrueUid, QNetworkAccessManager* nam) :
     m_Nam(nam ? nam : new QNetworkAccessManager(this)),
     m_ServerCert(serverCert),
-    m_UseTrueUid(useTrueUid)
+    m_UseTrueUid(useTrueUid),
+    m_ClientUniqueId(IdentityManager::get()->getUniqueId()),
+    m_ClientSslConfig(IdentityManager::get()->getSslConfig()),
+    m_RequestCanceled(std::make_shared<std::atomic_bool>(!ProfileManager::get()->requestsAllowed()))
 {
+    // Keep cancellation visible even if this worker has not entered its event
+    // loop yet. The direct callback touches only shared atomic state.
+    connect(ProfileManager::get(), &ProfileManager::pendingRequestsCanceled,
+            this, [canceled = m_RequestCanceled]() { *canceled = true; }, Qt::DirectConnection);
     m_BaseUrlHttp.setScheme("http");
     m_BaseUrlHttps.setScheme("https");
 
@@ -517,19 +526,24 @@ NvHTTP::openConnection(QUrl baseUrl,
     // Port must be set
     Q_ASSERT(baseUrl.port(0) != 0);
 
+    if (*m_RequestCanceled || !ProfileManager::get()->requestsAllowed()) {
+        throw QtNetworkReplyException(QNetworkReply::OperationCanceledError, "Request canceled");
+    }
+
     // Build a URL for the request
     QUrl url(baseUrl);
     url.setPath("/" + command);
 
-    // Use a placeholder UID for GFE allow them to quit games for each other.
-    url.setQuery("uniqueid=" + (m_UseTrueUid ? IdentityManager::get()->getUniqueId() : "0123456789ABCDEF") +
+    // Use this client's profile UID for Sunshine/non-GFE hosts, but keep the
+    // shared placeholder UID for GFE so clients can quit each other's games.
+    url.setQuery("uniqueid=" + (m_UseTrueUid ? m_ClientUniqueId : "0123456789ABCDEF") +
                  "&uuid=" + QUuid::createUuid().toRfc4122().toHex() +
                  ((arguments != nullptr) ? ("&" + arguments) : ""));
 
     QNetworkRequest request(url);
 
     // Add our client certificate
-    request.setSslConfiguration(IdentityManager::get()->getSslConfig());
+    request.setSslConfiguration(m_ClientSslConfig);
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     // Disable HTTP/2 (GFE 3.22 doesn't like it) and Qt 6 enables it by default
@@ -550,13 +564,17 @@ NvHTTP::openConnection(QUrl baseUrl,
     QEventLoop loop;
     connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
     connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, &loop, &QEventLoop::quit);
+    connect(ProfileManager::get(), &ProfileManager::pendingRequestsCanceled, &loop, &QEventLoop::quit,
+            Qt::QueuedConnection);
     if (timeoutMs) {
         QTimer::singleShot(timeoutMs, &loop, &QEventLoop::quit);
     }
     if (logLevel >= NvLogLevel::NVLL_VERBOSE) {
         qInfo() << "Executing request:" << url.toString();
     }
-    loop.exec(QEventLoop::ExcludeUserInputEvents);
+    if (!*m_RequestCanceled && ProfileManager::get()->requestsAllowed()) {
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
+    }
 
     // Abort the request if it timed out
     if (!reply->isFinished())
@@ -572,6 +590,13 @@ NvHTTP::openConnection(QUrl baseUrl,
     m_Nam->clearAccessCache();
 #endif
     disconnect(sslErrorsConnection);
+
+    // Cancellation can race with a successful reply before the event loop is
+    // connected or stopped. Never deliver that response to the old profile.
+    if (*m_RequestCanceled || !ProfileManager::get()->requestsAllowed()) {
+        delete reply;
+        throw QtNetworkReplyException(QNetworkReply::OperationCanceledError, "Request canceled");
+    }
 
     // Handle error
     if (reply->error() != QNetworkReply::NoError)

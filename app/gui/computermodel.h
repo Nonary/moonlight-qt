@@ -58,5 +58,5 @@ private slots:
 
 private:
     QVector<NvComputer*> m_Computers;
-    ComputerManager* m_ComputerManager;
+    ComputerManager* m_ComputerManager = nullptr;
 };

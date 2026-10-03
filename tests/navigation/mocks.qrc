@@ -1,0 +1,7 @@
+<RCC>
+    <qresource prefix="/navigation-tests">
+        <file>mocks/Backend.qml</file>
+        <file>mocks/ComputerModel.qml</file>
+        <file>mocks/AppModel.qml</file>
+    </qresource>
+</RCC>

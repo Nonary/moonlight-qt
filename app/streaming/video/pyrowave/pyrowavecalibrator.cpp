@@ -3,6 +3,7 @@
 #include "backend/networkbuffers.h"
 #include "backend/computermanager.h"
 #include "backend/nvhttp.h"
+#include "backend/profilemanager.h"
 #include "streaming/session.h"
 #include "streaming/video/pyrowave/pyrowavebitrate.h"
 
@@ -841,20 +842,36 @@ QVariantMap toMap(const Sample& sample)
 
 } // namespace
 
-PyroWaveCalibrator::PyroWaveCalibrator(QObject* parent) : QObject(parent) {}
+PyroWaveCalibrator::PyroWaveCalibrator(QObject* parent) : QObject(parent)
+{
+    connect(ProfileManager::get(), &ProfileManager::activeProfileAboutToChange,
+            this, &PyroWaveCalibrator::stop);
+}
 
 PyroWaveCalibrator::~PyroWaveCalibrator()
 {
-    if (m_Worker) {
-        if (m_Cancel) m_Cancel->store(true);
-        m_Worker->wait();
-        delete m_Worker;
-    }
+    stop();
 }
 
 void PyroWaveCalibrator::cancel()
 {
     if (m_Cancel) m_Cancel->store(true);
+}
+
+void PyroWaveCalibrator::stop()
+{
+    ++m_Generation;
+    cancel();
+    if (m_Worker) {
+        m_Worker->wait();
+        delete m_Worker;
+    }
+    m_Cancel.reset();
+    m_Running = false;
+    m_Results.clear();
+    m_Message.clear();
+    m_LinkSummary.clear();
+    emit changed();
 }
 
 void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid, int fps,
@@ -922,14 +939,24 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
     m_Message = tr("Testing host-to-client bandwidth…");
     emit changed();
 
+    const auto generation = ++m_Generation;
     auto cancelled = std::make_shared<std::atomic<bool>>(false);
     m_Cancel = cancelled;
     m_Worker = QThread::create([this, fps, displayWidth, displayHeight, linkMbps,
                                 hostAddress, hostHttpsPort, hostCertificate, hostName,
-                                useTrueUid, cancelled] {
+                                useTrueUid, cancelled, generation] {
         int measuredMbps = 0;
         int hostLinkMbps = 0;
         try {
+            if (cancelled->load()) {
+                QMetaObject::invokeMethod(this, [this, generation] {
+                    if (generation != m_Generation) return;
+                    m_Running = false;
+                    m_Message = tr("Calibration stopped.");
+                    emit changed();
+                }, Qt::QueuedConnection);
+                return;
+            }
             NvHTTP http(hostAddress, hostHttpsPort, hostCertificate, useTrueUid);
             const QString serverInfo = http.getServerInfo(NvHTTP::NVLL_ERROR);
             bool validBytes = false;
@@ -951,7 +978,8 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
         }
         catch (const std::exception& e) {
             const QString error = QString::fromUtf8(e.what());
-            QMetaObject::invokeMethod(this, [this, error] {
+            QMetaObject::invokeMethod(this, [this, error, generation] {
+                if (generation != m_Generation) return;
                 m_Running = false;
                 m_Message = error;
                 m_LinkSummary = tr("Host-to-client bandwidth could not be measured.");
@@ -960,7 +988,8 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
             return;
         }
         if (cancelled->load()) {
-            QMetaObject::invokeMethod(this, [this] {
+            QMetaObject::invokeMethod(this, [this, generation] {
+                if (generation != m_Generation) return;
                 m_Running = false;
                 m_Message = tr("Calibration stopped.");
                 emit changed();
@@ -972,7 +1001,8 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
         if (linkMbps > 0) availableMbps = (std::min)(availableMbps, linkMbps);
         const int linkCapKbps = roundDownKbps(availableMbps * 1000.0 * kLinkShare);
         if (linkCapKbps < 5000) {
-            QMetaObject::invokeMethod(this, [this] {
+            QMetaObject::invokeMethod(this, [this, generation] {
+                if (generation != m_Generation) return;
                 m_Running = false;
                 m_Message = tr("This route is too slow for the minimum PyroWave bitrate.");
                 m_LinkSummary = tr("No usable PyroWave bitrate could be recommended.");
@@ -981,7 +1011,8 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
             return;
         }
         QMetaObject::invokeMethod(this, [this, fps, hostName, measuredMbps, hostLinkMbps,
-                                         linkMbps, linkCapKbps] {
+                                         linkMbps, linkCapKbps, generation] {
+            if (generation != m_Generation) return;
             m_LinkSummary = tr("%1 → this PC: measured %2 Mbps; host link %3 Mbps; client link %4 Mbps. Video bitrate cap: %5 Mbps. 4K 4:4:4 at %6 FPS: SDR %7, HDR %8 by network capacity.")
                 .arg(hostName).arg(measuredMbps)
                 .arg(hostLinkMbps > 0 ? QString::number(hostLinkMbps) : tr("unknown"))
@@ -993,15 +1024,17 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
             emit changed();
         }, Qt::QueuedConnection);
         const QString error = runSweep(fps, displayWidth, displayHeight, linkCapKbps, *cancelled,
-                                       [this](const Sample& sample) {
+                                       [this, generation](const Sample& sample) {
             const QVariantMap result = toMap(sample);
-            QMetaObject::invokeMethod(this, [this, result] {
+            QMetaObject::invokeMethod(this, [this, result, generation] {
+                if (generation != m_Generation) return;
                 m_Results.append(result);
                 emit changed();
             }, Qt::QueuedConnection);
         });
         const bool stopped = cancelled->load();
-        QMetaObject::invokeMethod(this, [this, error, stopped] {
+        QMetaObject::invokeMethod(this, [this, error, stopped, generation] {
+            if (generation != m_Generation) return;
             m_Running = false;
             if (!error.isEmpty()) {
                 m_Message = error;
@@ -1015,8 +1048,9 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
             emit changed();
         }, Qt::QueuedConnection);
     });
-    QThread* worker = m_Worker;
+    QPointer<QThread> worker = m_Worker;
     connect(worker, &QThread::finished, this, [this, worker] {
+        if (!worker) return;
         if (m_Worker == worker) m_Worker = nullptr;
         worker->deleteLater();
     });

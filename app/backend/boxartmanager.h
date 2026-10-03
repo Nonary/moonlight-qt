@@ -15,12 +15,14 @@ class BoxArtManager : public QObject
 public:
     explicit BoxArtManager(QObject *parent = nullptr);
 
+    void stop();
+
     QUrl
     loadBoxArt(NvComputer* computer, NvApp& app);
 
     static
     void
-    deleteBoxArt(NvComputer* computer);
+    deleteBoxArt(NvComputer* computer, const QString& profileId);
 
 signals:
     void
@@ -41,4 +43,5 @@ private:
 
     QDir m_BoxArtDir;
     QThreadPool m_ThreadPool;
+    bool m_ProfileActive = true;
 };

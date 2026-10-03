@@ -4,6 +4,7 @@
 #include <QGuiApplication>
 #include <QWindow>
 
+#include "backend/profilemanager.h"
 #include "settings/mappingmanager.h"
 
 #define AXIS_NAVIGATION_REPEAT_DELAY 150
@@ -131,7 +132,7 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
                         QEvent::Type::KeyPress : QEvent::Type::KeyRelease;
 
             // Swap face buttons if needed
-            if (m_Prefs->swapFaceButtons) {
+            if (shouldSwapFaceButtons()) {
                 switch (event.cbutton.button) {
                 case SDL_CONTROLLER_BUTTON_A:
                     event.cbutton.button = SDL_CONTROLLER_BUTTON_B;
@@ -260,6 +261,15 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
             m_LastAxisNavigationEventTime = SDL_GetTicks();
         }
     }
+}
+
+bool SdlGamepadKeyNavigation::shouldSwapFaceButtons() const
+{
+    if (m_Prefs != nullptr) {
+        return m_Prefs->swapFaceButtons;
+    }
+
+    return ProfileManager::hasActiveProfile() && StreamingPreferences::get()->swapFaceButtons;
 }
 
 void SdlGamepadKeyNavigation::sendKey(QEvent::Type type, Qt::Key key, Qt::KeyboardModifiers modifiers)

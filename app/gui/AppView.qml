@@ -24,7 +24,9 @@ CenteredGridView {
     function computerLost()
     {
         // Go back to the PC view on PC loss
-        stackView.pop()
+        if (activated && stackView.currentItem === appGrid) {
+            stackView.pop()
+        }
     }
 
     Component.onCompleted: {
@@ -37,6 +39,8 @@ CenteredGridView {
     StackView.onActivated: {
         appModel.computerLost.connect(computerLost)
         activated = true
+        SdlGamepadKeyNavigation.setUiNavMode(false)
+        forceActiveFocus(Qt.TabFocusReason)
 
         // Highlight the first item if a gamepad is connected
         if (currentIndex === -1 && SdlGamepadKeyNavigation.getConnectedGamepads() > 0) {
@@ -64,8 +68,7 @@ CenteredGridView {
 
     function createModel()
     {
-        var model = Qt.createQmlObject('import StreamingPreferences 1.0
-import AppModel 1.0; AppModel {}', parent, '')
+        var model = Qt.createQmlObject('import AppModel 1.0; AppModel {}', appGrid, '')
         model.initialize(ComputerManager, computerIndex, showHiddenGames)
         return model
     }
@@ -221,9 +224,11 @@ import AppModel 1.0; AppModel {}', parent, '')
             }
 
             var component = Qt.createComponent("StreamSegue.qml")
+            var session = appModel.createSessionForApp(index)
+            if (!session) return
             var segue = component.createObject(stackView, {
                                                    "appName": model.name,
-                                                   "session": appModel.createSessionForApp(index),
+                                                   "session": session,
                                                    "isResume": runningId === model.appid
                                                })
             stackView.push(segue)
@@ -364,6 +369,7 @@ import AppModel 1.0; AppModel {}', parent, '')
                 // successfully quitting the old app.
                 params.nextAppName = nextAppName
                 params.nextSession = appModel.createSessionForApp(nextAppIndex)
+                if (!params.nextSession) return
             }
             else {
                 params.nextAppName = null

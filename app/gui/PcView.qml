@@ -11,6 +11,10 @@ import SdlGamepadKeyNavigation 1.0
 
 CenteredGridView {
     property ComputerModel computerModel : createModel()
+    property bool focusFirstHostOnLoad: false
+    property bool firstHostFocusApplied: false
+    property bool initialSelectionReset: false
+    property bool activated: false
 
     id: pcGrid
     focus: true
@@ -25,22 +29,55 @@ CenteredGridView {
         // We do this here instead of onActivated to avoid losing the user's
         // selection when backing out of a different page of the app.
         currentIndex = -1
+        initialSelectionReset = true
+        focusFirstHostIfNeeded()
+    }
+
+    Timer {
+        id: selectedHostFocusTimer
+        interval: 0
+        repeat: false
+        onTriggered: {
+            if (!pcGrid.activated || stackView.currentItem !== pcGrid) {
+                return
+            }
+            if (pcGrid.currentIndex >= 0 && pcGrid.currentItem) {
+                pcGrid.currentItem.forceActiveFocus(Qt.TabFocusReason)
+            }
+            else {
+                pcGrid.forceActiveFocus(Qt.TabFocusReason)
+            }
+        }
     }
 
     // Note: Any initialization done here that is critical for streaming must
     // also be done in CliStartStreamSegue.qml, since this code does not run
     // for command-line initiated streams.
     StackView.onActivated: {
+        activated = true
+
         // Setup signals on CM
         ComputerManager.computerAddCompleted.connect(addComplete)
 
-        // Highlight the first item if a gamepad is connected
-        if (currentIndex === -1 && SdlGamepadKeyNavigation.getConnectedGamepads() > 0) {
-            currentIndex = 0
+        focusFirstHostIfNeeded()
+        if (firstHostFocusApplied && currentIndex >= 0) {
+            focusSelectedHostSoon()
+        }
+    }
+
+    onCountChanged: {
+        focusFirstHostIfNeeded()
+    }
+
+    onCurrentItemChanged: {
+        if (activated && firstHostFocusApplied) {
+            focusSelectedHostSoon()
         }
     }
 
     StackView.onDeactivating: {
+        activated = false
+        selectedHostFocusTimer.stop()
         ComputerManager.computerAddCompleted.disconnect(addComplete)
     }
 
@@ -75,11 +112,52 @@ CenteredGridView {
 
     function createModel()
     {
-        var model = Qt.createQmlObject('import ComputerModel 1.0; ComputerModel {}', parent, '')
+        var model = Qt.createQmlObject('import ComputerModel 1.0; ComputerModel {}', pcGrid, '')
         model.initialize(ComputerManager)
         model.pairingCompleted.connect(pairingComplete)
         model.connectionTestCompleted.connect(testConnectionDialog.connectionTestComplete)
         return model
+    }
+
+    function focusFirstHostIfNeeded()
+    {
+        if (!initialSelectionReset || firstHostFocusApplied ||
+                currentIndex !== -1 || count === 0) {
+            return
+        }
+
+        if (!focusFirstHostOnLoad &&
+                SdlGamepadKeyNavigation.getConnectedGamepads() === 0) {
+            return
+        }
+
+        currentIndex = 0
+        firstHostFocusApplied = true
+        if (activated) {
+            focusSelectedHostSoon()
+        }
+    }
+
+    function focusSelectedHostSoon()
+    {
+        selectedHostFocusTimer.restart()
+    }
+
+    function openComputer(computerIndex, computerName, showHiddenGames)
+    {
+        if (!activated || stackView.busy || stackView.currentItem !== pcGrid) {
+            return
+        }
+
+        var properties = {
+            "computerIndex": computerIndex,
+            "objectName": computerName
+        }
+        if (showHiddenGames === true) {
+            properties.showHiddenGames = true
+        }
+
+        stackView.push("qrc:/gui/AppView.qml", properties)
     }
 
     Row {
@@ -174,9 +252,7 @@ CenteredGridView {
                 NavigableMenuItem {
                     text: qsTr("View All Apps")
                     onTriggered: {
-                        var component = Qt.createComponent("AppView.qml")
-                        var appView = component.createObject(stackView, {"computerIndex": index, "objectName": model.name, "showHiddenGames": true})
-                        stackView.push(appView)
+                        pcGrid.openComputer(index, model.name, true)
                     }
                     visible: model.online && model.paired
                 }
@@ -228,9 +304,7 @@ CenteredGridView {
                 }
                 else if (model.paired) {
                     // go to game view
-                    var component = Qt.createComponent("AppView.qml")
-                    var appView = component.createObject(stackView, {"computerIndex": index, "objectName": model.name})
-                    stackView.push(appView)
+                    pcGrid.openComputer(index, model.name, false)
                 }
                 else {
                     var pin = computerModel.generatePinString()

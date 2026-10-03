@@ -3,7 +3,7 @@ import QtQuick.Controls 2.2
 
 GridView {
     property int minMargin: 10
-    property real availableWidth: (parent.width - 2 * minMargin)
+    property real availableWidth: Math.max(0, (parent ? parent.width : 0) - 2 * minMargin)
     property int itemsPerRow: availableWidth / cellWidth
     property real horizontalMargin: itemsPerRow < count && availableWidth >= cellWidth ?
                                         (availableWidth % cellWidth) / 2 : minMargin
