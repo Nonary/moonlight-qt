@@ -6,12 +6,15 @@ import QtQuick.Controls.Material 2.2
 
 import ComputerManager 1.0
 import AutoUpdateChecker 1.0
+import ProfileManager 1.0
 import StreamingPreferences 1.0
 import SystemProperties 1.0
 import SdlGamepadKeyNavigation 1.0
 
 ApplicationWindow {
     property bool pollingActive: false
+    property bool configChecksStarted: false
+    property bool autoLoginPromptShown: false
 
     // Set by SettingsView to force the back operation to pop all
     // pages except the initial view. This is required when doing
@@ -34,9 +37,14 @@ ApplicationWindow {
         SdlGamepadKeyNavigation.enable()
     }
 
-    Component.onCompleted: {
+    function showWindowWithCurrentDisplayMode() {
         // Show the window according to the user's preferences
         if (SystemProperties.hasDesktopEnvironment) {
+            if (!ProfileManager.hasActiveProfile) {
+                window.show()
+                return
+            }
+
             if (StreamingPreferences.uiDisplayMode == StreamingPreferences.UI_MAXIMIZED) {
                 window.showMaximized()
             }
@@ -49,18 +57,84 @@ ApplicationWindow {
         } else {
             window.showFullScreen()
         }
+    }
 
-        // Display any modal dialogs for configuration warnings
-        if (runConfigChecks) {
-            if (SystemProperties.isWow64) {
-                wow64Dialog.open()
-            }
+    Component.onCompleted: {
+        showWindowWithCurrentDisplayMode()
+    }
 
-            // Hardware acceleration and unmapped gamepads are checked asynchronously
-            SystemProperties.hasHardwareAccelerationChanged.connect(hasHardwareAccelerationChanged)
-            SystemProperties.unmappedGamepadsChanged.connect(hasUnmappedGamepadsChanged)
-            SystemProperties.startAsyncLoad()
+    function enterProfile(profileId, suppressAutoLoginPrompt, focusFirstHostOnLoad) {
+        if (!profileId || stackView.busy) {
+            return false
         }
+
+        stopPollingIfNeeded()
+
+        if (stackView.depth > 1) {
+            stackView.pop(null, StackView.Immediate)
+        }
+
+        if (!ProfileManager.activateProfile(profileId)) {
+            return false
+        }
+
+        StreamingPreferences.retranslate()
+        showWindowWithCurrentDisplayMode()
+        // Reopen controllers with the selected profile's mappings.
+        SdlGamepadKeyNavigation.disable()
+        SdlGamepadKeyNavigation.enable()
+        SdlGamepadKeyNavigation.setUiNavMode(false)
+        ComputerManager.reloadForActiveProfile()
+
+        if (!(stackView.currentItem instanceof PcView)) {
+            stackView.push("qrc:/gui/PcView.qml", {
+                "focusFirstHostOnLoad": focusFirstHostOnLoad === true
+            })
+        }
+
+        if (runConfigChecks && !currentItemSuppressesPolling()) {
+            runConfigurationChecks()
+        }
+
+        if (!suppressAutoLoginPrompt &&
+                !autoLoginPromptShown &&
+                ProfileManager.autoLoginProfileId.length === 0) {
+            autoLoginPromptShown = true
+            autoLoginPromptDialog.profileId = profileId
+            autoLoginPromptDialog.text = qsTr("Use '%1' as the default profile and open the default profile automatically next time?").arg(ProfileManager.activeProfileName)
+            autoLoginPromptDialog.open()
+        }
+
+        return true
+    }
+
+    function returnToProfileSelection() {
+        if (stackView.busy) {
+            return
+        }
+
+        stopPollingIfNeeded()
+
+        if (stackView.depth > 1) {
+            stackView.pop(null)
+        }
+    }
+
+    function runConfigurationChecks() {
+        if (configChecksStarted) {
+            return
+        }
+
+        configChecksStarted = true
+
+        if (SystemProperties.isWow64) {
+            wow64Dialog.open()
+        }
+
+        // Hardware acceleration and unmapped gamepads are checked asynchronously
+        SystemProperties.hasHardwareAccelerationChanged.connect(hasHardwareAccelerationChanged)
+        SystemProperties.unmappedGamepadsChanged.connect(hasUnmappedGamepadsChanged)
+        SystemProperties.startAsyncLoad()
     }
 
     function hasHardwareAccelerationChanged() {
@@ -96,7 +170,16 @@ ApplicationWindow {
     ToolTip.toolTip.contentWidth: Math.min(tooltipTextLayoutHelper.width, 400)
 
     function goBack() {
-        if (clearOnBack) {
+        // A second pop during the transition can skip pages and leave focus
+        // in a view that is being removed.
+        if (stackView.busy) {
+            return
+        }
+
+        if (stackView.depth <= 1) {
+            quitConfirmationDialog.open()
+        }
+        else if (clearOnBack) {
             // Pop all items except the first one
             stackView.pop(null)
             clearOnBack = false
@@ -114,8 +197,13 @@ ApplicationWindow {
         Component.onCompleted: {
             // Perform our early initialization before constructing
             // the initial view and pushing it to the StackView
+            var autoEnterProfile = initialView === "qrc:/gui/ProfileSelectionView.qml" &&
+                                   ProfileManager.hasActiveProfile
             doEarlyInit()
             push(initialView)
+            if (autoEnterProfile) {
+                enterProfile(ProfileManager.activeProfileId, true, true)
+            }
         }
 
         onCurrentItemChanged: {
@@ -123,35 +211,43 @@ ApplicationWindow {
             if (currentItem) {
                 currentItem.forceActiveFocus()
             }
-        }
 
-        Keys.onEscapePressed: {
-            if (depth > 1) {
-                goBack()
+            if (currentItemSuppressesPolling()) {
+                stopPollingIfNeeded()
             }
             else {
-                quitConfirmationDialog.open()
+                startPollingIfNeeded()
+                if (runConfigChecks) {
+                    runConfigurationChecks()
+                }
             }
         }
 
-        Keys.onBackPressed: {
-            if (depth > 1) {
+        Keys.onEscapePressed: function(event) {
+            if (!event.isAutoRepeat) {
                 goBack()
             }
-            else {
-                quitConfirmationDialog.open()
+        }
+
+        Keys.onBackPressed: function(event) {
+            if (!event.isAutoRepeat) {
+                goBack()
             }
         }
 
         Keys.onMenuPressed: {
-            settingsButton.clicked()
+            if (settingsButton.visible) {
+                settingsButton.clicked()
+            }
         }
 
         // This is a keypress we've reserved for letting the
         // SdlGamepadKeyNavigation object tell us to show settings
         // when Menu is consumed by a focused control.
         Keys.onHangupPressed: {
-            settingsButton.clicked()
+            if (settingsButton.visible) {
+                settingsButton.clicked()
+            }
         }
     }
 
@@ -170,26 +266,35 @@ ApplicationWindow {
         }
     }
 
+    function currentItemSuppressesPolling() {
+        return !stackView.currentItem || stackView.currentItem.suppressPolling === true
+    }
+
+    function startPollingIfNeeded() {
+        if (!currentItemSuppressesPolling() && visible && active && ProfileManager.hasActiveProfile && !pollingActive) {
+            ComputerManager.startPolling()
+            pollingActive = true
+        }
+    }
+
+    function stopPollingIfNeeded() {
+        if (pollingActive) {
+            ComputerManager.stopPollingAsync()
+            pollingActive = false
+        }
+    }
+
     onVisibleChanged: {
         // When we become invisible while streaming is going on,
         // stop polling immediately.
         if (!visible) {
             inactivityTimer.stop()
-
-            if (pollingActive) {
-                ComputerManager.stopPollingAsync()
-                pollingActive = false
-            }
+            stopPollingIfNeeded()
         }
         else if (active) {
             // When we become visible and active again, start polling
             inactivityTimer.stop()
-
-            // Restart polling if it was stopped
-            if (!pollingActive) {
-                ComputerManager.startPolling()
-                pollingActive = true
-            }
+            startPollingIfNeeded()
         }
 
         // Poll for gamepad input only when the window is in focus
@@ -200,12 +305,7 @@ ApplicationWindow {
         if (active) {
             // Stop the inactivity timer
             inactivityTimer.stop()
-
-            // Restart polling if it was stopped
-            if (!pollingActive) {
-                ComputerManager.startPolling()
-                pollingActive = true
-            }
+            startPollingIfNeeded()
         }
         else {
             // Start the inactivity timer to stop polling
@@ -219,6 +319,10 @@ ApplicationWindow {
 
     function navigateTo(url, objectType)
     {
+        if (stackView.busy) {
+            return
+        }
+
         var existingItem = stackView.find(function(item, index) {
             return item instanceof objectType
         })
@@ -267,6 +371,15 @@ ApplicationWindow {
                 Keys.onDownPressed: {
                     stackView.currentItem.forceActiveFocus(Qt.TabFocus)
                 }
+            }
+
+            Label {
+                visible: ProfileManager.hasActiveProfile && !currentItemSuppressesPolling()
+                text: ProfileManager.activeProfileName
+                font.pointSize: 11
+                color: Material.accent
+                elide: Label.ElideRight
+                Layout.maximumWidth: 250
             }
 
             // This label will appear when the window gets too small and
@@ -337,6 +450,26 @@ ApplicationWindow {
 
                 Keys.onDownPressed: {
                     stackView.currentItem.forceActiveFocus(Qt.TabFocus)
+                }
+            }
+
+            NavigableToolButton {
+                id: profilesButton
+                visible: stackView.currentItem instanceof PcView
+
+                iconSource: "qrc:/res/account_circle.svg"
+
+                ToolTip.delay: 1000
+                ToolTip.timeout: 3000
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Profiles")
+
+                onClicked: {
+                    returnToProfileSelection()
+                }
+
+                Keys.onDownPressed: {
+                    stackView.currentItem.forceActiveFocus(Qt.TabFocusReason)
                 }
             }
 
@@ -423,6 +556,7 @@ ApplicationWindow {
 
             NavigableToolButton {
                 id: settingsButton
+                visible: !currentItemSuppressesPolling()
 
                 iconSource:  "qrc:/res/settings.svg"
 
@@ -435,6 +569,7 @@ ApplicationWindow {
                 Shortcut {
                     id: settingsShortcut
                     sequence: StandardKey.Preferences
+                    enabled: settingsButton.visible
                     onActivated: settingsButton.clicked()
                 }
 
@@ -487,6 +622,13 @@ ApplicationWindow {
         text: qsTr("Are you sure you want to quit?")
         // For keyboard/gamepad navigation
         onAccepted: Qt.quit()
+    }
+
+    NavigableMessageDialog {
+        id: autoLoginPromptDialog
+        property string profileId
+        standardButtons: Dialog.Yes | Dialog.No
+        onAccepted: ProfileManager.setAutoLoginProfile(profileId, true)
     }
 
     // HACK: This belongs in StreamSegue but keeping a dialog around after the parent

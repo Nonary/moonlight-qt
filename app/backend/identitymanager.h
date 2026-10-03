@@ -24,6 +24,9 @@ public:
     IdentityManager*
     get();
 
+    static void
+    reset();
+
 private:
     IdentityManager();
 
@@ -39,9 +42,9 @@ private:
     // Initialized in constructor
     QByteArray m_CachedPrivateKey;
     QByteArray m_CachedPemCert;
+    QString m_CachedUniqueId;
 
     // Lazy initialized
-    QString m_CachedUniqueId;
     QSslCertificate m_CachedSslCert;
     QSslKey m_CachedSslKey;
 

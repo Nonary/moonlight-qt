@@ -21,6 +21,25 @@ You can follow development on our [Discord server](https://moonlight-stream.org/
  - Support for both pointer capture (for games) and direct mouse control (for remote desktop)
  - Support for passing system-wide keyboard shortcuts like Alt+Tab to the host
  
+## Profiles
+
+Choose a profile at startup, or use the profile button in the host list to switch.
+Profiles have separate paired hosts, streaming preferences, controller mappings,
+and artwork caches. The first launch preserves the existing configuration in the
+Default profile; newly created profiles pair with hosts independently.
+
+The profile menu can select a default profile. The auto-login toggle controls
+whether that profile opens automatically at startup.
+Command-line actions accept `--profile <name-or-id>`; without it, they use the
+default profile.
+
+### Default PC
+
+Choose **Set as Default PC** in a computer's context menu to open its applications
+automatically when the profile opens and the computer becomes available. The
+choice is separate for each profile. Returning to the computer list keeps it
+open; **Remove Default PC** disables automatic opening.
+
 ## Downloads
 - [Windows, macOS, and Steam Link](https://github.com/moonlight-stream/moonlight-qt/releases)
 - [Snap (for Ubuntu-based Linux distros)](https://snapcraft.io/moonlight)

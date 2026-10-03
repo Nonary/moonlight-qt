@@ -1,4 +1,5 @@
 #include "appmodel.h"
+#include "backend/profilemanager.h"
 
 AppModel::AppModel(QObject *parent)
     : QAbstractListModel(parent)
@@ -14,6 +15,7 @@ double AppModel::frameLimiterFpsLimit() const { return m_FrameLimiterFpsLimit; }
 
 void AppModel::updateFrameLimiterCapabilities()
 {
+    if (!m_Computer) return;
     // Snapshot discovery state; QML getters use only this GUI-thread cache.
     QReadLocker locker(&m_Computer->lock);
     const bool changed = m_FrameLimiterSupported != m_Computer->frameLimiterSupported ||
@@ -30,12 +32,22 @@ void AppModel::updateFrameLimiterCapabilities()
 
 void AppModel::initialize(ComputerManager* computerManager, int computerIndex, bool showHiddenGames)
 {
+    if (!computerManager) {
+        return;
+    }
     m_ComputerManager = computerManager;
     connect(m_ComputerManager, &ComputerManager::computerStateChanged,
             this, &AppModel::handleComputerStateChanged);
+    connect(m_ComputerManager, &ComputerManager::hostRemoved,
+            this, &AppModel::handleHostRemoved);
+    connect(ProfileManager::get(), &ProfileManager::activeProfileAboutToChange,
+            this, &AppModel::invalidateComputer);
 
-    Q_ASSERT(computerIndex < m_ComputerManager->getComputers().count());
-    m_Computer = m_ComputerManager->getComputers().at(computerIndex);
+    const auto computers = m_ComputerManager->getComputers();
+    if (computerIndex < 0 || computerIndex >= computers.count()) {
+        return;
+    }
+    m_Computer = computers.at(computerIndex);
     m_CurrentGameId = m_Computer->currentGameId;
     m_ShowHiddenGames = showHiddenGames;
 
@@ -63,7 +75,7 @@ QString AppModel::getRunningAppName()
 
 Session* AppModel::createSessionForApp(int appIndex)
 {
-    Q_ASSERT(appIndex < m_VisibleApps.count());
+    if (!m_Computer || appIndex < 0 || appIndex >= m_VisibleApps.count()) return nullptr;
     NvApp app = m_VisibleApps.at(appIndex);
 
     return new Session(m_Computer, app);
@@ -92,10 +104,8 @@ int AppModel::rowCount(const QModelIndex &parent) const
 
 QVariant AppModel::data(const QModelIndex &index, int role) const
 {
-    if (!index.isValid())
+    if (!m_Computer || !index.isValid() || index.row() < 0 || index.row() >= m_VisibleApps.count())
         return QVariant();
-
-    Q_ASSERT(index.row() < m_VisibleApps.count());
     NvApp app = m_VisibleApps.at(index.row());
 
     switch (role)
@@ -137,7 +147,9 @@ QHash<int, QByteArray> AppModel::roleNames() const
 
 void AppModel::quitRunningApp()
 {
-    m_ComputerManager->quitRunningApp(m_Computer);
+    if (m_Computer) {
+        m_ComputerManager->quitRunningApp(m_Computer);
+    }
 }
 
 bool AppModel::isAppCurrentlyVisible(const NvApp& app)
@@ -229,7 +241,9 @@ void AppModel::updateAppList(QVector<NvApp> newList)
 
 void AppModel::setAppHidden(int appIndex, bool hidden)
 {
-    Q_ASSERT(appIndex < m_VisibleApps.count());
+    if (!m_Computer || appIndex < 0 || appIndex >= m_VisibleApps.count()) {
+        return;
+    }
     int appId = m_VisibleApps.at(appIndex).id;
 
     {
@@ -248,7 +262,9 @@ void AppModel::setAppHidden(int appIndex, bool hidden)
 
 void AppModel::setAppDirectLaunch(int appIndex, bool directLaunch)
 {
-    Q_ASSERT(appIndex < m_VisibleApps.count());
+    if (!m_Computer || appIndex < 0 || appIndex >= m_VisibleApps.count()) {
+        return;
+    }
     int appId = m_VisibleApps.at(appIndex).id;
 
     {
@@ -272,10 +288,40 @@ void AppModel::setAppDirectLaunch(int appIndex, bool directLaunch)
     m_ComputerManager->clientSideAttributeUpdated(m_Computer);
 }
 
+void AppModel::handleHostRemoved(const QString& uuid)
+{
+    if (!m_Computer || m_Computer->uuid != uuid) {
+        return;
+    }
+    invalidateComputer();
+}
+
+void AppModel::invalidateComputer()
+{
+    if (!m_Computer) {
+        return;
+    }
+
+    // A popped QML page can outlive its host until deferred destruction.
+    m_BoxArtManager.stop();
+    beginResetModel();
+    m_Computer = nullptr;
+    m_CurrentGameId = 0;
+    m_VisibleApps.clear();
+    m_AllApps.clear();
+    m_FrameLimiterSupported = false;
+    m_FrameLimiterEnabled = false;
+    m_VirtualDisplayFrameLimiterEnabled = false;
+    m_FrameLimiterFpsLimit = 0;
+    endResetModel();
+    emit frameLimiterChanged();
+    emit computerLost();
+}
+
 void AppModel::handleComputerStateChanged(NvComputer* computer)
 {
     // Ignore updates for computers that aren't ours
-    if (computer != m_Computer) {
+    if (!m_Computer || computer != m_Computer) {
         return;
     }
 
@@ -327,7 +373,9 @@ void AppModel::handleComputerStateChanged(NvComputer* computer)
 
 void AppModel::handleBoxArtLoaded(NvComputer* computer, NvApp app, QUrl /* image */)
 {
-    Q_ASSERT(computer == m_Computer);
+    if (!m_Computer || computer != m_Computer) {
+        return;
+    }
 
     int index = m_VisibleApps.indexOf(app);
 

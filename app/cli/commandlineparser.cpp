@@ -38,6 +38,7 @@ public:
         setSingleDashWordOptionMode(QCommandLineParser::ParseAsLongOptions);
         addHelpOption();
         addVersionOption();
+        addOption(QCommandLineOption("profile", "Use the specified Moonlight profile.", "profile"));
         addOption(QCommandLineOption("haptics-license", "Print haptics component notices, licenses and covered source (use alone)."));
     }
 
@@ -167,6 +168,7 @@ GlobalCommandLineParser::ParseResult GlobalCommandLineParser::parse(const QStrin
     );
     parser.addPositionalArgument("action", "Action to execute", "<action>");
     parser.parse(args);
+    m_Profile = parser.value("profile");
     auto posArgs = parser.positionalArguments();
 
     if (posArgs.isEmpty()) {
@@ -198,6 +200,11 @@ GlobalCommandLineParser::ParseResult GlobalCommandLineParser::parse(const QStrin
 
         parser.showError("Invalid action");
     }
+}
+
+QString GlobalCommandLineParser::getProfile() const
+{
+    return m_Profile;
 }
 
 QuitCommandLineParser::QuitCommandLineParser()

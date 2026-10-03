@@ -21,6 +21,10 @@ public:
 
     ParseResult parse(const QStringList &args);
 
+    QString getProfile() const;
+
+private:
+    QString m_Profile;
 };
 
 class QuitCommandLineParser

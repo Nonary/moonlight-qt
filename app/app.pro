@@ -174,6 +174,7 @@ macx {
 SOURCES += \
     backend/nvaddress.cpp \
     backend/nvapp.cpp \
+    backend/profilemanager.cpp \
     cli/pair.cpp \
     main.cpp \
     backend/computerseeker.cpp \
@@ -228,6 +229,7 @@ HEADERS += \
     SDL_compat.h \
     backend/nvaddress.h \
     backend/nvapp.h \
+    backend/profilemanager.h \
     cli/pair.h \
     settings/compatfetcher.h \
     settings/mappingfetcher.h \

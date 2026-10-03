@@ -1,4 +1,5 @@
 #include "mappingmanager.h"
+#include "backend/profilemanager.h"
 #include "path.h"
 
 #include <QDir>
@@ -13,9 +14,8 @@
 MappingFetcher* MappingManager::s_MappingFetcher;
 
 MappingManager::MappingManager()
+    : m_ProfileId(ProfileManager::activeProfileId())
 {
-    QSettings settings;
-
     // Load updated mappings from the Internet once per Moonlight launch
     if (s_MappingFetcher == nullptr) {
         s_MappingFetcher = new MappingFetcher();
@@ -24,14 +24,19 @@ MappingManager::MappingManager()
 
     // First load existing saved mappings. This ensures the user's
     // hints can always override the old data.
-    int mappingCount = settings.beginReadArray(SER_GAMEPADMAPPING);
-    for (int i = 0; i < mappingCount; i++) {
-        settings.setArrayIndex(i);
+    if (!m_ProfileId.isEmpty()) {
+        QSettings settings;
+        ProfileManager::beginProfileSettings(settings, m_ProfileId);
 
-        SdlGamepadMapping mapping(settings.value(SER_GUID).toString(), settings.value(SER_MAPPING).toString());
-        addMapping(mapping);
+        int mappingCount = settings.beginReadArray(SER_GAMEPADMAPPING);
+        for (int i = 0; i < mappingCount; i++) {
+            settings.setArrayIndex(i);
+
+            SdlGamepadMapping mapping(settings.value(SER_GUID).toString(), settings.value(SER_MAPPING).toString());
+            addMapping(mapping);
+        }
+        settings.endArray();
     }
-    settings.endArray();
 
     // Finally load mappings from SDL_HINT_GAMECONTROLLERCONFIG
     QStringList sdlMappings =
@@ -52,7 +57,12 @@ MappingManager::MappingManager()
 
 void MappingManager::save()
 {
+    if (m_ProfileId.isEmpty()) {
+        return;
+    }
+
     QSettings settings;
+    ProfileManager::beginProfileSettings(settings, m_ProfileId);
 
     settings.remove(SER_GAMEPADMAPPING);
     settings.beginWriteArray(SER_GAMEPADMAPPING);

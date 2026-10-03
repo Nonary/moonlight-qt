@@ -11,12 +11,14 @@
 #include <qmdnsengine/resolver.h>
 
 #include <QThread>
+#include <QThreadPool>
 #include <QReadWriteLock>
 #include <QSettings>
 #include <QRunnable>
 #include <QTimer>
 #include <QMutex>
 #include <QWaitCondition>
+#include <atomic>
 
 class ComputerManager;
 
@@ -210,10 +212,11 @@ private:
 class ComputerManager : public QObject
 {
     Q_OBJECT
+    Q_PROPERTY(QString defaultHostUuid READ defaultHostUuid NOTIFY defaultHostChanged)
 
-    friend class DeferredHostDeletionTask;
     friend class PendingAddTask;
     friend class PendingPairingTask;
+    friend class PendingQuitTask;
     friend class DelayedFlushThread;
 
 public:
@@ -221,11 +224,21 @@ public:
 
     virtual ~ComputerManager();
 
+    void stop();
+
     Q_INVOKABLE void startPolling();
 
     Q_INVOKABLE void stopPollingAsync();
 
+    Q_INVOKABLE void reloadForActiveProfile();
+
     Q_INVOKABLE void addNewHostManually(QString address);
+
+    QString defaultHostUuid() const;
+
+    Q_INVOKABLE bool setDefaultHost(QString uuid);
+
+    Q_INVOKABLE bool clearDefaultHost();
 
     void addNewHost(NvAddress address, bool mdns, QString name = QString(), NvAddress mdnsIpv6Address = NvAddress());
 
@@ -245,6 +258,7 @@ public:
     void clientSideAttributeUpdated(NvComputer* computer);
 
 signals:
+    void hostRemoved(QString uuid);
     void computerStateChanged(NvComputer* computer);
 
     void pairingCompleted(NvComputer* computer, QString error);
@@ -252,6 +266,8 @@ signals:
     void computerAddCompleted(QVariant success, QVariant detectedPortBlocking);
 
     void quitAppCompleted(QVariant error);
+
+    void defaultHostChanged();
 
 private slots:
     void handleAboutToQuit();
@@ -261,6 +277,14 @@ private slots:
     void handleMdnsServiceResolved(MdnsPendingComputer* computer, QVector<QHostAddress>& addresses);
 
 private:
+    void loadHosts();
+
+    void clearHostsAndDiscovery();
+
+    void startDelayedFlushThread();
+
+    void stopDelayedFlushThread();
+
     void saveHosts();
 
     void saveHost(NvComputer* computer);
@@ -268,6 +292,8 @@ private:
     QHostAddress getBestGlobalAddressV6(QVector<QHostAddress>& addresses);
 
     void startPollingComputer(NvComputer* computer);
+
+    bool containsComputer(NvComputer* computer);
 
     StreamingPreferences* m_Prefs;
     int m_PollingRef;
@@ -283,4 +309,9 @@ private:
     QMutex m_DelayedFlushMutex; // Lock ordering: Must never be acquired while holding NvComputer lock
     QWaitCondition m_DelayedFlushCondition;
     bool m_NeedsDelayedFlush;
+    QString m_ProfileId;
+    QString m_DefaultHostUuid;
+    QThreadPool m_ThreadPool;
+    quint64 m_ProfileGeneration = 0;
+    std::atomic_bool m_Stopping{false};
 };

@@ -1,4 +1,5 @@
 #include "computermodel.h"
+#include "backend/profilemanager.h"
 
 #include <QThreadPool>
 
@@ -7,11 +8,28 @@ ComputerModel::ComputerModel(QObject* object)
 
 void ComputerModel::initialize(ComputerManager* computerManager)
 {
+    if (!computerManager) return;
     m_ComputerManager = computerManager;
     connect(m_ComputerManager, &ComputerManager::computerStateChanged,
             this, &ComputerModel::handleComputerStateChanged);
     connect(m_ComputerManager, &ComputerManager::pairingCompleted,
             this, &ComputerModel::handlePairingCompleted);
+    connect(m_ComputerManager, &ComputerManager::hostRemoved, this, [this](const QString& uuid) {
+        for (int row = 0; row < m_Computers.count(); ++row) {
+            if (uuidAt(row) == uuid) {
+                beginRemoveRows(QModelIndex(), row, row);
+                m_Computers.removeAt(row);
+                endRemoveRows();
+                return;
+            }
+        }
+    });
+    connect(ProfileManager::get(), &ProfileManager::activeProfileAboutToChange,
+            this, [this]() {
+        beginResetModel();
+        m_Computers.clear();
+        endResetModel();
+    });
 
     beginResetModel();
     m_Computers = m_ComputerManager->getComputers();
@@ -20,11 +38,9 @@ void ComputerModel::initialize(ComputerManager* computerManager)
 
 QVariant ComputerModel::data(const QModelIndex& index, int role) const
 {
-    if (!index.isValid()) {
+    if (!index.isValid() || index.row() < 0 || index.row() >= m_Computers.count()) {
         return QVariant();
     }
-
-    Q_ASSERT(index.row() < m_Computers.count());
 
     NvComputer* computer = m_Computers[index.row()];
     QReadLocker lock(&computer->lock);
@@ -32,6 +48,8 @@ QVariant ComputerModel::data(const QModelIndex& index, int role) const
     switch (role) {
     case NameRole:
         return computer->name;
+    case UuidRole:
+        return computer->uuid;
     case OnlineRole:
         return computer->state == NvComputer::CS_ONLINE;
     case PairedRole:
@@ -112,6 +130,7 @@ QHash<int, QByteArray> ComputerModel::roleNames() const
     QHash<int, QByteArray> names;
 
     names[NameRole] = "name";
+    names[UuidRole] = "uuid";
     names[OnlineRole] = "online";
     names[PairedRole] = "paired";
     names[BusyRole] = "busy";
@@ -125,12 +144,9 @@ QHash<int, QByteArray> ComputerModel::roleNames() const
 
 Session* ComputerModel::createSessionForCurrentGame(int computerIndex)
 {
-    Q_ASSERT(computerIndex < m_Computers.count());
+    if (computerIndex < 0 || computerIndex >= m_Computers.count()) return nullptr;
 
     NvComputer* computer = m_Computers[computerIndex];
-
-    // We must currently be streaming a game to use this function
-    Q_ASSERT(computer->currentGameId != 0);
 
     for (NvApp& app : computer->appList) {
         if (app.id == computer->currentGameId) {
@@ -138,44 +154,47 @@ Session* ComputerModel::createSessionForCurrentGame(int computerIndex)
         }
     }
 
-    // We have a current running app but it's not in our app list
-    Q_ASSERT(false);
     return nullptr;
 }
 
 void ComputerModel::deleteComputer(int computerIndex)
 {
-    Q_ASSERT(computerIndex < m_Computers.count());
+    if (computerIndex < 0 || computerIndex >= m_Computers.count()) {
+        return;
+    }
 
+    NvComputer* computer = m_Computers[computerIndex];
     beginRemoveRows(QModelIndex(), computerIndex, computerIndex);
-
-    // m_Computer[computerIndex] will be deleted by this call
-    m_ComputerManager->deleteHost(m_Computers[computerIndex]);
-
-    // Remove the now invalid item
     m_Computers.removeAt(computerIndex);
-
     endRemoveRows();
+
+    // Other models also remove this host when deleteHost emits hostRemoved.
+    m_ComputerManager->deleteHost(computer);
 }
 
 class DeferredWakeHostTask : public QRunnable
 {
 public:
     DeferredWakeHostTask(NvComputer* computer)
-        : m_Computer(computer) {}
+    {
+        QReadLocker lock(&computer->lock);
+        m_Computer = *computer;
+    }
 
     void run()
     {
-        m_Computer->wake();
+        m_Computer.wake();
     }
 
 private:
-    NvComputer* m_Computer;
+    NvComputer m_Computer;
 };
 
 void ComputerModel::wakeComputer(int computerIndex)
 {
-    Q_ASSERT(computerIndex < m_Computers.count());
+    if (computerIndex < 0 || computerIndex >= m_Computers.count()) {
+        return;
+    }
 
     DeferredWakeHostTask* wakeTask = new DeferredWakeHostTask(m_Computers[computerIndex]);
     QThreadPool::globalInstance()->start(wakeTask);
@@ -183,9 +202,23 @@ void ComputerModel::wakeComputer(int computerIndex)
 
 void ComputerModel::renameComputer(int computerIndex, QString name)
 {
-    Q_ASSERT(computerIndex < m_Computers.count());
+    if (computerIndex < 0 || computerIndex >= m_Computers.count()) {
+        return;
+    }
 
     m_ComputerManager->renameHost(m_Computers[computerIndex], name);
+}
+
+int ComputerModel::indexOfComputer(QString uuid) const
+{
+    for (int i = 0; i < m_Computers.count(); i++) {
+        QReadLocker lock(&m_Computers[i]->lock);
+        if (m_Computers[i]->uuid == uuid) {
+            return i;
+        }
+    }
+
+    return -1;
 }
 
 QString ComputerModel::generatePinString()
@@ -224,7 +257,9 @@ void ComputerModel::testConnectionForComputer(int)
 
 void ComputerModel::pairComputer(int computerIndex, QString pin)
 {
-    Q_ASSERT(computerIndex < m_Computers.count());
+    if (computerIndex < 0 || computerIndex >= m_Computers.count()) {
+        return;
+    }
 
     m_ComputerManager->pairHost(m_Computers[computerIndex], pin);
 }
@@ -247,7 +282,9 @@ void ComputerModel::handleComputerStateChanged(NvComputer* computer)
     else {
         // Let the view know that this specific computer changed
         int index = m_Computers.indexOf(computer);
-        emit dataChanged(createIndex(index, 0), createIndex(index, 0));
+        if (index >= 0) {
+            emit dataChanged(createIndex(index, 0), createIndex(index, 0));
+        }
     }
 }
 

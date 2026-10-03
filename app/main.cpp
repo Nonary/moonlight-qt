@@ -14,6 +14,7 @@
 #include <QElapsedTimer>
 #include <QTemporaryFile>
 #include <QRegularExpression>
+#include <memory>
 
 #ifdef Q_OS_UNIX
 #include <sys/socket.h>
@@ -52,6 +53,7 @@
 #include "gui/appmodel.h"
 #include "backend/autoupdatechecker.h"
 #include "backend/computermanager.h"
+#include "backend/profilemanager.h"
 #include "backend/systemproperties.h"
 #include "streaming/session.h"
 #include "settings/streamingpreferences.h"
@@ -858,6 +860,22 @@ int main(int argc, char *argv[])
 
     GlobalCommandLineParser parser;
     GlobalCommandLineParser::ParseResult commandLineParserResult = parser.parse(app.arguments());
+
+    ProfileManager* profileManager = ProfileManager::get();
+    if (!parser.getProfile().isEmpty()) {
+        QString profileError;
+        if (!profileManager->activateProfileByNameOrId(parser.getProfile(), &profileError)) {
+            QTextStream(stderr) << profileError << Qt::endl;
+            return 1;
+        }
+    }
+    else if (commandLineParserResult == GlobalCommandLineParser::NormalStartRequested) {
+        profileManager->activateAutoLoginProfile();
+    }
+    else {
+        profileManager->activateDefaultProfile();
+    }
+
     switch (commandLineParserResult) {
     case GlobalCommandLineParser::ListRequested:
         // Don't log to the console since it will jumble the command output
@@ -909,8 +927,12 @@ int main(int argc, char *argv[])
 #endif
     }
 
-    // Apply the initial translation based on user preference
-    StreamingPreferences::get()->retranslate();
+    // Apply the initial translation based on user preference if a profile was
+    // activated before QML startup. Otherwise, the profile picker will use the
+    // default language until the user selects a profile.
+    if (ProfileManager::hasActiveProfile()) {
+        StreamingPreferences::get()->retranslate();
+    }
 
     // Trickily declare the translation for dialog buttons
     QCoreApplication::translate("QPlatformTheme", "&Yes");
@@ -987,10 +1009,19 @@ int main(int argc, char *argv[])
     qmlRegisterType<ComputerModel>("ComputerModel", 1, 0, "ComputerModel");
     qmlRegisterType<AppModel>("AppModel", 1, 0, "AppModel");
     qmlRegisterUncreatableType<Session>("Session", 1, 0, "Session", "Session cannot be created from QML");
+    qmlRegisterSingletonType<ProfileManager>("ProfileManager", 1, 0,
+                                             "ProfileManager",
+                                             [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
+                                                 QQmlEngine::setObjectOwnership(ProfileManager::get(), QQmlEngine::CppOwnership);
+                                                 Q_UNUSED(qmlEngine);
+                                                 return ProfileManager::get();
+                                             });
     qmlRegisterSingletonType<ComputerManager>("ComputerManager", 1, 0,
                                               "ComputerManager",
                                               [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
-                                                  return new ComputerManager(StreamingPreferences::get(qmlEngine));
+                                                  auto manager = new ComputerManager(StreamingPreferences::get(qmlEngine));
+                                                  manager->setParent(qmlEngine);
+                                                  return manager;
                                               });
     qmlRegisterSingletonType<AutoUpdateChecker>("AutoUpdateChecker", 1, 0,
                                                 "AutoUpdateChecker",
@@ -1005,7 +1036,8 @@ int main(int argc, char *argv[])
     qmlRegisterSingletonType<SdlGamepadKeyNavigation>("SdlGamepadKeyNavigation", 1, 0,
                                                       "SdlGamepadKeyNavigation",
                                                       [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
-                                                          return new SdlGamepadKeyNavigation(StreamingPreferences::get(qmlEngine));
+                                                          Q_UNUSED(qmlEngine);
+                                                          return new SdlGamepadKeyNavigation(nullptr);
                                                       });
     qmlRegisterSingletonType<StreamingPreferences>("StreamingPreferences", 1, 0,
                                                    "StreamingPreferences",
@@ -1023,8 +1055,11 @@ int main(int argc, char *argv[])
                                                  return new NetworkBuffers();
                                              });
 
-    // Create the identity manager on the main thread
-    IdentityManager::get();
+    // Create the identity manager on the main thread if a profile is already
+    // active. Profile selection will create it when the user enters a profile.
+    if (ProfileManager::hasActiveProfile()) {
+        IdentityManager::get();
+    }
 
     // We require the Material theme
     QQuickStyle::setStyle("Material");
@@ -1049,10 +1084,11 @@ int main(int argc, char *argv[])
     QQmlApplicationEngine engine;
     QString initialView;
     bool hasGUI = true;
+    std::unique_ptr<ComputerManager> cliComputerManager;
 
     switch (commandLineParserResult) {
     case GlobalCommandLineParser::NormalStartRequested:
-        initialView = "qrc:/gui/PcView.qml";
+        initialView = "qrc:/gui/ProfileSelectionView.qml";
         break;
     case GlobalCommandLineParser::StreamRequested:
         {
@@ -1089,7 +1125,8 @@ int main(int argc, char *argv[])
             ListCommandLineParser listParser;
             listParser.parse(app.arguments());
             auto launcher = new CliListApps::Launcher(listParser.getHost(), listParser, &app);
-            launcher->execute(new ComputerManager(StreamingPreferences::get()));
+            cliComputerManager = std::make_unique<ComputerManager>(StreamingPreferences::get());
+            launcher->execute(cliComputerManager.get());
             hasGUI = false;
             break;
         }
@@ -1106,6 +1143,15 @@ int main(int argc, char *argv[])
     }
 
     int err = app.exec();
+
+    // Persist QML editors while their profile is still active. Suspending
+    // requests lets artwork workers finish quickly during view destruction.
+    profileManager->suspendRequests();
+    qDeleteAll(engine.rootObjects());
+
+    // Drain all profile workers, including CLI artwork, before freeing hosts
+    // or restoring log handlers. Requests remain suspended during shutdown.
+    profileManager->deactivateProfile();
 
     // Give worker tasks time to properly exit. Fixes PendingQuitTask
     // sometimes freezing and blocking process exit.

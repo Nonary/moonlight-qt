@@ -40,6 +40,9 @@ public:
     // Stops after the current network transfer or format; finished results stay.
     Q_INVOKABLE void cancel();
 
+    // Drain the worker before replacing the client identity on a profile change.
+    void stop();
+
 signals:
     void changed();
 
@@ -50,4 +53,5 @@ private:
     QVariantList m_Results;
     QPointer<QThread> m_Worker;
     std::shared_ptr<std::atomic<bool>> m_Cancel;
+    quint64 m_Generation = 0;
 };

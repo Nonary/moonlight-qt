@@ -10,6 +10,7 @@ class ComputerModel : public QAbstractListModel
     enum Roles
     {
         NameRole = Qt::UserRole,
+        UuidRole,
         OnlineRole,
         PairedRole,
         BusyRole,
@@ -45,6 +46,8 @@ public:
 
     Q_INVOKABLE QString uuidAt(int computerIndex) const;
 
+    Q_INVOKABLE int indexOfComputer(QString uuid) const;
+
     Q_INVOKABLE Session* createSessionForCurrentGame(int computerIndex);
 
 signals:
@@ -58,5 +61,5 @@ private slots:
 
 private:
     QVector<NvComputer*> m_Computers;
-    ComputerManager* m_ComputerManager;
+    ComputerManager* m_ComputerManager = nullptr;
 };

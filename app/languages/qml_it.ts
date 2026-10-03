@@ -216,6 +216,18 @@
 <context>
     <name>PcView</name>
     <message>
+        <source>Default</source>
+        <translation>Predefinito</translation>
+    </message>
+    <message>
+        <source>Set as Default PC</source>
+        <translation>Imposta come PC predefinito</translation>
+    </message>
+    <message>
+        <source>Remove Default PC</source>
+        <translation>Rimuovi PC predefinito</translation>
+    </message>
+    <message>
         <location filename="../gui/PcView.qml" line="21"/>
         <source>Computers</source>
         <translation>Lista Computer</translation>
@@ -1273,6 +1285,14 @@
 <context>
     <name>main</name>
     <message>
+        <source>Profiles</source>
+        <translation>Profili</translation>
+    </message>
+    <message>
+        <source>Use '%1' as the default profile and open the default profile automatically next time?</source>
+        <translation>Usare '%1' come profilo predefinito e aprirlo automaticamente al prossimo avvio?</translation>
+    </message>
+    <message>
         <location filename="../gui/main.qml" line="444"/>
         <source>Settings</source>
         <translation>Impostazioni</translation>
@@ -1351,6 +1371,81 @@
         <location filename="../gui/main.qml" line="517"/>
         <source>Enter the IP address of your host PC:</source>
         <translation>Inserisci l&apos;indirizzo IP del tuo PC host:</translation>
+    </message>
+</context>
+<context>
+    <name>ProfileSelectionView</name>
+    <message>
+        <source>Profiles</source>
+        <translation>Profili</translation>
+    </message>
+    <message>
+        <source>Unable to activate this profile.</source>
+        <translation>Impossibile attivare questo profilo.</translation>
+    </message>
+    <message>
+        <source>Choose a profile</source>
+        <translation>Scegli un profilo</translation>
+    </message>
+    <message>
+        <source>Add Profile</source>
+        <translation>Aggiungi profilo</translation>
+    </message>
+    <message>
+        <source>Current</source>
+        <translation>Attuale</translation>
+    </message>
+    <message>
+        <source>Default / Auto-login</source>
+        <translation>Predefinito / Accesso automatico</translation>
+    </message>
+    <message>
+        <source>Default</source>
+        <translation>Predefinito</translation>
+    </message>
+    <message>
+        <source>Rename Profile</source>
+        <translation>Rinomina profilo</translation>
+    </message>
+    <message>
+        <source>Default Profile</source>
+        <translation>Profilo predefinito</translation>
+    </message>
+    <message>
+        <source>Set as Default</source>
+        <translation>Imposta come predefinito</translation>
+    </message>
+    <message>
+        <source>Delete Profile</source>
+        <translation>Elimina profilo</translation>
+    </message>
+    <message>
+        <source>Disable Default Auto-login</source>
+        <translation>Disabilita accesso automatico</translation>
+    </message>
+    <message>
+        <source>Enable Default Auto-login</source>
+        <translation>Abilita accesso automatico</translation>
+    </message>
+    <message>
+        <source>Profile names must be unique and cannot be empty.</source>
+        <translation>I nomi dei profili devono essere univoci e non possono essere vuoti.</translation>
+    </message>
+    <message>
+        <source>New profile name:</source>
+        <translation>Nome del nuovo profilo:</translation>
+    </message>
+    <message>
+        <source>Profile name:</source>
+        <translation>Nome del profilo:</translation>
+    </message>
+    <message>
+        <source>Delete profile '%1'? This removes its paired hosts, settings, and identity.</source>
+        <translation>Eliminare il profilo '%1'? Verranno rimossi i PC associati, le impostazioni e l’identità.</translation>
+    </message>
+    <message>
+        <source>Unable to delete this profile.</source>
+        <translation>Impossibile eliminare questo profilo.</translation>
     </message>
 </context>
 </TS>

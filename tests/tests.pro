@@ -7,6 +7,8 @@ contains(CONFIG, tests) {
     SUBDIRS += vrr
     SUBDIRS += haptics
     SUBDIRS += pyrowave
+    SUBDIRS += profiles
+    SUBDIRS += navigation
 } else {
     message(VRR tests are disabled; rerun qmake with CONFIG+=tests)
 }

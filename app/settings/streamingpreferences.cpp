@@ -1,4 +1,5 @@
 #include "streamingpreferences.h"
+#include "backend/profilemanager.h"
 #include "streaming/video/pyrowave/pyrowavebitrate.h"
 #include "utils.h"
 #include "streaming/vrrratepolicy.h"
@@ -119,7 +120,22 @@ StreamingPreferences* StreamingPreferences::get(QQmlEngine *qmlEngine)
 
 void StreamingPreferences::reload()
 {
-    QSettings settings;
+    // The profile picker can create this singleton before a profile is chosen.
+    // An empty snapshot initializes the same defaults without touching storage.
+    QVariantMap settings;
+    if (ProfileManager::hasActiveProfile()) {
+        QSettings storedSettings;
+        ProfileManager::beginProfileSettings(storedSettings);
+
+        // Native VRR always permits tearing. Remove retired timing selectors
+        // only from the selected profile.
+        storedSettings.remove(QStringLiteral("allowvrrtearing"));
+        storedSettings.remove(QStringLiteral("vrrdiagnosticmode"));
+
+        for (const QString& key : storedSettings.childKeys()) {
+            settings.insert(key, storedSettings.value(key));
+        }
+    }
 
     int defaultVer = settings.value(SER_DEFAULTVER, 0).toInt();
 
@@ -146,9 +162,6 @@ void StreamingPreferences::reload()
     autoAdjustBitrate = settings.value(SER_AUTOADJUSTBITRATE, true).toBool();
     enableVsync = settings.value(SER_VSYNC, true).toBool();
     enableVrr = settings.value(SER_ENABLEVRR, false).toBool();
-    // VRR adaptive presentation always requires tearing permission. Remove
-    // the retired override so stale profiles cannot disable native VRR.
-    settings.remove(QStringLiteral("allowvrrtearing"));
     vrrLatencyMode = VLM_BALANCED;
     if (settings.contains(SER_VRRLATENCYMODE)) {
         bool validMode = false;
@@ -163,7 +176,6 @@ void StreamingPreferences::reload()
     }
     smoothVrrFrameTiming = settings.value(SER_SMOOTHVRRFRAMETIMING, true).toBool();
     traceVrrFrames = settings.value(SER_TRACEVRRFRAMES, false).toBool();
-    settings.remove("vrrdiagnosticmode"); // Retired, unpublished timing comparison selector.
     gameOptimizations = settings.value(SER_GAMEOPTS, true).toBool();
     playAudioOnHost = settings.value(SER_HOSTAUDIO, false).toBool();
     multiController = settings.value(SER_MULTICONT, true).toBool();
@@ -355,7 +367,12 @@ QString StreamingPreferences::getSuffixFromLanguage(StreamingPreferences::Langua
 
 void StreamingPreferences::save()
 {
+    if (!ProfileManager::hasActiveProfile()) {
+        return;
+    }
+
     QSettings settings;
+    ProfileManager::beginProfileSettings(settings);
 
     settings.setValue(SER_WIDTH, width);
     settings.setValue(SER_HEIGHT, height);

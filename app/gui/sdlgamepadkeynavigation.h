@@ -27,6 +27,8 @@ public:
     Q_INVOKABLE int getConnectedGamepads();
 
 private:
+    bool shouldSwapFaceButtons() const;
+
     void sendKey(QEvent::Type type, Qt::Key key, Qt::KeyboardModifiers modifiers = Qt::NoModifier);
 
     void updateTimerState();
