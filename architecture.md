@@ -1,5 +1,23 @@
 # Streaming, VRR, and timing architecture
 
+## Client HDR peak luminance
+
+Windows HDR sessions collect the selected display's peak luminance before
+starting the connection worker. The selected Qt screen must have a unique native
+SDL display origin, and the hidden probe must resolve to that same display;
+screen sizes may differ under DPI scaling. The collector prefers the selected
+display's WCS Extended ICC/MHC2 default, then independent DXGI luminance.
+Unavailable, ambiguous, or malformed profile data falls back to DXGI. Monitor
+registry indices are not used to infer profile identity.
+
+The GUI thread snapshots the ephemeral `ClientHdrPeakVersion=1` capability under
+the host read lock. Host polling clears it on identity mismatch or offline
+transition. The worker receives that immutable gate and normalized values.
+`launch` and `resume` send only `clientHdrPeakCalibrated` and `clientHdrPeakEdid`
+integer nits when the capability matches and 10-bit HDR is supported. Display
+identifiers and profile paths stay local. This extension requires the matching
+Vibepollo host change; older hosts keep their existing requests.
+
 This is the persistent technical orientation for this fork. Read it at the start
 of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;

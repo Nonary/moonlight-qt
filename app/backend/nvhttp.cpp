@@ -1,4 +1,5 @@
 #include "nvcomputer.h"
+#include "clientdisplaycapabilities.h"
 #include <Limelight.h>
 
 #include <QDebug>
@@ -228,12 +229,22 @@ NvHTTP::startApp(QString verb,
                  int playStationGamepadMask,
                  bool persistGameControllersOnDisconnect,
                  bool clientVrrRequested,
+                 bool sendClientHdrPeak,
+                 int clientHdrPeakCalibratedNits,
+                 int clientHdrPeakEdidNits,
                  QString& rtspSessionUrl)
 {
     int riKeyId;
 
     memcpy(&riKeyId, streamConfig->remoteInputAesIv, sizeof(riKeyId));
     riKeyId = qFromBigEndian(riKeyId);
+
+    const QString clientHdrPeakArguments = ClientDisplayCapabilities::hdrPeakQueryArguments(
+        verb,
+        sendClientHdrPeak ? NvComputer::kClientHdrPeakVersion : 0,
+        (streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) != 0,
+        clientHdrPeakCalibratedNits,
+        clientHdrPeakEdidNits);
 
     QString response =
             openConnectionToString(m_BaseUrlHttps,
@@ -252,6 +263,7 @@ NvHTTP::startApp(QString verb,
                                    ((streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) ?
                                        "&hdrMode=1&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0" :
                                         "")+
+                                   clientHdrPeakArguments+
                                    "&localAudioPlayMode="+QString::number(localAudio ? 1 : 0)+
                                    "&surroundAudioInfo="+QString::number(SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(streamConfig->audioConfiguration))+
                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+

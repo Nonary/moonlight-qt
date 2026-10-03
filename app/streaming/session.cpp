@@ -23,6 +23,7 @@
 #endif
 
 #ifdef Q_OS_WIN32
+#include "backend/clientdisplaycapabilities_win.h"
 // Scaling the icon down on Win32 looks dreadful, so render at lower res
 #define ICON_SIZE 32
 #else
@@ -1826,6 +1827,9 @@ bool Session::startConnectionAsync()
                       m_InputHandler->getAttachedPlayStationGamepadMask(),
                       !m_Preferences->multiController,
                       m_PresentationSettings.enableVrr,
+                      m_SendClientHdrPeak,
+                      m_ClientHdrPeakCalibratedNits,
+                      m_ClientHdrPeakEdidNits,
                       rtspSessionUrl);
     } catch (const GfeHttpResponseException& e) {
         emit displayLaunchError(tr("Host returned error: %1").arg(e.toQString()));
@@ -1985,6 +1989,16 @@ void Session::start()
     // We're now active
     s_ActiveSession = this;
 
+    // Freeze the ephemeral host capability before handing off to the connection
+    // thread. The display collector and request must use the same snapshot.
+    {
+        QReadLocker lock(&m_Computer->lock);
+        m_SendClientHdrPeak =
+            m_Computer->clientHdrPeakVersion == NvComputer::kClientHdrPeakVersion;
+    }
+#ifdef Q_OS_WIN32
+    prepareClientHdrPeakReport();
+#endif
     if (m_Preferences->traceVrrFrames) {
         Utils::flushLogs();
         const QJsonObject metadata{
@@ -2021,6 +2035,52 @@ void Session::start()
     QObject::connect(thread, &QThread::finished, thread, &QThread::deleteLater);
     thread->start();
 }
+
+#ifdef Q_OS_WIN32
+void Session::prepareClientHdrPeakReport()
+{
+    m_ClientHdrPeakCalibratedNits = 0;
+    m_ClientHdrPeakEdidNits = 0;
+
+    if (!m_Preferences->enableHdr ||
+            !(m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) ||
+            !m_SendClientHdrPeak ||
+            !m_QtWindow || !m_QtWindow->screen()) {
+        return;
+    }
+
+    SDL_Window* probeWindow = StreamUtils::createTestWindow();
+    if (!probeWindow) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Unable to create HDR display probe window");
+        return;
+    }
+
+    const QRect screenGeometry = m_QtWindow->screen()->geometry();
+    SDL_SetWindowPosition(probeWindow, screenGeometry.left(), screenGeometry.top());
+    const auto capabilities = ClientDisplayCapabilitiesWin::collectClientDisplayCapabilities(
+        m_QtWindow->screen(),
+        reinterpret_cast<quintptr>(probeWindow));
+
+    if (capabilities.has_value()) {
+        if (capabilities->calibrated.has_value()) {
+            m_ClientHdrPeakCalibratedNits = ClientDisplayCapabilities::normalizePeakLuminance(
+                capabilities->calibrated->peakLuminanceNits).value_or(0);
+        }
+        if (capabilities->edid.has_value()) {
+            m_ClientHdrPeakEdidNits = ClientDisplayCapabilities::normalizePeakLuminance(
+                capabilities->edid->peakLuminanceNits).value_or(0);
+        }
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "HDR display peak report: ICC/MHC2=%d nits, DXGI/EDID=%d nits",
+                    m_ClientHdrPeakCalibratedNits,
+                    m_ClientHdrPeakEdidNits);
+    }
+
+    SDL_DestroyWindow(probeWindow);
+}
+#endif
 
 void Session::interrupt()
 {

@@ -45,10 +45,15 @@ private:
         // Ensure the machine that responded is the one we intended to contact
         if (m_Computer->uuid != newState.uuid) {
             qInfo() << "Found unexpected PC" << newState.name << "looking for" << m_Computer->name;
+            QWriteLocker lock(&m_Computer->lock);
+            if (m_Computer->clientHdrPeakVersion != 0) {
+                m_Computer->clientHdrPeakVersion = 0;
+                changed = true;
+            }
             return false;
         }
 
-        changed = m_Computer->update(newState);
+        changed = m_Computer->update(newState) || changed;
         return true;
     }
 
@@ -68,7 +73,7 @@ private:
         }
 
         QWriteLocker lock(&m_Computer->lock);
-        changed = m_Computer->updateAppList(appList);
+        changed = m_Computer->updateAppList(appList) || changed;
         return true;
     }
 
@@ -112,12 +117,17 @@ private:
             }
 
             // Check if we failed after all retry attempts
-            // Note: we don't need to acquire the read lock here,
-            // because we're on the writing thread.
-            if (!online && m_Computer->state != NvComputer::CS_OFFLINE) {
-                qInfo() << m_Computer->name << "is now offline";
-                m_Computer->state = NvComputer::CS_OFFLINE;
-                stateChanged = true;
+            if (!online) {
+                QWriteLocker lock(&m_Computer->lock);
+                if (m_Computer->state != NvComputer::CS_OFFLINE) {
+                    qInfo() << m_Computer->name << "is now offline";
+                    m_Computer->state = NvComputer::CS_OFFLINE;
+                    stateChanged = true;
+                }
+                if (m_Computer->clientHdrPeakVersion != 0) {
+                    m_Computer->clientHdrPeakVersion = 0;
+                    stateChanged = true;
+                }
             }
 
             // Grab the applist if it's empty or it's been long enough that we need to refresh

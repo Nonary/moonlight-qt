@@ -4,7 +4,9 @@ TEMPLATE = subdirs
 CONFIG += ordered
 
 contains(CONFIG, tests) {
-    SUBDIRS += vrr
+    SUBDIRS += vrr hdr
+
+    hdr.file = $$PWD/hdr/hdr.pro
     SUBDIRS += haptics
     SUBDIRS += pyrowave
 } else {
