@@ -15,16 +15,20 @@ Flickable {
     id: settingsPage
     ComputerModel {
         id: calibrationHosts
-        Component.onCompleted: initialize(ComputerManager)
+        Component.onCompleted: if (!settingsPage.gameMode) initialize(ComputerManager)
     }
     objectName: qsTr("Settings")
+    property var preferences: StreamingPreferences
+    property bool gameMode: false
+    property bool manageLifecycle: true
+    readonly property bool singleColumn: width < 1100
 
     signal languageChanged()
 
     boundsBehavior: Flickable.OvershootBounds
 
-    contentWidth: settingsColumn1.width > settingsColumn2.width ? settingsColumn1.width : settingsColumn2.width
-    contentHeight: settingsColumn1.height > settingsColumn2.height ? settingsColumn1.height : settingsColumn2.height
+    contentWidth: width
+    contentHeight: singleColumn ? settingsColumn1.height + settingsColumn2.height : Math.max(settingsColumn1.height, settingsColumn2.height)
 
     ScrollBar.vertical: ScrollBar {
         anchors {
@@ -76,34 +80,37 @@ Flickable {
         }
     }
 
-    StackView.onActivated: {
+    function activate() {
         // This enables Tab and BackTab based navigation rather than arrow keys.
         // It is required to shift focus between controls on the settings page.
         SdlGamepadKeyNavigation.setUiNavMode(true)
 
         // Highlight the first item if a gamepad is connected
         if (SdlGamepadKeyNavigation.getConnectedGamepads() > 0) {
-            resolutionComboBox.forceActiveFocus(Qt.TabFocus)
+            resolutionComboBox.forceActiveFocus(Qt.TabFocusReason)
         }
     }
 
-    StackView.onDeactivating: {
+    function deactivate() {
         SdlGamepadKeyNavigation.setUiNavMode(false)
 
         // Save the prefs so the Session can observe the changes
-        StreamingPreferences.save()
+        if (!gameMode) preferences.save()
     }
+
+    StackView.onActivated: if (manageLifecycle) activate()
+    StackView.onDeactivating: if (manageLifecycle) deactivate()
 
     Component.onDestruction: {
         // Also save preferences on destruction, since we won't get a
         // deactivating callback if the user just closes Moonlight
-        StreamingPreferences.save()
+        if (!gameMode) preferences.save()
     }
 
     Column {
         padding: 10
         id: settingsColumn1
-        width: settingsPage.width / 2
+        width: settingsPage.singleColumn ? settingsPage.width : settingsPage.width / 2
         spacing: 15
 
         GroupBox {
@@ -206,8 +213,8 @@ Flickable {
 
                             // load the saved width/height, and iterate through the ComboBox until a match is found
                             // and set it to that index.
-                            var saved_width = StreamingPreferences.width
-                            var saved_height = StreamingPreferences.height
+                            var saved_width = preferences.width
+                            var saved_height = preferences.height
                             var index_set = false
                             for (var i = 0; i < resolutionListModel.count; i++) {
                                 var el_width = parseInt(resolutionListModel.get(i).video_width);
@@ -223,9 +230,9 @@ Flickable {
                             if (!index_set) {
                                 // We did not find a match. This must be a custom resolution.
                                 resolutionListModel.append({
-                                                               "text": qsTr("Custom")+" ("+StreamingPreferences.width+"x"+StreamingPreferences.height+")",
-                                                               "video_width": ""+StreamingPreferences.width,
-                                                               "video_height": ""+StreamingPreferences.height,
+                                                               "text": qsTr("Custom")+" ("+preferences.width+"x"+preferences.height+")",
+                                                               "video_width": ""+preferences.width,
+                                                               "video_height": ""+preferences.height,
                                                                "is_custom": true
                                                            })
                                 currentIndex = resolutionListModel.count - 1
@@ -284,13 +291,13 @@ Flickable {
                             var selectedHeight = parseInt(resolutionListModel.get(currentIndex).video_height)
 
                             // Only modify the bitrate if the values actually changed
-                            if (StreamingPreferences.width !== selectedWidth || StreamingPreferences.height !== selectedHeight) {
-                                StreamingPreferences.width = selectedWidth
-                                StreamingPreferences.height = selectedHeight
+                            if (preferences.width !== selectedWidth || preferences.height !== selectedHeight) {
+                                preferences.width = selectedWidth
+                                preferences.height = selectedHeight
 
-                                if (StreamingPreferences.autoAdjustBitrate) {
-                                    StreamingPreferences.bitrateKbps = slider.defaultBitrate();
-                                    slider.value = StreamingPreferences.bitrateKbps
+                                if (preferences.autoAdjustBitrate) {
+                                    preferences.bitrateKbps = slider.defaultBitrate();
+                                    slider.value = preferences.bitrateKbps
                                 }
                             }
 
@@ -449,12 +456,12 @@ Flickable {
 
                         function updateBitrateForSelection() {
                             var selectedFps = parseInt(model.get(fpsComboBox.currentIndex).video_fps)
-                            var fpsChanged = StreamingPreferences.fps !== selectedFps
-                            StreamingPreferences.fps = selectedFps
+                            var fpsChanged = preferences.fps !== selectedFps
+                            preferences.fps = selectedFps
 
-                            if (fpsChanged && StreamingPreferences.autoAdjustBitrate) {
-                                StreamingPreferences.bitrateKbps = slider.defaultBitrate();
-                                slider.value = StreamingPreferences.bitrateKbps
+                            if (fpsChanged && preferences.autoAdjustBitrate) {
+                                preferences.bitrateKbps = slider.defaultBitrate();
+                                slider.value = preferences.bitrateKbps
                             }
 
                             lastIndexValue = currentIndex
@@ -532,7 +539,11 @@ Flickable {
                                         id: fpsField
                                         maximumLength: 4
                                         inputMethodHints: Qt.ImhDigitsOnly
-                                        placeholderText: fpsListModel.get(fpsComboBox.currentIndex).video_fps
+                                        placeholderText: {
+                                            var entry = fpsComboBox.currentIndex >= 0 && fpsComboBox.currentIndex < fpsListModel.count
+                                                ? fpsListModel.get(fpsComboBox.currentIndex) : null
+                                            return entry ? entry.video_fps : preferences.fps
+                                        }
                                         validator: IntValidator{bottom:10; top:9999}
                                         focus: true
 
@@ -583,7 +594,7 @@ Flickable {
                         }
 
                         function reinitialize() {
-                            var choices = StreamingPreferences.getFpsChoices(getRefreshRates())
+                            var choices = preferences.getFpsChoices(getRefreshRates())
                             model.clear()
                             var hasCustomChoice = false
 
@@ -597,7 +608,7 @@ Flickable {
                                              })
                             }
 
-                            var saved_fps = StreamingPreferences.fps
+                            var saved_fps = preferences.fps
                             var found = false
                             for (var i = 0; i < model.count; i++) {
                                 var el_fps = parseInt(model.get(i).video_fps);
@@ -632,8 +643,8 @@ Flickable {
                         Component.onCompleted: {
                             reinitialize()
                             languageChanged.connect(reinitialize)
-                            StreamingPreferences.enableVsyncChanged.connect(reinitialize)
-                            StreamingPreferences.enableVrrChanged.connect(reinitialize)
+                            preferences.enableVsyncChanged.connect(reinitialize)
+                            preferences.enableVrrChanged.connect(reinitialize)
                         }
 
                         model: ListModel {
@@ -641,6 +652,8 @@ Flickable {
                         }
 
                         id: fpsComboBox
+
+                        objectName: "fpsComboBox"
                         maximumWidth: parent.width / 2
                         textRole: "text"
                         // ::onActivated must be used, as it only listens for when the index is changed by a human
@@ -673,7 +686,7 @@ Flickable {
                             })
                         }
 
-                        var saved_vcc = StreamingPreferences.videoCodecConfig
+                        var saved_vcc = preferences.videoCodecConfig
 
                         // Default to Automatic (relevant if HDR is enabled,
                         // where we will match none of the codecs in the list)
@@ -687,7 +700,7 @@ Flickable {
                             }
                         }
 
-                        activated(currentIndex)
+                        recalculateWidth()
                     }
 
                     id: codecComboBox
@@ -715,17 +728,17 @@ Flickable {
                     onActivated : {
                         if (enabled) {
                             var wasPyroWave = slider.pyroWave
-                            StreamingPreferences.videoCodecConfig = codecListModel.get(currentIndex).val
+                            preferences.videoCodecConfig = codecListModel.get(currentIndex).val
 
                             // PyroWave's useful bitrates are an order of magnitude above
                             // the other codecs', so switching in or out resets a default.
-                            if (slider.pyroWave !== wasPyroWave && StreamingPreferences.autoAdjustBitrate) {
-                                StreamingPreferences.bitrateKbps = slider.defaultBitrate()
-                                slider.value = StreamingPreferences.bitrateKbps
+                            if (slider.pyroWave !== wasPyroWave && preferences.autoAdjustBitrate) {
+                                preferences.bitrateKbps = slider.defaultBitrate()
+                                slider.value = preferences.bitrateKbps
                             }
-                            else if (StreamingPreferences.bitrateKbps > slider.to) {
-                                StreamingPreferences.bitrateKbps = slider.to
-                                slider.value = StreamingPreferences.bitrateKbps
+                            else if (preferences.bitrateKbps > slider.to) {
+                                preferences.bitrateKbps = slider.to
+                                slider.value = preferences.bitrateKbps
                             }
                         }
                     }
@@ -742,14 +755,14 @@ Flickable {
                     text: qsTr("Enable YUV 4:4:4")
                     font.pointSize: 12
 
-                    checked: StreamingPreferences.enableYUV444
-                    onCheckedChanged: {
+                    checked: preferences.enableYUV444
+                    onToggled: {
                         // This is called on init, so only reset to default bitrate when checked state changes.
-                        if (StreamingPreferences.enableYUV444 != checked) {
-                            StreamingPreferences.enableYUV444 = checked
-                            if (StreamingPreferences.autoAdjustBitrate) {
-                                StreamingPreferences.bitrateKbps = slider.defaultBitrate();
-                                slider.value = StreamingPreferences.bitrateKbps
+                        if (preferences.enableYUV444 != checked) {
+                            preferences.enableYUV444 = checked
+                            if (preferences.autoAdjustBitrate) {
+                                preferences.bitrateKbps = slider.defaultBitrate();
+                                slider.value = preferences.bitrateKbps
                             }
                         }
                     }
@@ -785,40 +798,31 @@ Flickable {
 
                     Slider {
                         id: slider
+                        objectName: "videoBitrateSlider"
 
-                        readonly property bool pyroWave: StreamingPreferences.videoCodecConfig === StreamingPreferences.VCC_FORCE_PYROWAVE
+                        readonly property bool pyroWave: preferences.videoCodecConfig === StreamingPreferences.VCC_FORCE_PYROWAVE
 
                         // PyroWave needs several hundred Mbps, up to multi-gigabit LANs
                         function defaultBitrate() {
-                            if (pyroWave) {
-                                return StreamingPreferences.getDefaultPyroWaveBitrate(StreamingPreferences.width,
-                                                                                      StreamingPreferences.height,
-                                                                                      StreamingPreferences.fps,
-                                                                                      StreamingPreferences.enableYUV444,
-                                                                                      StreamingPreferences.enableHdr)
-                            }
-                            return StreamingPreferences.getDefaultBitrate(StreamingPreferences.width,
-                                                                          StreamingPreferences.height,
-                                                                          StreamingPreferences.fps,
-                                                                          StreamingPreferences.enableYUV444)
+                            return preferences.getEffectiveDefaultBitrate()
                         }
 
-                        value: StreamingPreferences.bitrateKbps
+                        value: preferences.bitrateKbps
 
                         stepSize: pyroWave ? 5000 : 500
                         from : pyroWave ? 5000 : 500
-                        to: pyroWave ? 3000000 : (StreamingPreferences.unlockBitrate ? 500000 : 150000)
+                        to: pyroWave ? 3000000 : (preferences.unlockBitrate ? 500000 : 150000)
 
                         snapMode: "SnapOnRelease"
                         width: Math.min(bitrateDesc.implicitWidth, parent.width - (resetBitrateButton.visible ? resetBitrateButton.width + parent.spacing : 0))
 
                         onValueChanged: {
                             bitrateTitle.text = qsTr("Video bitrate: %1 Mbps").arg(value / 1000.0)
-                            StreamingPreferences.bitrateKbps = value
                         }
 
                         onMoved: {
-                            StreamingPreferences.autoAdjustBitrate = false
+                            preferences.bitrateKbps = value
+                            preferences.autoAdjustBitrate = false
                         }
 
                         Component.onCompleted: {
@@ -830,11 +834,11 @@ Flickable {
                     Button {
                         id: resetBitrateButton
                         text: qsTr("Use Default (%1 Mbps)").arg(slider.defaultBitrate() / 1000.0)
-                        visible: StreamingPreferences.bitrateKbps !== slider.defaultBitrate()
+                        visible: !preferences.autoAdjustBitrate || preferences.bitrateKbps !== slider.defaultBitrate()
                         onClicked: {
                             var defaultBitrate = slider.defaultBitrate()
-                            StreamingPreferences.bitrateKbps = defaultBitrate
-                            StreamingPreferences.autoAdjustBitrate = true
+                            preferences.bitrateKbps = defaultBitrate
+                            preferences.autoAdjustBitrate = true
                             slider.value = defaultBitrate
                         }
                     }
@@ -843,9 +847,9 @@ Flickable {
                 Column {
                     width: parent.width
                     spacing: 5
-                    visible: slider.pyroWave && (Qt.platform.os === "linux" || Qt.platform.os === "windows")
+                    visible: !gameMode && slider.pyroWave && (Qt.platform.os === "linux" || Qt.platform.os === "windows")
 
-                    Component.onCompleted: NetworkBuffers.refresh()
+                    Component.onCompleted: if (!gameMode) NetworkBuffers.refresh()
 
                     Label {
                         width: parent.width
@@ -896,7 +900,7 @@ Flickable {
                 Column {
                     width: parent.width
                     spacing: 5
-                    visible: SystemProperties.hasPyroWave && slider.pyroWave
+                    visible: !gameMode && SystemProperties.hasPyroWave && slider.pyroWave
 
                     ComboBox {
                         id: calibrationHost
@@ -910,7 +914,7 @@ Flickable {
                         text: qsTr("Calibrate PyroWave")
                         enabled: !PyroWaveCalibrator.running && calibrationHost.currentIndex >= 0
                         onClicked: {
-                            calibrationDialog.testFps = StreamingPreferences.fps
+                            calibrationDialog.testFps = preferences.fps
                             calibrationDialog.open()
                             // Each test frame is drawn at this screen's size, as a stream would be
                             PyroWaveCalibrator.start(ComputerManager,
@@ -1025,21 +1029,21 @@ Flickable {
                     }
 
                     function applyChoice(option) {
-                        if (!canApply(option)) return
-                        StreamingPreferences.videoCodecConfig = StreamingPreferences.VCC_FORCE_PYROWAVE
+                        if (gameMode || !canApply(option)) return
+                        preferences.videoCodecConfig = StreamingPreferences.VCC_FORCE_PYROWAVE
                         for (var codecIndex = 0; codecIndex < codecListModel.count; codecIndex++) {
                             if (codecListModel.get(codecIndex).val === StreamingPreferences.VCC_FORCE_PYROWAVE) {
                                 codecComboBox.currentIndex = codecIndex
                                 break
                             }
                         }
-                        StreamingPreferences.width = option.width
-                        StreamingPreferences.height = option.height
-                        StreamingPreferences.enableYUV444 = option.chroma444
-                        StreamingPreferences.enableHdr = option.hdr
-                        StreamingPreferences.bitrateKbps = option.bitrateKbps
-                        StreamingPreferences.autoAdjustBitrate = false
-                        slider.value = StreamingPreferences.bitrateKbps
+                        preferences.width = option.width
+                        preferences.height = option.height
+                        preferences.enableYUV444 = option.chroma444
+                        preferences.enableHdr = option.hdr
+                        preferences.bitrateKbps = option.bitrateKbps
+                        preferences.autoAdjustBitrate = false
+                        slider.value = preferences.bitrateKbps
 
                         var found = false
                         for (var i = 0; i < resolutionListModel.count; i++) {
@@ -1062,7 +1066,7 @@ Flickable {
                             resolutionComboBox.currentIndex = resolutionListModel.count - 1
                             resolutionComboBox.lastIndexValue = resolutionComboBox.currentIndex
                         }
-                        StreamingPreferences.save()
+                        preferences.save()
                         close()
                     }
 
@@ -1246,7 +1250,7 @@ Flickable {
                         // Set the recommended option based on the OS
                         for (var i = 0; i < model.count; i++) {
                             var thisWm = model.get(i).val;
-                            if (thisWm === StreamingPreferences.recommendedFullScreenMode) {
+                            if (thisWm === preferences.recommendedFullScreenMode) {
                                 model.get(i).text += " " + qsTr("(Recommended)")
                                 model.move(i, 0, 1)
                                 break
@@ -1271,7 +1275,7 @@ Flickable {
                         // saved window-mode preference is never overwritten.
                         var savedWm = vrrForced ?
                                           StreamingPreferences.WM_FULLSCREEN_DESKTOP :
-                                          StreamingPreferences.windowMode
+                                          preferences.windowMode
                         for (var i = 0; i < model.count; i++) {
                              var thisWm = model.get(i).val;
                              if (savedWm === thisWm) {
@@ -1280,12 +1284,7 @@ Flickable {
                              }
                         }
 
-                        if (!vrrForced) {
-                            activated(currentIndex)
-                        }
-
-                        // VRR skips activation to preserve the saved mode, but
-                        // the disabled control still needs its text measured.
+                        // Refresh the disabled control without changing the saved mode.
                         recalculateWidth()
                     }
 
@@ -1295,14 +1294,14 @@ Flickable {
                     }
 
                     id: windowModeComboBox
-                    property bool vrrForced: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                    property bool vrrForced: preferences.enableVsync && preferences.enableVrr
                     onVrrForcedChanged: reinitialize()
                     visible: SystemProperties.hasDesktopEnvironment
                     enabled: !SystemProperties.rendererAlwaysFullScreen && !vrrForced
                     hoverEnabled: true
                     textRole: "text"
                     onActivated: {
-                        StreamingPreferences.windowMode = model.get(currentIndex).val
+                        preferences.windowMode = model.get(currentIndex).val
                     }
 
                     ToolTip.delay: 1000
@@ -1320,12 +1319,13 @@ Flickable {
 
                     CheckBox {
                         id: vsyncCheck
+                        objectName: "vsyncCheck"
                         hoverEnabled: true
                         text: qsTr("V-Sync")
                         font.pointSize:  12
-                        checked: StreamingPreferences.enableVsync
-                        onCheckedChanged: {
-                            StreamingPreferences.enableVsync = checked
+                        checked: preferences.enableVsync
+                        onToggled: {
+                            preferences.enableVsync = checked
                         }
 
                         ToolTip.delay: 1000
@@ -1339,10 +1339,10 @@ Flickable {
                         hoverEnabled: true
                         text: qsTr("Frame pacing")
                         font.pointSize:  12
-                        enabled: StreamingPreferences.enableVsync
-                        checked: StreamingPreferences.enableVsync && StreamingPreferences.framePacing
-                        onCheckedChanged: {
-                            StreamingPreferences.framePacing = checked
+                        enabled: preferences.enableVsync
+                        checked: preferences.enableVsync && preferences.framePacing
+                        onToggled: {
+                            preferences.framePacing = checked
                         }
                         ToolTip.delay: 1000
                         ToolTip.timeout: 5000
@@ -1352,12 +1352,14 @@ Flickable {
 
                     CheckBox {
                         hoverEnabled: true
+                        id: vrrCheck
+                        objectName: "vrrCheck"
                         text: qsTr("VRR")
                         font.pointSize: 12
-                        enabled: StreamingPreferences.enableVsync
-                        checked: StreamingPreferences.enableVrr
-                        onCheckedChanged: {
-                            StreamingPreferences.enableVrr = checked
+                        enabled: preferences.enableVsync
+                        checked: preferences.enableVrr
+                        onToggled: {
+                            preferences.enableVrr = checked
                         }
 
                         ToolTip.delay: 1000
@@ -1373,8 +1375,8 @@ Flickable {
                 Column {
                     width: parent.width
                     spacing: 5
-                    visible: StreamingPreferences.enableVrr
-                    enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                    visible: preferences.enableVrr
+                    enabled: preferences.enableVsync && preferences.enableVrr
 
                     Label {
                         width: parent.width
@@ -1385,6 +1387,7 @@ Flickable {
 
                     AutoResizingComboBox {
                         id: vrrLatencyModeComboBox
+                        objectName: "vrrLatencyModeComboBox"
                         textRole: "text"
                         model: ListModel {
                             id: vrrLatencyModeListModel
@@ -1403,14 +1406,14 @@ Flickable {
                         }
                         currentIndex: {
                             for (var i = 0; i < vrrLatencyModeListModel.count; i++) {
-                                if (vrrLatencyModeListModel.get(i).val === StreamingPreferences.vrrLatencyMode) {
+                                if (vrrLatencyModeListModel.get(i).val === preferences.vrrLatencyMode) {
                                     return i
                                 }
                             }
                             return 1
                         }
                         onActivated: {
-                            StreamingPreferences.vrrLatencyMode = vrrLatencyModeListModel.get(currentIndex).val
+                            preferences.vrrLatencyMode = vrrLatencyModeListModel.get(currentIndex).val
                         }
                         Component.onCompleted: {
                             recalculateWidth()
@@ -1421,9 +1424,9 @@ Flickable {
                     Label {
                         width: parent.width
                         wrapMode: Text.Wrap
-                        text: StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_LOW_LATENCY ?
+                        text: preferences.vrrLatencyMode === StreamingPreferences.VLM_LOW_LATENCY ?
                                   qsTr("Minimizes added delay. Uneven delivery can cause more stutter or skipped frames.") :
-                              StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_SMOOTH ?
+                              preferences.vrrLatencyMode === StreamingPreferences.VLM_SMOOTH ?
                                   qsTr("Uses more padding and holds it longer for steadier motion, with more input delay.") :
                                   qsTr("Targets steadier motion with a moderate timing reserve and balanced input delay.")
                     }
@@ -1431,9 +1434,9 @@ Flickable {
                     Label {
                         width: parent.width
                         wrapMode: Text.Wrap
-                        text: StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_SMOOTH ?
+                        text: preferences.vrrLatencyMode === StreamingPreferences.VLM_SMOOTH ?
                                   qsTr("Buffer allowance: up to 4 source frames, limited by queue capacity. Actual learned delay may be lower.") :
-                              StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_LOW_LATENCY ?
+                              preferences.vrrLatencyMode === StreamingPreferences.VLM_LOW_LATENCY ?
                                   qsTr("Buffer allowance: up to 1 source frame, limited by queue capacity. Actual learned delay may be lower.") :
                                   qsTr("Buffer allowance: up to 2 source frames, limited by queue capacity. Actual learned delay may be lower.")
                     }
@@ -1447,12 +1450,14 @@ Flickable {
 
                 CheckBox {
                     hoverEnabled: true
+                    id: reduceJudderCheck
+                    objectName: "reduceJudderCheck"
                     text: qsTr("Reduce judder")
                     font.pointSize: 12
-                    visible: StreamingPreferences.enableVrr
-                    enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
-                    checked: StreamingPreferences.smoothVrrFrameTiming
-                    onCheckedChanged: StreamingPreferences.smoothVrrFrameTiming = checked
+                    visible: preferences.enableVrr
+                    enabled: preferences.enableVsync && preferences.enableVrr
+                    checked: preferences.smoothVrrFrameTiming
+                    onToggled: preferences.smoothVrrFrameTiming = checked
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
@@ -1468,19 +1473,19 @@ Flickable {
                     font.pointSize: 12
 
                     enabled: SystemProperties.supportsHdr
-                    checked: enabled && StreamingPreferences.enableHdr
-                    onCheckedChanged: {
-                        if (StreamingPreferences.enableHdr != checked) {
-                            StreamingPreferences.enableHdr = checked
+                    checked: enabled && preferences.enableHdr
+                    onToggled: {
+                        if (preferences.enableHdr != checked) {
+                            preferences.enableHdr = checked
                             // PyroWave's default bitrate depends on HDR
-                            if (slider.pyroWave && StreamingPreferences.autoAdjustBitrate) {
-                                StreamingPreferences.bitrateKbps = slider.defaultBitrate();
-                                slider.value = StreamingPreferences.bitrateKbps
+                            if (slider.pyroWave && preferences.autoAdjustBitrate) {
+                                preferences.bitrateKbps = slider.defaultBitrate();
+                                slider.value = preferences.bitrateKbps
                             }
                         }
                     }
 
-                    // Updating StreamingPreferences.videoCodecConfig is handled above
+                    // Updating preferences.videoCodecConfig is handled above
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
@@ -1496,6 +1501,7 @@ Flickable {
         GroupBox {
             width: parent.width - (parent.leftPadding + parent.rightPadding)
             padding: 12
+            visible: !gameMode
             title: "<font color=\"skyblue\">" + qsTr("VRR diagnostics") + "</font>"
             font.pointSize: 12
 
@@ -1505,10 +1511,11 @@ Flickable {
 
                 CheckBox {
                     id: traceVrrFramesCheckBox
+                    objectName: "traceVrrFramesCheck"
                     text: qsTr("Trace VRR frames for debugging")
                     font.pointSize: 12
                     checked: StreamingPreferences.traceVrrFrames
-                    onCheckedChanged: StreamingPreferences.traceVrrFrames = checked
+                    onToggled: StreamingPreferences.traceVrrFrames = checked
                 }
 
                 Label {
@@ -1573,7 +1580,7 @@ Flickable {
                 AutoResizingComboBox {
                     // ignore setting the index at first, and actually set it when the component is loaded
                     Component.onCompleted: {
-                        var saved_audio = StreamingPreferences.audioConfig
+                        var saved_audio = preferences.audioConfig
                         currentIndex = 0
                         for (var i = 0; i < audioListModel.count; i++) {
                             var el_audio = audioListModel.get(i).val;
@@ -1582,7 +1589,7 @@ Flickable {
                                 break
                             }
                         }
-                        activated(currentIndex)
+                        recalculateWidth()
                     }
 
                     id: audioComboBox
@@ -1604,7 +1611,7 @@ Flickable {
                     }
                     // ::onActivated must be used, as it only listens for when the index is changed by a human
                     onActivated : {
-                        StreamingPreferences.audioConfig = audioListModel.get(currentIndex).val
+                        preferences.audioConfig = audioListModel.get(currentIndex).val
                     }
                 }
 
@@ -1614,9 +1621,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Mute host PC speakers while streaming")
                     font.pointSize: 12
-                    checked: !StreamingPreferences.playAudioOnHost
-                    onCheckedChanged: {
-                        StreamingPreferences.playAudioOnHost = !checked
+                    checked: !preferences.playAudioOnHost
+                    onToggled: {
+                        preferences.playAudioOnHost = !checked
                     }
 
                     ToolTip.delay: 1000
@@ -1631,9 +1638,9 @@ Flickable {
                     text: qsTr("Mute audio stream when Moonlight is not the active window")
                     font.pointSize: 12
                     visible: SystemProperties.hasDesktopEnvironment
-                    checked: StreamingPreferences.muteOnFocusLoss
-                    onCheckedChanged: {
-                        StreamingPreferences.muteOnFocusLoss = checked
+                    checked: preferences.muteOnFocusLoss
+                    onToggled: {
+                        preferences.muteOnFocusLoss = checked
                     }
 
                     ToolTip.delay: 1000
@@ -1660,9 +1667,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Optimize game settings for streaming")
                     font.pointSize:  12
-                    checked: StreamingPreferences.gameOptimizations
-                    onCheckedChanged: {
-                        StreamingPreferences.gameOptimizations = checked
+                    checked: preferences.gameOptimizations
+                    onToggled: {
+                        preferences.gameOptimizations = checked
                     }
                 }
 
@@ -1671,9 +1678,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Quit app on host PC after ending stream")
                     font.pointSize: 12
-                    checked: StreamingPreferences.quitAppAfter
-                    onCheckedChanged: {
-                        StreamingPreferences.quitAppAfter = checked
+                    checked: preferences.quitAppAfter
+                    onToggled: {
+                        preferences.quitAppAfter = checked
                     }
 
                     ToolTip.delay: 1000
@@ -1698,6 +1705,7 @@ Flickable {
                 Label {
                     width: parent.width
                     id: languageTitle
+                    visible: !gameMode
                     text: qsTr("Language")
                     font.pointSize: 12
                     wrapMode: Text.Wrap
@@ -1706,7 +1714,7 @@ Flickable {
                 AutoResizingComboBox {
                     // ignore setting the index at first, and actually set it when the component is loaded
                     Component.onCompleted: {
-                        var saved_language = StreamingPreferences.language
+                        var saved_language = preferences.language
                         currentIndex = 0
                         for (var i = 0; i < languageListModel.count; i++) {
                             var el_language = languageListModel.get(i).val;
@@ -1716,10 +1724,13 @@ Flickable {
                             }
                         }
 
-                        activated(currentIndex)
+                        recalculateWidth()
                     }
 
                     id: languageComboBox
+
+                    objectName: "languageComboBox"
+                    visible: !gameMode
                     textRole: "text"
                     model: ListModel {
                         id: languageListModel
@@ -1856,9 +1867,9 @@ Flickable {
                     onActivated : {
                         // Retranslating is expensive, so only do it if the language actually changed
                         var new_language = languageListModel.get(currentIndex).val
-                        if (StreamingPreferences.language !== new_language) {
-                            StreamingPreferences.language = languageListModel.get(currentIndex).val
-                            if (!StreamingPreferences.retranslate()) {
+                        if (preferences.language !== new_language) {
+                            preferences.language = languageListModel.get(currentIndex).val
+                            if (!preferences.retranslate()) {
                                 ToolTip.show(qsTr("You must restart Moonlight for this change to take effect"), 5000)
                             }
                             else {
@@ -1879,7 +1890,7 @@ Flickable {
                     text: qsTr("GUI display mode")
                     font.pointSize: 12
                     wrapMode: Text.Wrap
-                    visible: SystemProperties.hasDesktopEnvironment
+                    visible: !gameMode && SystemProperties.hasDesktopEnvironment
                 }
 
                 AutoResizingComboBox {
@@ -1890,7 +1901,7 @@ Flickable {
                             return
                         }
 
-                        var saved_uidisplaymode = StreamingPreferences.uiDisplayMode
+                        var saved_uidisplaymode = preferences.uiDisplayMode
                         currentIndex = 0
                         for (var i = 0; i < uiDisplayModeListModel.count; i++) {
                             var el_uidisplaymode = uiDisplayModeListModel.get(i).val;
@@ -1900,11 +1911,13 @@ Flickable {
                             }
                         }
 
-                        activated(currentIndex)
+                        recalculateWidth()
                     }
 
                     id: uiDisplayModeComboBox
-                    visible: SystemProperties.hasDesktopEnvironment
+
+                    objectName: "uiDisplayModeComboBox"
+                    visible: !gameMode && SystemProperties.hasDesktopEnvironment
                     textRole: "text"
                     model: ListModel {
                         id: uiDisplayModeListModel
@@ -1923,7 +1936,7 @@ Flickable {
                     }
                     // ::onActivated must be used, as it only listens for when the index is changed by a human
                     onActivated : {
-                        StreamingPreferences.uiDisplayMode = uiDisplayModeListModel.get(currentIndex).val
+                        preferences.uiDisplayMode = uiDisplayModeListModel.get(currentIndex).val
                     }
                 }
 
@@ -1932,9 +1945,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Show connection quality warnings")
                     font.pointSize: 12
-                    checked: StreamingPreferences.connectionWarnings
-                    onCheckedChanged: {
-                        StreamingPreferences.connectionWarnings = checked
+                    checked: preferences.connectionWarnings
+                    onToggled: {
+                        preferences.connectionWarnings = checked
                     }
                 }
 
@@ -1943,21 +1956,21 @@ Flickable {
                     width: parent.width
                     text: qsTr("Show configuration warnings")
                     font.pointSize: 12
-                    checked: StreamingPreferences.configurationWarnings
-                    onCheckedChanged: {
-                        StreamingPreferences.configurationWarnings = checked
+                    checked: preferences.configurationWarnings
+                    onToggled: {
+                        preferences.configurationWarnings = checked
                     }
                 }
 
                 CheckBox {
-                    visible: SystemProperties.hasDiscordIntegration
+                    visible: !gameMode && SystemProperties.hasDiscordIntegration
                     id: discordPresenceCheck
                     width: parent.width
                     text: qsTr("Discord Rich Presence integration")
                     font.pointSize: 12
-                    checked: StreamingPreferences.richPresence
-                    onCheckedChanged: {
-                        StreamingPreferences.richPresence = checked
+                    checked: preferences.richPresence
+                    onToggled: {
+                        preferences.richPresence = checked
                     }
 
                     ToolTip.delay: 1000
@@ -1971,9 +1984,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Keep the display awake while streaming")
                     font.pointSize: 12
-                    checked: StreamingPreferences.keepAwake
-                    onCheckedChanged: {
-                        StreamingPreferences.keepAwake = checked
+                    checked: preferences.keepAwake
+                    onToggled: {
+                        preferences.keepAwake = checked
                     }
 
                     ToolTip.delay: 1000
@@ -1988,9 +2001,10 @@ Flickable {
     Column {
         padding: 10
         rightPadding: 20
-        anchors.left: settingsColumn1.right
+        x: settingsPage.singleColumn ? 0 : settingsColumn1.width
+        y: settingsPage.singleColumn ? settingsColumn1.height : 0
         id: settingsColumn2
-        width: settingsPage.width / 2
+        width: settingsPage.singleColumn ? settingsPage.width : settingsPage.width / 2
         spacing: 15
 
         GroupBox {
@@ -2010,9 +2024,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Optimize mouse for remote desktop instead of games")
                     font.pointSize:  12
-                    checked: StreamingPreferences.absoluteMouseMode
-                    onCheckedChanged: {
-                        StreamingPreferences.absoluteMouseMode = checked
+                    checked: preferences.absoluteMouseMode
+                    onToggled: {
+                        preferences.absoluteMouseMode = checked
                     }
 
                     ToolTip.delay: 1000
@@ -2029,11 +2043,14 @@ Flickable {
 
                     CheckBox {
                         id: captureSysKeysCheck
+                        objectName: "captureSysKeysCheck"
                         hoverEnabled: true
                         text: qsTr("Capture system keyboard shortcuts")
                         font.pointSize: 12
                         enabled: SystemProperties.hasDesktopEnvironment
-                        checked: StreamingPreferences.captureSysKeysMode !== StreamingPreferences.CSK_OFF || !SystemProperties.hasDesktopEnvironment
+                        checked: preferences.captureSysKeysMode !== StreamingPreferences.CSK_OFF || !SystemProperties.hasDesktopEnvironment
+                        onToggled: captureSysKeysModeComboBox.updatePref()
+                        width: Math.min(implicitWidth, parent.width - captureSysKeysModeComboBox.width - parent.spacing)
 
                         ToolTip.delay: 1000
                         ToolTip.timeout: 10000
@@ -2050,7 +2067,7 @@ Flickable {
                                 return
                             }
 
-                            var saved_syskeysmode = StreamingPreferences.captureSysKeysMode
+                            var saved_syskeysmode = preferences.captureSysKeysMode
                             currentIndex = 0
                             for (var i = 0; i < captureSysKeysModeListModel.count; i++) {
                                 var el_syskeysmode = captureSysKeysModeListModel.get(i).val;
@@ -2060,9 +2077,11 @@ Flickable {
                                 }
                             }
 
-                            activated(currentIndex)
+                            recalculateWidth()
                         }
 
+                        id: captureSysKeysModeComboBox
+                        maximumWidth: parent.width / 2
                         enabled: captureSysKeysCheck.checked && captureSysKeysCheck.enabled
                         textRole: "text"
                         model: ListModel {
@@ -2079,10 +2098,10 @@ Flickable {
 
                         function updatePref() {
                             if (!enabled) {
-                                StreamingPreferences.captureSysKeysMode = StreamingPreferences.CSK_OFF
+                                preferences.captureSysKeysMode = StreamingPreferences.CSK_OFF
                             }
                             else {
-                                StreamingPreferences.captureSysKeysMode = captureSysKeysModeListModel.get(currentIndex).val
+                                preferences.captureSysKeysMode = captureSysKeysModeListModel.get(currentIndex).val
                             }
                         }
 
@@ -2091,10 +2110,6 @@ Flickable {
                             updatePref()
                         }
 
-                        // This handles transition of the checkbox state
-                        onEnabledChanged: {
-                            updatePref()
-                        }
                     }
                 }
 
@@ -2104,9 +2119,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Use touchscreen as a virtual trackpad")
                     font.pointSize:  12
-                    checked: !StreamingPreferences.absoluteTouchMode
-                    onCheckedChanged: {
-                        StreamingPreferences.absoluteTouchMode = !checked
+                    checked: !preferences.absoluteTouchMode
+                    onToggled: {
+                        preferences.absoluteTouchMode = !checked
                     }
 
                     ToolTip.delay: 1000
@@ -2121,9 +2136,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Swap left and right mouse buttons")
                     font.pointSize:  12
-                    checked: StreamingPreferences.swapMouseButtons
-                    onCheckedChanged: {
-                        StreamingPreferences.swapMouseButtons = checked
+                    checked: preferences.swapMouseButtons
+                    onToggled: {
+                        preferences.swapMouseButtons = checked
                     }
                 }
 
@@ -2133,9 +2148,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Reverse mouse scrolling direction")
                     font.pointSize: 12
-                    checked: StreamingPreferences.reverseScrollDirection
-                    onCheckedChanged: {
-                        StreamingPreferences.reverseScrollDirection = checked
+                    checked: preferences.reverseScrollDirection
+                    onToggled: {
+                        preferences.reverseScrollDirection = checked
                     }
                 }
             }
@@ -2157,9 +2172,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Swap A/B and X/Y gamepad buttons")
                     font.pointSize: 12
-                    checked: StreamingPreferences.swapFaceButtons
-                    onCheckedChanged: {
-                        StreamingPreferences.swapFaceButtons = checked
+                    checked: preferences.swapFaceButtons
+                    onToggled: {
+                        preferences.swapFaceButtons = checked
                     }
 
                     ToolTip.delay: 1000
@@ -2173,9 +2188,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Force gamepad #1 always connected")
                     font.pointSize:  12
-                    checked: !StreamingPreferences.multiController
-                    onCheckedChanged: {
-                        StreamingPreferences.multiController = !checked
+                    checked: !preferences.multiController
+                    onToggled: {
+                        preferences.multiController = !checked
                     }
 
                     ToolTip.delay: 1000
@@ -2191,9 +2206,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Enable mouse control with gamepads by holding the 'Start' button")
                     font.pointSize: 12
-                    checked: StreamingPreferences.gamepadMouse
-                    onCheckedChanged: {
-                        StreamingPreferences.gamepadMouse = checked
+                    checked: preferences.gamepadMouse
+                    onToggled: {
+                        preferences.gamepadMouse = checked
                     }
                 }
 
@@ -2203,9 +2218,9 @@ Flickable {
                     text: qsTr("Process gamepad input when Moonlight is in the background")
                     font.pointSize: 12
                     visible: SystemProperties.hasDesktopEnvironment
-                    checked: StreamingPreferences.backgroundGamepad
-                    onCheckedChanged: {
-                        StreamingPreferences.backgroundGamepad = checked
+                    checked: preferences.backgroundGamepad
+                    onToggled: {
+                        preferences.backgroundGamepad = checked
                     }
 
                     ToolTip.delay: 1000
@@ -2238,7 +2253,7 @@ Flickable {
                 AutoResizingComboBox {
                     // ignore setting the index at first, and actually set it when the component is loaded
                     Component.onCompleted: {
-                        var saved_vds = StreamingPreferences.videoDecoderSelection
+                        var saved_vds = preferences.videoDecoderSelection
                         currentIndex = 0
                         for (var i = 0; i < decoderListModel.count; i++) {
                             var el_vds = decoderListModel.get(i).val;
@@ -2247,7 +2262,7 @@ Flickable {
                                 break
                             }
                         }
-                        activated(currentIndex)
+                        recalculateWidth()
                     }
 
                     id: decoderComboBox
@@ -2270,7 +2285,7 @@ Flickable {
                     // ::onActivated must be used, as it only listens for when the index is changed by a human
                     onActivated: {
                         if (enabled) {
-                            StreamingPreferences.videoDecoderSelection = decoderListModel.get(currentIndex).val
+                            preferences.videoDecoderSelection = decoderListModel.get(currentIndex).val
                         }
                     }
                 }
@@ -2287,7 +2302,7 @@ Flickable {
                 AutoResizingComboBox {
                     // ignore setting the index at first, and actually set it when the component is loaded
                     Component.onCompleted: {
-                        var saved_rs = StreamingPreferences.rendererSelection
+                        var saved_rs = preferences.rendererSelection
 
                         // Default to Automatic
                         currentIndex = 0
@@ -2300,7 +2315,7 @@ Flickable {
                             }
                         }
 
-                        activated(currentIndex)
+                        recalculateWidth()
                     }
 
                     id: rendererComboBox
@@ -2327,7 +2342,7 @@ Flickable {
                     }
                     // ::onActivated must be used, as it only listens for when the index is changed by a human
                     onActivated : {
-                        StreamingPreferences.rendererSelection = rendererListModel.get(currentIndex).val
+                        preferences.rendererSelection = rendererListModel.get(currentIndex).val
                     }
                 }
 
@@ -2337,11 +2352,11 @@ Flickable {
                     text: qsTr("Unlock bitrate limit (Experimental)")
                     font.pointSize: 12
 
-                    checked: StreamingPreferences.unlockBitrate
-                    onCheckedChanged: {
-                        StreamingPreferences.unlockBitrate = checked
-                        StreamingPreferences.bitrateKbps = Math.min(StreamingPreferences.bitrateKbps, slider.to)
-                        slider.value = StreamingPreferences.bitrateKbps
+                    checked: preferences.unlockBitrate
+                    onToggled: {
+                        preferences.unlockBitrate = checked
+                        preferences.bitrateKbps = Math.min(preferences.bitrateKbps, slider.to)
+                        slider.value = preferences.bitrateKbps
                     }
 
                     ToolTip.delay: 1000
@@ -2352,15 +2367,17 @@ Flickable {
 
                 CheckBox {
                     id: enableMdns
+                    objectName: "enableMdns"
+                    visible: !gameMode
                     width: parent.width
                     text: qsTr("Automatically find PCs on the local network (Recommended)")
                     font.pointSize: 12
-                    checked: StreamingPreferences.enableMdns
-                    onCheckedChanged: {
+                    checked: preferences.enableMdns
+                    onToggled: {
                         // This is called on init, so only do the work if we've
                         // actually changed the value.
-                        if (StreamingPreferences.enableMdns != checked) {
-                            StreamingPreferences.enableMdns = checked
+                        if (preferences.enableMdns != checked) {
+                            preferences.enableMdns = checked
 
                             // Restart polling so the mDNS change takes effect
                             if (window.pollingActive) {
@@ -2373,12 +2390,13 @@ Flickable {
 
                 CheckBox {
                     id: detectNetworkBlocking
+                    visible: !gameMode
                     width: parent.width
                     text: qsTr("Automatically detect blocked connections (Recommended)")
                     font.pointSize: 12
-                    checked: StreamingPreferences.detectNetworkBlocking
-                    onCheckedChanged: {
-                        StreamingPreferences.detectNetworkBlocking = checked
+                    checked: preferences.detectNetworkBlocking
+                    onToggled: {
+                        preferences.detectNetworkBlocking = checked
                     }
                 }
 
@@ -2387,9 +2405,9 @@ Flickable {
                     width: parent.width
                     text: qsTr("Show performance stats while streaming")
                     font.pointSize: 12
-                    checked: StreamingPreferences.showPerformanceOverlay
-                    onCheckedChanged: {
-                        StreamingPreferences.showPerformanceOverlay = checked
+                    checked: preferences.showPerformanceOverlay
+                    onToggled: {
+                        preferences.showPerformanceOverlay = checked
                     }
 
                     ToolTip.delay: 1000

@@ -8,6 +8,7 @@ on:
   pull_request:
     branches:
       - master
+      - release/6.1.0-vrr18
 
 concurrency:
   group: build-${{ github.ref }}

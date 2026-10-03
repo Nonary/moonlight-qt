@@ -614,7 +614,7 @@ bool Session::populateDecoderProperties(SDL_Window* window)
 }
 
 Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *preferences)
-    : m_Preferences(preferences ? preferences : StreamingPreferences::get()),
+    : m_Preferences((preferences ? preferences : StreamingPreferences::get())->createTransientCopy()),
       m_IsFullScreen(m_Preferences->windowMode != StreamingPreferences::WM_WINDOWED || !WMUtils::isRunningDesktopEnvironment()),
       m_Computer(computer),
       m_App(app),
@@ -1897,9 +1897,8 @@ bool Session::startConnectionAsync()
     // support YUV444 streaming, use the default non-444 bitrate for the stream instead.
     // This should provide equivalent image quality for YUV420 as the stream would have
     // had if the host supported YUV444 (though obviously with 4:2:0 subsampling).
-    // If the user has adjusted the bitrate from default, we'll assume they really wanted
-    // that value and not second guess them.
-    if (m_Preferences->enableYUV444 &&
+    // Preserve manually selected bitrates, including values equal to the default.
+    if (m_Preferences->autoAdjustBitrate && m_Preferences->enableYUV444 &&
         !(m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_YUV444) &&
         m_StreamConfig.bitrate == StreamingPreferences::getDefaultBitrate(m_StreamConfig.width,
                                                                           m_StreamConfig.height,
@@ -1911,9 +1910,10 @@ bool Session::startConnectionAsync()
                                                                          false);
     }
 
-    // Likewise, a PyroWave default bitrate is far too high for the H.264
+    // Likewise, an automatic PyroWave default bitrate is far too high for the H.264
     // fallback used when the host or this PC can't do PyroWave.
-    if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_PYROWAVE &&
+    if (m_Preferences->autoAdjustBitrate &&
+        m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_PYROWAVE &&
         !(m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) &&
         m_StreamConfig.bitrate == StreamingPreferences::getDefaultPyroWaveBitrate(m_StreamConfig.width,
                                                                                   m_StreamConfig.height,
@@ -2001,12 +2001,12 @@ void Session::start()
         QString error;
         m_DiagnosticCapture = DiagnosticCapture::begin(DiagnosticCapture::rootDirectory(), metadata, error);
         if (m_DiagnosticCapture) {
-            m_Preferences->setDiagnosticsStatus(tr("Recording folder: %1. Disconnect before exporting.")
+            StreamingPreferences::get()->setDiagnosticsStatus(tr("Recording folder: %1. Disconnect before exporting.")
                 .arg(QDir::toNativeSeparators(m_DiagnosticCapture->directory())));
             qInfo() << "VRR diagnostic capture:" << m_DiagnosticCapture->directory();
         }
         else {
-            m_Preferences->setDiagnosticsStatus(error);
+            StreamingPreferences::get()->setDiagnosticsStatus(error);
             qWarning() << "Settings diagnostics not enabled:" << error;
         }
     }

@@ -4,6 +4,22 @@
 <context>
     <name>AppView</name>
     <message>
+        <source>Streaming Settings</source>
+        <translation>Impostazioni di streaming</translation>
+    </message>
+    <message>
+        <source>Streaming Settings (Custom)</source>
+        <translation>Impostazioni di streaming (personalizzate)</translation>
+    </message>
+    <message>
+        <source>Remove Custom Settings</source>
+        <translation>Rimuovi impostazioni personalizzate</translation>
+    </message>
+    <message>
+        <source>Remove all custom streaming settings for %1?</source>
+        <translation>Rimuovere tutte le impostazioni di streaming personalizzate per %1?</translation>
+    </message>
+    <message>
         <location filename="../gui/AppView.qml" line="143"/>
         <location filename="../gui/AppView.qml" line="299"/>
         <source>Resume Game</source>
@@ -1273,6 +1289,14 @@
 <context>
     <name>main</name>
     <message>
+        <source>Profiles</source>
+        <translation>Profili</translation>
+    </message>
+    <message>
+        <source>Use '%1' as the default profile and open the default profile automatically next time?</source>
+        <translation>Usare '%1' come profilo predefinito e aprirlo automaticamente al prossimo avvio?</translation>
+    </message>
+    <message>
         <location filename="../gui/main.qml" line="444"/>
         <source>Settings</source>
         <translation>Impostazioni</translation>
@@ -1351,6 +1375,134 @@
         <location filename="../gui/main.qml" line="517"/>
         <source>Enter the IP address of your host PC:</source>
         <translation>Inserisci l&apos;indirizzo IP del tuo PC host:</translation>
+    </message>
+</context>
+<context>
+    <name>ProfileSelectionView</name>
+    <message>
+        <source>Profiles</source>
+        <translation>Profili</translation>
+    </message>
+    <message>
+        <source>Unable to activate this profile.</source>
+        <translation>Impossibile attivare questo profilo.</translation>
+    </message>
+    <message>
+        <source>Choose a profile</source>
+        <translation>Scegli un profilo</translation>
+    </message>
+    <message>
+        <source>Add Profile</source>
+        <translation>Aggiungi profilo</translation>
+    </message>
+    <message>
+        <source>Current</source>
+        <translation>Attuale</translation>
+    </message>
+    <message>
+        <source>Default / Auto-login</source>
+        <translation>Predefinito / Accesso automatico</translation>
+    </message>
+    <message>
+        <source>Default</source>
+        <translation>Predefinito</translation>
+    </message>
+    <message>
+        <source>Rename Profile</source>
+        <translation>Rinomina profilo</translation>
+    </message>
+    <message>
+        <source>Default Profile</source>
+        <translation>Profilo predefinito</translation>
+    </message>
+    <message>
+        <source>Set as Default</source>
+        <translation>Imposta come predefinito</translation>
+    </message>
+    <message>
+        <source>Delete Profile</source>
+        <translation>Elimina profilo</translation>
+    </message>
+    <message>
+        <source>Disable Default Auto-login</source>
+        <translation>Disabilita accesso automatico</translation>
+    </message>
+    <message>
+        <source>Enable Default Auto-login</source>
+        <translation>Abilita accesso automatico</translation>
+    </message>
+    <message>
+        <source>Profile names must be unique and cannot be empty.</source>
+        <translation>I nomi dei profili devono essere univoci e non possono essere vuoti.</translation>
+    </message>
+    <message>
+        <source>New profile name:</source>
+        <translation>Nome del nuovo profilo:</translation>
+    </message>
+    <message>
+        <source>Profile name:</source>
+        <translation>Nome del profilo:</translation>
+    </message>
+    <message>
+        <source>Delete profile '%1'? This removes its paired hosts, settings, and identity.</source>
+        <translation>Eliminare il profilo '%1'? Verranno rimossi i PC associati, le impostazioni e l’identità.</translation>
+    </message>
+    <message>
+        <source>Unable to delete this profile.</source>
+        <translation>Impossibile eliminare questo profilo.</translation>
+    </message>
+</context>
+<context>
+    <name>GameSettingsView</name>
+    <message><source>Streaming Settings: %1 (%2)</source><translation>Streaming: %1 (%2)</translation></message>
+    <message><source>Profile settings</source><translation>Impostazioni del profilo</translation></message>
+    <message><source>Use Profile Setting</source><translation>Usa valore del profilo</translation></message>
+    <message><source>Reset All</source><translation>Ripristina tutto</translation></message>
+    <message><source>Remove all custom streaming settings for %1?</source><translation>Rimuovere tutte le impostazioni di streaming personalizzate per %1?</translation></message>
+</context>
+<context>
+    <name>GameStreamingSettings</name>
+    <message><source>Resolution</source><translation>Risoluzione</translation></message>
+    <message><source>Frame rate</source><translation>Frequenza fotogrammi</translation></message>
+    <message><source>Video bitrate</source><translation>Bitrate video</translation></message>
+    <message><source>Bitrate limit</source><translation>Limite bitrate</translation></message>
+    <message><source>V-Sync</source><translation>V-Sync</translation></message>
+    <message><source>Frame pacing</source><translation>Ritmo frame</translation></message>
+    <message><source>Display mode</source><translation>Modalità display</translation></message>
+    <message><source>Audio configuration</source><translation>Configurazione audio</translation></message>
+    <message><source>Host audio</source><translation>Audio dell&apos;host</translation></message>
+    <message><source>Mute on focus loss</source><translation>Silenzia in secondo piano</translation></message>
+    <message><source>Game optimizations</source><translation>Ottimizzazioni del gioco</translation></message>
+    <message><source>Quit app after stream</source><translation>Chiudi il gioco a fine streaming</translation></message>
+    <message><source>Connection warnings</source><translation>Avvisi di connessione</translation></message>
+    <message><source>Configuration warnings</source><translation>Avvisi di configurazione</translation></message>
+    <message><source>Keep display awake</source><translation>Mantieni lo schermo acceso</translation></message>
+    <message><source>Remote desktop mouse</source><translation>Mouse per desktop remoto</translation></message>
+    <message><source>System keyboard shortcuts</source><translation>Scorciatoie di sistema</translation></message>
+    <message><source>Touchscreen mode</source><translation>Modalità touchscreen</translation></message>
+    <message><source>Mouse buttons</source><translation>Pulsanti del mouse</translation></message>
+    <message><source>Scroll direction</source><translation>Direzione di scorrimento</translation></message>
+    <message><source>Gamepad button layout</source><translation>Disposizione pulsanti controller</translation></message>
+    <message><source>Multiple controllers</source><translation>Controller multipli</translation></message>
+    <message><source>Gamepad mouse control</source><translation>Controllo mouse con controller</translation></message>
+    <message><source>Background gamepad input</source><translation>Controller in secondo piano</translation></message>
+    <message><source>Video decoder</source><translation>Decoder video</translation></message>
+    <message><source>Video codec</source><translation>Codec video</translation></message>
+    <message><source>Renderer</source><translation>Renderer</translation></message>
+    <message><source>HDR</source><translation>HDR</translation></message>
+    <message><source>YUV 4:4:4</source><translation>YUV 4:4:4</translation></message>
+    <message><source>Performance statistics</source><translation>Statistiche di prestazioni</translation></message>
+    <message>
+        <source>Variable refresh rate</source>
+        <translation>Frequenza di aggiornamento variabile</translation>
+    </message>
+    <message>
+        <source>VRR latency mode</source>
+        <translation>Modalità di latenza VRR</translation>
+    </message>
+    <message>
+        <source>VRR frame timing</source>
+        <translation>Temporizzazione fotogrammi VRR</translation>
     </message>
 </context>
 </TS>

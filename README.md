@@ -21,6 +21,32 @@ You can follow development on our [Discord server](https://moonlight-stream.org/
  - Support for both pointer capture (for games) and direct mouse control (for remote desktop)
  - Support for passing system-wide keyboard shortcuts like Alt+Tab to the host
  
+## Profiles
+
+Choose a profile at startup, or use the profile button in the host list to switch.
+Profiles have separate paired hosts, streaming preferences, controller mappings,
+and artwork caches. The first launch preserves the existing configuration in the
+Default profile; newly created profiles pair with hosts independently.
+
+The profile menu can select a default profile. The auto-login toggle controls
+whether that profile opens automatically at startup.
+Command-line actions accept `--profile <name-or-id>`; without it, they use the
+default profile.
+
+### Per-game streaming settings
+
+Open an application's context menu and choose **Streaming Settings** to customize
+that game. Values inherit from the current profile until changed. **Use Profile
+Setting** restores inheritance for an individual setting; **Reset All** removes
+all overrides for that game. The application menu also offers **Remove Custom
+Settings**.
+
+Overrides are separate for each profile, host and application. They support the
+fork's VRR latency/smoothing options and PyroWave codec/bitrate choices. Diagnostics,
+calibration and network-adapter tools remain in the general settings screen.
+Explicit streaming CLI options take precedence over per-game values without
+saving those command-line choices.
+
 ## Downloads
 - [Windows, macOS, and Steam Link](https://github.com/moonlight-stream/moonlight-qt/releases)
 - [Snap (for Ubuntu-based Linux distros)](https://snapcraft.io/moonlight)

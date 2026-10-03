@@ -11,12 +11,14 @@
 #include <qmdnsengine/resolver.h>
 
 #include <QThread>
+#include <QThreadPool>
 #include <QReadWriteLock>
 #include <QSettings>
 #include <QRunnable>
 #include <QTimer>
 #include <QMutex>
 #include <QWaitCondition>
+#include <atomic>
 
 class ComputerManager;
 
@@ -211,9 +213,9 @@ class ComputerManager : public QObject
 {
     Q_OBJECT
 
-    friend class DeferredHostDeletionTask;
     friend class PendingAddTask;
     friend class PendingPairingTask;
+    friend class PendingQuitTask;
     friend class DelayedFlushThread;
 
 public:
@@ -221,9 +223,13 @@ public:
 
     virtual ~ComputerManager();
 
+    void stop();
+
     Q_INVOKABLE void startPolling();
 
     Q_INVOKABLE void stopPollingAsync();
+
+    Q_INVOKABLE void reloadForActiveProfile();
 
     Q_INVOKABLE void addNewHostManually(QString address);
 
@@ -240,11 +246,14 @@ public:
     // computer is deleted inside this call
     void deleteHost(NvComputer* computer);
 
+    QString profileId() const { return m_ProfileId; }
+
     void renameHost(NvComputer* computer, QString name);
 
     void clientSideAttributeUpdated(NvComputer* computer);
 
 signals:
+    void hostRemoved(QString uuid);
     void computerStateChanged(NvComputer* computer);
 
     void pairingCompleted(NvComputer* computer, QString error);
@@ -261,6 +270,14 @@ private slots:
     void handleMdnsServiceResolved(MdnsPendingComputer* computer, QVector<QHostAddress>& addresses);
 
 private:
+    void loadHosts();
+
+    void clearHostsAndDiscovery();
+
+    void startDelayedFlushThread();
+
+    void stopDelayedFlushThread();
+
     void saveHosts();
 
     void saveHost(NvComputer* computer);
@@ -268,6 +285,8 @@ private:
     QHostAddress getBestGlobalAddressV6(QVector<QHostAddress>& addresses);
 
     void startPollingComputer(NvComputer* computer);
+
+    bool containsComputer(NvComputer* computer);
 
     StreamingPreferences* m_Prefs;
     int m_PollingRef;
@@ -283,4 +302,8 @@ private:
     QMutex m_DelayedFlushMutex; // Lock ordering: Must never be acquired while holding NvComputer lock
     QWaitCondition m_DelayedFlushCondition;
     bool m_NeedsDelayedFlush;
+    QString m_ProfileId;
+    QThreadPool m_ThreadPool;
+    quint64 m_ProfileGeneration = 0;
+    std::atomic_bool m_Stopping{false};
 };

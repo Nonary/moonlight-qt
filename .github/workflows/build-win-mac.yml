@@ -80,7 +80,7 @@ jobs:
           set "PATH=%QT_PATH%;%PATH%"
           scripts\build-arch.bat Release x64
         env:
-          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
+          QT_PATH: ${{ github.workspace }}\..\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
 
       - name: Build VRR diagnostics (Windows x64)
         if: runner.os == 'Windows'
@@ -96,14 +96,14 @@ jobs:
           nmake
           if errorlevel 1 exit /b 1
         env:
-          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
+          QT_PATH: ${{ github.workspace }}\..\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
 
       - name: Test VRR diagnostics (Windows x64)
         timeout-minutes: 5
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
+          QT_PATH: ${{ github.workspace }}\..\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
           MOONLIGHT_VRR_TEST_EXPORT_TRACE: ${{ github.workspace }}/build/replay-fixture.vrrtrace
           MOONLIGHT_VRR_TEST_EXPORT_WARM_TRACE: ${{ github.workspace }}/build/replay-warm-fixture.vrrtrace
           MOONLIGHT_DIAGNOSTICS_TEST_EXPORT: ${{ github.workspace }}/build/diagnostic-fixture.zip
@@ -126,6 +126,33 @@ jobs:
           }
           python tests/vrr/check_diagnostic_zip.py build/diagnostic-fixture.zip
           if ($LASTEXITCODE -ne 0) { throw "Diagnostic export ZIP validation failed" }
+
+      - name: Test profiles, navigation and game settings (Windows x64)
+        timeout-minutes: 2
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          QT_PATH: ${{ github.workspace }}\..\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
+          QT_QPA_PLATFORM: offscreen
+          QT_QUICK_BACKEND: software
+          QT_QUICK_CONTROLS_STYLE: Material
+          QT_QUICK_CONTROLS_MATERIAL_THEME: Dark
+        run: |
+          $deploy = (Resolve-Path build/deploy-x64-release).Path
+          $env:Path = "$env:QT_PATH;$deploy;$env:Path"
+          $env:QT_PLUGIN_PATH = (Resolve-Path "$env:QT_PATH/../plugins").Path
+          $env:QT_QPA_FONTDIR = "$env:WINDIR/Fonts"
+          foreach ($path in @('build/tests-vrr/profiles/release/tst_profiles.exe', 'build/tests-vrr/navigation/release/tst_navigation.exe', 'build/tests-vrr/game-settings/release/tst_game_settings.exe')) {
+            $test = (Resolve-Path $path).Path
+            $report = Join-Path (Split-Path $test -Parent) 'results.txt'
+            Remove-Item -LiteralPath $report -ErrorAction SilentlyContinue
+            Write-Host "Running $test"
+            & $test -o "$report,txt"
+            $testExitCode = $LASTEXITCODE
+            if (Test-Path $report) { Get-Content $report }
+            if ($testExitCode -ne 0) { throw "$test failed: $testExitCode" }
+            if (-not (Test-Path $report) -or (Get-Item $report).Length -eq 0) { throw "$test did not produce a test report" }
+          }
 
       - name: Test DualSense haptics (Windows x64)
         timeout-minutes: 2
@@ -188,7 +215,7 @@ jobs:
           set "PATH=%QT_PATH%;%PATH%"
           scripts\build-arch.bat Release arm64
         env:
-          QT_PATH: ${{ runner.workspace }}\Qt\${{ matrix.qt_version }}\msvc2022_arm64\bin
+          QT_PATH: ${{ github.workspace }}\..\Qt\${{ matrix.qt_version }}\msvc2022_arm64\bin
 
       - name: Build Package
         shell: pwsh

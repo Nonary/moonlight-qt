@@ -1,4 +1,5 @@
 #include "streamingpreferences.h"
+#include "backend/profilemanager.h"
 #include "streaming/video/pyrowave/pyrowavebitrate.h"
 #include "utils.h"
 #include "streaming/vrrratepolicy.h"
@@ -9,6 +10,7 @@
 #include <QCoreApplication>
 #include <QLocale>
 #include <QReadWriteLock>
+#include <QMetaProperty>
 #include <QVariantMap>
 #include <QtMath>
 #include <QDesktopServices>
@@ -74,10 +76,138 @@ static StreamingPreferences* s_GlobalPrefs;
 
 Q_GLOBAL_STATIC(QReadWriteLock, s_GlobalPrefsLock)
 
-StreamingPreferences::StreamingPreferences(QQmlEngine *qmlEngine)
-    : m_QmlEngine(qmlEngine)
+StreamingPreferences::StreamingPreferences(QQmlEngine *qmlEngine, bool transient)
+    : m_QmlEngine(qmlEngine), m_Transient(transient)
 {
-    reload();
+    if (!m_Transient) reload();
+}
+
+namespace {
+struct GameField {
+    const char* key;
+    const char* property;
+    const char* label;
+};
+
+// Keep storage keys shared with profile serialization. Profile-only fields are
+// deliberately absent; this is also the allowlist for untrusted persisted data.
+const GameField gameFields[] = {
+    {SER_WIDTH, "width", QT_TRANSLATE_NOOP("GameStreamingSettings", "Resolution")},
+    {SER_HEIGHT, "height", nullptr},
+    {SER_FPS, "fps", QT_TRANSLATE_NOOP("GameStreamingSettings", "Frame rate")},
+    {SER_BITRATE, "bitrateKbps", QT_TRANSLATE_NOOP("GameStreamingSettings", "Video bitrate")},
+    {SER_AUTOADJUSTBITRATE, "autoAdjustBitrate", nullptr},
+    {SER_UNLOCK_BITRATE, "unlockBitrate", QT_TRANSLATE_NOOP("GameStreamingSettings", "Bitrate limit")},
+    {SER_VSYNC, "enableVsync", QT_TRANSLATE_NOOP("GameStreamingSettings", "V-Sync")},
+    {SER_ENABLEVRR, "enableVrr", QT_TRANSLATE_NOOP("GameStreamingSettings", "Variable refresh rate")},
+    {SER_VRRLATENCYMODE, "vrrLatencyMode", QT_TRANSLATE_NOOP("GameStreamingSettings", "VRR latency mode")},
+    {SER_SMOOTHVRRFRAMETIMING, "smoothVrrFrameTiming", QT_TRANSLATE_NOOP("GameStreamingSettings", "VRR frame timing")},
+    {SER_FRAMEPACING, "framePacing", QT_TRANSLATE_NOOP("GameStreamingSettings", "Frame pacing")},
+    {SER_WINDOWMODE, "windowMode", QT_TRANSLATE_NOOP("GameStreamingSettings", "Display mode")},
+    {SER_AUDIOCFG, "audioConfig", QT_TRANSLATE_NOOP("GameStreamingSettings", "Audio configuration")},
+    {SER_HOSTAUDIO, "playAudioOnHost", QT_TRANSLATE_NOOP("GameStreamingSettings", "Host audio")},
+    {SER_MUTEONFOCUSLOSS, "muteOnFocusLoss", QT_TRANSLATE_NOOP("GameStreamingSettings", "Mute on focus loss")},
+    {SER_GAMEOPTS, "gameOptimizations", QT_TRANSLATE_NOOP("GameStreamingSettings", "Game optimizations")},
+    {SER_QUITAPPAFTER, "quitAppAfter", QT_TRANSLATE_NOOP("GameStreamingSettings", "Quit app after stream")},
+    {SER_CONNWARNINGS, "connectionWarnings", QT_TRANSLATE_NOOP("GameStreamingSettings", "Connection warnings")},
+    {SER_CONFWARNINGS, "configurationWarnings", QT_TRANSLATE_NOOP("GameStreamingSettings", "Configuration warnings")},
+    {SER_KEEPAWAKE, "keepAwake", QT_TRANSLATE_NOOP("GameStreamingSettings", "Keep display awake")},
+    {SER_ABSMOUSEMODE, "absoluteMouseMode", QT_TRANSLATE_NOOP("GameStreamingSettings", "Remote desktop mouse")},
+    {SER_CAPTURESYSKEYS, "captureSysKeysMode", QT_TRANSLATE_NOOP("GameStreamingSettings", "System keyboard shortcuts")},
+    {SER_ABSTOUCHMODE, "absoluteTouchMode", QT_TRANSLATE_NOOP("GameStreamingSettings", "Touchscreen mode")},
+    {SER_SWAPMOUSEBUTTONS, "swapMouseButtons", QT_TRANSLATE_NOOP("GameStreamingSettings", "Mouse buttons")},
+    {SER_REVERSESCROLL, "reverseScrollDirection", QT_TRANSLATE_NOOP("GameStreamingSettings", "Scroll direction")},
+    {SER_SWAPFACEBUTTONS, "swapFaceButtons", QT_TRANSLATE_NOOP("GameStreamingSettings", "Gamepad button layout")},
+    {SER_MULTICONT, "multiController", QT_TRANSLATE_NOOP("GameStreamingSettings", "Multiple controllers")},
+    {SER_GAMEPADMOUSE, "gamepadMouse", QT_TRANSLATE_NOOP("GameStreamingSettings", "Gamepad mouse control")},
+    {SER_BACKGROUNDGAMEPAD, "backgroundGamepad", QT_TRANSLATE_NOOP("GameStreamingSettings", "Background gamepad input")},
+    {SER_VIDEODEC, "videoDecoderSelection", QT_TRANSLATE_NOOP("GameStreamingSettings", "Video decoder")},
+    {SER_VIDEOCFG, "videoCodecConfig", QT_TRANSLATE_NOOP("GameStreamingSettings", "Video codec")},
+    {SER_RENDERER, "rendererSelection", QT_TRANSLATE_NOOP("GameStreamingSettings", "Renderer")},
+    {SER_HDR, "enableHdr", QT_TRANSLATE_NOOP("GameStreamingSettings", "HDR")},
+    {SER_YUV444, "enableYUV444", QT_TRANSLATE_NOOP("GameStreamingSettings", "YUV 4:4:4")},
+    {SER_SHOWPERFOVERLAY, "showPerformanceOverlay", QT_TRANSLATE_NOOP("GameStreamingSettings", "Performance statistics")},
+};
+}
+
+std::unique_ptr<StreamingPreferences> StreamingPreferences::createTransientCopy() const
+{
+    std::unique_ptr<StreamingPreferences> copy(new StreamingPreferences(nullptr, true));
+    for (int i = staticMetaObject.propertyOffset(); i < staticMetaObject.propertyCount(); ++i) {
+        const auto property = staticMetaObject.property(i);
+        const auto name = QByteArray(property.name());
+        if (property.isWritable() && name != "exportingDiagnostics" && name != "diagnosticsStatus") {
+            property.write(copy.get(), property.read(this));
+        }
+    }
+    copy->recommendedFullScreenMode = recommendedFullScreenMode;
+    copy->packetSize = packetSize;
+    return copy;
+}
+
+QVariantMap StreamingPreferences::gameValues() const
+{
+    QVariantMap values;
+    for (const auto& field : gameFields) {
+        const auto value = property(field.property);
+        values.insert(field.key, value.userType() == QMetaType::Bool ? value : QVariant(value.toInt()));
+    }
+    return values;
+}
+
+QVariantList StreamingPreferences::gameSettingGroups()
+{
+    QVariantList groups;
+    for (const auto& field : gameFields) {
+        if (field.label) groups.append(QVariantMap{{"key", field.key},
+            {"text", QCoreApplication::translate("GameStreamingSettings", field.label)}});
+    }
+    return groups;
+}
+
+QVariantMap StreamingPreferences::validatedGameValues(const QVariantMap& values)
+{
+    QVariantMap valid;
+    for (const auto& field : gameFields) {
+        if (!values.contains(field.key)) continue;
+        const auto property = staticMetaObject.property(staticMetaObject.indexOfProperty(field.property));
+        const auto value = values.value(field.key);
+        bool ok = false;
+        int number = value.toInt(&ok);
+        if (property.userType() == QMetaType::Bool) {
+            const auto string = value.toString().toLower();
+            ok = string == "true" || string == "false" || string == "0" || string == "1";
+            if (ok) valid.insert(field.key, string == "true" || string == "1");
+        }
+        else {
+            if (property.isEnumType()) {
+                ok = ok && number >= 0 && property.enumerator().valueToKey(number) != nullptr;
+                if (QString::fromLatin1(field.key) == SER_VIDEOCFG && number == VCC_FORCE_HEVC_HDR_DEPRECATED) ok = false;
+            }
+            else if (QString::fromLatin1(field.key) == SER_VRRLATENCYMODE) ok = ok && number >= VLM_SMOOTH && number <= VLM_LOW_LATENCY;
+            else if (QString::fromLatin1(field.key) == SER_BITRATE) ok = ok && number >= 500 && number <= 3000000;
+            else ok = ok && number >= (QString::fromLatin1(field.key) == SER_FPS ? 10 : 1) && number <= 9999;
+            // Reject fractional numbers rather than silently truncating them.
+            ok = ok && value.toDouble() == number;
+            if (ok) valid.insert(field.key, number);
+        }
+        if (!ok) qWarning() << "Ignoring invalid per-game streaming setting:" << field.key;
+    }
+    if (valid.contains(SER_WIDTH) != valid.contains(SER_HEIGHT)) {
+        valid.remove(SER_WIDTH);
+        valid.remove(SER_HEIGHT);
+    }
+    if (valid.value(SER_AUTOADJUSTBITRATE).toBool()) valid.remove(SER_BITRATE);
+    else if (valid.contains(SER_AUTOADJUSTBITRATE) && !valid.contains(SER_BITRATE)) valid.remove(SER_AUTOADJUSTBITRATE);
+    if (valid.contains(SER_BITRATE)) valid.insert(SER_AUTOADJUSTBITRATE, false);
+    return valid;
+}
+
+void StreamingPreferences::applyGameValues(const QVariantMap& values)
+{
+    for (const auto& field : gameFields) {
+        if (values.contains(field.key)) setProperty(field.property, values.value(field.key));
+    }
 }
 
 StreamingPreferences* StreamingPreferences::get(QQmlEngine *qmlEngine)
@@ -119,7 +249,23 @@ StreamingPreferences* StreamingPreferences::get(QQmlEngine *qmlEngine)
 
 void StreamingPreferences::reload()
 {
-    QSettings settings;
+    if (m_Transient) return;
+    // The profile picker can create this singleton before a profile is chosen.
+    // An empty snapshot initializes the same defaults without touching storage.
+    QVariantMap settings;
+    if (ProfileManager::hasActiveProfile()) {
+        QSettings storedSettings;
+        ProfileManager::beginProfileSettings(storedSettings);
+
+        // Native VRR always permits tearing. Remove retired timing selectors
+        // only from the selected profile.
+        storedSettings.remove(QStringLiteral("allowvrrtearing"));
+        storedSettings.remove(QStringLiteral("vrrdiagnosticmode"));
+
+        for (const QString& key : storedSettings.childKeys()) {
+            settings.insert(key, storedSettings.value(key));
+        }
+    }
 
     int defaultVer = settings.value(SER_DEFAULTVER, 0).toInt();
 
@@ -146,9 +292,6 @@ void StreamingPreferences::reload()
     autoAdjustBitrate = settings.value(SER_AUTOADJUSTBITRATE, true).toBool();
     enableVsync = settings.value(SER_VSYNC, true).toBool();
     enableVrr = settings.value(SER_ENABLEVRR, false).toBool();
-    // VRR adaptive presentation always requires tearing permission. Remove
-    // the retired override so stale profiles cannot disable native VRR.
-    settings.remove(QStringLiteral("allowvrrtearing"));
     vrrLatencyMode = VLM_BALANCED;
     if (settings.contains(SER_VRRLATENCYMODE)) {
         bool validMode = false;
@@ -163,7 +306,6 @@ void StreamingPreferences::reload()
     }
     smoothVrrFrameTiming = settings.value(SER_SMOOTHVRRFRAMETIMING, true).toBool();
     traceVrrFrames = settings.value(SER_TRACEVRRFRAMES, false).toBool();
-    settings.remove("vrrdiagnosticmode"); // Retired, unpublished timing comparison selector.
     gameOptimizations = settings.value(SER_GAMEOPTS, true).toBool();
     playAudioOnHost = settings.value(SER_HOSTAUDIO, false).toBool();
     multiController = settings.value(SER_MULTICONT, true).toBool();
@@ -231,6 +373,7 @@ void StreamingPreferences::reload()
 
 bool StreamingPreferences::retranslate()
 {
+    if (m_Transient) return false;
     static QTranslator* translator = nullptr;
 
 #if QT_VERSION < QT_VERSION_CHECK(5, 10, 0)
@@ -355,7 +498,12 @@ QString StreamingPreferences::getSuffixFromLanguage(StreamingPreferences::Langua
 
 void StreamingPreferences::save()
 {
+    if (m_Transient || !ProfileManager::hasActiveProfile()) {
+        return;
+    }
+
     QSettings settings;
+    ProfileManager::beginProfileSettings(settings);
 
     settings.setValue(SER_WIDTH, width);
     settings.setValue(SER_HEIGHT, height);
@@ -548,4 +696,11 @@ int StreamingPreferences::getDefaultPyroWaveBitrate(int width, int height, int f
 {
     // Match the author recommendation shown by calibration without running it.
     return pyroWaveRecommendedKbps(width, height, fps, yuv444, hdr);
+}
+
+int StreamingPreferences::getEffectiveDefaultBitrate() const
+{
+    return videoCodecConfig == VCC_FORCE_PYROWAVE
+        ? getDefaultPyroWaveBitrate(width, height, fps, enableYUV444, enableHdr)
+        : getDefaultBitrate(width, height, fps, enableYUV444);
 }

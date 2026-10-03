@@ -4,6 +4,8 @@
 #include <QRect>
 #include <QQmlEngine>
 #include <QVariantList>
+#include <QVariantMap>
+#include <memory>
 
 class StreamingPreferences : public QObject
 {
@@ -23,6 +25,14 @@ public:
     Q_INVOKABLE void save();
 
     void reload();
+
+    Q_INVOKABLE int getEffectiveDefaultBitrate() const;
+
+    std::unique_ptr<StreamingPreferences> createTransientCopy() const;
+    QVariantMap gameValues() const;
+    static QVariantMap validatedGameValues(const QVariantMap& values);
+    static QVariantList gameSettingGroups();
+    void applyGameValues(const QVariantMap& values);
 
     enum AudioConfig
     {
@@ -196,52 +206,52 @@ public:
     Q_INVOKABLE QVariantList getFpsChoices(const QVariantList& refreshRates) const;
 
     // Directly accessible members for preferences
-    int width;
-    int height;
-    int fps;
-    int bitrateKbps;
-    bool unlockBitrate;
-    bool autoAdjustBitrate;
-    bool enableVsync;
-    bool enableVrr;
-    int vrrLatencyMode;
+    int width = 0;
+    int height = 0;
+    int fps = 0;
+    int bitrateKbps = 0;
+    bool unlockBitrate = false;
+    bool autoAdjustBitrate = false;
+    bool enableVsync = false;
+    bool enableVrr = false;
+    int vrrLatencyMode = VLM_BALANCED;
     // Re-present the last frame inside a host gap longer than the panel's
     // adaptive-refresh floor, so the panel never engages its own
     // low-framerate compensation.
-    bool smoothVrrFrameTiming;
-    bool traceVrrFrames;
-    bool gameOptimizations;
-    bool playAudioOnHost;
-    bool multiController;
-    bool enableMdns;
-    bool quitAppAfter;
-    bool absoluteMouseMode;
-    bool absoluteTouchMode;
-    bool framePacing;
-    bool connectionWarnings;
-    bool configurationWarnings;
-    bool richPresence;
-    bool gamepadMouse;
-    bool detectNetworkBlocking;
-    bool showPerformanceOverlay;
-    bool swapMouseButtons;
-    bool muteOnFocusLoss;
-    bool backgroundGamepad;
-    bool reverseScrollDirection;
-    bool swapFaceButtons;
-    bool keepAwake;
-    int packetSize;
-    AudioConfig audioConfig;
-    VideoCodecConfig videoCodecConfig;
-    bool enableHdr;
-    bool enableYUV444;
-    VideoDecoderSelection videoDecoderSelection;
-    WindowMode windowMode;
-    WindowMode recommendedFullScreenMode;
-    UIDisplayMode uiDisplayMode;
-    Language language;
-    CaptureSysKeysMode captureSysKeysMode;
-    RendererSelection rendererSelection;
+    bool smoothVrrFrameTiming = true;
+    bool traceVrrFrames = false;
+    bool gameOptimizations = false;
+    bool playAudioOnHost = false;
+    bool multiController = false;
+    bool enableMdns = false;
+    bool quitAppAfter = false;
+    bool absoluteMouseMode = false;
+    bool absoluteTouchMode = false;
+    bool framePacing = false;
+    bool connectionWarnings = false;
+    bool configurationWarnings = false;
+    bool richPresence = false;
+    bool gamepadMouse = false;
+    bool detectNetworkBlocking = false;
+    bool showPerformanceOverlay = false;
+    bool swapMouseButtons = false;
+    bool muteOnFocusLoss = false;
+    bool backgroundGamepad = false;
+    bool reverseScrollDirection = false;
+    bool swapFaceButtons = false;
+    bool keepAwake = false;
+    int packetSize = 0;
+    AudioConfig audioConfig = AC_STEREO;
+    VideoCodecConfig videoCodecConfig = VCC_AUTO;
+    bool enableHdr = false;
+    bool enableYUV444 = false;
+    VideoDecoderSelection videoDecoderSelection = VDS_AUTO;
+    WindowMode windowMode = WM_FULLSCREEN;
+    WindowMode recommendedFullScreenMode = WM_FULLSCREEN;
+    UIDisplayMode uiDisplayMode = UI_WINDOWED;
+    Language language = LANG_AUTO;
+    CaptureSysKeysMode captureSysKeysMode = CSK_OFF;
+    RendererSelection rendererSelection = RS_AUTO;
 
 signals:
     void displayModeChanged();
@@ -287,11 +297,12 @@ signals:
     void rendererSelectionChanged();
 
 private:
-    explicit StreamingPreferences(QQmlEngine *qmlEngine);
+    explicit StreamingPreferences(QQmlEngine *qmlEngine, bool transient = false);
 
     QString getSuffixFromLanguage(Language lang);
 
     QQmlEngine* m_QmlEngine;
+    bool m_Transient;
     bool m_ExportingDiagnostics = false;
     QString m_DiagnosticsStatus;
 };

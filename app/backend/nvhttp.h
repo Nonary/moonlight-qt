@@ -9,6 +9,8 @@
 #include <QUrl>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
+#include <atomic>
+#include <memory>
 
 class NvComputer;
 
@@ -205,4 +207,7 @@ private:
     QNetworkAccessManager* m_Nam;
     QSslCertificate m_ServerCert;
     bool m_UseTrueUid;
+    QString m_ClientUniqueId;
+    QSslConfiguration m_ClientSslConfig;
+    std::shared_ptr<std::atomic_bool> m_RequestCanceled;
 };

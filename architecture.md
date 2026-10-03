@@ -3532,6 +3532,21 @@ decode service, GPU dependency wait, preparation/acquisition, scheduler lateness
 intentional queue protection, submission behavior, and native/display evidence.
 An average FPS counter alone can conceal all of these.
 
+## Client profile lifecycle
+
+Client profiles isolate identity, paired hosts, preferences, controller mappings
+and artwork. A profile change suspends HTTP requests, cancels existing clients,
+and drains host/artwork and PyroWave calibration workers before replacing the
+identity. Models discard the old host pointers before storage is reloaded.
+Calibration callbacks carry a generation so queued results cannot update the
+next profile. This changes configuration ownership, not the VRR timing policy.
+
+Per-game overrides resolve profile preferences, then sparse host/application
+settings, then explicit CLI options. The session owns a transient configuration
+copy and derives the existing presentation snapshot from that copy. Operational
+diagnostic/export status stays on the global preferences object. Codec-dependent
+automatic bitrate is calculated after the final codec, chroma and HDR choices.
+
 ## 15. Tests, deployment boundaries, and maintenance
 
 The deterministic suites are

@@ -21,6 +21,10 @@ public:
 
     ParseResult parse(const QStringList &args);
 
+    QString getProfile() const;
+
+private:
+    QString m_Profile;
 };
 
 class QuitCommandLineParser
@@ -59,7 +63,7 @@ public:
     StreamCommandLineParser();
     virtual ~StreamCommandLineParser();
 
-    void parse(const QStringList &args, StreamingPreferences *preferences);
+    void parse(const QStringList &args, StreamingPreferences *preferences, bool warnOnRanges = true);
 
     QString getHost() const;
     QString getAppName() const;

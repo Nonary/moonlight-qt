@@ -38,6 +38,7 @@ public:
         setSingleDashWordOptionMode(QCommandLineParser::ParseAsLongOptions);
         addHelpOption();
         addVersionOption();
+        addOption(QCommandLineOption("profile", "Use the specified Moonlight profile.", "profile"));
         addOption(QCommandLineOption("haptics-license", "Print haptics component notices, licenses and covered source (use alone)."));
     }
 
@@ -167,6 +168,7 @@ GlobalCommandLineParser::ParseResult GlobalCommandLineParser::parse(const QStrin
     );
     parser.addPositionalArgument("action", "Action to execute", "<action>");
     parser.parse(args);
+    m_Profile = parser.value("profile");
     auto posArgs = parser.positionalArguments();
 
     if (posArgs.isEmpty()) {
@@ -198,6 +200,11 @@ GlobalCommandLineParser::ParseResult GlobalCommandLineParser::parse(const QStrin
 
         parser.showError("Invalid action");
     }
+}
+
+QString GlobalCommandLineParser::getProfile() const
+{
+    return m_Profile;
 }
 
 QuitCommandLineParser::QuitCommandLineParser()
@@ -329,7 +336,7 @@ StreamCommandLineParser::~StreamCommandLineParser()
 {
 }
 
-void StreamCommandLineParser::parse(const QStringList &args, StreamingPreferences *preferences)
+void StreamCommandLineParser::parse(const QStringList &args, StreamingPreferences *preferences, bool warnOnRanges)
 {
     CommandLineParser parser;
     parser.setupCommonOptions();
@@ -410,7 +417,7 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     // Resolve --fps option
     if (parser.isSet("fps")) {
         preferences->fps = parser.getIntOption("fps");
-        if (!inRange(preferences->fps, 10, 480)) {
+        if (warnOnRanges && !inRange(preferences->fps, 10, 480)) {
             fprintf(stderr, "Warning: FPS is out of the supported range (10 - 480 FPS). Performance may suffer!\n");
         }
     }
@@ -418,12 +425,7 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     // Resolve --bitrate option
     if (parser.isSet("bitrate")) {
         preferences->bitrateKbps = parser.getIntOption("bitrate");
-        if (!inRange(preferences->bitrateKbps, 500, 500000)) {
-            fprintf(stderr, "Warning: Bitrate is out of the supported range (500 - 500000 Kbps). Performance may suffer!\n");
-        }
-    } else if (displaySet || parser.isSet("fps")) {
-        preferences->bitrateKbps = preferences->getDefaultBitrate(
-            preferences->width, preferences->height, preferences->fps, preferences->enableYUV444);
+        preferences->autoAdjustBitrate = false;
     }
 
     // Resolve --packet-size option
@@ -515,6 +517,22 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     // Resolve --video-decoder option
     if (parser.isSet("video-decoder")) {
         preferences->videoDecoderSelection = mapValue(m_VideoDecoderMap, parser.getChoiceOptionValue("video-decoder"));
+    }
+
+    // Resolve bitrate after the effective codec, HDR and chroma are known.
+    if (parser.isSet("bitrate")) {
+        const bool pyroWave = preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_PYROWAVE;
+        const int minimum = pyroWave ? 5000 : 500;
+        const int maximum = pyroWave ? 3000000 : 500000;
+        if (warnOnRanges && !inRange(preferences->bitrateKbps, minimum, maximum)) {
+            fprintf(stderr, "Warning: Bitrate is out of the supported range (%d - %d Kbps). Performance may suffer!\n", minimum, maximum);
+        }
+    }
+    else if (preferences->autoAdjustBitrate && (displaySet || parser.isSet("fps") ||
+        parser.isSet("yuv444") || parser.isSet("no-yuv444") ||
+         parser.isSet("video-codec") || (preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_PYROWAVE &&
+         (parser.isSet("hdr") || parser.isSet("no-hdr"))))) {
+        preferences->bitrateKbps = preferences->getEffectiveDefaultBitrate();
     }
 
     // This method will not return and terminates the process if --version or

@@ -1,4 +1,5 @@
 #include "identitymanager.h"
+#include "profilemanager.h"
 #include "utils.h"
 
 #include <QDebug>
@@ -24,6 +25,12 @@ IdentityManager::get()
     }
 
     return s_Im;
+}
+
+void IdentityManager::reset()
+{
+    delete s_Im;
+    s_Im = nullptr;
 }
 
 void IdentityManager::createCredentials(QSettings& settings)
@@ -109,6 +116,7 @@ void IdentityManager::createCredentials(QSettings& settings)
 IdentityManager::IdentityManager()
 {
     QSettings settings;
+    ProfileManager::beginProfileSettings(settings);
 
     m_CachedPemCert = settings.value(SER_CERT).toByteArray();
     m_CachedPrivateKey = settings.value(SER_KEY).toByteArray();

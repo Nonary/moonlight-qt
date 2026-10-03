@@ -1,0 +1,25 @@
+<RCC>
+    <!-- UI tests use the real artwork without depending on stream resources,
+         generated shaders, translations, or the controller database submodule. -->
+    <qresource prefix="/res">
+        <file alias="ic_videogame_asset_white_48px.svg">../app/res/ic_videogame_asset_white_48px.svg</file>
+        <file alias="desktop_windows-48px.svg">../app/res/desktop_windows-48px.svg</file>
+        <file alias="ic_add_to_queue_white_48px.svg">../app/res/ic_add_to_queue_white_48px.svg</file>
+        <file alias="account_circle.svg">../app/res/account_circle.svg</file>
+        <file alias="baseline-lock-24px.svg">../app/res/baseline-lock-24px.svg</file>
+        <file alias="play_arrow_FILL1_wght700_GRAD200_opsz48.svg">../app/res/play_arrow_FILL1_wght700_GRAD200_opsz48.svg</file>
+        <file alias="baseline-warning-24px.svg">../app/res/baseline-warning-24px.svg</file>
+        <file alias="warning_FILL1_wght300_GRAD200_opsz24.svg">../app/res/warning_FILL1_wght300_GRAD200_opsz24.svg</file>
+        <file alias="stop_FILL1_wght700_GRAD200_opsz48.svg">../app/res/stop_FILL1_wght700_GRAD200_opsz48.svg</file>
+        <file alias="no_app_image.png">../app/res/no_app_image.png</file>
+        <file alias="settings.svg">../app/res/settings.svg</file>
+        <file alias="arrow_left.svg">../app/res/arrow_left.svg</file>
+        <file alias="question_mark.svg">../app/res/question_mark.svg</file>
+        <file alias="moonlight.svg">../app/res/moonlight.svg</file>
+        <file alias="update.svg">../app/res/update.svg</file>
+        <file alias="baseline-help_outline-24px.svg">../app/res/baseline-help_outline-24px.svg</file>
+        <file alias="baseline-error_outline-24px.svg">../app/res/baseline-error_outline-24px.svg</file>
+        <file alias="baseline-check_circle_outline-24px.svg">../app/res/baseline-check_circle_outline-24px.svg</file>
+        <file alias="discord.svg">../app/res/discord.svg</file>
+    </qresource>
+</RCC>

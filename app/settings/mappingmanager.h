@@ -71,6 +71,7 @@ public:
     void save();
 
 private:
+    QString m_ProfileId;
     QMap<QString, SdlGamepadMapping> m_Mappings;
 
     static MappingFetcher* s_MappingFetcher;

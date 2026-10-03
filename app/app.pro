@@ -174,6 +174,7 @@ macx {
 SOURCES += \
     backend/nvaddress.cpp \
     backend/nvapp.cpp \
+    backend/profilemanager.cpp \
     cli/pair.cpp \
     main.cpp \
     backend/computerseeker.cpp \
@@ -191,6 +192,7 @@ SOURCES += \
     settings/compatfetcher.cpp \
     settings/mappingfetcher.cpp \
     settings/streamingpreferences.cpp \
+    settings/gamestreamingsettings.cpp \
     diagnostics/diagnosticcapture.cpp \
     diagnostics/gputrace.cpp \
     diagnostics/diagnosticzip.cpp \
@@ -228,6 +230,7 @@ HEADERS += \
     SDL_compat.h \
     backend/nvaddress.h \
     backend/nvapp.h \
+    backend/profilemanager.h \
     cli/pair.h \
     settings/compatfetcher.h \
     settings/mappingfetcher.h \
@@ -246,6 +249,7 @@ HEADERS += \
     cli/quitstream.h \
     cli/startstream.h \
     settings/streamingpreferences.h \
+    settings/gamestreamingsettings.h \
     diagnostics/diagnosticcapture.h \
     diagnostics/gputrace.h \
     diagnostics/diagnosticzip.h \

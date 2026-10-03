@@ -278,7 +278,7 @@ private:
         StreamingPreferences::RendererSelection rendererSelection = StreamingPreferences::RS_AUTO;
     };
 
-    StreamingPreferences* m_Preferences;
+    std::unique_ptr<StreamingPreferences> m_Preferences;
     PresentationSettings m_PresentationSettings;
     std::unique_ptr<DiagnosticCapture> m_DiagnosticCapture;
     bool m_IsFullScreen;

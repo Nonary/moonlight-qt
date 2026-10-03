@@ -2,11 +2,11 @@
 
 #include <QObject>
 #include <QVariant>
+#include <QStringList>
 
 class ComputerManager;
 class NvComputer;
 class Session;
-class StreamingPreferences;
 
 namespace CliStartStream
 {
@@ -21,7 +21,7 @@ class Launcher : public QObject
 
 public:
     explicit Launcher(QString computer, QString app,
-                      StreamingPreferences* preferences,
+                      QStringList arguments,
                       QObject *parent = nullptr);
     ~Launcher();
     Q_INVOKABLE void execute(ComputerManager *manager);

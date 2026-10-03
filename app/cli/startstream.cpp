@@ -2,6 +2,8 @@
 #include "backend/computermanager.h"
 #include "backend/computerseeker.h"
 #include "streaming/session.h"
+#include "settings/gamestreamingsettings.h"
+#include "commandlineparser.h"
 
 #include <QCoreApplication>
 #include <QTimer>
@@ -102,7 +104,13 @@ public:
                     m_TimeoutTimer->stop();
                     if (isNotStreaming() || isStreamingApp(app)) {
                         m_State = StateStartSession;
-                        session = new Session(m_Computer, app, m_Preferences);
+                        auto preferences = GameStreamingSettings::resolve(*StreamingPreferences::get(),
+                            m_ComputerManager->profileId(), m_Computer->uuid, app.id);
+                        // Parse onto the resolved snapshot so explicitly supplied options
+                        // win even when their values happen to match profile defaults.
+                        StreamCommandLineParser parser;
+                        parser.parse(m_Arguments, preferences.get());
+                        session = new Session(m_Computer, app, preferences.get());
                         emit q->sessionCreated(app.name, session);
                     } else {
                         emit q->appQuitRequired(getCurrentAppName());
@@ -173,7 +181,7 @@ public:
     Launcher *q_ptr;
     QString m_ComputerName;
     QString m_AppName;
-    StreamingPreferences *m_Preferences;
+    QStringList m_Arguments;
     ComputerManager *m_ComputerManager;
     ComputerSeeker *m_ComputerSeeker;
     NvComputer *m_Computer;
@@ -182,14 +190,14 @@ public:
 };
 
 Launcher::Launcher(QString computer, QString app,
-                   StreamingPreferences* preferences, QObject *parent)
+                   QStringList arguments, QObject *parent)
     : QObject(parent),
       m_DPtr(new LauncherPrivate(this))
 {
     Q_D(Launcher);
     d->m_ComputerName = computer;
     d->m_AppName = app;
-    d->m_Preferences = preferences;
+    d->m_Arguments = arguments;
     d->m_State = StateInit;
     d->m_TimeoutTimer = new QTimer(this);
     d->m_TimeoutTimer->setSingleShot(true);
