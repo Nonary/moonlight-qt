@@ -196,7 +196,9 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutPredictionOnly = 1;
     // Every normal VRR session uses the interval-quality queue. Historical
     // policies remain selectable only through explicit diagnostic parameters.
-    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 9;
+    // Restore revision 7: reporting and buffer control share the one-second
+    // mean-before-tolerance score. Revisions 9/10 remain replayable.
+    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 7;
     // Timeline mapping anchors to decode completion, absorbing hardware decode
     // duration into the sender offset instead of inflating client buffer delay.
     parameters.playoutSourceMappingDecoderOutput = 0;
@@ -2235,7 +2237,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutRecentPressureRelease,
                 m_Parameters.playoutSerialServiceGate,
                 m_Parameters.playoutHoldRenewBelowTarget,
-                m_Parameters.playoutResponsiveBuffer >= 9);
+                m_Parameters.playoutResponsiveBuffer >= 9,
+                m_Parameters.playoutResponsiveBuffer >= 10);
         }
         else m_MeanMissBuffer.observe(submissionUs, ready > deadline ? ready - deadline : 0,
             p.applied, submitted && !cancelled && m_Pending.hasPreparationDuration &&

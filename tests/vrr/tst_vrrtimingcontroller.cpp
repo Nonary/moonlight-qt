@@ -994,7 +994,7 @@ void testProductionPreparationUsesAvailableSlack()
                    policy.renderStartAfterSubmissionUs == 0 &&
                    policy.renderStartPreserveLearnedLead == 1,
                "production must spend the playout cushion on preparation without squeezing learned lead");
-        expect(policy.playoutResponsiveBuffer == 9 &&
+        expect(policy.playoutResponsiveBuffer == 7 &&
                    policy.playoutSerialServiceGate == 2 &&
                    policy.playoutSourceMappingDecoderOutput == 0 &&
                    policy.playoutSmoothingGainPerMille == 150,
@@ -3055,7 +3055,7 @@ void testBalancedReadinessFloorFollowsLoad()
     const auto run = [&](uint64_t perMille, bool tailOnly = false) {
         auto policy = production;
         // This fixture isolates the recorded revision-7 readiness floor.
-        // Production revision 9 may raise delay without that floor.
+        // Production may raise delay without that historical floor.
         policy.playoutResponsiveBuffer = 7;
         policy.playoutReadinessFloorPerMille = perMille;
         VrrTimingController controller(session, true, policy);
@@ -5772,7 +5772,7 @@ void testPresetReadinessTargets()
         const auto policy = vrrTimingParametersForSession(session);
         const uint64_t target = mode == 2 ? 990000 : mode == 1 ? 995000 : 999900;
         const uint64_t window = mode == 2 ? 60000000 : mode == 1 ? 120000000 : 300000000;
-        expect(policy.playoutResponsiveBuffer == 9 &&
+        expect(policy.playoutResponsiveBuffer == 7 &&
                    policy.playoutOnTimeTargetPerMillion == target &&
                    policy.playoutReadinessWindowUs == window,
                "presets must resolve their exact reliability target and bounded history");
@@ -5952,7 +5952,7 @@ void testMeanMissBuffer()
         auto session = config(116, 120);
         session.latencyMode = mode;
         const auto policy = vrrTimingParametersForSession(session);
-        expect(policy.playoutResponsiveBuffer == 9 &&
+        expect(policy.playoutResponsiveBuffer == 7 &&
             policy.playoutSourceMappingDecoderOutput == 0 &&
             policy.playoutSerialServiceGate == 2 &&
             policy.playoutRecentPressureRelease == 3 &&
@@ -6100,6 +6100,114 @@ void testPerIntervalBufferPreventsRecoverableSpikes()
     expect(peak > 1000 && peak <= 4000 && excess < unprotectedExcess &&
                buffer.stats().qualityPercent() >= 99.0,
            "buffering must reduce modeled recoverable excess without chasing the delay cap");
+}
+
+void testRelaxedBufferControlPreservesAccurateReporting()
+{
+    // Feed identical outcomes to all three policies: revision 7/8 is the
+    // control reference, revision 9 is the reporting reference, and revision
+    // 10 must match both independently on every observation.
+    for (int mode : {0, 1, 2}) {
+        auto session = config(100, 120);
+        session.latencyMode = mode;
+        const auto policy = vrrTimingParametersForSession(session);
+        for (int cause = 0; cause < 8; ++cause) {
+            Vrr13::IntervalBuffer former, accurate, relaxed;
+            uint64_t intended = 1000000, applied = 3500;
+            bool sawAccuratePenalty = false, sawGrowth = false, sawRelease = false;
+            for (uint64_t i = 1; i <= 3600; ++i) {
+                const uint64_t period = cause == 6 && i > 1200 ? 20000 : 10000;
+                intended += period;
+                if (cause == 7 && i == 1800) intended += 3000000;
+                const bool disturbed = i > 120 && i <= 1200;
+                const uint64_t late = disturbed &&
+                    (cause == 0 ? i % 25 == 0 : i % 2 == 0) ? 2000 : 0;
+                const bool valid = !(cause == 5 && i % 197 == 0);
+                Vrr13::IntervalBuffer::Sample sample{
+                    i, intended, intended + late, intended,
+                    intended + (cause == 2 ? 0 : late), applied, valid, true,
+                    cause == 3 && i <= 1200 ? 12000ULL : 1000ULL,
+                    cause == 4 && i <= 1200 ? 12000ULL : 0ULL};
+                if (cause == 6 && i == 1600) {
+                    former.restoreTarget(5000, sample.submitted);
+                    relaxed.restoreTarget(5000, sample.submitted);
+                }
+                const auto observe = [&](Vrr13::IntervalBuffer& buffer,
+                                         bool perInterval, bool averagedControl) {
+                    buffer.observe(sample, 1000, 8000,
+                        policy.playoutMeanMissHoldUs, policy.playoutMeanMissReleaseUsPerSecond,
+                        true, policy.playoutOnTimeTargetPerMillion,
+                        policy.playoutIntervalToleranceUs, policy.playoutReadinessWindowUs,
+                        500000, 32, 3, 2, 3, perInterval, averagedControl);
+                };
+                const auto before = relaxed.demand(applied);
+                observe(former, false, false);
+                observe(accurate, true, false);
+                observe(relaxed, true, true);
+                const auto oldStats = former.stats(), reportStats = accurate.stats(), stats = relaxed.stats();
+                applied = relaxed.demand(applied);
+                expect(applied == former.demand(applied) &&
+                           stats.update.action == oldStats.update.action &&
+                           stats.update.holdRemainingUs == oldStats.update.holdRemainingUs &&
+                           stats.update.cooldownRemainingUs == oldStats.update.cooldownRemainingUs &&
+                           stats.update.attemptedIncreaseUs == oldStats.update.attemptedIncreaseUs &&
+                           stats.update.clippedIncreaseUs == oldStats.update.clippedIncreaseUs &&
+                           stats.lastGrowthAtUs == oldStats.lastGrowthAtUs &&
+                           stats.lastGrowthUs == oldStats.lastGrowthUs,
+                       "relaxed growth, holds, release and caps must match the former buffer on every frame");
+                expect(stats.bufferLossFraction() == oldStats.lossFraction(),
+                       "the buffer must use the former long-window loss, including zero-error intervals");
+                expect(stats.evaluatedUs == reportStats.evaluatedUs &&
+                           stats.failedUs == reportStats.failedUs &&
+                           stats.weightedLossUs == reportStats.weightedLossUs &&
+                           stats.qualityPercent() == reportStats.qualityPercent() &&
+                           stats.averageErrorUs == reportStats.averageErrorUs,
+                       "client timing and its one-second error must match accurate reporting exactly");
+                sawAccuratePenalty |= stats.qualityPercent() < stats.bufferQualityPercent();
+                sawGrowth |= applied > before;
+                sawRelease |= applied < before;
+            }
+            expect(sawAccuratePenalty && sawRelease,
+                   "the fixture must expose distinct reporting/control scores and exercise recovery");
+            expect(cause == 0 || cause == 2 || cause == 3 || cause == 4 ? !sawGrowth : sawGrowth,
+                   "rare spikes, submission-only jitter and overload must not grow the relaxed buffer");
+            intended += policy.playoutReadinessWindowUs + 1000000;
+            relaxed.observe({3601, intended, intended, intended, intended, applied, true, true},
+                1000, 8000, policy.playoutMeanMissHoldUs, policy.playoutMeanMissReleaseUsPerSecond,
+                true, policy.playoutOnTimeTargetPerMillion, policy.playoutIntervalToleranceUs,
+                policy.playoutReadinessWindowUs, 500000, 32, 3, 2, 3, true, true);
+            expect(relaxed.stats().evaluatedUs == 0 && relaxed.stats().qualityPercent() == 100.0 &&
+                       relaxed.stats().bufferQualityPercent() == 100.0,
+                   "both histories must expire together without treating silence as clean recovery");
+        }
+    }
+
+    // These two buffers see the same rare misses, but the raised one must
+    // release even though accurate reporting remains below the selected goal.
+    for (int mode : {0, 1, 2}) {
+        auto session = config(100, 120);
+        session.latencyMode = mode;
+        const auto policy = vrrTimingParametersForSession(session);
+        Vrr13::IntervalBuffer low, raised;
+        uint64_t applied = 3500;
+        for (uint64_t i = 1; i <= 2000; ++i) {
+            const uint64_t intended = 1000000 + i * 10000;
+            const uint64_t late = i % 25 == 0 ? 2000 : 0;
+            for (auto* buffer : {&low, &raised}) {
+                const uint64_t bufferUs = buffer == &low ? 1000 : applied;
+                buffer->observe({i, intended, intended + late, intended,
+                                 intended + late, bufferUs, true, true, 1000, 0},
+                    1000, 8000, policy.playoutMeanMissHoldUs, policy.playoutMeanMissReleaseUsPerSecond,
+                    true, policy.playoutOnTimeTargetPerMillion, policy.playoutIntervalToleranceUs,
+                    policy.playoutReadinessWindowUs, 500000, 32, 3, 2, 3, true, true);
+            }
+            applied = raised.demand(applied);
+        }
+        expect(low.demand(1000) == 1000 && applied == 1000 &&
+                   raised.stats().qualityPercent() < policy.playoutOnTimeTargetPerMillion / 10000.0 &&
+                   raised.stats().bufferQualityPercent() == 100.0,
+               "rare spikes must stay accurately reported without raising or retaining standing delay");
+    }
 }
 
 void testIntervalBufferReleaseAcrossShortGaps()
@@ -6924,6 +7032,7 @@ int main()
     testIntervalQualityBuffer();
     testPerIntervalExcessQuality();
     testPerIntervalBufferPreventsRecoverableSpikes();
+    testRelaxedBufferControlPreservesAccurateReporting();
     testIntervalBufferReleaseAcrossShortGaps();
     testAlternatingSlowCadenceLeavesFastRate();
     testInitialPreparationIsNotTypicalRender();

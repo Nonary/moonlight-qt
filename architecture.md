@@ -9,10 +9,16 @@ Current source review baseline: `3cb67d3e` plus the packet-count shimmering
 warning correction in this worktree (2026-10-05). Automatic Windows composition
 presentation, explicit native synchronization and continuous D3D11 overlay
 publication are included.
+Buffer control was reviewed against `244779f9` plus this worktree on 2026-10-07.
+Production again selects responsive revision 7: client timing and buffer
+growth, holds and release share the former one-second mean-before-tolerance
+calculation. The displayed score and target therefore use the same metric.
+Revisions 9/10 remain available only for replay of their recorded policies.
+The experimental buffer policies from earlier tonight are stashed, not active.
 The upstream two-step PyroWave calibration targets, planned-present timing
 judgements and below-VRR-floor pause are included. The shared customizable VRR
 settings, Reduce judder readiness bound, above-target shrinkage correction,
-and per-interval excess scoring remain active. Deployment and live smoothness
+and the restored averaged interval scoring remain active. Deployment and live smoothness
 must be verified separately from this source description. Dated investigation
 sections below retain their historical policy and validation context; sections
 3, 8, 11, and 13 describe current selection and execution.
@@ -1784,9 +1790,9 @@ the shared-device/copy path against the separate-device/bind path.
 
 ### Production interval-quality queue (promoted from V2)
 
-Every normal VRR session now selects revision 9 without an A/B setting. The queue
-uses 0.5 ms tolerance for Low Latency and Balanced Target and 0.2 ms for Smooth;
-explicit revision 8 retains its 250 us tolerance for historical replay. Preset
+Every normal VRR session now selects revision 7 without an A/B setting. The queue
+uses 0.5 ms tolerance for Low Latency and Balanced Target and 0.25 ms for Smooth;
+explicit historical revisions retain their recorded tolerances. Preset
 targets and severity weighting remain active.
 Revision 7 retains revision 6's interval measurement and replaces its
 binary score with severity-weighted quality tied to each latency preset.
@@ -1799,28 +1805,34 @@ are removed before scoring. Submission boundaries are a display-timing proxy,
 not optical scanout confirmation. Discontinuous/missing frames break the pair;
 their drops remain separately visible.
 
-The controller and overlay share a diagnostic one-second average (10 ms buckets). After
+The controller and overlay share a one-second average (10 ms buckets). After
 initial qualification (500 ms and 32 intervals), or one-second requalification
 following a later sequence break, interval error through the selected profile tolerance
-is accepted (0.5 ms for Low Latency/Balanced Target, 0.2 ms for Smooth). For each
-evaluated interval, revision 9 computes
+is accepted (0.5 ms for Low Latency/Balanced Target, 0.25 ms for Smooth). For each
+evaluated interval, revisions 9/10 report
 `loss = clamp(max(intervalErrorUs - toleranceUs, 0) / intendedIntervalUs, 0, 1)`.
-Revisions 7/8 instead use `meanErrorUs`, retaining their captured scoring and
-growth behavior for historical replay.
-The shared score is `100 * (1 - sum(actualIntervalUs * loss) / sum(actualIntervalUs))`
+Production revision 7 instead uses `meanErrorUs` for both reporting and control.
+Explicit revision 8 uses the same arithmetic with its historical tolerance.
+The reported score is `100 * (1 - sum(actualIntervalUs * loss) / sum(actualIntervalUs))`
 over the selected preset's one/two/five-minute history, using 100 ms buckets.
 Loss retains fractional microseconds rather than rounding every frame. Missing
 coverage is unknown; before the selected history duration, the score uses the
 available evaluated time. This is timing quality, not a percentage of perfect
 frames or a perceptually calibrated score.
-The same calculation serves all presets and both controller and overlay.
+Historical revision 10 separately accumulates buffer-control loss using the qualified
+one-second `meanErrorUs` in place of `intervalErrorUs` in the loss formula.
+It weights that loss over the same preset history and evaluated intervals.
+Growth qualification, current pressure, attack amount, hold renewal, clean
+recovery and release all use this relaxed signal. The accurate reported score
+can stay below target while the buffer releases; it is not the control score.
+Revision 9 retains its coupled per-interval reporting/control for exact replay.
 
 Low Latency / Balanced Target / Smooth seek 99% / 99.5% / 99.99%, respectively,
 over one / two / five minutes.
-An attack requires the preset-duration score below its target, current interval loss
+An attack requires the preset-duration buffer-control score below its target, current mean-based loss
 above the preset's allowed loss, and a fresh interval error over the selected
 tolerance with
-readiness-attributable lateness. It acquires only the current interval excess above
+readiness-attributable lateness. It acquires only the mean-based excess above
 the preset allowance (`(1 - target) * intendedIntervalUs`), bounded by fresh
 error above tolerance, the affected frame's lateness, 250 us per 250 ms, and
 125 us applied per frame. The attributed frame must also be absorbable: its
@@ -1834,7 +1846,7 @@ buffer growth, and work that cannot fit a slot cannot be repaired by adding
 standing delay.
 
 Current attributable pressure renews the protection hold and clears fractional
-release credit only while the preset-duration quality score is below its target.
+release credit only while the preset-duration buffer-control score is below its target.
 Production records `playout_hold_renew_below_target=3`: score changes in either
 direction at or above the target neither restart the hold nor pause qualified
 recovery or gradual release. An above-target capacity dip pauses earning
@@ -1842,15 +1854,12 @@ recovery and release while service cannot fit, but preserves earned recovery
 instead of restarting the timer. Revision 2 retained that capacity-reset
 behavior; revision 3 removes it above target. Revision 1 avoided hold renewal above target but
 still paused recovery; revision 0 retains its earlier pressure-based hold.
-Captured values preserve historical behaviors for exact replay. The long score still qualifies a future attack and remains the
-reported preset-quality history, but an old below-target score does not renew the
-live release hold after recent pressure clears. Smooth requires ten clean
-seconds before release (increased from six after the latest gameplay report),
-retaining its slower 50 us/second release speed. Low Latency and Balanced Target
-hold for six/eight clean seconds. Low Latency retains 125 us per second; the
-current policy raises Balanced from the `6bea92dd` baseline's 100 us per second
-to the replay-selected 250 us per second knee. The longer holds still retain
-protection between disturbances. The Balanced rate is a controller tradeoff, not
+Captured values preserve historical behaviors for exact replay. The long control
+score qualifies a future attack, but old below-target debt does not renew the
+live release hold after recent pressure clears. All current presets share an
+eight-second clean hold and 250 us/second release. Older mode-specific holds
+and rates remain only in historical captures. These holds retain protection
+between disturbances. The release rate is a controller tradeoff, not
 live visual proof. This adjustment
 cannot improve a session already pinned at its buffer cap. The hold and release values
 are serialized independently, so revision 7 captures retain their own settings.
@@ -1858,7 +1867,7 @@ The one-second detection window remains unchanged; quality uses the selected
 one/two/five-minute history window. The overlay shows quality versus the selected target plus the current
 one-second mean and selected tolerance. Historical revision 6 retains its binary proportion of evaluated
 time within 500 us and its threshold-only buffer adaptation when selected through
-explicit controller parameters. Explicit revision 8 retains its 250 us severity tolerance for historical compatibility; production sessions capture revision 7 and display the selected 0.50 ms or 0.20 ms tolerance. The regression report supports restoring the last user-confirmed smooth setting; the initial capture was a 417-row connection fragment. After normal application exit, the finalized latest capture contained 1,981 rows over 17.91 seconds, in Lowest latency mode, with applied buffer fixed at its 4,310 us cap and 26 playback drops. It does not demonstrate buffer oscillation or isolate tolerance as the cause of the reported motion regression.
+explicit controller parameters. Explicit revision 8 retains its 250 us severity tolerance for historical compatibility; current production captures revision 7 and displays the configured tolerance (0.50/0.50/0.25 ms preset defaults). The earlier revision-7 regression report supported restoring the last user-confirmed smooth setting; its initial capture was a 417-row connection fragment. After normal application exit, that finalized capture contained 1,981 rows over 17.91 seconds, in Lowest latency mode, with applied buffer fixed at its 4,310 us cap and 26 playback drops. It did not demonstrate buffer oscillation or isolate tolerance as the cause of the reported motion regression.
 
 The preference, Session presentation snapshot, decoder parameters, Pacer signature,
 and VrrSessionConfig no longer carry a queue-arm flag. The existing
@@ -2776,7 +2785,7 @@ timing parameters. Exact replay uses captured parameters, independent of whether
 the recording was enabled through Settings or an external launcher.
 
 The resolver enables timestamp playout, shared readiness history and adaptive
-delay. Windows, Linux, and macOS use the revision-9 interval policy: client-added
+delay. Windows, Linux, and macOS use the revision-7 interval policy: averaged client-added
 submission-interval error triggers growth only with attributable late work that
 can fit its intended interval. The older thresholded-event policy is disabled
 with `playout_readiness_hitch_threshold_us=0`. Native-hitch adaptation is disabled.
@@ -2790,7 +2799,7 @@ zero initializer values preserve historical replay when captures omit them.
 The latency presets set independent caps; per-frame native slot protection
 remains enabled.
 Display smoothness feedback remains diagnostic. Historical Linux thresholded
-submission-error attribution is retained for replay; live revision 9 uses the
+submission-error attribution is retained for replay; live revision 7 uses the
 shared interval policy described above.
 Historical feedback policies remain selectable for exact replay.
 It disables the retired metronome and enables preparation on arrival.
@@ -3195,16 +3204,20 @@ legacy/replay behavior. In that branch 1000 per mille means p100, 999 means
 p99.9, and 995 means p99.5. Those values must not be confused with the active
 Reserve p99.95 implementation.
 
-Production sets `playout_prediction_only=1` and `playout_responsive_buffer=9`
+Production sets `playout_prediction_only=1` and `playout_responsive_buffer=7`
 for every normal VRR session. The interval-quality observer described above owns
 requested delay, with 125 us per-frame attack application and preset-timed
-release. Revision 9 scores each interval as
+release. Historical revisions 9/10 report each interval as
 `min(1, max(abs(actualInterval - intendedInterval) - tolerance, 0) / intendedInterval)`
-and averages that fractional loss over evaluated time in the preset's history
-window. The one-second mean remains diagnostic. Fresh per-interval excess and
-below-target history authorize growth only with eligible, absorbable late
-readiness; the 250 us request step and 250 ms cooldown remain unchanged.
-Revisions 7/8 retain their mean-before-tolerance scoring for exact replay.
+and average that fractional loss over evaluated time in the preset's history
+window. Production revision 7 uses
+`min(1, max(meanErrorOverOneSecond - tolerance, 0) / intendedInterval)` for
+both reporting and buffer control, accumulating time-weighted loss in that
+same history. Historical revision 10 uses this mean-based loss only for control,
+including hold/release qualification, while reporting per-interval loss. Fresh per-interval
+excess and eligible, absorbable late readiness are still required for growth;
+the 250 us request step and 250 ms cooldown remain unchanged. Revision 9
+retains coupled per-interval control; revisions 7/8 retain their old reports.
 With `playout_smoothing_readiness_bound=1`, its readiness attribution
 uses the later of the raw and smoothed targets, excluding misses caused solely
 by advancing an otherwise on-time frame. The same attribution governs hold
@@ -4135,13 +4148,15 @@ available outcomes before 30 seconds have elapsed. This remains a readiness
 measurement, not a visible-smoothness score. With no eligible frames, the line
 shows the starting state. Revision 4 applies the same thresholded-miss policy to
 this score: through 1 ms is on time, 1-2 ms counts only above 50% prevalence,
-and over 2 ms or a drop always counts. Production revision 9 instead reports
+and over 2 ms or a drop always counts. Production revision 7 instead reports
 the interval buffer's one-second mean error and severity-weighted quality over
 the preset's history window; these are not that older readiness percentage.
-Tolerance is applied to each interval before time-weighted averaging, so
-isolated excess cannot disappear beneath a clean one-second mean. The score
-still measures severity, rather than the share of frames inside tolerance;
-unobserved sequence gaps remain excluded and drops are reported separately.
+Tolerance is applied to the one-second mean before severity weighting. Both
+the report and buffer control use this averaged score and the displayed target.
+Isolated spikes can disappear beneath tolerance; this is a buffer-control quality
+measure, not the share of perfect frames or a guarantee of visible smoothness.
+Unobserved sequence gaps remain excluded and drops are reported separately.
+Historical revisions 9/10 retain per-interval reporting for exact replay.
 
 With deep tracing off, the overview retains the VRR17 frame queue delay,
 rendering time, incoming host smoothness, VRR pacing/smoothness target, and
@@ -4209,7 +4224,7 @@ with the current definition:
 The result rides in `IntervalBuffer::Stats::present` for the overlay. It shows a
 percentage when there are fresh scored intervals, `paused below VRR range` when
 only paused intervals are fresh, and otherwise unavailable. It is diagnostic only:
-production revision 9 scores Smoothness from submission intervals and keeps
+production revision 7 scores Smoothness from submission intervals and keeps
 native-hitch adaptation off. Display misses therefore neither lower Smoothness
 nor grow, hold or release the buffer. Targets, buffer policy, trace schema and
 exact replay are unchanged.
@@ -4354,7 +4369,7 @@ and does not exclude long local arrival gaps when RTP is steady. The older
 including their sender/arrival exclusions, for comparison.
 
 These replay spacing fields use submission timing as a presentation proxy.
-Current revision 9 uses submission-interval error with readiness attribution to
+Current revision 7 uses averaged submission-interval error with readiness attribution to
 control padding; native confirmation remains diagnostic. Historical prediction-
 only policies instead derive padding from readiness prediction.
 Report `smoothness_feedback.native_window_samples` and `native_window_misses`
