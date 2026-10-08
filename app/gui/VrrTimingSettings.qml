@@ -44,7 +44,12 @@ GroupBox {
             from: 250; to: 4000; stepSize: 250
             value: root.bufferPerMille
             editable: true
-            Component.onCompleted: contentItem.Keys.forwardTo = [buffer]
+            Component.onCompleted: {
+                // Handle adjustment keys before the editor moves its text cursor.
+                contentItem.Keys.priority = Keys.BeforeItem
+                contentItem.Keys.leftPressed.connect(function(event) { buffer.Keys.leftPressed(event) })
+                contentItem.Keys.rightPressed.connect(function(event) { buffer.Keys.rightPressed(event) })
+            }
             validator: DoubleValidator { bottom: 0.25; top: 4; decimals: 2; locale: buffer.locale.name }
             textFromValue: function(value, locale) { return Number(value / 1000).toLocaleString(locale, 'f', 2) }
             valueFromText: function(text, locale) { return Math.round(Number.fromLocaleString(locale, text) * 1000) }
@@ -62,7 +67,12 @@ GroupBox {
             from: 9000; to: 9999; stepSize: 50
             value: root.targetHundredths
             editable: true
-            Component.onCompleted: contentItem.Keys.forwardTo = [target]
+            Component.onCompleted: {
+                // Handle adjustment keys before the editor moves its text cursor.
+                contentItem.Keys.priority = Keys.BeforeItem
+                contentItem.Keys.leftPressed.connect(function(event) { target.Keys.leftPressed(event) })
+                contentItem.Keys.rightPressed.connect(function(event) { target.Keys.rightPressed(event) })
+            }
             validator: DoubleValidator { bottom: 90; top: 99.99; decimals: 2; locale: target.locale.name }
             textFromValue: function(value, locale) { return Number(value / 100).toLocaleString(locale, 'f', 2) }
             valueFromText: function(text, locale) { return Math.round(Number.fromLocaleString(locale, text) * 100) }
@@ -80,7 +90,12 @@ GroupBox {
             from: 10; to: 300; stepSize: 10
             value: root.historySeconds
             editable: true
-            Component.onCompleted: contentItem.Keys.forwardTo = [history]
+            Component.onCompleted: {
+                // Handle adjustment keys before the editor moves its text cursor.
+                contentItem.Keys.priority = Keys.BeforeItem
+                contentItem.Keys.leftPressed.connect(function(event) { history.Keys.leftPressed(event) })
+                contentItem.Keys.rightPressed.connect(function(event) { history.Keys.rightPressed(event) })
+            }
             onValueModified: root.historyEdited(value)
             Keys.onLeftPressed: root.historyEdited(Math.max(from, value - stepSize))
             Keys.onRightPressed: root.historyEdited(Math.min(to, value + stepSize))

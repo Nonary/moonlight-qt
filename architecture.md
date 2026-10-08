@@ -1019,7 +1019,13 @@ restores all four recorded values for customizable captures. Exact replay always
 uses the full captured parameter snapshot.
 
 The timing controls support gamepad Tab/Shift-Tab focus navigation and left/right
-adjustment, including when a numeric text field has focus. Preset and PyroWave
+adjustment, including when a numeric text field has focus. The editable VRR
+fields route the editor's left/right key signals directly to the adjustment
+handlers before text editing (input correction reviewed against `ff6f071c`,
+2026-10-08). Forwarding key events to the parent SpinBox alone lets its editor
+consume presses as cursor movement. `tests/gui/tst_vrrtiminginput.qml` covers
+single presses, repeated adjustments and bounds on all four fields.
+Preset and PyroWave
 calibration-host popups use `AutoResizingComboBox`, switching the gamepad to
 arrow/Return navigation while open and restoring UI navigation on close.
 The calibration host resolves its target-card focus on each closed-menu Tab
