@@ -987,6 +987,7 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
         PyroWaveLink::PaceResult pace;
         QString paceNote;
         int linkSpeedKbps = 0;
+        int frameCapKbps = 0;
         pyrowave::bandwidth::transport_t transport;
         transport.packetsize = packetSize;
         try {
@@ -1046,7 +1047,7 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
             }
             // Starting at the bounded ceiling avoids a slow upward staircase.
             // Search precision, probe duration and two confirmations are intact.
-            link = PyroWaveLink::search(capKbps, capKbps, [&](int kbps) {
+            const auto probeCapacity = [&](int kbps) {
                 QMetaObject::invokeMethod(this, [this, kbps] {
                     m_Message = tr("Testing %1 Mbps including FEC: measuring throughput, loss and delivery timing…").arg(kbps / 1000);
                     emit changed();
@@ -1063,7 +1064,8 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
                     result.capacityQualified() ? "pass" : "fail",
                     result.stable() ? "pass" : "fail", result.failureReason());
                 return result;
-            }, [&] { return cancelled->load(); }, false);
+            };
+            link = PyroWaveLink::search(capKbps, capKbps, probeCapacity, [&] { return cancelled->load(); }, false);
             if (!cancelled->load() && !link.capacityQualified()) {
                 throw std::runtime_error(QString("No usable PyroWave network budget: %1. Last test %2 Mbps: received %3/%4 packets, "
                     "loss %5%, delivery variation p99 %6 ms, delay growth %7 ms, host duration %8 ms.")
@@ -1074,7 +1076,8 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
             }
             // The capacity probe spreads load evenly, but the stream sends each
             // frame back-to-back. Send the measured budget as frames at this
-            // frame rate and find the fastest pace within the loss limit.
+            // frame rate and find the fastest pace passing whole-frame and
+            // tail loss checks as well as the aggregate loss limits.
             int paceLinkMbps = 0;
             for (int known : {hostLinkMbps, linkMbps}) {
                 if (known > 0) paceLinkMbps = paceLinkMbps ? (std::min)(paceLinkMbps, known) : known;
@@ -1085,10 +1088,10 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
                 throw std::runtime_error("Calibration stopped.");
             }
             if (NvHTTP::getXmlString(serverInfo, "PyroWaveUdpProbeBurstVersion") != "1") {
-                paceNote = tr("Update Vibeshine to calibrate frame pacing; the host will use its default.");
+                throw std::runtime_error(tr("Update Vibeshine to support frame-shaped bandwidth tests before calibrating PyroWave.").toStdString());
             }
             else if (paceLinkMbps <= 0) {
-                paceNote = tr("Frame pacing was not calibrated because neither wired link speed is known.");
+                throw std::runtime_error(tr("Frame pacing cannot be calibrated because neither wired link speed is known.").toStdString());
             }
             else {
                 // Probe frames as large as the selected video settings stream
@@ -1106,7 +1109,8 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
                 }
                 const int burstFps = std::clamp(fps, 10, 500);
                 try {
-                    pace = PyroWaveLink::searchPace(paceLinkMbps * 1000, budgetKbps / 4 * 5, [&](int paceKbps) {
+                    pace = PyroWaveLink::searchPace(paceLinkMbps * 1000, budgetKbps / 4 * 5,
+                        [&](int paceKbps) {
                         QMetaObject::invokeMethod(this, [this, paceKbps, budgetKbps] {
                             m_Message = tr("Testing frame pacing at %1 Mbps: sending %2 Mbps as whole frames and measuring packet loss…")
                                 .arg(paceKbps / 1000).arg(budgetKbps / 1000);
@@ -1116,32 +1120,42 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
                                                                   burstFps, (std::max)(paceKbps, budgetKbps));
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "PyroWave pace probe: %d kbps as %d FPS frames paced at %d kbps: sent %u/%u, received %u, "
-                            "loss %.3f%%, worst 100ms %.3f%%, host duration %.2f ms, host send retries %u, "
+                            "loss %.3f%%, worst 100ms %.3f%%, damaged frames %u/%u, "
+                            "frames losing more than 10%% %.3f%%, missing tails %.3f%%, worst frame loss %.3f%%, "
+                            "host duration %.2f ms, host send retries %u, "
                             "host send error %d: %s", budgetKbps, burstFps, paceKbps,
                             result.sent, result.expected, result.received, result.lossPercent,
-                            result.worstWindowLossPercent, result.senderMs,
+                            result.worstWindowLossPercent, result.damagedFrames, result.frames,
+                            result.excessiveLossFramePercent(), result.missingTailFramePercent(),
+                            result.worstFrameLossPercent, result.senderMs,
                             result.hostSendRetries, result.hostLastSendError,
-                            PyroWaveLink::paceQualified(result) ? "within loss limit" : "over loss limit");
+                            PyroWaveLink::paceQualified(result) ? "frame loss pass" : "frame loss fail");
                         return result;
                     }, [&] { return cancelled->load(); });
+                    frameCapKbps = budgetKbps;
                 }
                 catch (const std::exception& e) {
                     if (cancelled->load()) throw;
-                    pace = {};
-                    paceNote = tr("Frame pacing could not be calibrated (%1); the host will use its default.")
-                        .arg(QString::fromUtf8(e.what()));
+                    throw std::runtime_error(tr("Frame pacing could not be calibrated (%1). Test bandwidth again before applying a format.")
+                        .arg(QString::fromUtf8(e.what())).toStdString());
+                }
+                if (!cancelled->load() && !pace.paceKbps) {
+                    throw std::runtime_error(tr("No usable frame pacing measurement completed. Test bandwidth again.").toStdString());
                 }
                 if (!cancelled->load() && pace.paceKbps) {
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave frame pace: %d kbps (%s, loss %.3f%%), link %d Mbps",
-                                pace.paceKbps, pace.lossless ? "within loss limit" : "least loss",
+                                pace.paceKbps, pace.qualified ? "frame loss confirmed" : "best available; loss limits not met",
                                 pace.probe.lossPercent, paceLinkMbps);
-                    paceNote = pace.lossless ?
-                        tr("Frame pacing: %1 Mbps keeps packet loss under %2% on this %3 Mbps path (measured %4%).")
-                            .arg(pace.paceKbps / 1000).arg(PyroWaveLink::paceLossPercent, 0, 'f', 0)
-                            .arg(paceLinkMbps).arg(pace.probe.lossPercent, 0, 'f', 2) :
-                        tr("Frame pacing: no pace kept packet loss under %1%; %2 Mbps lost least (%3%).")
-                            .arg(PyroWaveLink::paceLossPercent, 0, 'f', 0)
-                            .arg(pace.paceKbps / 1000).arg(pace.probe.lossPercent, 0, 'f', 2);
+                    paceNote = (pace.qualified ?
+                        tr("Frame pacing: %1 Mbps confirmed on this %2 Mbps path. Packet loss %3%; "
+                           "frames losing more than 10%: %4%; missing frame tails: %5%; worst frame loss: %6%.") :
+                        tr("Warning: no tested packet speed met all loss limits. Best available: %1 Mbps on this %2 Mbps path. "
+                           "Packet loss %3%; frames losing more than 10%: %4%; missing frame tails: %5%; worst frame loss: %6%. Visible damage may remain."))
+                            .arg(pace.paceKbps / 1000).arg(paceLinkMbps)
+                            .arg(pace.probe.lossPercent, 0, 'f', 2)
+                            .arg(pace.probe.excessiveLossFramePercent(), 0, 'f', 2)
+                            .arg(pace.probe.missingTailFramePercent(), 0, 'f', 2)
+                            .arg(pace.probe.worstFrameLossPercent, 0, 'f', 2);
                 }
             }
         }
@@ -1162,20 +1176,23 @@ void PyroWaveCalibrator::start(ComputerManager* manager, const QString& hostUuid
             }, Qt::QueuedConnection);
             return;
         }
-        QMetaObject::invokeMethod(this, [this, hostName, link, pace, paceNote, linkSpeedKbps, transport, cancelled] {
+        QMetaObject::invokeMethod(this, [this, hostName, link, pace, paceNote, linkSpeedKbps, frameCapKbps, transport, cancelled] {
             if (cancelled->load()) return;
-            m_LinkCapKbps = link.requestedKbps;
+            m_LinkCapKbps = (std::min)(link.requestedKbps, frameCapKbps);
             m_LinkSpeedKbps = linkSpeedKbps;
             m_PaceMbps = pace.paceKbps / 1000;
             m_Transport = transport;
             m_BandwidthReady = true;
-            m_LinkSummary = tr("%1 → this PC: measured throughput budget %2 Mbps including FEC and headers, with 5% headroom where available. Packet loss %3%; worst 100 ms %4%; delivery variation p99 %5 ms. Critical FEC: %6%. Rates below include overhead; quality uses the remaining image bitrate.")
+            m_LinkSummary = tr("%1 → this PC: measured capacity %2 Mbps; frame-tested budget %7 Mbps including FEC and headers, with 5% headroom where available. Capacity packet loss %3%; worst 100 ms %4%; delivery variation p99 %5 ms. Critical FEC: %6%. Rates below include overhead; quality uses the remaining image bitrate.")
                 .arg(hostName).arg(link.requestedKbps / 1000).arg(link.lossPercent, 0, 'f', 2)
                 .arg(link.worstWindowLossPercent, 0, 'f', 2).arg(link.delayP99Ms, 0, 'f', 1)
-                .arg(transport.critical_fec_percentage);
+                .arg(transport.critical_fec_percentage).arg(m_LinkCapKbps / 1000);
             if (!paceNote.isEmpty()) m_LinkSummary += QStringLiteral(" ") + paceNote;
             const auto grade = bandwidthQuality();
-            if (grade == QStringLiteral("target")) {
+            if (!pace.qualified) {
+                m_Message = tr("No tested packet speed met all loss limits. The best available speed is selected; visible damage may remain. Choose Next to test the decoder.");
+            }
+            else if (grade == QStringLiteral("target")) {
                 m_Message = tr("Selected quality target met for %1. Choose Next to test the decoder.").arg(m_VideoDescription);
             }
             else if (grade == QStringLiteral("reduced")) {

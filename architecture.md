@@ -582,10 +582,40 @@ for packet pacing. Its physical wire cap no longer applies a second 20%
 reduction after calibration. The capacity probe uses evenly spread 1 ms groups.
 Against hosts with `PyroWaveUdpProbeBurstVersion=1`, calibration then sends the
 selected settings' bitrate (capped by the budget) as frames on the stream pacer's schedule and keeps the fastest
-pace losing under 2% (`PyroWaveLink::searchPace`); applying a format stores it as
+pace passing aggregate and per-frame loss checks (`PyroWaveLink::searchPace`).
+The 2026-10-07 correction reconstructs each burst-v1 frame's sequence range
+and its final 1 ms send group using the host's exact packet/wire accounting.
+All missing packets, including absent frames and tails, enter the frame's
+loss percentage. A speed fails if any frame loses **more than 10%** of its
+packets, or at least 2% of frames have holes in the final send group. A
+surviving final packet does not excuse holes elsewhere in that group. Smaller
+interior holes are allowed within the aggregate under-2% loss and under-5%
+per-100-ms limits; the share of frames with any hole is diagnostic only.
+Both fresh confirmations must pass all checks. The search first tries the
+link, then bisects a passing boundary with a measured 5% margin. If this path
+fails, it checks remaining 50 Mbps steps across the usable range: a failed
+floor does not prove that all intermediate speeds fail. If none qualifies,
+it selects the best usable measurement, ranked by fewer violated limits,
+fewer tail-damaged frames, fewer frames over 10%, worst frame loss, then
+aggregate/window loss (faster on ties), and measures it twice afresh. Invalid
+or incomplete probes cannot become a fallback. Failed confirmations remain
+in fallback ranking rather than inheriting a lucky initial result. The result
+and status explicitly warn when no tested speed meets all limits; this does
+not automatically reduce the bitrate budget. Every format remains capped at
+the actual frame-tested budget, even when aggregate capacity was higher.
+Logs and the result summary distinguish aggregate loss, the share of frames
+over 10%, missing tails and worst frame loss. Missing burst support/link speed
+still prevents a recommendation. Passing does not promise zero artifacts.
+Applying a format stores the selected pace as
 `StreamingPreferences::pyroWavePaceMbps`, announced at launch in
 `x-ss-video[0].pyrowavePaceMbps`. Uncalibrated, the host paces at 80% of the
 link, because a USB 2.5GbE dock dropped whole frame tails above ~2.2 Gbps.
+Settings exposes Packet speed (Mbps) beside video bitrate for PyroWave. Manual
+values are editable in 50 Mbps steps (or directly typed), and zero/Automatic
+restores the host's default. Applying calibration updates this same persisted
+value; manual changes take effect on the next stream. The host still caps the
+requested pace at the link and raises it to the frame's required rate, so the
+saved value is a request rather than a measurement of actual wire speed.
 Host encoding, sustained gameplay and physical scanout remain unverified. See
 [protocol details](docs/pyrowave-protocol.md#fec-inclusive-recommendations-and-udp-calibration).
 
