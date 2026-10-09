@@ -20,6 +20,7 @@ private slots:
     void nativeHitchPolicyRoundTrip();
     void displayEventPolicyRoundTrip();
     void nativeSynchronizationRoundTrip();
+    void nativeSchedulingRoundTrip();
     void submissionEstimatePolicyRoundTrip();
     void predictionOnlyPolicyRoundTrip();
     void rateProtectionPolicyRoundTrip();
@@ -40,6 +41,8 @@ private slots:
     void gpuReadyOperationAudit();
     void gpuReadyStageTimingAudit();
     void presenterSubmissionAudit();
+    void nativeSchedulingAudit();
+    void nativeTargetClockAudit();
     void spacingCorrectionAudit();
     void spacingLifecycleTimingAudit();
     void postPresentQueryTimingAudit();
@@ -51,7 +54,28 @@ private slots:
     void rationalDisplayTiming();
     void busyWorkerReadinessFloor();
     void decodeReadinessOrder();
+    void recordedWorkerQueueCapacity();
 };
+
+void VrrReplayConfigTest::nativeSchedulingRoundTrip()
+{
+    VrrTimingParameters parameters;
+    QCOMPARE(parameters.nativeScheduledPresentation, uint64_t(0));
+    const auto native = vrrTimingParametersForSession(VrrSessionConfig{}, true, true);
+    QCOMPARE(native.nativeScheduledPresentation, uint64_t(1));
+    QString error;
+    QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(native),
+                                             parameters, error), qPrintable(error));
+    QCOMPARE(parameters.nativeScheduledPresentation, uint64_t(1));
+    auto historical = vrrTimingParametersToJson(native);
+    historical.remove("native_scheduled_presentation");
+    parameters = VrrTimingParameters{};
+    QVERIFY2(applyVrrReplayControllerSnapshot(historical, parameters, error), qPrintable(error));
+    QCOMPARE(parameters.nativeScheduledPresentation, uint64_t(0));
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        {{"native_scheduled_presentation", 2}}, parameters, error));
+    QCOMPARE(parameters.nativeScheduledPresentation, uint64_t(0));
+}
 
 void VrrReplayConfigTest::initialCalibrationPolicyRoundTrip()
 {
@@ -1980,6 +2004,55 @@ void VrrReplayConfigTest::presenterSubmissionAudit()
     QVERIFY(audit.relationshipValid);
 }
 
+void VrrReplayConfigTest::nativeSchedulingAudit()
+{
+    auto audit = evaluateVrrNativeScheduling(false, true, false,
+                                              1000, 0, 1000);
+    QVERIFY(audit.relationshipValid);
+    QCOMPARE(audit.expectedSchedulingBoundaryUs, uint64_t(1000));
+    audit = evaluateVrrNativeScheduling(true, true, false,
+                                       1000, 3000, 3000);
+    QVERIFY(audit.relationshipValid);
+    QCOMPARE(audit.expectedSchedulingBoundaryUs, uint64_t(3000));
+    // A late enqueue retains its actual CPU time, never moving backwards to
+    // a requested display deadline which has already passed.
+    QVERIFY(evaluateVrrNativeScheduling(true, true, false,
+                                        4000, 3000, 4000).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(true, true, false,
+                                         1000, 3000, 1000).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(true, true, false,
+                                         1000, 0, 1000).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(false, true, false,
+                                         1000, 3000, 3000).relationshipValid);
+    // Failure or cancellation cannot install a future cadence boundary.
+    QVERIFY(evaluateVrrNativeScheduling(true, false, false,
+                                        0, 0, 0).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(true, false, false,
+                                         0, 3000, 0).relationshipValid);
+    QVERIFY(evaluateVrrNativeScheduling(true, true, true,
+                                        1000, 0, 1000).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(true, true, true,
+                                         1000, 0, 3000).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(true, true, true,
+                                         1000, 3000, 1000).relationshipValid);
+}
+
+void VrrReplayConfigTest::nativeTargetClockAudit()
+{
+    auto audit = evaluateVrrNativeTargetClock(3000, 119900, 100000, 1000, 1020, 11);
+    QVERIFY(audit.relationshipValid);
+    QCOMPARE(audit.expectedTarget100ns, uint64_t(119900));
+    QVERIFY(!evaluateVrrNativeTargetClock(3000, 100000, 100000, 1000, 1020, 11).relationshipValid);
+    QVERIFY(!evaluateVrrNativeTargetClock(3000, 119900, 100000, 1000, 1020, 0).relationshipValid);
+    QVERIFY(evaluateVrrNativeTargetClock(1000, 100000, 100000, 1000, 1020, 11).relationshipValid);
+    QVERIFY(!evaluateVrrNativeTargetClock(1000, 183330, 100000, 1000, 1020, 11).relationshipValid);
+    QVERIFY(!evaluateVrrNativeTargetClock(3000, 119900, 100000, 1000, 1501, 252).relationshipValid);
+    QVERIFY(!evaluateVrrNativeTargetClock(3000, 119900, 0, 1000, 1020, 11).relationshipValid);
+    constexpr auto max = (std::numeric_limits<uint64_t>::max)();
+    QVERIFY(!evaluateVrrNativeTargetClock(max, 100000, 100000, 1000, 1020, 11).relationshipValid);
+    QVERIFY(evaluateVrrNativeTargetClock(1011, max, max - 10, 1000, 1020, 11).relationshipValid);
+}
+
 void VrrReplayConfigTest::spacingCorrectionAudit()
 {
     QVERIFY(evaluateVrrSpacingCorrection(
@@ -2461,6 +2534,34 @@ void VrrReplayConfigTest::decodeReadinessOrder()
         1000, 2100, 1020, 1030, 2210, 1100, true, true, true));
     QVERIFY(vrrDecodeReadinessOrderValid(
         1000, 1000, 1020, 1030, 1040, 200, true, true, true));
+    // The explicit observation flag permits both short waits and already-ready
+    // GPU fences without weakening validation of historical captures.
+    QVERIFY(vrrDecodeReadinessOrderValid(
+        1000, 6888, 1020, 6803, 6890, 83, true, true, true, true));
+    QVERIFY(vrrDecodeReadinessOrderValid(
+        1000, 6803, 1020, 6803, 6805, 0, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 1000, 1020, 6803, 6890, 83, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 6888, 1020, 6803, 6880, 83, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 6888, 1020, 6803, 6890, 90, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 1000, 1020, 0, 0, 0, false, true, true, true));
+}
+
+void VrrReplayConfigTest::recordedWorkerQueueCapacity()
+{
+    for (uint64_t configured : {0ULL, 1ULL, 3ULL, 4ULL, 5ULL}) {
+        VrrTimingParameters parameters;
+        parameters.playoutQueueFrames = configured;
+        VrrTimingController controller(VrrSessionConfig{}, false, parameters);
+        QCOMPARE(vrrRecordedWorkerQueueCapacity(configured),
+                 uint64_t(controller.queuedFrameCapacity()));
+    }
+    QCOMPARE(vrrRecordedWorkerQueueCapacity(0), uint64_t(3));
+    QCOMPARE(vrrRecordedWorkerQueueCapacity(4), uint64_t(4));
+    QVERIFY(uint64_t(5) > vrrRecordedWorkerQueueCapacity(4));
 }
 
 QTEST_APPLESS_MAIN(VrrReplayConfigTest)

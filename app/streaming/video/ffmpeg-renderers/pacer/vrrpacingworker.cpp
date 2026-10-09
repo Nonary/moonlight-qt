@@ -29,9 +29,6 @@ namespace {
 // still turning repeated timestamps and controller state into very small,
 // infrequent physical writes.
 constexpr int kTraceChunkBytes = 256 * 1024;
-// A decode sync shorter than this did not wait on the GPU; the frame keeps
-// the decoder's completion time as its readiness.
-constexpr uint64_t kDecodeSyncNoticeUs = 200;
 // Slack between the published PyroWave reassembly deadline and the latest
 // on-time reassembly, covering receive-thread wake-up and depacketizing.
 constexpr uint64_t kReceiveDeadlineMarginUs = 250;
@@ -91,7 +88,10 @@ constexpr char kTraceHeader[] =
     ",prepared_ahead,stage_start_us,stage_decode_ready_us,stage_decode_wait_us,stage_render_start_us,stage_render_end_us,stage_ready_us"
     ",flip_protection_checked,flip_protection_query_result,flip_protection_query_start_us,flip_protection_query_end_us"
     ",flip_protection_pending,flip_protection_reference_us,flip_protection_latched"
-    ",decode_hold_us"
+    ",decode_hold_us,decode_readiness_observed"
+    ",native_scheduled_presentation,native_target_us,scheduling_boundary_us"
+    ",native_target_100ns,native_target_reference_100ns,native_target_clock_before_us,native_target_clock_after_us,native_target_uncertainty_us"
+    ",native_outstanding_presents,native_retiring_present_id,native_skipped_frames,native_canceled_frames,native_displayed_duration_100ns,native_status_id,native_status,native_dropped_status_frames"
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
 constexpr uint32_t kVrrWindowStateMask =
@@ -173,9 +173,12 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
                            presenter->canLatchAdaptivePresent()),
     m_NativeSynchronizedPresentation(m_CanLatchPresentation &&
         presenter->alwaysSynchronizesAdaptivePresent()),
+    m_NativeScheduledPresentation(m_NativeSynchronizedPresentation &&
+        presenter->supportsScheduledPresentation()),
     m_TimingController(std::make_unique<VrrTimingController>(
         config, m_CanLatchPresentation,
-        vrrTimingParametersForSession(config, m_NativeSynchronizedPresentation)))
+        vrrTimingParametersForSession(config, m_NativeSynchronizedPresentation,
+                                     m_NativeScheduledPresentation)))
 {
     // Settings enables tracing after SDL initialization. SDL2-compat may cache
     // its environment, so read the current process value just like the path.
@@ -205,7 +208,10 @@ VrrPacingWorker::~VrrPacingWorker()
         m_WorkerThread = nullptr;
     }
 
-    if (m_Presenter) m_Presenter->stopFramePreparation();
+    if (m_Presenter) {
+        if (m_NativeScheduledPresentation) m_Presenter->clearScheduledPresentation();
+        m_Presenter->stopFramePreparation();
+    }
 
     VrrReceiveDeadline::clear();
     VrrReceiveDeadline::clearPresentWindow();
@@ -443,13 +449,17 @@ int VrrPacingWorker::run()
             noteDrop();
             continue;
         }
-        const uint64_t decodeSyncWaitUs = preparedAhead ? 0 :
-            m_Presenter->waitForDecode(frame.frame(), frame.decodeBoundary());
+        const auto decodeReadiness = preparedAhead ? VrrDecodeReadiness{} :
+            m_Presenter->observeDecodeReadiness(frame.frame(), frame.decodeBoundary());
+        const uint64_t decodeSyncWaitUs = decodeReadiness.waitUs;
         frame.noteDecodeSyncWaitUs(decodeSyncWaitUs);
+        if (decodeReadiness.asynchronousOutput) {
+            frame.setDecoderOutputComplete(false);
+        }
         if (preparedAhead) {
             frame.noteGpuReadyUs(queuedFrame.preparation->timing.decodeReadyUs);
         }
-        if (decodeSyncWaitUs > kDecodeSyncNoticeUs) {
+        if (decodeReadiness.completionObserved) {
             // This is an upper bound on completion, sampled after the native
             // wait. Adding the wait duration to decoder output is wrong when
             // the frame already spent time in the pacing queue: it can place
@@ -473,6 +483,7 @@ int VrrPacingWorker::run()
         telemetry.preparedAhead = preparedAhead;
         if (preparedAhead) telemetry.preparationStage = queuedFrame.preparation->timing;
         telemetry.decodeSyncWaitUs = decodeSyncWaitUs;
+        telemetry.decodeReadinessObserved = decodeReadiness.completionObserved;
         telemetry.decisionTimeUs = decisionTimeUs;
         telemetry.decisionEndUs = LiGetMicroseconds();
         telemetry.externalRebaseApplied = externalRebaseApplied;
@@ -693,20 +704,27 @@ int VrrPacingWorker::run()
             av_frame_free(&reusableFrame);
         }
 
-        telemetry.targetWaitEntryUs = LiGetMicroseconds();
-        const VrrTargetWaitResult targetWait =
-            m_TargetWaiter->waitUntil(decision.targetUs,
-                                      decision.targetWakeLeadUs);
-        telemetry.targetWait = targetWait;
-        telemetry.targetWaitFinalUs = targetWait.finalNowUs;
-        telemetry.targetWaitOvershootUs = targetWait.deadlineAlreadyElapsed ?
-            0 : positiveDifference(targetWait.finalNowUs,
-                                   decision.targetUs);
-        telemetry.targetSchedulerDelayUs = targetWait.schedulerDelayUs;
-        telemetry.targetSchedulerDelayValid =
-            targetWait.schedulerDelayValid;
-        telemetry.targetDeadlineAlreadyElapsed =
-            targetWait.deadlineAlreadyElapsed;
+        telemetry.nativeScheduledPresentation = m_NativeScheduledPresentation;
+        VrrTargetWaitResult targetWait;
+        const auto holdCadence = [&]() {
+            do {
+                telemetry.targetWaitEntryUs = LiGetMicroseconds();
+                targetWait = m_TargetWaiter->waitUntil(decision.targetUs,
+                                                      decision.targetWakeLeadUs);
+                // Keep the last complete wait observation intact. Combining
+                // one attempt's raw fields with a later clock sample corrupts
+                // exact replay, especially for an already-elapsed deadline.
+            } while (m_NativeScheduledPresentation &&
+                     targetWait.finalNowUs < decision.targetUs);
+            telemetry.targetWait = targetWait;
+            telemetry.targetWaitFinalUs = targetWait.finalNowUs;
+            telemetry.targetWaitOvershootUs = targetWait.deadlineAlreadyElapsed ?
+                0 : positiveDifference(targetWait.finalNowUs, decision.targetUs);
+            telemetry.targetSchedulerDelayUs = targetWait.schedulerDelayUs;
+            telemetry.targetSchedulerDelayValid = targetWait.schedulerDelayValid;
+            telemetry.targetDeadlineAlreadyElapsed = targetWait.deadlineAlreadyElapsed;
+        };
+        if (!m_NativeScheduledPresentation) holdCadence();
         midframeWindowStateFlags =
             consumeWindowStateNotifications();
         telemetry.midframeWindowStateFlags |=
@@ -744,70 +762,77 @@ int VrrPacingWorker::run()
         // Recheck both mathematical floors immediately before Present. The
         // waiter deliberately has a bounded active phase, so a pathological
         // clock must not turn an early return into an early submission.
-        uint64_t beforePresentUs = LiGetMicroseconds();
-        telemetry.spacingCheckUs = beforePresentUs;
-        uint64_t earliestSubmissionUs =
-            m_TimingController->earliestSubmissionUs();
-        m_TimingController->noteSpacingDeficit(0);
-        if (earliestSubmissionUs != 0 &&
-                beforePresentUs < earliestSubmissionUs) {
-            telemetry.spacingDeficitUs =
-                earliestSubmissionUs - beforePresentUs;
-            telemetry.spacingCorrected = true;
-        }
-
-        const uint64_t presentationFloorUs = std::max(decision.targetUs,
-                                                       earliestSubmissionUs);
-        telemetry.presentationFloorUs = presentationFloorUs;
-        while (beforePresentUs < presentationFloorUs) {
-            m_TargetWaiter->waitUntil(presentationFloorUs);
-            beforePresentUs = LiGetMicroseconds();
-        }
-
-        const bool hadPriorSubmission =
-            m_TimingController->hasLastSubmission();
-        const uint64_t priorSubmissionUs =
-            m_TimingController->lastSubmissionUs();
-        telemetry.spacingRecheckUs = LiGetMicroseconds();
-        telemetry.presentStartUs = telemetry.spacingRecheckUs;
-        if (hadPriorSubmission) {
-            telemetry.presentSpacingUs =
-                telemetry.presentStartUs >= priorSubmissionUs ?
-                    telemetry.presentStartUs - priorSubmissionUs : 0;
-            // A tearing present must clear the previous frame's flip, which
-            // for a latched predecessor can be later than its Present call.
-            const uint64_t minimumUntornUs =
-                m_TimingController->untornReferenceUs() +
-                m_TimingController->displayPeriodUs();
-            telemetry.spacingMarginUs = signedDifference(
-                telemetry.presentStartUs, minimumUntornUs);
-
-            // A second check protects against a clock anomaly between the
-            // first check and the actual call boundary.
-            if (telemetry.spacingMarginUs < 0) {
-                const uint64_t deficitUs = static_cast<uint64_t>(
-                    -(telemetry.spacingMarginUs + 1)) + 1;
-                telemetry.spacingDeficitUs = std::max(
-                    telemetry.spacingDeficitUs, deficitUs);
-                telemetry.spacingGuardFeedbackUs = deficitUs;
+        const bool hadPriorSubmission = m_TimingController->hasLastSubmission();
+        const uint64_t priorSubmissionUs = m_TimingController->lastSubmissionUs();
+        if (!m_NativeScheduledPresentation) {
+            uint64_t beforePresentUs = LiGetMicroseconds();
+            telemetry.spacingCheckUs = beforePresentUs;
+            uint64_t earliestSubmissionUs =
+                m_TimingController->earliestSubmissionUs();
+            m_TimingController->noteSpacingDeficit(0);
+            if (earliestSubmissionUs != 0 &&
+                    beforePresentUs < earliestSubmissionUs) {
+                telemetry.spacingDeficitUs =
+                    earliestSubmissionUs - beforePresentUs;
                 telemetry.spacingCorrected = true;
-                m_TimingController->noteSpacingDeficit(deficitUs);
-                const uint64_t correctedFloorUs =
-                    m_TimingController->earliestSubmissionUs();
-                telemetry.spacingCorrectedFloorUs = correctedFloorUs;
-                telemetry.correctionWaitStartUs = LiGetMicroseconds();
-                telemetry.presentStartUs = LiGetMicroseconds();
-                while (telemetry.presentStartUs < correctedFloorUs) {
-                    m_TargetWaiter->waitUntil(correctedFloorUs);
-                    telemetry.presentStartUs = LiGetMicroseconds();
-                }
-                telemetry.correctionWaitEndUs = telemetry.presentStartUs;
+            }
+
+            const uint64_t presentationFloorUs = std::max(decision.targetUs,
+                                                           earliestSubmissionUs);
+            telemetry.presentationFloorUs = presentationFloorUs;
+            while (beforePresentUs < presentationFloorUs) {
+                m_TargetWaiter->waitUntil(presentationFloorUs);
+                beforePresentUs = LiGetMicroseconds();
+            }
+
+            telemetry.spacingRecheckUs = LiGetMicroseconds();
+            telemetry.presentStartUs = telemetry.spacingRecheckUs;
+            if (hadPriorSubmission) {
                 telemetry.presentSpacingUs =
                     telemetry.presentStartUs >= priorSubmissionUs ?
                         telemetry.presentStartUs - priorSubmissionUs : 0;
+                // A tearing present must clear the previous frame's flip, which
+                // for a latched predecessor can be later than its Present call.
+                const uint64_t minimumUntornUs =
+                    m_TimingController->untornReferenceUs() +
+                    m_TimingController->displayPeriodUs();
                 telemetry.spacingMarginUs = signedDifference(
                     telemetry.presentStartUs, minimumUntornUs);
+
+                // A second check protects against a clock anomaly between the
+                // first check and the actual call boundary.
+                if (telemetry.spacingMarginUs < 0) {
+                    const uint64_t deficitUs = static_cast<uint64_t>(
+                        -(telemetry.spacingMarginUs + 1)) + 1;
+                    telemetry.spacingDeficitUs = std::max(
+                        telemetry.spacingDeficitUs, deficitUs);
+                    telemetry.spacingGuardFeedbackUs = deficitUs;
+                    telemetry.spacingCorrected = true;
+                    m_TimingController->noteSpacingDeficit(deficitUs);
+                    const uint64_t correctedFloorUs =
+                        m_TimingController->earliestSubmissionUs();
+                    telemetry.spacingCorrectedFloorUs = correctedFloorUs;
+                    telemetry.correctionWaitStartUs = LiGetMicroseconds();
+                    telemetry.presentStartUs = LiGetMicroseconds();
+                    while (telemetry.presentStartUs < correctedFloorUs) {
+                        m_TargetWaiter->waitUntil(correctedFloorUs);
+                        telemetry.presentStartUs = LiGetMicroseconds();
+                    }
+                    telemetry.correctionWaitEndUs = telemetry.presentStartUs;
+                    telemetry.presentSpacingUs =
+                        telemetry.presentStartUs >= priorSubmissionUs ?
+                            telemetry.presentStartUs - priorSubmissionUs : 0;
+                    telemetry.spacingMarginUs = signedDifference(
+                        telemetry.presentStartUs, minimumUntornUs);
+                }
             }
+        }
+        else {
+            telemetry.spacingCheckUs = LiGetMicroseconds();
+            telemetry.spacingRecheckUs = telemetry.spacingCheckUs;
+            // The controller reserved display spacing. CPU enqueue is
+            // intentionally early and must not be checked against a flip floor.
+            presentRequest.displayTargetUs = decision.targetUs;
         }
 
         // The mathematical floor and its correction can add another
@@ -846,7 +871,7 @@ int VrrPacingWorker::run()
             continue;
         }
 
-        m_TimingController->noteSchedulerDelays(
+        if (!m_NativeScheduledPresentation) m_TimingController->noteSchedulerDelays(
             telemetry.renderWaitOvershootUs,
             targetWait.schedulerDelayUs,
             targetWait.schedulerDelayValid);
@@ -889,6 +914,15 @@ int VrrPacingWorker::run()
                     !feedback.gpuReadyCompletedBeforeWait);
             }
         }
+        if (m_NativeScheduledPresentation) {
+            // Submission and retirement are now owned by the native queue.
+            // Hold only this worker's next dequeue until the logical deadline,
+            // avoiding a speculative extra queue of future frames.
+            holdCadence();
+            m_TimingController->noteSchedulerDelays(
+                telemetry.renderWaitOvershootUs,
+                targetWait.schedulerDelayUs, targetWait.schedulerDelayValid);
+        }
         recordSubmission(decision, feedback, telemetry.presentStartUs,
                          telemetry.presentEndUs,
                          telemetry);
@@ -910,7 +944,7 @@ int VrrPacingWorker::run()
             // Preserve known completion only. An asynchronous decoder output
             // alone cannot prove that its GPU work fit inside the buffer.
             sample.graph.decoderReadyUs = preparedAhead ? telemetry.preparationStage.decodeReadyUs :
-                (decodeSyncWaitUs > kDecodeSyncNoticeUs || frame.decoderOutputComplete() ?
+                (decodeReadiness.completionObserved || frame.decoderOutputComplete() ?
                     frame.decodeCompleteUs() : 0);
             sample.graph.discontinuity = decision.rebased || decision.phaseDiscontinuity || externalRebaseApplied;
             sample.graph.backend = feedback.nativeBackendValid ? uint32_t(feedback.nativeBackend) : 0;
@@ -1006,14 +1040,18 @@ bool VrrPacingWorker::dequeueFrame(QueuedFrame& frame,
 {
     std::deque<QueuedFrame> expiredFrames;
     QMutexLocker lock(&m_FrameQueueLock);
-    while (!isStopping() && !m_Suspended.load() && m_FrameQueue.empty()) {
+    while (!isStopping() && !m_Suspended.load() &&
+            m_PendingWindowStateFlags.load() == 0 && m_FrameQueue.empty()) {
         m_FrameQueueNotEmpty.wait(&m_FrameQueueLock);
     }
 
     if (isStopping()) {
         return false;
     }
-    if (m_Suspended.load()) {
+    if (m_Suspended.load() || m_PendingWindowStateFlags.load() != 0 ||
+            m_FrameQueue.empty()) {
+        // A display epoch must reach the presenter even when no successor
+        // frame arrives. Return an empty wake to the notification drain.
         return true;
     }
 
@@ -1096,6 +1134,11 @@ uint32_t VrrPacingWorker::consumeWindowStateNotifications()
     if (suspended != m_PresenterSuspended) {
         m_Presenter->setSuspended(suspended);
         m_PresenterSuspended = suspended;
+    }
+    if (m_NativeScheduledPresentation) {
+        // Accepted deadlines belong to this window/display epoch. Cancel any
+        // queued updates before preparing work for the reconciled new epoch.
+        m_Presenter->clearScheduledPresentation();
     }
     m_RebaseOnNextFrame = true;
     m_RebaseOnNextFrameFlags |= consumedFlags;
@@ -1193,8 +1236,8 @@ void VrrPacingWorker::recordSubmission(
             telemetry.submissionBoundaryUs, decision.targetUs);
 
         if (telemetry.hadPriorSubmission) {
-            const uint64_t priorSubmissionUs =
-                m_TimingController->lastSubmissionUs();
+            const uint64_t priorSubmissionUs = telemetry.nativeScheduledPresentation ?
+                m_LastActualSubmissionUs : m_TimingController->lastSubmissionUs();
             telemetry.presentSpacingUs =
                 telemetry.submissionBoundaryUs >= priorSubmissionUs ?
                     telemetry.submissionBoundaryUs - priorSubmissionUs : 0;
@@ -1205,13 +1248,21 @@ void VrrPacingWorker::recordSubmission(
         }
     }
 
+    telemetry.schedulingBoundaryUs = telemetry.submissionBoundaryUs;
+    if (telemetry.nativeScheduledPresentation && feedback.presented &&
+            !feedback.cancelled && feedback.nativeTargetValid) {
+        telemetry.schedulingBoundaryUs = std::max(
+            telemetry.submissionBoundaryUs, feedback.nativeTargetUs);
+    }
+    if (feedback.presented) m_LastActualSubmissionUs = telemetry.submissionBoundaryUs;
+
     if (feedback.flipProtectionLatched) {
         m_TimingController->noteNativeFlipProtection(
             feedback.flipProtectionReferenceUs);
     }
     m_TimingController->noteSubmission(
         feedback.presented, feedback.cancelled,
-        telemetry.submissionBoundaryUs);
+        telemetry.schedulingBoundaryUs);
     Vrr13::PresentationObservation observation;
     observation.smoothness = m_TimingController->smoothnessSample(decision);
     observation.submitted = feedback.presented && !feedback.cancelled;
@@ -1464,7 +1515,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     auto traceConfig = m_Config;
     traceConfig.latencyMode = row.latencyMode;
     const VrrTimingParameters parameters = vrrTimingParametersForSession(
-        traceConfig, m_NativeSynchronizedPresentation);
+        traceConfig, m_NativeSynchronizedPresentation, m_NativeScheduledPresentation);
     const VrrPresentFeedback& feedback = row.feedback;
     const FrameTelemetry& telemetry = row.telemetry;
     const uint64_t nativePresentDurationUs =
@@ -1886,6 +1937,23 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(feedback.flipProtectionReferenceUs);
     addBool(feedback.flipProtectionLatched);
     addUnsigned(row.decodeHoldUs);
+    addBool(row.telemetry.decodeReadinessObserved);
+    addBool(row.telemetry.nativeScheduledPresentation);
+    addUnsigned(row.feedback.nativeTargetValid ? row.feedback.nativeTargetUs : 0);
+    addUnsigned(row.telemetry.schedulingBoundaryUs);
+    addUnsigned(row.feedback.nativeTargetTime100ns);
+    addUnsigned(row.feedback.nativeTargetReferenceTime100ns);
+    addUnsigned(row.feedback.nativeTargetClockBeforeUs);
+    addUnsigned(row.feedback.nativeTargetClockAfterUs);
+    addUnsigned(row.feedback.nativeTargetUncertaintyUs);
+    addUnsigned(row.feedback.nativeOutstandingPresents);
+    addUnsigned(row.feedback.nativeRetiringPresentId);
+    addUnsigned(row.feedback.nativeSkippedFrames);
+    addUnsigned(row.feedback.nativeCanceledFrames);
+    addUnsigned(row.feedback.nativeDisplayedDuration100ns);
+    addUnsigned(row.feedback.nativeStatusId);
+    addUnsigned(row.feedback.nativeStatus);
+    addUnsigned(row.feedback.nativeDroppedStatusFrames);
     line.append('\n');
 
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {

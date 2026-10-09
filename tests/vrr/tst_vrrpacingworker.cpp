@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <functional>
 #include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -1092,6 +1093,323 @@ void testFirstFrameDecodeReadinessTrace()
     }
     qputenv("MOONLIGHT_VRR_TRACE", "");
     qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+}
+
+void testShortAndAlreadyCompleteDecodeReadiness()
+{
+    // Reproduce the HEVC capture: output was returned almost six milliseconds
+    // before the worker's short (or already-complete) GPU fence observation.
+    class ReadinessPresenter : public FakeVrrFramePresenter {
+    public:
+        uint64_t waitUs = 0;
+        bool observed = true;
+        VrrDecodeReadiness observeDecodeReadiness(AVFrame*, uint64_t) override
+        {
+            g_FrozenTestClockUs.fetch_add(waitUs);
+            return {waitUs, observed, true};
+        }
+    };
+    for (const auto waitUs : {uint64_t(0), uint64_t(83), uint64_t(200), uint64_t(201)}) {
+        for (const bool observed : {false, true}) {
+            if (!observed && waitUs != 0) continue;
+            resetFakeClock();
+            QTemporaryDir directory;
+            const QString path = directory.filePath("short-decode.vrrtrace");
+            qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(path).constData());
+            ReadinessPresenter backend;
+            backend.waitUs = waitUs;
+            backend.observed = observed;
+            PacerTelemetry telemetry;
+            TrackedFrameLifetime lifetime;
+            uint64_t outputUs = 0;
+            {
+                VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+                expect(worker.start(), "short decode readiness worker must start");
+                FrozenTestClock clock;
+                auto input = frame(1, lifetime);
+                outputUs = input.decoderOutputUs();
+                clock.advance(5803);
+                worker.submit(std::move(input));
+                expect(backend.waitForPrepareCount(1), "readiness observation must reach preparation");
+                clock.resume();
+                expect(backend.waitForPresentCount(1), "short decode readiness frame must present");
+            }
+            const auto lines = readExpandedTrace(path).split('\n');
+            const auto columns = lines.value(0).split(',');
+            const auto fields = lines.value(1).split(',');
+            const auto value = [&](const char* name) {
+                return fields.value(columns.indexOf(name)).toULongLong();
+            };
+            expect(value("decoder_output_us") == outputUs &&
+                       value("decode_sync_wait_us") == waitUs &&
+                       value("decode_readiness_observed") == uint64_t(observed),
+                   "readiness evidence must preserve immutable output and actual CPU wait");
+            const auto graph = telemetry.timingGraphSnapshot().points;
+            if (observed) {
+                expect(value("decode_complete_us") >= value("dequeue_us") + waitUs &&
+                           value("decode_complete_us") >= outputUs + 5803 &&
+                           value("source_time_us") == value("decode_complete_us"),
+                       "short and zero-wait GPU observations must seed completion-based mapping after the queue");
+                expect(graph.size() == 1 && graph[0].decoderReadyUs == value("decode_complete_us"),
+                       "the graph must use the same proven completion bound as scheduling");
+            }
+            else {
+                expect(graph.size() == 1 && graph[0].decoderReadyUs == 0,
+                       "an unavailable asynchronous completion must remain unknown in the graph");
+            }
+            const char* exportPrefix = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_SHORT_DECODE_TRACE");
+            if (exportPrefix && exportPrefix[0]) {
+                const QString destination = QString::fromLocal8Bit(exportPrefix) +
+                    QString("-%1-%2.vrrtrace").arg(waitUs).arg(observed ? "observed" : "unknown");
+                QFile::remove(destination);
+                expect(QFile::copy(path, destination), "short-readiness fixture must export for exact replay");
+            }
+            qputenv("MOONLIGHT_VRR_TRACE", "");
+        }
+    }
+}
+
+class NativeScheduledPresenter : public FakeVrrFramePresenter {
+public:
+    struct Enqueue {
+        uint64_t targetUs = 0;
+        uint64_t atUs = 0;
+        bool accepted = false;
+    };
+
+    int lateAttempt = 0;
+    int failedAttempt = 0;
+    std::atomic_uint clears { 0 };
+    std::atomic_uint queuedNativeFrames { 0 };
+
+    NativeScheduledPresenter() { setCanLatch(true); }
+    bool alwaysSynchronizesAdaptivePresent() const override { return true; }
+    bool supportsScheduledPresentation() const override { return true; }
+
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        const int attempt = ++m_Attempts;
+        if (attempt == lateAttempt) {
+            // Model native work before acceptance, with an actual enqueue
+            // boundary later than the deadline requested by the worker.
+            g_FrozenTestClockUs.store(std::max(LiGetMicroseconds(), request.displayTargetUs + 500));
+        }
+        auto feedback = FakeVrrFramePresenter::presentAdaptive(request);
+        feedback.nativeBackendValid = true;
+        feedback.nativeBackend = VrrNativePresentationBackend::Composition;
+        feedback.nativeTargetValid = request.displayTargetUs != 0;
+        feedback.nativeTargetUs = request.displayTargetUs;
+        if (attempt == failedAttempt) {
+            feedback.presented = false;
+            feedback.cancelled = true;
+            feedback.nativeTargetValid = false;
+            feedback.nativeTargetUs = 0;
+            feedback.submissionIdValid = false;
+            feedback.submissionId = 0;
+            feedback.nativePresentResult = -1;
+            feedback.submissionTimeValid = false;
+            feedback.submissionTimeUs = 0;
+        }
+        else {
+            feedback.submissionIdValid = true;
+            feedback.submissionId = ++m_AcceptedId;
+            ++queuedNativeFrames;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_EnqueueMutex);
+            m_Enqueues.push_back({request.displayTargetUs, LiGetMicroseconds(), feedback.presented});
+        }
+        return feedback;
+    }
+
+    void clearScheduledPresentation() override
+    {
+        queuedNativeFrames.store(0);
+        ++clears;
+    }
+
+    std::vector<Enqueue> enqueues() const
+    {
+        std::lock_guard<std::mutex> lock(m_EnqueueMutex);
+        return m_Enqueues;
+    }
+
+private:
+    std::atomic_int m_Attempts { 0 };
+    uint64_t m_AcceptedId = 0;
+    mutable std::mutex m_EnqueueMutex;
+    std::vector<Enqueue> m_Enqueues;
+};
+
+void testNativeScheduledEnqueueCadenceAndLifecycle()
+{
+    for (const char* variant : {"accepted", "late", "failed"}) {
+        resetFakeClock();
+        QTemporaryDir directory;
+        const QString path = directory.filePath("native-scheduled.vrrtrace");
+        qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(path).constData());
+        qputenv("MOONLIGHT_VRR_DEEP_TRACE", "1");
+        NativeScheduledPresenter backend;
+        backend.lateAttempt = std::string(variant) == "late" ? 2 : 0;
+        backend.failedAttempt = std::string(variant) == "failed" ? 2 : 0;
+        PacerTelemetry telemetry;
+        std::array<TrackedFrameLifetime, 7> lifetimes;
+        auto session = enabledConfig();
+        session.streamRateHz = 120;
+        session.latencyMode = 2;
+        unsigned clearCountBeforeShutdown = 0;
+        unsigned completed = 0;
+        {
+            // Explicit stepping proves ordering without depending on the
+            // scheduler delivering the test thread within a fraction of a ms.
+            FrozenTestClock clock;
+            g_FrozenTestClockUs.store(1000000);
+            VrrPacingWorker worker(&backend, session, &telemetry);
+            expect(worker.start(), "native scheduled worker fixture must start");
+            const auto submit = [&](int index) {
+                worker.submit(makeTrackedPacedFrame(index + 1, uint32_t(index * 750),
+                                                    LiGetMicroseconds(), lifetimes[index]));
+            };
+            submit(0);
+            bool successorAlreadyQueued = false;
+            uint64_t priorLogicalUs = 0;
+            for (int i = 0; i < 6; ++i) {
+                if (i != 0 && !successorAlreadyQueued) submit(i);
+                successorAlreadyQueued = false;
+                const bool enqueued = waitFor([&] { return backend.enqueues().size() > size_t(i); });
+                expect(enqueued, "prepared native frame must enqueue before its worker cadence hold");
+                if (!enqueued) {
+                    // Resume time before destroying a worker whose old wait
+                    // implementation may still own an outstanding deadline.
+                    clock.resume();
+                    break;
+                }
+                const auto event = backend.enqueues()[i];
+                expect(event.targetUs != 0,
+                       "native presentation must receive the controller's display deadline");
+                if (priorLogicalUs) {
+                    expect(event.targetUs >= priorLogicalUs + 8333,
+                           "successive accepted native deadlines must clear one display period");
+                }
+                if (i != 1 || backend.lateAttempt == 0) {
+                    expect(event.atUs < event.targetUs,
+                           "ready native frames must enqueue before the display deadline");
+                }
+                else {
+                    expect(event.atUs == event.targetUs + 500,
+                           "late native fixture must preserve the actual enqueue boundary");
+                }
+                if (i == 0) {
+                    // Deliver a replacement while the first image is native
+                    // owned. It must remain queued, not be prepared early.
+                    submit(1);
+                    successorAlreadyQueued = true;
+                    expect(telemetryStats(telemetry).vrrPresentedFrames == 0 &&
+                               backend.preparedFrames().size() == 1,
+                           "native acceptance must precede worker completion and the next dequeue");
+                    g_FrozenTestClockUs.store(event.targetUs - 1);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    expect(telemetryStats(telemetry).vrrPresentedFrames == 0 &&
+                               backend.preparedFrames().size() == 1,
+                           "worker completion and the next preparation must wait until the native deadline");
+                }
+                g_FrozenTestClockUs.store(std::max(LiGetMicroseconds(), event.targetUs + 75));
+                ++completed;
+                const unsigned expectedPresents = completed - (backend.failedAttempt != 0 && completed >= 2 ? 1 : 0);
+                const unsigned expectedDrops = backend.failedAttempt != 0 && completed >= 2 ? 1 : 0;
+                expect(waitFor([&] {
+                    const auto stats = telemetryStats(telemetry);
+                    return stats.vrrPresentedFrames >= expectedPresents &&
+                        stats.vrrPacingDroppedFrames >= expectedDrops;
+                }), "native outcome must complete after the logical deadline");
+                if (event.accepted) priorLogicalUs = std::max(event.atUs, event.targetUs);
+            }
+            if (std::string(variant) == "accepted") {
+                const unsigned priorClears = backend.clears.load();
+                WINDOW_STATE_CHANGE_INFO changed {};
+                changed.stateChangeFlags = WINDOW_STATE_CHANGE_DISPLAY;
+                worker.notifyWindowChanged(&changed);
+                expect(waitFor([&] { return backend.clears.load() > priorClears; }),
+                       "display epoch change must clear native queued deadlines on the worker");
+                expect(backend.queuedNativeFrames == 0,
+                       "no native queue entry from the old display epoch may remain");
+                submit(6);
+                expect(waitFor([&] { return backend.enqueues().size() == 7; }),
+                       "fresh presentation must resume after clearing the native display epoch");
+                if (backend.enqueues().size() == 7) {
+                    const auto fresh = backend.enqueues().back();
+                    g_FrozenTestClockUs.store(std::max(LiGetMicroseconds(), fresh.targetUs + 75));
+                    expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == 7; }),
+                           "fresh native frame must complete under the new display epoch");
+                    ++completed;
+                }
+            }
+            clearCountBeforeShutdown = backend.clears.load();
+            clock.resume();
+        }
+        expect(completed >= 6 && backend.clears.load() > clearCountBeforeShutdown &&
+                   backend.queuedNativeFrames == 0,
+               "shutdown must clear accepted native work without a replacement submission");
+        for (unsigned i = 0; i < completed; ++i) {
+            expect(lifetimes[i].releases == 1,
+                   "native scheduled source ownership must release each frame exactly once");
+        }
+        const auto expanded = readExpandedTrace(path);
+        const auto lines = expanded.split('\n');
+        const auto columns = lines.value(0).split(',');
+        unsigned rows = 0;
+        uint64_t acceptedLogicalUs = 0;
+        bool observedLate = false;
+        bool observedFailure = false;
+        bool observedEpoch = false;
+        for (int i = 1; i < lines.size(); ++i) {
+            const auto fields = lines[i].split(',');
+            if (fields.size() != columns.size()) continue;
+            const auto value = [&](const char* name) {
+                return fields.value(columns.indexOf(name)).toULongLong();
+            };
+            ++rows;
+            expect(value("native_scheduled_presentation") == 1 &&
+                       value("param_native_scheduled_presentation") == 1 &&
+                       value("native_target_us") == (value("presented") ? value("target_us") : 0) &&
+                       value("native_backend_valid") == 1 && value("native_backend") == 3,
+                   "scheduled trace must preserve the capability and native display deadline");
+            expect(value("target_wait_entry_us") >= value("present_end_us") &&
+                       value("target_wait_final_us") >= value("target_us"),
+                   "native trace must place the worker cadence hold after enqueue and through the deadline");
+            if (value("presented")) {
+                const uint64_t logical = std::max(value("submission_boundary_us"), value("native_target_us"));
+                expect(value("scheduling_boundary_us") == logical &&
+                           (!acceptedLogicalUs || value("target_us") >= acceptedLogicalUs + 8333),
+                       "scheduling feedback must use accepted deadlines while tracing actual native enqueue");
+                observedLate |= value("submission_boundary_us") > value("native_target_us");
+                acceptedLogicalUs = logical;
+                observedEpoch |= value("external_rebase_applied") != 0 && value("frame") == 7;
+            }
+            else {
+                observedFailure = true;
+                expect(value("cancelled") == 1 &&
+                           value("scheduling_boundary_us") == value("submission_boundary_us"),
+                       "failed native enqueue must not claim the unaccepted future deadline as its boundary");
+            }
+        }
+        expect(rows == completed && expanded.contains("#vrr_trace_footer,"),
+               "scheduled fixture must close with one terminal row per delivery and a clean footer");
+        expect((backend.lateAttempt != 0) == observedLate &&
+                   (backend.failedAttempt != 0) == observedFailure &&
+                   (std::string(variant) == "accepted") == observedEpoch,
+               "scheduled fixtures must retain their late, failure, and epoch evidence");
+        const char* exportPrefix = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_NATIVE_SCHEDULED_TRACE");
+        if (exportPrefix && exportPrefix[0]) {
+            const QString destination = QString::fromLocal8Bit(exportPrefix) +
+                QString("-%1.vrrtrace").arg(QString::fromLatin1(variant));
+            QFile::remove(destination);
+            expect(QFile::copy(path, destination),
+                   "native scheduled fixture must export separately for exact replay");
+        }
+        qputenv("MOONLIGHT_VRR_TRACE", "");
+        qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+    }
 }
 
 void testTelemetrySnapshotsRemainCumulative()
@@ -3243,6 +3561,8 @@ int main()
     testDecodeWaitDoesNotExpireReadyFrame();
     testRepeatedDecodeContentionKeepsPresenting();
     testFirstFrameDecodeReadinessTrace();
+    testShortAndAlreadyCompleteDecodeReadiness();
+    testNativeScheduledEnqueueCadenceAndLifecycle();
     testTelemetrySnapshotsRemainCumulative();
     testSuspendDiscardAndFreshFrame();
     testCancelledPreparedFenceTrace();

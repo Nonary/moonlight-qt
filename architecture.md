@@ -5,8 +5,9 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Current source review baseline: `42cd1d68` plus the rendering and interval-policy
-corrections in this worktree, reviewed 2026-10-08 local / 2026-10-09 UTC.
+Current source review baseline: `a8759d13` plus the GPU completion-observation
+and native display-deadline corrections in this worktree, reviewed
+2026-10-08 local / 2026-10-09 UTC.
 Windows prefers composition on supported devices, with DXGI fallback. D3D11
 verifies rendering completion during preparation, before the cadence hold, and
 the final presentation checks a cached proof for the exact prepared marker.
@@ -41,6 +42,67 @@ this exploratory capture; this is not strict A/B proof or live smoothness proof.
 Deterministic tests reproduce the history undercoverage and premature release,
 and all eight new/historical D3D11 readiness fixtures pass exact replay.
 Physical display cadence and live gameplay fluidity remain to be validated.
+
+The 2026-10-08 fluidity investigation selected the newest completed capture
+`20261009-015916-375-a0f03198-c6d5-4499-b488-4e21792e1073/Moonlight.vrrtrace`
+(1,592,443 bytes; last write 2026-10-09 02:00:01.205 UTC; SHA-256
+`d6c39be0e40a2d8f45080d3cadc9dd2bdc2e9dc8d0a1c2a901207d7c5c99145f`).
+It passes fresh exact replay after the captured queue-capacity audit correction.
+The subsequent 020015 capture was still open at this selection and was excluded.
+The earlier policy held until its CPU submission target, then called native
+`SetTargetTime` with current QPC-derived time. It also disabled the physical
+interval floor because native synchronization was assumed to space each frame.
+The selected capture contains 891 of 4,007 steady CPU submission intervals below
+8,333 us and eleven groups of distinct native IDs with equal display timestamps.
+For example, frames 2063/2064 (native IDs 2024/2025) both have native display
+time 222,897,479 us. An earlier interpretation of frame 2063's 16.662 ms display
+interval was incomplete: it may have been immediately superseded at that same
+display opportunity. Native acceptance and even a display-event record do not
+prove that a frame remained visible for a source period. Native queue ownership
+was usually one frame, so a large sustained native backlog is not established.
+Production
+sets `playoutPredictionOnly=1` and `playoutNativeHitchAdaptation=0`; native
+presentation observations are diagnostic and do not supply compositor lead or
+buffer demand. Submission regularity therefore does not establish display
+regularity. Native events must be matched by presentation ID rather than the
+trace row on which they were polled. Some long display intervals also have
+upstream readiness/capture stalls; the native scheduling defect does not explain
+every hitch.
+An exact-baseline-backed nine-scenario replay reproduced useful CPU pacing
+improvement with fixed 2 ms versus 10 ms allowances, but does not simulate a
+new native future-target queue. Enabling the historical metronome reduced
+submission jerk while raising median decoder-output-to-submission latency from
+9.942 ms to 18.111 ms at a 2 ms allowance; it is not a demonstrated latency-
+bounded correction. Current composition scheduling instead admits logical
+display deadlines at least one physical period apart, submits prepared frames
+before those deadlines, and holds the serial worker until the reserved deadline
+before its next dequeue. Accepted targets anchor spacing; CPU hold overshoot
+does not accumulate into the next target. Late actual enqueue remains an anchor
+when it exceeds the requested deadline. Five existing buffers bound ownership;
+native availability, retirement, and skipped/canceled status release accounting.
+The replay models CPU enqueue and logical scheduling separately; it does not
+simulate Windows' physical display queue. Dedicated controller/worker/ownership
+tests and exact replay are required, followed by a new live capture before
+claiming improved gameplay fluidity.
+
+Final native-scheduling validation on 2026-10-08 local: the incremental Windows
+application build, diagnostic build, all six required VRR suites, native
+composition ownership/clock policy, presentation-clock, and DXGI call-boundary
+suites pass. Nine freshly exported worker traces pass strict exact replay,
+including native accepted/late/failed cases, legacy composition, and five short
+or unavailable GPU-readiness cases. A five-scenario native-worker fault batch
+passes all 20 interval, residual, and latency assertions; its 20 ms latency bound
+is synthetic worker-model validation, not a measurement of gameplay latency.
+The newest completed capture at handoff is
+`20261009-022434-049-bb998eaf-49be-4f36-97f0-0cbd30c4da35/Moonlight.vrrtrace`
+(18,347,503 bytes; last write 2026-10-09 02:33:48.861 UTC; SHA-256
+`7f1aa20d447a6399423f030aea457a45e4ec63dea97985a36d13dad1fec8723e`).
+Its matching sidecar confirms clean close, HEVC session settings at 113 Mbps,
+120 FPS, Reduce judder enabled, and buffer per-mille 250. Fresh strict replay
+passes sequence, semantic, and exact-policy gates. It was captured before native
+deadline scheduling was installed, so it does not validate the new physical
+presentation behavior. Native-clock coverage and actual display/skip observations
+must come from a subsequent live session.
 
 macOS now has a native Metal presenter for the shared VRR worker. Session
 eligibility uses the actual window's `NSScreen` refresh range, including
@@ -2522,7 +2584,7 @@ successful IDR completion establishes valid reference state.
 | `enqueueTimeUs` / reassembled time | Client monotonic microseconds | Complete compressed frame assembled/queued. |
 | `decodeSubmitUs` | Client monotonic microseconds | Sampled immediately before FFmpeg packet submission. |
 | `decoderOutputUs` | Client monotonic microseconds | Immutable timestamp captured immediately when FFmpeg returns the decoded frame; client-processing reporting origin. |
-| `decodeCompleteUs` | Client monotonic microseconds | Post-output readiness observation; anchors production RTP-to-client mapping so hardware decode duration is absorbed in the sender offset. Linux samples it after `vaSyncSurface()`, Windows after the monitored decode-to-render fence wait. Without a wait over 200 us it equals `decoderOutputUs`, as on Windows before 2026-09-22 and on shared-device or non-monitored-fence sessions. |
+| `decodeCompleteUs` | Client monotonic microseconds | Post-output readiness observation; anchors production RTP-to-client mapping so hardware decode duration is absorbed in the sender offset. Linux samples it after `vaSyncSurface()`, Windows after the monitored decode-to-render fence wait. Every proven D3D11 completion, including a short wait or an already-ready fence, retains a post-observation upper bound. Historical captures and backends without completion evidence retain their output-time mapping fallback. |
 | `decodeSyncWaitUs` | Elapsed client microseconds | Explicit CPU time spent by the worker on a decoder/backend completion primitive. It is serial service and latency accounting, not a source-clock timestamp. A zero value does not exclude a GPU-queued dependency. |
 | Worker queue, decision, preparation, wait, submission times | Client monotonic microseconds | Distinct CPU-side lifecycle boundaries. |
 | Shared fence values | GPU ordering identities | Establish dependencies/completion; not elapsed time by themselves. |
@@ -3048,9 +3110,12 @@ This restores vrr14's planned-slot protection rule, without vrr17's extra
 and its software floor is disabled. Otherwise the adaptive floor applies.
 DXGI uses `Present(1, 0)` for protected slots and
 `Present(0, DXGI_PRESENT_ALLOW_TEARING)` for slots that clear that threshold;
-`MOONLIGHT_VRR_SYNC_FLIPS=1` synchronizes those too (see 2026-09-28 above). Diagnostic composition already
-provides native ordering; its protection capability likewise permits a slot
-without the extra CPU floor. It does not expose DXGI tearing flags.
+`MOONLIGHT_VRR_SYNC_FLIPS=1` synchronizes those too (see 2026-09-28 above).
+Composition's separate `native_scheduled_presentation` capability reserves
+display deadlines at least one physical display period apart, without the
+DXGI guard or a CPU enqueue floor. Merely accepting a synchronized native
+present does not establish separate visible frames. Composition does not
+expose DXGI tearing flags.
 
 `lastSubmission` in that rule is the spacing anchor, not always the previous
 Present call (`latched_flip_anchor=1` in production since 2026-09-22). A
@@ -3449,11 +3514,13 @@ ordering protects texture reuse. The purpose is both correctness and avoiding
 accidental waits for work belonging to subsequent frames.
 `renderVideo()` queues `ID3D11DeviceContext4::Wait` for the captured boundary
 before any copy or shader read; that GPU dependency is the correctness mechanism.
-With monitored fences, the worker's `waitForDecode()` also blocks until the
-exact captured value completes, taking no context lock and using its own event
-with the 50 ms / fence-value-verified wait described below. That post-wait clock
-is `decodeCompleteUs`, which production source mapping requires to absorb
-hardware decode time (the Linux `vaSyncSurface()` equivalent). Between
+With monitored fences, `observeDecodeReadiness()` independently reports CPU
+wait duration and completion evidence, taking no context lock and using its own
+event with the 50 ms / fence-value-verified wait described below. The worker
+records its post-observation upper bound as `decodeCompleteUs` even for short
+waits and already-ready fences; the former 200 us threshold cannot determine
+timestamp correctness. Unknown asynchronous readiness stays unknown in the
+input graph. Production source mapping uses the observed completion boundary. Between
 `78b99f1c` and 2026-09-22 this check was nonblocking, which left Windows mapped
 from decoder output while Linux mapped from completion. Non-monitored fences and
 shared devices remain nonblocking; there, a zero CPU decode-wait measurement
@@ -3636,13 +3703,23 @@ Initial allocation and each resize explicitly set the surface source rectangle
 to the full buffer; omitting this leaves successful submissions with no image.
 The same shaders, overlays, colorspace, GPU-ready fence, and pacing deadline
 are used. Buffer acquisition checks availability without waiting and returns
-`S_FALSE` when all five buffers remain unavailable. Submission preserves accepted
-predecessors and targets the current QPC-derived presentation time, with
-no added source period or wait for a presentation event. `ForceVSyncInterrupt`
+`S_FALSE` when all five buffers remain unavailable. Scheduled submission preserves
+accepted predecessors and translates the worker's future display deadline into
+QPC-derived 100 ns presentation time using a fresh clock bracket. Elapsed
+deadlines request immediate presentation, without adding a period to hide
+lateness. The legacy immediate overload remains available for probes.
+Clock correlation is retried a bounded number of times when preemption makes
+the bracket unreliable; persistent uncertainty drops that frame with `S_FALSE`
+instead of treating a scheduling interruption as device loss.
+`ForceVSyncInterrupt`
 requests prompt statistics even with hardware flip queues. Buffer storage
 is not a queue-depth target; OS/driver scheduling still needs measurement.
-`CancelPresentsFrom(1)` is restricted to resize/reset lifecycle changes rather
-than discarding older accepted frames before every new present.
+`CancelPresentsFrom(1)` is restricted to resize/reset, window/display epoch,
+suspension, and worker shutdown rather than discarding accepted predecessors
+before each new present. Retiring-fence, availability, and skipped/canceled
+status evidence release the ownership accounting. Queued status alone does
+not release ownership or establish display. Trace rows expose cumulative skip,
+cancel, and status-overflow counts plus the latest drained status ID and value.
 
 Only independent-flip statistics with the matching surface tag, output adapter,
 source ID, and increasing present ID become display events. Their 100 ns system-relative
@@ -3650,9 +3727,23 @@ timestamps are correlated with scaled QPC through a fresh bracket on the worker
 clock, with bounded age and uncertainty. Composition statistics do not become
 display events. The backend is trace value 3; DXGI flags, query results, and raw
 QPC fields remain unset. The explicit `native_synchronized_presentation` flag
-keeps every controller decision latched and omits the software floor without
-claiming DXGI flag switching. Missing flags default to zero for historical exact
-replay; session-policy replay resolves the current composition capability.
+keeps every controller decision latched without claiming DXGI flag switching.
+The independent `native_scheduled_presentation` flag enforces a display-period
+deadline floor and permits early CPU enqueue. `submission_us` records actual
+native enqueue; `native_target_us` records an accepted deadline, and
+`scheduling_boundary_us` is their maximum for accepted work. CPU holding occurs
+after enqueue, outside the renderer lock. Failed enqueue does not reserve a
+future anchor. Raw target/clock-bracket fields audit native deadline translation;
+skipped/canceled counts distinguish acceptance from display. The raw
+`native_displayed_duration_100ns` field is Windows' `GetPresentDuration()` value:
+the driver-approved custom refresh duration, not measured image residency or
+proof that the image remained visible for that long. A native display event
+earlier than the requested target is diagnostic rather than capture corruption;
+Windows documents the target as an attempt to display as close as possible.
+Missing flags retain historical exact replay. Session-policy replay resolves
+the current composition capabilities, but cannot predict native service timing
+under a changed queue model. D3D11 calibration identity includes
+`native-scheduled=1` so old scheduling history is not silently reused.
 Resize replaces
 buffers; display changes recreate the renderer and its output identity.
 
@@ -4151,7 +4242,14 @@ not establish native panel refresh or satisfy the DXGI raster gate.
 
 Current-policy replay and queue simulation select the shared prediction policy
 regardless of native backend. Exact replay continues to use recorded parameters,
-including historical Linux thresholded-event demand. Replay audits Vulkan's
+including `playout_queue_frames` for admission and completion queue-depth audits.
+The audit uses the same bounded capacity as the worker: an omitted/zero override
+retains the historical three waiting slots, while current four-slot captures
+permit depth four. A hard-coded three-slot audit falsely rejected clean current
+captures at startup without indicating a production queue overflow. The
+20261009-015916 capture exposed this discrepancy; its recorded timings remain
+observations, and counterfactual results require the corrected exact gate.
+Exact replay also retains historical Linux thresholded-event demand. Replay audits Vulkan's
 historical texture-poll readiness rows with their recorded result and completion-
 bound rules. Asynchronous Linux VAAPI captures can leave output readiness
 unavailable; replay must not invent completion evidence for those rows. The separate strict Windows/raster diagnostic gate remains backend-specific
@@ -4288,6 +4386,31 @@ interval needs feedback for both frames of the same epoch and backend, so a
 missing presentation is a gap, never one long interval. Planned intervals
 include buffer steps, which therefore appear as matching planned and submission
 spikes.
+
+GPU completion-observation correction (2026-10-08): the HEVC capture
+`20261009-013057-293-10dddb85-100d-45f0-bac6-e3639ec023c5/Moonlight.vrrtrace`
+closed cleanly and passed a fresh exact baseline with the pre-change replay.
+Frame 132 returned output at 61,649,565 us, dequeued at 61,655,368 us, and
+waited another 83 us, but retained output time as completion. 104 positive
+waits of at most 200 us have this error; 363 already-ready checks likewise
+retained output without evidence that it was complete at output. These points
+frequently established the minimum used for RTP mapping. The worker now uses
+explicit completion evidence independently of wait duration. Schema 5 adds the
+optional boolean `decode_readiness_observed`; replay audits post-observation
+ordering for declared observations and preserves the historical rules when it
+is absent. D3D11 calibration identity includes `decode-readiness=2`, preventing
+restoration of buffer seeds learned from the inconsistent timestamps. The new
+worker regression covers 0/83/200/201 us observations after 5.803 ms of prior
+delay and unknown asynchronous readiness. Completion is a conservative bound
+at observation, not exact GPU execution time. Backends without completion
+evidence retain the established output-time mapping fallback. Stored old
+traces cannot establish live GPU or display behavior after this correction.
+Final Windows validation: incremental app and diagnostic builds pass, all six
+required VRR suites plus profile and overlay tests pass, and all five exported
+readiness fixtures pass exact replay. The final replay also reproduces the
+selected HEVC capture exactly with zero changes across 21 compared metrics.
+This establishes the corrected observation contract and historical replay
+compatibility, not a measured improvement in live latency or display hitches.
 
 Incoming jitter / buffer panel (2026-10-08): a fourth panel shares frame
 positions with the cadence lanes and uses its own signed millisecond axis.

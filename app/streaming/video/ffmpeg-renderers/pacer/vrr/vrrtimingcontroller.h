@@ -227,7 +227,9 @@
     X(uint64_t, playout_epoch_sustain_us, playoutEpochSustainUs, 0) \
     X(uint64_t, playout_delay_decrease_slew_us, playoutDelayDecreaseSlewUs, 0) \
     X(uint64_t, playout_epoch_confirm_us, playoutEpochConfirmUs, 0) \
-    X(uint64_t, playout_smoothing_readiness_bound, playoutSmoothingReadinessBound, 0)
+    X(uint64_t, playout_smoothing_readiness_bound, playoutSmoothingReadinessBound, 0) \
+    /* Native future deadlines use the logical display clock, not CPU enqueue. */ \
+    X(uint64_t, native_scheduled_presentation, nativeScheduledPresentation, 0)
 
 // Every value that changes VRR policy remains replaceable by replay without
 // rebuilding the controller. Production callers use these defaults.
@@ -241,7 +243,8 @@ struct VrrTimingParameters {
 // Resolve mode-dependent production policy once for both the live worker and
 // the replay baseline. Candidate replay configs may still override any field.
 VrrTimingParameters vrrTimingParametersForSession(
-    const VrrSessionConfig& config, bool nativeSynchronizedPresentation = false);
+    const VrrSessionConfig& config, bool nativeSynchronizedPresentation = false,
+    bool nativeScheduledPresentation = false);
 
 struct VrrTimingDiagnostics {
     int64_t readinessPhaseUs = 0;

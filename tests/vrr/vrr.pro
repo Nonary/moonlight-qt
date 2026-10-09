@@ -13,6 +13,8 @@ SUBDIRS += dxgipresent
 
 presentationclock.file = $$PWD/presentationclock.pro
 SUBDIRS += presentationclock
+compositionpresentpolicy.file = $$PWD/compositionpresentpolicy.pro
+SUBDIRS += compositionpresentpolicy
 
 win32 {
     compositionprobe.file = $$PWD/compositionprobe.pro

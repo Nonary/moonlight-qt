@@ -473,6 +473,7 @@ win32:!winrt {
         streaming/video/ffmpeg-renderers/dxva2.h \
         streaming/video/ffmpeg-renderers/d3d11va.h \
         streaming/video/ffmpeg-renderers/d3d11composition.h \
+        streaming/video/ffmpeg-renderers/compositionpresentpolicy.h \
         streaming/video/ffmpeg-renderers/d3d11pyrowave.h \
         streaming/video/pyrowave/pyrowavesurfaces.h \
         streaming/video/ffmpeg-renderers/presentationclock.h \

@@ -7,9 +7,17 @@
 struct AVFrame;
 class VrrPreparedFrame;
 
-// Renderer-facing VRR contract. Pacing timestamps and sender metadata never
-// cross this boundary: the presenter only prepares, adaptively presents, or
-// abandons a decoded image.
+// CPU service time and completion evidence are independent: an already-ready
+// GPU fence proves readiness even though checking it did not block.
+struct VrrDecodeReadiness {
+    uint64_t waitUs = 0;
+    bool completionObserved = false;
+    bool asynchronousOutput = false;
+};
+
+// Renderer-facing VRR contract. A backend with native timed presentation may
+// receive a display deadline on the shared monotonic clock. Sender metadata
+// remains worker-owned.
 enum class VrrFallbackReason : uint8_t {
     NoFallback,
     IneffectiveVsync,
@@ -77,6 +85,23 @@ struct VrrPresentFeedback {
     bool cancelled = false;
     bool submissionTimeValid = false;
     uint64_t submissionTimeUs = 0;
+    // Acceptance of a native future display deadline is independent of the
+    // actual CPU enqueue timestamp above. Never substitute one for the other.
+    bool nativeTargetValid = false;
+    uint64_t nativeTargetUs = 0;
+    uint64_t nativeTargetTime100ns = 0;
+    uint64_t nativeTargetReferenceTime100ns = 0;
+    uint64_t nativeTargetClockBeforeUs = 0;
+    uint64_t nativeTargetClockAfterUs = 0;
+    uint64_t nativeTargetUncertaintyUs = 0;
+    uint64_t nativeOutstandingPresents = 0;
+    uint64_t nativeRetiringPresentId = 0;
+    uint64_t nativeSkippedFrames = 0;
+    uint64_t nativeCanceledFrames = 0;
+    uint64_t nativeDisplayedDuration100ns = 0;
+    uint64_t nativeStatusId = 0;
+    uint64_t nativeStatus = 0;
+    uint64_t nativeDroppedStatusFrames = 0;
     // Backend and signed native result for the actual presentation call.
     // Both validity flags are set whenever that call was attempted, including
     // cancellation and failure paths. Vulkan's libplacebo wrapper and Metal
@@ -294,6 +319,10 @@ struct VrrPresentFeedback {
 struct VrrPresentRequest {
     bool latchedPresentation = false;
     bool collectDiagnostics = false;
+    // Zero retains the immediate path. A supported native backend accepts
+    // this future display deadline before the worker completes its cadence
+    // hold. It echoes acceptance separately from actual enqueue timing.
+    uint64_t displayTargetUs = 0;
     // Nonzero on an unlatched request asks a latch-capable backend to latch
     // anyway if the predecessor is not yet displayed or its refresh started
     // less than this long ago. Only presentAdaptive() consults it.
@@ -361,6 +390,12 @@ public:
         return false;
     }
 
+    virtual bool supportsScheduledPresentation() const { return false; }
+
+    // Invalidate native queued deadlines on suspension or a display epoch.
+    // This must not submit a replacement image.
+    virtual void clearScheduledPresentation() {}
+
     // Startup eligibility only. NoFallback means the presenter supports a worker-
     // thread split prepare/present path using its adaptive presentation mode.
     virtual VrrFallbackReason checkSupport() const = 0;
@@ -381,6 +416,12 @@ public:
     virtual uint64_t waitForDecode(AVFrame* frame, uint64_t)
     {
         return waitForDecode(frame);
+    }
+
+    virtual VrrDecodeReadiness observeDecodeReadiness(AVFrame* frame, uint64_t boundary)
+    {
+        const auto waitUs = waitForDecode(frame, boundary);
+        return {waitUs, waitUs != 0, false};
     }
 
     // May acquire a swapchain image and submit rendering work, but must not

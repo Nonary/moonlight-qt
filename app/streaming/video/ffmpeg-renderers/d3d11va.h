@@ -36,9 +36,12 @@ public:
     // presentation ordering. Both can honor a protected slot without a CPU floor.
     virtual bool canLatchAdaptivePresent() const override { return true; }
     bool alwaysSynchronizesAdaptivePresent() const override { return m_CompositionPresenter.active(); }
+    bool supportsScheduledPresentation() const override { return m_CompositionPresenter.active(); }
+    void clearScheduledPresentation() override;
     virtual VrrFallbackReason checkSupport() const override;
     virtual uint64_t captureDecodeBoundary() override;
     uint64_t waitForDecode(AVFrame* frame, uint64_t decodeBoundary) override;
+    VrrDecodeReadiness observeDecodeReadiness(AVFrame* frame, uint64_t decodeBoundary) override;
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
                                           uint64_t decodeBoundary) override;
     virtual VrrPresentFeedback presentAdaptive(
@@ -104,7 +107,7 @@ private:
     void bindVideoVertexBuffer(bool frameChanged, AVFrame* frame);
     bool renderVideo(AVFrame* frame, uint64_t decodeBoundary = 0);
     bool renderPyroWaveVideo(AVFrame* frame, PyroWaveFrameRef* ref);
-    uint64_t waitForPyroWaveDecode(const PyroWaveFrameRef* ref);
+    VrrDecodeReadiness waitForPyroWaveDecode(const PyroWaveFrameRef* ref);
     bool isPyroWave() const { return (m_DecoderParams.videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) != 0; }
     bool checkDecoderSupport(IDXGIAdapter* adapter);
     bool createDeviceByAdapterIndex(int adapterIndex, bool* adapterNotFound = nullptr);

@@ -1259,12 +1259,17 @@ uint64_t D3D11VARenderer::captureDecodeBoundary()
 
 uint64_t D3D11VARenderer::waitForDecode(AVFrame* frame, uint64_t decodeBoundary)
 {
+    return observeDecodeReadiness(frame, decodeBoundary).waitUs;
+}
+
+VrrDecodeReadiness D3D11VARenderer::observeDecodeReadiness(AVFrame* frame, uint64_t decodeBoundary)
+{
     if (auto* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
         return waitForPyroWaveDecode(pyroWaveRef);
     }
 
     if (decodeBoundary == 0 || m_DecodeD2RFence == nullptr) {
-        return 0;
+        return {0, false, true};
     }
 
     const uint64_t startUs = LiGetMicroseconds();
@@ -1277,10 +1282,10 @@ uint64_t D3D11VARenderer::waitForDecode(AVFrame* frame, uint64_t decodeBoundary)
         m_VrrPresentReadyAvailable = false;
         m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
         queueRenderDeviceReset();
-        return 0;
+        return {0, false, true};
     }
     if (completed >= decodeBoundary) {
-        return 0;
+        return {0, true, true};
     }
 
     // renderVideo() still queues an ID3D11DeviceContext4::Wait for this
@@ -1292,7 +1297,7 @@ uint64_t D3D11VARenderer::waitForDecode(AVFrame* frame, uint64_t decodeBoundary)
     // Only a monitored fence reports GPU progress to the CPU.
     if (m_FenceType != SupportedFenceType::Monitored ||
             m_VrrDecodeReadyEvent == nullptr) {
-        return 0;
+        return {0, false, true};
     }
 
     // The decoder thread already signalled and flushed this value. Fence
@@ -1326,9 +1331,9 @@ uint64_t D3D11VARenderer::waitForDecode(AVFrame* frame, uint64_t decodeBoundary)
         m_VrrPresentReadyAvailable = false;
         m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
         queueRenderDeviceReset();
-        return 0; // Failure must never advertise GPU readiness.
+        return {0, false, true}; // Failure must never advertise GPU readiness.
     }
-    return LiGetMicroseconds() - startUs;
+    return {LiGetMicroseconds() - startUs, true, true};
 }
 
 bool D3D11VARenderer::renderPyroWaveVideo(AVFrame* frame, PyroWaveFrameRef* ref)
@@ -1371,11 +1376,11 @@ bool D3D11VARenderer::renderPyroWaveVideo(AVFrame* frame, PyroWaveFrameRef* ref)
     return true;
 }
 
-uint64_t D3D11VARenderer::waitForPyroWaveDecode(const PyroWaveFrameRef* ref)
+VrrDecodeReadiness D3D11VARenderer::waitForPyroWaveDecode(const PyroWaveFrameRef* ref)
 {
     ID3D11Fence* fence = m_PyroWaveSurfaces ? m_PyroWaveSurfaces->decodeFence() : nullptr;
     if (fence == nullptr || m_VrrDecodeReadyEvent == nullptr) {
-        return 0;
+        return {0, false, true};
     }
 
     const uint64_t target = ref->decodeFenceValue;
@@ -1388,10 +1393,10 @@ uint64_t D3D11VARenderer::waitForPyroWaveDecode(const PyroWaveFrameRef* ref)
         m_VrrPresentReadyAvailable = false;
         m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
         queueRenderDeviceReset();
-        return 0;
+        return {0, false, true};
     }
     if (completed >= target) {
-        return 0;
+        return {0, true, true};
     }
 
     // Vulkan signals this fence when the decode finishes; no D3D11 context
@@ -1417,9 +1422,9 @@ uint64_t D3D11VARenderer::waitForPyroWaveDecode(const PyroWaveFrameRef* ref)
         m_VrrPresentReadyAvailable = false;
         m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
         queueRenderDeviceReset();
-        return 0; // Failure must never advertise GPU readiness.
+        return {0, false, true}; // Failure must never advertise GPU readiness.
     }
-    return LiGetMicroseconds() - startUs;
+    return {LiGetMicroseconds() - startUs, true, true};
 }
 
 IPyroWaveSurfacePool* D3D11VARenderer::getPyroWaveSurfacePool()
@@ -3013,16 +3018,31 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         feedback.nativeBackend = VrrNativePresentationBackend::Composition;
         feedback.nativePresentTimingValid = true;
         feedback.nativePresentStartUs = LiGetMicroseconds();
-        const HRESULT hr = m_CompositionPresenter.present(m_CompositionPresentId);
+        D3D11CompositionPresenter::PresentResult nativeTarget;
+        const HRESULT hr = request.displayTargetUs != 0 ?
+            m_CompositionPresenter.present(request.displayTargetUs, LiGetMicroseconds,
+                                           m_CompositionPresentId, &nativeTarget) :
+            m_CompositionPresenter.present(m_CompositionPresentId);
         feedback.nativePresentEndUs = LiGetMicroseconds();
         feedback.nativePresentResultValid = true;
         feedback.nativePresentResult = static_cast<int64_t>(hr);
         feedback.presented = hr == S_OK;
         feedback.cancelled = !feedback.presented;
         feedback.submissionTimeValid = feedback.presented;
-        feedback.submissionTimeUs = feedback.presented ? feedback.nativePresentStartUs : 0;
+        feedback.submissionTimeUs = feedback.presented ?
+            (nativeTarget.submissionTimeUs != 0 ? nativeTarget.submissionTimeUs :
+                                                 feedback.nativePresentStartUs) : 0;
         feedback.submissionIdValid = feedback.presented;
         feedback.submissionId = feedback.presented ? m_CompositionPresentId : 0;
+        feedback.nativeTargetValid = feedback.presented && request.displayTargetUs != 0;
+        if (feedback.nativeTargetValid) {
+            feedback.nativeTargetUs = nativeTarget.requestedTargetUs;
+            feedback.nativeTargetTime100ns = nativeTarget.targetTime100ns;
+            feedback.nativeTargetReferenceTime100ns = nativeTarget.referenceTime100ns;
+            feedback.nativeTargetClockBeforeUs = nativeTarget.clockBeforeUs;
+            feedback.nativeTargetClockAfterUs = nativeTarget.clockAfterUs;
+            feedback.nativeTargetUncertaintyUs = nativeTarget.clockUncertaintyUs;
+        }
         D3D11CompositionPresenter::DisplayedFrame displayed;
         if (m_CompositionPresenter.pollDisplayedFrame(LiGetMicroseconds, displayed)) {
             feedback.latchSampleValid = true;
@@ -3030,7 +3050,18 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
             feedback.latchSubmissionId = displayed.id;
             feedback.latchTimeUs = displayed.clock.timeUs;
             feedback.presentationUncertaintyUs = displayed.clock.uncertaintyUs;
+            feedback.nativeDisplayedDuration100ns = displayed.presentDuration100ns;
         }
+        D3D11CompositionPresenter::PresentStatusFrame status;
+        while (m_CompositionPresenter.pollPresentStatus(status)) {
+            feedback.nativeStatusId = status.id;
+            feedback.nativeStatus = static_cast<uint64_t>(status.status);
+        }
+        feedback.nativeOutstandingPresents = m_CompositionPresenter.outstandingPresents();
+        feedback.nativeRetiringPresentId = m_CompositionPresenter.retiringPresentId();
+        feedback.nativeSkippedFrames = m_CompositionPresenter.skippedFrames();
+        feedback.nativeCanceledFrames = m_CompositionPresenter.canceledFrames();
+        feedback.nativeDroppedStatusFrames = m_CompositionPresenter.droppedStatusFrames();
         if (!m_CompositionModeLogged && (m_CompositionPresenter.independentFrames() ||
                                         m_CompositionPresenter.composedFrames() >= 120)) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -3397,6 +3428,16 @@ void D3D11VARenderer::setSuspended(bool suspended)
         m_VrrPriorPresentCountValid = false;
         m_VrrPriorFrameStatsValid = false;
     }
+}
+
+void D3D11VARenderer::clearScheduledPresentation()
+{
+    if (!m_CompositionPresenter.active()) return;
+    const bool acquireLock = !m_VrrPresentationLocked;
+    if (acquireLock) lockPresentation();
+    const HRESULT hr = m_CompositionPresenter.clearQueuedPresents();
+    if (acquireLock) unlockPresentation();
+    if (FAILED(hr)) queueRenderDeviceReset();
 }
 
 void D3D11VARenderer::refreshVrrDisplayTiming()
@@ -4017,11 +4058,11 @@ QString D3D11VARenderer::getCalibrationIdentity()
     if (!m_RenderDevice || FAILED(m_RenderDevice.As(&device)) ||
         FAILED(device->GetAdapter(&adapter)) || FAILED(adapter->GetDesc(&desc)) ||
         FAILED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver))) return {};
-    // Retain the historical enabled-policy identity so existing calibration
-    // from the former default setting remains applicable.
-    return QString("D3D11|%1|%2|%3|%4|%5|%6|%7|allow-tearing=%8")
+    // Old readiness samples mixed asynchronous output with GPU completion.
+    // Start fresh instead of restoring a buffer seed learned from that floor.
+    return QString("D3D11|%1|%2|%3|%4|%5|%6|%7|allow-tearing=%8|decode-readiness=2|native-scheduled=%9")
         .arg(desc.VendorId).arg(desc.DeviceId).arg(desc.SubSysId).arg(desc.Revision)
         .arg(driver.QuadPart).arg(m_DecodeDevice == m_RenderDevice)
         .arg(m_CompositionPresenter.active() ? "composition" : "dxgi")
-        .arg(1);
+        .arg(1).arg(m_CompositionPresenter.active() ? 1 : 0);
 }

@@ -165,7 +165,8 @@ uint64_t intervalQualityToleranceUs(const VrrTimingParameters& parameters)
 } // namespace
 
 VrrTimingParameters vrrTimingParametersForSession(
-    const VrrSessionConfig& config, bool nativeSynchronizedPresentation)
+    const VrrSessionConfig& config, bool nativeSynchronizedPresentation,
+    bool nativeScheduledPresentation)
 {
     // Present on a tracked source cadence plus a learned delay. The readiness
     // reserve, its per-frame slewing, and every phase re-anchor are off on this
@@ -175,6 +176,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     // Explicit parameters keep older policies replayable.
     VrrTimingParameters parameters;
     parameters.nativeSynchronizedPresentation = nativeSynchronizedPresentation ? 1 : 0;
+    parameters.nativeScheduledPresentation = nativeScheduledPresentation ? 1 : 0;
     // Mode zero is the new Smooth profile. Captured parameters retain their
     // own defaults for exact replay.
     const int latencyMode = config.latencyMode >= 0 && config.latencyMode <= 2 ?
@@ -2741,6 +2743,13 @@ uint64_t VrrTimingController::earliestSubmissionUs() const
 {
     if (!m_HaveLastSubmission) {
         return 0;
+    }
+    if (m_Parameters.nativeScheduledPresentation != 0) {
+        // A synchronized presentation manager may coalesce several overdue
+        // images into one refresh. Native acceptance does not promise each
+        // image a visible interval. Reserve an admissible display deadline;
+        // CPU enqueue may precede it on the native scheduled path.
+        return saturatingAdd(m_LastSubmissionUs, m_DisplayPeriodUs);
     }
     if (m_Parameters.latchedFloorDisabled != 0 && m_LatchedPresentation) {
         // Latched presents omit the tearing flag, so the flip queue already

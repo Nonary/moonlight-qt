@@ -2886,6 +2886,193 @@ void testNativeSynchronizedPresentation()
     }
 }
 
+VrrTimingParameters nativeDeadlineTestParameters(const VrrSessionConfig& session)
+{
+    auto policy = vrrTimingParametersForSession(session, true, true);
+    // Isolate native deadline admission from adaptive padding and smoothing.
+    // Readiness still goes through schedule(), and production's nonzero guard
+    // and disabled historical latched floor remain selected.
+    policy.playoutDelayStartUs = 2000;
+    policy.playoutDelayMinimumUs = 2000;
+    policy.playoutDelayMaximumUs = 2000;
+    policy.playoutDelayStartSeedUs = 2000;
+    policy.playoutDelayStartPeriodPerMille = 0;
+    policy.playoutDelayMaximumPeriodPerMille = 0;
+    policy.playoutDelayCapSourcePeriodPerMille = 0;
+    policy.playoutSmoothingGainPerMille = 0;
+    policy.playoutSmoothingReserveMaxUs = 0;
+    policy.playoutCatchupPerMille = 0;
+    return policy;
+}
+
+void testNativeScheduledDeadlinesSurviveCompressedCadence()
+{
+    const auto session = config(120, 120);
+    const auto policy = nativeDeadlineTestParameters(session);
+    expect(policy.nativeScheduledPresentation == 1 &&
+               policy.nativeSynchronizedPresentation == 1 &&
+               policy.latchedFloorDisabled == 1,
+           "native scheduling must have a separate capability from historical synchronization");
+    VrrTimingController controller(session, true, policy);
+    uint32_t timestamp = 0;
+    uint64_t priorTargetUs = 0;
+    unsigned compressedTargets = 0;
+    for (int i = 0; i < 400; ++i) {
+        // Alternate 3.33/13.33 ms source stamps while retaining 120 FPS on
+        // average. Two such accepted presents must not target one refresh.
+        if (i) timestamp += i % 2 ? 300 : 1200;
+        const uint64_t at = decodedTimeForRtp(1000000, timestamp);
+        const auto d = controller.schedule(frame(i + 1, timestamp, true, at), at);
+        expect(d.latchedPresentation,
+               "native scheduled frames must retain synchronized presentation");
+        if (priorTargetUs) {
+            expect(d.targetUs >= priorTargetUs + controller.displayPeriodUs(),
+                   "compressed source timestamps must not compress native display deadlines");
+            if (d.originalTargetUs < priorTargetUs + controller.displayPeriodUs()) {
+                ++compressedTargets;
+                expect(d.presentationFloorPushUs != 0,
+                       "native deadline admission must expose its spacing correction");
+            }
+        }
+        controller.noteSubmission(true, false, d.targetUs);
+        expect(controller.earliestSubmissionUs() == d.targetUs + controller.displayPeriodUs(),
+               "native scheduled admission must reserve one display period without a guard");
+        priorTargetUs = d.targetUs;
+    }
+    expect(compressedTargets > 100,
+           "compressed-cadence regression must exercise the native deadline floor");
+}
+
+void testNativeScheduledLogicalAnchorDoesNotAccumulateCpuOverhead()
+{
+    const auto session = config(120, 120);
+    const auto policy = nativeDeadlineTestParameters(session);
+    VrrTimingController controller(session, true, policy);
+    uint64_t workerAvailableUs = 0;
+    uint64_t initialPhaseUs = 0;
+    uint64_t firstTargetUs = 0;
+    uint64_t finalTargetUs = 0;
+    constexpr uint64_t holdOvershootUs = 75;
+    constexpr int frames = 7200;
+    for (int i = 0; i < frames; ++i) {
+        const uint32_t timestamp = uint32_t(i * 750);
+        const uint64_t readyUs = decodedTimeForRtp(1000000, timestamp);
+        const uint64_t nowUs = std::max(readyUs, workerAvailableUs);
+        const auto d = controller.schedule(frame(i + 1, timestamp, true, readyUs), nowUs);
+        // Native enqueue finishes before the accepted display deadline. The
+        // subsequent CPU hold overshoots by 75 us, but that is not a later
+        // display request and must not shift the next deadline.
+        expect(d.targetUs >= nowUs + 100,
+               "exact-period fixture must leave time for native enqueue before its deadline");
+        const uint64_t nativeEnqueueUs = d.targetUs - 100;
+        const uint64_t logicalSubmissionUs = std::max(nativeEnqueueUs, d.targetUs);
+        controller.noteSubmission(true, false, logicalSubmissionUs);
+        workerAvailableUs = d.targetUs + holdOvershootUs;
+        if (i == 0) {
+            initialPhaseUs = d.targetUs - readyUs;
+            firstTargetUs = d.targetUs;
+        }
+        expect(d.targetUs - readyUs == initialPhaseUs,
+               "CPU hold overshoot must not accumulate into native deadline phase");
+        expect(controller.earliestSubmissionUs() == d.targetUs + controller.displayPeriodUs(),
+               "the native deadline floor must exclude both CPU hold overshoot and tearing guard");
+        finalTargetUs = d.targetUs;
+    }
+    expect(finalTargetUs - firstTargetUs == uint64_t(frames - 1) * 1000000 / 120,
+           "one minute of exact source cadence must retain its rational source phase");
+}
+
+void testNativeScheduledFailureAndCancellationDoNotConsumeSlots()
+{
+    const auto session = config(120, 120);
+    VrrTimingController controller(session, true, nativeDeadlineTestParameters(session));
+    auto d = controller.schedule(frame(1, 0, true, 1000000), 1000000);
+    controller.noteSubmission(false, true, d.targetUs);
+    expect(controller.lastSubmissionUs() == 0 && controller.earliestSubmissionUs() == 0,
+           "cancellation before native enqueue must not create a display anchor");
+
+    d = controller.schedule(frame(2, 750, true, 1008333), 1008333);
+    controller.noteSubmission(true, false, d.targetUs);
+    const uint64_t acceptedUs = d.targetUs;
+    for (int i = 3; i <= 4; ++i) {
+        const uint64_t at = decodedTimeForRtp(1000000, uint32_t((i - 1) * 750));
+        d = controller.schedule(frame(i, uint32_t((i - 1) * 750), true, at), at);
+        controller.noteSubmission(false, i == 4, d.targetUs + 100000);
+        expect(controller.lastSubmissionUs() == acceptedUs &&
+                   controller.earliestSubmissionUs() == acceptedUs + controller.displayPeriodUs(),
+               "failed or unsubmitted canceled frames must not reserve future native slots");
+    }
+    // A canceled frame which actually reached a native queue is different:
+    // other backends can submit an abandoned image and must retain its slot.
+    d = controller.schedule(frame(5, 3000, true, 1033333), 1033333);
+    controller.noteSubmission(true, true, d.targetUs);
+    expect(controller.lastSubmissionUs() == d.targetUs &&
+               controller.earliestSubmissionUs() == d.targetUs + controller.displayPeriodUs(),
+           "native acceptance must retain spacing even when the lifecycle result is canceled");
+    const uint64_t acceptedCancelledUs = d.targetUs;
+    controller.rebase();
+    expect(controller.earliestSubmissionUs() == acceptedCancelledUs + controller.displayPeriodUs(),
+           "source requalification must retain an accepted native predecessor");
+    controller.reset();
+    expect(controller.lastSubmissionUs() == 0 && controller.earliestSubmissionUs() == 0,
+           "native lifecycle reset must discard the old deadline anchor");
+}
+
+void testNativeScheduledSlowerCadenceAndOverloadAdmission()
+{
+    for (int rate : {30, 60, 116, 120}) {
+        const auto session = config(rate, 120);
+        VrrTimingController controller(session, true, nativeDeadlineTestParameters(session));
+        uint64_t priorTargetUs = 0;
+        for (int i = 0; i < 600; ++i) {
+            const uint32_t timestamp = uint32_t(uint64_t(i) * 90000 / rate);
+            const uint64_t at = decodedTimeForRtp(1000000, timestamp);
+            const auto d = controller.schedule(frame(i + 1, timestamp, true, at), at);
+            expect(!priorTargetUs || d.targetUs >= priorTargetUs + controller.displayPeriodUs(),
+                   "every supported slower source must retain admissible native deadline spacing");
+            expect(d.targetUs >= at && d.targetUs - at < 10000,
+                   "slower source cadence must not accumulate display-floor latency");
+            controller.noteSubmission(true, false, d.targetUs);
+            priorTargetUs = d.targetUs;
+        }
+    }
+
+    // Sustained 240 FPS cannot be displayed at 120 Hz. Exercise the actual
+    // worker's before-render age policy rather than demanding an impossible
+    // controller-only guarantee that every admitted source frame is shown.
+    const auto session = config(240, 120);
+    const auto policy = nativeDeadlineTestParameters(session);
+    VrrTimingController controller(session, true, policy);
+    uint64_t workerAvailableUs = 0;
+    uint64_t priorTargetUs = 0;
+    unsigned dropped = 0;
+    unsigned accepted = 0;
+    for (int i = 0; i < 1200; ++i) {
+        const uint32_t timestamp = uint32_t(uint64_t(i) * 90000 / 240);
+        const uint64_t at = decodedTimeForRtp(1000000, timestamp);
+        const uint64_t nowUs = std::max(at, workerAvailableUs);
+        const auto d = controller.schedule(frame(i + 1, timestamp, true, at), nowUs);
+        const bool successorQueued = decodedTimeForRtp(
+            1000000, uint32_t(uint64_t(i + 1) * 90000 / 240)) <= nowUs;
+        if (successorQueued && VrrFrameDropPolicy::beforeRender(d, controller.displayPeriodUs(),
+                nowUs - at, false, true, d.playoutDelayUs, policy.playoutLateRecovery != 0)) {
+            controller.noteSubmission(false, false, 0);
+            ++dropped;
+            continue;
+        }
+        expect(!priorTargetUs || d.targetUs >= priorTargetUs + controller.displayPeriodUs(),
+               "overload recovery must not compress accepted native display deadlines");
+        expect(d.targetUs >= at && d.targetUs - at < 30000,
+               "shared stale-frame admission must bound overload latency instead of accumulating slots");
+        controller.noteSubmission(true, false, d.targetUs);
+        priorTargetUs = d.targetUs;
+        workerAvailableUs = d.targetUs + 75;
+        ++accepted;
+    }
+    expect(dropped > 400 && accepted > 400,
+           "an above-ceiling source must shed replaceable frames while continuing native presentation");
+}
+
 void testRuntimeParametersChangePolicy()
 {
     VrrTimingController defaults(config(60, 120));
@@ -7332,6 +7519,10 @@ int main()
     testBurstExclusionKeepsDelayAfterStall();
     testLatchedPresentationDropsSoftwareFloor();
     testNativeSynchronizedPresentation();
+    testNativeScheduledDeadlinesSurviveCompressedCadence();
+    testNativeScheduledLogicalAnchorDoesNotAccumulateCpuOverhead();
+    testNativeScheduledFailureAndCancellationDoNotConsumeSlots();
+    testNativeScheduledSlowerCadenceAndOverloadAdmission();
     testRuntimeParametersChangePolicy();
     return failures == 0 ? 0 : 1;
 }

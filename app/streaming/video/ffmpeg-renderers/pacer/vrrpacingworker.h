@@ -106,6 +106,9 @@ private:
         uint64_t preparationEndUs = 0;
         uint64_t preparationDurationUs = 0;
         uint64_t decodeSyncWaitUs = 0;
+        bool decodeReadinessObserved = false;
+        bool nativeScheduledPresentation = false;
+        uint64_t schedulingBoundaryUs = 0;
         bool prepareTimingValid = false;
         uint64_t prepareDecodeSyncUs = 0;
         uint64_t prepareAcquireUs = 0;
@@ -215,6 +218,8 @@ private:
     VrrSessionConfig m_Config;
     bool m_CanLatchPresentation = false;
     const bool m_NativeSynchronizedPresentation;
+    const bool m_NativeScheduledPresentation;
+    uint64_t m_LastActualSubmissionUs = 0;
     bool m_WorkerStarted = false;
     std::atomic_bool m_CalibrationInvalidated { false };
     QByteArray m_InitialPlayoutProfile;
