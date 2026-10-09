@@ -10,7 +10,7 @@ Item {
         id: settings
         width: 420
         onPresetPicked: function(mode) {
-            var values = mode === 2 ? [500, 9900, 60, 500] : mode === 0 ? [4000, 9999, 300, 250] : [1000, 9950, 120, 500]
+            var values = mode === 2 ? [500, 9900, 60, 500] : mode === 0 ? [4000, 9995, 300, 250] : [1000, 9950, 120, 500]
             bufferPerMille = values[0]; targetHundredths = values[1]
             historySeconds = values[2]; toleranceUs = values[3]
         }
@@ -61,9 +61,11 @@ Item {
             compare(preset.currentIndex, 3)
             settings.presetPicked(0)
             compare(preset.currentIndex, 2)
+            compare(settings.targetHundredths, 9995)
             compare(settings.toleranceUs, 250)
             settings.presetPicked(1)
             compare(preset.currentIndex, 1)
+            compare(settings.targetHundredths, 9950)
         }
         function test_adjust_and_bounds() {
             var names = ["vrrBuffer", "vrrTarget", "vrrHistory", "vrrTolerance"]

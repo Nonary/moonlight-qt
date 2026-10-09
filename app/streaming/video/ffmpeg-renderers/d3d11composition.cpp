@@ -221,9 +221,9 @@ HRESULT D3D11CompositionPresenter::present(uint64_t& id)
 {
     id = 0;
     if (!m_Manager || m_Acquired == m_Buffers.size()) return E_UNEXPECTED;
-    HRESULT hr = m_Manager->CancelPresentsFrom(1);
-    if (FAILED(hr)) return hr;
-    hr = m_Surface->SetBuffer(m_Buffers[m_Acquired].presentation.Get());
+    // An accepted predecessor may still be waiting to display. Preserve it;
+    // replacing every in-flight present here creates gaps in visible cadence.
+    HRESULT hr = m_Surface->SetBuffer(m_Buffers[m_Acquired].presentation.Get());
     if (FAILED(hr)) return hr;
     // Pacing and GPU readiness are already complete. Do not add a source
     // period, wait for a statistics event, or prequeue a future target here.

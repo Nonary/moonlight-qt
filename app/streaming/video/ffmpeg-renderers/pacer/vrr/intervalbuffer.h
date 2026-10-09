@@ -9,8 +9,8 @@
 
 namespace Vrr13 {
 // Client-added interval error, including zero-error intervals. Production
-// averages over one second before applying tolerance to reporting and control.
-// Recorded revisions 9/10 retain per-interval reporting; revision 10 uses a
+// applies tolerance to each interval before averaging loss for both reporting
+// and control. Recorded revisions 7/8 average before tolerance; revision 10 uses a
 // separate mean-before-tolerance control history for exact historical replay.
 class IntervalBuffer {
 public:
@@ -63,6 +63,7 @@ public:
         uint64_t bufferFailedUs = 0;
         double bufferWeightedLossUs = 0;
         uint64_t toleranceUs = ToleranceUs;
+        uint64_t scoreWindowUs = 30000000;
         bool severityWeighted = false;
         bool averageValid = false;
         bool serviceOverloaded = false; // Qualified one-second workload, diagnostic only.
@@ -98,8 +99,10 @@ public:
                  uint64_t serialServiceGate = 0,
                  uint64_t holdRenewBelowTarget = 0,
                  bool perIntervalExcess = false,
-                 bool averageBufferControl = false) {
+                 bool averageBufferControl = false,
+                 bool historyDriven = false) {
         m_Stats.toleranceUs = toleranceUs;
+        m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
         minimum = std::min(minimum, maximum);
         if (!m_Initialized) { m_Target = s.buffer; m_Initialized = true; }
@@ -180,12 +183,13 @@ public:
         m_Stats.calibrationCoverageUs = s.submitted - m_First;
         m_Stats.averageValid = samples >= 2 && m_SequenceSamples >= m_SequenceMinimumSamples &&
             m_Stats.calibrationCoverageUs >= m_SequenceWarmupUs;
-        if (!m_Stats.averageValid) {
+        if (!m_Stats.averageValid && !historyDriven) {
             updateScore(s.submitted, scoreWindowUs);
             return;
         }
-        m_Stats.initialCalibrationComplete = true;
-        m_Stats.serviceOverloaded = service > intendedTime || decoderQueue > intendedTime;
+        if (m_Stats.averageValid) m_Stats.initialCalibrationComplete = true;
+        m_Stats.serviceOverloaded = m_Stats.averageValid &&
+            (service > intendedTime || decoderQueue > intendedTime);
         const bool pressure = total > samples * toleranceUs;
         // Weight the score by evaluated time, not frame rate; gaps are unknown.
         // Revision 9 applies tolerance before averaging so clean intervals
@@ -213,13 +217,19 @@ public:
         if (severityWeighted) score.bufferWeightedLoss += actual * bufferLoss;
         updateScore(s.submitted, scoreWindowUs);
 
+        // Revision 12 retains every observed adjacent interval in the long
+        // history. Qualification guards buffer changes, not measurement:
+        // discarding a second after each break made a 2-minute score behave
+        // like a much shorter history in sessions with repeated frame gaps.
+        if (!m_Stats.averageValid) return;
+
         const double allowedLoss = (1000000 - std::min<uint64_t>(targetPerMillion, 1000000)) / 1000000.0;
         const bool belowTarget = m_Stats.bufferLossFraction() > allowedLoss;
         const bool currentPressure = severityWeighted ? bufferLoss > allowedLoss : pressure;
         // Old score debt holds protection, but cannot authorize another attack
         // without current, attributable error outside the preset's allowance.
         const bool historicalPressure = severityWeighted && belowTarget;
-        const bool historyHolds = !recentPressureRelease && historicalPressure;
+        const bool historyHolds = (!recentPressureRelease || historyDriven) && historicalPressure;
         const auto& delayed = actual >= intended ? s : previous;
         const auto lateness = delayed.ready > delayed.deadline ? delayed.ready - delayed.deadline : 0;
         const bool freshError = severityWeighted ? error > toleranceUs : error != 0;

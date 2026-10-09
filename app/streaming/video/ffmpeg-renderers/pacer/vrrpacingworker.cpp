@@ -900,6 +900,18 @@ int VrrPacingWorker::run()
             sample.graph.sourcePeriodUs = decision.sourcePeriodUs;
             sample.graph.bufferUs = decision.playoutDelayUs;
             sample.graph.requestedBufferUs = decision.requestedPlayoutDelayUs;
+            sample.graph.toleranceUs = m_TimingController->intervalToleranceUs();
+            sample.graph.sourceTimeUs = decision.sourceTimeUs;
+            sample.graph.cadenceRetimingUs = decision.cadenceSmoothingUs + decision.readinessBudgetUs;
+            sample.graph.sourceTimingValid = decision.usedRtpTimestamp &&
+                !decision.rebased && !decision.phaseDiscontinuity && !externalRebaseApplied;
+            sample.graph.networkReadyUs = frame.reassembledUs();
+            sample.graph.decoderOutputUs = frame.decoderOutputUs();
+            // Preserve known completion only. An asynchronous decoder output
+            // alone cannot prove that its GPU work fit inside the buffer.
+            sample.graph.decoderReadyUs = preparedAhead ? telemetry.preparationStage.decodeReadyUs :
+                (decodeSyncWaitUs > kDecodeSyncNoticeUs || frame.decoderOutputComplete() ?
+                    frame.decodeCompleteUs() : 0);
             sample.graph.discontinuity = decision.rebased || decision.phaseDiscontinuity || externalRebaseApplied;
             sample.graph.backend = feedback.nativeBackendValid ? uint32_t(feedback.nativeBackend) : 0;
             sample.graph.idValid = feedback.submissionIdValid;

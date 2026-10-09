@@ -484,7 +484,7 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.playoutIntervalInitialMinimumSamples > 512) {
         return fail("initial interval calibration requires 250000..1000000 us and 2..512 samples");
     }
-    if (value.playoutResponsiveBuffer > 10 || (value.playoutResponsiveBuffer &&
+    if (value.playoutResponsiveBuffer > 12 || (value.playoutResponsiveBuffer &&
             (!value.playoutPredictionOnly || value.playoutReadinessHitchThresholdUs))) {
         return fail("playout_responsive_buffer requires prediction-only playout without historical hitch feedback");
     }

@@ -1,5 +1,6 @@
 #include "../../app/streaming/video/ffmpeg-renderers/dxgipresent.h"
 #include "../../app/streaming/video/ffmpeg-renderers/d3d11fencewait.h"
+#include "../../app/streaming/video/ffmpeg-renderers/d3d11presentpolicy.h"
 
 #include <cstdio>
 
@@ -32,6 +33,44 @@ int main()
             ++failures;
         }
     };
+    {
+        D3D11PresentPolicy::PreparedCompletion prepared;
+        check(!prepared.ready(7), "an unprepared frame must have no completion proof");
+        prepared.begin(7);
+        check(!prepared.complete(7, false) && !prepared.ready(7),
+              "a failed fence wait must never admit presentation or surface reuse");
+        check(!prepared.complete(6, true) && !prepared.ready(7),
+              "another frame's completion must never release the active frame");
+        check(prepared.complete(7, true) && prepared.ready(7),
+              "the exact successful marker must admit a nonblocking Present");
+        prepared.clear();
+        check(!prepared.ready(7) && !prepared.complete(7, true),
+              "a completion returning after cancellation must not revive the frame");
+        prepared.begin(8);
+        check(!prepared.complete(7, true) && !prepared.ready(8),
+              "a completion returning after replacement must not admit its successor");
+        check(prepared.complete(8, true) && prepared.ready(8),
+              "the replacement needs its own completed rendering marker");
+    }
+    for (const bool plannedLatched : {false, true}) {
+        for (const bool synchronizeAll : {false, true}) {
+            for (const bool valid : {false, true}) {
+                for (const bool pending : {false, true}) {
+                    unsigned pendingCalls = 0;
+                    const bool latched = D3D11PresentPolicy::latch(
+                        plannedLatched, synchronizeAll,
+                        [&] {
+                            ++pendingCalls;
+                            return D3D11PresentPolicy::PendingObservation{valid, pending};
+                        });
+                    check(latched == (plannedLatched || synchronizeAll || (valid && pending)),
+                          "only a proven pending predecessor may add a latch to the planned mode");
+                    check(pendingCalls == unsigned(!plannedLatched && !synchronizeAll),
+                          "native flip protection must query once for adaptive frames and never wait for another observation");
+                }
+            }
+        }
+    }
     for (const auto readyAt : {0ULL, 3000ULL, 50000ULL, 100000ULL}) {
         uint64_t now = 0;
         const auto result = D3D11FenceWait::wait(7, [&] { return now; },
@@ -92,29 +131,26 @@ int main()
               "native wait failure diagnostics must count the failing call and its elapsed time");
     }
     {
-        // Preparation submitted the fence at t=0, but the pacing worker did
-        // useful cadence waiting until t=8 ms before entering the residual
-        // completion wait. Work that finished during that hold must add no
-        // extra CPU wait at Present.
+        // An already completed preparation marker needs no CPU wait. Its
+        // completion proof is retained through the later cadence hold.
         uint64_t now = 8000;
         const auto result = D3D11FenceWait::wait(7, [&] { return now; },
             [] { return 7ULL; },
             [&](unsigned timeoutMs) { now += timeoutMs * 1000; return true; });
         check(result.status == D3D11FenceWait::Status::Complete &&
               result.elapsedUs == 0 && result.waitCalls == 0 && now == 8000,
-              "GPU completion during the cadence hold must leave no residual Present wait");
+              "an already complete preparation marker must add no CPU wait");
     }
     {
-        // If rendering is genuinely late, only the portion beyond the cadence
-        // target remains blocking. This is the behavior relied on by the
-        // split begin/finish present-ready fence path.
+        // Preparation waits only for its exact remaining GPU work, before
+        // the worker begins its cadence hold. Present does not repeat it.
         uint64_t now = 8000;
         const auto result = D3D11FenceWait::wait(7, [&] { return now; },
             [&] { return now >= 10000 ? 7ULL : 6ULL; },
             [&](unsigned timeoutMs) { now += timeoutMs * 1000; return true; });
         check(result.status == D3D11FenceWait::Status::Complete &&
               result.elapsedUs == 2000 && result.waitCalls == 2 && now == 10000,
-              "the target-boundary wait must charge only genuinely late GPU work");
+              "preparation must charge only the remaining exact-marker wait");
     }
     const auto submit = [&](DxgiPresentParameters parameters,
                             unsigned int interval, unsigned int flags) {

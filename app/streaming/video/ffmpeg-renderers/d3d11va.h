@@ -3,6 +3,7 @@
 #include "dxgipresent.h"
 #include "d3d11composition.h"
 #include "d3d11pyrowave.h"
+#include "d3d11presentpolicy.h"
 #include "ivrrframepresenter.h"
 #include "renderer.h"
 
@@ -211,10 +212,6 @@ private:
     // MOONLIGHT_VRR_SYNC_FLIPS=1 synchronizes every VRR flip instead of
     // per-frame tearing presents (see presentAdaptive).
     bool m_VrrSyncFlips = false;
-    // Flip protection's raster wait; disabled for the session if the raster
-    // never reports a vertical blank (see presentAdaptive).
-    bool m_VrrRasterGuardDisabled = false;
-    unsigned m_VrrRasterGuardTimeouts = 0;
     bool m_VrrRasterOpenResultValid;
     int64_t m_VrrRasterOpenResult;
     bool m_VrrRasterSourceValid;
@@ -223,6 +220,7 @@ private:
     bool m_VrrSuspended;
     VrrFallbackReason m_VrrFallbackReason;
     bool m_VrrFramePrepared;
+    D3D11PresentPolicy::PreparedCompletion m_VrrPreparedCompletion;
     uint64_t m_VrrPreparedDecodeBoundary;
     bool m_VrrPresentationLocked;
     Microsoft::WRL::ComPtr<ID3D11Fence> m_VrrPresentReadyFence;

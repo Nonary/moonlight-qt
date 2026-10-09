@@ -16,7 +16,7 @@ GroupBox {
     signal toleranceEdited(int value)
     readonly property int presetIndex: bufferPerMille === 500 && targetHundredths === 9900 && historySeconds === 60 && toleranceUs === 500 ? 0 :
                                        bufferPerMille === 1000 && targetHundredths === 9950 && historySeconds === 120 && toleranceUs === 500 ? 1 :
-                                       bufferPerMille === 4000 && targetHundredths === 9999 && historySeconds === 300 && toleranceUs === 250 ? 2 : 3
+                                       bufferPerMille === 4000 && targetHundredths === 9995 && historySeconds === 300 && toleranceUs === 250 ? 2 : 3
 
     ColumnLayout {
         width: parent.width

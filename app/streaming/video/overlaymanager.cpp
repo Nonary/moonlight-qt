@@ -14,8 +14,9 @@ namespace {
 // composed surface through their current overlay upload path; no GPU API work
 // or text rendering happens on the frame path.
 // Draws the lanes above the optional stats text surface, which it consumes.
-SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingGraphSnapshot& points, double scale)
+SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingGraphSnapshot& snapshot, double scale)
 {
+    const auto& points = snapshot.points;
     using Layout = TimingGraphLayout;
     const size_t first = points.size() > size_t(Layout::Frames) ? points.size() - Layout::Frames : 0;
     const size_t count = points.size() - first;
@@ -132,7 +133,97 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
             previousX = x; previousY = y; havePrevious = true;
         }
     }
-    label("Flat within 1 ms. Red: clipped. Gaps: no OS feedback.", left, height - S(26), labelColor);
+    // The input lane uses signed offsets from the cadence slot rather than
+    // intervals. Keep its own axis: network delivery can be several ms early,
+    // and the actual buffer allowance varies independently of frame rate.
+    const SDL_Color networkColor{255, 185, 70, 255}, decodeColor{160, 145, 255, 255};
+    const SDL_Color bufferColor{85, 225, 135, 255}, outputColor{135, 145, 160, 255};
+    double inputMinimum = -2000, inputMaximum = 2000;
+    const auto latestInput = bufferGraphSample(points.back());
+    for (size_t i = first; i < points.size(); ++i) {
+        const auto s = bufferGraphSample(points[i]);
+        if (!s.valid) continue;
+        inputMaximum = std::max(inputMaximum, s.bufferUs);
+        const auto include = [&](double v) {
+            inputMinimum = std::min(inputMinimum, v);
+            inputMaximum = std::max(inputMaximum, v);
+        };
+        if (s.networkValid) include(s.networkUs);
+        if (s.readyValid) include(s.decoderReadyUs);
+        else if (s.outputValid) include(s.decoderOutputUs);
+    }
+    inputMinimum = std::floor(inputMinimum / 1000) * 1000;
+    inputMaximum = std::ceil(inputMaximum / 1000) * 1000;
+    const int inputTop = S(Layout::plotTop(Layout::BufferLane));
+    const int inputBottom = S(Layout::plotBottom(Layout::BufferLane));
+    const auto inputY = [&](double v) {
+        return int(std::lround(inputBottom - (std::clamp(v, inputMinimum, inputMaximum) - inputMinimum) /
+                               (inputMaximum - inputMinimum) * (inputBottom - inputTop)));
+    };
+    if (!latestInput.valid)
+        std::snprintf(caption, sizeof(caption), "Incoming jitter / buffer: unavailable");
+    else if (!latestInput.readyValid)
+        std::snprintf(caption, sizeof(caption), "Incoming jitter: decoder completion unknown");
+    else if (latestInput.absorbed())
+        std::snprintf(caption, sizeof(caption), "Incoming jitter: absorbed (%.2f / %.2f ms)",
+                      latestInput.decoderReadyUs / 1000, latestInput.bufferUs / 1000);
+    else
+        std::snprintf(caption, sizeof(caption), "Incoming jitter: exceeds buffer by %.2f ms",
+                      (latestInput.decoderReadyUs - latestInput.bufferUs) / 1000);
+    label(caption, left, S(Layout::titleTop(Layout::BufferLane)), labelColor);
+    for (int tick = 0; tick <= 2; ++tick) {
+        const double v = inputMinimum + (inputMaximum - inputMinimum) * tick / 2;
+        const int y = inputY(v);
+        line(left, y, right, y, gridColor);
+        char number[32]; std::snprintf(number, sizeof(number), "%.1f", v / 1000);
+        label(number, S(8), y - S(8), labelColor);
+    }
+    for (int x = left; x < right; x += S(8))
+        line(x, inputY(0), std::min(x + S(3), right), inputY(0), referenceColor);
+
+    const SDL_Color inputColors[] = {networkColor, decodeColor, outputColor, bufferColor};
+    for (int series = 0; series < 4; ++series) {
+        bool havePrevious = false;
+        int previousX = 0, previousY = 0;
+        for (size_t i = first; i < points.size(); ++i) {
+            const auto s = bufferGraphSample(points[i]);
+            const bool valid = s.valid && (series == 0 ? s.networkValid : series == 1 ? s.readyValid :
+                                          series == 2 ? s.outputValid && !s.readyValid : true);
+            if (!valid) { havePrevious = false; continue; }
+            if (points[i].breakBefore) havePrevious = false;
+            const double v = series == 0 ? s.networkUs : series == 1 ? s.decoderReadyUs :
+                             series == 2 ? s.decoderOutputUs : s.bufferUs;
+            const int x = xAt(i), y = inputY(v);
+            if (havePrevious) line(previousX, previousY, x, y, inputColors[series], stroke);
+            else line(x, y, x + 1, y, inputColors[series], stroke);
+            previousX = x; previousY = y; havePrevious = true;
+        }
+    }
+    // Mark exact crossings, without the frametime lanes' 1 ms flattening.
+    // Keep the buffer line green even at a missed frame so it stays readable.
+    for (size_t i = first; i < points.size(); ++i) {
+        const auto s = bufferGraphSample(points[i]);
+        if (!s.readyValid || s.absorbed()) continue;
+        const int x = xAt(i), y = inputY(s.decoderReadyUs);
+        line(x - S(2), y - S(2), x + S(2), y + S(2), clipColor, stroke);
+        line(x - S(2), y + S(2), x + S(2), y - S(2), clipColor, stroke);
+    }
+    const int legendY = inputBottom + S(8);
+    label("Network ready", left, legendY, networkColor);
+    label("Decode ready", left + S(180), legendY, decodeColor);
+    label("Output only", left + S(350), legendY, outputColor);
+    label("Buffer", left + S(540), legendY, bufferColor);
+    const auto& hitches = snapshot.hitches;
+    std::snprintf(caption, sizeof(caption), "Hitches (2m, >%.2f ms): absorbed %llu | missed %llu",
+        hitches.toleranceUs / 1000.0,
+        static_cast<unsigned long long>(hitches.absorbed), static_cast<unsigned long long>(hitches.missed));
+    label(caption, left, height - S(80), labelColor);
+    std::snprintf(caption, sizeof(caption), "Unknown %llu | Worst excess %.2f ms | Measured %.0f%%",
+        static_cast<unsigned long long>(hitches.unknown), hitches.worstExcessUs / 1000.0,
+        hitches.observedFrames ? hitches.measuredFrames * 100.0 / hitches.observedFrames : 0.0);
+    label(caption, left, height - S(60), labelColor);
+    label("Input offsets from cadence slot. Red X: not absorbed.", left, height - S(40), labelColor);
+    label("Frametimes: flat within 1 ms; red edges: clipped.", left, height - S(20), labelColor);
     return surface;
 }
 
@@ -264,7 +355,7 @@ std::string OverlayManager::getOverlayText(OverlayType type)
 
 void OverlayManager::updateOverlayText(OverlayType type, const char* text, TimingGraphSnapshot graph)
 {
-    const auto snapshot = graph.empty() ? nullptr : std::make_shared<const TimingGraphSnapshot>(std::move(graph));
+    const auto snapshot = graph.points.empty() ? nullptr : std::make_shared<const TimingGraphSnapshot>(std::move(graph));
     {
         std::lock_guard<std::mutex> lock(m_StateLock);
         auto& overlay = m_Overlays[type];
@@ -279,7 +370,7 @@ void OverlayManager::updateOverlayText(OverlayType type, const char* text, Timin
 
 void OverlayManager::updateTimingGraph(TimingGraphSnapshot graph)
 {
-    if (graph.empty()) return;
+    if (graph.points.empty()) return;
     auto snapshot = std::make_shared<const TimingGraphSnapshot>(std::move(graph));
     {
         std::lock_guard<std::mutex> lock(m_StateLock);
@@ -412,7 +503,7 @@ void OverlayManager::run()
         const auto started = Clock::now();
         auto& overlay = m_Overlays[type];
         SDL_Surface* surface = nullptr;
-        const bool drawGraph = enabled && graph && graph->size() >= 2;
+        const bool drawGraph = enabled && graph && graph->points.size() >= 2;
         if (drawText || drawGraph) {
             if ((!overlay.font || rasterFontSizes[type] != fontSize) && !m_FontData.isEmpty()) {
                 auto resized = TTF_OpenFontRW(SDL_RWFromConstMem(m_FontData.constData(), m_FontData.size()), 1, fontSize);

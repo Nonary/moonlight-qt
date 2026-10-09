@@ -119,6 +119,11 @@ void appendBounded(std::deque<T>& values, T value, size_t limit)
 
 uint64_t intervalQualityWindowUs(const VrrTimingParameters& parameters)
 {
+    // Live revision 11 honors the explicit history for presets and custom
+    // settings. Preserve the tuple-based histories of recorded revisions.
+    if (parameters.playoutResponsiveBuffer >= 11) {
+        return parameters.playoutReadinessWindowUs;
+    }
     // Revision 7 originally captured playoutReadinessWindowUs for the
     // readiness estimator, while IntervalBuffer used a fixed 30-second score
     // history. Identify the new preset tuples here so old revision-7 traces
@@ -196,9 +201,10 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutPredictionOnly = 1;
     // Every normal VRR session uses the interval-quality queue. Historical
     // policies remain selectable only through explicit diagnostic parameters.
-    // Restore revision 7: reporting and buffer control share the one-second
-    // mean-before-tolerance score. Revisions 9/10 remain replayable.
-    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 7;
+    // Apply tolerance to each interval before averaging its loss. Isolated
+    // late/catch-up pairs must remain visible to both reporting and control.
+    // Revision 11 also honors custom history; recorded 7/9/10 stay replayable.
+    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 12;
     // Timeline mapping anchors to decode completion, absorbing hardware decode
     // duration into the sender offset instead of inflating client buffer delay.
     parameters.playoutSourceMappingDecoderOutput = 0;
@@ -261,7 +267,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutOffsetSlewUsPerSecond = 2400;
     // Local GPU and worker backlog must not age the sender-clock model or buy
     // a larger correction. The unwrapped RTP timeline supplies elapsed time;
-    // immutable decoder output supplies the source offset being corrected.
+    // decode completion supplies the source offset being corrected.
     parameters.playoutOffsetSourceClock = 1;
     parameters.playoutOffsetMaximumStepUs = 100;
     parameters.playoutDelayAdaptive = 1;
@@ -312,7 +318,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelaySlewAcrossBands = 1;
     // Spend the existing playout interval on preparation on both platforms.
     // Vulkan can hand off a pending GPU render using its present semaphore;
-    // D3D11 can execute during the target hold before its final fence check.
+    // D3D11 completes its verified render fence before the target hold.
     // Delaying preparation until just before Present would remove that overlap,
     // especially when no synchronous GPU wait is available to train a lead.
     // Acquisition still enforces native backpressure; it does not justify an
@@ -2238,7 +2244,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutSerialServiceGate,
                 m_Parameters.playoutHoldRenewBelowTarget,
                 m_Parameters.playoutResponsiveBuffer >= 9,
-                m_Parameters.playoutResponsiveBuffer >= 10);
+                m_Parameters.playoutResponsiveBuffer == 10,
+                m_Parameters.playoutResponsiveBuffer >= 12);
         }
         else m_MeanMissBuffer.observe(submissionUs, ready > deadline ? ready - deadline : 0,
             p.applied, submitted && !cancelled && m_Pending.hasPreparationDuration &&

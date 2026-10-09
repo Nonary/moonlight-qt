@@ -19,7 +19,6 @@
 
 #include <cwchar>
 #include <limits>
-#include <thread>
 
 using Microsoft::WRL::ComPtr;
 
@@ -2134,8 +2133,6 @@ void D3D11VARenderer::initializeVrrPresentationState(SDL_Window* window,
     const char* syncFlipsEnv = SDL_getenv("MOONLIGHT_VRR_SYNC_FLIPS");
     m_VrrSyncFlips = syncFlipsEnv != nullptr &&
         syncFlipsEnv[0] == '1' && syncFlipsEnv[1] == '\0';
-    m_VrrRasterGuardDisabled = false;
-    m_VrrRasterGuardTimeouts = 0;
     SDL_SysWMinfo windowInfo;
     SDL_VERSION(&windowInfo.version);
     if (window != nullptr &&
@@ -2379,6 +2376,7 @@ void D3D11VARenderer::releasePreparedVrrFrame()
     }
 
     m_VrrFramePrepared = false;
+    m_VrrPreparedCompletion.clear();
     m_VrrPreparedDecodeBoundary = 0;
     m_VrrGpuReadyAttempted = false;
     m_VrrGpuReadySignalResultValid = false;
@@ -2420,8 +2418,8 @@ bool D3D11VARenderer::retirePreparedVrrFrameForMutation()
     // ResizeBuffers and composition/display replacement may not invalidate a
     // back buffer while this frame's GPU writes are outstanding. These state
     // changes are rare and already hold the presentation mutex, so drain the
-    // bounded fence without releasing that mutex. The ordinary per-frame
-    // path remains asynchronous with decode during its cadence hold.
+    // bounded fence without releasing that mutex. A normally prepared frame
+    // already has verified completion, so this becomes a state check.
     const bool completed = finishVrrPresentReady(false);
     if (!completed) {
         m_VrrFallbackReason =
@@ -2614,10 +2612,10 @@ bool D3D11VARenderer::beginVrrPresentReady()
 
     // Queue a completion marker immediately after this frame's rendering.
     // The pacing worker will spend any remaining lead time waiting for its
-    // cadence target while the GPU runs. presentAdaptive() verifies this exact
-    // value at the target boundary before issuing Present, so GPU completion
-    // is not serialized in front of the deliberate cadence hold.
+    // cadence target after prepareFrame() has verified this exact value.
+    // No deferred GPU wait may move the native Present past that target.
     const UINT64 fenceValue = ++m_VrrPresentReadyFenceValue;
+    m_VrrPreparedCompletion.begin(fenceValue);
     m_VrrGpuReadyAttempted = true;
     m_VrrGpuReadyFenceValue = fenceValue;
     m_VrrGpuReadySignalStartUs = LiGetMicroseconds();
@@ -2654,7 +2652,7 @@ bool D3D11VARenderer::beginVrrPresentReady()
     // is still incomplete, its call start is a conservative lower bound for
     // the eventual completion. If it is already complete, Signal() call start
     // remains the only defensible lower bound and this poll end is the upper
-    // bound. The later target-boundary poll/wait supplies the completion upper
+    // bound. The preparation completion wait supplies the completion upper
     // bound when rendering is still outstanding here.
     m_VrrGpuReadyPollStartUs = LiGetMicroseconds();
     const UINT64 completedValue =
@@ -2676,6 +2674,9 @@ bool D3D11VARenderer::beginVrrPresentReady()
 bool D3D11VARenderer::finishVrrPresentReady(
     bool releasePresentationWhileWaiting)
 {
+    if (m_VrrPreparedCompletion.ready(m_VrrGpuReadyFenceValue)) {
+        return true;
+    }
     if (!m_VrrGpuReadyAttempted ||
             !m_VrrGpuReadySignalResultValid ||
             FAILED(static_cast<HRESULT>(m_VrrGpuReadySignalResult)) ||
@@ -2694,8 +2695,7 @@ bool D3D11VARenderer::finishVrrPresentReady(
     // Once the completion marker has been submitted, checking it needs
     // neither immediate context. Release presentation (and, on a shared
     // device, FFmpeg's lock with it) so window changes and decoding can
-    // continue while a genuinely late GPU frame consumes the bounded
-    // residual wait at the cadence boundary.
+    // continue while rendering completes before the worker's target hold.
     const bool presentationReleased =
         releasePresentationWhileWaiting && m_VrrPresentationLocked;
     if (presentationReleased) {
@@ -2746,8 +2746,8 @@ bool D3D11VARenderer::finishVrrPresentReady(
     }
 
     m_VrrGpuReadyWaitStartUs = initialPollEndUs;
-    // Readiness before the residual wait must describe this check, not the
-    // earlier prepare-time poll. Work often completes during the cadence hold.
+    // Readiness describes the exact completion check during preparation,
+    // rather than the earlier poll immediately after submitting the marker.
     m_VrrGpuReadyPollStartUs = initialPollStartUs;
     m_VrrGpuReadyPollEndUs = initialPollEndUs;
     m_VrrGpuReadyPollCompletedValue = initialCompletedValue;
@@ -2795,6 +2795,7 @@ bool D3D11VARenderer::finishVrrPresentReady(
     }
 
     m_VrrGpuReadyTimingValid = true;
+    m_VrrPreparedCompletion.complete(fenceValue, true);
     return true;
 }
 
@@ -2883,8 +2884,27 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame,
         return result;
     }
 
-    // Signal/flush above is nonblocking, but it may still expose synchronous
-    // device removal. Revalidate before publishing this prepared frame.
+    // Publish the in-flight marker before releasing the presentation mutex so
+    // resize/cancellation can retire its GPU writes. Complete rendering here,
+    // before the worker's cadence hold, rather than waiting at its deadline.
+    m_VrrFramePrepared = true;
+    if (!finishVrrPresentReady(true)) {
+        const bool frameCancelled = !m_VrrFramePrepared || m_VrrSuspended;
+        if (!frameCancelled) {
+            m_VrrFallbackReason =
+                VrrFallbackReason::AdaptivePresentationUnavailable;
+        }
+        populateVrrGpuReadyFeedback(result.feedback);
+        result.feedback.cancelled = true;
+        releasePreparedVrrFrame();
+        if (!frameCancelled) {
+            queueRenderDeviceReset();
+        }
+        return result;
+    }
+
+    // The readiness wait released the mutex. Revalidate the prepared image
+    // and display epoch after reacquiring it, before returning a usable frame.
     if (m_VrrSuspended || checkSupport() != VrrFallbackReason::NoFallback) {
         populateVrrGpuReadyFeedback(result.feedback);
         result.feedback.cancelled = true;
@@ -2904,15 +2924,11 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame,
         return result;
     }
 
-    m_VrrFramePrepared = true;
     result.prepared = true;
-    // Preparation reports the submitted marker without claiming completion.
-    // presentAdaptive() returns the completed wait after the cadence hold.
+    // The exact rendering marker completed successfully. No GPU wait remains
+    // at the submission boundary, and the decoder surface is safe to release.
     populateVrrGpuReadyFeedback(result.feedback);
-    // GPU reads are still allowed to be in flight here. Keep the AVFrame
-    // alive through presentation; the worker's deferred-frame ownership and
-    // the D3D11 render-to-decode fence protect decoder-surface reuse.
-    result.sourceFrameReusable = false;
+    result.sourceFrameReusable = true;
 
     // Never hold the presentation mutex while the pacing worker waits for its
     // presentation target. On a shared device it includes FFmpeg's lock, and
@@ -2936,31 +2952,21 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         return cancelFrame();
     }
 
-    // Preparation queued this frame's marker before the worker's cadence
-    // wait. Usually it is complete now and this is only a fence-value poll.
-    // A late GPU consumes only the residual bounded wait instead of adding
-    // its full render time in front of the cadence hold.
-    if (!finishVrrPresentReady(true)) {
-        // A display/resize callback may have cancelled this frame while the
-        // completion wait temporarily released the presentation mutex.
-        // That is an ordinary interrupted frame, not a fence failure.
-        const bool frameCancelled = !m_VrrFramePrepared || m_VrrSuspended;
-        if (!frameCancelled) {
-            m_VrrFallbackReason =
-                VrrFallbackReason::AdaptivePresentationUnavailable;
-        }
+    // prepareFrame() already verified this exact marker. Completion cannot
+    // move backwards; keep the deadline boundary free of another GPU wait.
+    // Cancellation clears that proof and may never admit a replacement marker.
+    if (!m_VrrPreparedCompletion.ready(m_VrrGpuReadyFenceValue)) {
+        m_VrrFallbackReason =
+            VrrFallbackReason::AdaptivePresentationUnavailable;
         populateVrrGpuReadyFeedback(feedback);
         feedback.cancelled = true;
         releasePreparedVrrFrame();
-        if (!frameCancelled) {
-            queueRenderDeviceReset();
-        }
+        queueRenderDeviceReset();
         return feedback;
     }
 
-    // The completion wait releases the presentation mutex. A window
-    // transition can run in that interval, so revalidate the prepared image
-    // after the mutex has been reacquired and before touching native state.
+    // A window transition can run during the worker's cadence hold. Revalidate
+    // the retained image before touching native state at the target boundary.
     if (m_VrrSuspended || checkSupport() != VrrFallbackReason::NoFallback) {
         populateVrrGpuReadyFeedback(feedback);
         feedback.cancelled = true;
@@ -3039,23 +3045,13 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         return feedback;
     }
 
-    // Native flip protection. The controller anchors a tearing present's flip
-    // at its call, but DXGI can take several milliseconds to flip it, so a
-    // latched successor reaches scanout later than anchored and this tearing
-    // present would land inside that scanout. Ask DXGI instead: if the
-    // predecessor is not on screen yet, or its refresh began less than the
-    // window ago, latch. The flip queue then shows this frame at the first
-    // untorn refresh, and a panel already idle in its VRR blank flips a
-    // latched present at once, so an unneeded latch costs almost nothing.
-    //
-    // DXGI's refresh time for a tearing predecessor is often credited to a
-    // refresh that began before its flip, so that check alone let a flip land
-    // inside the previous scanout. Where the scanout state can be read, wait
-    // for it instead: with nothing queued ahead and the panel in its
-    // (VRR-extended) vertical blank, a tearing flip cannot tear. The wait ends
-    // where a latched present would have flipped anyway, without depending on
-    // how a given driver implements sync-interval presents. Latch only if the
-    // blank does not arrive within two display periods.
+    // Native flip protection checks the predecessor once. A proven pending
+    // present selects synchronized submission; otherwise retain the controller's
+    // planned mode and spacing floor. The raster now is not the raster when an
+    // asynchronous flip reaches the panel. Latching whenever scanout is active
+    // pushes near-refresh streams onto a potentially much slower driver path.
+    // Raster samples remain diagnostic; never poll until blank or add a latch
+    // based on DXGI's unreliable adaptive-flip refresh-time reference.
     //
     // MOONLIGHT_VRR_SYNC_FLIPS=1 skips all of that and synchronizes every flip,
     // as Linux's Mailbox/FIFO presentation does, reporting it as a protection
@@ -3063,78 +3059,24 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
     // 890M, all-synchronized sessions sometimes took a slow flip path (Present
     // to screen p50 6-10 ms instead of ~1 ms), blocking Present calls and
     // juddering far worse than the occasional tear it avoided.
-    bool latchedPresentation = request.latchedPresentation;
-    if (!latchedPresentation && m_VrrSyncFlips) {
-        latchedPresentation = true;
-        feedback.flipProtectionLatched = true;
-    }
-    else if (!latchedPresentation && request.flipProtectionWindowUs != 0 &&
-            m_VrrPriorPresentCountValid) {
-        feedback.flipProtectionChecked = true;
-        feedback.flipProtectionQueryStartUs = LiGetMicroseconds();
-        const auto predecessorPending = [&](HRESULT& result,
-                                            DXGI_FRAME_STATISTICS& stats) {
-            stats = {};
-            result = m_SwapChain->GetFrameStatistics(&stats);
-            feedback.flipProtectionQueryResult = static_cast<int64_t>(result);
-            // A failed query (for example FRAME_STATISTICS_DISJOINT after a
-            // mode change) proves nothing and keeps the planned mode.
-            const bool pending = result == S_OK &&
+    const bool latchedPresentation = D3D11PresentPolicy::latch(
+        request.latchedPresentation, m_VrrSyncFlips,
+        [&]() -> D3D11PresentPolicy::PendingObservation {
+            if (request.flipProtectionWindowUs == 0 || !m_VrrPriorPresentCountValid) {
+                return {};
+            }
+            feedback.flipProtectionChecked = true;
+            feedback.flipProtectionQueryStartUs = LiGetMicroseconds();
+            DXGI_FRAME_STATISTICS stats = {};
+            const HRESULT queryResult = m_SwapChain->GetFrameStatistics(&stats);
+            feedback.flipProtectionQueryResult = static_cast<int64_t>(queryResult);
+            feedback.flipProtectionPending = queryResult == S_OK &&
                 stats.PresentCount < m_VrrPriorPresentCount;
-            feedback.flipProtectionPending |= pending;
-            return pending;
-        };
-        HRESULT guardResult = S_OK;
-        DXGI_FRAME_STATISTICS guardStats = {};
-        bool rasterDecided = false;
-        if (m_VrrRasterSourceValid && !m_VrrRasterGuardDisabled) {
-            const uint64_t limitUs = feedback.flipProtectionQueryStartUs +
-                2 * request.flipProtectionWindowUs;
-            for (;;) {
-                const bool pending = predecessorPending(guardResult, guardStats);
-                const VrrNativeRasterSample raster = queryVrrRaster();
-                if (!raster.queryResultValid || raster.queryResult != 0) {
-                    break;
-                }
-                rasterDecided = true;
-                if (!pending && raster.inVerticalBlank) {
-                    m_VrrRasterGuardTimeouts = 0;
-                    break;
-                }
-                if (LiGetMicroseconds() >= limitUs) {
-                    latchedPresentation = true;
-                    // A scanout never lasts two periods. A driver whose raster
-                    // does not report the VRR blank would make every frame
-                    // wait; fall back to the frame-statistics check instead.
-                    if (++m_VrrRasterGuardTimeouts >= 3) {
-                        m_VrrRasterGuardDisabled = true;
-                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                                    "VRR flip protection: the display raster never reported a vertical blank; using frame statistics instead");
-                    }
-                    break;
-                }
-                std::this_thread::yield();
-            }
-        }
-        if (!rasterDecided) {
-            uint64_t refreshUs = 0;
-            uint64_t qpcFrequency = 0;
-            if (predecessorPending(guardResult, guardStats)) {
-                latchedPresentation = true;
-            }
-            else if (guardResult == S_OK &&
-                     translateVrrSyncQpcTime(guardStats.SyncQPCTime,
-                                             refreshUs, qpcFrequency)) {
-                feedback.flipProtectionReferenceUs = refreshUs;
-                const uint64_t nowUs = LiGetMicroseconds();
-                latchedPresentation =
-                    nowUs - refreshUs < request.flipProtectionWindowUs ||
-                    nowUs < refreshUs;
-            }
-        }
-        feedback.flipProtectionQueryEndUs = LiGetMicroseconds();
-        feedback.flipProtectionLatched = latchedPresentation;
-    }
+            feedback.flipProtectionQueryEndUs = LiGetMicroseconds();
+            // Failed/disjoint queries do not justify changing the planned mode.
+            return {queryResult == S_OK, feedback.flipProtectionPending};
+        });
+    feedback.flipProtectionLatched = !request.latchedPresentation && latchedPresentation;
 
     // The risk decision is per frame. Sync interval 1 protects risky frames;
     // other frames retain interval-zero replacement semantics. Active DXGI
@@ -3477,9 +3419,9 @@ void D3D11VARenderer::refreshVrrDisplayTiming()
         return;
     }
 
-    // Always open the raster source: flip protection reads the live scanout
-    // state before every tearing present. Only diagnostic sampling of it into
-    // the trace stays behind MOONLIGHT_VRR_ALIGN.
+    // Open the raster source for observation-only alignment diagnostics.
+    // Production flip protection does not wait for or infer a future flip
+    // from the current raster phase.
     {
         D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME openAdapter = {};
         wcsncpy_s(openAdapter.DeviceName, monitorInfo.szDevice, _TRUNCATE);

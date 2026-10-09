@@ -201,10 +201,12 @@ void testPreparedFramesOverlapAndTrace()
         expect(worker.start(), "prepared-frame worker must start");
         auto a = frame(1, first);
         a.frame()->pkt_dts = a.decoderOutputUs();
+        a.setDeliveryTimeline(1, 1, 0);
         worker.submit(std::move(a));
         expect(backend.waitForPrepareCount(1), "completed stage must activate on the pacing thread");
         auto b = frame(2, second);
         b.frame()->pkt_dts = b.decoderOutputUs();
+        b.setDeliveryTimeline(2, 2, 0);
         worker.submit(std::move(b));
         expect(backend.tickets.size() == 2 && backend.tickets[1]->wait([] { return false; }),
                "next image preparation must advance while the pacing thread owns the previous image");
@@ -222,10 +224,16 @@ void testPreparedFramesOverlapAndTrace()
     }
     expect(backend.stopped && first.releases == 1 && second.releases == 1 && pending.releases == 1,
            "prepared-frame shutdown must stop preparation and release each image exactly once");
-    const auto graph = telemetry.timingGraphSnapshot();
+    const auto graph = telemetry.timingGraphSnapshot().points;
     expect(graph.size() == 2 && graph[0].targetUs && graph[0].submissionUs &&
                graph[1].targetUs && graph[1].submissionUs,
            "normal prepared presentations must publish individual target and submission observations for live stats");
+    expect(graph.size() == 2 && graph[0].networkReadyUs == 1 && graph[1].networkReadyUs == 2 &&
+               graph[0].decoderReadyUs == graph[0].decoderOutputUs &&
+               graph[1].decoderReadyUs == graph[1].decoderOutputUs,
+           "input graph must retain frame-specific network and proven staged decoder readiness");
+    expect(graph.size() == 2 && graph[0].toleranceUs == 250 && graph[1].toleranceUs == 250,
+           "input graph must carry the active Smooth profile tolerance on each frame");
     const auto lines = readExpandedTrace(path).split('\n');
     const auto columns = lines.value(0).split(',');
     int stagedRows = 0;
@@ -2352,6 +2360,166 @@ private:
     uint64_t m_Id = 0, m_PreviousSubmissionUs = 0;
 };
 
+// Model both D3D11 fence placements using the same trace contract. Advancing
+// the test clock makes a long render deterministic without relying on an OS
+// sleep to cross the target. The prepared image owns its rendered output;
+// successful early completion therefore permits release of the decoder input.
+class D3D11ReadinessPresenter : public FakeVrrFramePresenter {
+public:
+    D3D11ReadinessPresenter(FrozenTestClock& clock,
+                           TrackedFrameLifetime& lifetime,
+                           bool completeDuringPreparation,
+                           uint64_t gpuWorkUs) :
+        m_Clock(clock), m_Lifetime(lifetime),
+        m_CompleteDuringPreparation(completeDuringPreparation),
+        m_GpuWorkUs(gpuWorkUs)
+    {}
+
+    VrrPrepareResult prepareFrame(AVFrame* frame, uint64_t boundary) override
+    {
+        auto result = FakeVrrFramePresenter::prepareFrame(frame, boundary);
+        const uint64_t markerUs = LiGetMicroseconds();
+        m_Readiness = {};
+        m_Readiness.gpuReadyAttempted = true;
+        m_Readiness.gpuReadySignalResultValid = true;
+        m_Readiness.gpuReadySetEventResultValid = true;
+        m_Readiness.gpuReadySignalStartUs = markerUs;
+        m_Readiness.gpuReadySignalEndUs = markerUs;
+        m_Readiness.gpuReadyFlushStartUs = markerUs;
+        m_Readiness.gpuReadyFlushEndUs = markerUs;
+        m_Readiness.gpuReadySetEventStartUs = markerUs;
+        m_Readiness.gpuReadySetEventEndUs = markerUs;
+        m_Readiness.gpuReadyPollStartUs = markerUs;
+        m_Readiness.gpuReadyPollEndUs = markerUs;
+        m_Readiness.gpuReadyFenceValue = 1;
+        if (m_CompleteDuringPreparation) completeFence();
+        result.feedback = m_Readiness;
+        result.sourceFrameReusable = m_CompleteDuringPreparation;
+        m_Clock.resume();
+        return result;
+    }
+
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        sourceReleasedBeforePresent = m_Lifetime.releases.load() == 1;
+        if (!m_CompleteDuringPreparation) completeFence();
+        auto feedback = FakeVrrFramePresenter::presentAdaptive(request);
+        const auto submission = feedback;
+        feedback = m_Readiness;
+        feedback.presented = submission.presented;
+        feedback.cancelled = submission.cancelled;
+        feedback.submissionTimeValid = submission.submissionTimeValid;
+        feedback.submissionTimeUs = submission.submissionTimeUs;
+        feedback.nativeBackendValid = true;
+        // Composition uses the same D3D11 fence but has a portable serial-ID
+        // acceptance contract. This fixture has no real DXGI capability or
+        // display-statistics queries and must not claim their evidence.
+        feedback.nativeBackend = VrrNativePresentationBackend::Composition;
+        feedback.nativePresentResultValid = true;
+        feedback.nativePresentTimingValid = true;
+        feedback.nativePresentStartUs = feedback.submissionTimeUs;
+        feedback.nativePresentEndUs = LiGetMicroseconds();
+        feedback.submissionIdValid = feedback.presented;
+        feedback.submissionId = 1;
+        return feedback;
+    }
+
+    std::atomic_bool sourceReleasedBeforePresent { false };
+
+private:
+    void completeFence()
+    {
+        const uint64_t waitStartUs = LiGetMicroseconds();
+        m_Readiness.gpuReadyPollStartUs = waitStartUs;
+        m_Readiness.gpuReadyPollEndUs = waitStartUs;
+        m_Readiness.gpuReadyWaitStartUs = waitStartUs;
+        if (g_FrozenTestClockUs.load()) m_Clock.advance(m_GpuWorkUs);
+        else g_TestClockOffsetUs.fetch_add(static_cast<int64_t>(m_GpuWorkUs));
+        m_Readiness.gpuReadyTimeUs = LiGetMicroseconds();
+        m_Readiness.gpuReadyWaitResultValid = true;
+        m_Readiness.gpuReadyTimingValid = true;
+    }
+
+    FrozenTestClock& m_Clock;
+    TrackedFrameLifetime& m_Lifetime;
+    const bool m_CompleteDuringPreparation;
+    const uint64_t m_GpuWorkUs;
+    VrrPresentFeedback m_Readiness;
+};
+
+void testD3D11ReadinessBeforeTarget()
+{
+    for (const bool completeInPrepare : {false, true}) {
+        for (const uint64_t gpuWorkUs : {uint64_t(1000), uint64_t(30000)}) {
+            resetFakeClock();
+            QTemporaryDir directory;
+            const QString tracePath = directory.filePath("d3d11-readiness.vrrtrace");
+            qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(tracePath));
+            qputenv("MOONLIGHT_VRR_DEEP_TRACE", "1");
+            FrozenTestClock clock;
+            TrackedFrameLifetime lifetime;
+            D3D11ReadinessPresenter backend(clock, lifetime, completeInPrepare, gpuWorkUs);
+            PacerTelemetry telemetry;
+            {
+                VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+                expect(worker.start(), "D3D11 readiness fixture must start");
+                worker.submit(frame(1, lifetime));
+                expect(backend.waitForPresentCount(1),
+                       "both early and late GPU completion must present their completed image");
+                expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == 1; }),
+                       "D3D11 readiness telemetry must include the completed image");
+                expect(backend.sourceReleasedBeforePresent.load() == completeInPrepare,
+                       "only verified prepare-time completion may release the decoder surface before Present");
+            }
+            expect(lifetime.releases == 1,
+                   "both fence placements must release the decoder input exactly once");
+            const auto lines = readExpandedTrace(tracePath).split('\n');
+            const auto columns = lines.value(0).split(',');
+            const auto fields = lines.value(1).split(',');
+            const auto value = [&](const char* name) {
+                return fields.value(columns.indexOf(name)).toULongLong();
+            };
+            expect(fields.size() == columns.size() && value("presented") == 1 &&
+                       value("gpu_ready_timing_valid") == 1 &&
+                       value("gpu_ready_wait_result_valid") == 1 &&
+                       value("gpu_ready_wait_result") == 0 &&
+                       value("gpu_ready_wait_us") >= gpuWorkUs &&
+                       value("submission_boundary_us") >= value("target_us"),
+                   "successful GPU completion must retain readiness evidence and respect the cadence target");
+            if (completeInPrepare) {
+                expect(value("gpu_ready_time_us") <= value("prepare_end_us") &&
+                           value("prepare_end_us") <= value("target_wait_entry_us") &&
+                           value("gpu_ready_wait_start_us") < value("prepare_end_us"),
+                       "the render fence must complete during preparation before the target hold begins");
+                expect(gpuWorkUs == 1000 ?
+                           value("gpu_ready_time_us") < value("target_us") :
+                           (value("gpu_ready_time_us") > value("target_us") &&
+                            value("target_deadline_already_elapsed") == 1),
+                       "readiness must precede a reachable target and preserve an elapsed target when rendering is late");
+                expect(telemetryStats(telemetry).vrrGpuReadyWaitUs == value("gpu_ready_wait_us"),
+                       "prepare-time GPU service must be counted once even when final feedback repeats the completion");
+            }
+            else {
+                expect(value("gpu_ready_wait_start_us") >= value("prepare_end_us") &&
+                           value("gpu_ready_wait_start_us") >= value("present_start_us"),
+                       "historical deferred-fence traces must retain their distinct Present-time placement");
+            }
+            if (const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_D3D11_READINESS_TRACE")) {
+                if (*exportPath) {
+                    const QString destination = QString::fromLocal8Bit(exportPath) +
+                        (completeInPrepare ? ".prepare" : ".deferred") +
+                        (gpuWorkUs == 1000 ? ".ready.vrrtrace" : ".late.vrrtrace");
+                    QFile::remove(destination);
+                    expect(QFile::copy(tracePath, destination),
+                           "both fence placements must export unchanged schema fixtures for exact replay");
+                }
+            }
+            qputenv("MOONLIGHT_VRR_TRACE", "");
+            qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+        }
+    }
+}
+
 void testSynchronizedCompositionFeedback()
 {
     resetFakeClock();
@@ -2384,7 +2552,7 @@ void testSynchronizedCompositionFeedback()
     expect(requests.size() == 24 && std::all_of(requests.begin(), requests.end(),
         [](const VrrPresentRequest& request) { return request.latchedPresentation; }),
         "the worker must request native synchronization on every composition frame");
-    const auto graph = telemetry.timingGraphSnapshot();
+    const auto graph = telemetry.timingGraphSnapshot().points;
     size_t displayIntervals = 0;
     for (size_t i = 0; i < graph.size(); ++i) {
         uint64_t interval;
@@ -2653,7 +2821,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     expect(restored.loadProfile(profile) && restored.common() == 4000000 && restored.evidence() == 0,
            "captured calibration must restore prior history without inventing fresh successes");
     expect(fields.value(columns.indexOf("param_playout_prediction_only")) == "1" &&
-               fields.value(columns.indexOf("param_playout_responsive_buffer")) == "7" &&
+               fields.value(columns.indexOf("param_playout_responsive_buffer")) == "12" &&
                fields.value(columns.indexOf("param_playout_smoothing_windowed_cadence")) == "2" &&
                fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "0",
            "capture must identify production interval-quality adaptation for exact replay");
@@ -3092,6 +3260,7 @@ int main()
     testSmoothnessTraceCapturesReadinessPolicy();
     testFailedCancellationNativeEvidenceIsTraced();
     testMetalPresentationFeedback();
+    testD3D11ReadinessBeforeTarget();
     testSynchronizedCompositionFeedback();
     testMetalFailedPreparationFeedback();
     testReconnectPreservesCompletedTraces();

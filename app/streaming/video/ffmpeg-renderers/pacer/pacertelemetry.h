@@ -111,12 +111,12 @@ struct VrrTelemetrySample {
 
 class PacerTelemetry {
 public:
-    Overlay::TimingGraphSnapshot timingGraphSnapshot() const
+    Overlay::TimingGraphSnapshot timingGraphSnapshot(uint64_t atUs = 0) const
     {
         Overlay::TimingGraphSnapshot points;
-        points.reserve(Overlay::TimingGraphHistory::Capacity); // Allocate before locking.
+        points.points.reserve(Overlay::TimingGraphHistory::Capacity); // Allocate before locking.
         QMutexLocker lock(&m_Lock);
-        m_TimingGraph.copyTo(points);
+        m_TimingGraph.copyTo(points, atUs);
         return points;
     }
     PacerTelemetrySnapshot snapshot() const

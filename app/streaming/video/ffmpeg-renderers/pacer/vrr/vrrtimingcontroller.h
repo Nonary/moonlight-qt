@@ -387,6 +387,7 @@ public:
         stats.present = m_PresentTiming.stats();
         return stats;
     }
+    uint64_t intervalToleranceUs() const { return m_IntervalBuffer.stats().toleranceUs; }
     uint64_t typicalRenderUs() const;
     uint64_t recoveryHeadroomUs() const;
 

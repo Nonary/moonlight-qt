@@ -994,7 +994,7 @@ void testProductionPreparationUsesAvailableSlack()
                    policy.renderStartAfterSubmissionUs == 0 &&
                    policy.renderStartPreserveLearnedLead == 1,
                "production must spend the playout cushion on preparation without squeezing learned lead");
-        expect(policy.playoutResponsiveBuffer == 7 &&
+        expect(policy.playoutResponsiveBuffer == 12 &&
                    policy.playoutSerialServiceGate == 2 &&
                    policy.playoutSourceMappingDecoderOutput == 0 &&
                    policy.playoutSmoothingGainPerMille == 150,
@@ -5274,6 +5274,11 @@ LowRateSmoothingResult runLowRateSmoothingFixture(int mode, bool bounded,
     session.latencyMode = mode;
     session.smoothFrameTiming = smoothing;
     auto policy = vrrTimingParametersForSession(session);
+    // Isolate the recorded readiness-bound correction from subsequent score
+    // and preset changes. Both sides replay revision 7's original goals.
+    policy.playoutResponsiveBuffer = 7;
+    policy.playoutOnTimeTargetPerMillion = mode == 2 ? 990000 : mode == 1 ? 995000 : 999900;
+    policy.playoutIntervalToleranceUs = mode == 0 ? 200 : 500;
     policy.playoutSmoothingReadinessBound = bounded && smoothing ? 1 : 0;
     policy.playoutDelayStartSeedUs = 8000;
     // This readiness-attribution fixture requires the historical 8 ms seed
@@ -5770,9 +5775,9 @@ void testPresetReadinessTargets()
         auto session = config(120, 116);
         session.latencyMode = mode;
         const auto policy = vrrTimingParametersForSession(session);
-        const uint64_t target = mode == 2 ? 990000 : mode == 1 ? 995000 : 999900;
+        const uint64_t target = mode == 2 ? 990000 : mode == 1 ? 995000 : 999500;
         const uint64_t window = mode == 2 ? 60000000 : mode == 1 ? 120000000 : 300000000;
-        expect(policy.playoutResponsiveBuffer == 7 &&
+        expect(policy.playoutResponsiveBuffer == 12 &&
                    policy.playoutOnTimeTargetPerMillion == target &&
                    policy.playoutReadinessWindowUs == window,
                "presets must resolve their exact reliability target and bounded history");
@@ -5781,7 +5786,7 @@ void testPresetReadinessTargets()
             const uint64_t required = n < 19800 ? 1000 : n < 19900 ? 3000 : n < 19990 ? 6000 : 9000;
             recent.observe(required, 0, 100000, 1000000 + n * 1000);
         }
-        const uint64_t expected = mode == 2 ? 1000 : mode == 1 ? 3000 : 9000;
+        const uint64_t expected = mode == 2 ? 1000 : mode == 1 ? 3000 : 6000;
         expect(recent.demand(21000000) == expected,
            "nearest-rank percentiles must distinguish the preset targets without rounding to 100");
         expect(recent.demand(21000000 + window) == 0,
@@ -5952,7 +5957,7 @@ void testMeanMissBuffer()
         auto session = config(116, 120);
         session.latencyMode = mode;
         const auto policy = vrrTimingParametersForSession(session);
-        expect(policy.playoutResponsiveBuffer == 7 &&
+        expect(policy.playoutResponsiveBuffer == 12 &&
             policy.playoutSourceMappingDecoderOutput == 0 &&
             policy.playoutSerialServiceGate == 2 &&
             policy.playoutRecentPressureRelease == 3 &&
@@ -6004,7 +6009,10 @@ void testPerIntervalExcessQuality()
     for (int mode : {0, 1, 2}) {
         auto session = config(100, 120);
         session.latencyMode = mode;
-        const auto policy = vrrTimingParametersForSession(session);
+        auto policy = vrrTimingParametersForSession(session);
+        // This historical revision-9 fixture isolates a 99% quality goal.
+        // Live presets have a separate production-policy regression below.
+        policy.playoutOnTimeTargetPerMillion = 990000;
         const uint64_t tolerance = mode == 0 ? 200 : 500;
         for (int cause : {0, 1, 2, 3, 4}) {
             Vrr13::IntervalBuffer current, recorded;
@@ -6110,7 +6118,8 @@ void testRelaxedBufferControlPreservesAccurateReporting()
     for (int mode : {0, 1, 2}) {
         auto session = config(100, 120);
         session.latencyMode = mode;
-        const auto policy = vrrTimingParametersForSession(session);
+        auto policy = vrrTimingParametersForSession(session);
+        policy.playoutOnTimeTargetPerMillion = 990000;
         for (int cause = 0; cause < 8; ++cause) {
             Vrr13::IntervalBuffer former, accurate, relaxed;
             uint64_t intended = 1000000, applied = 3500;
@@ -6187,7 +6196,8 @@ void testRelaxedBufferControlPreservesAccurateReporting()
     for (int mode : {0, 1, 2}) {
         auto session = config(100, 120);
         session.latencyMode = mode;
-        const auto policy = vrrTimingParametersForSession(session);
+        auto policy = vrrTimingParametersForSession(session);
+        policy.playoutOnTimeTargetPerMillion = 990000;
         Vrr13::IntervalBuffer low, raised;
         uint64_t applied = 3500;
         for (uint64_t i = 1; i <= 2000; ++i) {
@@ -6208,6 +6218,174 @@ void testRelaxedBufferControlPreservesAccurateReporting()
                    raised.stats().bufferQualityPercent() == 100.0,
                "rare spikes must stay accurately reported without raising or retaining standing delay");
     }
+}
+
+void testProductionIntervalControlPreservesHistoricalRevisions()
+{
+    auto session = config(100, 120);
+    session.smoothFrameTiming = false;
+    session.timingOptions = {1000, 9900, 30, 500};
+    auto production = vrrTimingParametersForSession(session);
+    expect(production.playoutResponsiveBuffer == 12,
+           "live sessions must explicitly select the per-interval production revision");
+    // Give all policies identical fixed targets and completed preparation.
+    // Only the scoring/control revision can explain their different requests.
+    production.playoutDelayAdaptive = 0;
+    production.sourcePlayoutDelayUs = 1000;
+    production.playoutLateRecovery = 0;
+    production.playoutCatchupPerMille = 0;
+    auto meanPolicy = production, intervalPolicy = production, splitPolicy = production;
+    meanPolicy.playoutResponsiveBuffer = 7;
+    intervalPolicy.playoutResponsiveBuffer = 9;
+    splitPolicy.playoutResponsiveBuffer = 10;
+    VrrTimingController live(session, true, production);
+    VrrTimingController historicalMean(session, true, meanPolicy);
+    VrrTimingController historicalInterval(session, true, intervalPolicy);
+    VrrTimingController historicalSplit(session, true, splitPolicy);
+    bool sawLiveGrowth = false, sawHistoricalSplit = false;
+    for (uint64_t i = 1; i <= 1800; ++i) {
+        const uint64_t decoded = 1000000 + i * 10000;
+        const auto a = live.schedule(frame(int(i), uint32_t(i * 900), true, decoded), decoded);
+        const auto b = historicalMean.schedule(frame(int(i), uint32_t(i * 900), true, decoded), decoded);
+        const auto c = historicalInterval.schedule(frame(int(i), uint32_t(i * 900), true, decoded), decoded);
+        const auto d = historicalSplit.schedule(frame(int(i), uint32_t(i * 900), true, decoded), decoded);
+        expect(a.targetUs == b.targetUs && a.targetUs == c.targetUs && a.targetUs == d.targetUs,
+               "quality-law comparison must preserve source targets and fixed latency");
+        const uint64_t late = i % 25 == 0 ? 2000 : 0;
+        for (auto* controller : {&live, &historicalMean, &historicalInterval, &historicalSplit}) {
+            controller->notePreparationDuration(500, 0, a.targetUs + late);
+            controller->noteSchedulerDelays(0, 0, true);
+            controller->noteSubmission(true, false, a.targetUs + late);
+        }
+        const auto current = live.intervalStats();
+        const auto averaged = historicalMean.intervalStats();
+        const auto interval = historicalInterval.intervalStats();
+        const auto split = historicalSplit.intervalStats();
+        expect(current.qualityPercent() == current.bufferQualityPercent() &&
+                   current.evaluatedUs >= interval.evaluatedUs &&
+                   current.update.requestedUs >= 1000 && current.update.requestedUs <= 24000,
+               "production must retain all measured history and use its score for bounded buffer control");
+        expect(averaged.qualityPercent() == 100.0 &&
+                   split.qualityPercent() == interval.qualityPercent() &&
+                   split.bufferQualityPercent() == averaged.bufferQualityPercent() &&
+                   split.update.requestedUs == averaged.update.requestedUs &&
+                   split.update.action == averaged.update.action,
+               "recorded revisions must preserve mean scoring, per-interval scoring and split control independently");
+        sawLiveGrowth |= current.update.action == Vrr13::IntervalBuffer::Action::Grow;
+        sawHistoricalSplit |= split.qualityPercent() < split.bufferQualityPercent();
+    }
+    expect(sawLiveGrowth && sawHistoricalSplit &&
+               live.intervalStats().qualityPercent() < 99.0 &&
+               historicalMean.intervalStats().update.requestedUs == 1000,
+           "recoverable spikes hidden by the old mean must create bounded production protection");
+}
+
+void testProductionIntervalHistoryUsesCustomSeconds()
+{
+    const auto run = [](uint64_t revision, int historySeconds) {
+        auto session = config(100, 120);
+        session.smoothFrameTiming = false;
+        session.timingOptions = {1000, 9900, historySeconds, 500};
+        auto policy = vrrTimingParametersForSession(session);
+        policy.playoutResponsiveBuffer = revision;
+        policy.playoutDelayAdaptive = 0;
+        policy.sourcePlayoutDelayUs = 1000;
+        VrrTimingController controller(session, true, policy);
+        for (uint64_t i = 1; i <= 2000; ++i) {
+            const uint64_t decoded = 1000000 + i * 10000;
+            const auto decision = controller.schedule(
+                frame(int(i), uint32_t(i * 900), true, decoded), decoded);
+            const uint64_t late = i <= 500 && i % 25 == 0 ? 2000 : 0;
+            controller.notePreparationDuration(500, 0, decision.targetUs + late);
+            controller.noteSchedulerDelays(0, 0, true);
+            controller.noteSubmission(true, false, decision.targetUs + late);
+        }
+        return controller.intervalStats();
+    };
+    const auto shortLive = run(12, 10), longLive = run(12, 45);
+    const auto shortRecorded = run(9, 10), longRecorded = run(9, 45);
+    expect(shortLive.qualityPercent() == 100.0 && longLive.qualityPercent() < 100.0 &&
+               shortLive.evaluatedUs <= 10100000 && longLive.evaluatedUs > 18000000,
+           "production must expire quality history at custom seconds rather than a preset tuple");
+    expect(shortRecorded.qualityPercent() == longRecorded.qualityPercent() &&
+               shortRecorded.evaluatedUs == longRecorded.evaluatedUs &&
+               shortRecorded.qualityPercent() < 100.0,
+           "recorded revision 9 must retain its historical thirty-second fallback window");
+}
+
+void testTwoMinuteScoreCoverage()
+{
+    Vrr13::IntervalBuffer continuous, interrupted, historical;
+    const auto observe = [](Vrr13::IntervalBuffer& buffer, uint64_t number,
+                            uint64_t at, uint64_t lateness, bool historyDriven = true) {
+        buffer.observe({number, at, at + lateness, at, at + lateness,
+                        1000, true, false},
+                       1000, 4000, 8000000, 250, true, 975000,
+                       500, 120000000, 500000, 32, 3, 2, 3, true, false, historyDriven);
+    };
+    // Both sessions run for 130 seconds. A dropped frame every 1.5 seconds
+    // repeatedly restarts one-second control qualification. Measurement must
+    // keep every valid adjacent interval until its actual two-minute expiry.
+    for (uint64_t i = 1; i <= 13000; ++i) {
+        const uint64_t at = 1000000 + i * 10000;
+        observe(continuous, i, at, 0);
+        observe(interrupted, i + i / 150, at, 0);
+        observe(historical, i + i / 150, at, 0, false);
+    }
+    expect(continuous.stats().scoreWindowUs == 120000000 &&
+               continuous.stats().evaluatedUs >= 119900000 &&
+               continuous.stats().evaluatedUs <= 120000000,
+           "continuous two-minute scoring must retain the full rolling denominator");
+    expect(interrupted.stats().evaluatedUs > 119000000 &&
+               interrupted.stats().evaluatedUs < 120000000 &&
+               historical.stats().evaluatedUs > 38000000 &&
+               historical.stats().evaluatedUs < 42000000 &&
+               interrupted.stats().qualityPercent() == 100.0,
+           "control qualification must not discard known timing or reproduce historical undercoverage");
+    const auto coverage = continuous.stats().evaluatedUs;
+    continuous.breakSequence();
+    expect(continuous.stats().evaluatedUs == coverage,
+           "a sequence break must not reset the long score denominator");
+    // Requalify, then inject one second of severe alternating late/catch-up
+    // intervals. A full history cannot lose several percentage points in that
+    // second; a short observed history can move much faster.
+    for (uint64_t i = 13001; i <= 13200; ++i)
+        observe(continuous, i, 1000000 + i * 10000,
+                i > 13100 && i % 2 ? 9000 : 0);
+    Vrr13::IntervalBuffer starting;
+    for (uint64_t i = 1; i <= 200; ++i)
+        observe(starting, i, 1000000 + i * 10000, i > 100 && i % 2 ? 9000 : 0);
+    expect(continuous.stats().qualityPercent() < 100.0 &&
+               continuous.stats().qualityPercent() >= 99.0 &&
+               starting.stats().qualityPercent() < 75.0,
+           "the same one-second disturbance must respect actual scored coverage, not the history label");
+}
+
+void testHistoryControlsBufferRelease()
+{
+    Vrr13::IntervalBuffer history, recent;
+    for (uint64_t i = 1; i <= 14500; ++i) {
+        const uint64_t intended = 1000000 + i * 10000;
+        const uint64_t late = i <= 500 && i % 2 ? 9000 : 0;
+        for (auto* buffer : {&history, &recent}) {
+            // Readiness is already inside the deadline: the timing score may
+            // hold existing protection, but cannot invent a reason to grow it.
+            buffer->observe({i, intended, intended + late, intended + 5000,
+                             intended, buffer->demand(5000), true, true, 1000, 0},
+                            1000, 6000, 8000000, 250, true, 975000,
+                            500, 120000000, 500000, 32, 3, 2, 3, true, false,
+                            buffer == &history);
+        }
+        if (i == 3000) {
+            expect(history.stats().qualityPercent() < 97.5 &&
+                       history.demand(5000) == 5000 && recent.demand(5000) < 5000,
+                   "below-target retained history must prevent recent clean time from shrinking the buffer");
+        }
+        expect(history.demand(5000) <= 5000,
+               "historical score debt alone must never authorize buffer growth");
+    }
+    expect(history.stats().qualityPercent() == 100.0 && history.demand(5000) < 5000,
+           "expired loss and qualified recovery must eventually release history-held protection");
 }
 
 void testIntervalBufferReleaseAcrossShortGaps()
@@ -7034,6 +7212,8 @@ int main()
     testPerIntervalBufferPreventsRecoverableSpikes();
     testRelaxedBufferControlPreservesAccurateReporting();
     testIntervalBufferReleaseAcrossShortGaps();
+    testTwoMinuteScoreCoverage();
+    testHistoryControlsBufferRelease();
     testAlternatingSlowCadenceLeavesFastRate();
     testInitialPreparationIsNotTypicalRender();
     testIntervalBufferRestoreHoldsRestoredTarget();
@@ -7042,6 +7222,8 @@ int main()
     testIntervalBufferThresholdControlsShrinkage();
     testIntervalBufferAboveTargetCapacityDipPreservesRecovery();
     testIntervalQualityUsesPresetHistory();
+    testProductionIntervalControlPreservesHistoricalRevisions();
+    testProductionIntervalHistoryUsesCustomSeconds();
     testPresetIntervalTolerances();
     testCustomTimingOptions();
     testMeanMissBuffer();

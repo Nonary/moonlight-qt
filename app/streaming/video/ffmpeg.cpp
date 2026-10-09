@@ -1521,10 +1521,14 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             if (readiness.intervalPolicy) {
                 const auto& interval = readiness.interval;
                 char score[32], average[32];
-                const char* scoreWindow =
-                    stats.vrrOnTimeTargetPerMillion == 999900 ? "5m" :
-                    stats.vrrOnTimeTargetPerMillion == 995000 ? "2m" :
-                    stats.vrrOnTimeTargetPerMillion == 990000 ? "1m" : "30s";
+                char scoreWindow[32];
+                const auto historySeconds = interval.scoreWindowUs / 1000000;
+                if (historySeconds && historySeconds % 60 == 0)
+                    snprintf(scoreWindow, sizeof(scoreWindow), "%llum",
+                             static_cast<unsigned long long>(historySeconds / 60));
+                else
+                    snprintf(scoreWindow, sizeof(scoreWindow), "%llus",
+                             static_cast<unsigned long long>(historySeconds));
                 if (interval.evaluatedUs)
                     snprintf(score, sizeof(score), "%.2f%%",
                         interval.qualityPercent());
@@ -1552,25 +1556,28 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 else snprintf(presentTiming, sizeof(presentTiming), "unavailable");
                 if (advancedStats) {
                     ret = snprintf(&output[offset], length - offset,
-                        "Client timing: %s (target %.2f%% over %s)\n"
+                        "Client timing: %s (target %.2f%%)\n"
+                        "Scored time: %.1fs / %s history (gaps excluded)\n"
                         "Timing error (1s avg): %s | Allowed: %.2f ms | Drops (30s): %llu\n"
                         "Present timing issues (30s): %s\n",
                         score,
                         stats.vrrOnTimeTargetPerMillion / 10000.0,
-                        scoreWindow, average,
+                        interval.evaluatedUs / 1000000.0, scoreWindow, average,
                         interval.toleranceUs / 1000.0,
                         static_cast<unsigned long long>(readiness.dropped),
                         presentTiming);
                 }
                 else {
                     ret = snprintf(&output[offset], length - offset,
-                        "VRR pacing: %s | Smoothness (%s): %s / %.2f%% target%s\n"
+                        "VRR pacing: %s | Smoothness: %s / %.2f%% target%s\n"
+                        "Scored time: %.1fs / %s history (gaps excluded)\n"
                         "Client interval error (1s): %s | Tolerance: %.2f ms | Dropped (30s): %llu\n"
                         "Present timing issues (30s): %s\n",
                         stats.vrrTelemetryActive ? "Active" : "Inactive",
-                        scoreWindow, score,
+                        score,
                         stats.vrrOnTimeTargetPerMillion / 10000.0,
-                        stats.vrrBufferAtLimit ? " (buffer limit)" : "", average,
+                        stats.vrrBufferAtLimit ? " (buffer limit)" : "",
+                        interval.evaluatedUs / 1000000.0, scoreWindow, average,
                         interval.toleranceUs / 1000.0,
                         static_cast<unsigned long long>(readiness.dropped),
                         presentTiming);

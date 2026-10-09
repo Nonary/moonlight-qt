@@ -14,7 +14,7 @@ struct VrrTimingOptions {
     static VrrTimingOptions preset(int mode)
     {
         return mode == 2 ? VrrTimingOptions{500, 9900, 60, 500} :
-               mode == 0 ? VrrTimingOptions{4000, 9999, 300, 250} :
+               mode == 0 ? VrrTimingOptions{4000, 9995, 300, 250} :
                            VrrTimingOptions{1000, 9950, 120, 500};
     }
 

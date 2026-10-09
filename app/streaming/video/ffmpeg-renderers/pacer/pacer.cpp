@@ -113,7 +113,7 @@ PacerTelemetrySnapshot Pacer::telemetrySnapshot() const
 
 Overlay::TimingGraphSnapshot Pacer::timingGraphSnapshot() const
 {
-    return m_Telemetry.timingGraphSnapshot();
+    return m_Telemetry.timingGraphSnapshot(LiGetMicroseconds());
 }
 
 void Pacer::renderOnMainThread()

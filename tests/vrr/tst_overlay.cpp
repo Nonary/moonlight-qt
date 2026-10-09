@@ -32,12 +32,16 @@ public:
             rowColors = {};
             minInkY.fill(std::numeric_limits<int>::max()); maxInkY.fill(-1);
             if (surface && surface->format->format == SDL_PIXELFORMAT_ARGB8888) {
-                // Planned, submission, display and clipped-spike inks.
-                const std::array<Uint32, 4> palette{
+                // Cadence, clipped spikes, incoming stages and buffer inks.
+                const std::array<Uint32, 8> palette{
                     SDL_MapRGBA(surface->format, 190, 198, 210, 255),
                     SDL_MapRGBA(surface->format, 65, 215, 250, 255),
                     SDL_MapRGBA(surface->format, 245, 110, 220, 255),
-                    SDL_MapRGBA(surface->format, 255, 95, 65, 255)};
+                    SDL_MapRGBA(surface->format, 255, 95, 65, 255),
+                    SDL_MapRGBA(surface->format, 255, 185, 70, 255),
+                    SDL_MapRGBA(surface->format, 160, 145, 255, 255),
+                    SDL_MapRGBA(surface->format, 135, 145, 160, 255),
+                    SDL_MapRGBA(surface->format, 85, 225, 135, 255)};
                 const double scale = manager.getOverlayFontSize(OverlayDebug) / 20.0;
                 const auto S = [scale](int v) { return int(std::lround(v * scale)); };
                 for (int y = 0; y < surface->h; ++y) {
@@ -45,7 +49,7 @@ public:
                     for (int x = 0; x < surface->w; ++x)
                         for (size_t k = 0; k < palette.size(); ++k) {
                             colors[k] += row[x] == palette[k];
-                            for (int graphRow = 0; graphRow < TimingGraphLayout::Lanes; ++graphRow) {
+                            for (int graphRow = 0; graphRow <= TimingGraphLayout::BufferLane; ++graphRow) {
                                 if (x >= S(TimingGraphLayout::Left) && y >= S(TimingGraphLayout::plotTop(graphRow)) &&
                                     y <= S(TimingGraphLayout::plotBottom(graphRow)) + S(2) && row[x] == palette[k]) {
                                     ++rowColors[graphRow][k];
@@ -84,27 +88,28 @@ public:
     unsigned calls = 0;
     std::string last;
     int height = 0, width = 0;
-    std::array<unsigned, 4> colors{};
-    std::array<std::array<unsigned, 4>, TimingGraphLayout::Lanes> rowColors{};
-    std::array<int, TimingGraphLayout::Lanes> minInkY{}, maxInkY{};
+    std::array<unsigned, 8> colors{};
+    std::array<std::array<unsigned, 8>, TimingGraphLayout::Lanes + 1> rowColors{};
+    std::array<int, TimingGraphLayout::Lanes + 1> minInkY{}, maxInkY{};
 };
 
 static TimingGraphSnapshot testTimingGraph()
 {
     TimingGraphHistory history;
-    TimingGraphSnapshot points;
+    TimingGraphSnapshot snapshot;
+    auto& points = snapshot.points;
     points.reserve(TimingGraphHistory::Capacity);
     TimingGraphInput in;
     in.submitted = true; in.idValid = true; in.backend = 2;
     in.submissionUs = in.targetUs = 1000000; in.sourcePeriodUs = 10000;
-    in.bufferUs = in.requestedBufferUs = 2500;
+    in.bufferUs = in.requestedBufferUs = 2500; in.toleranceUs = 500;
     in.submissionId = UINT64_MAX - 1000; // Preserve full-width identity.
     history.record(in);
     const auto firstId = in.submissionId;
     in.submissionId++; in.submissionUs += 12000; in.targetUs += 10000;
     in.displayValid = true; in.displayId = firstId; in.displayUs = 1002000;
     history.record(in);
-    history.copyTo(points);
+    history.copyTo(snapshot);
     assert(points.size() == 2 && points[0].displayUs == 1002000 && points[1].displayUs == 0);
     assert(points[1].submissionIntervalUs == 12000 && points[1].targetIntervalUs == 10000);
     // Invalid samples, duplicate feedback, and pre-submission timestamps must
@@ -112,11 +117,11 @@ static TimingGraphSnapshot testTimingGraph()
     in.submitted = false; in.displayUs = 1003000; history.record(in);
     in.displayId++; in.displayUs = 1001000; history.record(in);
     in.displayUs = 1015000; in.displayValid = false; history.record(in);
-    history.copyTo(points);
+    history.copyTo(snapshot);
     assert(points[0].displayUs == 1002000 && points[1].displayUs == 0);
     in.discontinuity = true; in.submitted = true; in.submissionUs += 10000; in.targetUs += 10000;
     in.submissionId++; in.displayValid = true; in.displayId = firstId; in.displayUs = 1004000;
-    history.record(in); history.copyTo(points);
+    history.record(in); history.copyTo(snapshot);
     assert(points.back().breakBefore && points.back().submissionIntervalUs == 0 && points[0].displayUs == 1002000);
     // Fixed storage wraps; the snapshot holds the drawn frames plus one
     // predecessor and keeps individual hitches rather than averages.
@@ -125,10 +130,16 @@ static TimingGraphSnapshot testTimingGraph()
         in.submissionId++; in.submissionUs += 10000 + (i % 23 == 0 ? 3000 : 0); in.targetUs += 10000;
         in.bufferUs = i % 60 < 30 ? 2500 : 4500;
         in.requestedBufferUs = i % 60 < 20 ? 2500 : 5000;
+        in.sourceTimingValid = i % 80 != 0;
+        in.sourceTimeUs = in.targetUs - in.bufferUs;
+        in.cadenceRetimingUs = -500;
+        in.networkReadyUs = in.sourceTimeUs - 1500 + (i % 23 == 0 ? 3000 : 0);
+        in.decoderOutputUs = in.sourceTimeUs + (i % 23 == 0 ? 5000 : 500);
+        in.decoderReadyUs = i % 9 == 0 ? 0 : in.decoderOutputUs + 1000;
         in.displayId = in.submissionId; in.displayUs = in.submissionUs + 2000 + (i % 11 == 0 ? 2000 : 0);
         history.record(in);
     }
-    history.copyTo(points);
+    history.copyTo(snapshot);
     assert(points.size() == TimingGraphHistory::SnapshotPoints);
     bool hitch = false, jump = false;
     for (size_t i = 1; i < points.size(); ++i) {
@@ -136,12 +147,128 @@ static TimingGraphSnapshot testTimingGraph()
         jump |= points[i].bufferUs != points[i-1].bufferUs;
     }
     assert(hitch && jump);
-    return points;
+    assert(points.back().sourceTimeUs == in.sourceTimeUs &&
+           points.back().decoderReadyUs == in.decoderReadyUs &&
+           points.back().cadenceRetimingUs == in.cadenceRetimingUs);
+    assert(snapshot.hitches.observedFrames > points.size());
+    return snapshot;
+}
+
+static void testBufferCoverage()
+{
+    TimingGraphPoint p;
+    p.sourceTimingValid = true;
+    p.sourceTimeUs = 1000000;
+    p.cadenceRetimingUs = 500;
+    p.networkReadyUs = 999500;
+    p.decoderOutputUs = 1001000;
+    p.decoderReadyUs = 1003000;
+    p.bufferUs = 2500;
+    auto sample = bufferGraphSample(p);
+    assert(sample.valid && sample.networkValid && sample.outputValid && sample.readyValid);
+    assert(sample.networkUs == -1000 && sample.decoderOutputUs == 500);
+    assert(sample.decoderReadyUs == 2500 && sample.absorbed());
+    // No tolerance/flattening at the coverage boundary. A late-clamped final
+    // target or an unapplied buffer request must not hide a missed deadline.
+    ++p.decoderReadyUs;
+    p.targetUs = 2000000;
+    p.requestedBufferUs = 9000;
+    assert(!bufferGraphSample(p).absorbed());
+    p.cadenceRetimingUs = -500;
+    assert(bufferGraphSample(p).decoderReadyUs == 3501);
+    p.decoderReadyUs = 0;
+    sample = bufferGraphSample(p);
+    assert(sample.outputValid && !sample.readyValid && !sample.absorbed());
+    p.decoderReadyUs = p.decoderOutputUs - 1;
+    assert(!bufferGraphSample(p).readyValid);
+    p.decoderOutputUs = p.networkReadyUs - 1;
+    assert(!bufferGraphSample(p).outputValid && !bufferGraphSample(p).readyValid);
+    p.sourceTimingValid = false;
+    assert(!bufferGraphSample(p).valid);
+    p.sourceTimingValid = true; p.sourceTimeUs = 0;
+    assert(!bufferGraphSample(p).valid);
+}
+
+static void testBufferHitchHistory()
+{
+    BufferHitchHistory history;
+    TimingGraphPoint p;
+    p.sourceTimingValid = true; p.sourceTimeUs = 900000;
+    p.networkReadyUs = 899999; p.decoderOutputUs = 900500;
+    p.bufferUs = 2000; p.toleranceUs = 1000; p.submissionUs = 1000000; p.decoderReadyUs = 901000;
+    history.record(p); // Exactly 1 ms is not a hitch.
+    p.submissionUs += 100000; ++p.decoderReadyUs; history.record(p);
+    p.submissionUs += 100000; p.decoderReadyUs = 902000; history.record(p); // Exactly covered.
+    p.submissionUs += 100000; ++p.decoderReadyUs; history.record(p); // One us missed.
+    p.submissionUs += 100000; p.decoderReadyUs = 0; history.record(p); // Completion unknown, no known hitch.
+    p.submissionUs += 100000; p.decoderOutputUs = 901001; history.record(p); // Known late output.
+    p.submissionUs += 100000; p.sourceTimingValid = false; history.record(p);
+    p.submissionUs += 100000; p.sourceTimingValid = true;
+    p.networkReadyUs = 901010; p.decoderOutputUs = 900500; history.record(p); // Invalid decoder order.
+    history.record(p); // Duplicate must not inflate totals.
+    const auto stats = history.snapshot();
+    assert(stats.absorbed == 2 && stats.missed == 1 && stats.unknown == 2);
+    assert(stats.worstExcessUs == 1 && stats.observedFrames == 8 && stats.measuredFrames == 4);
+    // Read-time expiry also works if delivery stops. Expire the worst miss
+    // with its bucket, never retain a session-wide maximum in a rolling row.
+    const auto expired = history.snapshot(121400000);
+    assert(expired.absorbed == 0 && expired.missed == 0 && expired.unknown == 2);
+    assert(expired.worstExcessUs == 0 && expired.observedFrames == 3);
+    assert(history.snapshot(122000000).observedFrames == 0);
+    p.submissionUs = 500000; p.sourceTimeUs = 400000;
+    p.networkReadyUs = 399999; p.decoderOutputUs = 400500; p.decoderReadyUs = 402001;
+    history.record(p); // A restarted local clock starts a new history.
+    assert(history.snapshot().observedFrames == 1 && history.snapshot().missed == 1);
+
+    for (uint64_t tolerance : {250ULL, 500ULL, 1000ULL, 1750ULL, 2000ULL}) {
+        BufferHitchHistory profile;
+        TimingGraphPoint frame;
+        frame.sourceTimingValid = true; frame.sourceTimeUs = 1000000;
+        frame.networkReadyUs = 999999; frame.decoderOutputUs = 1000001;
+        frame.toleranceUs = tolerance; frame.bufferUs = tolerance + 1000;
+        frame.submissionUs = 2000000; frame.decoderReadyUs = frame.sourceTimeUs + tolerance;
+        profile.record(frame);
+        assert(profile.snapshot().absorbed == 0); // Exactly the selected tolerance is accepted.
+        frame.submissionUs += 10000; ++frame.decoderReadyUs; profile.record(frame);
+        assert(profile.snapshot().absorbed == 1); // One us beyond any preset/custom tolerance counts.
+        frame.submissionUs += 10000; frame.decoderReadyUs = frame.sourceTimeUs + frame.bufferUs + 1;
+        profile.record(frame);
+        assert(profile.snapshot().missed == 1 && profile.snapshot().worstExcessUs == 1);
+        frame.submissionUs += 10000; frame.toleranceUs = tolerance + 250;
+        profile.record(frame);
+        assert(profile.snapshot().observedFrames == 1 && profile.snapshot().missed == 1);
+        assert(profile.snapshot().toleranceUs == frame.toleranceUs); // Never mix hitch definitions.
+    }
+
+    TimingGraphHistory graph;
+    TimingGraphInput in;
+    in.submitted = true; in.sourceTimingValid = true; in.bufferUs = 2500; in.toleranceUs = 500;
+    in.sourcePeriodUs = 10000;
+    for (unsigned i = 1; i <= 20000; ++i) {
+        in.submissionUs = in.targetUs = 1000000 + uint64_t(i) * 10000;
+        in.sourceTimeUs = in.submissionUs - 5000;
+        in.networkReadyUs = in.sourceTimeUs - 1000;
+        in.decoderOutputUs = in.sourceTimeUs + 500;
+        in.decoderReadyUs = in.sourceTimeUs + (i % 10 ? 2000 : 3000);
+        in.discontinuity = i == 15000; // A new phase must not erase prior counts.
+        graph.record(in);
+    }
+    TimingGraphSnapshot snapshot;
+    graph.copyTo(snapshot, in.submissionUs);
+    assert(snapshot.points.size() == TimingGraphHistory::SnapshotPoints);
+    assert(snapshot.hitches.observedFrames >= 11990 && snapshot.hitches.observedFrames <= 12000);
+    assert(snapshot.hitches.absorbed > 10000 && snapshot.hitches.missed > 1000);
+    assert(snapshot.hitches.worstExcessUs == 500);
+    in.submitted = false; graph.record(in); // Feedback-only updates are not input frames.
+    graph.copyTo(snapshot, in.submissionUs);
+    assert(snapshot.hitches.absorbed + snapshot.hitches.missed == snapshot.hitches.observedFrames);
+    graph.copyTo(snapshot, in.submissionUs + BufferHitchStats::WindowUs);
+    assert(snapshot.hitches.observedFrames == 0 && !snapshot.points.empty());
 }
 
 static void testLaneIntervals()
 {
-    TimingGraphSnapshot points(4);
+    TimingGraphPoints points(4);
     for (size_t i = 0; i < points.size(); ++i) {
         points[i].submissionUs = 1000000 + i * 10000;
         points[i].displayUs = points[i].submissionUs + 20000 + (i == 2 ? 3000 : 0);
@@ -175,6 +302,8 @@ static void testLaneIntervals()
 int main(int argc, char** argv)
 {
     testLaneIntervals();
+    testBufferCoverage();
+    testBufferHitchHistory();
     {
         PyroWavePacketLossWarning warning;
         uint64_t now = 1000000;
@@ -361,6 +490,10 @@ int main(int argc, char** argv)
                     assert((replacement.rowColors[lane][ink] > 100) == (lane == ink));
             assert(replacement.rowColors[1][3] > 0); // Submission hitches beyond the axis are marked.
             assert(replacement.rowColors[2][3] > 0); // So are display spikes.
+            const auto& incoming = replacement.rowColors[TimingGraphLayout::BufferLane];
+            for (int ink = 4; ink < 8; ++ink) assert(incoming[ink] > 10);
+            assert(incoming[3] > 0); // Exact decoder/buffer crossings have red X markers.
+            for (int ink = 0; ink < 3; ++ink) assert(incoming[ink] == 0);
         }
         int normalWidth, normalHeight;
         {
@@ -387,7 +520,8 @@ int main(int argc, char** argv)
         // Variation within the flat zone is drawn on the reference line;
         // larger variation is drawn at its true height.
         const auto jitter = [](uint64_t amplitudeUs) {
-            TimingGraphSnapshot points;
+            TimingGraphSnapshot snapshot;
+            auto& points = snapshot.points;
             for (unsigned i = 0; i < 300; ++i) {
                 TimingGraphPoint point;
                 point.sourcePeriodUs = point.targetIntervalUs = point.submissionIntervalUs = 10000;
@@ -395,7 +529,7 @@ int main(int argc, char** argv)
                 point.displayUs = point.submissionUs + 2000 + (i % 2 ? amplitudeUs : 0);
                 points.push_back(point);
             }
-            return points;
+            return snapshot;
         };
         manager.updateOverlayText(OverlayDebug, "Unnoticeable variation", jitter(900));
         replacement.awaitText("Unnoticeable variation");
@@ -417,7 +551,7 @@ int main(int argc, char** argv)
         // A backend without DisplayEvent feedback must leave the display lane
         // empty rather than painting submission timestamps as presentation.
         auto withoutDisplay = graph;
-        for (auto& point : withoutDisplay) point.displayUs = 0;
+        for (auto& point : withoutDisplay.points) point.displayUs = 0;
         manager.updateOverlayText(OverlayDebug, "No OS display feedback", std::move(withoutDisplay));
         replacement.awaitText("No OS display feedback");
         {
@@ -452,10 +586,15 @@ int main(int argc, char** argv)
         manager.setOverlayState(OverlayDebug, true);
         manager.updateOverlayText(OverlayDebug, "Stats only", graph);
         manager.updateTimingGraph(graph);
-        replacement.awaitText("Stats only");
         {
-            std::lock_guard<std::mutex> guard(replacement.lock);
-            assert(replacement.height > 0 && replacement.height < TimingGraphLayout::Height);
+            // Text state can advance between publication and the renderer's
+            // callback. Wait for the actual text-only surface, not a newer
+            // text string read alongside an earlier hide notification.
+            std::unique_lock<std::mutex> guard(replacement.lock);
+            assert(replacement.ready.wait_for(guard, 3s, [&] {
+                return replacement.last == "Stats only" && replacement.height > 0 &&
+                    replacement.height < TimingGraphLayout::Height;
+            }));
             for (const auto& row : replacement.rowColors)
                 for (auto count : row) assert(count == 0);
         }

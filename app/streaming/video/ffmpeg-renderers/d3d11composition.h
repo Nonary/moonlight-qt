@@ -43,7 +43,7 @@ private:
         Microsoft::WRL::ComPtr<IPresentationBuffer> presentation;
     };
     // Buffer storage is not a queue target. Only available buffers are used;
-    // old pending presents are canceled before posting the newest ready one.
+    // accepted presents retain their native display/retirement lifecycle.
     std::array<Buffer, 5> m_Buffers;
     size_t m_Acquired = m_Buffers.size();
     size_t m_NextBuffer = 0;
