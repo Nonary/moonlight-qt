@@ -5,7 +5,7 @@ decoding, rendering, VRR, latency, or replay. It describes source contracts and
 measurement boundaries; deployment and live behavior require separate verification.
 
 Source audit: October 9, 2026, main repository
-`0becddd0ba37a018b542fd201d37e77d18dde61d`. The inspected common-library checkout is
+`ff6f071ce2d05e8ba292086fd562bc40d241330e`. The inspected common-library checkout is
 `9ab994975acba22423c819c0c441bf4a0c979856`; the main repository records
 `9348def91b5bbe9f21ba5af4aa11fcadc85b5875` instead. This pre-existing checkout
 discrepancy affects calibrated pacing negotiation in sections 3.3–3.4 and PyroWave tail
@@ -89,7 +89,7 @@ interface differences that affect this pipeline.
 | Packet ordering, FEC and reassembly | [RtpVideoQueue.c](moonlight-common-c/moonlight-common-c/src/RtpVideoQueue.c): `RtpvAddPacket()`; [VideoDepacketizer.c](moonlight-common-c/moonlight-common-c/src/VideoDepacketizer.c): `processRtpPayload()`, `requestDecoderRefresh()` |
 | FFmpeg decoder and shared PyroWave wrapper | [ffmpeg.cpp](app/streaming/video/ffmpeg.cpp): `ffGetFormat()`, `submitDecodeUnit()`, decoder thread; [ffmpeg.h](app/streaming/video/ffmpeg.h) |
 | PyroWave framing and decode | [pyrowaveframing.cpp](app/streaming/video/pyrowave/pyrowaveframing.cpp), [pyrowavedecoder.cpp](app/streaming/video/pyrowave/pyrowavedecoder.cpp) |
-| PyroWave bitrate, bandwidth and calibration | [pyrowavebitrate.h](app/streaming/video/pyrowave/pyrowavebitrate.h), [pyrowavebandwidth.h](app/streaming/video/pyrowave/pyrowavebandwidth.h), [pyrowavecalibrationpolicy.h](app/streaming/video/pyrowave/pyrowavecalibrationpolicy.h), [pyrowavecalibrator.cpp](app/streaming/video/pyrowave/pyrowavecalibrator.cpp), [pyrowavelinkpolicy.h](app/streaming/video/pyrowave/pyrowavelinkpolicy.h); paired-host probe orchestration in [nvhttp.cpp](app/backend/nvhttp.cpp) and UDP transport in [pyrowaveudpprobe.cpp](app/backend/pyrowaveudpprobe.cpp) |
+| PyroWave bitrate, bandwidth and calibration | [pyrowavebitrate.h](app/streaming/video/pyrowave/pyrowavebitrate.h), [pyrowavebandwidth.h](app/streaming/video/pyrowave/pyrowavebandwidth.h), [pyrowavecalibrationpolicy.h](app/streaming/video/pyrowave/pyrowavecalibrationpolicy.h), [pyrowavecalibrator.cpp](app/streaming/video/pyrowave/pyrowavecalibrator.cpp), [pyrowavelinkpolicy.h](app/streaming/video/pyrowave/pyrowavelinkpolicy.h); paired-host probe orchestration in [nvhttp.cpp](app/backend/nvhttp.cpp) and UDP transport in [pyrowaveudpprobe.cpp](app/backend/pyrowaveudpprobe.cpp); manual pace control in [PyroWavePacketSpeedSettings.qml](app/gui/PyroWavePacketSpeedSettings.qml) |
 | Renderer abstraction and pacer selection | [renderer.h](app/streaming/video/ffmpeg-renderers/renderer.h), [pacer.cpp](app/streaming/video/ffmpeg-renderers/pacer/pacer.cpp) |
 | Frame and presenter contracts | [vrrtypes.h](app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h), [ivrrframepresenter.h](app/streaming/video/ffmpeg-renderers/ivrrframepresenter.h) |
 | VRR execution and tracing | [vrrpacingworker.cpp](app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.cpp) |
@@ -200,9 +200,9 @@ Compression version/feature parsing and framing support remain in shared code fo
 wire-compatibility and tests, not as active production negotiation. See [PyroWave
 protocol](docs/pyrowave-protocol.md).
 
-PyroWave's optional calibration is separate from VRR timing. It probes link capacity
-and, when the host advertises paced UDP probes and link information is available, tests
-complete frames at stream cadence to choose a loss-bounded frame-send pace. Moonlight
+PyroWave's optional calibration is separate from VRR timing. It probes aggregate link
+capacity, then requires burst-v1 support and at least one known wired endpoint link
+speed to test complete frames at stream cadence and choose a frame-send pace. Moonlight
 saves that pace in user preferences. At session start it recomputes the routed
 wired-client link estimate and assigns it alongside the saved pace to the stream
 configuration. There is a source seam in this checkout: `Session` assigns
@@ -210,7 +210,11 @@ configuration. There is a source seam in this checkout: `Session` assigns
 `STREAM_CONFIGURATION` field or SDP attribute. The parent gitlink `9348def` adds both;
 calibrated pace reaches the host only
 with that matching common-c interface. A client-side calibration result alone does not
-prove streaming performance or visual smoothness.
+prove streaming performance or visual smoothness. Settings exposes the same persisted
+pace as Packet speed (Mbps), independently of video bitrate. The control allows 50 Mbps
+steps or direct entry; zero/Automatic asks the host to choose. Applying calibration
+replaces that value, and manual edits take effect on the next stream. The saved pace is
+a request, not a measurement of actual host wire speed.
 
 ### 3.4 PyroWave bitrate and calibration
 
@@ -224,7 +228,27 @@ capacity: the conversion reserves packet, IP/UDP/RTP and encryption overhead, fr
 headers, critical FEC parity, and an audio/control allowance. The Minimum and
 Recommended targets refer to image bitrate; Moderate starts from 60% of the slower known
 endpoint link but cannot go below Recommended wire cost or above the measured budget.
-Maximum uses the full confirmed budget.
+Maximum uses the full confirmed budget, subject to the frame-tested cap below.
+
+Frame-shaped testing requires host burst-probe version 1 and at least one known wired
+endpoint link speed; missing support, missing link information, or an invalid/incomplete
+pace measurement stops calibration rather than silently using an untested budget.
+Burst-v1 frame identity comes from expected sequence partitions, including entirely
+absent frames. Tail damage includes any hole in the final 1 ms send group, even when its
+last packet arrived. A speed qualifies only with aggregate loss below 2%, worst
+100 ms-window loss below 5%, no frame losing more than 10%, and tail damage in fewer
+than 2% of frames. The share of frames with any hole is diagnostic rather than a gate.
+
+The pace search tries the link ceiling, then a passing boundary with a measured 5%
+margin and two fresh confirmations. If that path fails, it checks the remaining 50 Mbps
+steps because loss need not be monotonic. If none qualifies, it ranks valid measurements
+by violated limits, tail-damaged frames, severe-frame loss, worst frame loss, then
+aggregate/window loss, preferring faster speeds on ties. It measures the selected
+fallback twice afresh; invalid measurements cannot become a fallback, and failed
+confirmations remain in the ranking. A usable but unqualified result explicitly warns
+that loss limits were not met. That warning does not automatically reduce video bitrate.
+The format sweep uses the lesser of aggregate capacity and the actual frame-tested
+budget before applying local device limits.
 
 The second step measures local decode and rendering cost across its resolution, chroma,
 and HDR test matrix at the selected stream FPS, against the wire budget for each
@@ -233,8 +257,8 @@ host encoding, compositor scheduling, display presentation, or physical scanout.
 accounting reserves a full frame period on Linux, while Windows and macOS use a
 conservative 75% period share. Network capacity and local device service time are
 separate limits, and the reported choice is the lower feasible image rate. A calibrated
-burst send pace is tested separately from the capacity and device probes. It requires a
-host advertising paced UDP probes. The session code stores and assigns that value, but
+burst send pace is tested separately from the capacity and device probes. The session
+code stores and assigns that value, but
 it reaches SDP only when common-c provides the newer `pyrowavePaceMbps` field described
 above; the checked-out 9ab interface does not. Calibration grades are useful connection
 guidance, not proof of smooth live gameplay.
@@ -645,7 +669,7 @@ completed.
 
 `VRR_TIMING_PARAMETER_FIELDS` is the shared trace/replay schema. Its initializer values
 preserve historical behavior; `vrrTimingParametersForSession()` resolves the live
-policy. Normal sessions select interval-buffer revision 9 and
+policy. Normal sessions select interval-buffer revision 7 and
 `playout_readiness_hitch_threshold_us=0`; the older thresholded readiness policy is not
 the production growth policy. The diagnostic capture checkbox does not change the timing
 policy. Replay uses the parameters recorded in the capture, with compatibility defaults
@@ -839,10 +863,10 @@ growth or clean recovery.
 For responsive production, this FIFO model writes a version-20 `Reserve` used for
 five-minute readiness diagnostics and cached history. It is not the live buffer
 controller: `RecentReadiness` is only passed into the predictor for responsive revisions
-below 5, while production resolves to revision 9. The reserve bins valid raw readiness
+below 5, while production resolves to revision 7. The reserve bins valid raw readiness
 errors in 250 us steps, including successes, over a five-minute monotonic-time window
 (one-second aging buckets). Its nearest-rank p99.95 and cache state must not be
-described as the source of revision-9 growth or release. Sustained backlog, decoder
+described as the source of revision-7 growth or release. Sustained backlog, decoder
 queue above one source period, or work plus scheduler delay above a period is held as an
 episode; recovery flushes its samples into the diagnostic reserve. An episode lasting
 two seconds or filling 512 held samples is marked overloaded and discarded rather than
@@ -856,17 +880,19 @@ attributes which frame arrived too late, while the service check asks whether st
 buffer can absorb the work. In production the qualified one-second sums of serial
 service and decoder queue must each fit within summed intended interval time.
 
-### 9.2 Revision-9 interval buffer and feedback
+### 9.2 Revision-7 interval buffer and feedback
 
-The session resolver selects `playout_responsive_buffer=9` on every ordinary VRR
+The session resolver selects `playout_responsive_buffer=7` on every ordinary VRR
 backend. The interval buffer compares each pair of adjacent eligible submissions against
 intended mapped source-slot spacing, including deliberate cadence smoothing when enabled:
 `error = abs(actual submission spacing - intended mapped-slot spacing)`.
-Revision 9 averages the per-interval excess over the configured tolerance, weighted by
-evaluated time, over the
-preset's quality window. A source-rate, phase, missing-frame, or other sequence break
+Production revision 7 computes the qualified one-second mean of absolute interval
+error before subtracting the configured tolerance. It divides that excess by the
+intended interval, caps loss at one, and accumulates actual-interval-time-weighted loss
+over the preset's quality window. Reporting and buffer control use the same score. A source-rate, phase, missing-frame, or other sequence break
 makes the next pair unqualified; unknown gaps do not count as clean intervals. The
-one-second mean remains diagnostic. Preset quality target and window tune the shared
+one-second mean supplies the production score and remains visible in the overlay.
+Preset quality target and window tune the shared
 policy; they do not select separate control algorithms.
 
 An increase requires current quality pressure, a fresh interval error above tolerance,
@@ -874,13 +900,15 @@ positive lateness of the delayed frame relative to its readiness deadline, and
 absorbable serial service. The delayed frame is the later frame for a stretch and the
 earlier frame for catch-up; its original buffer is the growth base so a catch-up cannot
 charge the same miss against a newly raised buffer. Each request is limited by the
-quality excess, readiness lateness, fresh interval excess, and 250 us, with at least 250
-ms between attacks. Old score debt may hold protection, but cannot by itself trigger
-another increase. Native presentation timing and CPU submission hitches are diagnostic
+mean-based quality excess above the target allowance, readiness lateness, fresh interval
+excess, and 250 us, with at least 250
+ms between attacks. Long-window score debt can qualify a future attack, but cannot by
+itself renew the hold or trigger another increase. Native presentation timing and CPU
+submission hitches are diagnostic
 evidence; neither can independently grow this buffer.
 
-Revision 9 applies the tolerance to each interval before averaging, so clean intervals
-do not erase the scored excess of isolated hitches. With production settings, pressure
+Revision 7 applies tolerance after the one-second mean, so isolated interval spikes can
+fall below tolerance and disappear from the quality score. With production settings, pressure
 renews the eight-second hold only for a fresh, attributable, absorbable late-work miss.
 Clean recovery accrues only from eligible adjacent intervals whose one-second
 serial-service and decoder-queue totals fit their intended time. Short sequence breaks
@@ -897,19 +925,21 @@ ambiguous threshold crossings are unavailable evidence. Native presentation obse
 require a fresh matched display event in production. DXGI refresh references remain
 available only to legacy replay and are not display timestamps. The submission fallback
 is lower confidence and does not enter verified display counters. Because production
-sets prediction-only adaptation, neither smoothness-feedback stream controls revision-9
+sets prediction-only adaptation, neither smoothness-feedback stream controls revision-7
 delay. A submission-spacing score is not optical evidence of displayed smoothness.
 
 Older responsive revisions, the readiness-hitch `ReadinessFeedback` path, native-hitch
 adaptation, and the original readiness percentile laws remain in the parameter schema
 for exact replay and explicit experiments. Revision 8 retains its 250 us tolerance;
-revision 9 uses the resolved preset tolerance. `Reserve` revisions 13 through 20
+production revision 7 uses the resolved preset tolerance. Revisions 9/10 retain
+per-interval-excess reporting; revision 9 couples that report to control, while revision
+10 uses a separate mean-before-tolerance history for growth, holds, and release. `Reserve` revisions 13 through 20
 likewise preserve historical models and captured replay. A class or file named `Vrr13`
 does not identify the active production revision.
 
 ### 9.3 Delay update and capacity formulas
 
-Revision 9 learns a requested target bounded by the minimum of the source-rate preset
+Revision 7 learns a requested target bounded by the minimum of the source-rate preset
 cap and available queue capacity. Production's preset cap uses the fitted source period:
 0.5 source periods for Low Latency, one for Balanced, and four for Smooth. The available
 queue allowance uses the faster of fitted and negotiated cadence, multiplied by the
@@ -929,7 +959,7 @@ clipped by the existing queue ownership and work already occupying it. The produ
 cold-start input is `max(6,000 us, 0.95 * fitted source period)`, capped by the larger
 of display period and render lead, then clamped to the current delay bounds. A cached
 calibration may seed this cold-start input only through the separately stored bounded
-start-delay entry; it does not load a revision-9 target or authorize growth. Applied
+start-delay entry; it does not load a revision-7 target or authorize growth. Applied
 delay remains within the live bounds after source-rate changes. Capacity telemetry can
 expose requested demand above the cap, but clipped demand is not retained as growth
 debt.
@@ -949,12 +979,12 @@ changes.
 Profiles are version-checked, expire after 14 days, and are aged on load. Saving
 requires at least 240 observations; storage uses a lock and atomic replacement and keeps
 at most 16 profiles. A cached histogram can inform the diagnostic five-minute
-distribution, but it does not qualify current-session coverage or change the revision-9
+distribution, but it does not qualify current-session coverage or change the revision-7
 interval target. The worker separately stores a start-delay seed from settled session
 samples under the same identity. That seed only changes the initial delay within current
 bounds. Display-epoch changes invalidate calibration saving.
 
-The initial revision-9 interval-calibration flag is session-local and is not loaded from
+The initial revision-7 interval-calibration flag is session-local and is not loaded from
 either cache. It qualifies after at least 500 ms and 32 consecutive eligible intervals;
 once complete it survives later sequence breaks and FPS changes. After a break,
 adaptation must requalify for one second and at least two eligible intervals. The long
@@ -1551,7 +1581,7 @@ resets after the path is inactive or observations stop for more than 2.5 seconds
 warning is enabled by the client pacing warnings setting. Such frames remain delivered.
 Their lost-packet count makes their readiness/prediction evidence ineligible to
 authorize buffer growth or clean recovery, while the resulting output spacing can still
-enter revision 9 interval-quality scoring. This does not restore detail or guarantee
+enter revision 7 interval-quality scoring. This does not restore detail or guarantee
 regular display timing.
 
 The client pacing warning is also conditional. It requires qualified interval
@@ -1566,11 +1596,13 @@ suggestions are diagnostic prompts, not a diagnosis of the faulty stage.
 
 ### Interpret client quality, display timing, and latency separately
 
-Current revision 9 `Client timing` / `Smoothness` is severity-weighted client interval
+Current revision 7 `Client timing` / `Smoothness` is severity-weighted client interval
 quality over the preset's history window. For each valid adjacent submission pair, it
-compares actual and intended intervals, applies the configured tolerance (500 µs by
-default) to that pair's error, and weights excess severity by evaluated time. The
-overlay's one-second mean interval error is a separate diagnostic. The score is not the
+compares actual and intended intervals, computes their qualified one-second mean
+absolute error, then applies the configured tolerance (500 µs by default). Excess severity
+is weighted by evaluated time over the preset history, using the same calculation for
+reporting and buffer control. The overlay also shows that one-second mean. Isolated
+spikes can disappear beneath tolerance; the score need not expose every hitch. The score is not the
 share of perfect frames, not a frame-drop rate, and not physical display smoothness.
 Unobserved sequence gaps are excluded; report the separate 30-second drop count and
 qualification/sample coverage. The longer score window can retain earlier error after
@@ -1588,7 +1620,8 @@ count, and worst added error. Scoring pauses when the source period or submitted
 exceeds the controller's 20 ms low-refresh-compensation floor, and for 250 ms of settling
 after the last such interval. It uses OS-reported display
 events, not physical-panel measurements. It does not lower Smoothness or request buffer
-changes: production buffering responds to eligible pre-submission readiness evidence.
+changes: production buffering uses mean-before-tolerance interval quality with eligible
+pre-submission readiness and absorbability gates.
 
 In the advanced VRR overlay, per-frame averages are over successfully presented VRR
 frames. `GPU decode wait` is explicit synchronization wait; `Frame queue` is queue

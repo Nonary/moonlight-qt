@@ -545,20 +545,49 @@ hub) lost whole 12-16 packet USB transfers whenever a frame arrived above
 (10-500 FPS, `kbps <= P <= 9999999`): the same packets leave as `N` frames per
 second, each sent on the stream pacer's schedule of `P` kbps worth of
 back-to-back packets per 1 ms group. Only loss and the host's sending
-duration grade these probes (`PyroWaveLink::paceQualified`: under 2% lost,
-under 5% in any 100 ms window; lost detail is blur, not stutter, once the
-receiver releases on time and the pacer ignores loss). After the capacity search, calibration sends the
-selected video settings' bitrate for the chosen target (capped by the measured
-budget) as frames at the test frame rate and searches from the smaller
-known link speed down to 125% of the budget (`PyroWaveLink::searchPace`): the
-link is tried first and confirmed twice; otherwise a bisected qualifying edge
-is reduced 5% and confirmed twice, stepping down 10% on failure. If no pace
-qualifies, the pace that lost least is chosen. Applying a calibrated format
+duration grade these probes (`PyroWaveLink::paceQualified`). Qualification
+requires under 2% overall packet loss and under 5% in every 100 ms window,
+no frame losing **more than 10%** of its packets, and fewer than 2% of frames
+with holes in the final 1 ms send group. Exactly 10% per-frame loss is allowed;
+a single frame above it fails, regardless of the aggregate loss. Small
+interior losses remain acceptable within the aggregate limits; the share of
+frames with any hole is recorded for diagnosis rather than used as a gate.
+The receiver reconstructs frame boundaries as
+`floor(expected * frame / frames)`, with `frames = fps * 2000 / 1000`, and
+matches the host's group size using the probe payload and actual IPv4/IPv6
+wire overhead. Counts include unsent packets, entirely missing frames and
+missing final tails; a surviving final packet does not hide holes in the
+tail group. Arrival ordering and duplicates cannot change frame membership.
+After the capacity search, calibration sends the selected video settings'
+bitrate for the chosen target (capped by the measured budget) as frames at the
+test frame rate and searches from the smaller known link speed down to 125%
+of the budget (`PyroWaveLink::searchPace`). The link is tried first and
+confirmed twice; otherwise a bisected qualifying edge is reduced 5% and
+confirmed twice, stepping down 10% on failure. If this path finds no passing
+speed, all remaining 50 Mbps steps are tested before concluding that no
+speed qualifies. Loss can be nonmonotonic; a failed floor is insufficient.
+If none qualifies, usable measurements are ranked by fewer violated limits,
+fewer tail-damaged frames, fewer frames over 10%, worst frame loss, aggregate
+loss and worst-window loss, then faster pace on ties. The worst observation
+at each speed includes failed confirmations. The selected fallback is
+measured twice afresh, and the status and summary warn explicitly if it
+still fails. Invalid or incomplete probes cannot become a fallback; exceptions
+invalidate the recommendation. Packet-speed failure does not automatically
+reduce the bitrate budget. Both fresh confirmations must satisfy all limits
+before a pace is described as confirmed. All format recommendations are
+capped by the actual frame-tested budget, even if aggregate capacity is higher.
+Applying a calibrated format
 stores the pace, and Moonlight announces it at launch as
 `x-ss-video[0].pyrowavePaceMbps`. The host paces PyroWave there, capped at its
 link and never below the frame's demand; uncalibrated sessions use 80% of the
-smaller link. Hosts without support ignore the attribute and skip pace
-calibration with a note.
+smaller link. Hosts without support ignore the attribute, but calibration
+requires burst-v1 support and a known endpoint link speed before issuing a
+recommendation; it cannot silently substitute an untested default pace.
+The PyroWave Packet speed (Mbps) control beside video bitrate edits this same
+saved value independently of calibration. Zero/Automatic uses the host's
+default; manual changes apply on the next stream, and applying a calibration
+result replaces the value. The host's link cap and minimum rate required by
+the frame still apply to manual requests.
 
 This tests fresh UDP delivery and synthetic GPU work separately. It does not
 prove sustained gameplay smoothness, host encoding speed, or physical scanout. The older 32 MiB HTTPS download endpoint remains available

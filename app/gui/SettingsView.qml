@@ -840,6 +840,13 @@ Flickable {
                     }
                 }
 
+                PyroWavePacketSpeedSettings {
+                    width: parent.width
+                    visible: SystemProperties.hasPyroWave && slider.pyroWave
+                    paceMbps: StreamingPreferences.pyroWavePaceMbps
+                    onPaceEdited: function(value) { StreamingPreferences.pyroWavePaceMbps = value }
+                }
+
                 Column {
                     width: parent.width
                     spacing: 5

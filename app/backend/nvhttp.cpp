@@ -312,7 +312,12 @@ PyroWaveLink::Result NvHTTP::probePyroWaveUdp(int kbps, int packetSize, const st
     if (missingTimestamp) {
         throw std::runtime_error("PyroWave UDP packets arrived without valid kernel timestamps; calibration cannot grade delivery timing");
     }
-    PyroWaveLink::summarize(result, arrivals);
+    // Burst-v1 uses this exact wire charge for its 1 ms groups. Keep the
+    // final group's holes visible even when its last packet arrived.
+    const int burstWireBytes = packetSize + 48 + 8 +
+        (host.protocol() == QAbstractSocket::IPv6Protocol ? 40 : 20) + 38;
+    const uint32_t burstGroupPackets = (std::max)(1, paceKbps / 8 / burstWireBytes);
+    PyroWaveLink::summarize(result, arrivals, burstFps, burstGroupPackets);
     if (!readDelays.empty()) {
         std::sort(readDelays.begin(), readDelays.end());
         result.receiverReadDelayP99Ms = readDelays[(readDelays.size() - 1) * 99 / 100];

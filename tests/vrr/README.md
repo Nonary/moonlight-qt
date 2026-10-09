@@ -19,7 +19,7 @@ Set `MOONLIGHT_DIAGNOSTICS_TEST_EXPORT` to a new `.zip` path to export its fixtu
 then run `python3 tests/vrr/check_diagnostic_zip.py PATH` for independent CRC and
 content verification. Cold/warm worker exports use the current production policy.
 
-The interval-quality queue is the production VRR policy (responsive revision 9).
+The interval-quality queue is the production VRR policy (responsive revision 7).
 The four customizable timing settings and their bounds are documented in
 [the architecture](../../architecture.md). Low Latency / Balanced / Smooth
 presets use 0.5 / 1 / 4 source frames, 99 / 99.5 / 99.99 percent targets,
@@ -27,7 +27,7 @@ presets use 0.5 / 1 / 4 source frames, 99 / 99.5 / 99.99 percent targets,
 All share an eight-second clean hold and 250 us/s release. Custom tolerance
 accepts 0.25–2 ms in 0.25 ms increments; zero is reserved for historical traces.
 Growth
-requires below-target long-window quality, current pressure, fresh readiness-
+requires below-target long-window buffer-control quality, current mean-based pressure, fresh readiness-
 related interval error, and serial local work that fits the intended interval.
 Only current pressure with a below-target score renews the clean-time release hold; old score debt remains
 useful for qualifying future growth but cannot pin the live delay by itself.
@@ -280,13 +280,15 @@ interval safety separately; they do not claim 99.95% under post-target faults.
 The all-arrival queue simulator uses the capture's `can_latch_present` capability;
 forcing it off invents software-floor backlog on a latch-capable session.
 
-Production sets `playout_responsive_buffer=9`: Low Latency targets 99% over
+Production sets `playout_responsive_buffer=7`: Low Latency targets 99% over
 1 minute, Balanced Target 99.5% over 2 minutes, and Smooth 99.99% over 5 minutes.
-It applies the selected interval tolerance to each absolute
-submission-interval error before averaging, then weights long-window quality
-loss by the excess relative to the intended interval. The one-second mean
-remains diagnostic and cannot erase an isolated excess. Growth requires both below-target
-history and current excess, a fresh readiness-late frame, and decoder-queue and
+It applies the selected interval tolerance to the one-second mean absolute
+submission-interval error, then weights long-window quality loss by the excess
+relative to the intended interval. Reporting and buffer control use that same
+averaged loss, restoring the former score, growth, hold and release behavior.
+Isolated spikes can disappear beneath tolerance; the score is a control metric,
+not a count of perfect frames or a guarantee of visible smoothness. Growth requires both below-target
+control history and current mean-based excess, a fresh readiness-late frame, and decoder-queue and
 serial-service costs that each fit that interval. Requests can rise by at most
 250 us per 250 ms. Old score debt remains reportable but does not renew the
 clean-time release hold. The 500 us scheduling margin and 1 ms minimum remain.
@@ -1596,15 +1598,24 @@ It does not substitute replay scenarios for missing measured presets.
 
 ### Responsive buffer history
 
-Production resolves `playout_responsive_buffer=9`; revisions 0 through 8 remain
-available for exact historical replay. Revision 3 records the selected target
+Production again resolves `playout_responsive_buffer=7`, restoring the same
+mean-before-tolerance score for reporting and control. Revisions 0 through 10
+remain available for exact historical replay. Revision 3 records the selected target
 in `playout_on_time_target_per_million` and learning window in
 `playout_readiness_window_us`; revision 4 added thresholded misses and excluded
 pacing-queue residence from its then-current decode-ready timestamp. Revisions
 5 through 7 move adaptation to interval quality, add severity weighting, and
 keep long score history separate from current release pressure. Revision 9
 applies tolerance per interval; revisions 7/8 preserve their mean-before-tolerance
-score and growth pressure for historical replay. The rolling
+score and growth pressure; revision 7 is again the live policy. Historical
+revision 10 keeps revision 9's
+accurate report and independently restores revision 7/8's mean-based buffer
+control, including history, attack amount and hold/release qualification.
+`testRelaxedBufferControlPreservesAccurateReporting` checks both references on
+every observation across all presets, rare and sustained misses, submission-only
+jitter, serial/decoder overload, short breaks, epoch restore and long silence.
+Rare spikes remain reportable while raised buffer releases to its minimum.
+The rolling
 30-second outcome readout always counts client drops and lateness over 2 ms as
 misses, counts 1-2 ms lateness only above 50% prevalence, tolerates lateness
 through 1 ms, and measures lateness before deadline recovery clamps.

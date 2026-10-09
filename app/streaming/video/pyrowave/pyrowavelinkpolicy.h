@@ -21,6 +21,7 @@ constexpr int windowCount = durationMs / windowMs;
 constexpr double lossLimitPercent = 2.0;
 constexpr double windowLossLimitPercent = 5.0;
 constexpr double minimumSentShare = 0.98;
+constexpr double frameLossLimitPercent = 10.0;
 
 struct Result {
     int requestedKbps = 0;
@@ -32,6 +33,15 @@ struct Result {
     double worstWindowLossPercent = 100;
     double delayP99Ms = 0;
     double delayGrowthMs = 0;
+    uint32_t frames = 0;
+    uint32_t damagedFrames = 0;
+    uint32_t excessiveLossFrames = 0;
+    uint32_t missingTailFrames = 0;
+    double worstFrameLossPercent = 100;
+
+    double damagedFramePercent() const { return frames ? 100.0 * damagedFrames / frames : 100; }
+    double excessiveLossFramePercent() const { return frames ? 100.0 * excessiveLossFrames / frames : 100; }
+    double missingTailFramePercent() const { return frames ? 100.0 * missingTailFrames / frames : 100; }
     bool kernelArrivalTimestamps = false;
     double receiverReadDelayP99Ms = 0;
     // Host diagnostics (Vibeshine): packets retried after a full send buffer
@@ -78,8 +88,41 @@ struct Result {
 // Unique sequence IDs make reordering harmless and prevent duplicate packets
 // from hiding loss. Delay is relative to the minimum transit in this run, so
 // host/client clock offsets never enter the grade.
-inline void summarize(Result& result, const std::vector<int64_t>& arrivalsUs)
+inline void summarize(Result& result, const std::vector<int64_t>& arrivalsUs, int burstFps = 0,
+                      uint32_t burstGroupPackets = 1)
 {
+    result.frames = result.damagedFrames = result.excessiveLossFrames = result.missingTailFrames = 0;
+    result.worstFrameLossPercent = 100;
+    if (burstFps > 0 && result.expected > 0) {
+        // Match the burst-v1 host's sequence partitions, not arrival-time
+        // buckets. Reordering cannot move a packet to another frame, and an
+        // entirely absent frame or final tail still contributes its full loss.
+        const uint32_t frames = (std::max)(uint32_t(1), uint32_t(uint64_t(burstFps) * durationMs / 1000));
+        result.worstFrameLossPercent = 0;
+        for (uint32_t frame = 0; frame < frames; ++frame) {
+            const uint32_t begin = uint64_t(result.expected) * frame / frames;
+            const uint32_t end = uint64_t(result.expected) * (frame + 1) / frames;
+            if (begin == end) continue;
+            // The tail is the final 1 ms send group, including interior holes
+            // when the group's final packet survived. Match host partitioning.
+            const uint32_t group = (std::max)(uint32_t(1), burstGroupPackets);
+            const uint32_t tailBegin = begin + (end - begin - 1) / group * group;
+            uint32_t missing = 0;
+            bool missingTail = false;
+            for (uint32_t seq = begin; seq < end; ++seq) {
+                if (seq >= arrivalsUs.size() || arrivalsUs[seq] < 0) {
+                    ++missing;
+                    missingTail |= seq >= tailBegin;
+                }
+            }
+            const double loss = 100.0 * missing / (end - begin);
+            ++result.frames;
+            result.damagedFrames += missing != 0;
+            result.excessiveLossFrames += loss > frameLossLimitPercent;
+            result.missingTailFrames += missingTail;
+            result.worstFrameLossPercent = (std::max)(result.worstFrameLossPercent, loss);
+        }
+    }
     std::vector<double> transit;
     double first = 0, last = 0;
     int firstCount = 0, lastCount = 0;
@@ -166,31 +209,65 @@ Result search(int targetKbps, int capKbps, Probe probe, Cancelled cancelled,
 // 2.5GbE dock lost whole 12-16 packet USB transfers above ~2.2 Gbps although
 // its link reported 2.5 Gbps; the host then paces at the pace found here.
 constexpr int paceStepKbps = 50000;
-// The same loss limits as capacity: below 2% a faster pace (sooner whole
-// frames) is worth more than the missing detail.
+// Speed calibration primarily prevents repeated loss in the final send group.
+// Small interior holes are allowed within the aggregate limits, but no frame
+// may lose more than 10% of its total packets.
 constexpr double paceLossPercent = lossLimitPercent;
 constexpr double paceWindowLossPercent = windowLossLimitPercent;
+constexpr double paceTailFrameLimitPercent = 2.0;
 
 // Only loss and the host's sending duration grade a frame-shaped probe: its
 // delivery timing is intentionally bursty, not the capacity probe's schedule.
-inline bool paceQualified(const Result& result)
+inline bool paceMeasured(const Result& result)
 {
     return result.hostSentEnough() && result.received > 0 && result.received <= result.sent &&
            std::isfinite(result.senderMs) && std::isfinite(result.lossPercent) &&
+           std::isfinite(result.worstWindowLossPercent) &&
            result.senderMs >= durationMs * 0.98 && result.senderMs <= durationMs * 1.02 &&
-           result.lossPercent < paceLossPercent && result.worstWindowLossPercent < paceWindowLossPercent;
+           result.frames > 0 && std::isfinite(result.worstFrameLossPercent);
+}
+
+inline bool paceQualified(const Result& result)
+{
+    return paceMeasured(result) &&
+           result.lossPercent < paceLossPercent && result.worstWindowLossPercent < paceWindowLossPercent &&
+           result.excessiveLossFrames == 0 && result.worstFrameLossPercent <= frameLossLimitPercent &&
+           result.missingTailFramePercent() < paceTailFrameLimitPercent;
+}
+
+// Rank usable fallback measurements by violated limits, then the tail loss
+// this search targets, severe frame damage, worst frame damage and total loss.
+// Invalid/unfinished probes must never become a usable fallback.
+inline bool betterPaceMeasurement(const Result& a, const Result& b)
+{
+    const auto violations = [](const Result& r) {
+        return int(r.lossPercent >= paceLossPercent) + int(r.worstWindowLossPercent >= paceWindowLossPercent) +
+               int(r.excessiveLossFrames != 0 || r.worstFrameLossPercent > frameLossLimitPercent) +
+               int(r.missingTailFramePercent() >= paceTailFrameLimitPercent);
+    };
+    if (violations(a) != violations(b)) return violations(a) < violations(b);
+    if (a.missingTailFramePercent() != b.missingTailFramePercent())
+        return a.missingTailFramePercent() < b.missingTailFramePercent();
+    if (a.excessiveLossFramePercent() != b.excessiveLossFramePercent())
+        return a.excessiveLossFramePercent() < b.excessiveLossFramePercent();
+    if (a.worstFrameLossPercent != b.worstFrameLossPercent)
+        return a.worstFrameLossPercent < b.worstFrameLossPercent;
+    if (a.lossPercent != b.lossPercent) return a.lossPercent < b.lossPercent;
+    return a.worstWindowLossPercent < b.worstWindowLossPercent;
 }
 
 struct PaceResult {
     int paceKbps = 0;      // Zero: not determined; the host keeps its default.
-    bool lossless = false; // True: within the loss limit. False: none was; paceKbps lost least.
+    bool qualified = false; // Both fresh confirmations pass aggregate and frame loss limits.
     Result probe;          // Measurement behind paceKbps.
 };
 
 // Highest pace, between floorKbps (a frame must still fit the frame interval)
-// and the link, within the loss limit; if none is, the pace that lost least
-// (the faster on ties). The link is tried first. Below it, a bisected pass
-// leaves a 5% margin that must pass twice afresh, stepping down on failure.
+// and the link. The link is tried first. Below it, a bisected pass leaves a
+// 5% margin that must pass twice afresh, stepping down on failure. If that
+// fails, test every remaining 50 Mbps step: loss need not be monotonic. Only
+// after exhausting those alternatives return an explicitly unqualified best
+// measurement (faster on ties), freshly measured twice at the fallback pace.
 template<class Probe, class Cancelled>
 PaceResult searchPace(int linkKbps, int floorKbps, Probe probe, Cancelled cancelled)
 {
@@ -199,20 +276,27 @@ PaceResult searchPace(int linkKbps, int floorKbps, Probe probe, Cancelled cancel
     if (cap < paceStepKbps) return {};
     const int floor = std::clamp(int(std::ceil(double(floorKbps) / paceStepKbps)) * paceStepKbps,
                                  paceStepKbps, cap);
-    PaceResult fewest;
-    const auto passes = [&](int pace) {
+    std::vector<PaceResult> measurements;
+    const auto measure = [&](int pace) {
         const Result result = probe(pace);
-        if (!fewest.paceKbps || result.lossPercent < fewest.probe.lossPercent ||
-            (result.lossPercent == fewest.probe.lossPercent && pace > fewest.paceKbps)) {
-            fewest = {pace, false, result};
-        }
+        const auto previous = std::find_if(measurements.begin(), measurements.end(),
+            [pace](const PaceResult& r) { return r.paceKbps == pace; });
+        // Keep the worse observation at each pace, including failed fresh
+        // confirmations, instead of letting a lucky initial run win fallback.
+        if (previous == measurements.end()) measurements.push_back({pace, false, result});
+        else if (!paceMeasured(result) || (paceMeasured(previous->probe) &&
+                 betterPaceMeasurement(previous->probe, result))) previous->probe = result;
+        return result;
+    };
+    const auto passes = [&](int pace) {
+        const auto result = measure(pace);
         return paceQualified(result);
     };
     const auto confirmed = [&](int pace) -> PaceResult {
         Result last;
         for (int run = 0; run < 2; ++run) {
             if (cancelled()) return {};
-            last = probe(pace);
+            last = measure(pace);
             if (!paceQualified(last)) return {};
         }
         return {pace, true, last};
@@ -220,27 +304,54 @@ PaceResult searchPace(int linkKbps, int floorKbps, Probe probe, Cancelled cancel
     if (passes(cap)) {
         if (cancelled()) return {};
         const auto atLink = confirmed(cap);
-        if (atLink.lossless || cancelled()) return cancelled() ? PaceResult{} : atLink;
+        if (atLink.qualified || cancelled()) return cancelled() ? PaceResult{} : atLink;
     }
     if (cancelled()) return {};
     int low = 0, high = cap;
     if (floor < cap) {
-        if (!passes(floor)) return cancelled() ? PaceResult{} : fewest;
-        low = floor;
-        for (int attempt = 0; attempt < 16 && high - low > paceStepKbps && !cancelled(); ++attempt) {
+        if (passes(floor)) low = floor;
+        for (int attempt = 0; low && attempt < 16 && high - low > paceStepKbps && !cancelled(); ++attempt) {
             const int next = (std::max)(low + paceStepKbps, stepDown((low + high) / 2.0));
             if (next >= high) break;
             if (passes(next)) low = next;
             else high = next;
         }
     }
-    if (cancelled() || !low) return cancelled() ? PaceResult{} : fewest;
-    for (int pace = (std::max)(floor, stepDown(low * 0.95)); !cancelled();
+    if (cancelled()) return {};
+    for (int pace = (std::max)(floor, stepDown(low * 0.95)); low && !cancelled();
          pace = (std::max)(floor, stepDown(pace * 0.9))) {
         const auto result = confirmed(pace);
-        if (result.lossless) return result;
+        if (result.qualified) return result;
         if (pace == floor) break;
     }
-    return cancelled() ? PaceResult{} : fewest;
+    // A failed floor says nothing about intermediate speeds. Probe the whole
+    // remaining range before deciding every tested speed still has damage.
+    for (int pace = cap - paceStepKbps; pace >= floor && !cancelled(); pace -= paceStepKbps) {
+        const auto previous = std::find_if(measurements.begin(), measurements.end(),
+            [pace](const PaceResult& r) { return r.paceKbps == pace; });
+        if (previous != measurements.end() && !paceQualified(previous->probe)) continue;
+        if (previous != measurements.end() || passes(pace)) {
+            const auto result = confirmed(pace);
+            if (result.qualified) return result;
+        }
+    }
+    if (cancelled()) return {};
+    PaceResult best;
+    for (const auto& result : measurements) {
+        if (paceMeasured(result.probe) && (!best.paceKbps || betterPaceMeasurement(result.probe, best.probe) ||
+            (!betterPaceMeasurement(best.probe, result.probe) && result.paceKbps > best.paceKbps))) best = result;
+    }
+    if (!best.paceKbps) return {};
+    bool passed = true;
+    for (int run = 0; run < 2; ++run) {
+        if (cancelled()) return {};
+        const auto result = measure(best.paceKbps);
+        // Do not publish a fallback if its final measurements are invalid.
+        if (!paceMeasured(result)) return {};
+        passed &= paceQualified(result);
+        if (run == 0 || betterPaceMeasurement(best.probe, result)) best.probe = result;
+    }
+    best.qualified = passed;
+    return cancelled() ? PaceResult{} : best;
 }
 } // namespace PyroWaveLink
