@@ -21,6 +21,13 @@ You can follow development on our [Discord server](https://moonlight-stream.org/
  - Support for both pointer capture (for games) and direct mouse control (for remote desktop)
  - Support for passing system-wide keyboard shortcuts like Alt+Tab to the host
  
+## VRR diagnostics and troubleshooting
+
+For this fork's blue client-submission and magenta display-event frametime lines,
+see the [client timing troubleshooting guide](docs/client-timing-troubleshooting.md).
+It covers host, network, decoder, GPU, scheduler and display causes, controlled
+tests, trace collection and replay limits. See also [VRR tracing and log export](docs/vrr-diagnostics.md).
+
 ## Downloads
 - [Windows, macOS, and Steam Link](https://github.com/moonlight-stream/moonlight-qt/releases)
 - [Snap (for Ubuntu-based Linux distros)](https://snapcraft.io/moonlight)

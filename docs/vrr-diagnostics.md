@@ -6,6 +6,11 @@ that separate build/deployment step.
 
 ## User workflow
 
+For interpreting the blue/cyan client-submission and magenta display-event
+lines, identifying host/network/decoder/GPU/scheduler/display causes, and
+choosing controlled tests, see the
+[client timing troubleshooting guide](client-timing-troubleshooting.md).
+
 Enable **Show frametime graph while streaming** in Settings, or toggle it during a
 stream with **Ctrl+Alt+Shift+F** or **Select+L1+R1+Y** (Triangle). It is separate
 from the stats text (Ctrl+Alt+Shift+S / Select+L1+R1+X) and can be shown alone.
@@ -47,15 +52,17 @@ at least one whole frame worse on screen than they were submitted, and
 **Worst** is the largest such delay in the window. A few large stalls are very
 visible but barely change the percentage.
 
-Hitches that start at the host (the game or host capture stalling) are not
-present timing issues: in the frametime graph they spike the Planned, Client and
-Display lanes together.
+Host cadence stalls can propagate into all three graph lanes without being
+display-added timing issues. Aligned spikes alone do not identify the host:
+client drops and buffer/target changes can also lengthen the intervals between
+surviving graph observations. Check source timestamps, frame continuity and
+client-drop evidence to distinguish them.
 
-Below about 50 fps the panel is under its adaptive-refresh range and the GPU
-driver repeats frames on its own schedule, so the line reads **paused below VRR
-range** instead of blaming the display; scoring resumes 250 ms after the stream
-is back above it. The line reads **unavailable** without current OS display
-feedback.
+The diagnostic assumes gaps over 20 ms (roughly below 50 fps) may enter the
+driver's low-framerate-compensation regime. It reads **paused below VRR range**
+and allows 250 ms to settle after such gaps. This is a scoring assumption,
+not a measurement of every panel's actual adaptive-refresh floor. The line
+reads **unavailable** without current OS display feedback.
 
 If magenta jumps while the other lanes stay flat on an AMD GPU under Linux, try
 **High-performance GPU power while streaming** in the video settings. It holds the
@@ -75,7 +82,7 @@ stats overlay with buffer status and the GPU/queue/rendering delay breakdown.
 Without deep tracing, the normal VRR17 queue delay and smoothness overview is
 shown. External launchers setting `MOONLIGHT_VRR_DEEP_TRACE=1` enable the same
 details; setting only a trace destination does not. Tracing
-does not select old/new timing rules, change the 2/2/4 buffer allowances, reset
+does not select old/new timing rules, change the configured buffer allowance, reset
 calibration or change the user's latency preset or Reduce judder choice.
 
 ## Destination, files and privacy

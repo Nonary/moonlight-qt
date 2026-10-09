@@ -4062,6 +4062,10 @@ free-running scenarios. `optical_tear_confirmation_available` remains false.
 
 ## 14. Metrics and a useful investigation method
 
+For the blue client-submission and magenta display-event graph interpretation,
+causal troubleshooting, controlled tests and capture analysis, see the
+[client timing troubleshooting guide](docs/client-timing-troubleshooting.md).
+
 The overlay's `Incoming smoothness (host)` uses the last 30 valid source frame
 intervals. Compute their population variance around their own mean, rather
 than an expected interval derived from the requested FPS. For standard deviation
