@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "presenttiming.h"
+#include "cadencedetection.h"
 
 namespace Vrr13 {
 // Client-added interval error, including zero-error intervals. Production
@@ -75,6 +76,7 @@ public:
         // Filled by the controller; post-submission timing never changes
         // this buffer's score or requests.
         PresentTiming::Stats present;
+        CadenceDetection::Stats submissionCadence, displayCadence;
         double lossFraction() const {
             return evaluatedUs ? std::clamp(
                 (severityWeighted ? weightedLossUs : double(failedUs)) / evaluatedUs,

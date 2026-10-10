@@ -8,6 +8,12 @@ it does not establish that a particular deployed executable matches the source.
 Current source review baseline: `a8759d13` plus the GPU completion-observation
 and native display-deadline corrections in this worktree, reviewed
 2026-10-08 local / 2026-10-09 UTC.
+The 2026-10-09 source-relative cadence detector adds separate submission and
+identity-matched OS display evidence without changing revision-12 control.
+The 2026-10-10 replay qualification additionally caps native scheduled
+smoothing and its reserve at 2 ms, retaining 6/3 ms on worker-paced presenters.
+Schema-5 rows now append `lost_packets` so packet-loss buffer eligibility is
+replayable; older rows without it retain their historical zero-loss input.
 Windows prefers composition on supported devices, with DXGI fallback. D3D11
 verifies rendering completion during preparation, before the cadence hold, and
 the final presentation checks a cached proof for the exact prepared marker.
@@ -2951,8 +2957,8 @@ It also sets `latchedFloorDisabled=1` and disables the extra queue-mode budget.
 | Capacity telemetry | `playout_capacity_telemetry=1` exposes unclamped demand and cap pressure in live decisions |
 | Smoothing gain | 150 when Reduce judder is checked; 0 when unchecked |
 | Smoothing period EMA | 25 per mille with fractional carry, plus 20,000 per million phase-error feedback; active only with smoothing enabled |
-| Positive smoothing lag cap | 6,000 us, shared with the readiness reserve; active only with smoothing enabled |
-| Smoothing readiness reserve | p98 of the last 128 smoother-caused shortfalls minus 500 us, at most 3,000 us, +250 us per frame, released at 500 us/s; zero when unchecked |
+| Positive smoothing lag cap | 2,000 us for native scheduled presentation; 6,000 us for worker-paced presentation, shared with the readiness reserve; active only with smoothing enabled |
+| Smoothing readiness reserve | p98 of the last 128 smoother-caused shortfalls minus 500 us, at most 2,000 us for native scheduled or 3,000 us for worker-paced presentation, +250 us per frame, released at 500 us/s; zero when unchecked |
 | Smoothing readiness bound | Enabled with Reduce judder; early retiming preserves known decode readiness and the raw target's typical render allowance; smoothing-only misses cannot grow or renew the interval buffer |
 | Render lead floor | 3,000 us |
 | Preparation start | Use the existing playout interval (`playout_prepare_on_arrival=1`), with no additional post-submission delay |
@@ -3032,9 +3038,13 @@ predicted      = previousSmoothedBasis + trackedPeriod
 error          = predicted - (raw + R)
 trackedPeriod -= 0.02 * error                 # phase feedback, next frame
 adjustment     = 0.85 * error
-adjustment     = clamp(adjustment, -(delayBeforeThisFrame + R), 6000 us - R)
+adjustment     = clamp(adjustment, -(delayBeforeThisFrame + R), lagCap - R)
 smoothedBasis  = raw + R + adjustment         # cadence_smoothing_us = R + adjustment
 ```
+
+`lagCap` is 2,000 us for native scheduled presentation and 6,000 us for
+worker-paced presentation. The readiness reserve is capped by that retiming
+allowance, so its native maximum is 2,000 us rather than 3,000 us.
 
 With the production readiness bound, `adjustment` above is the requested
 smoother adjustment. Its clock basis retains that request, while the applied
@@ -3047,7 +3057,8 @@ including frames the smoother cannot currently place, so a cadence reset does
 not step the schedule by `R`. It is learned only from frames the smoother
 placed: `min(readyOffset - playoutDelay, 0) - adjustment` is the lateness caused
 by moving that frame before its raw slot, and `R` tracks its p98 over the last
-128 placed frames minus 500 us, capped at 3 ms. See the 2026-09-22 Reduce judder
+128 placed frames minus 500 us, capped at 2 ms for native scheduled presentation
+and 3 ms for worker-paced presentation. See the 2026-09-22 Reduce judder
 section above for why and for its evidence.
 
 The actual integer implementation also reseeds from the authoritative fitted
@@ -4361,8 +4372,94 @@ Historical revisions retain their recorded averaging/control behavior for exact 
 
 With deep tracing off, the overview retains the VRR17 frame queue delay,
 rendering time, incoming host smoothness, VRR pacing/smoothness target, and
-interval-error rows. The historical Smoothness label still denotes the client
-interval-quality score, not measured physical display smoothness.
+interval-error rows. The production overview calls the interval-quality score
+`Client timing`; historical policy branches retain their older labels.
+
+Native scheduled retiming qualification (2026-10-10): selected the completed
+`C:/Users/Chase/Desktop/vrr-diagnostics/20261010-011901-001-1b37e5ed-11a9-4df3-8e1d-28f7721924ee/Moonlight.vrrtrace`
+(21,358,668 bytes; last write 2026-10-10 01:30:11.9569692 UTC; SHA-256
+`b05a58575aeabbee6e38edd51ca1694c4b822a4a86d3021fdc9cbc692888b0e9`).
+The untouched trace fails exact replay after loss on frame 1929 because the old
+writer omitted `PacedFrame::lostPackets()`. Its matching session log explicitly
+identifies all seven affected frame IDs and confirms seven loss-affected decoded
+frames. A separately named derived trace adds only their logged packet counts,
+the optional `lost_packets` column, and a recomputed content hash. Every original
+timing, policy and identity field is preserved. Provenance is retained in
+`build/cadence-loss-reconstruction.json`; this is a reconstruction using external
+evidence, not an unchanged original capture.
+
+On that derived input the unchanged policy reproduces all 63,945 reference
+targets, 63,944 submitted timestamps, 63,947 tear classifications, and required
+controller diagnostics exactly. The 15-policy sweep retains gain 150 and selects
+a 2 ms native scheduled lag/reserve cap: presented-interval jerk over 2 ms changes
+from 30.2% to 29.6%, source-spacing p99 from 1,949 to 1,931 us, and the replay's
+decode-to-submission p99 from 8,968 to 6,839 us. Average latency changes by only
+36 us. Shorter history, faster release and disabled smoothing worsen cadence in
+this capture. These are controller/submission simulations, including legitimate
+source variation; they do not predict a changed Windows display queue or prove
+optical smoothness. Wider worker-paced retiming remains active for the existing
+host-quantized cadence fixtures. New capture serialization preserves packet loss
+on every terminal row and the replay loader restores it before scheduling.
+This is a latency/cadence tradeoff: raw presented-interval jerk p99 increases
+slightly from 5,649 to 5,751 us, despite the lower over-2-ms share and source-error
+p99. It is not an improvement in every tail statistic.
+The final build passes all ten relevant deterministic suites and five exported
+exact fixtures, including cold/warm loss-bearing inputs and accepted/late/failed
+native submissions. Paired original/candidate nominal, periodic decision,
+preparation, submission and three-frame scheduler-burst runs remain unsaturated
+with zero modeled interval violations. Nominal p99 is bounded at 9 ms; the
+synthetic fault runs use a separate 25 ms p99 bound, not a normal-latency claim.
+The final scheduler run includes a 2.5 ms decision-stage burst because the
+recorded coarse-wake paths absorbed or suppressed the requested wake injection.
+
+Source-relative cadence detection (2026-10-09): `CadenceDetection` maintains
+independent two-second windows for CPU submissions and identity-matched native
+`DisplayEvent` observations. The reference is unwrapped RTP time carried with
+the frame through the existing presentation identity join, before mapping-offset
+slew, smoothing, buffering, and deadline recovery. A fixed latency cancels.
+Actual source intervals, including lower-rate output and rate transitions, remain
+the reference; this detector does not infer a defect from their duration.
+
+For native scheduled presentation, the worker supplies both the scheduling
+boundary and actual CPU enqueue to `noteSubmission()`. Only the actual enqueue
+feeds the CPU detector; accepted future deadlines continue to drive the existing
+controller policy. Replay supplies the corresponding recorded or simulated
+enqueue separately. The first diagnostic build accidentally used the scheduling
+boundary for this row; captures from it require raw `submission_boundary_us`
+analysis rather than treating the displayed CPU percentage as enqueue evidence.
+
+The existing configured tolerance is a diagnostic deadband, not a visibility
+threshold. Timestamp uncertainty is subtracted conservatively from interval-error
+magnitude; crossings whose uncertainty spans the deadband are reported separately
+as uncertain, never counted as definite deviations or clean evidence. The detector
+does not learn away scheduler delays as measurement noise. It reports definite
+deviations/observed intervals, positive stretches recurring within 250 ms, and
+sign reversals between adjacent definite deviations. A delayed frame and its
+catch-up create one stretch, not two recurring events. The 250 ms association
+window is an engineering grouping convention, not a perceptual threshold.
+
+Advanced statistics report the uncertainty-adjusted absolute error divided by
+observed source duration, worst interval error, and worst residual jerk with the
+number of observed interval pairs. These magnitudes are lower bounds; jerk uses
+`u[i] + 2*u[i-1] + u[i-2]` because the shared middle timestamp participates twice.
+Equal OS display timestamps for adjacent identities are counted as coalesced
+reports, not silently discarded or claimed as optical residency measurements.
+Source discontinuities, invalid samples and missing identities break adjacency;
+out-of-order identities do not replace the current frame. Clock restart or a
+tolerance change clears the window. Windows use 100 ms buckets and expire by
+observation time; no high-percentile estimate is inferred from two seconds.
+
+Source fidelity, deliberate smoothing, OS display behavior and perceived motion
+remain different quantities. The new display row includes the whole observed
+source-to-display residual, including intended retiming and panel-floor behavior;
+the existing `Present timing issues` row separately compares display outcomes to
+planned deadlines and submission error. Sparse display coverage is shown through
+the observed denominator or as unavailable, not filled from CPU submissions. DXGI
+refresh-reference observations are not promoted to native display instants.
+Neither detector changes targets, buffer requests, growth/release, presets, or
+trace schema. The derived source reference is recomputed during replay. Tests
+cover isolated/recurring errors, source cadence, uncertainty, identity gaps,
+coalesced reports, expiry, and native-feedback independence from control.
 
 Live statistics timing graph (2026-10-03, over `92119295` plus this worktree):
 the frametime graph is a separate overlay toggle from the stats text

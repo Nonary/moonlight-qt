@@ -1,5 +1,23 @@
 # VRR deterministic tests
 
+`tst_vrrtimingcontroller` also exercises the source-relative cadence detector:
+constant latency, genuine irregular/51 ms source intervals, isolated late/catch-up
+pairs versus recurring oscillation, 60/90/120/144/240 FPS, uncertainty bounds
+(including the shared middle timestamp in residual jerk), missing/out-of-order
+identities, coincident OS display reports, expiry, deadband changes and clock
+restart. A native feedback fixture verifies that actual early CPU enqueues are
+measured separately from accepted future deadlines and that neither CPU nor
+display evidence changes buffering or deadlines. Scheduled presentation that absorbs
+uneven CPU enqueues remains clean in the independent display detector.
+The new rows are diagnostics, not a perceptual score. Schema 5 additionally
+records `lost_packets`; replay restores that frame input so loss-affected
+delivery cannot falsely grow the interval buffer. Historical captures without
+the column retain zero-loss input and may require separately documented log
+reconstruction. The deep and warm-history fixtures carry loss through exact
+replay. Native scheduled retiming is capped at 2 ms while worker-paced sessions
+retain their wider quantized-source policy; runtime tests cover deadline floors
+and reserve bounds across source rates and presets.
+
 Windows VRR prefers the composition presentation API when independent-flip
 capability is available. `native_synchronized_presentation=1` records its
 constant synchronized mode; historical captures default that parameter to zero.

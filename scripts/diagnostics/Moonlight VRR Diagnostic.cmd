@@ -1,4 +1,5 @@
 @echo off
+rem Schema 5 appends lost_packets; use the bundled replay to preserve loss eligibility.
 rem Schema 5 replay capture with passive Windows GPU sidecars.
 rem Supported Windows VRR uses synchronized composition and native display events by default.
 rem Set MOONLIGHT_VRR_COMPOSITION=0 before launch for a DXGI comparison (no display-event lane).

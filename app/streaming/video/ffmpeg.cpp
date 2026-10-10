@@ -1569,7 +1569,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 }
                 else {
                     ret = snprintf(&output[offset], length - offset,
-                        "VRR pacing: %s | Smoothness: %s / %.2f%% target%s\n"
+                        "VRR pacing: %s | Client timing: %s / %.2f%% target%s\n"
                         "Scored time: %.1fs / %s history (gaps excluded)\n"
                         "Client interval error (1s): %s | Tolerance: %.2f ms | Dropped (30s): %llu\n"
                         "Present timing issues (30s): %s\n",
@@ -1581,6 +1581,45 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                         interval.toleranceUs / 1000.0,
                         static_cast<unsigned long long>(readiness.dropped),
                         presentTiming);
+                }
+                if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
+                offset += ret;
+                const auto cadenceText = [&fresh](const Vrr13::CadenceDetection::Stats& cadence,
+                                                  char* text, size_t size) {
+                    if (!cadence.intervals || !fresh(cadence.lastObservedUs)) {
+                        snprintf(text, size, "unavailable (no recent adjacent measurements)");
+                        return;
+                    }
+                    snprintf(text, size,
+                        "%llu/%llu deviations | recurring %llu | reversals %llu | uncertain %llu",
+                        static_cast<unsigned long long>(cadence.deviations),
+                        static_cast<unsigned long long>(cadence.intervals),
+                        static_cast<unsigned long long>(cadence.recurring),
+                        static_cast<unsigned long long>(cadence.reversals),
+                        static_cast<unsigned long long>(cadence.uncertain));
+                };
+                char submissions[192], displays[192];
+                cadenceText(interval.submissionCadence, submissions, sizeof(submissions));
+                cadenceText(interval.displayCadence, displays, sizeof(displays));
+                ret = snprintf(&output[offset], length - offset,
+                    "Source-relative submissions (2s): %s\n"
+                    "Source-relative OS display (2s): %s\n", submissions, displays);
+                if (advancedStats) {
+                    if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
+                    offset += ret;
+                    const auto detail = [&fresh](const Vrr13::CadenceDetection::Stats& c, char* text, size_t size) {
+                        if (!c.intervals || !fresh(c.lastObservedUs)) {
+                            snprintf(text, size, "unavailable"); return;
+                        }
+                        snprintf(text, size, "error floor %.2f%% of period | worst %.2f ms | jerk %.2f ms (%llu pairs) | coalesced %llu",
+                            c.normalizedErrorPercent(), c.worstErrorUs / 1000.0, c.worstJerkUs / 1000.0,
+                            static_cast<unsigned long long>(c.jerkPairs),
+                            static_cast<unsigned long long>(c.coalesced));
+                    };
+                    detail(interval.submissionCadence, submissions, sizeof(submissions));
+                    detail(interval.displayCadence, displays, sizeof(displays));
+                    ret = snprintf(&output[offset], length - offset,
+                        "Submission evidence: %s\nOS display evidence: %s\n", submissions, displays);
                 }
             }
             else if (readiness.meanMissPolicy) {

@@ -12781,6 +12781,12 @@ int main(int argc, char* argv[])
                          unsignedField(fields, columns.rtpValid) != 0,
                          decoderOutputUs);
         frame.noteGpuReadyUs(decodeCompleteUs);
+        const uint64_t lostPackets = optionalUnsignedField(fields, traceHeader.indexOf("lost_packets"));
+        if (lostPackets > UINT32_MAX) {
+            std::fprintf(stderr, "Packet loss input exceeds uint32 on frame %d\n", frameNumber);
+            return 2;
+        }
+        frame.setLostPackets(uint32_t(lostPackets));
         frame.noteDecodeSyncWaitUs(
             optionalUnsignedField(fields, columns.decodeSyncWaitUs));
         frame.setDeliveryTimeline(
@@ -14961,10 +14967,11 @@ int main(int argc, char* argv[])
             }
             else {
                 referenceController->noteSubmission(
-                    presented, cancelled, recordedSchedulingBoundaryUs);
+                    presented, cancelled, recordedSchedulingBoundaryUs, recordedSubmissionUs);
                 simulatedController->noteSubmission(
                     presented, cancelled, nativeScheduledLifecycle && presented && !cancelled ?
-                        std::max(simulatedSubmissionUs, simulatedDecision.targetUs) : simulatedSubmissionUs);
+                        std::max(simulatedSubmissionUs, simulatedDecision.targetUs) : simulatedSubmissionUs,
+                    simulatedSubmissionUs);
             }
         }
         else {
@@ -14975,10 +14982,11 @@ int main(int argc, char* argv[])
                     rowFlipProtectionReferenceUs);
             }
             referenceController->noteSubmission(presented, cancelled,
-                                                 recordedSchedulingBoundaryUs);
+                                                 recordedSchedulingBoundaryUs, recordedSubmissionUs);
             simulatedController->noteSubmission(presented, cancelled,
                 nativeScheduledLifecycle && presented && !cancelled ?
-                    std::max(simulatedSubmissionUs, simulatedDecision.targetUs) : simulatedSubmissionUs);
+                    std::max(simulatedSubmissionUs, simulatedDecision.targetUs) : simulatedSubmissionUs,
+                simulatedSubmissionUs);
             addReferenceControllerDiagnostics(
                 metrics, referenceController->diagnostics(), fields, columns);
             auditBufferUpdate();

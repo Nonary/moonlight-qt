@@ -287,6 +287,9 @@ struct VrrTimingDecision {
     uint64_t sourceTimeUs = 0;
     uint64_t sourceIntervalUs = 0;
     uint64_t sourcePeriodUs = 0;
+    // Derived diagnostics only; no policy input or trace schema field.
+    uint64_t diagnosticSourceTimestampUs = 0;
+    bool diagnosticSourceTimestampValid = false;
 
     int64_t readyOffsetUs = 0;
     // How far the display floor pushed the target past the frame's own slot.
@@ -375,10 +378,11 @@ public:
     // this feedback adjusts one bounded guard for future frames.
     void noteSpacingDeficit(uint64_t deficitUs);
 
-    // The worker records its own call boundary and supplies only the neutral
-    // lifecycle result. The timing controller has no renderer/native types.
+    // submissionUs is the scheduling boundary (possibly a future accepted
+    // deadline). Supply the actual CPU enqueue separately for diagnostics.
+    // Immediate presenters may omit it because both boundaries are identical.
     void noteSubmission(bool submitted, bool cancelled,
-                        uint64_t submissionUs);
+                        uint64_t submissionUs, uint64_t actualSubmissionUs = 0);
     void notePresentation(const Vrr13::PresentationObservation& observation);
     uint64_t nativeCadenceIntervals() const { return m_NativeCadenceIntervals; }
     uint64_t estimatedCadenceIntervals() const { return m_EstimatedCadenceIntervals; }
@@ -388,6 +392,8 @@ public:
     Vrr13::IntervalBuffer::Stats intervalStats() const {
         auto stats = m_IntervalBuffer.stats();
         stats.present = m_PresentTiming.stats();
+        stats.submissionCadence = m_SubmissionCadence.stats();
+        stats.displayCadence = m_DisplayCadence.stats();
         return stats;
     }
     uint64_t intervalToleranceUs() const { return m_IntervalBuffer.stats().toleranceUs; }
@@ -690,6 +696,7 @@ private:
     uint64_t m_EpochCandidateSinceUs = 0;
     Vrr13::PresentationPrediction m_PresentationPrediction;
     Vrr13::PresentTiming m_PresentTiming;
+    Vrr13::CadenceDetection m_SubmissionCadence, m_DisplayCadence;
     Vrr13::SmoothnessFeedback m_SubmissionSmoothness, m_NativeSmoothness;
     // Lifetime counters for decoder-owned reporting windows. These do not
     // expire with the controller's rolling adaptation histogram.

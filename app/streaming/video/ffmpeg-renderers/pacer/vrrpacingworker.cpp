@@ -92,6 +92,7 @@ constexpr char kTraceHeader[] =
     ",native_scheduled_presentation,native_target_us,scheduling_boundary_us"
     ",native_target_100ns,native_target_reference_100ns,native_target_clock_before_us,native_target_clock_after_us,native_target_uncertainty_us"
     ",native_outstanding_presents,native_retiring_present_id,native_skipped_frames,native_canceled_frames,native_displayed_duration_100ns,native_status_id,native_status,native_dropped_status_frames"
+    ",lost_packets"
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
 constexpr uint32_t kVrrWindowStateMask =
@@ -1262,7 +1263,7 @@ void VrrPacingWorker::recordSubmission(
     }
     m_TimingController->noteSubmission(
         feedback.presented, feedback.cancelled,
-        telemetry.schedulingBoundaryUs);
+        telemetry.schedulingBoundaryUs, telemetry.submissionBoundaryUs);
     Vrr13::PresentationObservation observation;
     observation.smoothness = m_TimingController->smoothnessSample(decision);
     observation.submitted = feedback.presented && !feedback.cancelled;
@@ -1430,6 +1431,7 @@ void VrrPacingWorker::recordFrameCompletion(const QueuedFrame& queuedFrame,
     TraceRow row;
     row.frameNumber = frame.frameNumber();
     row.rtpTimestamp = frame.rtpTimestamp();
+    row.lostPackets = frame.lostPackets();
     row.timestampValid = frame.timestampValid();
     row.decodeCompleteUs = frame.decodeCompleteUs();
     row.decoderOutputUs = frame.decoderOutputUs();
@@ -1954,6 +1956,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(row.feedback.nativeStatusId);
     addUnsigned(row.feedback.nativeStatus);
     addUnsigned(row.feedback.nativeDroppedStatusFrames);
+    addUnsigned(row.lostPackets);
     line.append('\n');
 
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {

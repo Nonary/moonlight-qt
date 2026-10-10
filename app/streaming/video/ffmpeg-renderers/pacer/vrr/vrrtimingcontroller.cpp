@@ -57,6 +57,10 @@ constexpr uint64_t kPlayoutSmoothingReserveMaxUs = 3000;
 constexpr uint64_t kPlayoutSmoothingReserveToleranceUs = 500;
 constexpr uint64_t kPlayoutSmoothingReservePercentilePerMille = 980;
 constexpr uint64_t kPlayoutSmoothingReserveReleaseUsPerSecond = 500;
+// Native future-target sessions in the 2026-10-10 capture trade away tail
+// latency for little cadence benefit above 2 ms. Retain the wider worker-paced
+// policy for host-quantized sources; explicit capture parameters remain exact.
+constexpr uint64_t kNativeScheduledSmoothingMaxLagUs = 2000;
 // A cadence reset (a few slow game frames, a burst, a stall) used to drop the
 // accumulated retiming in one frame: up to a 6 ms step on screen, the most
 // common client-made snap at 116/120 in capture 20260922-193211. Ease it back
@@ -287,10 +291,12 @@ VrrTimingParameters vrrTimingParametersForSession(
         kPlayoutSmoothingGainPerMille;
     parameters.playoutSmoothingPeriodAlphaPerMille =
         kPlayoutSmoothingPeriodAlphaPerMille;
-    parameters.playoutSmoothingMaxLagUs = kPlayoutSmoothingMaxLagUs;
+    parameters.playoutSmoothingMaxLagUs = nativeScheduledPresentation ?
+        kNativeScheduledSmoothingMaxLagUs : kPlayoutSmoothingMaxLagUs;
     parameters.playoutSmoothingPeriodFeedbackPerMillion =
         kPlayoutSmoothingPeriodFeedbackPerMillion;
-    parameters.playoutSmoothingReserveMaxUs = kPlayoutSmoothingReserveMaxUs;
+    parameters.playoutSmoothingReserveMaxUs = std::min(
+        kPlayoutSmoothingReserveMaxUs, parameters.playoutSmoothingMaxLagUs);
     parameters.playoutSmoothingReserveToleranceUs =
         kPlayoutSmoothingReserveToleranceUs;
     parameters.playoutSmoothingReservePercentilePerMille =
@@ -477,6 +483,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_IntervalBuffer.breakSequence();
     m_PresentationPrediction.reset();
     m_PresentTiming.breakSequence();
+    m_SubmissionCadence.breakSequence();
+    m_DisplayCadence.breakSequence();
     m_SubmissionSmoothness.breakSequence();
     m_NativeSmoothness.breakSequence();
     m_FeedbackModeValid = false;
@@ -486,6 +494,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_MeanMissBuffer.reset();
         m_IntervalBuffer.reset();
         m_PresentTiming.reset();
+        m_SubmissionCadence.reset();
+        m_DisplayCadence.reset();
         m_SubmissionSmoothness.reset();
         m_NativeSmoothness.reset();
         m_RequestedPlayoutDelayUs = 0;
@@ -1184,6 +1194,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.sourceRateChanged = !rebased && cadence.sourceRateChanged;
     decision.phaseDiscontinuity = !rebased && cadence.phaseDiscontinuity;
     decision.rebased = rebased;
+    decision.diagnosticSourceTimestampUs = rtpUs;
+    decision.diagnosticSourceTimestampValid = timestampPlayout && !rebased && !cadence.phaseDiscontinuity;
 
     m_Pending.valid = true;
     m_Pending.smoothness = smoothnessSample(decision);
@@ -2193,11 +2205,18 @@ void VrrTimingController::noteSpacingDeficit(uint64_t deficitUs)
 }
 
 void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
-                                         uint64_t submissionUs)
+                                         uint64_t submissionUs, uint64_t actualSubmissionUs)
 {
     if (!m_Pending.valid) {
         return;
     }
+
+    const auto& cadenceSample = m_Pending.smoothness;
+    const uint64_t enqueueUs = actualSubmissionUs ? actualSubmissionUs : submissionUs;
+    m_SubmissionCadence.observe({cadenceSample.frame, cadenceSample.sourceTimestampUs,
+        enqueueUs, enqueueUs, 0,
+        submitted && !cancelled && cadenceSample.sourceTimestampValid},
+        intervalQualityToleranceUs(m_Parameters));
 
     if (m_Parameters.playoutResponsiveBuffer >= 5) {
         const auto& p = m_Pending.prediction;
@@ -2388,6 +2407,8 @@ Vrr13::SmoothnessFeedback::Sample VrrTimingController::smoothnessSample(const Vr
 {
     Vrr13::SmoothnessFeedback::Sample sample;
     sample.frame = d.frameNumber;
+    sample.sourceTimestampUs = d.diagnosticSourceTimestampUs;
+    sample.sourceTimestampValid = d.diagnosticSourceTimestampValid;
     // Judge cadence against the intended source schedule. A newly learned
     // compositor lead changes our prediction, not the spacing we want to
     // display. Including its frame-to-frame changes manufactures buffer
@@ -2434,6 +2455,7 @@ void VrrTimingController::notePresentation(const Vrr13::PresentationObservation&
         if (m_FeedbackModeValid && m_FeedbackLatched != observation.latched) {
             m_NativeSmoothness.breakSequence();
             m_PresentTiming.breakSequence();
+            m_DisplayCadence.breakSequence();
         }
         m_FeedbackModeValid = true;
         m_FeedbackLatched = observation.latched;
@@ -2442,6 +2464,9 @@ void VrrTimingController::notePresentation(const Vrr13::PresentationObservation&
                                                                         uint64_t observed, uint64_t submittedUs,
                                                                         uint64_t plannedUs) {
         if (observation.timeKind == Vrr13::PresentationTimeKind::DisplayEvent) {
+            m_DisplayCadence.observe({sample.frame, sample.sourceTimestampUs, sample.at,
+                observed, sample.uncertainty, sample.sourceTimestampValid},
+                intervalQualityToleranceUs(m_Parameters));
             m_PresentTiming.observe({sample.frame, submittedUs, sample.at, plannedUs, sample.uncertainty, observed},
                                     {intervalQualityToleranceUs(m_Parameters), m_DisplayPeriodUs,
                                      m_SourcePeriodUs, m_Parameters.vrrFloorLatchGapUs});

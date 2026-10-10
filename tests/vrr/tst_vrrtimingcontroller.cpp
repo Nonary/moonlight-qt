@@ -2905,6 +2905,40 @@ VrrTimingParameters nativeDeadlineTestParameters(const VrrSessionConfig& session
     return policy;
 }
 
+void testNativeScheduledRetimingBounds()
+{
+    for (int rate : {60, 90, 120, 144, 240}) for (int mode : {0, 1, 2}) {
+        auto session = config(rate, std::max(120, rate));
+        session.latencyMode = mode;
+        const auto scheduled = vrrTimingParametersForSession(session, true, true);
+        const auto paced = vrrTimingParametersForSession(session, true, false);
+        expect(scheduled.playoutSmoothingMaxLagUs == 2000 &&
+                   scheduled.playoutSmoothingReserveMaxUs == 2000 &&
+                   scheduled.playoutSmoothingGainPerMille == paced.playoutSmoothingGainPerMille &&
+                   paced.playoutSmoothingMaxLagUs == 6000 && paced.playoutSmoothingReserveMaxUs == 3000,
+               "native retiming must retain the smoothing gain while preserving the worker-paced quantized-source policy");
+        VrrTimingController controller(session, true, scheduled);
+        uint32_t ticks = 0;
+        uint64_t previousTarget = 0;
+        for (int i = 0; i < 300; ++i) {
+            ticks += i % 71 == 70 ? 4590U : uint32_t(90000 / rate);
+            const uint64_t at = decodedTimeForRtp(1000000, ticks) + uint64_t(i % 5) * 100;
+            const auto d = controller.schedule(frame(i + 1, ticks, true, at), at);
+            expect(d.cadenceSmoothingUs <= 2000 && controller.smoothingReserveUs() <= 2000,
+                   "rate changes and irregular readiness must retain the native retiming and reserve bounds");
+            expect(!previousTarget || d.targetUs >= previousTarget + controller.displayPeriodUs(),
+                   "bounded native retiming must retain the accepted display deadline floor");
+            controller.notePreparationDuration(1000, 0, at + 1000);
+            controller.noteSubmission(true, false, std::max(d.targetUs, at + 1000), at + 1000);
+            previousTarget = d.targetUs;
+        }
+        session.smoothFrameTiming = false;
+        const auto disabled = vrrTimingParametersForSession(session, true, true);
+        expect(disabled.playoutSmoothingGainPerMille == 0 && disabled.playoutSmoothingReserveMaxUs == 0,
+               "the independent smoothing preference must still disable native retiming");
+    }
+}
+
 void testNativeScheduledDeadlinesSurviveCompressedCadence()
 {
     const auto session = config(120, 120);
@@ -4696,7 +4730,8 @@ void testPredictionOnlyBufferAdaptation()
                "slow source cadence must remain within queue capacity");
     }
 
-    // Display-only errors can be logged but cannot steer any timing decision.
+    // Display-only errors and irregular early enqueues can be logged without
+    // steering the scheduling boundary or any timing decision.
     VrrTimingController control(session, true, policy), feedback(session, true, policy);
     bool identical = true;
     uint64_t initial = 0, finalDelay = 0;
@@ -4711,7 +4746,9 @@ void testPredictionOnlyBufferAdaptation()
         finalDelay = a.playoutDelayUs;
         for (auto* c : {&control, &feedback}) {
             c->notePreparationDuration(1000);
-            c->noteSubmission(true, false, a.targetUs);
+            const uint64_t enqueue = c == &feedback ?
+                a.targetUs - 2000 + (i % 2 ? 1000 : 0) : a.targetUs;
+            c->noteSubmission(true, false, a.targetUs, enqueue);
         }
         Vrr13::PresentationObservation o;
         o.timeKind = Vrr13::PresentationTimeKind::DisplayEvent;
@@ -4735,6 +4772,14 @@ void testPredictionOnlyBufferAdaptation()
            "display-only hitches must be reported as present timing issues");
     expect(feedback.intervalStats().qualityPercent() == control.intervalStats().qualityPercent(),
            "present timing issues must not lower buffer Smoothness");
+    const auto cadenceEvidence = feedback.intervalStats();
+    expect(cadenceEvidence.submissionCadence.intervals > 50 &&
+           cadenceEvidence.submissionCadence.deviations >
+               control.intervalStats().submissionCadence.deviations + 50 &&
+           cadenceEvidence.displayCadence.intervals > 50 &&
+           cadenceEvidence.displayCadence.deviations > 5 &&
+           control.intervalStats().displayCadence.intervals == 0,
+           "CPU cadence must use actual early enqueues while native cadence follows the identity join");
 
     Vrr13::Reserve oldHistory(17);
     oldHistory.observe(46000000, 16000000);
@@ -7356,9 +7401,110 @@ void testPresentTiming()
            "reset must clear present timing history");
 }
 
+void testSourceRelativeCadenceDetection()
+{
+    using Detection = Vrr13::CadenceDetection;
+    Detection d;
+    uint64_t id = 0, source = 0;
+    const auto feed = [&](uint64_t period, int64_t displacement = 0, uint64_t uncertainty = 0) {
+        source += period;
+        const auto actual = uint64_t(int64_t(1000000 + source) + displacement);
+        d.observe({++id, source, actual, actual + 1000, uncertainty, true}, 500);
+    };
+    // Source variation and a fixed latency are not client-added variation.
+    for (auto period : {8333, 16667, 51000, 4167, 10000, 20000}) feed(period);
+    expect(d.stats().intervals == 5 && d.stats().deviations == 0 &&
+           d.stats().worstJerkUs == 0 && d.stats().normalizedErrorPercent() == 0,
+           "faithful irregular source cadence must remain clean, including a 51 ms source interval");
+    d.reset(); id = source = 0;
+    feed(10000); feed(10000, 1000); feed(10000);
+    expect(d.stats().deviations == 2 && d.stats().stretches == 1 && d.stats().recurring == 0 &&
+           d.stats().reversals == 1 && d.stats().worstJerkUs == 2000,
+           "one late frame and catch-up must be one isolated event, with its 2 ms residual jerk");
+    feed(10000, 1000); feed(10000); feed(10000, 1000); feed(10000);
+    expect(d.stats().recurring == 2 && d.stats().reversals == 5,
+           "repeated alternating residuals must expose recurrence and direction reversals");
+    // The same millisecond error has a different fraction of a source period.
+    Detection slow, fast;
+    for (auto* detector : {&slow, &fast}) {
+        const uint64_t period = detector == &slow ? 20000 : 5000;
+        detector->observe({1, 0, 1000000, 1000000, 0, true}, 500);
+        detector->observe({2, period, 1000000 + period + 1000,
+                          1000000 + period + 1000, 0, true}, 500);
+    }
+    expect(slow.stats().normalizedErrorPercent() == 5 && fast.stats().normalizedErrorPercent() == 20,
+           "severity must normalize against the matching source interval, not requested FPS");
+    d.reset(); id = source = 0;
+    feed(10000, 0, 300); feed(10000, 700, 300); feed(10000, 0, 300);
+    expect(d.stats().uncertain == 2 && d.stats().deviations == 0 && d.stats().worstErrorUs == 100 &&
+           d.stats().worstJerkUs == 200 && d.stats().recurring == 0,
+           "ambiguous crossings must remain unknown; jerk must include twice the shared timestamp uncertainty");
+    d.reset(); id = source = 0;
+    feed(10000); feed(10000, 500);
+    expect(d.stats().deviations == 0 && d.stats().uncertain == 0,
+           "the exact deadband boundary must not be a definite deviation");
+    feed(10000, 1001);
+    expect(d.stats().deviations == 1, "an error beyond the deadband must remain detectable");
+    // Native APIs can report two identities at the same display instant.
+    d.reset();
+    d.observe({1, 0, 1000000, 1001000, 0, true}, 500);
+    d.observe({2, 10000, 1000000, 1002000, 0, true}, 500);
+    expect(d.stats().intervals == 1 && d.stats().coalesced == 1 && d.stats().deviations == 1,
+           "coincident OS display reports must be exposed rather than silently excluded");
+    d.observe({4, 30000, 1040000, 1041000, 0, true}, 500);
+    expect(d.stats().intervals == 1, "missing identities must not manufacture an interval");
+    d.observe({3, 20000, 1030000, 1042000, 0, true}, 500);
+    d.observe({5, 40000, 1050000, 1051000, 0, true}, 500);
+    expect(d.stats().intervals == 2 && d.stats().jerkPairs == 0,
+           "out-of-order feedback must not replace the latest identity or bridge jerk across a gap");
+    d.breakSequence();
+    d.observe({6, 50000, 1090000, 1091000, 0, true}, 500);
+    expect(d.stats().intervals == 2, "a phase break must retain statistics without joining the old sequence");
+    d.observe({7, 60000, 1100000, 1101000, 0, true}, 750);
+    expect(d.stats().intervals == 0 && d.stats().toleranceUs == 750,
+           "changing the deadband must not mix incompatible counts");
+    d.observe({8, 70000, 1110000, 1111000, 0, true}, 750);
+    d.observe({9, 80000, 1120000, 4000000, 0, false}, 750);
+    expect(d.stats().intervals == 0, "old evidence must expire even when new outcomes are invalid");
+    d.observe({1, 0, 1000, 1000, 0, true}, 500);
+    d.observe({2, 10000, 11000, 11000, 0, true}, 500);
+    expect(d.stats().intervals == 1 && d.stats().deviations == 0,
+           "a local-clock restart must reset old evidence and identities");
+    d.reset(); id = source = 0;
+    feed(10000, 0, UINT64_MAX); feed(10000, 1000, UINT64_MAX); feed(10000, 0, UINT64_MAX);
+    expect(d.stats().uncertain == 2 && d.stats().worstJerkUs == 0,
+           "large uncertainty must saturate instead of wrapping into false precision");
+    for (uint64_t fps : {60, 90, 120, 144, 240}) {
+        Detection clean, oscillating;
+        for (uint64_t i = 0; i < fps * 2; ++i) {
+            const auto sourceAt = i * 1000000 / fps;
+            const auto cleanAt = 1000000 + sourceAt;
+            const auto disturbedAt = cleanAt + (i % 2 ? 1000 : 0);
+            clean.observe({i, sourceAt, cleanAt, cleanAt, 0, true}, 500);
+            oscillating.observe({i, sourceAt, disturbedAt, disturbedAt, 0, true}, 500);
+        }
+        expect(clean.stats().deviations == 0 && oscillating.stats().recurring > 10 &&
+               oscillating.stats().worstJerkUs == 2000,
+               "clean cadence and recurring oscillation must remain distinguishable across 60-240 FPS");
+    }
+    // Native scheduled presentation can absorb irregular CPU enqueues.
+    Detection enqueued, displayed;
+    for (uint64_t i = 0; i < 100; ++i) {
+        const auto sourceAt = i * 10000;
+        const auto enqueueAt = 1000000 + sourceAt + (i % 2 ? 1000 : 0);
+        const auto displayAt = 1020000 + sourceAt;
+        enqueued.observe({i, sourceAt, enqueueAt, enqueueAt, 0, true}, 500);
+        displayed.observe({i, sourceAt, displayAt, displayAt, 0, true}, 500);
+    }
+    expect(enqueued.stats().deviations > 90 && displayed.stats().deviations == 0,
+           "uneven CPU enqueues must not become display deviations when scheduled presentation absorbs them");
+}
+
 int main()
 {
     testPresentTiming();
+    testSourceRelativeCadenceDetection();
+    testNativeScheduledRetimingBounds();
     testLateFrameRecoveryWithoutQueueBacklog();
     testProductionGradualBacklogRecovery();
     {

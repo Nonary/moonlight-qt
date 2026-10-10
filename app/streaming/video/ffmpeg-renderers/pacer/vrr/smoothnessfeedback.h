@@ -12,6 +12,10 @@ public:
         uint64_t frame = 0, at = 0, intended = 0;
         uint64_t buffer = 0, headroom = 0, uncertainty = 0;
         bool eligible = false;
+        // Diagnostic source reference travels with the identity join. It is
+        // raw unwrapped RTP, never a retimed target or a moving clock offset.
+        uint64_t sourceTimestampUs = 0;
+        bool sourceTimestampValid = false;
     };
     // Return demand only for a newly confirmed interval miss. Consumers that
     // gate adaptation on events must not replay an old histogram tail.

@@ -3093,6 +3093,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
         VrrPacingWorker worker(&backend, cachedConfig, &telemetry);
         expect(worker.start(), "worker must start for deep diagnostics testing");
         auto input = frame(1, first);
+        input.setLostPackets(12);
         worker.submit(std::move(input));
         expect(backend.waitForPresentCount(1),
                "deep diagnostics must not suppress presentation");
@@ -3111,6 +3112,8 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     const QList<QByteArray> columns = header.split(',');
     const QList<QByteArray> fields = row.split(',');
     expect(columns.size() == fields.size(), "diagnostic columns must align with every value");
+    expect(columns.contains("lost_packets") && fields.value(columns.indexOf("lost_packets")) == "12",
+           "trace must preserve packet loss so replay can reproduce buffer eligibility");
     expect(columns.contains("decoder_output_us") &&
                fields.value(columns.indexOf("decoder_output_us")).toULongLong() > 0 &&
                fields.value(columns.indexOf("decoder_output_us")).toULongLong() ==
@@ -3354,7 +3357,9 @@ void exportWarmHistoryReplayFixture()
                 expect(backend.waitForPresentCount(120), "feedback fixture must drain before its controlled stall");
                 backend.blockPreparation();
             }
-            worker.submit(frame(i + 1, lifetime[i]));
+            auto paced = frame(i + 1, lifetime[i]);
+            if (i == 120) paced.setLostPackets(12);
+            worker.submit(std::move(paced));
             if (i == 120) {
                 expect(backend.waitForPrepareCount(121), "feedback fixture must enter preparation before its controlled stall");
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));

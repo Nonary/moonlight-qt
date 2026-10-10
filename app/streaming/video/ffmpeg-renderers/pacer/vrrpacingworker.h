@@ -147,6 +147,7 @@ private:
     struct TraceRow {
         int frameNumber = 0;
         uint32_t rtpTimestamp = 0;
+        uint32_t lostPackets = 0;
         bool timestampValid = false;
         uint64_t decodeCompleteUs = 0;
         uint64_t decoderOutputUs = 0;
