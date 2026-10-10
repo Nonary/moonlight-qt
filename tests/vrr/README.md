@@ -18,14 +18,30 @@ replay. Native scheduled retiming is capped at 2 ms while worker-paced sessions
 retain their wider quantized-source policy; runtime tests cover deadline floors
 and reserve bounds across source rates and presets.
 
-Windows VRR prefers the composition presentation API when independent-flip
-capability is available. `native_synchronized_presentation=1` records its
-constant synchronized mode; historical captures default that parameter to zero.
+Windows VRR prefers composition on supported devices, with worker-paced DXGI
+as fallback or the explicit `MOONLIGHT_VRR_COMPOSITION=0` comparison. DXGI’s magenta graph joins submitted
+image IDs and reported display-refresh counts to measured refresh-clock anchors,
+with separate `ConfirmedRefresh` provenance. `tst_overlay` and the worker's DXGI
+fixture cover delayed matching, invalid evidence, missing samples and epoch resets.
+This graph feed requires successful vblank-virtualization disabling and does not
+change controller adaptation or require PresentMon or elevation.
+DXGI protection separately samples live scanout immediately before otherwise
+adaptive native calls. Unknown predecessor IDs, failed/disjoint statistics,
+pending work, active/missing raster and stale observations synchronize rather
+than treating missing timing as safe. `tst_dxgipresent` verifies the native
+arguments for these cases, and the worker verifies first-frame protection.
+Set `MOONLIGHT_VRR_TEST_EXPORT_GUARD_TRACE` to a CSV path while running
+`tst_vrrpacingworker` to export the four-frame guard-only fixture. Run
+`check_dxgi_raster_trace_audit.py` with the replay executable and that CSV to
+verify exact replay, optional raster omission and rejection of corrupted guard
+qualification/timing evidence. The fixture keeps alignment and deep tracing off.
+Composition is requested unless `MOONLIGHT_VRR_COMPOSITION=0`; initialization
+still requires independent-flip capability and retains DXGI on setup failure. `native_synchronized_presentation=1`
+records its constant synchronized mode; historical captures default that parameter to zero.
 `tst_vrrtimingcontroller` verifies startup, rate changes and omission of the
 software display-period floor. The worker's composition fixture verifies delayed
 display-ID matching into the magenta graph and can be exported with
 `MOONLIGHT_VRR_TEST_EXPORT_COMPOSITION_TRACE` for an exact replay gate.
-`MOONLIGHT_VRR_COMPOSITION=0` retains the DXGI path for comparisons.
 The native `compositionprobe --run` remains a separate hardware test: capability
 and display coverage do not establish sub-refresh latency or optical VRR.
 
@@ -509,6 +525,10 @@ scan line, and VidPn source ID. It does not poll, sleep, align, or otherwise
 change presentation policy. A sample in active scanout proves where the raster
 was around the CPU Present call; it does not prove when the queued flip took
 effect or that the panel showed an optical tear.
+The production protection veto also records before-only raster evidence with
+alignment off. This is distinguished by the protection-query bracket and keeps
+its native Present timing for correlation. It does not add polling or turn a
+raster observation into a timestamp of a visible image.
 
 Schema 4 introduced two deliberately separate tear signals and an explicit
 `spacing_guard_feedback_us` value. The latter distinguishes a harmless wait at
@@ -1770,3 +1790,14 @@ trace. Export the contention fixture with
 `MOONLIGHT_VRR_TEST_EXPORT_CONTENTION_TRACE` for the exact replay gate. Genuine
 queue age, the sole-image rule, and post-wait scheduler stalls remain covered by
 the other worker tests; this fixture does not model GPU throughput.
+
+
+DXGI waitable experiment checks: `tst_dxgipresent` covers opt-in eligibility,
+first-frame admission, timeouts, native failures, cancellation/resize races,
+retained permits, and permanent shutdown interruption. `tst_vrrpacingworker`
+checks interruption before joining a blocked renderer and on minimize, with
+exact decoded-frame release. `tst_vrrpreferences` verifies default-off persistence
+without changing renderer selection. Run `tests/qml/tst_DxgiWaitableSetting.qml`
+with qmltestrunner for actual mouse/keyboard toggling and platform/VRR/V-sync
+eligibility. A subsequent opt-in live comparison is still needed to validate
+driver behavior, resizing, stop/reconnect, tearing and visible pacing.

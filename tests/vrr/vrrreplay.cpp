@@ -571,6 +571,11 @@ struct Columns {
     int externalRebaseFlags = -1;
     int midframeWindowStateFlags = -1;
     int deepTrace = -1;
+    int flipProtectionChecked = -1;
+    int flipProtectionQueryResult = -1;
+    int flipProtectionQueryStartUs = -1;
+    int flipProtectionQueryEndUs = -1;
+    int flipProtectionPending = -1;
     int nativePresentTimingValid = -1;
     int nativePresentStartUs = -1;
     int nativePresentEndUs = -1;
@@ -895,6 +900,11 @@ struct Columns {
         midframeWindowStateFlags =
             find("midframe_window_state_flags");
         deepTrace = find("deep_trace");
+        flipProtectionChecked = find("flip_protection_checked");
+        flipProtectionQueryResult = find("flip_protection_query_result");
+        flipProtectionQueryStartUs = find("flip_protection_query_start_us");
+        flipProtectionQueryEndUs = find("flip_protection_query_end_us");
+        flipProtectionPending = find("flip_protection_pending");
         nativePresentTimingValid = find("native_present_timing_valid");
         nativePresentStartUs = find("native_present_start_us");
         nativePresentEndUs = find("native_present_end_us");
@@ -6153,6 +6163,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.presentOperationDurationMismatchRows == 0 &&
         metrics.nativePresentOrderViolations == 0 &&
         metrics.nativePresentDurationMismatchRows == 0 &&
+        metrics.nativeRasterTimingOrderMismatchRows == 0 &&
         metrics.gpuReadyOrderViolations == 0 &&
         metrics.gpuReadyDurationMismatchRows == 0 &&
         (!metrics.gpuReadyStageTimingTelemetryAvailable ||
@@ -8915,6 +8926,16 @@ int main(int argc, char* argv[])
             fields, traceHeader.indexOf("flip_protection_latched")) != 0;
         const uint64_t rowFlipProtectionReferenceUs = optionalUnsignedField(
             fields, traceHeader.indexOf("flip_protection_reference_us"));
+        const bool rowFlipProtectionChecked = optionalUnsignedField(
+            fields, columns.flipProtectionChecked) != 0;
+        const int64_t rowFlipProtectionQueryResult = optionalSignedField(
+            fields, columns.flipProtectionQueryResult);
+        const uint64_t rowFlipProtectionQueryStartUs = optionalUnsignedField(
+            fields, columns.flipProtectionQueryStartUs);
+        const uint64_t rowFlipProtectionQueryEndUs = optionalUnsignedField(
+            fields, columns.flipProtectionQueryEndUs);
+        const bool rowFlipProtectionPending = optionalUnsignedField(
+            fields, columns.flipProtectionPending) != 0;
         const bool rowAllowTearing = columns.sessionAllowTearing < 0 ||
             unsignedField(fields, columns.sessionAllowTearing) != 0;
         const bool deepTraceRow = optionalUnsignedField(
@@ -10585,26 +10606,35 @@ int main(int argc, char* argv[])
                         nativeRasterAfterQueryResult)];
             }
 
-            const bool beforeQueryExpected =
+            const bool alignmentQueryExpected =
                 nativeDxgiPresentAttempt &&
                 deepTraceRow &&
                 nativeRasterSamplingRequested &&
                 nativeRasterSourceDeclared;
-            const bool afterQueryExpected = beforeQueryExpected;
+            // Production protection may take a single before-Present raster
+            // sample without enabling paired alignment diagnostics. It can
+            // also veto before querying the raster, so this sample is optional.
+            const bool protectionQueryAllowed =
+                nativeDxgiPresentAttempt && rowFlipProtectionChecked &&
+                rowFlipProtectionQueryResult == 0 && !rowFlipProtectionPending &&
+                nativeSameGpuOutput && nativeVblankVirtualizationDisabled &&
+                nativeDisplayPathDeclared && nativeDisplayTargetAvailable &&
+                nativeDisplaySignalDeclared && nativeRenderAdapterLuidDeclared &&
+                nativeDisplaySourceAdapterLuid == nativeRenderAdapterLuid &&
+                nativeRasterSourceDeclared &&
+                nativeRasterVidPnSourceId == nativeDisplaySourceId;
             const bool relationshipValid =
                 (!nativeRasterSamplingRequested ||
                  nativeDxgiPresentAttempt) &&
-                (nativeRasterOpenResultDeclared ==
-                    nativeRasterSamplingRequested) &&
+                (!nativeRasterOpenResultDeclared || nativeDxgiPresentAttempt) &&
+                (!nativeRasterSamplingRequested || nativeRasterOpenResultDeclared) &&
                 (nativeRasterSourceDeclared ==
                     (nativeRasterOpenResultDeclared &&
                      nativeRasterOpenResult == 0)) &&
-                (!nativeRasterSourceDeclared ||
-                 nativeRasterSamplingRequested) &&
-                (nativeRasterBeforeQueryResultDeclared ==
-                    beforeQueryExpected) &&
-                (nativeRasterAfterQueryResultDeclared ==
-                    afterQueryExpected) &&
+                (nativeRasterBeforeQueryResultDeclared ?
+                    (alignmentQueryExpected || protectionQueryAllowed) :
+                    !alignmentQueryExpected) &&
+                (nativeRasterAfterQueryResultDeclared == alignmentQueryExpected) &&
                 (!nativeRasterBeforeQueryResultDeclared ||
                  nativeRasterBeforeQueryResult == 0 ||
                  (!nativeRasterBeforeInVerticalBlank &&
@@ -10625,6 +10655,13 @@ int main(int argc, char* argv[])
                         nativeRasterBeforeQueryEndUs &&
                     nativeRasterBeforeQueryEndUs <=
                         nativePresentStartUs;
+                if (!alignmentQueryExpected) {
+                    timingOrderValid = timingOrderValid &&
+                        rowFlipProtectionQueryStartUs != 0 &&
+                        rowFlipProtectionQueryStartUs <= nativeRasterBeforeQueryStartUs &&
+                        nativeRasterBeforeQueryEndUs <= rowFlipProtectionQueryEndUs &&
+                        rowFlipProtectionQueryEndUs <= nativePresentStartUs;
+                }
                 if (nativeRasterBeforeQueryEndUs >=
                         nativeRasterBeforeQueryStartUs) {
                     metrics.nativeRasterBeforeQueryDurationUs.add(
@@ -13228,8 +13265,14 @@ int main(int argc, char* argv[])
             simulatedDecision.phaseDiscontinuity;
         timelineDetails.simulatedSourceRateHz = roundedRateForPeriod(
             simulatedDecision.sourcePeriodUs);
-        timelineDetails.simulatedLatched =
-            simulatedDecision.latchedPresentation && simulatedCanLatch;
+        // Native protection is recorded execution evidence, already reused by
+        // tear classification and the submission anchor below. Keep raster and
+        // mode metadata consistent with it without changing the planned latch.
+        // Counterfactual replay does not predict a different driver's guard.
+        const bool simulatedNativeLatched =
+            (simulatedDecision.latchedPresentation || rowFlipProtectionLatched) &&
+            simulatedCanLatch;
+        timelineDetails.simulatedLatched = simulatedNativeLatched;
         const uint64_t recordedTargetUs = unsignedField(
             fields, columns.recordedTargetUs);
         const uint64_t referenceTargetDrift = absoluteValue(
@@ -14482,8 +14525,7 @@ int main(int argc, char* argv[])
                     recordedRasterAnchorUs != 0) {
                 ++metrics.adaptivePrePresentAnchorValidRows;
             }
-            if (!(simulatedDecision.latchedPresentation &&
-                    simulatedCanLatch) &&
+            if (!simulatedNativeLatched &&
                     simulatedRasterAnchorUs != 0) {
                 ++metrics.simulatedAdaptivePrePresentAnchorValidRows;
             }
@@ -14492,8 +14534,7 @@ int main(int argc, char* argv[])
                 recordedRasterAnchorUs != 0 &&
                 recordedRasterAnchorUs != rowPrePresentSyncSampleUs ? 1 : 0;
             metrics.simulatedRasterAnchorFallbacks +=
-                !(simulatedDecision.latchedPresentation &&
-                    simulatedCanLatch) &&
+                !simulatedNativeLatched &&
                 simulatedRasterAnchorUs != 0 &&
                 simulatedRasterAnchorUs != rowPrePresentSyncSampleUs ? 1 : 0;
             observedRaster = evaluateVrrRasterPhase(
@@ -14503,8 +14544,7 @@ int main(int argc, char* argv[])
                 timelineDetails.recordedSourcePeriodUs,
                 rasterDisplayParameters);
             simulatedRaster = evaluateVrrRasterPhase(
-                true, simulatedDecision.latchedPresentation &&
-                    simulatedCanLatch,
+                true, simulatedNativeLatched,
                 simulatedSubmissionUs, simulatedRasterAnchorUs,
                 periodForRate(simulatedConfig.displayRefreshHz),
                 simulatedDecision.sourcePeriodUs,
@@ -14518,14 +14558,11 @@ int main(int argc, char* argv[])
             addRasterEnvelopeToBands(metrics.simulatedRateBands,
                 timelineDetails.simulatedSourceRateHz,
                 simulatedRaster.envelope);
-            const bool simulatedLatched =
-                simulatedDecision.latchedPresentation &&
-                simulatedCanLatch;
             if (scenario.mode != "fixed") {
                 counterfactualFreeRunningTracker.reset();
                 haveCounterfactualTransitionOrigin = false;
             }
-            else if (simulatedLatched) {
+            else if (simulatedNativeLatched) {
                 counterfactualFreeRunningTracker.reset();
                 haveCounterfactualTransitionOrigin = false;
                 ++metrics.counterfactualFreeRunningLatchedResets;
@@ -14866,8 +14903,7 @@ int main(int argc, char* argv[])
             metrics.simulatedProjectedSourceToSubmission.addElapsed(
                 simulatedSubmissionUs, simulatedDecision.sourceTimeUs);
 
-            if (simulatedDecision.latchedPresentation &&
-                    simulatedCanLatch) {
+            if (simulatedNativeLatched) {
                 ++metrics.simulatedLatchedFrames;
             }
             if (hadPriorSimulatedSubmission) {
@@ -14896,9 +14932,7 @@ int main(int argc, char* argv[])
                     submission.simulatedSubmissionUs = simulatedSubmissionUs;
                     submission.simulatedSourcePeriodUs =
                         simulatedDecision.sourcePeriodUs;
-                    submission.simulatedLatched =
-                        simulatedDecision.latchedPresentation &&
-                        simulatedCanLatch;
+                    submission.simulatedLatched = simulatedNativeLatched;
                     submission.simulatedPresentTransportUs =
                         simulatedPresentTransportUs;
                     submission.simulatedDisplayTransitionDelayUs =
@@ -15025,7 +15059,7 @@ int main(int argc, char* argv[])
             // Recorded presentation latency is an external service sample, not
             // proof of the candidate's actual scanout. Move it with its submission.
             observation.timelineShift = signedDifference(simulatedSubmissionUs, recordedSubmissionUs);
-            observation.latched = fixedPresentationMode ? false : simulatedDecision.latchedPresentation;
+            observation.latched = fixedPresentationMode ? false : simulatedNativeLatched;
             observation.deadline = observation.timelineShift >= 0 ?
                 simulatedDecision.originalScanoutUs - std::min(simulatedDecision.originalScanoutUs, uint64_t(observation.timelineShift)) :
                 simulatedDecision.originalScanoutUs + uint64_t(-observation.timelineShift);

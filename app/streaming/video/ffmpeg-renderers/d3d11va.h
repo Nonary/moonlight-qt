@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dxgipresent.h"
+#include "dxgiwaitable.h"
 #include "d3d11composition.h"
 #include "d3d11pyrowave.h"
 #include "d3d11presentpolicy.h"
@@ -38,6 +39,7 @@ public:
     bool alwaysSynchronizesAdaptivePresent() const override { return m_CompositionPresenter.active(); }
     bool supportsScheduledPresentation() const override { return m_CompositionPresenter.active(); }
     void clearScheduledPresentation() override;
+    void interruptFrameWait(bool stopping) override { m_DxgiAdmission.interrupt(stopping); }
     virtual VrrFallbackReason checkSupport() const override;
     virtual uint64_t captureDecodeBoundary() override;
     uint64_t waitForDecode(AVFrame* frame, uint64_t decodeBoundary) override;
@@ -73,6 +75,10 @@ private:
 
     bool setupRenderingResources();
     bool m_CompositionRequested = false;
+    Microsoft::WRL::Wrappers::HandleT<Microsoft::WRL::Wrappers::HandleTraits::HANDLENullTraits> m_DxgiFrameLatencyHandle;
+    DxgiWaitable::Admission m_DxgiAdmission;
+    bool m_DxgiWaitableActive = false;
+    uint64_t m_DxgiWaitWarningUs = 0;
     D3D11CompositionPresenter m_CompositionPresenter;
     uint64_t m_CompositionPresentId = 0;
     bool m_CompositionModeLogged = false;
@@ -218,6 +224,7 @@ private:
     bool m_VrrRasterOpenResultValid;
     int64_t m_VrrRasterOpenResult;
     bool m_VrrRasterSourceValid;
+    HMONITOR m_VrrRasterMonitor = nullptr;
     D3DKMT_HANDLE m_VrrRasterAdapter;
     D3DDDI_VIDEO_PRESENT_SOURCE_ID m_VrrRasterVidPnSourceId;
     bool m_VrrSuspended;

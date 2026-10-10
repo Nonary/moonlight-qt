@@ -5,8 +5,8 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Current source review baseline: `a8759d13` plus the GPU completion-observation
-and native display-deadline corrections in this worktree, reviewed
+Current source review baseline: `765d09d7` plus the composition-default restoration, graph-refresh and native tear-guard corrections
+in this worktree, reviewed
 2026-10-08 local / 2026-10-09 UTC.
 The 2026-10-09 source-relative cadence detector adds separate submission and
 identity-matched OS display evidence without changing revision-12 control.
@@ -14,11 +14,13 @@ The 2026-10-10 replay qualification additionally caps native scheduled
 smoothing and its reserve at 2 ms, retaining 6/3 ms on worker-paced presenters.
 Schema-5 rows now append `lost_packets` so packet-loss buffer eligibility is
 replayable; older rows without it retain their historical zero-loss input.
-Windows prefers composition on supported devices, with DXGI fallback. D3D11
+Windows prefers native composition when supported; `MOONLIGHT_VRR_COMPOSITION=0`
+selects worker-paced DXGI for diagnostics. Unsupported devices retain DXGI. D3D11
 verifies rendering completion during preparation, before the cadence hold, and
 the final presentation checks a cached proof for the exact prepared marker.
-DXGI flip protection queries predecessor statistics once; it neither spins
-for a raster blank nor derives a latch from refresh-reference age.
+DXGI flip protection queries predecessor statistics and a fresh physical raster
+immediately before an adaptive native call. Unknown, pending, active or stale
+observations synchronize; it neither spins for blank nor extrapolates refresh age.
 Production selects responsive revision 12: tolerance applies to each interval
 before averaging its severity-weighted loss, for both reporting and buffer
 control. Low Latency / Balanced / Smooth target 99% / 99.50% / 99.95%, and the
@@ -34,6 +36,27 @@ must be verified separately from this source description. Dated investigation
 sections below retain their historical policy and validation context; sections
 3, 8, 9, 10, 11, and 13 describe current selection and execution.
 
+The 2026-10-08 source-timing review reads Claude Code session
+`ca9fb224-9b65-47bb-a9e0-da3c9fe23973` and Astra's frame-timing investigation
+`01a11ed1-1dc4-7e63-b95c-969c5a7976c5`. Claude's final recommendation rejects
+fitting away real game cadence. Vibeshine's former WGC send path refined
+composition timestamps using foreground DXGI Present-start events, learned
+latency, composition-grid clamping and fallback stamps without a captured-image
+identity join. The host source correction removes that rewrite and tracker,
+preserving WGC's compositor-render timestamp already paired with the image under
+the IPC keyed mutex. Slow capture delivery does not change that source timestamp.
+Linux's custom DRM export likewise associates the framebuffer, sequence and
+presentation timestamp coherently. Actual source-output intervals are preserved;
+constant clock offset and capture/read latency are not the cadence objective.
+The host maps source QPC with a fixed per-session clock correlation so capture
+read scheduling cannot perturb source intervals. Eight focused host regressions pass; the full host application remains
+unbuilt and undeployed because its cached MinGW environment is incomplete.
+Astra independently reproduced a misleading readiness-offset hitch counter and
+observed GPU-wait and post-submission disturbances. These are separate issues,
+not proof that every hitch is host timestamp noise. Composition preference is
+restored without retuning the controller, erasing real source cadence, or
+claiming a deployed host or verified gameplay fix.
+
 The latest completed Windows capture selected for the history/graph correction is
 `20261009-003723-616-724c9575-362c-4eb7-aeeb-f39c84fd86b3/Moonlight.vrrtrace`
 (634,954 bytes; last write 2026-10-09 00:37:43.874 UTC; SHA-256
@@ -48,6 +71,98 @@ this exploratory capture; this is not strict A/B proof or live smoothness proof.
 Deterministic tests reproduce the history undercoverage and premature release,
 and all eight new/historical D3D11 readiness fixtures pass exact replay.
 Physical display cadence and live gameplay fluidity remain to be validated.
+
+The 2026-10-08 blue-line investigation selected the completed capture
+`C:/Users/Chase/Desktop/vrr-diagnostics/20261009-031900-785-8971e6ac-c16b-48c5-97ae-1e7828e76003/Moonlight.vrrtrace`
+(4,526,890 bytes; last write 2026-10-09 03:20:55.1728289 UTC; SHA-256
+`ace9bcc5629ea8f1fe0080b08c0053b8088f980831f73a53bc42542c0666f728`).
+Its sidecar confirms clean close and the previously deployed executable,
+120 FPS, Smooth mode, and 1,500,000 kbps. The later 032107 capture was open and
+zero bytes at selection. After excluding the first five seconds, 7,575 of
+12,745 matched native display events precede their target by more than 1 ms.
+Frame 12305 was prepared before native enqueue, but its reported display follows
+enqueue by 11.453 ms and its target by 9.343 ms; successor 12306 has essentially
+the same reported display time (within 1 us). These are OS presentation reports,
+not optical residency measurements. Distinct accepted future targets do not
+establish distinct visible intervals on this driver.
+Fresh exact replay with both the untouched deployed and rebuilt replay exits 3
+at frame 757 following a buffer diagnostic disagreement; their logs are byte
+identical. Sequence/fidelity JSON is not produced. This capture is exploratory
+and cannot provide strict A/B proof. The matching Moonlight log records packet
+loss on frame 756; lost-packet eligibility is not serialized into the current
+trace input, so replay cannot reconstruct that controller observation exactly.
+An experimental 2 ms enqueue gate was withdrawn: it bounds early exposure
+without correcting native late-event coalescence and is not active policy.
+The investigation initially restored the DXGI default. That backend verifies
+readiness, waits for the target and spacing floor, and selects protected versus
+tearing-permitted Present per frame. The subsequent source-timing review restores
+composition preference; these observations did not isolate it as the cause.
+Both paths preserve the recent GPU completion corrections.
+The blue line remains actual CPU submissions. The magenta DXGI lane restores
+the older identity join, separately labeled `Display refresh (DXGI)`: submitted
+image ID -> reported PresentRefreshCount -> an observed SyncRefreshCount/QPC
+anchor with the same refresh number. It never assigns the latest QPC sample
+directly to the latest image, extrapolates from nominal refresh periods, or fills
+missing intervals. Matched timestamps must follow image submission and readiness,
+be fresh within 100 ms, and have clock-conversion uncertainty at most 500 us.
+Each anchor retains its own uncertainty. Disjoint statistics, display epochs,
+backend changes and counter rollback invalidate matching history. Physical-refresh
+telemetry requires successful startup `DXGIDisableVBlankVirtualization()`.
+This is an image-associated refresh observation, not the precise instant of an
+interval-zero flip during active scanout. Its separate graph provenance never
+becomes `DisplayEvent` controller feedback or changes buffer adaptation. Existing
+composition/Metal/Vulkan display-event rendering retains its existing source.
+This no-UAC path uses the swapchain's existing queries, without PresentMon or
+new privileges. Coverage depends on driver-provided matches and must be checked
+in a new live DXGI session along with gameplay improvement; replay and backend
+selection do not prove physical cadence.
+The final incremental Windows application and diagnostic builds pass. All ten
+timing/controller, rate, worker, replay-config, rendering, D3D11 binding,
+composition-policy, clock, DXGI presentation and overlay suites pass, together
+with `vrrreplay --help`. The new fixtures cover delayed identity joins,
+contradictory/future/stale anchors, original-report causal bounds, missing samples,
+disjoint epochs, counter rollback and virtualization gating. These deterministic
+checks validate matching and pacing contracts, not live DXGI feedback coverage.
+
+The subsequent tearing-protection investigation selected
+`C:/Users/Chase/Desktop/vrr-diagnostics/20261009-035444-464-dd413aea-edb6-446a-82d2-778ff1cecdc3/Moonlight.vrrtrace`
+(8,234,038 bytes; last write 2026-10-09 03:58:13.645 UTC; SHA-256
+`7c00ef3c3743f3006b0adac6abc87cb6d83d7d19362a414f35b89961f8621bb8`).
+Its exact sidecar confirms clean close, the published DXGI executable, 120 FPS,
+Balanced mode and 113,000 kbps. Of 24,794 presents, 533 permitted tearing and
+none of those had a raster observation; 532 checked predecessor statistics
+successfully and one skipped startup protection. Successful predecessor accounting
+does not prove that its scanout ended. The pending-only guard retained during
+the backend rollback therefore left a concrete protection gap. The fresh untouched
+exact replay exits 3 because its audit wrongly requires alignment mode for an
+opened raster source and its simulated raster mode omits native protection overrides.
+Corrected replay passes the exact baseline: every target, submission, controller
+diagnostic and all 24,794 raster classifications match, with valid sequence,
+semantic and timestamp integrity. This preserves recorded execution evidence;
+replay does not predict a prospective guard's physical flip phase.
+The correction applies protection from the first adaptive request and makes a
+single final raster check after metadata/optional diagnostics. Unknown predecessor,
+failed/disjoint or unexpected statistics, active/missing raster, ambiguous/moved
+output, virtualized clocks and stale/reversed observation brackets synchronize.
+Fresh blank evidence is bounded to min(250 us, display period / 16), including
+age after the query; this is a conservative freshness budget, not remaining blank
+duration. There is no polling loop or failure count that disables safety.
+Protection samples are captured before Present even without alignment mode, with
+native Present brackets for correlation; they never become measured flip times.
+A later asynchronous flip can still outlive a sampled blank, so hardware gameplay
+validation remains necessary. The graph's existing sub-millisecond drawing
+deadband was unrelated to this protection defect and is unchanged.
+The final incremental application/diagnostic builds and all ten deterministic
+suites pass, together with replay help. The guard-only worker fixture passes
+exact replay with alignment and deep tracing disabled; optional raster omission
+and fourteen repaired-footer corruptions verify the evidence audit, including
+rejection of invalid protection brackets by the exact gate. The completed
+portable installation and ZIP are published to ChaseShare. Build, staging and
+live hashes agree; the live executable SHA-256 is
+`4891512ad3de7f0fc810d6ebc0e5b7de2ca49e5a359b7a71106d7d095df09d64`.
+The replay utility runs successfully from its canonical UNC directory. These
+checks establish publication and software contracts; a new live session is
+still needed to assess physical tearing and latency under the corrected guard.
 
 The 2026-10-08 fluidity investigation selected the newest completed capture
 `20261009-015916-375-a0f03198-c6d5-4499-b488-4e21792e1073/Moonlight.vrrtrace`
@@ -2179,13 +2294,14 @@ The capture lost one row and failed exact replay. Exploratory replay favored
 retaining the current per-frame controller over rate protection or adaptive-only
 spacing, but cannot model a change of native backend or prove a visual remedy.
 A fresh gameplay capture is required for that comparison. The 2026-10-04
-automatic policy superseded this diagnostic-only selection and remains active
-with the current 2026-10-08 rendering corrections below.
+automatic composition policy superseded this selection. A 2026-10-08 DXGI
+rollback was subsequently withdrawn after review of the host timing path.
 
-Current Windows presenter policy (2026-10-08): VRR sessions attempt composition
-on supported Windows 11/WDDM devices by default. `MOONLIGHT_VRR_COMPOSITION=0`
-explicitly selects DXGI, retaining per-frame synchronized or tearing-permitted
-native calls. Composition's native path
+Current Windows presenter policy (2026-10-08): VRR sessions prefer composition
+on supported Windows 11/WDDM devices. Only `MOONLIGHT_VRR_COMPOSITION=0`
+explicitly selects DXGI; unset and other values request composition. DXGI
+fallback retains the worker's pre-Present target/spacing waits and per-frame
+synchronized or tearing-permitted native calls. Composition's native path
 synchronizes every frame; the renderer exposes that capability to the worker,
 which records `native_synchronized_presentation=1` in the controller parameters.
 The controller then reports latched presentation at every source rate, including
@@ -3625,13 +3741,20 @@ swapchain, including transitions, parameter reporting, and native result
 propagation. Actual display behavior still requires Windows validation.
 
 For a controller-planned adaptive slot, native flip protection performs at most
-one `GetFrameStatistics()` query. It changes that slot to synchronized presentation
-only when a successful query proves that `PresentCount` is still below the
-previous accepted present count. Failure or disjoint statistics preserve the
-planned mode. Raster observations remain diagnostic: there is no scanline spin,
-refresh-age fallback, or latch caused solely by observing active scanout. This
-avoids both a software refresh wait after the deadline and systematically selecting
-the device's slow synchronized path based on a CPU-time raster snapshot.
+one `GetFrameStatistics()` query, immediately before the native call. An accepted
+predecessor ID must be known and `PresentCount` must equal it; missing identity,
+failed/disjoint statistics, pending work and unexpected counters synchronize.
+Only a fresh successful blank observation on the same uniquely identified physical
+output can admit the adaptive candidate. Active, unavailable, stale, reversed or
+uncertain raster evidence also synchronizes. Protection starts with the first
+adaptive request, independently of diagnostic/alignment flags. The final query
+follows metadata population and optional diagnostic probes, and its full age is
+limited to min(250 us, display period / 16). There is no scanline spin or
+refresh-age extrapolation, and repeated observation failures never disable safety.
+The native override is reported as `flip_protection_latched`; its reference stays
+zero because the raster-query time is not a measured predecessor flip timestamp.
+This closes the pending-only guard's unknown/active-scanout admission holes; a
+fresh blank cannot reserve the phase of a later asynchronous flip.
 `MOONLIGHT_VRR_SYNC_FLIPS=1` retains the explicit all-synchronized diagnostic mode.
 
 Historical builds computed and recorded interval one but hardcoded zero in
@@ -3669,9 +3792,13 @@ to zero to preserve old exact baselines. New schema-5 traces additionally record
 `latch_time_kind` (0 unavailable, 1 refresh reference, 2 display event).
 
 The fallback DXGI statistics provider supplies no verified display events.
-Production uses submission estimates for its client cadence report; independent-
-flip events from the preferred composition presenter populate the separate
-display graph and present-timing diagnostics.
+The graph separately joins its image IDs and measured refresh-count/QPC anchors
+to show `Display refresh (DXGI)`. That observation does not enter verified
+display-event cadence, latency learning, or adaptation.
+Production uses submission estimates for its client cadence report. Matched
+DXGI refresh observations populate the separately labeled graph lane;
+independent-flip events from composition populate display-event timing
+and present-timing diagnostics.
 Readiness prediction independently adapts padding in both directions. Composition-frame statistics also lack a verified frame
 display instant, so the same estimator covers periods without independent-flip
 events. This lower-confidence timing remains internal telemetry; it does not
@@ -3679,7 +3806,10 @@ claim native display coverage or learn display-service latency from it.
 Linux Wayland presentation feedback and Gamescope actual-present timestamps
 are explicitly marked as display events and remain eligible for measurement.
 
-`MOONLIGHT_VRR_ALIGN=1` enables observation-only raster probes around Present.
+`MOONLIGHT_VRR_ALIGN=1` adds observation-only raster probes around Present.
+The independent protection guard can record a before-only sample with alignment
+off. Such samples require matching protection-query and native Present brackets;
+replay accepts that provenance without relaxing the paired alignment contract.
 DisplayConfig signal geometry and QPC correlation support phase modeling.
 `D3DKMTGetScanLine()` reports raster position around a CPU observation; it does
 not establish when a queued flip became visible. Cloned/ambiguous display paths
@@ -3691,8 +3821,8 @@ for that claim.
 
 ### 10.4 Composition presentation and display timing
 
-Windows VRR sessions attempt the composition presenter by default.
-`MOONLIGHT_VRR_COMPOSITION=0` explicitly selects DXGI for diagnostic comparisons.
+Windows VRR sessions prefer the composition presenter on supported devices.
+`MOONLIGHT_VRR_COMPOSITION=0` selects DXGI explicitly for diagnostics.
 The value is captured during renderer initialization,
 so a stream reconnect is required. Startup logs identify the actual presenter,
 including setup fallback. Hardware support permits independent flip but does
@@ -4468,8 +4598,10 @@ streaming). `OverlayManager` keeps separate stats and graph flags; the debug
 overlay is enabled while either shows, so renderers need no new overlay type, and
 the graph can show without the text. It draws three aligned lanes, each with
 the raw interval of the newest 240 frames: Planned cadence (gray, target to
-target), Client submissions (cyan) and Display events (magenta, OS-reported
-`DisplayEvent` times). All lanes share one millisecond axis centred on the
+target), Client submissions (cyan), and magenta display timing. Native
+`DisplayEvent` sources retain `Display events`; matched DXGI refresh anchors
+use `Display refresh (DXGI)` with distinct provenance and accuracy. All lanes
+share one millisecond axis centred on the
 median planned interval with a +/-2 ms range, so a disturbance appears only in
 the lane where it enters the pipeline. Intervals within 1 ms of the reference
 (`TimingGraphLayout::FlatUs`) are drawn on the reference line, because that
@@ -4621,9 +4753,11 @@ and revision validation discards stale work during output changes. Status-messag
 font sizes remain independent.
 
 Display events are associated by backend, submission ID and presentation epoch;
-delayed feedback updates the earlier frame's observation. Only `DisplayEvent`
-timestamps are accepted. DXGI `RefreshReference` samples, Present return times
-and modeled scanout are excluded. Missing or nonmonotonic display samples leave
+delayed feedback updates the earlier frame's observation. Native `DisplayEvent`
+timestamps retain their existing semantics. DXGI references must pass a separate
+image-ID/refresh-identity join before becoming `ConfirmedRefresh` graph points;
+they do not enter strict display-event diagnostics or adaptation. Present return
+times and modeled scanout are excluded. Missing or nonmonotonic samples leave
 gaps, and a backend without feedback shows `Display events: unavailable`. These remain OS
 presentation observations, not physical-panel timing. Source rebases/phase
 discontinuities break the curves and ID matching, while ordinary client drops
@@ -4976,3 +5110,29 @@ The final native build and offscreen help pass. All nine VRR/backend suites pass
 and exact replay passes for the selected live trace plus contention, early-queue-
 discard, and Windows cancellation-fence worker fixtures. Windows source changes
 remain uncompiled here; fresh native integration tests are still required.
+
+
+### Opt-in DXGI waitable queue admission (Windows)
+
+`experimentalDxgiWaitable` defaults to false and is captured with the session's
+presentation settings. For qualified D3D11 VRR playback it overrides composition
+selection without changing renderer preferences. The swapchain retains its five
+buffers and uses FRAME_LATENCY_WAITABLE_OBJECT with per-swapchain maximum latency
+two. Unsupported creation/latency/handle setup retries ordinary DXGI once before
+swapchain resources exist. Probes, non-VRR playback, and other renderers do not
+activate the experiment; disabling it restores normal backend selection.
+
+The pacing worker waits before touching the back buffer, outside presentation and
+decode locks. Admission waits have a 50 ms budget with 1 ms native wait slices;
+timeout skips rendering and native wait failure requests a device reset. UI
+transitions and worker destruction interrupt admission before the worker join.
+Cancellation without Present retains a consumed queue permit. ResizeBuffers
+preserves the creation flags and the handle; renderer recreation owns handle
+replacement. Fixed-pacing startup fallback disables CPU admission and restores
+the normal three-frame limit, leaving Present to throttle the valid swapchain.
+
+The wait signal is only queue admission. It is never used as scanout, vertical
+blank, or presentation-time evidence. Existing conservative DXGI tearing policy
+and honest estimated/confirmed timing labels remain unchanged. This experiment
+requires a reconnect and live validation; deterministic tests do not establish
+physical smoothness or complete display-event coverage.

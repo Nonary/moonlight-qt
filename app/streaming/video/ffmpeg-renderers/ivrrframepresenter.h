@@ -233,6 +233,8 @@ struct VrrPresentFeedback {
     // is retained separately so cross-clock translation can be audited.
     bool frameStatsQueryResultValid = false;
     int64_t frameStatsQueryResult = 0;
+    // Reset observation-only refresh matching across native timing epochs.
+    bool frameStatsDisjoint = false;
     uint64_t frameStatsQueryStartUs = 0;
     uint64_t frameStatsQueryEndUs = 0;
     bool latchRawSyncQpcValid = false;
@@ -296,10 +298,10 @@ struct VrrPresentFeedback {
     uint64_t gpuReadyTimeUs = 0;
 
     // Native flip protection (VrrPresentRequest::flipProtectionWindowUs).
-    // Unlike the observation fields above, this pre-Present frame-statistics
-    // query does gate the native mode: a planned tearing present is sent
-    // latched when the predecessor has not reached the screen (pending) or
-    // its refresh began less than the window before the query (reference).
+    // Unlike the graph observations above, this final native guard gates the
+    // present mode. Pending, active or unknown scanout selects synchronization.
+    // A raster-query time is not a measured flip time; reference remains zero
+    // unless a backend actually has that display-time evidence.
     bool flipProtectionChecked = false;
     int64_t flipProtectionQueryResult = 0;
     uint64_t flipProtectionQueryStartUs = 0;
@@ -323,9 +325,10 @@ struct VrrPresentRequest {
     // this future display deadline before the worker completes its cadence
     // hold. It echoes acceptance separately from actual enqueue timing.
     uint64_t displayTargetUs = 0;
-    // Nonzero on an unlatched request asks a latch-capable backend to latch
-    // anyway if the predecessor is not yet displayed or its refresh started
-    // less than this long ago. Only presentAdaptive() consults it.
+    // Nonzero on an unlatched request requires native scanout protection,
+    // including startup or missing predecessor identity. Backends synchronize
+    // when evidence is missing, stale, pending or active. Only presentAdaptive()
+    // consults it; zero explicitly disables this additional protection.
     uint64_t flipProtectionWindowUs = 0;
 };
 
@@ -372,6 +375,10 @@ public:
 
     // Join preparation before renderer teardown. Must also cancel queued work.
     virtual void stopFramePreparation() {}
+
+    // Thread-safe interruption only: do not acquire rendering locks or release
+    // resources. Called before joining the worker, and on window transitions.
+    virtual void interruptFrameWait(bool /*stopping*/) {}
 
     // Some backends select native protection per present; persistent Vulkan
     // Mailbox already provides it. Vulkan Immediate/FIFO return false and keep

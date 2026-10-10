@@ -204,6 +204,8 @@ VrrPacingWorker::~VrrPacingWorker()
         m_FrameQueueNotEmpty.wakeAll();
     }
 
+    if (m_Presenter) m_Presenter->interruptFrameWait(true);
+
     if (m_WorkerThread != nullptr) {
         SDL_WaitThread(m_WorkerThread, nullptr);
         m_WorkerThread = nullptr;
@@ -368,6 +370,7 @@ void VrrPacingWorker::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
     }
 
     m_PendingWindowStateFlags.fetch_or(flags);
+    if (m_Presenter) m_Presenter->interruptFrameWait(false);
     m_FrameQueueNotEmpty.wakeAll();
 }
 
@@ -877,11 +880,12 @@ int VrrPacingWorker::run()
             targetWait.schedulerDelayUs,
             targetWait.schedulerDelayValid);
 
-        // Let the backend confirm from native statistics that a planned
-        // tearing present will not land inside its predecessor's scanout.
+        // Require native scanout protection even before the first accepted ID
+        // and after resets. Missing evidence must synchronize, not silently
+        // admit the adaptive path under a submission-time estimate.
         presentRequest.flipProtectionWindowUs =
             m_TimingController->parameters().nativeFlipProtection != 0 &&
-                m_CanLatchPresentation && hadPriorSubmission &&
+                m_CanLatchPresentation &&
                 !decision.latchedPresentation ?
             m_TimingController->displayPeriodUs() : 0;
         telemetry.presentStartUs = LiGetMicroseconds();
@@ -955,6 +959,29 @@ int VrrPacingWorker::run()
                 feedback.latchTimeKind == Vrr13::PresentationTimeKind::DisplayEvent;
             sample.graph.displayId = feedback.latchSubmissionId;
             sample.graph.displayUs = feedback.latchTimeUs;
+            // DXGI exposes an image's refresh identity separately from its
+            // sampled refresh clock. The graph joins those identities and
+            // labels the result as refresh timing; strict display-event
+            // diagnostics and controller adaptation retain their own policy.
+            sample.graph.preparationReadyUs = telemetry.preparationEndUs;
+            sample.graph.refreshDisjoint = feedback.frameStatsDisjoint;
+            sample.graph.refreshValid =
+                feedback.nativeBackend == VrrNativePresentationBackend::Dxgi &&
+                feedback.latchSampleValid &&
+                feedback.latchTimeKind == Vrr13::PresentationTimeKind::RefreshReference &&
+                feedback.latchRawSyncQpcValid && feedback.latchQpcCorrelationValid &&
+                feedback.latchRawSyncQpcFrequency != 0 &&
+                feedback.nativeVblankVirtualizationDisabled;
+            if (sample.graph.refreshValid) {
+                sample.graph.refreshReportedId = feedback.latchSubmissionId;
+                sample.graph.refreshPresentSequence = feedback.latchPresentRefreshSequence;
+                sample.graph.refreshSyncSequence = feedback.latchRefreshSequence;
+                sample.graph.refreshTimeUs = feedback.latchTimeUs;
+                sample.graph.refreshObservedUs = telemetry.presentEndUs;
+                sample.graph.refreshUncertaintyUs =
+                    feedback.latchQpcCorrelationSpanTicks * 1000000 /
+                        feedback.latchRawSyncQpcFrequency;
+            }
             sample.queueResidenceUs = positiveDifference(queuedFrame.trace.dequeueUs,
                                                          queuedFrame.trace.arrivalUs);
             sample.decodeWaitUs = telemetry.decodeSyncWaitUs;

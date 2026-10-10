@@ -699,11 +699,12 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     HRESULT hr;
 
     m_DecoderParams = *params;
-    // Prefer native display events and synchronized independent flip when the
-    // OS/driver support it. The worker resolves this presenter's constant
-    // synchronized mode after initialization; DXGI retains per-frame selection.
-    // An explicit zero remains available for diagnostic DXGI comparisons.
-    m_CompositionRequested = params->enableVrr &&
+    // Prefer native composition scheduling and display-event feedback when
+    // supported. An explicit zero selects worker-paced DXGI for comparisons;
+    // unsupported devices and composition setup failures retain that fallback.
+    const bool waitableRequested = DxgiWaitable::requested(
+        params->experimentalDxgiWaitable, params->enableVrr, params->enableVsync, params->testOnly);
+    m_CompositionRequested = params->enableVrr && !waitableRequested &&
         qgetenv("MOONLIGHT_VRR_COMPOSITION") != "0";
 
     if (qgetenv("D3D11VA_ENABLED") == "0") {
@@ -839,27 +840,45 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
 
     // Always use windowed or borderless windowed mode.. SDL does mode-setting for us in
     // full-screen exclusive mode (SDL_WINDOW_FULLSCREEN), so this actually works out okay.
-    ComPtr<IDXGISwapChain1> swapChain;
-    hr = m_Factory->CreateSwapChainForHwnd(m_RenderDevice.Get(),
-                                           info.info.win.window,
-                                           &swapChainDesc,
-                                           nullptr,
-                                           nullptr,
-                                           &swapChain);
-
-    if (FAILED(hr)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "IDXGIFactory::CreateSwapChainForHwnd() failed: %x",
-                     hr);
-        return false;
+    // Waitable creation is confined to a qualified VRR renderer. Off keeps the
+    // existing backend selection and swapchain descriptor unchanged.
+    m_DxgiWaitableActive = waitableRequested &&
+        m_VrrFallbackReason == VrrFallbackReason::NoFallback;
+    for (;;) {
+        if (m_DxgiWaitableActive)
+            swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        else
+            swapChainDesc.Flags &= ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        ComPtr<IDXGISwapChain1> swapChain;
+        hr = m_Factory->CreateSwapChainForHwnd(m_RenderDevice.Get(),
+            info.info.win.window, &swapChainDesc, nullptr, nullptr, &swapChain);
+        if (SUCCEEDED(hr)) hr = swapChain.As(&m_SwapChain);
+        if (SUCCEEDED(hr) && m_DxgiWaitableActive) {
+            hr = m_SwapChain->SetMaximumFrameLatency(DxgiWaitable::MaximumFrameLatency);
+            if (SUCCEEDED(hr)) {
+                m_DxgiFrameLatencyHandle.Attach(m_SwapChain->GetFrameLatencyWaitableObject());
+                if (!m_DxgiFrameLatencyHandle.IsValid()) hr = E_FAIL;
+            }
+        }
+        if (SUCCEEDED(hr)) break;
+        if (!m_DxgiWaitableActive) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "DXGI swapchain initialization failed: %x", hr);
+            return false;
+        }
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+            "Experimental DXGI waitable pacing unavailable (%x); using normal DXGI pacing", hr);
+        m_DxgiWaitableActive = false;
+        m_DxgiFrameLatencyHandle.Close();
+        m_SwapChain.Reset();
+        swapChain.Reset();
+        // No swapchain-dependent resources exist yet. Flush deferred D3D11
+        // destruction before creating another flip chain for the same HWND.
+        m_RenderDeviceContext->Flush();
     }
-
-    hr = swapChain.As(&m_SwapChain);
-    if (FAILED(hr)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "IDXGISwapChain::QueryInterface(IDXGISwapChain4) failed: %x",
-                     hr);
-        return false;
+    if (waitableRequested) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Experimental DXGI selected: waitable=%d, maximum frame latency=%u (queue admission, not display timing)",
+            m_DxgiWaitableActive, m_DxgiWaitableActive ? DxgiWaitable::MaximumFrameLatency : 0);
     }
 
     // Disable Alt+Enter, PrintScreen, and window message snooping. This makes
@@ -877,6 +896,13 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     // descriptor. Driver/runtime normalization and fullscreen state are part
     // of the capability evidence and must be settled before VRR starts.
     refreshVrrDisplayState();
+    if (m_DxgiWaitableActive && m_VrrFallbackReason != VrrFallbackReason::NoFallback) {
+        // The actual descriptor/output can reject VRR after creation. Preserve
+        // fixed-path queue behavior even though the creation flag is immutable.
+        if (FAILED(m_SwapChain->SetMaximumFrameLatency(3))) return false;
+        m_DxgiWaitableActive = false;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "DXGI waitable pacing disabled: output did not qualify for VRR");
+    }
 
     if (m_CompositionRequested &&
             m_VrrFallbackReason == VrrFallbackReason::NoFallback && m_VrrDisplayTiming.pathValid) {
@@ -1733,6 +1759,7 @@ bool D3D11VARenderer::createOverlayVertexBuffer(Overlay::OverlayType type, int w
 
 bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
 {
+    interruptFrameWait(false);
     if (stateInfo->stateChangeFlags & WINDOW_STATE_CHANGE_DISPLAY) {
         if (m_CompositionPresenter.active()) {
             // Recreate the manager for the new output. Its statistics identity
@@ -2814,7 +2841,9 @@ HRESULT D3D11VARenderer::presentPreparedFrame(
     if (m_CompositionPresenter.active()) {
         return m_CompositionPresenter.present(m_CompositionPresentId);
     }
-    return parameters.present(*m_SwapChain.Get());
+    const HRESULT result = parameters.present(*m_SwapChain.Get());
+    m_DxgiAdmission.presented();
+    return result;
 }
 
 UINT D3D11VARenderer::legacyPresentFlags() const
@@ -2860,11 +2889,38 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame,
         return result;
     }
 
+    const auto admissionEpoch = m_DxgiAdmission.epoch();
+    if (m_DxgiWaitableActive) {
+        const auto admitted = m_DxgiAdmission.acquire(admissionEpoch,
+            [] { return LiGetMicroseconds(); }, [this](unsigned timeoutMs) {
+                const auto result = WaitForSingleObjectEx(m_DxgiFrameLatencyHandle.Get(), timeoutMs, FALSE);
+                return result == WAIT_OBJECT_0 ? DxgiWaitable::Wake::Signalled :
+                    result == WAIT_TIMEOUT ? DxgiWaitable::Wake::Timeout : DxgiWaitable::Wake::Failed;
+            });
+        if (admitted != DxgiWaitable::Status::Admitted) {
+            if (admitted == DxgiWaitable::Status::Failed) queueRenderDeviceReset();
+            if (admitted == DxgiWaitable::Status::Timeout) {
+                const auto now = LiGetMicroseconds();
+                if (m_DxgiWaitWarningUs == 0 || now - m_DxgiWaitWarningUs >= 1000000) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "DXGI queue admission timed out; skipping frame without rendering");
+                    m_DxgiWaitWarningUs = now;
+                }
+            }
+            return result;
+        }
+    }
+
     // Serialize rendering preparation with swap-chain state (and with decode
     // on a shared device). With separate devices, renderVideo() takes FFmpeg's
     // lock only around its own decode-context fence calls.
     lockPresentation();
     m_VrrPresentationLocked = true;
+
+    if (m_DxgiWaitableActive && m_DxgiAdmission.interrupted(admissionEpoch)) {
+        releasePreparedVrrFrame();
+        return result;
+    }
 
     // Display-state changes share this lock with preparation through Present.
     // Check eligibility only after taking it so a UI callback cannot replace
@@ -3076,49 +3132,8 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         return feedback;
     }
 
-    // Native flip protection checks the predecessor once. A proven pending
-    // present selects synchronized submission; otherwise retain the controller's
-    // planned mode and spacing floor. The raster now is not the raster when an
-    // asynchronous flip reaches the panel. Latching whenever scanout is active
-    // pushes near-refresh streams onto a potentially much slower driver path.
-    // Raster samples remain diagnostic; never poll until blank or add a latch
-    // based on DXGI's unreliable adaptive-flip refresh-time reference.
-    //
-    // MOONLIGHT_VRR_SYNC_FLIPS=1 skips all of that and synchronizes every flip,
-    // as Linux's Mailbox/FIFO presentation does, reporting it as a protection
-    // latch so the controller anchors the flip queue. It is opt-in: on the
-    // 890M, all-synchronized sessions sometimes took a slow flip path (Present
-    // to screen p50 6-10 ms instead of ~1 ms), blocking Present calls and
-    // juddering far worse than the occasional tear it avoided.
-    const bool latchedPresentation = D3D11PresentPolicy::latch(
-        request.latchedPresentation, m_VrrSyncFlips,
-        [&]() -> D3D11PresentPolicy::PendingObservation {
-            if (request.flipProtectionWindowUs == 0 || !m_VrrPriorPresentCountValid) {
-                return {};
-            }
-            feedback.flipProtectionChecked = true;
-            feedback.flipProtectionQueryStartUs = LiGetMicroseconds();
-            DXGI_FRAME_STATISTICS stats = {};
-            const HRESULT queryResult = m_SwapChain->GetFrameStatistics(&stats);
-            feedback.flipProtectionQueryResult = static_cast<int64_t>(queryResult);
-            feedback.flipProtectionPending = queryResult == S_OK &&
-                stats.PresentCount < m_VrrPriorPresentCount;
-            feedback.flipProtectionQueryEndUs = LiGetMicroseconds();
-            // Failed/disjoint queries do not justify changing the planned mode.
-            return {queryResult == S_OK, feedback.flipProtectionPending};
-        });
-    feedback.flipProtectionLatched = !request.latchedPresentation && latchedPresentation;
-
-    // The risk decision is per frame. Sync interval 1 protects risky frames;
-    // other frames retain interval-zero replacement semantics. Active DXGI
-    // VRR always permits tearing for those adaptive submissions.
-    const auto presentParameters = DxgiPresentParameters::adaptive(
-        latchedPresentation, DXGI_PRESENT_ALLOW_TEARING);
     feedback.nativeBackendValid = true;
     feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
-    feedback.nativePresentParametersValid = true;
-    feedback.nativePresentSyncInterval = presentParameters.syncInterval;
-    feedback.nativePresentFlags = presentParameters.flags;
     feedback.nativeVrrStateValid = true;
     feedback.nativeTearingSupported = m_VrrTearingSupported;
     feedback.nativeBorderlessFlipModel = m_VrrBorderlessFlipModel;
@@ -3232,6 +3247,57 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
             m_VrrRasterSourceValid) {
         feedback.nativeRasterBeforePresent = sampleVrrRaster();
     }
+    // Decide after metadata and optional diagnostics, immediately before the
+    // native call. A completed present may still be actively scanning out;
+    // neither missing statistics nor a CPU spacing floor proves blank.
+    // Never spin for blank or disable this guard after observation failures.
+    const bool latchedPresentation = D3D11PresentPolicy::latch(
+        request.latchedPresentation, m_VrrSyncFlips, request.flipProtectionWindowUs,
+        [&]() -> D3D11PresentPolicy::FlipObservation {
+            D3D11PresentPolicy::FlipObservation observation;
+            feedback.flipProtectionChecked = true;
+            feedback.flipProtectionQueryStartUs = LiGetMicroseconds();
+            observation.predecessorKnown = m_VrrPriorPresentCountValid;
+            DXGI_FRAME_STATISTICS stats = {};
+            const HRESULT result = m_SwapChain->GetFrameStatistics(&stats);
+            feedback.frameStatsDisjoint = feedback.frameStatsDisjoint ||
+                result == DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+            feedback.flipProtectionQueryResult = static_cast<int64_t>(result);
+            observation.statisticsValid = observation.predecessorKnown && result == S_OK &&
+                stats.PresentCount <= m_VrrPriorPresentCount;
+            observation.pending = observation.predecessorKnown && result == S_OK &&
+                stats.PresentCount < m_VrrPriorPresentCount;
+            feedback.flipProtectionPending = observation.pending;
+            // A handle opened by GDI name is insufficient on cloned or
+            // ambiguous outputs. Qualify the current physical path before
+            // allowing its raster to authorize adaptive presentation.
+            if (observation.statisticsValid && !observation.pending &&
+                    feedback.nativeVblankVirtualizationDisabled &&
+                    m_VrrSameGpuOutput && m_VrrDisplayTiming.pathValid &&
+                    m_VrrDisplayTiming.targetAvailable && m_VrrDisplayTiming.signalValid &&
+                    m_VrrRenderAdapterLuidValid &&
+                    m_VrrDisplayTiming.sourceAdapterLuid == m_VrrRenderAdapterLuid &&
+                    m_VrrDisplayTiming.sourceId == m_VrrRasterVidPnSourceId &&
+                    m_VrrRasterMonitor != nullptr &&
+                    MonitorFromWindow(m_VrrWindowHandle, MONITOR_DEFAULTTONULL) == m_VrrRasterMonitor) {
+                const VrrNativeRasterSample raster = queryVrrRaster();
+                feedback.nativeRasterBeforePresent = raster;
+                observation.rasterValid = raster.queryResultValid && raster.queryResult == 0;
+                observation.inVerticalBlank = raster.inVerticalBlank;
+                observation.rasterQueryStartUs = raster.queryStartUs;
+                observation.rasterQueryEndUs = raster.queryEndUs;
+            }
+            feedback.flipProtectionQueryEndUs = LiGetMicroseconds();
+            return observation;
+        }, [] { return LiGetMicroseconds(); });
+    feedback.flipProtectionLatched = !request.latchedPresentation && latchedPresentation;
+    // Synchronize unknown or risky observations. A fresh blank is only an
+    // adaptive risk filter; it cannot reserve a later asynchronous flip.
+    const auto presentParameters = DxgiPresentParameters::adaptive(
+        latchedPresentation, DXGI_PRESENT_ALLOW_TEARING);
+    feedback.nativePresentParametersValid = true;
+    feedback.nativePresentSyncInterval = presentParameters.syncInterval;
+    feedback.nativePresentFlags = presentParameters.flags;
     const uint64_t submissionTimeUs = LiGetMicroseconds();
     HRESULT hr = presentPreparedFrame(presentParameters);
     const uint64_t nativePresentEndUs = LiGetMicroseconds();
@@ -3242,7 +3308,7 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
     }
     feedback.nativePresentResultValid = true;
     feedback.nativePresentResult = static_cast<int64_t>(hr);
-    if (request.collectDiagnostics) {
+    if (request.collectDiagnostics || feedback.nativeRasterBeforePresent.queryResultValid) {
         feedback.nativePresentTimingValid = true;
         feedback.nativePresentStartUs = submissionTimeUs;
         feedback.nativePresentEndUs = nativePresentEndUs;
@@ -3322,6 +3388,8 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
     feedback.frameStatsQueryResultValid = true;
     feedback.frameStatsQueryResult =
         static_cast<int64_t>(frameStatsResult);
+    feedback.frameStatsDisjoint = feedback.frameStatsDisjoint ||
+        frameStatsResult == DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
     const bool syncQpcTranslated =
         frameStatsResult == S_OK &&
         translateVrrSyncQpcTime(
@@ -3412,6 +3480,14 @@ bool D3D11VARenderer::restoreFixedPresentation(VrrFallbackReason reason)
         }
         m_LastColorTrc = AVCOL_TRC_UNSPECIFIED;
     }
+    // A failed worker startup falls back to the legacy Present-throttled path.
+    // The creation flag must survive ResizeBuffers; simply stop CPU admission
+    // waits and restore the ordinary queue limit on this still-valid chain.
+    if (m_DxgiWaitableActive) {
+        if (FAILED(m_SwapChain->SetMaximumFrameLatency(3))) return false;
+        m_DxgiWaitableActive = false;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "DXGI waitable pacing disabled for fixed presentation fallback");
+    }
     m_VrrSuspended = false;
     m_DecoderParams.enableVrr = false;
     m_VrrFallbackReason = reason == VrrFallbackReason::NoFallback ?
@@ -3460,9 +3536,9 @@ void D3D11VARenderer::refreshVrrDisplayTiming()
         return;
     }
 
-    // Open the raster source for observation-only alignment diagnostics.
-    // Production flip protection does not wait for or infer a future flip
-    // from the current raster phase.
+    // Open the raster for the final adaptive-flip veto and optional alignment
+    // diagnostics. Protection also requires the unique physical path below;
+    // an opened source alone must never qualify a cloned/ambiguous output.
     {
         D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME openAdapter = {};
         wcsncpy_s(openAdapter.DeviceName, monitorInfo.szDevice, _TRUNCATE);
@@ -3472,6 +3548,7 @@ void D3D11VARenderer::refreshVrrDisplayTiming()
         m_VrrRasterOpenResult = static_cast<int64_t>(openResult);
         if (openResult == 0) {
             m_VrrRasterSourceValid = true;
+            m_VrrRasterMonitor = monitor;
             m_VrrRasterAdapter = openAdapter.hAdapter;
             m_VrrRasterVidPnSourceId = openAdapter.VidPnSourceId;
         }
@@ -3630,6 +3707,7 @@ void D3D11VARenderer::closeVrrRasterSource()
     m_VrrRasterOpenResultValid = false;
     m_VrrRasterOpenResult = 0;
     m_VrrRasterSourceValid = false;
+    m_VrrRasterMonitor = nullptr;
     m_VrrRasterAdapter = 0;
     m_VrrRasterVidPnSourceId = 0;
 }
@@ -4064,5 +4142,6 @@ QString D3D11VARenderer::getCalibrationIdentity()
         .arg(desc.VendorId).arg(desc.DeviceId).arg(desc.SubSysId).arg(desc.Revision)
         .arg(driver.QuadPart).arg(m_DecodeDevice == m_RenderDevice)
         .arg(m_CompositionPresenter.active() ? "composition" : "dxgi")
-        .arg(1).arg(m_CompositionPresenter.active() ? 1 : 0);
+        .arg(1).arg(m_CompositionPresenter.active() ? 1 : 0) +
+        (m_DxgiWaitableActive ? QString("|waitable=2") : QString());
 }

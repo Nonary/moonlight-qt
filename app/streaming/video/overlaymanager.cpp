@@ -88,6 +88,15 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
     const TimingGraphLane lanes[Layout::Lanes] = {TimingGraphLane::Target, TimingGraphLane::Submit, TimingGraphLane::Display};
     const SDL_Color colors[Layout::Lanes] = {planColor, submitColor, displayColor};
     const char* names[Layout::Lanes] = {"Planned cadence", "Client submissions", "Display events"};
+    // DXGI's matched refresh is useful measured timing, but it does not
+    // timestamp an interval-zero flip in the middle of active scanout.
+    for (auto it = points.rbegin(); it != points.rend(); ++it) {
+        if (it->generation != points.back().generation) break;
+        if (!it->displayUs) continue;
+        if (it->displayKind == TimingGraphDisplayKind::ConfirmedRefresh)
+            names[2] = "Display refresh (DXGI)";
+        break;
+    }
     for (int lane = 0; lane < Layout::Lanes; ++lane) {
         const int top = S(Layout::plotTop(lane)), bottom = S(Layout::plotBottom(lane));
         const auto yAt = [&](double v) {

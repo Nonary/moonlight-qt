@@ -294,14 +294,199 @@ static void testLaneIntervals()
     assert(!timingGraphInterval(rebased, 3, Lane::Display, interval));
     rebased = points; rebased[3].backend++;
     assert(!timingGraphInterval(rebased, 3, Lane::Display, interval));
+    rebased = points; rebased[3].displayKind = TimingGraphDisplayKind::ConfirmedRefresh;
+    assert(!timingGraphInterval(rebased, 3, Lane::Display, interval));
     rebased = points; rebased[3].displayUs = rebased[2].displayUs;
     assert(!timingGraphInterval(rebased, 3, Lane::Display, interval));
     assert(!timingGraphInterval(points, points.size(), Lane::Target, interval));
 }
 
+static void testConfirmedDisplayRefresh()
+{
+    const auto submission = [](uint64_t id, uint64_t at, uint32_t backend = 1) {
+        TimingGraphInput in;
+        in.submitted = in.idValid = true;
+        in.submissionId = id; in.submissionUs = in.targetUs = at;
+        in.preparationReadyUs = at - 100;
+        in.backend = backend;
+        return in;
+    };
+    const auto reference = [](uint64_t id, uint64_t present, uint64_t sync,
+                              uint64_t time, uint64_t observed, uint64_t uncertainty = 0) {
+        TimingGraphInput in;
+        in.backend = 1; in.refreshValid = true;
+        in.refreshReportedId = id; in.refreshPresentSequence = present; in.refreshSyncSequence = sync;
+        in.refreshTimeUs = time; in.refreshObservedUs = observed; in.refreshUncertaintyUs = uncertainty;
+        return in;
+    };
+    const auto points = [](const TimingGraphHistory& history) {
+        TimingGraphSnapshot snapshot;
+        history.copyTo(snapshot);
+        return snapshot.points;
+    };
+    {
+        TimingGraphHistory history;
+        history.record(submission(10, 1000000));
+        history.record(submission(11, 1010000));
+        history.record(reference(10, 52, 51, 1001000, 1011000));
+        assert(points(history)[0].displayUs == 0); // A nearby refresh is not the same refresh.
+        history.record(reference(10, 52, 52, 1002000, 1012000));
+        auto p = points(history);
+        assert(p.size() == 2 && p[0].displayUs == 1002000 && p[1].displayUs == 0);
+        assert(p[0].displayKind == TimingGraphDisplayKind::ConfirmedRefresh);
+        history.record(reference(10, 52, 52, 1002000, 1012000)); // Exact duplicate is idempotent.
+        history.record(reference(10, 53, 53, 1004000, 1013000)); // Repeat scanout is not a new image.
+        p = points(history);
+        assert(p.size() == 2 && p[0].displayUs == 1002000 && p[0].presentRefreshSequence == 52);
+        history.record(reference(11, 54, 54, 1012000, 1013000));
+        p = points(history);
+        uint64_t interval = 0;
+        assert(timingGraphInterval(p, 1, TimingGraphLane::Display, interval) && interval == 10000);
+        history.record(submission(12, 1020000));
+        history.record(submission(13, 1030000));
+        history.record(reference(13, 56, 56, 1032000, 1033000));
+        p = points(history);
+        assert(!p[2].displayUs && p[3].displayUs == 1032000);
+        assert(!timingGraphInterval(p, 2, TimingGraphLane::Display, interval));
+        assert(!timingGraphInterval(p, 3, TimingGraphLane::Display, interval)); // Never bridge a missing image.
+        TimingGraphInput event;
+        event.backend = 1; event.displayValid = true; event.displayId = 11; event.displayUs = 1012500;
+        history.record(event);
+        p = points(history);
+        assert(p[1].displayUs == 1012500 && p[1].displayKind == TimingGraphDisplayKind::DisplayEvent);
+        assert(!timingGraphInterval(p, 1, TimingGraphLane::Display, interval)); // Separate evidence kinds.
+        event.displayUs = 1013000; history.record(event);
+        assert(points(history)[1].displayUs == 1012500); // Actual events retain their first timestamp.
+    }
+    {
+        TimingGraphHistory history;
+        history.record(submission(1, 1000000));
+        history.record(reference(1, 7, 6, 1001000, 1002000));
+        history.record(reference(2, 8, 7, 1010000, 1011000));
+        assert(!points(history)[0].displayUs); // Image was already reported displayed before this anchor.
+    }
+    {
+        TimingGraphHistory history;
+        history.record(submission(20, 2000000));
+        history.record(reference(19, 80, 81, 2002000, 2003000)); // Anchor before the image's refresh report.
+        assert(!points(history)[0].displayUs);
+        history.record(reference(20, 81, 82, 2004000, 2005000));
+        assert(points(history)[0].displayUs == 2002000); // Join to the earlier anchor, not this row's QPC.
+        history.record(reference(20, 81, 82, 2004000, 2006000));
+        assert(points(history)[0].displayUs == 2002000);
+    }
+    struct InvalidReference {
+        uint64_t time, observed, prepared, uncertainty;
+    };
+    const InvalidReference invalid[] = {
+        {999999, 1002000, 999900, 0},   // Before submission.
+        {1001000, 1002000, 1001500, 0}, // Before verified preparation completion.
+        {1002000, 1001999, 999900, 0},  // Future timestamp.
+        {1001000, 1101001, 999900, 0},  // Stale anchor.
+        {1100001, 1100001, 999900, 0},  // Implausibly late relative to this image's readiness.
+        {1001000, 1002000, 999900, 501}, // Clock conversion bracket too broad.
+    };
+    for (const auto& bad : invalid) {
+        TimingGraphHistory history;
+        auto in = submission(1, 1000000); in.preparationReadyUs = bad.prepared;
+        history.record(in);
+        history.record(reference(1, 7, 7, bad.time, bad.observed, bad.uncertainty));
+        assert(!points(history)[0].displayUs);
+    }
+    {
+        TimingGraphHistory history;
+        history.record(submission(1, 1000000));
+        auto raw = reference(1, 7, 7, 1001000, 1002000); raw.refreshValid = false;
+        history.record(raw);
+        assert(!points(history)[0].displayUs); // Query success/correlation validity is supplied explicitly.
+    }
+    {
+        TimingGraphHistory history;
+        history.record(submission(1, 1000000));
+        history.record(reference(1, 7, 7, 1001000, 1101000, 500));
+        assert(points(history)[0].displayUs == 1001000); // Inclusive freshness/uncertainty bounds.
+    }
+    {
+        TimingGraphHistory history;
+        history.record(submission(1, 1000000));
+        history.record(reference(1, 7, 6, 1001000, 1002000)); // Pending image-to-refresh mapping.
+        history.record(reference(2, 8, 7, 1102001, 1102001));
+        assert(!points(history)[0].displayUs); // Expired mapping cannot recover through a later anchor.
+    }
+    {
+        TimingGraphHistory history;
+        history.record(submission(1, 1000000));
+        history.record(reference(0, 6, 7, 1001000, 1002000, 501)); // Uncertain anchor is not retained.
+        history.record(reference(1, 7, 8, 1002000, 1003000));
+        assert(!points(history)[0].displayUs);
+    }
+    {
+        TimingGraphHistory history;
+        history.record(submission(1, 1000000));
+        history.record(reference(1, 7, 7, 1001000, 1002000));
+        history.record(reference(1, 7, 7, 1001500, 1003000)); // Contradictory timestamp for the same refresh.
+        assert(!points(history)[0].displayUs);
+        history.record(reference(1, 7, 7, 1001000, 1004000));
+        assert(!points(history)[0].displayUs); // A convenient later duplicate cannot repair the contradiction.
+    }
+    for (bool disjoint : {false, true}) {
+        TimingGraphHistory history;
+        history.record(submission(1, 1000000));
+        history.record(reference(1, 7, 6, 1001000, 1002000));
+        TimingGraphInput boundary;
+        boundary.backend = 1;
+        boundary.refreshDisjoint = disjoint;
+        boundary.discontinuity = !disjoint;
+        history.record(boundary);
+        history.record(reference(1, 7, 7, 1002000, 1003000));
+        assert(!points(history)[0].displayUs); // Old pending IDs belong to the retired epoch.
+        history.record(submission(2, 1010000));
+        history.record(reference(2, 7, 8, 1011000, 1012000));
+        assert(!points(history)[1].displayUs); // The old epoch's anchor was cleared as well.
+    }
+    {
+        TimingGraphHistory history;
+        history.record(submission(100, 1000000));
+        history.record(reference(100, 7, 6, 1001000, 1002000));
+        auto unavailable = submission(101, 1005000); unavailable.idValid = false;
+        history.record(unavailable);
+        history.record(submission(1, 1010000)); // Counter reset hidden behind an unavailable ID query.
+        const auto p = points(history);
+        assert(p[2].breakBefore && p[2].generation != p[0].generation);
+        history.record(reference(1, 7, 7, 1011000, 1012000));
+        assert(!points(history)[0].displayUs && points(history)[2].displayUs == 1011000);
+    }
+    {
+        TimingGraphHistory history;
+        history.record(submission(1, 1000000));
+        history.record(reference(1, 7, 6, 1001000, 1002000));
+        history.record(reference(1, 7, 5, 1001500, 1003000)); // Refresh-clock regression.
+        history.record(reference(1, 7, 7, 1002000, 1004000));
+        assert(!points(history)[0].displayUs);
+    }
+    {
+        TimingGraphHistory history;
+        history.record(submission(100, 1000000));
+        history.record(reference(100, 7, 6, 1001000, 1002000));
+        history.record(reference(99, 7, 7, 1002000, 1003000)); // Displayed present counter regression.
+        history.record(reference(100, 7, 8, 1003000, 1004000));
+        assert(!points(history)[0].displayUs);
+    }
+    {
+        TimingGraphHistory history;
+        history.record(submission(1, 1000000));
+        history.record(reference(1, 7, 6, 1001000, 1002000));
+        history.record(submission(2, 1010000, 2)); // Backend change clears pending references and anchors.
+        auto raw = reference(2, 7, 7, 1011000, 1012000); raw.backend = 2;
+        history.record(raw);
+        assert(!points(history)[0].displayUs && points(history)[1].displayUs == 1011000);
+    }
+}
+
 int main(int argc, char** argv)
 {
     testLaneIntervals();
+    testConfirmedDisplayRefresh();
     testBufferCoverage();
     testBufferHitchHistory();
     {

@@ -2,6 +2,7 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profilecodec.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h"
+#include "../../app/streaming/video/ffmpeg-renderers/d3d11presentpolicy.h"
 #include "vrrtestfakes.h"
 
 #include <SDL.h>
@@ -420,6 +421,8 @@ void testPresentationRequestSelectedBeforePreparation()
                        presented[0].latchedPresentation == prepared[0].latchedPresentation &&
                        presented[0].collectDiagnostics == prepared[0].collectDiagnostics,
                        "preparation and presentation must receive the same mode after a delay");
+                expect(presented.size() == 1 && presented[0].flipProtectionWindowUs != 0,
+                       "the first adaptive submission must require native protection even without a prior present identity");
                 expect(waitFor([&telemetry] { return telemetryStats(telemetry).vrrPrepareLateFrames != 0; }),
                        "swapchain preparation delays must remain accounted for in timing telemetry");
                 expect(telemetryStats(telemetry).vrrCadenceIntervals == 0 &&
@@ -511,6 +514,51 @@ void testQueueCapacityAndDrops(int latencyMode, size_t capacity)
     expect(telemetryStats(telemetry).vrrReadiness.samples == capacity + 2 &&
                telemetryStats(telemetry).vrrReadiness.dropped == 1,
            "completion accounting must count each presented or evicted frame once");
+}
+
+class AdmissionWaitPresenter : public FakeVrrFramePresenter {
+public:
+    std::atomic<bool> entered{false};
+    std::atomic<bool> interrupted{false};
+    std::atomic<bool> stopping{false};
+    std::atomic<bool> watchdogExpired{false};
+    VrrPrepareResult prepareFrame(AVFrame*, uint64_t) override
+    {
+        entered.store(true);
+        watchdogExpired.store(!waitFor([&] { return interrupted.load(); }));
+        return {};
+    }
+    void interruptFrameWait(bool stop) override
+    {
+        if (stop) stopping.store(true);
+        interrupted.store(true);
+    }
+};
+
+void testAdmissionWaitInterruption()
+{
+    for (bool windowChange : {false, true}) {
+        resetFakeClock();
+        AdmissionWaitPresenter backend;
+        PacerTelemetry telemetry;
+        TrackedFrameLifetime lifetime;
+        {
+            VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+            expect(worker.start(), "admission interruption worker must start");
+            worker.submit(frame(1, lifetime));
+            expect(waitFor([&] { return backend.entered.load(); }), "worker must enter admission wait");
+            if (windowChange) {
+                WINDOW_STATE_CHANGE_INFO info = {};
+                info.stateChangeFlags = WINDOW_STATE_CHANGE_MINIMIZED;
+                worker.notifyWindowChanged(&info);
+                expect(backend.interrupted.load() && !backend.stopping.load(),
+                       "window notification must interrupt admission without stopping the presenter");
+            }
+        }
+        expect(backend.stopping.load() && !backend.watchdogExpired.load(),
+               "shutdown must interrupt native admission before joining the worker");
+        expect(lifetime.releases == 1, "interrupted admission must release its decoded frame exactly once");
+    }
 }
 
 void testLatePreparedFramePresentsImmediately()
@@ -2678,6 +2726,156 @@ private:
     uint64_t m_Id = 0, m_PreviousSubmissionUs = 0;
 };
 
+// DXGI reports the preceding image's refresh identity and a separately sampled
+// refresh clock. Keep this evidence distinct from a native display event.
+class DelayedDxgiRefreshPresenter : public FakeVrrFramePresenter {
+public:
+    DelayedDxgiRefreshPresenter(bool virtualizationDisabled, uint64_t disjointId) :
+        m_VirtualizationDisabled(virtualizationDisabled), m_DisjointId(disjointId)
+    {}
+
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        auto feedback = FakeVrrFramePresenter::presentAdaptive(request);
+        feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
+        feedback.submissionIdValid = feedback.presented;
+        feedback.submissionId = ++m_Id;
+        feedback.nativeVblankVirtualizationDisabled = m_VirtualizationDisabled;
+        feedback.frameStatsDisjoint = m_Id == m_DisjointId;
+        if (m_PreviousSubmissionUs) {
+            feedback.latchSampleValid = !feedback.frameStatsDisjoint;
+            feedback.latchTimeKind = Vrr13::PresentationTimeKind::RefreshReference;
+            feedback.latchSubmissionId = m_Id - 1;
+            feedback.latchPresentRefreshSequence = m_Id - 1;
+            feedback.latchRefreshSequence = m_Id - 1;
+            feedback.latchTimeUs = m_PreviousSubmissionUs + 1000;
+            feedback.latchRawSyncQpcValid = true;
+            feedback.latchRawSyncQpcTicks = feedback.latchTimeUs;
+            feedback.latchRawSyncQpcFrequency = 1000000;
+            feedback.latchQpcCorrelationValid = true;
+            feedback.latchQpcCorrelationReferenceTicks = feedback.latchTimeUs;
+            feedback.latchQpcCorrelationReferenceTimeUs = feedback.latchTimeUs;
+            feedback.latchQpcCorrelationSpanTicks = 100;
+        }
+        m_PreviousSubmissionUs = feedback.submissionTimeUs;
+        return feedback;
+    }
+
+private:
+    const bool m_VirtualizationDisabled;
+    const uint64_t m_DisjointId;
+    uint64_t m_Id = 0, m_PreviousSubmissionUs = 0;
+};
+
+class GuardOnlyDxgiPresenter : public FakeVrrFramePresenter {
+public:
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        // Hold the simulated native operation's clock still so scheduler
+        // preemption cannot turn the fresh-blank fixture into a stale one.
+        FrozenTestClock clock;
+        VrrPresentFeedback feedback;
+        feedback.nativeBackendValid = true;
+        feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
+        feedback.nativeVrrStateValid = true;
+        feedback.nativeTearingSupported = true;
+        feedback.nativeBorderlessFlipModel = true;
+        feedback.nativeSameGpuOutput = true;
+        feedback.nativeRenderAdapterLuidValid = true;
+        feedback.nativeRenderAdapterLuid = 0x1234;
+        feedback.nativeSwapChainAllowsTearing = true;
+        feedback.nativeTearingFeatureQueryResultValid = true;
+        feedback.nativeTearingFeatureAllowsTearing = true;
+        feedback.nativeSwapChainDescQueryResultValid = true;
+        feedback.nativeSwapChainFlags = 0x840; // Tearing and frame-latency handle.
+        feedback.nativeSwapChainSwapEffect = 4; // FLIP_DISCARD.
+        feedback.nativeFullscreenStateQueryResultValid = true;
+        feedback.nativeWindowFlags = 0x1001; // SDL_WINDOW_FULLSCREEN_DESKTOP.
+        feedback.nativePresentReadyAvailable = true;
+        feedback.nativeForegroundWindow = true;
+        feedback.nativeDesktopMonitorCount = 1;
+        feedback.nativeVblankVirtualizationProbeComplete = true;
+        feedback.nativeVblankVirtualizationCallAvailable = true;
+        feedback.nativeVblankVirtualizationResultValid = true;
+        feedback.nativeVblankVirtualizationDisabled = true;
+        feedback.nativeDisplayConfigQueryResultValid = true;
+        feedback.nativeDisplayPathValid = true;
+        feedback.nativeDisplayPathFlags = 1;
+        feedback.nativeDisplayTargetAvailable = true;
+        feedback.nativeDisplaySourceAdapterLuid = 0x1234;
+        feedback.nativeDisplaySourceId = 1;
+        feedback.nativeDisplayTargetAdapterLuid = 0x1234;
+        feedback.nativeDisplayTargetId = 1;
+        feedback.nativeDisplayRotation = 1;
+        feedback.nativeDisplayScaling = 1;
+        feedback.nativeDisplayPathRefreshNumerator = 120;
+        feedback.nativeDisplayPathRefreshDenominator = 1;
+        feedback.nativeDisplaySignalValid = true;
+        feedback.nativeDisplaySignalPixelRateHz = 297000000;
+        feedback.nativeDisplaySignalHSyncNumerator = 135000;
+        feedback.nativeDisplaySignalHSyncDenominator = 1;
+        feedback.nativeDisplaySignalVSyncNumerator = 120;
+        feedback.nativeDisplaySignalVSyncDenominator = 1;
+        feedback.nativeDisplaySignalActiveWidth = 1920;
+        feedback.nativeDisplaySignalActiveHeight = 1080;
+        feedback.nativeDisplaySignalTotalWidth = 2200;
+        feedback.nativeDisplaySignalTotalHeight = 1125;
+        feedback.nativeDisplaySignalScanLineOrdering = 1;
+        feedback.nativeRasterOpenResultValid = true;
+        feedback.nativeRasterSourceValid = true;
+        feedback.nativeRasterVidPnSourceId = 1;
+        const bool latched = D3D11PresentPolicy::latch(
+            request.latchedPresentation, false, request.flipProtectionWindowUs,
+            [&] {
+                D3D11PresentPolicy::FlipObservation observation;
+                feedback.flipProtectionChecked = true;
+                feedback.flipProtectionQueryStartUs = LiGetMicroseconds();
+                observation.predecessorKnown = m_Id != 0;
+                observation.statisticsValid = observation.predecessorKnown;
+                if (observation.statisticsValid) {
+                    auto& raster = feedback.nativeRasterBeforePresent;
+                    raster.queryResultValid = true;
+                    raster.queryStartUs = LiGetMicroseconds();
+                    raster.queryResult = m_Id == 3 ? -1 : 0;
+                    raster.inVerticalBlank = m_Id == 1;
+                    raster.scanLine = m_Id == 2 ? 500 : 0;
+                    raster.queryEndUs = LiGetMicroseconds();
+                    observation.rasterValid = raster.queryResult == 0;
+                    observation.inVerticalBlank = raster.inVerticalBlank;
+                    observation.rasterQueryStartUs = raster.queryStartUs;
+                    observation.rasterQueryEndUs = raster.queryEndUs;
+                }
+                feedback.flipProtectionQueryEndUs = LiGetMicroseconds();
+                return observation;
+            }, [] { return LiGetMicroseconds(); });
+        feedback.flipProtectionLatched = !request.latchedPresentation && latched;
+        feedback.nativePresentParametersValid = true;
+        feedback.nativePresentSyncInterval = latched ? 1 : 0;
+        feedback.nativePresentFlags = latched ? 0 : 0x200;
+        const auto submitted = FakeVrrFramePresenter::presentAdaptive(request);
+        feedback.presented = submitted.presented;
+        feedback.cancelled = submitted.cancelled;
+        feedback.submissionTimeValid = submitted.submissionTimeValid;
+        feedback.submissionTimeUs = submitted.submissionTimeUs;
+        feedback.nativePresentResultValid = true;
+        feedback.nativePresentTimingValid = request.collectDiagnostics ||
+            feedback.nativeRasterBeforePresent.queryResultValid;
+        if (feedback.nativePresentTimingValid) {
+            feedback.nativePresentStartUs = submitted.submissionTimeUs;
+            feedback.nativePresentEndUs = LiGetMicroseconds();
+        }
+        feedback.submissionIdValid = feedback.presented;
+        feedback.submissionId = ++m_Id;
+        feedback.submissionIdQueryResultValid = true;
+        // No post-Present display observation is supplied by this fixture.
+        feedback.frameStatsQueryResultValid = true;
+        feedback.frameStatsQueryResult = -2147467259LL;
+        return feedback;
+    }
+private:
+    uint64_t m_Id = 0;
+};
+
 // Model both D3D11 fence placements using the same trace contract. Advancing
 // the test clock makes a long render deterministic without relying on an OS
 // sleep to cross the target. The prepared image owns its rendered output;
@@ -2889,6 +3087,140 @@ void testSynchronizedCompositionFeedback()
     }
     qputenv("MOONLIGHT_VRR_TRACE", "");
     qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+}
+
+void testDxgiConfirmedRefreshFeedback()
+{
+    for (int scenario = 0; scenario < 3; ++scenario) {
+        resetFakeClock();
+        const bool virtualizationDisabled = scenario != 0;
+        const bool disjoint = scenario == 2;
+        DelayedDxgiRefreshPresenter backend(virtualizationDisabled, disjoint ? 4 : 0);
+        auto config = enabledConfig();
+        config.streamRateHz = 116;
+        PacerTelemetry telemetry;
+        TrackedFrameLifetime lifetime[6];
+        {
+            VrrPacingWorker worker(&backend, config, &telemetry);
+            expect(worker.start(), "DXGI refresh feedback worker must start");
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < 6; ++i) {
+                const uint32_t ticks = uint32_t(uint64_t(i) * 90000 / 116);
+                std::this_thread::sleep_until(start +
+                    std::chrono::microseconds(uint64_t(ticks) * 100 / 9));
+                worker.submit(makeTrackedPacedFrame(i + 1, ticks,
+                    LiGetMicroseconds(), lifetime[i]));
+                expect(backend.waitForPresentCount(size_t(i + 1)),
+                       "DXGI refresh fixture must submit each frame");
+            }
+            expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == 6; }),
+                   "DXGI refresh telemetry must include the final result");
+        }
+        const auto graph = telemetry.timingGraphSnapshot().points;
+        expect(graph.size() == 6, "DXGI refresh graph must retain every submitted frame");
+        size_t confirmedFrames = 0, confirmedIntervals = 0;
+        for (size_t i = 0; i < graph.size(); ++i) {
+            const auto& point = graph[i];
+            if (point.displayUs) {
+                ++confirmedFrames;
+                expect(point.displayKind == Overlay::TimingGraphDisplayKind::ConfirmedRefresh &&
+                           point.displayUs == point.submissionUs + 1000,
+                       "delayed DXGI refresh feedback must match its own earlier submission without becoming a display event");
+            }
+            uint64_t interval = 0;
+            confirmedIntervals += Overlay::timingGraphInterval(
+                graph, i, Overlay::TimingGraphLane::Display, interval);
+        }
+        expect(confirmedFrames == (virtualizationDisabled ? (disjoint ? 4 : 5) : 0) &&
+                   confirmedIntervals == (virtualizationDisabled ? (disjoint ? 2 : 4) : 0),
+               "only unvirtualized DXGI refresh evidence may populate the graph, with no join across disjoint statistics");
+        const auto stats = telemetryStats(telemetry);
+        expect(stats.vrrCadenceIntervals == 0 && stats.vrrCadenceHitches == 0,
+               "confirmed DXGI refresh timing must not populate native display-event diagnostics");
+        for (const auto& frameLifetime : lifetime)
+            expect(frameLifetime.releases == 1,
+                   "DXGI refresh feedback must release each source frame exactly once");
+    }
+}
+
+void testDxgiGuardWithoutAlignmentTrace()
+{
+    resetFakeClock();
+    QTemporaryDir directory;
+    expect(directory.isValid(), "DXGI guard trace directory must exist");
+    const QString tracePath = directory.filePath("dxgi-guard.vrrtrace");
+    const QByteArray previousTrace = qgetenv("MOONLIGHT_VRR_TRACE");
+    const QByteArray previousDeep = qgetenv("MOONLIGHT_VRR_DEEP_TRACE");
+    const QByteArray previousAlignment = qgetenv("MOONLIGHT_VRR_ALIGN");
+    qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(tracePath));
+    qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+    qputenv("MOONLIGHT_VRR_ALIGN", "0");
+    GuardOnlyDxgiPresenter backend;
+    backend.setCanLatch(true);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime[4];
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "DXGI guard trace worker must start");
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 4; ++i) {
+            std::this_thread::sleep_until(start + std::chrono::microseconds(i * 16667));
+            worker.submit(frame(i + 1, lifetime[i]));
+            expect(backend.waitForPresentCount(size_t(i + 1)),
+                   "DXGI guard fixture must present every frame");
+        }
+        expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == 4; }),
+               "DXGI guard telemetry must contain the final result");
+    }
+    const auto expanded = readExpandedTrace(tracePath);
+    const auto lines = expanded.split('\n');
+    const auto columns = lines.value(0).split(',');
+    int rows = 0;
+    for (int i = 1; i < lines.size(); ++i) {
+        if (lines[i].isEmpty() || lines[i].startsWith("#vrr_trace_footer,")) continue;
+        const auto fields = lines[i].split(',');
+        const auto value = [&](const char* name) {
+            return fields.value(columns.indexOf(name)).toULongLong();
+        };
+        ++rows;
+        expect(fields.size() == columns.size() && value("trace_schema") == 5 &&
+                   value("native_raster_sampling_requested") == 0 &&
+                   value("native_raster_after_query_result_valid") == 0 &&
+                   value("latch_valid") == 0 && value("latch_time_kind") == 0,
+               "guard-only trace must retain schema 5 without alignment, after probes, or fabricated display events");
+        const bool adaptive = rows == 2;
+        expect(value("native_present_sync_interval") == (adaptive ? 0 : 1) &&
+                   value("native_present_flags") == (adaptive ? 0x200 : 0) &&
+                   value("flip_protection_latched") == (adaptive ? 0 : 1),
+               "unknown, active, and failed guard evidence must synchronize while a fresh blank remains adaptive");
+        if (rows > 1) {
+            expect(value("native_raster_before_query_result_valid") == 1 &&
+                       value("native_present_timing_valid") == 1 &&
+                       value("flip_protection_checked") == 1 &&
+                       value("flip_protection_pending") == 0 &&
+                       value("flip_protection_query_start_us") <= value("native_raster_before_query_start_us") &&
+                       value("native_raster_before_query_start_us") <= value("native_raster_before_query_end_us") &&
+                       value("native_raster_before_query_end_us") <= value("flip_protection_query_end_us") &&
+                       value("flip_protection_query_end_us") <= value("native_present_start_us"),
+                   "before-only guard evidence must retain native timing and its enclosing decision bracket");
+        }
+    }
+    expect(rows == 4, "DXGI guard trace must contain every controller decision");
+    expect(telemetryStats(telemetry).vrrCadenceIntervals == 0,
+           "guard raster timing must not populate native display-event cadence");
+    for (const auto& frameLifetime : lifetime)
+        expect(frameLifetime.releases == 1, "DXGI guard fixture must release each source once");
+    if (const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_GUARD_TRACE")) {
+        if (*exportPath) {
+            QFile exported(QString::fromLocal8Bit(exportPath));
+            expect(exported.open(QIODevice::WriteOnly) &&
+                       exported.write(expanded) == expanded.size(),
+                   "guard-only trace must export complete CSV replay input");
+        }
+    }
+    qputenv("MOONLIGHT_VRR_TRACE", previousTrace);
+    qputenv("MOONLIGHT_VRR_DEEP_TRACE", previousDeep);
+    qputenv("MOONLIGHT_VRR_ALIGN", previousAlignment);
 }
 
 void testMetalPresentationFeedback()
@@ -3556,6 +3888,7 @@ int main()
     testQueueCapacityAndDrops(1, VrrLargestQueuedFrames);
     testQueueCapacityAndDrops(2, VrrLargestQueuedFrames);
     testQueueCapacityAndDrops(0, VrrLargestQueuedFrames);
+    testAdmissionWaitInterruption();
     testLatePreparedFramePresentsImmediately();
     testQueuedStaleFrameYieldsToFreshSuccessor();
     testExpiredQueueSkipsBlockingDecode();
@@ -3587,6 +3920,8 @@ int main()
     testMetalPresentationFeedback();
     testD3D11ReadinessBeforeTarget();
     testSynchronizedCompositionFeedback();
+    testDxgiConfirmedRefreshFeedback();
+    testDxgiGuardWithoutAlignmentTrace();
     testMetalFailedPreparationFeedback();
     testReconnectPreservesCompletedTraces();
     testDeepTraceRequestsNativeObservationsWithoutChangingMode();

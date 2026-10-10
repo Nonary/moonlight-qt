@@ -26,22 +26,39 @@ private:
     bool m_Ready = false;
 };
 
-struct PendingObservation
+struct FlipObservation
 {
-    bool valid;
-    bool pending;
+    bool predecessorKnown = false;
+    bool statisticsValid = false;
+    bool pending = false;
+    bool rasterValid = false;
+    bool inVerticalBlank = false;
+    uint64_t rasterQueryStartUs = 0;
+    uint64_t rasterQueryEndUs = 0;
 };
 
-// Preserve the controller's planned mode unless DXGI proves a predecessor is
-// still pending. The current raster phase cannot predict the phase of a later
-// asynchronous flip; making every active-raster observation latch would push
-// otherwise safe near-refresh streams onto the driver's slower sync path.
-template<class PendingQuery>
-bool latch(bool plannedLatched, bool synchronizeAll, PendingQuery&& pendingQuery)
+// A retired predecessor can still be scanning out. Unknown or active scanout
+// must not authorize a tearing flip. A fresh blank is a risk filter, not a
+// reservation of the phase when a later asynchronous flip reaches the panel.
+template<class ObservationQuery, class Clock>
+bool latch(bool plannedLatched, bool synchronizeAll, uint64_t protectionWindowUs,
+           ObservationQuery&& observationQuery, Clock&& clock)
 {
     if (plannedLatched || synchronizeAll) return true;
-    const PendingObservation observation = pendingQuery();
-    return observation.valid && observation.pending;
+    if (!protectionWindowUs) return false; // Explicitly disabled protection.
+    const FlipObservation observation = observationQuery();
+    if (!observation.predecessorKnown || !observation.statisticsValid ||
+            observation.pending || !observation.rasterValid ||
+            !observation.inVerticalBlank) return true;
+    const uint64_t nowUs = clock();
+    // Bound the entire observation age, including any preemption after the
+    // query. This conservative budget does not claim a remaining blank time.
+    const uint64_t precisionUs = protectionWindowUs / 16 < 250 ?
+        protectionWindowUs / 16 : 250;
+    return !precisionUs || !observation.rasterQueryStartUs ||
+        observation.rasterQueryEndUs < observation.rasterQueryStartUs ||
+        nowUs < observation.rasterQueryEndUs ||
+        nowUs - observation.rasterQueryStartUs > precisionUs;
 }
 
 }

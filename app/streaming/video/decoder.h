@@ -98,6 +98,7 @@ typedef struct _DECODER_PARAMETERS {
     bool enableFramePacing;
     // VRR is an opt-in, session-snapshotted third pacing mode.
     bool enableVrr;
+    bool experimentalDxgiWaitable = false;
     // Select the VRR-capable renderer without activating VRR presentation.
     // Used by the startup probe so negotiated color policy matches playback.
     bool preferVrrRenderer = false;

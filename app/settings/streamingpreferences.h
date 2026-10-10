@@ -162,6 +162,7 @@ public:
     Q_PROPERTY(bool autoAdjustBitrate MEMBER autoAdjustBitrate NOTIFY autoAdjustBitrateChanged)
     Q_PROPERTY(bool enableVsync MEMBER enableVsync NOTIFY enableVsyncChanged)
     Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
+    Q_PROPERTY(bool experimentalDxgiWaitable MEMBER experimentalDxgiWaitable NOTIFY experimentalDxgiWaitableChanged)
     Q_PROPERTY(int vrrLatencyMode MEMBER vrrLatencyMode NOTIFY vrrLatencyModeChanged)
     Q_PROPERTY(int vrrBufferPerMille READ vrrBufferPerMille WRITE setVrrBufferPerMille NOTIFY vrrTimingChanged)
     Q_PROPERTY(int vrrTargetHundredths READ vrrTargetHundredths WRITE setVrrTargetHundredths NOTIFY vrrTimingChanged)
@@ -223,6 +224,7 @@ public:
     bool autoAdjustBitrate;
     bool enableVsync;
     bool enableVrr;
+    bool experimentalDxgiWaitable;
     int vrrLatencyMode;
     // Re-present the last frame inside a host gap longer than the panel's
     // adaptive-refresh floor, so the panel never engages its own
@@ -275,6 +277,7 @@ signals:
     void autoAdjustBitrateChanged();
     void enableVsyncChanged();
     void enableVrrChanged();
+    void experimentalDxgiWaitableChanged();
     void vrrLatencyModeChanged();
     void vrrTimingChanged();
     void smoothVrrFrameTimingChanged();

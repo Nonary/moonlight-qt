@@ -289,7 +289,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             bool enableVrr, bool preferVrrRenderer, int vrrDisplayRefreshHz,
                             [[maybe_unused]] bool* effectiveVrr, bool smoothVrrFrameTiming,
                             bool gamescopeMailbox, int vrrLatencyMode, bool gamescopeRepaint,
-                            VrrTimingOptions vrrTimingOptions)
+                            VrrTimingOptions vrrTimingOptions, bool experimentalDxgiWaitable)
 {
     DECODER_PARAMETERS params = {};
 
@@ -307,6 +307,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.enableVsync = enableVsync;
     params.enableFramePacing = enableFramePacing;
     params.enableVrr = enableVrr;
+    params.experimentalDxgiWaitable = experimentalDxgiWaitable;
     // Playback already sets enableVrr; the probe uses preferVrrRenderer alone so
     // it can match that renderer/color policy without starting VRR presentation.
     params.preferVrrRenderer = preferVrrRenderer || enableVrr;
@@ -679,6 +680,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
     m_PresentationSettings.enableFramePacing = m_PresentationSettings.effectiveVsync &&
                                                m_Preferences->framePacing;
     m_PresentationSettings.enableVrr = false;
+    m_PresentationSettings.experimentalDxgiWaitable = m_Preferences->experimentalDxgiWaitable;
     m_PresentationSettings.vrrLatencyMode = m_Preferences->vrrLatencyMode;
     m_PresentationSettings.vrrTimingOptions = m_Preferences->vrrTimingOptions();
     m_PresentationSettings.gamescopeRepaint = false; // Retired repaint experiment.
@@ -2025,6 +2027,7 @@ void Session::start()
             {"bitrate_kbps", m_StreamConfig.bitrate},
             {"vrr_requested", m_Preferences->enableVrr},
             {"vrr_qualified", m_PresentationSettings.enableVrr},
+            {"experimental_dxgi_waitable_requested", m_PresentationSettings.experimentalDxgiWaitable},
             {"display_refresh_hz", m_PresentationSettings.refreshRate},
             {"latency_mode", m_PresentationSettings.vrrLatencyMode},
             {"vrr_buffer_per_mille", m_PresentationSettings.vrrTimingOptions.bufferPerMille},
@@ -2579,7 +2582,8 @@ void Session::exec()
                                m_PresentationSettings.gamescopeMailbox,
                                m_PresentationSettings.vrrLatencyMode,
                                m_PresentationSettings.gamescopeRepaint,
-                               m_PresentationSettings.vrrTimingOptions)) {
+                               m_PresentationSettings.vrrTimingOptions,
+                               m_PresentationSettings.experimentalDxgiWaitable)) {
                 SDL_UnlockMutex(m_DecoderLock);
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "Failed to recreate decoder after reset");

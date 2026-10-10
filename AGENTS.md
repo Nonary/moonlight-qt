@@ -9,6 +9,31 @@ Check its source baseline against current code and update affected sections
 when behavior changes; historical comments and replay defaults are not proof
 of the active production policy.
 
+## Interpret VRR timing against the actual source cadence
+
+VRR follows the frames the host actually produces; the requested stream FPS and
+display maximum are not a promise of constant frame delivery. A 51 ms interval
+can be entirely normal when source FPS drops, a game is inactive or not visible,
+or the desktop is idle. Do not label a large submission, display, first-packet,
+or sender interval a stall, hitch, missed deadline, or malfunction merely because
+it exceeds the period at the requested FPS or an arbitrary threshold.
+
+Before attributing a timing disturbance, establish the workload and the source
+cadence for that same span using frame identities, source/RTP timestamps, and
+contemporaneous rate information. Separate legitimate lower-rate output and
+rate transitions from delivery or presentation that fails to follow the source.
+If workload or source evidence is unavailable, state that the cause is unresolved;
+do not infer a host, network, or client defect from the gap alone. In particular,
+a long gap before the next frame's first packet does not by itself establish an
+upstream stall: the host may simply have produced no new frame during that span.
+
+On native scheduled presentation, the blue client-submission line measures CPU
+enqueue spacing, while magenta measures OS-reported display timing. Uneven early
+enqueues can still produce correct display cadence. Diagnose lateness against
+the matching frame's appropriate deadline and actual source cadence; neither a
+jagged blue line nor a raw maximum interval proves visible stutter. OS display
+reports also require identity matching and are not optical screen measurements.
+
 ## ChaseShare Windows build
 
 The gaming build is an unsigned Windows x64 release. The canonical share is:
@@ -390,10 +415,15 @@ batch:
 The `session-policy` row is the production policy the capture would run
 under today. Ignore any scenario the table marks `saturated`: its worker fell
 behind the source cadence and the fixed-admission replay cannot shed frames,
-so its latency is meaningless. Host capture stalls (sender intervals over
-25 ms) are excluded from the hitch count by design; report them separately
-from the trace's RTP timestamps when the user reports visible stutter, because
-they are usually the cause and the pacer cannot fix them.
+so its latency is meaningless. Sender intervals over 25 ms are excluded from
+the hitch count by design. That threshold is a metric exclusion, not proof of a
+host capture stall. Report long source intervals separately from the trace's RTP
+timestamps, and interpret them against the workload and actual source cadence
+as required above. Idle output, inactive games, lower FPS, and rate transitions
+can legitimately produce those intervals. Attribute an abnormal source stall
+only when evidence establishes that the source should have continued producing
+frames at the relevant cadence; the pacer cannot create frames the host did not
+produce.
 
 Keep the untouched baseline and candidate results in separately named files.
 Evaluate cadence residual p95/p99, jerk p95/p99, decode-to-submission mean and
