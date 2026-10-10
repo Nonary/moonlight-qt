@@ -2,14 +2,19 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 
 // Admission is queue capacity, never scanout/blanking evidence. Only the render
 // worker acquires/consumes a permit; interruption is safe on the UI/owner thread.
 namespace DxgiWaitable {
 constexpr unsigned MaximumFrameLatency = 2;
-constexpr bool requested(bool option, bool vrr, bool vsync, bool testOnly)
+inline bool compositionRequested(bool vrr, const char* overrideValue)
 {
-    return option && vrr && vsync && !testOnly;
+    return vrr && overrideValue && std::strcmp(overrideValue, "1") == 0;
+}
+constexpr bool requested(bool vrr, bool vsync, bool testOnly, bool composition)
+{
+    return vrr && vsync && !testOnly && !composition;
 }
 enum class Status { Admitted, Interrupted, Timeout, Failed };
 enum class Wake { Signalled, Timeout, Failed };

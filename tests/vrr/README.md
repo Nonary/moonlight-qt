@@ -18,8 +18,9 @@ replay. Native scheduled retiming is capped at 2 ms while worker-paced sessions
 retain their wider quantized-source policy; runtime tests cover deadline floors
 and reserve bounds across source rates and presets.
 
-Windows VRR prefers composition on supported devices, with worker-paced DXGI
-as fallback or the explicit `MOONLIGHT_VRR_COMPOSITION=0` comparison. DXGI’s magenta graph joins submitted
+Windows D3D11 VRR defaults to waitable DXGI queue admission, with ordinary DXGI
+as fallback. `MOONLIGHT_VRR_COMPOSITION=1` explicitly requests composition;
+unset, zero and other values retain DXGI. DXGI’s magenta graph joins submitted
 image IDs and reported display-refresh counts to measured refresh-clock anchors,
 with separate `ConfirmedRefresh` provenance. `tst_overlay` and the worker's DXGI
 fixture cover delayed matching, invalid evidence, missing samples and epoch resets.
@@ -35,7 +36,7 @@ Set `MOONLIGHT_VRR_TEST_EXPORT_GUARD_TRACE` to a CSV path while running
 `check_dxgi_raster_trace_audit.py` with the replay executable and that CSV to
 verify exact replay, optional raster omission and rejection of corrupted guard
 qualification/timing evidence. The fixture keeps alignment and deep tracing off.
-Composition is requested unless `MOONLIGHT_VRR_COMPOSITION=0`; initialization
+Composition is requested only with `MOONLIGHT_VRR_COMPOSITION=1`; initialization
 still requires independent-flip capability and retains DXGI on setup failure. `native_synchronized_presentation=1`
 records its constant synchronized mode; historical captures default that parameter to zero.
 `tst_vrrtimingcontroller` verifies startup, rate changes and omission of the
@@ -1792,12 +1793,12 @@ queue age, the sole-image rule, and post-wait scheduler stalls remain covered by
 the other worker tests; this fixture does not model GPU throughput.
 
 
-DXGI waitable experiment checks: `tst_dxgipresent` covers opt-in eligibility,
-first-frame admission, timeouts, native failures, cancellation/resize races,
-retained permits, and permanent shutdown interruption. `tst_vrrpacingworker`
-checks interruption before joining a blocked renderer and on minimize, with
-exact decoded-frame release. `tst_vrrpreferences` verifies default-off persistence
-without changing renderer selection. Run `tests/qml/tst_DxgiWaitableSetting.qml`
-with qmltestrunner for actual mouse/keyboard toggling and platform/VRR/V-sync
-eligibility. A subsequent opt-in live comparison is still needed to validate
-driver behavior, resizing, stop/reconnect, tearing and visible pacing.
+DXGI waitable checks: `tst_dxgipresent` covers default eligibility and the
+exclusive `MOONLIGHT_VRR_COMPOSITION=1` override, first-frame admission, timeouts,
+native failures, cancellation/resize races, retained permits, and permanent
+shutdown interruption. `tst_vrrpacingworker` checks interruption before joining a
+blocked renderer and on minimize, with exact decoded-frame release.
+`tst_vrrpreferences` verifies removal of both values of the retired waitable opt-in
+without changing renderer selection. The experimental checkbox is removed.
+A subsequent live comparison is still needed to validate driver behavior,
+resizing, stop/reconnect, tearing and visible pacing.

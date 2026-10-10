@@ -1,8 +1,8 @@
 @echo off
 rem Schema 5 appends lost_packets; use the bundled replay to preserve loss eligibility.
 rem Schema 5 replay capture with passive Windows GPU sidecars.
-rem Windows VRR prefers composition presentation with native display-event timing.
-rem Set MOONLIGHT_VRR_COMPOSITION=0 before launch for worker-paced DXGI comparisons.
+rem Windows D3D11 VRR defaults to waitable DXGI queue admission.
+rem Set MOONLIGHT_VRR_COMPOSITION=1 before launch for composition display-event timing.
 rem Use Moonlight VRR Full Diagnostic.cmd for correlated OS graphics and scheduler events.
 rem Trace diagnostics do not change smoothing settings or prove physical tear-free scanout.
 setlocal EnableExtensions DisableDelayedExpansion

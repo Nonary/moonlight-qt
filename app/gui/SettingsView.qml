@@ -1843,13 +1843,6 @@ Flickable {
                                   qsTr("Reconnect the stream after changing this setting.")
                 }
 
-                DxgiWaitableSetting {
-                    vrrEnabled: StreamingPreferences.enableVrr
-                    vsyncEnabled: StreamingPreferences.enableVsync
-                    checked: StreamingPreferences.experimentalDxgiWaitable
-                    onToggled: StreamingPreferences.experimentalDxgiWaitable = checked
-                }
-
                 CheckBox {
                     hoverEnabled: true
                     text: qsTr("High-performance GPU power while streaming")

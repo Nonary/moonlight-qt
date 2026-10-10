@@ -1,7 +1,7 @@
 @echo off
 rem Schema 5 appends lost_packets; use the bundled replay to preserve loss eligibility.
-rem Windows VRR prefers composition presentation with native display-event timing.
-rem Set MOONLIGHT_VRR_COMPOSITION=0 before launch for worker-paced DXGI comparisons.
+rem Windows D3D11 VRR defaults to waitable DXGI queue admission.
+rem Set MOONLIGHT_VRR_COMPOSITION=1 before launch for composition display-event timing.
 rem The DXGI graph needs no UAC; Full Diagnostic adds optional PresentMon and scheduler tracing.
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%SystemRoot%"

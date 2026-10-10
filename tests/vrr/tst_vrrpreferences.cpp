@@ -33,24 +33,19 @@ private slots:
         QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, directory.path());
     }
     void init() { QSettings().clear(); }
-    void experimentalDxgiWaitablePersistence()
+    void retiredDxgiWaitablePreference()
     {
         auto* prefs = StreamingPreferences::get();
-        prefs->reload();
-        QVERIFY(!prefs->experimentalDxgiWaitable);
-        const auto renderer = prefs->rendererSelection;
-        QSignalSpy changed(prefs, &StreamingPreferences::experimentalDxgiWaitableChanged);
-        QVERIFY(prefs->setProperty("experimentalDxgiWaitable", true));
-        QCOMPARE(changed.count(), 1);
-        prefs->save();
-        prefs->reload();
-        QVERIFY(prefs->experimentalDxgiWaitable);
-        QCOMPARE(prefs->rendererSelection, renderer);
-        QVERIFY(prefs->setProperty("experimentalDxgiWaitable", false));
-        prefs->save();
-        prefs->reload();
-        QVERIFY(!prefs->experimentalDxgiWaitable);
-        QCOMPARE(prefs->rendererSelection, renderer);
+        for (bool oldValue : {false, true}) {
+            QSettings().setValue("experimentaldxgiwaitable", oldValue);
+            prefs->reload();
+            const auto renderer = prefs->rendererSelection;
+            QVERIFY(!QSettings().contains("experimentaldxgiwaitable"));
+            prefs->save();
+            prefs->reload();
+            QVERIFY(!QSettings().contains("experimentaldxgiwaitable"));
+            QCOMPARE(prefs->rendererSelection, renderer);
+        }
     }
     void migration()
     {

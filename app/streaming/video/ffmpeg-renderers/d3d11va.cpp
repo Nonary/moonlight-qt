@@ -699,13 +699,12 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     HRESULT hr;
 
     m_DecoderParams = *params;
-    // Prefer native composition scheduling and display-event feedback when
-    // supported. An explicit zero selects worker-paced DXGI for comparisons;
-    // unsupported devices and composition setup failures retain that fallback.
+    // Qualified VRR playback uses waitable DXGI queue admission by default.
+    // Composition is an explicit environment override, captured at setup.
+    m_CompositionRequested = DxgiWaitable::compositionRequested(
+        params->enableVrr, qgetenv("MOONLIGHT_VRR_COMPOSITION").constData());
     const bool waitableRequested = DxgiWaitable::requested(
-        params->experimentalDxgiWaitable, params->enableVrr, params->enableVsync, params->testOnly);
-    m_CompositionRequested = params->enableVrr && !waitableRequested &&
-        qgetenv("MOONLIGHT_VRR_COMPOSITION") != "0";
+        params->enableVrr, params->enableVsync, params->testOnly, m_CompositionRequested);
 
     if (qgetenv("D3D11VA_ENABLED") == "0") {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -840,8 +839,8 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
 
     // Always use windowed or borderless windowed mode.. SDL does mode-setting for us in
     // full-screen exclusive mode (SDL_WINDOW_FULLSCREEN), so this actually works out okay.
-    // Waitable creation is confined to a qualified VRR renderer. Off keeps the
-    // existing backend selection and swapchain descriptor unchanged.
+    // Waitable creation is confined to qualified VRR playback; probes, fixed
+    // pacing and the explicit composition path retain an ordinary swapchain.
     m_DxgiWaitableActive = waitableRequested &&
         m_VrrFallbackReason == VrrFallbackReason::NoFallback;
     for (;;) {
@@ -866,7 +865,7 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
             return false;
         }
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-            "Experimental DXGI waitable pacing unavailable (%x); using normal DXGI pacing", hr);
+            "DXGI waitable pacing unavailable (%x); using normal DXGI pacing", hr);
         m_DxgiWaitableActive = false;
         m_DxgiFrameLatencyHandle.Close();
         m_SwapChain.Reset();
@@ -877,7 +876,7 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     }
     if (waitableRequested) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "Experimental DXGI selected: waitable=%d, maximum frame latency=%u (queue admission, not display timing)",
+            "DXGI selected: waitable=%d, maximum frame latency=%u (queue admission, not display timing)",
             m_DxgiWaitableActive, m_DxgiWaitableActive ? DxgiWaitable::MaximumFrameLatency : 0);
     }
 

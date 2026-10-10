@@ -5,18 +5,19 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Current source review baseline: `765d09d7` plus the composition-default restoration, graph-refresh and native tear-guard corrections
-in this worktree, reviewed
-2026-10-08 local / 2026-10-09 UTC.
+Current source review baseline: `f6024a84` plus the Windows waitable-DXGI default
+and environment-only composition selection in this worktree, reviewed
+2026-10-09 local / 2026-10-10 UTC.
 The 2026-10-09 source-relative cadence detector adds separate submission and
 identity-matched OS display evidence without changing revision-12 control.
 The 2026-10-10 replay qualification additionally caps native scheduled
 smoothing and its reserve at 2 ms, retaining 6/3 ms on worker-paced presenters.
 Schema-5 rows now append `lost_packets` so packet-loss buffer eligibility is
 replayable; older rows without it retain their historical zero-loss input.
-Windows prefers native composition when supported; `MOONLIGHT_VRR_COMPOSITION=0`
-selects worker-paced DXGI for diagnostics. Unsupported devices retain DXGI. D3D11
-verifies rendering completion during preparation, before the cadence hold, and
+Qualified Windows D3D11 VRR playback defaults to waitable DXGI queue admission.
+Only `MOONLIGHT_VRR_COMPOSITION=1` requests native composition; unset, zero and
+other values retain DXGI. Unsupported waitable setup falls back to ordinary DXGI.
+D3D11 verifies rendering completion during preparation, before the cadence hold, and
 the final presentation checks a cached proof for the exact prepared marker.
 DXGI flip protection queries predecessor statistics and a fresh physical raster
 immediately before an adaptive native call. Unknown, pending, active or stale
@@ -2297,10 +2298,13 @@ A fresh gameplay capture is required for that comparison. The 2026-10-04
 automatic composition policy superseded this selection. A 2026-10-08 DXGI
 rollback was subsequently withdrawn after review of the host timing path.
 
-Current Windows presenter policy (2026-10-08): VRR sessions prefer composition
-on supported Windows 11/WDDM devices. Only `MOONLIGHT_VRR_COMPOSITION=0`
-explicitly selects DXGI; unset and other values request composition. DXGI
-fallback retains the worker's pre-Present target/spacing waits and per-frame
+Current Windows presenter policy (2026-10-09 local): qualified D3D11 VRR
+sessions default to waitable DXGI with two-frame queue admission before rendering.
+Only `MOONLIGHT_VRR_COMPOSITION=1` requests composition on supported Windows
+11/WDDM devices; unset, zero and other values retain DXGI. The old experimental
+checkbox and saved opt-in are retired, so a saved false cannot suppress the default.
+Ordinary DXGI is the fallback when waitable setup is unavailable. Both DXGI paths
+retain the worker's pre-Present target/spacing waits and per-frame
 synchronized or tearing-permitted native calls. Composition's native path
 synchronizes every frame; the renderer exposes that capability to the worker,
 which records `native_synchronized_presentation=1` in the controller parameters.
@@ -3821,8 +3825,8 @@ for that claim.
 
 ### 10.4 Composition presentation and display timing
 
-Windows VRR sessions prefer the composition presenter on supported devices.
-`MOONLIGHT_VRR_COMPOSITION=0` selects DXGI explicitly for diagnostics.
+Windows VRR sessions use waitable DXGI by default. The composition presenter
+is requested only with `MOONLIGHT_VRR_COMPOSITION=1` on supported devices.
 The value is captured during renderer initialization,
 so a stream reconnect is required. Startup logs identify the actual presenter,
 including setup fallback. Hardware support permits independent flip but does
@@ -5112,15 +5116,20 @@ discard, and Windows cancellation-fence worker fixtures. Windows source changes
 remain uncompiled here; fresh native integration tests are still required.
 
 
-### Opt-in DXGI waitable queue admission (Windows)
+### Default DXGI waitable queue admission (Windows)
 
-`experimentalDxgiWaitable` defaults to false and is captured with the session's
-presentation settings. For qualified D3D11 VRR playback it overrides composition
-selection without changing renderer preferences. The swapchain retains its five
-buffers and uses FRAME_LATENCY_WAITABLE_OBJECT with per-swapchain maximum latency
-two. Unsupported creation/latency/handle setup retries ordinary DXGI once before
-swapchain resources exist. Probes, non-VRR playback, and other renderers do not
-activate the experiment; disabling it restores normal backend selection.
+Qualified D3D11 VRR playback uses waitable DXGI automatically, with V-sync enabled
+and outside test-only probing. `MOONLIGHT_VRR_COMPOSITION=1` explicitly selects
+composition instead; unset, zero and other values keep waitable DXGI. The value
+is read at renderer initialization and is recorded as `composition_override`
+in diagnostic capture metadata. Reconnect after changing it. Renderer preferences
+are unchanged. The retired `experimentaldxgiwaitable` setting is removed on reload
+and its checkbox has been removed, so previous opt-in values cannot change policy.
+The swapchain retains its five buffers and uses FRAME_LATENCY_WAITABLE_OBJECT
+with per-swapchain maximum latency two. Unsupported creation/latency/handle setup
+retries ordinary DXGI once before swapchain resources exist. Probes, non-VRR
+playback, and other renderers do not activate waitable admission. Explicit
+composition setup failures retain ordinary DXGI.
 
 The pacing worker waits before touching the back buffer, outside presentation and
 decode locks. Admission waits have a 50 ms budget with 1 ms native wait slices;
@@ -5133,6 +5142,19 @@ the normal three-frame limit, leaving Present to throttle the valid swapchain.
 
 The wait signal is only queue admission. It is never used as scanout, vertical
 blank, or presentation-time evidence. Existing conservative DXGI tearing policy
-and honest estimated/confirmed timing labels remain unchanged. This experiment
-requires a reconnect and live validation; deterministic tests do not establish
-physical smoothness or complete display-event coverage.
+and honest estimated/confirmed timing labels remain unchanged. Changing the
+composition override requires a reconnect and live validation; deterministic
+tests do not establish physical smoothness or complete display-event coverage.
+
+Default-policy validation on 2026-10-09 local: the incremental Windows release
+and diagnostic builds pass. All eleven timing/controller, rate, worker,
+replay-config, render-policy, D3D11 binding, DXGI presentation, preferences,
+composition-policy, presentation-clock and overlay suites pass, together with
+replay help. Selection tests cover unset, empty, zero, one and non-enabling
+override values; preference migration covers both old saved boolean values.
+The complete portable tree and ZIP are published to ChaseShare, with matching
+application, replay, decoder and ZIP hashes and a successful UNC replay help
+check. The live executable SHA-256 is
+`d128c1b0cb0365b3cb767cc32e706a2444e9848efd3438c51093fc403a34f65c`.
+Both share-root tracing launchers document the new default and explicit override.
+Live gameplay under the new default remains to be assessed.

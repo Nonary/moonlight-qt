@@ -30,7 +30,6 @@
 #define SER_FULLSCREEN "fullscreen"
 #define SER_VSYNC "vsync"
 #define SER_ENABLEVRR "enablevrr"
-#define SER_EXPERIMENTALDXGIWAITABLE "experimentaldxgiwaitable"
 #define SER_VRRLATENCYFIX "vrrlatencyfix"
 #define SER_VRRLATENCYMODE "vrrlatencymode"
 #define SER_VRRTIMINGPRESETREVISION "vrrtimingpresetrevision"
@@ -152,7 +151,8 @@ void StreamingPreferences::reload()
     autoAdjustBitrate = settings.value(SER_AUTOADJUSTBITRATE, true).toBool();
     enableVsync = settings.value(SER_VSYNC, true).toBool();
     enableVrr = settings.value(SER_ENABLEVRR, false).toBool();
-    experimentalDxgiWaitable = settings.value(SER_EXPERIMENTALDXGIWAITABLE, false).toBool();
+    // Waitable DXGI is the Windows VRR default, independent of the retired opt-in.
+    settings.remove(QStringLiteral("experimentaldxgiwaitable"));
     // VRR adaptive presentation always requires tearing permission. Remove
     // the retired override so stale profiles cannot disable native VRR.
     settings.remove(QStringLiteral("allowvrrtearing"));
@@ -409,7 +409,6 @@ void StreamingPreferences::save()
     settings.setValue(SER_AUTOADJUSTBITRATE, autoAdjustBitrate);
     settings.setValue(SER_VSYNC, enableVsync);
     settings.setValue(SER_ENABLEVRR, enableVrr);
-    settings.setValue(SER_EXPERIMENTALDXGIWAITABLE, experimentalDxgiWaitable);
     settings.setValue(SER_VRRLATENCYMODE, vrrLatencyMode);
     settings.setValue(SER_VRRTIMINGPRESETREVISION, CURRENT_VRR_TIMING_PRESET_REVISION);
     settings.setValue("vrrbufferpermille", vrrBufferPerMille());
