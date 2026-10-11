@@ -1,13 +1,10 @@
-name: Daily Windows, macOS and Linux prerelease
+name: Publish qualified Moonlight nightly
 on:
-  schedule:
-    - cron: '47 6 * * *'
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish after all gates (requires DAILY_RELEASE_ENABLED)
         type: boolean
-        required: false
+        required: true
         default: false
 permissions:
   contents: read
@@ -15,148 +12,155 @@ concurrency:
   group: daily-prerelease
   cancel-in-progress: false
 jobs:
-  prepare:
-    if: github.repository == 'Nonary/moonlight-qt' && github.ref == 'refs/heads/master' && vars.DAILY_RELEASE_SOURCE_BRANCH == 'master' && (github.event_name == 'workflow_dispatch' || vars.DAILY_RELEASE_ENABLED == 'true')
+  publish-qualified:
+    if: inputs.publish && github.repository == 'Nonary/moonlight-qt' && vars.DAILY_RELEASE_ENABLED == 'true' && vars.DAILY_RELEASE_SOURCE_BRANCH == 'master'
     runs-on: ubuntu-latest
-    outputs:
-      should_release: ${{ steps.changes.outputs.should_release }}
-      source_sha: ${{ steps.source.outputs.source_sha }}
-      ci_version: ${{ steps.version.outputs.ci_version }}
-      tag: ${{ steps.version.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-      - name: Snapshot explicitly confirmed remote source
-        id: source
-        run: |
-          set -euo pipefail
-          git fetch origin refs/heads/master:refs/remotes/origin/master --tags
-          sha=$(git rev-parse refs/remotes/origin/master)
-          echo "source_sha=$sha" >> "$GITHUB_OUTPUT"
-      - name: Test nightly notes and immutable metadata
-        run: python3 -m unittest discover -s scripts/tests -p test_nightly_notes.py -v
-      - name: Test release safeguards
-        run: python3 -m unittest discover -s scripts/tests -p test_daily_release.py -v
-      - name: Test Windows NT-only PyroWave interoperability requirements
-        run: python3 -m unittest discover -s scripts/tests -p test_pyrowave_nt_handles.py -v
-      - name: Skip unchanged source since last published nightly
-        id: changes
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
-        run: |
-          set -euo pipefail
-          changed=$(python3 scripts/nightly_source.py --repo Nonary/moonlight-qt --source "$SOURCE_SHA")
-          echo "should_release=$changed" >> "$GITHUB_OUTPUT"
-          if [[ "$changed" == false ]]; then
-            echo 'Source unchanged from the last successfully published Moonlight nightly; skipping builds and publication.' | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
-      - name: Allocate monotonic Windows version
-        if: steps.changes.outputs.should_release == 'true'
-        id: version
-        run: python3 scripts/daily-version.py
-  windows:
-    needs: prepare
-    if: needs.prepare.outputs.should_release == 'true'
-    uses: ./.github/workflows/build-win-mac.yml
-    with:
-      ci_version: ${{ needs.prepare.outputs.ci_version }}
-      source_ref: ${{ needs.prepare.outputs.source_sha }}
-      build_macos: true
-  linux:
-    needs: prepare
-    if: needs.prepare.outputs.should_release == 'true'
-    uses: ./.github/workflows/build-appimage.yml
-    with:
-      ci_version: ${{ needs.prepare.outputs.ci_version }}
-      source_ref: ${{ needs.prepare.outputs.source_sha }}
-  flatpak:
-    needs: prepare
-    if: needs.prepare.outputs.should_release == 'true'
-    uses: ./.github/workflows/build-flatpak.yml
-    with:
-      ci_version: ${{ needs.prepare.outputs.ci_version }}
-      source_ref: ${{ needs.prepare.outputs.source_sha }}
-  publish:
-    needs: [prepare, windows, linux, flatpak]
-    if: needs.prepare.outputs.should_release == 'true' && needs.prepare.result == 'success' && needs.windows.result == 'success' && needs.linux.result == 'success' && needs.flatpak.result == 'success' && vars.DAILY_RELEASE_ENABLED == 'true' && vars.DAILY_RELEASE_SOURCE_BRANCH == 'master' && (github.event_name == 'schedule' || inputs.publish)
-    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: Nonary/moonlight-qt
-      DAILY_TAG: ${{ needs.prepare.outputs.tag }}
-      CI_VERSION: ${{ needs.prepare.outputs.ci_version }}
-      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+      SOURCE_SHA: f07197712fe7afefe3d8eb85a1e68a678d8fcecc
+      QUALIFIED_RUN: '38176935263'
+      CI_VERSION: 6.2.0-daily.184
+      DAILY_TAG: v6.2.0-daily.184
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: f07197712fe7afefe3d8eb85a1e68a678d8fcecc
           fetch-depth: 0
+      - name: Require exact completed qualification and preserved source
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$(git ls-remote origin refs/heads/master | cut -f1)" == "$SOURCE_SHA" ]]
+          gh api "repos/$GH_REPO/actions/runs/$QUALIFIED_RUN" > qualified-run.json
+          gh api "repos/$GH_REPO/actions/runs/$QUALIFIED_RUN/jobs?per_page=100" > qualified-jobs.json
+          python3 - <<'PY'
+          import json, os
+          r=json.load(open('qualified-run.json'))
+          assert r['head_sha']==os.environ['SOURCE_SHA'] and r['status']=='completed' and r['conclusion']=='success'
+          jobs=json.load(open('qualified-jobs.json'))['jobs']
+          expected={'prepare','linux / build','flatpak / build','windows / build (windows-2025, 6.11.1)','windows / build (macos-26, 6.11.1)'}
+          assert {j['name'] for j in jobs if j['conclusion']=='success'}==expected
+          PY
+          for sha in a04581d62341adc406292fc99e397c8ce4d50df7 1020cfe3a9bf5cd13a242340022bfbd5167ad247 cfa5003120aaeeb733576f1de8140d3d605ddf38 5b062c4bddf641fdd2b669beba77c69b5a65b068 3c32553e5a8cba3d43eb41bfc49a0e260270175d 2083d82a166ddecc18df551cc5df0ee2f983cc52; do
+            git merge-base --is-ancestor "$sha" "$SOURCE_SHA"
+          done
       - uses: actions/download-artifact@v6
         with:
-          name: Moonlight-Windows-Release-${{ needs.prepare.outputs.ci_version }}
+          name: Moonlight-Windows-Release-6.2.0-daily.184
           path: release-assets
+          github-token: ${{ github.token }}
+          repository: Nonary/moonlight-qt
+          run-id: 38176935263
       - uses: actions/download-artifact@v6
         with:
-          name: Moonlight-macOS-${{ needs.prepare.outputs.ci_version }}
+          name: Moonlight-macOS-6.2.0-daily.184
           path: release-assets
+          github-token: ${{ github.token }}
+          repository: Nonary/moonlight-qt
+          run-id: 38176935263
       - uses: actions/download-artifact@v6
         with:
-          name: Moonlight-LinuxAppImage-${{ needs.prepare.outputs.ci_version }}
+          name: Moonlight-LinuxAppImage-6.2.0-daily.184
           path: release-assets
+          github-token: ${{ github.token }}
+          repository: Nonary/moonlight-qt
+          run-id: 38176935263
       - uses: actions/download-artifact@v6
         with:
-          name: Moonlight-Flatpak-${{ needs.prepare.outputs.ci_version }}
+          name: Moonlight-Flatpak-6.2.0-daily.184
           path: release-assets
-      - name: Recheck remote history and verify exact assets
+          github-token: ${{ github.token }}
+          repository: Nonary/moonlight-qt
+          run-id: 38176935263
+      - name: Verify archive integrity and actual Windows product version
+        run: |
+          python3 - <<'PY'
+          import os, struct, zipfile
+          from pathlib import Path
+          root=Path('release-assets');v=os.environ['CI_VERSION']
+          expected={f'MoonlightSetup-{v}.exe',f'MoonlightPortable-x64-{v}.zip',f'Moonlight-{v}.dmg',f'Moonlight-{v}-x86_64.AppImage',f'Moonlight-{v}-x86_64.flatpak'}
+          assert {p.name for p in root.iterdir()}==expected
+          assert all(p.is_file() and not p.is_symlink() and p.stat().st_size>0 for p in root.iterdir())
+          with zipfile.ZipFile(root/f'MoonlightPortable-x64-{v}.zip') as z:
+              assert z.testzip() is None
+              names=[n for n in z.namelist() if n.lower().endswith('moonlight.exe')];assert len(names)==1
+              exe=z.read(names[0]);needle=struct.pack('<I',0xfeef04bd)
+              offsets=[i for i in range(len(exe)) if exe.startswith(needle,i)]
+              versions=[struct.unpack_from('<6I',exe,i) for i in offsets if i+24<=len(exe)]
+              assert any(x[1]==0x10000 and x[4]==(6<<16|2) and x[5]==(184<<16) for x in versions),versions
+          with (root/f'Moonlight-{v}.dmg').open('rb') as f:
+              f.seek(-512,2);assert f.read(4)==b'koly'
+          with (root/f'Moonlight-{v}-x86_64.AppImage').open('rb') as f:
+              h=f.read(16);assert h[:4]==b'\x7fELF' and h[8:11]==b'AI\x02'
+          with (root/f'Moonlight-{v}-x86_64.flatpak').open('rb') as f:assert f.read(8)==b'flatpak\x00'
+          with (root/f'MoonlightSetup-{v}.exe').open('rb') as f:assert f.read(2)==b'MZ'
+          print('PASS five intact qualified packages; actual Windows product 6.2.184.0')
+          PY
+      - name: Generate established notes and immutable metadata
         run: |
           set -euo pipefail
           git fetch origin --tags
           python3 - <<'PY'
-          import importlib.util, os
-          from pathlib import Path
-          spec = importlib.util.spec_from_file_location('daily_version', 'scripts/daily-version.py')
-          module = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(module)
-          import subprocess
-          current = module.next_version(subprocess.check_output(['git', 'tag', '--list'], text=True).splitlines())
-          assert current == os.environ['CI_VERSION'], 'Tag history changed while building; rerun from scratch'
-          assets = Path('release-assets')
-          expected = {f'MoonlightSetup-{current}.exe', f'MoonlightPortable-x64-{current}.zip', f'Moonlight-{current}.dmg', f'Moonlight-{current}-x86_64.AppImage', f'Moonlight-{current}-x86_64.flatpak'}
-          assert {p.name for p in assets.iterdir()} == expected, 'Unexpected or missing assets'
-          assert all(p.is_file() and p.stat().st_size > 0 for p in assets.iterdir())
+          import importlib.util, os, subprocess
+          spec=importlib.util.spec_from_file_location('daily','scripts/daily-version.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+          assert m.next_version(subprocess.check_output(['git','tag','--list'],text=True).splitlines())==os.environ['CI_VERSION']
           PY
-          if gh release view "$DAILY_TAG" >/dev/null 2>&1; then
-            echo 'Release already exists; refusing to replace it' >&2
-            exit 1
-          fi
           : > release-notes.md
           python3 scripts/nightly_notes.py --repo "$GH_REPO" --tag "$DAILY_TAG" --version "$CI_VERSION" --source "$SOURCE_SHA" --assets release-assets --notes release-notes.md
-      - name: Create draft prerelease and upload unsigned packages
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path('release-notes.md');s=p.read_text()
+          limit='Intel NT-handle interoperability was probed on UHD 770; Arc B390 end-to-end playback remains unverified. Steam Deck native Wayland and GPU hold were verified; optical HDR/VRR output remains unverified.'
+          p.write_text(s.replace('### Linux installation',limit+'\n\n### Linux installation'))
+          m=json.load(open('release-assets/nightly-metadata.json'))
+          assert m['source_commit']==os.environ['SOURCE_SHA'] and m['nightly_sequence']==184 and m['windows_product_version']=='6.2.184'
+          assert m['previous_successful_tag']=='v6.2.0-daily.183' and m['commits_total']==m['commits_listed']==21
+          assert len(m['artifacts'])==5 and all(a['source_commit']==os.environ['SOURCE_SHA'] for a in m['artifacts'])
+          PY
+          (cd release-assets && sha256sum --check SHA256SUMS)
+          if gh release view "$DAILY_TAG" >/dev/null 2>&1; then
+            echo 'Immutable release already exists; refusing replacement' >&2
+            exit 1
+          fi
+      - name: Create draft and upload complete unsigned package set
         run: |
           set -euo pipefail
-          gh release create "$DAILY_TAG" --target "$SOURCE_SHA" --draft --prerelease --latest=false \
-            --title "Moonlight daily $CI_VERSION" --notes-file release-notes.md
+          gh release create "$DAILY_TAG" --target "$SOURCE_SHA" --draft --prerelease --latest=false --title "Moonlight daily $CI_VERSION" --notes-file release-notes.md
           gh release upload "$DAILY_TAG" release-assets/*
-      - name: Publish prerelease after upload verification
+      - name: Redownload and verify before publishing
         run: |
           set -euo pipefail
           mkdir verified-assets
           gh release download "$DAILY_TAG" --dir verified-assets
           (cd verified-assets && sha256sum --check SHA256SUMS)
+          diff -qr release-assets verified-assets
           git fetch origin --tags
           gh release view "$DAILY_TAG" --json isDraft,isPrerelease,targetCommitish,tagName > draft-release.json
           python3 - <<'PY'
-          import importlib.util, json, os, subprocess
-          spec = importlib.util.spec_from_file_location('daily_version', 'scripts/daily-version.py')
-          module = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(module)
-          tags = subprocess.check_output(['git', 'tag', '--list'], text=True).splitlines()
-          tag = os.environ['DAILY_TAG']
-          tag_sha = subprocess.check_output(['git', 'rev-list', '-n', '1', tag], text=True).strip() if tag in tags else None
-          module.verify_draft(json.load(open('draft-release.json')), os.environ['SOURCE_SHA'], tag, tag_sha)
-          assert module.next_version([t for t in tags if t != os.environ['DAILY_TAG']]) == os.environ['CI_VERSION'], 'Competing release appeared; draft left unpublished'
+          import importlib.util,json,os,subprocess
+          spec=importlib.util.spec_from_file_location('daily','scripts/daily-version.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+          tags=subprocess.check_output(['git','tag','--list'],text=True).splitlines();tag=os.environ['DAILY_TAG']
+          tag_sha=subprocess.check_output(['git','rev-list','-n','1',tag],text=True).strip() if tag in tags else None
+          m.verify_draft(json.load(open('draft-release.json')),os.environ['SOURCE_SHA'],tag,tag_sha)
+          assert m.next_version([t for t in tags if t!=tag])==os.environ['CI_VERSION']
           PY
           gh release edit "$DAILY_TAG" --draft=false --prerelease --latest=false
+          gh release view "$DAILY_TAG" --json url,isDraft,isPrerelease,targetCommitish,assets > published-release.json
+          echo 'Published exact-source nightly after complete upload and download verification.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Moonlight-publication-proof-6.2.0-daily.184
+          path: |
+            qualified-run.json
+            qualified-jobs.json
+            draft-release.json
+            published-release.json
+            release-notes.md
+            release-assets/nightly-metadata.json
+            release-assets/SHA256SUMS
