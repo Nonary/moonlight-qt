@@ -47,5 +47,26 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           QT_QUICK_BACKEND: software
         run: |
-          & ./build/qml-probe/release/tst_calibrationhosts.exe -o "-,txt"
-          if ($LASTEXITCODE -ne 0) { throw "Calibration assertions failed: $LASTEXITCODE" }
+          $sdk = "$env:QT_ROOT_DIR/bin"
+          $stage = Join-Path $env:RUNNER_TEMP 'deployed-qt-probe'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          foreach ($dll in @('Qt6Core.dll', 'Qt6Network.dll', 'Qt6Qml.dll', 'Qt6QmlModels.dll')) {
+            Copy-Item "$sdk/$dll" $stage
+          }
+          $env:Path = "$stage;$sdk;$env:Path"
+          $imports = $env:QML_IMPORT_PATH
+          $plugins = $env:QT_PLUGIN_PATH
+          Remove-Item Env:QML_IMPORT_PATH, Env:QML2_IMPORT_PATH, Env:QT_PLUGIN_PATH
+          $before = Join-Path $env:RUNNER_TEMP 'calibration-original.txt'
+          & ./build/qml-probe/release/tst_calibrationhosts.exe -o "$before,txt"
+          $originalExit = $LASTEXITCODE
+          Write-Host "Original deployed-DLL runtime exit: $originalExit"
+          Get-Content $before
+          $env:QML_IMPORT_PATH = $imports
+          $env:QML2_IMPORT_PATH = $imports
+          $env:QT_PLUGIN_PATH = $plugins
+          $after = Join-Path $env:RUNNER_TEMP 'calibration-fixed.txt'
+          & ./build/qml-probe/release/tst_calibrationhosts.exe -o "$after,txt"
+          $fixedExit = $LASTEXITCODE
+          Get-Content $after
+          if ($fixedExit -ne 0) { throw "Calibration assertions failed: $fixedExit" }
