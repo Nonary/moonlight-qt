@@ -86,9 +86,9 @@ jobs:
 
       - name: Install create-dmg (macOS)
         if: runner.os == 'macOS'
+        continue-on-error: true
         run: |
-          brew install node
-          npm install --global create-dmg
+          brew install create-dmg || true
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
@@ -273,25 +273,49 @@ jobs:
             bash scripts/generate-dmg.sh Release
           }
 
-      - name: Test nightly updater and macOS display timing
-        if: runner.os == 'macOS' && contains(inputs.ci_version, '-daily.')
+      - name: Test macOS updater and display timing
+        if: runner.os == 'macOS'
         timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p build/nightly-tests-updates build/nightly-tests-timing
-          (cd build/nightly-tests-updates && qmake ../../tests/updates/updates.pro CONFIG+=release && make -j2 && ./tst_autoupdatechecker)
-          (cd build/nightly-tests-timing && qmake ../../tests/vrr/macdisplaytiming.pro CONFIG+=release && make -j2 && ./tst_macdisplaytiming)
+          mkdir -p build/tests-updates build/tests-timing
+          (cd build/tests-updates && qmake ../../tests/updates/updates.pro CONFIG+=release && make -j2 && ./tst_autoupdatechecker)
+          (cd build/tests-timing && qmake ../../tests/vrr/macdisplaytiming.pro CONFIG+=release && make -j2 && ./tst_macdisplaytiming)
 
-      - name: Verify nightly universal macOS DMG
-        if: runner.os == 'macOS' && contains(inputs.ci_version, '-daily.')
+      - name: Test macOS VRR diagnostics and settings
+        if: runner.os == 'macOS'
+        timeout-minutes: 10
+        shell: bash
+        env:
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/libs/mac/lib
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -euo pipefail
+          mkdir -p build/tests-macos
+          (cd build/tests-macos && qmake ../../tests/tests.pro CONFIG+=tests CONFIG+=release QMAKE_APPLE_DEVICE_ARCHS=arm64 && make -j2)
+          build/tests-macos/vrr/tst_vrrtimingcontroller
+          build/tests-macos/vrr/tst_vrrratepolicy
+          build/tests-macos/vrr/tst_vrrreplayconfig
+          build/tests-macos/vrr/tst_vrrrenderpolicy
+          build/tests-macos/haptics/tst_dualsensehaptics
+          build/tests-macos/input/tst_toleranceinput
+          build/tests-macos/qml/tst_controllernavigation
+          build/tests-macos/qml/tst_calibrationhosts
+          build/tests-macos/pyrowave/tst_pyrowavesdp
+          build/tests-macos/pyrowave/tst_pyrowaveframing
+          build/tests-macos/pyrowave/tst_pyrowavelinkpolicy
+          build/tests-macos/pyrowave/tst_pyrowaveudpaddress
+
+      - name: Verify universal macOS DMG
+        if: runner.os == 'macOS'
         timeout-minutes: 5
         shell: bash
         run: |
           set -euo pipefail
           dmg="build/installer-Release/Moonlight-$CI_VERSION.dmg"
           test -s "$dmg"
-          mount="$RUNNER_TEMP/nightly-dmg-verification"
+          mount="$RUNNER_TEMP/dmg-verification"
           mkdir -p "$mount"
           hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount"
           trap 'hdiutil detach "$mount"' EXIT
@@ -300,12 +324,14 @@ jobs:
           lipo "$app/Contents/MacOS/Moonlight" -verify_arch x86_64 arm64
           version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
           test "$version" = "$(cat app/version.txt)"
-          bundle=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
-          identity=$(/usr/libexec/PlistBuddy -c 'Print :MoonlightNightlyVersion' "$app/Contents/Info.plist")
-          source=$(/usr/libexec/PlistBuddy -c 'Print :MoonlightSourceCommit' "$app/Contents/Info.plist")
-          test "$bundle" = "6.2.${CI_VERSION##*-daily.}"
-          test "$identity" = "$CI_VERSION"
-          test "$source" = "$(git rev-parse HEAD)"
+          if [[ "$CI_VERSION" =~ -daily\. ]]; then
+            bundle=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
+            identity=$(/usr/libexec/PlistBuddy -c 'Print :MoonlightNightlyVersion' "$app/Contents/Info.plist")
+            source=$(/usr/libexec/PlistBuddy -c 'Print :MoonlightSourceCommit' "$app/Contents/Info.plist")
+            test "$bundle" = "6.2.${CI_VERSION##*-daily.}"
+            test "$identity" = "$CI_VERSION"
+            test "$source" = "$(git rev-parse HEAD)"
+          fi
           test -z "${SIGNING_IDENTITY:-}"
           test -z "${NOTARY_KEYCHAIN_PROFILE:-}"
           echo 'Universal x86_64/arm64 DMG identity verified; no Developer ID signing or notarization requested.'
