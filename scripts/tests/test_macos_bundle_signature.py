@@ -65,6 +65,11 @@ if '--sign' in sys.argv and os.environ.get('TEST_CORRUPT_AFTER_SIGN') == '1':
         output.write(b'invalidating nested code signature after signing')
 ''')
         self.write_tool(tools, 'create-dmg', '''#!/bin/bash
+# Answer the generate-dmg.sh CLI probe like sindresorhus/create-dmg does.
+if [ "$1" = "--help" ]; then
+  echo '  $ create-dmg <app> [destination]'
+  exit 0
+fi
 # Record whether invalid nested code was caught before packaging started.
 touch "$TEST_ROOT/packaging-started"
 printf '%s\\n' "$@" > "$TEST_ROOT/dmg-arguments"
