@@ -22,6 +22,14 @@ else
   VERSION=`cat $SOURCE_ROOT/app/version.txt`
 fi
 
+if [ -z "$(command -v qmake)" ]; then
+  if [ -x "$SOURCE_ROOT/build/vrr-hybrid/qt/6.11.1/macos/bin/qmake" ]; then
+    export PATH="$SOURCE_ROOT/build/vrr-hybrid/qt/6.11.1/macos/bin:$PATH"
+  elif [ -d "/opt/homebrew/opt/qt/bin" ]; then
+    export PATH="/opt/homebrew/opt/qt/bin:$PATH"
+  fi
+fi
+
 if [ "$SIGNING_PROVIDER_SHORTNAME" == "" ]; then
   SIGNING_PROVIDER_SHORTNAME=$SIGNING_IDENTITY
 fi
@@ -37,9 +45,9 @@ python3 $SOURCE_ROOT/setup-deps.py
 echo Cleaning output directories
 rm -rf $BUILD_FOLDER
 rm -rf $INSTALLER_FOLDER
-mkdir $BUILD_ROOT
-mkdir $BUILD_FOLDER
-mkdir $INSTALLER_FOLDER
+mkdir -p $BUILD_ROOT
+mkdir -p $BUILD_FOLDER
+mkdir -p $INSTALLER_FOLDER
 
 # Enable LTO for official builds
 export CFLAGS=-flto=thin
@@ -95,16 +103,37 @@ fi
 codesign --verify --deep --strict "$BUILD_FOLDER/app/Moonlight.app" || fail "App bundle signature verification failed!"
 
 echo Creating DMG
-if [ "$SIGNING_IDENTITY" != "" ]; then
-  create-dmg $BUILD_FOLDER/app/Moonlight.app $INSTALLER_FOLDER --identity="$SIGNING_IDENTITY" --no-version-in-filename || fail "create-dmg failed!"
-else
-  # Keep unsigned builds unverified even if this machine has a signing identity.
-  create-dmg $BUILD_FOLDER/app/Moonlight.app $INSTALLER_FOLDER --no-version-in-filename --no-code-sign
-  case $? in
-    0) ;;
-    2) ;;
-    *) fail "create-dmg failed!";;
-  esac
+DMG_CREATED=0
+if command -v create-dmg >/dev/null 2>&1; then
+  # Test if create-dmg is sindresorhus/create-dmg (accepts <app> <destination>)
+  if create-dmg --help 2>&1 | grep -q "<app>"; then
+    if [ "$SIGNING_IDENTITY" != "" ]; then
+      create-dmg "$BUILD_FOLDER/app/Moonlight.app" "$INSTALLER_FOLDER" --identity="$SIGNING_IDENTITY" --no-version-in-filename && DMG_CREATED=1
+    else
+      # Keep unsigned builds unverified even if this machine has a signing identity.
+      create-dmg "$BUILD_FOLDER/app/Moonlight.app" "$INSTALLER_FOLDER" --no-version-in-filename --no-code-sign
+      case $? in
+        0|2) DMG_CREATED=1 ;;
+        *) DMG_CREATED=0 ;;
+      esac
+    fi
+  fi
+fi
+
+if [ "$DMG_CREATED" -eq 0 ]; then
+  echo "Staging DMG contents with Applications symlink..."
+  DMG_STAGING="$BUILD_FOLDER/dmg-staging"
+  rm -rf "$DMG_STAGING" "$INSTALLER_FOLDER/Moonlight.dmg"
+  mkdir -p "$DMG_STAGING"
+  ditto "$BUILD_FOLDER/app/Moonlight.app" "$DMG_STAGING/Moonlight.app"
+  ln -s /Applications "$DMG_STAGING/Applications"
+
+  if command -v diskutil >/dev/null 2>&1 && diskutil help image create from >/dev/null 2>&1; then
+    diskutil image create from --format UDZO --volname "Moonlight" "$DMG_STAGING" "$INSTALLER_FOLDER/Moonlight.dmg" || fail "diskutil image create failed!"
+  else
+    hdiutil create -volname "Moonlight" -srcfolder "$DMG_STAGING" -ov -format UDZO "$INSTALLER_FOLDER/Moonlight.dmg" || fail "hdiutil create failed!"
+  fi
+  rm -rf "$DMG_STAGING"
 fi
 
 if [ "$NOTARY_KEYCHAIN_PROFILE" != "" ]; then

@@ -20,10 +20,16 @@ def get_platform_config():
     sys.exit(1)
 
 def download_and_extract():
+    force = "--force" in sys.argv
     subfolder, asset_name = get_platform_config()
     
     target_dir = os.path.join(os.getcwd(), "libs", subfolder)
     url = f"https://github.com/{ORGANIZATION}/{PREBUILT_REPO}/releases/download/{TAG}/{asset_name}"
+
+    if os.path.exists(target_dir) and not force:
+        if os.path.isdir(os.path.join(target_dir, "lib")) and os.path.isdir(os.path.join(target_dir, "include")):
+            print("Dependencies already deployed. Use --force to re-download.")
+            return
 
     if os.path.exists(target_dir):
         print("Cleaning target directory...")
