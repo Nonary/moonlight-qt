@@ -5,6 +5,7 @@
 #include "SDL_compat.h"
 #include "settings/mappingmanager.h"
 #include "streaming/input/dualsensehaptics.h"
+#include "streaming/input/gamepadstickmerge.h"
 
 #include <QtMath>
 
@@ -79,6 +80,12 @@ void SdlInputHandler::sendGamepadState(GamepadState* state)
 
     // When in single controller mode, merge all gamepad state together
     if (!m_MultiController) {
+        const auto sticks = GamepadStickMerge::select(m_GamepadState, MAX_GAMEPADS, state->index);
+        lsX = sticks.left.x;
+        lsY = sticks.left.y;
+        rsX = sticks.right.x;
+        rsY = sticks.right.y;
+
         for (int i = 0; i < MAX_GAMEPADS; i++) {
             if (m_GamepadState[i].index == state->index) {
                 buttons |= m_GamepadState[i].buttons;
@@ -87,17 +94,6 @@ void SdlInputHandler::sendGamepadState(GamepadState* state)
                 }
                 if (rt < m_GamepadState[i].rt) {
                     rt = m_GamepadState[i].rt;
-                }
-
-                // We use abs() here instead of qAbs() for get proper integer promotion to
-                // correctly handle abs(-32768), which is not representable in a short.
-                if (abs(lsX) < abs(m_GamepadState[i].lsX) || abs(lsY) < abs(m_GamepadState[i].lsY)) {
-                    lsX = m_GamepadState[i].lsX;
-                    lsY = m_GamepadState[i].lsY;
-                }
-                if (abs(rsX) < abs(m_GamepadState[i].rsX) || abs(rsY) < abs(m_GamepadState[i].rsY)) {
-                    rsX = m_GamepadState[i].rsX;
-                    rsY = m_GamepadState[i].rsY;
                 }
             }
         }

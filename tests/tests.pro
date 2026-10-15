@@ -10,6 +10,8 @@ contains(CONFIG, tests) {
     SUBDIRS += pyrowave
     toleranceInput.file = $$PWD/input/tolerance.pro
     SUBDIRS += toleranceInput
+    gamepadStickMerge.file = $$PWD/input/gamepadstickmerge.pro
+    SUBDIRS += gamepadStickMerge
     calibrationHosts.file = $$PWD/qml/calibration-hosts.pro
     SUBDIRS += calibrationHosts
     macx {

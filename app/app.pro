@@ -227,6 +227,7 @@ HEADERS += \
     streaming/video/videothreadpriority.h \
     streaming/video/timinggraph.h \
     streaming/input/dualsensehid.h \
+    streaming/input/gamepadstickmerge.h \
     streaming/input/dualsensetriggers.h \
     ../third-party/saxense/packet.h \
     SDL_compat.h \

@@ -5167,6 +5167,13 @@ advertises LI_CCAP_HAPTICS_PCM. See third-party/saxense/PROVENANCE.md.
 
 In merged controller mode, startup opens attached DualSense controllers first
 so the host's first player-0 announcement describes the actual feedback target.
+Each analog stick selects the connected controller's complete X/Y pair with
+the greatest squared radial deflection. Equal magnitudes retain the lowest
+controller slot, independent of which controller generated the event. This
+prevents an idle controller's larger X offset from replacing held-forward Y;
+buttons remain combined by OR and triggers by their maximum. Multi-controller
+mode retains each controller's own axes. The pure selector regressions are in
+`tests/input/gamepadstickmerge.pro`; physical Deck validation remains pending.
 Multi-controller numbering retains enumeration order. Rumble and adaptive
 trigger feedback are routed by player index to the matching DualSense; SDL
 remains responsible for input and non-waveform effects. Waveform teardown joins
