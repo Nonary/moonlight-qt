@@ -380,6 +380,9 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     parser.addChoiceOption("steam-controller-grips", "Steam Controller (2026) grip buttons", m_SteamControllerGripsMap.keys());
     parser.addValueOption("steam-controller-rumble-hold", "Steam Controller (2026) rumble hold in ms (0 = unlimited)");
     parser.addToggleOption("steam-controller-stick-stretch", "Steam Controller (2026) stick rim stretch");
+    parser.addValueOption("steam-controller-haptic-boost", "Steam Controller (2026) over Bluetooth LE: dB added to Steam's pad tick/click gain (0, 6, 12, 20)");
+    parser.addValueOption("steam-controller-haptic-pulse-scale", "Steam Controller (2026) over Bluetooth LE: pad slide pulse on-time in percent (100, 150, 200, 300)");
+    parser.addValueOption("steam-controller-haptic-master-gain", "Steam Controller (2026) over Bluetooth LE: haptic master gain setting in dB (0 = not written, 6, 12)");
     parser.addToggleOption("keep-awake", "prevent display sleep while streaming");
     parser.addToggleOption("performance-overlay", "show performance overlay");
     parser.addToggleOption("hdr", "HDR streaming");
@@ -515,6 +518,15 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
         preferences->steamControllerRumbleHold = qMax(0, parser.getIntOption("steam-controller-rumble-hold"));
     }
     preferences->steamControllerStickStretch = parser.getToggleOptionValue("steam-controller-stick-stretch", preferences->steamControllerStickStretch);
+    if (parser.isSet("steam-controller-haptic-boost")) {
+        preferences->steamControllerHapticBoost = qBound(0, parser.getIntOption("steam-controller-haptic-boost"), 30);
+    }
+    if (parser.isSet("steam-controller-haptic-pulse-scale")) {
+        preferences->steamControllerHapticPulseScale = qBound(100, parser.getIntOption("steam-controller-haptic-pulse-scale"), 400);
+    }
+    if (parser.isSet("steam-controller-haptic-master-gain")) {
+        preferences->steamControllerHapticMasterGain = qBound(0, parser.getIntOption("steam-controller-haptic-master-gain"), 24);
+    }
 
     // Resolve --keep-awake and --no-keep-awake options
     preferences->keepAwake = parser.getToggleOptionValue("keep-awake", preferences->keepAwake);

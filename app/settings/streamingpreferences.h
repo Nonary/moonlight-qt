@@ -220,6 +220,9 @@ public:
     Q_PROPERTY(SteamControllerGrips steamControllerGrips MEMBER steamControllerGrips NOTIFY steamControllerChanged)
     Q_PROPERTY(int steamControllerRumbleHold MEMBER steamControllerRumbleHold NOTIFY steamControllerChanged)
     Q_PROPERTY(bool steamControllerStickStretch MEMBER steamControllerStickStretch NOTIFY steamControllerChanged)
+    Q_PROPERTY(int steamControllerHapticBoost MEMBER steamControllerHapticBoost NOTIFY steamControllerChanged)
+    Q_PROPERTY(int steamControllerHapticPulseScale MEMBER steamControllerHapticPulseScale NOTIFY steamControllerChanged)
+    Q_PROPERTY(int steamControllerHapticMasterGain MEMBER steamControllerHapticMasterGain NOTIFY steamControllerChanged)
     Q_PROPERTY(Language language MEMBER language NOTIFY languageChanged);
 
     Q_INVOKABLE bool retranslate();
@@ -292,6 +295,10 @@ public:
     SteamControllerGrips steamControllerGrips;
     int steamControllerRumbleHold;   // ms a host rumble is held without a refresh; 0 = unlimited
     bool steamControllerStickStretch;
+    // Bluetooth LE links only (the Android BLE driver's haptic knobs); the USB/puck path ignores them
+    int steamControllerHapticBoost;       // dB added to Steam's 0x82 tick/click gain byte (0, 6, 12, 20)
+    int steamControllerHapticPulseScale;  // percent of the 0x81 pulse on-time (100, 150, 200, 300)
+    int steamControllerHapticMasterGain;  // dB written as setting 76 in the link settings (0 = not written, 6, 12)
 
 private:
     VrrTimingOptions m_VrrTimingOptions = VrrTimingOptions::preset(1);

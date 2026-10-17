@@ -93,9 +93,10 @@ SteamControllerRunner::SteamControllerRunner(const SteamControllerConfig& config
     };
     m_ServiceThread = std::thread([this] { serviceLoop(); });
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Steam Controller (2026) driver started: motion %s, split pads %s, grips %d, rumble hold %d ms, stick stretch %s",
+                "Steam Controller (2026) driver started: motion %s, split pads %s, grips %d, rumble hold %d ms, stick stretch %s, "
+                "Bluetooth LE haptics: boost +%d dB, pulse on-time %d%%, master gain %d dB",
                 config.motion ? "on" : "off", config.splitPads ? "on" : "off", config.grips, rumbleHoldMs,
-                config.stickStretch ? "on" : "off");
+                config.stickStretch ? "on" : "off", config.hapticBoostDb, config.hapticPulseScalePercent, config.hapticMasterGainDb);
 }
 
 SteamControllerRunner::~SteamControllerRunner()

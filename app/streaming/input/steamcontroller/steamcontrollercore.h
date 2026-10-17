@@ -13,6 +13,13 @@ struct SteamControllerConfig {
     bool splitPads = true;     // both pads as two fingers on touchpad 0 (else DUAL_TOUCHPAD)
     int grips = GripsPaddles;  // what the four grip buttons become
     bool stickStretch = false; // per-axis rim stretch (session-only extents)
+
+    // Bluetooth LE links only (the Android BLE driver's haptic knobs; the defaults leave every
+    // report byte-identical to the USB path). The firmware's BLE haptic baseline is low; these
+    // lift it without the host's involvement.
+    int hapticBoostDb = 0;           // added to the signed gain byte of Steam's 0x82 ticks/clicks (clamped to -24..+6 dB)
+    int hapticPulseScalePercent = 100; // applied to the on-time (u16, bytes 2-3) of 0x81 pulses, capped at 0xFFFF
+    int hapticMasterGainDb = 0;      // written as setting 76 in the link's own settings (0 = not written)
 };
 
 // Receives what one controller decoded. Values are already in the Moonlight wire convention:

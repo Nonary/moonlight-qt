@@ -173,6 +173,8 @@ private:
     void writeFailedLocked(int generation, uint64_t nowMs);
     void writeSucceededLocked();
     void enqueueLocked(std::vector<uint8_t> report, uint64_t nowMs, bool settings = false);
+    // Bluetooth LE haptic knobs (config): 0x82 tick/click gain boost, 0x81 pulse on-time scale.
+    void adjustBleHapticLocked(std::vector<uint8_t>& report);
     void logLinkSettingsLocked(bool ok);
     // [01][type][len][payload], zero padded to FEATURE_REPORT_SIZE.
     static std::vector<uint8_t> featureFrame(uint8_t type, uint8_t length, const uint8_t* payload, int payloadLength);

@@ -12,6 +12,17 @@ const uint64_t NEVER = UINT64_MAX;
 
 std::vector<uint8_t> motorStop() { return std::vector<uint8_t>{OUT_RUMBLE, 0, 0, 0, 0, 0, 0, 0, 0, 0}; }
 
+int clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// The BLE haptic knobs within the ranges the Android BLE driver accepts.
+SteamControllerConfig sanitized(SteamControllerConfig config)
+{
+    config.hapticBoostDb = clampInt(config.hapticBoostDb, 0, HAPTIC_GAIN_MAX_DB - HAPTIC_GAIN_MIN_DB);
+    config.hapticPulseScalePercent = clampInt(config.hapticPulseScalePercent, 100, 400);
+    config.hapticMasterGainDb = clampInt(config.hapticMasterGainDb, 0, 24);
+    return config;
+}
+
 std::string slotName(const SteamHidDeviceInfo& info, int bleSlot)
 {
     char buffer[32];
@@ -34,7 +45,7 @@ SteamControllerLink::SteamControllerLink(int id, const SteamHidDeviceInfo& info,
       m_Device(std::move(device)),
       m_Listener(listener),
       m_RumbleHoldMs(rumbleHoldMs < 0 ? 0 : rumbleHoldMs),
-      m_Core(config, this)
+      m_Core(sanitized(config), this)
 {
 }
 
@@ -168,6 +179,14 @@ void SteamControllerLink::connectLocked(uint64_t nowMs)
     m_SummaryDueMs = nowMs + SUMMARY_MS;
     logf(LogInfo, "Steam Controller %s: controller connected (%s, link generation %d)",
          m_Name.c_str(), isPuck() ? "puck" : isBle() ? "Bluetooth LE" : "cable", m_Generation);
+    if (isBle()) {
+        const SteamControllerConfig& c = m_Core.config();
+        char gain[32];
+        snprintf(gain, sizeof(gain), "76=+%d dB", c.hapticMasterGainDb);
+        logf(LogInfo, "Steam Controller %s: haptics: 0x82 gain boost +%d dB (ceiling +%d dB), 0x81 pulse on-time x%d.%d, master gain setting %s",
+             m_Name.c_str(), c.hapticBoostDb, HAPTIC_GAIN_MAX_DB, c.hapticPulseScalePercent / 100, (c.hapticPulseScalePercent % 100) / 10,
+             c.hapticMasterGainDb == 0 ? "not written" : gain);
+    }
     m_Listener->linkConnected(*this, m_Generation);
     if (wake) wake();
 }
@@ -246,6 +265,9 @@ bool SteamControllerLink::steamHaptic(const uint8_t* report, int length, uint64_
         return false;
     }
     std::vector<uint8_t> copy(report, report + length);
+    if (isBle()) {
+        adjustBleHapticLocked(copy);
+    }
     if (id == OUT_RUMBLE) {
         m_HasRepeatingRumble = stopKey(copy) < 0;
         m_RepeatingRumble = copy;
@@ -259,6 +281,31 @@ bool SteamControllerLink::steamHaptic(const uint8_t* report, int length, uint64_
     enqueueLocked(std::move(copy), nowMs);
     if (wake) wake();
     return true;
+}
+
+void SteamControllerLink::adjustBleHapticLocked(std::vector<uint8_t>& r)
+{
+    const SteamControllerConfig& c = m_Core.config();
+    if (r[0] == OUT_HAPTIC_COMMAND && c.hapticBoostDb != 0 && (r[2] == HAPTIC_CMD_TICK || r[2] == HAPTIC_CMD_CLICK)) {
+        // The gain byte of a tick or click is signed dB: the boost lifts it toward the firmware's
+        // ceiling and keeps Steam's click-versus-tick balance below it. Stops (command 0) stay.
+        int gain = clampInt((int8_t)r[3] + c.hapticBoostDb, HAPTIC_GAIN_MIN_DB, HAPTIC_GAIN_MAX_DB);
+        if ((int8_t)r[3] != gain) {
+            r[3] = (uint8_t)(int8_t)gain;
+            m_SummaryAdjusted++;
+        }
+    }
+    else if (r[0] == OUT_PULSE && c.hapticPulseScalePercent != 100) {
+        // A pulse carries no gain: its strength is its on-time (Steam's slide texture is single
+        // 400 us pulses), so the scale lengthens that. Zero-repeat and zero-duration stops stay.
+        unsigned onUs = r[2] | (r[3] << 8), repeat = r[6] | (r[7] << 8);
+        if (onUs != 0 && repeat != 0) {
+            unsigned scaled = std::min<unsigned>(0xFFFF, onUs * (unsigned)c.hapticPulseScalePercent / 100);
+            r[2] = (uint8_t)scaled;
+            r[3] = (uint8_t)(scaled >> 8);
+            m_SummaryAdjusted++;
+        }
+    }
 }
 
 bool SteamControllerLink::rumble(uint16_t lowFreqMotor, uint16_t highFreqMotor, uint64_t nowMs, int expectedGeneration)
@@ -410,13 +457,16 @@ std::vector<uint8_t> SteamControllerLink::linkSettingsFrame(bool active) const
     // watchdog (71) stays disabled: armed, it reverts the settings when it never sees Steam's
     // heartbeat, which turned the cable-connected unit's IMU off between keep-alives (fork.119).
     // Identical over USB, the puck and Bluetooth LE (the firmware takes 0x87 on feature report 1
-    // over HID-over-GATT; it is 0x8F and 0xEA it refuses there).
-    uint8_t payload[9] = {
+    // over HID-over-GATT; it is 0x8F and 0xEA it refuses there). A Bluetooth LE link with the
+    // master gain preference adds setting 76 as a fourth triple (and clears it at stop).
+    uint8_t payload[12] = {
         SETTING_LIZARD_MODE, (uint8_t)(active ? 0 : 1), 0,
         SETTING_IMU_MODE, (uint8_t)((active && m_Core.config().motion) ? IMU_MODE_RAW : 0), 0,
         SETTING_STEAM_WATCHDOG_ENABLE, 0, 0,
+        SETTING_HAPTIC_MASTER_GAIN_DB, (uint8_t)(active ? m_Core.config().hapticMasterGainDb : 0), 0,
     };
-    return featureFrame(CMD_SET_SETTINGS_VALUES, sizeof(payload), payload, sizeof(payload));
+    const uint8_t length = (isBle() && m_Core.config().hapticMasterGainDb != 0) ? 12 : 9;
+    return featureFrame(CMD_SET_SETTINGS_VALUES, length, payload, length);
 }
 
 bool SteamControllerLink::sendFeature(const std::vector<uint8_t>& frame)
@@ -432,8 +482,12 @@ bool SteamControllerLink::configure(bool active)
 void SteamControllerLink::logLinkSettingsLocked(bool ok)
 {
     m_ConfigureState = ok ? 1 : 2;
-    logf(LogInfo, "Steam Controller %s: link settings (feature report 1, interface %d): lizard mode 0, IMU mode 0x%x, Steam watchdog 0 -> %s",
-         m_Name.c_str(), m_Info.interfaceNumber, m_Core.config().motion ? IMU_MODE_RAW : 0, ok ? "accepted" : "write failed");
+    char gain[48] = "";
+    if (isBle() && m_Core.config().hapticMasterGainDb != 0) {
+        snprintf(gain, sizeof(gain), ", haptic master gain +%d dB", m_Core.config().hapticMasterGainDb);
+    }
+    logf(LogInfo, "Steam Controller %s: link settings (feature report 1, interface %d): lizard mode 0, IMU mode 0x%x, Steam watchdog 0%s -> %s",
+         m_Name.c_str(), m_Info.interfaceNumber, m_Core.config().motion ? IMU_MODE_RAW : 0, gain, ok ? "accepted" : "write failed");
 }
 
 bool SteamControllerLink::featureQuery(uint8_t type, uint8_t length, const uint8_t* payload, int payloadLength, std::vector<uint8_t>& reply)

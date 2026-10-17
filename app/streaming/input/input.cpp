@@ -243,6 +243,9 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
                        prefs.steamControllerGrips == StreamingPreferences::SCG_OFF ? SteamControllerConfig::GripsOff :
                        SteamControllerConfig::GripsPaddles;
         config.stickStretch = prefs.steamControllerStickStretch;
+        config.hapticBoostDb = prefs.steamControllerHapticBoost;
+        config.hapticPulseScalePercent = prefs.steamControllerHapticPulseScale;
+        config.hapticMasterGainDb = prefs.steamControllerHapticMasterGain;
         m_SteamHost = new SteamControllerHost();
         SteamControllerHost::setActiveGamepadMask(m_GamepadMask);
         m_SteamController = new SteamControllerRunner(config, prefs.steamControllerRumbleHold, m_SteamHost);
