@@ -211,6 +211,16 @@ jobs:
           & ./build/tests-vrr/haptics/release/tst_dualsensehaptics.exe
           if ($LASTEXITCODE -ne 0) { throw "DualSense haptics tests failed: $LASTEXITCODE" }
 
+      - name: Test Steam Controller (2026) driver (Windows x64)
+        timeout-minutes: 2
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $deploy = (Resolve-Path build/deploy-x64-release).Path
+          $env:Path = "$deploy;$env:Path"
+          & ./build/tests-vrr/steamcontroller/release/tst_steamcontroller.exe
+          if ($LASTEXITCODE -ne 0) { throw "Steam Controller driver tests failed: $LASTEXITCODE" }
+
       - name: Stage and smoke-test VRR replay (Windows x64)
         if: runner.os == 'Windows'
         timeout-minutes: 2

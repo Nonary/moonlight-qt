@@ -248,9 +248,10 @@ jobs:
         timeout-minutes: 30
         run: |
           set -euo pipefail
-          mkdir -p build/nightly-tests-updates build/nightly-tests-haptics
+          mkdir -p build/nightly-tests-updates build/nightly-tests-haptics build/nightly-tests-steamcontroller
           (cd build/nightly-tests-updates && qmake6 ../../tests/updates/updates.pro CONFIG+=release && make -j"$BUILD_JOBS" && ./tst_autoupdatechecker)
           (cd build/nightly-tests-haptics && qmake6 ../../tests/haptics/haptics.pro CONFIG+=release && make -j"$BUILD_JOBS" && ./tst_dualsensehaptics)
+          (cd build/nightly-tests-steamcontroller && qmake6 ../../tests/steamcontroller/steamcontroller.pro CONFIG+=release && make -j"$BUILD_JOBS" && ./tst_steamcontroller)
           mkdir -p build/nightly-tests-feedback build/nightly-tests-present build/nightly-tests-gpu
           (cd build/nightly-tests-feedback && qmake6 ../../tests/vrr/waylandfeedback.pro && make -j"$BUILD_JOBS" && ./tst_waylandfeedback)
           (cd build/nightly-tests-present && qmake6 ../../tests/vrr/plvkpresentation.pro && make -j"$BUILD_JOBS" && ./tst_plvkpresentation)
