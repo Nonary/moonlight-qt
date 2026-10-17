@@ -57,7 +57,7 @@ public:
     void handleBattery(const uint8_t* p, int size, int offset);
 
     // Host request: motion reports of this type at this rate (0 = stop). Decimated like
-    // SdlInputHandler::handleControllerSensorEvent (period 1000/rate ms, unchanged samples skipped).
+    // Millisecond intervals round up; unchanged samples are skipped. Only rate 0 disables a sensor.
     void setMotionRate(uint8_t motionType, uint16_t reportRateHz);
 
     // Replay for a new announcement: the next report resends its state and pad DOWNs.
@@ -91,7 +91,7 @@ private:
     float m_LastTouchX[2] = {0, 0}, m_LastTouchY[2] = {0, 0}, m_LastTouchPressure[2] = {0, 0};
 
     // Motion decimation per type (index 0 accel, 1 gyro)
-    uint8_t m_MotionPeriodMs[2] = {0, 0};
+    uint16_t m_MotionPeriodMs[2] = {0, 0};
     uint64_t m_LastMotionTime[2] = {0, 0};
     float m_LastMotionData[2][3] = {{0, 0, 0}, {0, 0, 0}};
     bool m_MotionSeen[2] = {false, false};

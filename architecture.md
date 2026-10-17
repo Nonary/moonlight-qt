@@ -4934,6 +4934,20 @@ queued audio latency. Muting can suppress audio processing without retiming VRR.
 
 Input goes from SDL handlers to common-library input APIs and a separate sender.
 
+Steam Controller (2026) USB/puck input also has a direct HID path
+(`app/streaming/input/steamcontroller`, based on `51a884d1`). Reader threads
+publish input through a registry of announced link generations; the SDL main
+thread owns arrival/removal and player allocation. Feedback snapshots both the
+link and its announced generation, releases the registry mutex, then validates
+that generation under the link mutex before changing haptics or motion rates.
+This prevents an old arrival from controlling a replacement unit while SDL
+arrival/removal events are pending, without reversing the link-to-registry
+lock order. Motion intervals use 16 bits, round up to milliseconds and reserve
+zero for disabled sensors. Failed HID opens retry on the manager's bounded
+rescan schedule. `tests/steamcontroller` exercises the production registry,
+decoder and link with SDL/network/HID boundaries replaced by deterministic
+fakes; it does not establish physical controller behavior.
+
 Windows/Linux DualSense waveform feedback (updated 2026-10-05) runs separately
 from video and ordinary stream audio. A Bluetooth Sony DualSense/Edge with an
 exact SDL HID device path can advertise controller capability

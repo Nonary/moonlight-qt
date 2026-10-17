@@ -3,6 +3,7 @@
 // fake transport and a virtual clock. No SDL, no device: the byte sequences are the Android
 // client's regression harness (tools/regression/test_steam_usb.py) and the real unit's replies.
 #include "../../app/streaming/input/steamcontroller/steamcontrollerlink.h"
+#include "../../app/streaming/input/steamcontroller/steamcontrollerhost.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -13,6 +14,18 @@
 #include <vector>
 
 using namespace SteamController;
+
+// Network boundary only: execute the real registry and link bodies without a stream.
+extern "C" {
+int LiSendControllerArrivalEvent(uint8_t, uint16_t, uint8_t, uint32_t, uint16_t) { return 0; }
+int LiSendMultiControllerEvent(short, short, int, unsigned char, unsigned char, short, short, short, short) { return 0; }
+int LiSendControllerTouchEvent2(uint8_t, uint8_t, uint8_t, uint32_t, float, float, float) { return 0; }
+int LiSendControllerMotionEvent(uint8_t, uint8_t, float, float, float) { return 0; }
+int LiSendControllerBatteryEvent(uint8_t, uint8_t, uint8_t) { return 0; }
+#if STEAM_CONTROLLER_LI_EXTENSIONS
+int LiSendSteamControllerAttributesEvent(uint8_t, const LI_STEAM_CONTROLLER_ATTRIBUTES*) { return 0; }
+#endif
+}
 
 static int g_Checks, g_Failed;
 
@@ -747,6 +760,88 @@ static void testWired()
     m.stop(g_Now);
 }
 
+static void testMotionRateBounds()
+{
+    const struct { uint16_t rate; uint16_t period; } cases[] = {
+        {1, 1000}, {2, 500}, {3, 334}, {250, 4}, {1000, 1}, {1001, 1}, {65535, 1}
+    };
+    for (const auto& c : cases) {
+        for (uint8_t type : {LI_MOTION_TYPE_ACCEL, LI_MOTION_TYPE_GYRO}) {
+            CoreSink sink;
+            SteamControllerCore core(SteamControllerConfig{}, &sink);
+            core.setMotionRate(type, c.rate);
+            auto report = imu(0x42);
+            core.handleState(report.data(), (int)report.size(), 1, false, 0);
+            check(sink.motion.size() == 1, "every positive motion rate enables the requested sensor");
+            put16(report, type == LI_MOTION_TYPE_ACCEL ? 34 : 40, 1234);
+            core.handleState(report.data(), (int)report.size(), 1, false, c.period - 1);
+            check(sink.motion.size() == 1, "motion never runs ahead of the requested interval");
+            core.handleState(report.data(), (int)report.size(), 1, false, c.period);
+            check(sink.motion.size() == 2, "motion resumes at the full-width interval boundary");
+            core.setMotionRate(type, 0);
+            put16(report, type == LI_MOTION_TYPE_ACCEL ? 34 : 40, 2345);
+            core.handleState(report.data(), (int)report.size(), 1, false, c.period * 2);
+            check(sink.motion.size() == 2, "zero motion rate disables the sensor after any positive rate");
+        }
+    }
+}
+
+static void testOpenRetry()
+{
+    FakeTransport io;
+    io.add("transient/usb", PRODUCT_WIRED, 0, VENDOR_USAGE_PAGE);
+    io.unopenable.push_back("transient/usb");
+    Events events;
+    SteamControllerManager manager(io, SteamControllerConfig{}, 500, &events);
+    manager.service(0);
+    check(manager.links().empty(), "a failed HID open creates no link");
+    io.unopenable.clear();
+    manager.service(SteamControllerManager::RESCAN_MS - 1);
+    check(manager.links().empty(), "HID open retry waits for the bounded rescan interval");
+    manager.service(SteamControllerManager::RESCAN_MS);
+    check(manager.links().size() == 1, "a transient HID open failure recovers without unplugging the device");
+    manager.stop(SteamControllerManager::RESCAN_MS);
+}
+
+static void testHostFeedbackGeneration()
+{
+    SteamControllerHost host;
+    SteamControllerHost::setActiveGamepadMask(1);
+    auto device = std::make_shared<FakeState>();
+    SteamHidDeviceInfo info;
+    info.productId = PRODUCT_PUCK;
+    info.interfaceNumber = 2;
+    auto link = std::make_shared<SteamControllerLink>(1000, info,
+        std::unique_ptr<SteamHidDevice>(new FakeDevice(device)), SteamControllerConfig{}, 500, &host);
+    input(*link, state(0x45));
+    host.announce(0, link, link->generation());
+    auto effect = pulse(0, 1);
+    SteamControllerHost::clSteamHaptic(0, (uint8_t)effect.size(), effect.data());
+    check(link->queuedOutputs() == 1, "announced generation accepts host haptic feedback");
+
+    // Reader events can run ahead of the SDL main thread. The registry still
+    // names the first generation while the same receiver slot hosts a new one.
+    input(*link, {0x79, 1});
+    input(*link, {0x79, 2});
+    SteamControllerHost::clSteamHaptic(0, (uint8_t)effect.size(), effect.data());
+    check(link->queuedOutputs() == 0, "old arrival cannot send a haptic to a reconnected puck slot");
+    SteamControllerHost::rumble(0, 100, 200);
+    check(link->queuedOutputs() == 0, "old arrival cannot start rumble on a reconnected puck slot");
+    check(!SteamControllerHost::setMotionEventState(0, LI_MOTION_TYPE_GYRO, 250),
+          "old arrival cannot change a reconnected slot's motion configuration");
+
+    host.retire(link, 0, 0);
+    SteamControllerHost::setActiveGamepadMask(1);
+    host.announce(0, link, link->generation());
+    SteamControllerHost::clSteamHaptic(0, (uint8_t)effect.size(), effect.data());
+    check(link->queuedOutputs() == 1, "new arrival enables feedback for the replacement generation");
+    check(SteamControllerHost::setMotionEventState(0, LI_MOTION_TYPE_GYRO, 250),
+          "new arrival enables motion requests for the replacement generation");
+    host.shutdown();
+    check(!SteamControllerHost::rumble(0, 100, 200), "session shutdown retires the feedback registry");
+    link->stop(g_Now);
+}
+
 int main()
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -756,6 +851,9 @@ int main()
         testCore();
         testLink();
         testWired();
+        testMotionRateBounds();
+        testOpenRetry();
+        testHostFeedbackGeneration();
     }
     catch (const std::exception& ex) {
         printf("FAIL exception: %s\n", ex.what());

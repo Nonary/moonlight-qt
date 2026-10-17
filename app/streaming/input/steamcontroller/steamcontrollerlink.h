@@ -102,10 +102,12 @@ public:
     // Returns the next time (ms) it wants to run, or UINT64_MAX when idle.
     uint64_t service(uint64_t nowMs);
 
-    // Host side (any thread). Haptic reports carry their id first; invalid ones are dropped.
-    void steamHaptic(const uint8_t* report, int length, uint64_t nowMs);
-    void rumble(uint16_t lowFreqMotor, uint16_t highFreqMotor, uint64_t nowMs);
-    void setMotionRate(uint8_t motionType, uint16_t reportRateHz);
+    // Host side (any thread). Pass the registry's announced generation to reject
+    // feedback after a reconnect, atomically with mutation under the link mutex.
+    // Zero leaves local callers unscoped. False means the request was rejected.
+    bool steamHaptic(const uint8_t* report, int length, uint64_t nowMs, int expectedGeneration = 0);
+    bool rumble(uint16_t lowFreqMotor, uint16_t highFreqMotor, uint64_t nowMs, int expectedGeneration = 0);
+    bool setMotionRate(uint8_t motionType, uint16_t reportRateHz, int expectedGeneration = 0);
     // The next report resends its state and pad DOWNs (after an announcement). Lock-free.
     void requestInputReset() { m_InputResetPending = true; }
     // Re-delivers the cached attributes and battery through the listener (after an announcement).

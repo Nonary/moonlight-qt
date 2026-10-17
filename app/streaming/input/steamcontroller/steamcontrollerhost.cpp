@@ -32,11 +32,11 @@ struct Registry {
         return -1;
     }
     // Under mutex: the link announced as this controller number (the first in single-controller mode).
-    std::shared_ptr<SteamControllerLink> linkFor(uint16_t number) const {
+    Entry entryFor(uint16_t number) const {
         for (const Entry& e : entries) {
-            if (e.number == number) return e.link;
+            if (e.number == number) return e;
         }
-        return nullptr;
+        return {};
     }
 };
 
@@ -134,14 +134,14 @@ void SteamControllerHost::pushEvent(const SteamControllerLink& link, int generat
 void SteamControllerHost::clSteamHaptic(uint16_t controllerNumber, uint8_t length, const uint8_t* report)
 {
     if (controllerNumber >= MAX_STEAM_SLOTS || report == nullptr || length == 0) return;
-    std::shared_ptr<SteamControllerLink> link;
+    Entry entry;
     {
         Registry& r = registry();
         std::lock_guard<std::mutex> lock(r.mutex);
         if (!r.alive) return;
-        link = r.linkFor(controllerNumber);
+        entry = r.entryFor(controllerNumber);
     }
-    if (link) link->steamHaptic(report, length, SteamController::nowMs());
+    if (entry.link) entry.link->steamHaptic(report, length, SteamController::nowMs(), entry.generation);
 }
 
 void SteamControllerHost::clSteamSettings(uint16_t controllerNumber, uint8_t command, uint8_t count, const uint8_t* triples)
@@ -161,32 +161,29 @@ void SteamControllerHost::clSteamSettings(uint16_t controllerNumber, uint8_t com
 bool SteamControllerHost::rumble(uint16_t controllerNumber, uint16_t lowFreqMotor, uint16_t highFreqMotor)
 {
     if (controllerNumber >= MAX_STEAM_SLOTS) return false;
-    std::shared_ptr<SteamControllerLink> link;
+    Entry entry;
     {
         Registry& r = registry();
         std::lock_guard<std::mutex> lock(r.mutex);
         if (!r.alive) return false;
-        link = r.linkFor(controllerNumber);
+        entry = r.entryFor(controllerNumber);
     }
-    if (!link) return false;
-    link->rumble(lowFreqMotor, highFreqMotor, SteamController::nowMs());
-    return true;
+    return entry.link && entry.link->rumble(lowFreqMotor, highFreqMotor, SteamController::nowMs(), entry.generation);
 }
 
 bool SteamControllerHost::setMotionEventState(uint16_t controllerNumber, uint8_t motionType, uint16_t reportRateHz)
 {
     if (controllerNumber >= MAX_STEAM_SLOTS) return false;
-    std::shared_ptr<SteamControllerLink> link;
+    Entry entry;
     {
         Registry& r = registry();
         std::lock_guard<std::mutex> lock(r.mutex);
         if (!r.alive) return false;
-        link = r.linkFor(controllerNumber);
+        entry = r.entryFor(controllerNumber);
     }
-    if (!link) return false;
-    link->setMotionRate(motionType, reportRateHz);
+    if (!entry.link || !entry.link->setMotionRate(motionType, reportRateHz, entry.generation)) return false;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Steam Controller %s: motion type %u at %u Hz (host request)",
-                link->name().c_str(), motionType, reportRateHz);
+                entry.link->name().c_str(), motionType, reportRateHz);
     return true;
 }
 

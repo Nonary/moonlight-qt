@@ -89,7 +89,7 @@ void SteamControllerCore::setMotionRate(uint8_t motionType, uint16_t reportRateH
 {
     int index = motionType == LI_MOTION_TYPE_ACCEL ? 0 : motionType == LI_MOTION_TYPE_GYRO ? 1 : -1;
     if (index < 0) return;
-    m_MotionPeriodMs[index] = reportRateHz ? (uint8_t)(1000 / reportRateHz) : 0;
+    m_MotionPeriodMs[index] = reportRateHz ? (uint16_t)((1000u + reportRateHz - 1) / reportRateHz) : 0;
     m_MotionSeen[index] = false;
 }
 
