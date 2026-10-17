@@ -7,8 +7,9 @@
 //
 // Lock order: a link's mutex may be held when the registry mutex is taken (reader thread ->
 // listener -> registry); the registry mutex is a leaf. Host callbacks copy the link out of the
-// registry and call it after releasing the registry mutex. The main thread never holds the
-// registry mutex while calling into a link.
+// registry with its announced generation and call it after releasing the registry mutex.
+// The link validates that generation under its own mutex before accepting feedback. The main
+// thread never holds the registry mutex while calling into a link.
 #pragma once
 
 #include "steamcontrollerlink.h"

@@ -190,16 +190,17 @@ void SteamControllerLink::writeSucceededLocked()
     m_OutputFailures = 0;
 }
 
-void SteamControllerLink::steamHaptic(const uint8_t* report, int length, uint64_t nowMs)
+bool SteamControllerLink::steamHaptic(const uint8_t* report, int length, uint64_t nowMs, int expectedGeneration)
 {
     std::lock_guard<std::mutex> lock(m_Mutex);
-    if (m_Stopped || !m_Connected || report == nullptr || length <= 0 || length != outputReportSize(report[0])) {
-        return;
+    if (m_Stopped || !m_Connected || (expectedGeneration != 0 && expectedGeneration != m_Generation) ||
+            report == nullptr || length <= 0 || length != outputReportSize(report[0])) {
+        return false;
     }
     int id = report[0];
     // Invalid side values must not consume the finite stop-priority queue.
     if ((id == OUT_PULSE || id == OUT_HAPTIC_COMMAND) && report[1] > 2) {
-        return;
+        return false;
     }
     std::vector<uint8_t> copy(report, report + length);
     if (id == OUT_RUMBLE) {
@@ -214,19 +215,24 @@ void SteamControllerLink::steamHaptic(const uint8_t* report, int length, uint64_
     else m_SummaryOther++;
     enqueueLocked(std::move(copy), nowMs);
     if (wake) wake();
+    return true;
 }
 
-void SteamControllerLink::rumble(uint16_t lowFreqMotor, uint16_t highFreqMotor, uint64_t nowMs)
+bool SteamControllerLink::rumble(uint16_t lowFreqMotor, uint16_t highFreqMotor, uint64_t nowMs, int expectedGeneration)
 {
     uint8_t report[10] = {OUT_RUMBLE, 0, 0, 0, (uint8_t)lowFreqMotor, (uint8_t)(lowFreqMotor >> 8),
                           0, (uint8_t)highFreqMotor, (uint8_t)(highFreqMotor >> 8), 0};
-    steamHaptic(report, sizeof(report), nowMs);
+    return steamHaptic(report, sizeof(report), nowMs, expectedGeneration);
 }
 
-void SteamControllerLink::setMotionRate(uint8_t motionType, uint16_t reportRateHz)
+bool SteamControllerLink::setMotionRate(uint8_t motionType, uint16_t reportRateHz, int expectedGeneration)
 {
     std::lock_guard<std::mutex> lock(m_Mutex);
+    if (m_Stopped || !m_Connected || (expectedGeneration != 0 && expectedGeneration != m_Generation)) {
+        return false;
+    }
     m_Core.setMotionRate(motionType, reportRateHz);
+    return true;
 }
 
 void SteamControllerLink::replayForArrival(int generation)
@@ -601,7 +607,9 @@ void SteamControllerManager::rescan(uint64_t nowMs)
             if (!device) {
                 logf(LogWarn, "Steam Controller: cannot open %s (product 0x%04x, interface %d); check the hidraw permissions (udev rule) on Linux",
                      info.path.c_str(), info.productId, info.interfaceNumber);
-                m_RejectedPaths.push_back(info.path);
+                // Open can fail temporarily while another application releases
+                // the device or permissions settle. Retry at the next bounded
+                // rescan; only a failed collection probe is cached below.
                 continue;
             }
             const char* how = "usage page 0xff00";
