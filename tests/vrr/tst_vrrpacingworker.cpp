@@ -893,12 +893,31 @@ void runLatencyFixQueuedRecovery(int streamRateHz, bool enabled,
            "presented and skipped decoded images must each be released exactly once");
 }
 
+void testRecoveryProtectedQueueBoundary()
+{
+    PacedFrame front(nullptr, 2, 750, true, 1000000);
+    PacedFrame next(nullptr, 3, 1500, true, 1000000);
+    const uint64_t sourcePeriod = 8333;
+    const uint64_t protectedDelay = 4166 + sourcePeriod;
+    expect(!VrrFrameDropPolicy::beforeDecodeWait(front,next,1000000,1020832,sourcePeriod,false,protectedDelay),
+           "2.5 periods must retain intentionally protected recovery work");
+    expect(!VrrFrameDropPolicy::beforeDecodeWait(front,next,1000000,1020833,sourcePeriod,false,protectedDelay),
+           "a queued frame at the protected horizon must remain eligible");
+    expect(VrrFrameDropPolicy::beforeDecodeWait(front,next,1000000,1020834,sourcePeriod,false,protectedDelay),
+           "a queued frame beyond the protected horizon must expire");
+    expect(VrrFrameDropPolicy::beforeDecodeWait(front,next,1000000,1024999,sourcePeriod,false,protectedDelay),
+           "three periods must exceed even full bounded recovery protection");
+}
+
 void testLatencyFixQueuedRecovery()
 {
     runLatencyFixQueuedRecovery(120, true, true);
     runLatencyFixQueuedRecovery(116, true, true);
-    runLatencyFixQueuedRecovery(120, true, true, 2500);
-    runLatencyFixQueuedRecovery(116, true, true, 2500);
+    // Three periods exceeds both ordinary expiry and the intentionally
+    // protected half-period buffer plus one-period recovery carry. The old
+    // 2.5-period fixture sat within1us of that valid protected horizon.
+    runLatencyFixQueuedRecovery(120, true, true, 3000);
+    runLatencyFixQueuedRecovery(116, true, true, 3000);
     runLatencyFixQueuedRecovery(120, false, true);
     runLatencyFixQueuedRecovery(110, true, true);
     runLatencyFixQueuedRecovery(120, true, false);
@@ -3935,7 +3954,7 @@ void testTraceQueueConcurrency()
         expect(bounded.pop(value) && value == i, "trace queue must preserve order across wrap");
     uint64_t value = 0;
     expect(!bounded.pop(value), "an empty trace queue must reject immediately");
-    struct Row { uint64_t producer = 0, sequence = 0, checksum = 0; };
+    struct Row { uint64_t producer = 0, sequence = 0, checksum = 0; VrrBufferAuditSnapshot before, after; };
     Vrr13::TraceQueue<Row, 1024> queue;
     constexpr unsigned producers = 3, rows = 20000;
     std::array<std::thread, producers> threads;
@@ -3943,6 +3962,7 @@ void testTraceQueueConcurrency()
         threads[p] = std::thread([&, p] {
             for (unsigned i = 0; i < rows; ++i) {
                 Row row{p, i, (uint64_t(p) << 32) ^ i ^ 0xabcddcba};
+                row.before.atUs=i;row.before.layerId=p;row.after.currentUs=row.checksum;row.after.slewDeltaUs=-int64_t(i);
                 while (!queue.push(std::move(row))) std::this_thread::yield();
             }
         });
@@ -3955,6 +3975,7 @@ void testTraceQueueConcurrency()
         valid &= row.producer < producers;
         if (row.producer < producers) valid &= row.sequence == next[row.producer]++;
         valid &= row.checksum == ((row.producer << 32) ^ row.sequence ^ 0xabcddcba);
+        valid &= row.before.atUs==row.sequence && row.before.layerId==row.producer && row.after.currentUs==row.checksum && row.after.slewDeltaUs==-int64_t(row.sequence);
         ++i;
     }
     for (auto& thread : threads) thread.join();
@@ -4201,6 +4222,7 @@ int main()
     runNamed("testExpiredQueueSkipsBlockingDecode()", [&] { testExpiredQueueSkipsBlockingDecode(); });
     runNamed("testSinglePeriodQueueDelayPreservesFluidity()", [&] { testSinglePeriodQueueDelayPreservesFluidity(); });
     runNamed("testLatencyFixDropBoundaries()", [&] { testLatencyFixDropBoundaries(); });
+    runNamed("testRecoveryProtectedQueueBoundary()", [&] { testRecoveryProtectedQueueBoundary(); });
     runNamed("testLatencyFixQueuedRecovery()", [&] { testLatencyFixQueuedRecovery(); });
     runNamed("testLatencyPresetsQueuedRecovery()", [&] { testLatencyPresetsQueuedRecovery(); });
     runNamed("testDecodeWaitDoesNotExpireReadyFrame()", [&] { testDecodeWaitDoesNotExpireReadyFrame(); });

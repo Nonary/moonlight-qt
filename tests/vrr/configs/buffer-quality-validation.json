@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "purpose": "Predeclared fresh arrival/service workloads, fixed before first execution. No target/window tuning after evaluation.",
+  "session": {"display_hz": 120, "stream_hz": 116, "native_sync": false, "native_scheduled": false, "target_ppm": 995000, "window_us": 120000000, "tolerance_us": 500},
+  "seed": 53691,
+  "cases": [
+    {"name": "steady-fresh", "duration_s": 180, "kind": "steady"},
+    {"name": "source-rate-return-fresh", "duration_s": 180, "kind": "rates", "disturbance_end_us": 101000000},
+    {"name": "legitimate-source-gap-fresh", "duration_s": 180, "kind": "source-gap", "disturbance_end_us": 80000000},
+    {"name": "delivery-clusters-fresh", "duration_s": 180, "kind": "delivery", "disturbance_end_us": 61000000},
+    {"name": "render-backlog-fresh", "duration_s": 180, "kind": "render", "disturbance_end_us": 71000000},
+    {"name": "decode-completion-fresh", "duration_s": 180, "kind": "decode", "disturbance_end_us": 71000000},
+    {"name": "expired-return-fresh", "duration_s": 200, "kind": "expiry", "disturbance_end_us": 175000000},
+    {"name": "quiet-drain-fresh", "duration_s": 300, "kind": "drain", "disturbance_end_us": 61000000}
+  ],
+  "gates": {
+    "source_inputs_identical": true,
+    "trace_rows_dropped": 0,
+    "frame_release_errors": 0,
+    "unknown_display_is_not_success": true,
+    "same_target_window_tolerance": true,
+    "maximum_extra_latency_p99_us": 500,
+    "maximum_extra_latency_max_us": 500,
+    "maximum_extra_hitch_run": 0,
+    "maximum_extra_hitches_1s": 0,
+    "maximum_extra_error_severity_us": 0,
+    "maximum_extra_B_cycles_T": 0
+    ,"maximum_extra_settling_us": 0,
+    "maximum_extra_drain_us": 0
+  }
+}

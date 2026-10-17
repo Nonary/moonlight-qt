@@ -327,6 +327,8 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/absorbedjitter.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/bufferaudit.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/rollingquantile.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/phasetrajectory.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
@@ -336,6 +338,7 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/inputlayercadence.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/receivedriftclock.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/inputcoveragehistory.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/extrabufferslew.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/sourcegapsmoothing.h \

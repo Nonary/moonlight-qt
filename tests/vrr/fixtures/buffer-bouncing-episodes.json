@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "scope": "Consumed regression recordings only. Preserve full prefix for controller state; episode window is descriptive, not a fresh validation holdout.",
+  "captures": [
+    {
+      "name": "recorded-B-bouncing-012513",
+      "basename": "moonlight-pacing-20261017-012513-42054.vrrtrace",
+      "sha256": "1a5ce6557869729f31e275b86ac28df0333a8674981be9eefd3c5d039b51ee9d",
+      "episode_start_us": 46538773,
+      "episode_end_us": 63509816,
+      "full_prefix_required": true,
+      "display_proof": false
+    }
+  ]
+}

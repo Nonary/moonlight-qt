@@ -373,8 +373,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.playoutGpuReadinessAdaptation > 1) {
         return fail("prediction-only, display event requirement, native hitch adaptation, readiness adaptation, stable smoothness reference, learned preparation lead, observed-period cap, capacity telemetry, absorbed jitter release, and GPU readiness flags must be 0 or 1");
     }
-    if (value.playoutInputClockRelativeHistory > 3) {
-        return fail("playout_input_clock_relative_history must be 0 to 3");
+    if (value.playoutInputClockRelativeHistory > 4) {
+        return fail("playout_input_clock_relative_history must be 0 to 4");
     }
     if (value.playoutInputPercentileToleranceUs != 0 &&
         (value.playoutInputPercentileToleranceUs < 250 || value.playoutInputPercentileToleranceUs > 2000 ||
@@ -961,6 +961,29 @@ bool applyVrrReplayOverride(const QString& expression,
     error = "override must start with controller., worker., display., or execution.: " +
         expression;
     return false;
+}
+
+QString vrrLegacyControllerParameterDefaultText(const QString& path)
+{
+    const QString name = path.startsWith("controller.") ? path.mid(11) : path;
+    QString schemaDefault;
+#define VRR_SCHEMA_DEFAULT(type, jsonName, memberName, defaultValue) \
+    if (name == QStringLiteral(#jsonName)) schemaDefault = QString::number(static_cast<qulonglong>(defaultValue));
+    VRR_TIMING_PARAMETER_FIELDS(VRR_SCHEMA_DEFAULT)
+#undef VRR_SCHEMA_DEFAULT
+    if (schemaDefault.isEmpty()) return {};
+    if (name == "render_baseline_percentile") return "50";
+    if (name == "pacing_latency_budget_divisor") return "0";
+    if (name.endsWith("_period_numerator")) return "0";
+    if (name.endsWith("_period_denominator")) return "1";
+    if (name == "latch_base_guard_exit") return "1";
+    if (name == "cadence_stability_latch_frames" || name == "source_playout_delay_us" ||
+            name == "readiness_learning_window_us" || name == "retain_readiness_on_phase_reset" ||
+            name == "timestamp_playout_enabled") return "0";
+    if (name == "playout_offset_window_us") return "3000000";
+    if (name == "playout_offset_slew_us") return "20";
+    if (name == "playout_offset_warmup_samples") return "64";
+    return schemaDefault;
 }
 
 bool applyVrrReplayControllerSnapshot(const QJsonObject& object,

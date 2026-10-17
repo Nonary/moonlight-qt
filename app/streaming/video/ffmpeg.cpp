@@ -1422,8 +1422,17 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
         offset += ret;
 
-        // Only advanced tracing replaces the normal rows with a breakdown.
-        if (!advancedStats || !stats.vrrPresentedFrames) {
+        // A VRR budget overlaps measured pacing waits. Present the complete
+        // measured interval once, with included components and one denominator.
+        if (!advancedStats && (stats.vrrTelemetryActive || stats.vrrPresentedFrames)) {
+            const auto timing = PerformanceStats::formatClientTiming(
+                stats.totalClientProcessingTimeUs, stats.totalQueuePacingTimeUs,
+                stats.totalRenderingTimeUs, stats.renderedFrames);
+            ret = snprintf(&output[offset], length - offset, "%s", timing.c_str());
+            if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
+            offset += ret;
+        }
+        else if (!advancedStats || !stats.vrrPresentedFrames) {
             ret = snprintf(&output[offset], length - offset,
                            "Average frame queue delay: %.2f ms\n"
                            "Average rendering time (including monitor V-sync latency): %.2f ms\n",
@@ -1555,7 +1564,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 break;
             }
             ret = snprintf(&output[offset], length - offset,
-                "\nVRR buffer: %.2f ms added (limit %.2f ms) | %s\n"
+                "\nVRR buffer budget: %.2f ms (limit %.2f ms; not added to measured times) | %s\n"
                 "Buffer status: %s\n",
                 stats.vrrAppliedBufferUs / 1000.0, stats.vrrBufferCapUs / 1000.0,
                 stats.vrrTelemetryActive ? "Active" : "Inactive", reason);

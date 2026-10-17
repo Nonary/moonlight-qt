@@ -67,6 +67,8 @@ ratepolicy.file = $$PWD/ratepolicy.pro
 diagnostics.file = $$PWD/diagnostics.pro
 pacingworker.file = $$PWD/pacingworker.pro
 replay.file = $$PWD/replay.pro
+workerreplay.file = $$PWD/workerreplay.pro
+SUBDIRS += workerreplay
 replayconfig.file = $$PWD/replayconfig.pro
 queuesim.file = $$PWD/queuesim.pro
 
@@ -96,6 +98,8 @@ phasetrajectory.file = $$PWD/phasetrajectory.pro
 SUBDIRS += phasetrajectory
 inputpercentileintegration.file = $$PWD/inputpercentileintegration.pro
 SUBDIRS += inputpercentileintegration
+rollingquantile.file = $$PWD/rollingquantile.pro
+SUBDIRS += rollingquantile
 
 performancestats.file = $$PWD/performancestats.pro
 SUBDIRS += performancestats
@@ -103,3 +107,10 @@ SUBDIRS += performancestats
 # Clock-relative history and bounded recovery credit regression.
 SUBDIRS += inputaccounting
 inputaccounting.file = $$PWD/inputaccounting.pro
+
+receivedriftclock.file = $$PWD/receivedriftclock.pro
+SUBDIRS += receivedriftclock
+
+# Effective production policy must select the matching cache namespace.
+vrrcacheidentity.file = $$PWD/vrrcacheidentity.pro
+SUBDIRS += vrrcacheidentity

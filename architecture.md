@@ -1,3 +1,52 @@
+## Receive-clock correction (2026-10-17)
+
+New sessions select input clock-relative history revision4. Revisions0--3 keep
+historical replay semantics. The drift observer fits packet-receive/RTP offsets,
+using100ms bucket minima over the existing120s clock-fit window, rather than
+fitting producer mapping that includes decoder service. Buffer learning history,
+coverage target/tolerance, rate layers and actuator rise/fall laws are unchanged.
+A material change in actual source cadence starts a new drift-fit window without
+resetting buffer evidence or accumulated clock coordinates; it retains the last
+qualified oscillator slope while reacquiring. Clock qualification is independent
+of cached FPS layer selection. Invalid packets do not become evidence and an
+unrefreshed slope expires after120s. Calibration identity includes clock revision.
+Cache identity resolves the same effective adaptive session options as the worker
+before constructing policy tags, so new clock sessions cannot share an older
+clock policy's startup-delay namespace. The configured goal/window remain learning
+objectives; native synthetic tests can still contain below-target windows. Native
+correctness evidence and target attainment must be reported separately.
+
+Buffer quality observability (2026-10-17, accepted base `75e97d26`):
+the CPU optimization and eligible-age/fresh-reacquisition correction are now
+separate local commits. The staged native A/B binaries remain unchanged.
+Decision-applied B (`playout_delay_us`) is distinct from the historical
+post-feedback controller snapshot. Opt-in `MOONLIGHT_VRR_BUFFER_AUDIT=1` adds
+typed before/after scalar snapshots, stable cached-layer identity, eligible
+evidence age, qualification/authorization reasons and normal slew budgets.
+The existing bounded asynchronous trace handoff owns formatting and accounting.
+Frozen-input `vrrreplay` and production-worker virtual-clock `vrrworkerreplay`
+answer different questions: only the latter recalculates admission/drops, and
+neither proves GPU/compositor/optical or network behavior. See
+[Buffer quality contracts](tests/vrr/BUFFER-QUALITY.md) for CLI, provenance,
+metrics, missing-evidence handling, predeclared workloads and overhead limits.
+
+Historical offline exact-score experiment: interval-quality integer totals update on ring
+mutation/expiry. Weighted sums retain the original physical-index floating-point
+addition order; sparse zero-only buckets are skipped. Reporting/control policy,
+source timing, target/window and scoring are unchanged. This experiment is not
+installed and is separate from the frozen CPU-only application.
+
+Isolated exact segmented input-window experiment (2026-10-17, based on `7d1148f9`):
+`InputPercentileBuffer` retains chronological samples for expiry and outcomes,
+with small sorted blocks indexing raw requirements and proven misses. Integer
+nearest ranks, duplicate multiplicity, selected target/history, seeded layers,
+source coordinates and adaptation rules remain unchanged. Valid adjacent-pair
+coverage is maintained on insertion and expiry; large expiry advances compact
+indexes once. Splits/merges bound ordinary shifts to a small block rather than
+moving the entire retained history. Block allocation and retention are CPU and
+memory tradeoffs, not a statistical or timing-policy change. This experiment
+is isolated and has no physical display validation.
+
 Stable input adaptation (2026-10-17, based on `181415ec`): new adaptive
 sessions retain input-hitch scoring policy 10 and additionally select
 `playout_input_stable_adaptation=1`. This supersedes the release behavior below.
@@ -6139,3 +6188,23 @@ uniformly scales the complete surface only if it exceeds either bound, preservin
 all text/lanes and alpha without cropping; graph-only/already-fitting overlays
 keep their native size. The meaningful Deck/4K fit assertions remain mandatory.
 No GPU work or rasterization was moved into the streaming frame path.
+
+### Queue and budget display clarification (2026-10-17)
+
+The compact VRR overlay reports the measured decoder-output-to-Present-return
+interval once, with queue/pacing, GPU decode synchronization and CPU render/submit
+shown as included components. All four numbers use the same rendered-frame
+counter population and averaging window; dropped/cancelled work is excluded.
+GPU synchronization is recovered exactly as total minus queue minus rendering,
+using the existing bounded telemetry partition. Raw counters and pacing policy
+are unchanged. Render-start and target waits remain part of queue/pacing.
+
+The buffer and positive retiming correction remain explicitly scheduling budgets,
+with their combined budget marked “not added to measured times.” The applied
+budget is the latest decision, not the mean residence of rendered frames. There
+is no reliable causal buffer-wait partition: the trace contains the actual
+schedule, not a counterfactual schedule without buffering. In particular, a late
+frame can have queue time below the budget, and a zero-budget frame can still
+wait for physical presentation constraints. Subtracting the budget from queue
+would therefore discard measured time. OS presentation after CPU submission,
+scanout and pixel response are outside the measured total shown here.

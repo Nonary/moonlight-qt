@@ -3,6 +3,8 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/cadencedetection.h"
 #include <algorithm>
 #include <iostream>
+#include <memory>
+#include "../../app/streaming/video/ffmpeg-renderers/pacer/pacertelemetry.h"
 
 using PerformanceStats::Snapshot;
 using PerformanceStats::formatVrr;
@@ -10,6 +12,64 @@ static bool has(const std::string& text, const char* part) { return text.find(pa
 
 int main(int argc, char** argv)
 {
+    // Exercise the real producer, including queue < budget, early/late
+    // readiness, zero/near-zero budgets and changing budgets. The display must
+    // preserve measured waits (including render/target waits), never subtract B.
+    auto telemetry = std::make_unique<PacerTelemetry>();
+    struct TimingCase {
+        uint64_t budget, total, render, gpu;
+        const char* expected;
+    };
+    const TimingCase cases[] = {
+        // Current trace frame 328927: 2.094 ms queue residence plus pacing waits.
+        {6951, 11503, 1285, 2208, "Includes queue/pacing 8.01 ms | GPU decode wait 2.21 ms | CPU render/submit 1.28 ms"},
+        // Late output consumes protection before it can wait: Q is below B.
+        {7000, 5000, 1000, 3000, "Includes queue/pacing 1.00 ms | GPU decode wait 3.00 ms | CPU render/submit 1.00 ms"},
+        // Zero budget still permits physical/display pacing constraints.
+        {0, 4000, 1000, 0, "Includes queue/pacing 3.00 ms | GPU decode wait 0.00 ms | CPU render/submit 1.00 ms"},
+        {1, 3500, 500, 1000, "Includes queue/pacing 2.00 ms | GPU decode wait 1.00 ms | CPU render/submit 0.50 ms"},
+    };
+    for (const auto& c : cases) {
+        const auto before = telemetry->snapshot();
+        VrrTelemetrySample sample;
+        sample.presented = true;
+        sample.bufferUs = c.budget;
+        sample.clientProcessingTimeUs = c.total;
+        sample.renderingTimeUs = c.render;
+        sample.decodeWaitUs = c.gpu;
+        telemetry->recordVrrFrame(sample);
+        const auto after = telemetry->snapshot();
+        const auto value = PerformanceStats::formatClientTiming(
+            after.totalClientProcessingTimeUs - before.totalClientProcessingTimeUs,
+            after.totalQueuePacingTimeUs - before.totalQueuePacingTimeUs,
+            after.totalRenderingTimeUs - before.totalRenderingTimeUs,
+            after.renderedFrames - before.renderedFrames);
+        assert(has(value, c.expected));
+        assert(has(value, "(to Present return)"));
+    }
+    const auto completed = telemetry->snapshot();
+    assert(completed.renderedFrames == 4);
+    // Averaging uses one identical population, rather than the latest budget.
+    assert(has(PerformanceStats::formatClientTiming(completed.totalClientProcessingTimeUs,
+        completed.totalQueuePacingTimeUs, completed.totalRenderingTimeUs, completed.renderedFrames),
+        "Average post-output client time: 6.00 ms"));
+    for (const bool cancelled : {false, true}) {
+        VrrTelemetrySample dropped;
+        dropped.presented = cancelled;
+        dropped.cancelled = cancelled;
+        dropped.bufferUs = 99000;
+        dropped.clientProcessingTimeUs = 99000;
+        telemetry->recordVrrFrame(dropped);
+        const auto after = telemetry->snapshot();
+        assert(after.renderedFrames == completed.renderedFrames);
+        assert(after.totalClientProcessingTimeUs == completed.totalClientProcessingTimeUs);
+        assert(after.totalQueuePacingTimeUs == completed.totalQueuePacingTimeUs);
+        assert(after.totalRenderingTimeUs == completed.totalRenderingTimeUs);
+    }
+    assert(PerformanceStats::formatClientTiming(0, 0, 0, 0).empty());
+    assert(has(PerformanceStats::formatClientTiming(100, 101, 0, 1), "N/A"));
+    assert(has(PerformanceStats::formatClientTiming(100, 60, 41, 1), "N/A"));
+
     Snapshot s;
     s.vrr = s.adaptive = true;
     s.bufferUs = 5700;
@@ -22,9 +82,9 @@ int main(int argc, char** argv)
     s.present.lastObservedUs = s.nowUs = 10000000;
     auto text = formatVrr(s);
     // Each current value shares one line with its target.
-    assert(has(text, "VRR buffer: 5.70 ms (target 5.42) | coverage 99.95% / 99.95% target\n"));
+    assert(has(text, "VRR buffer budget: 5.70 ms (target 5.42) | coverage 99.95% / 99.95% target\n"));
     assert(has(text, "Present timing issues (30s): 1.00% >0.50 ms | hitches 1 | worst +4.2 ms\n"));
-    assert(has(text, "Extra delay: 0.00 ms (smoothing/recovery) | Planned total: 5.70 ms\n"));
+    assert(has(text, "Retiming budget: 0.00 ms | Combined budget: 5.70 ms (not added to measured times)\n"));
     assert(std::count(text.begin(), text.end(), '\n') == 3);
     if (argc > 1 && std::string(argv[1]) == "--fixture") { std::cout << text; return 0; }
 
@@ -46,30 +106,30 @@ int main(int argc, char** argv)
     s.present.lastPausedUs = s.nowUs;
     assert(has(formatVrr(s), "Present timing issues (30s): paused below VRR range"));
     s.input.tailUncertain = true;
-    assert(has(formatVrr(s), "VRR buffer: 5.70 ms (target 5.42 learning) | "));
+    assert(has(formatVrr(s), "VRR buffer budget: 5.70 ms (target 5.42 learning) | "));
     // Smoothing can vary while the graph's input buffer stays fixed. Keep
     // the leading buffer value stable, with the extra delay and total explicit.
     s.smoothingUs = 1250;
-    assert(has(formatVrr(s), "VRR buffer: 5.70 ms (target 5.42 learning) | "));
-    assert(has(formatVrr(s), "Extra delay: 1.25 ms (smoothing/recovery) | Planned total: 6.95 ms\n"));
+    assert(has(formatVrr(s), "VRR buffer budget: 5.70 ms (target 5.42 learning) | "));
+    assert(has(formatVrr(s), "Retiming budget: 1.25 ms | Combined budget: 6.95 ms (not added to measured times)\n"));
     s.bufferUs = 3000;
     for (const uint64_t smoothing : {0, 3000, 0, 3000}) {
         s.smoothingUs = smoothing;
         const auto value = formatVrr(s);
-        assert(has(value, "VRR buffer: 3.00 ms ("));
-        assert(has(value, smoothing ? "Extra delay: 3.00 ms (smoothing/recovery) | Planned total: 6.00 ms" : "Extra delay: 0.00 ms (smoothing/recovery) | Planned total: 3.00 ms"));
+        assert(has(value, "VRR buffer budget: 3.00 ms ("));
+        assert(has(value, smoothing ? "Retiming budget: 3.00 ms | Combined budget: 6.00 ms (not added to measured times)" : "Retiming budget: 0.00 ms | Combined budget: 3.00 ms (not added to measured times)"));
     }
     s.bufferUs = 5700;
     s.smoothingUs = 0;
     s.input.recentEligible = 0;
     assert(has(formatVrr(s), "| coverage N/A / 99.95% target\n"));
     s.atLimit = true;
-    assert(has(formatVrr(s), "VRR buffer: 5.70 ms at limit (target 5.42 learning) | "));
+    assert(has(formatVrr(s), "VRR buffer budget: 5.70 ms at limit (target 5.42 learning) | "));
     // Revision-12 buffer: the client timing score takes coverage's place.
     s.adaptive = false; s.atLimit = false;
-    assert(has(formatVrr(s), "VRR buffer: 5.70 ms | client timing collecting / 99.95% target\n"));
+    assert(has(formatVrr(s), "VRR buffer budget: 5.70 ms | client timing collecting / 99.95% target\n"));
     s.clientTimingValid = true; s.clientTimingPercent = 99.53;
-    assert(has(formatVrr(s), "VRR buffer: 5.70 ms | client timing 99.53% / 99.95% target\n"));
+    assert(has(formatVrr(s), "VRR buffer budget: 5.70 ms | client timing 99.53% / 99.95% target\n"));
     s.vrr = false;
     assert(formatVrr(s) == "VRR pacing: inactive\n");
 

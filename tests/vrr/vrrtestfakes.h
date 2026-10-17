@@ -496,7 +496,8 @@ inline void releaseTrackedFrameBuffer(void* opaque, uint8_t* data)
 inline PacedFrame makeTrackedPacedFrame(int frameNumber,
                                         uint32_t rtpTimestamp,
                                         uint64_t decodeCompleteUs,
-                                        TrackedFrameLifetime& lifetime)
+                                        TrackedFrameLifetime& lifetime,
+                                        bool rtpValid = true)
 {
     AVFrame* frame = av_frame_alloc();
     if (frame == nullptr) {
@@ -519,5 +520,5 @@ inline PacedFrame makeTrackedPacedFrame(int frameNumber,
 
     frame->opaque = reinterpret_cast<void*>(static_cast<intptr_t>(frameNumber));
 
-    return PacedFrame(frame, frameNumber, rtpTimestamp, true, decodeCompleteUs);
+    return PacedFrame(frame, frameNumber, rtpTimestamp, rtpValid, decodeCompleteUs);
 }

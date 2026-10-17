@@ -314,13 +314,13 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
     label("Buffer", left + S(490), legendY, bufferColor);
     if (adaptiveInput) label("Target", left + S(590), legendY, targetColor);
     std::snprintf(caption, sizeof(caption), adaptiveInput ?
-        "Buffer %.2f ms | Learned target %.2f ms%s%s" : "Buffer %.2f ms | Request %.2f ms%s%s",
+        "Buffer budget %.2f ms | Learned target %.2f ms%s%s" : "Buffer budget %.2f ms | Request %.2f ms%s%s",
         latestPoint.bufferUs / 1000.0,
         (adaptiveInput ? latestPoint.inputTargetUs : latestPoint.requestedBufferUs) / 1000.0,
         adaptiveInput && !latestPoint.inputTargetValid ? " (learning/unknown)" : "",
         latestPoint.inputTargetCapped ? " (capped)" : "");
     label(caption, left, height - S(180), labelColor);
-    std::snprintf(caption, sizeof(caption), "Extra delay %.2f ms | Planned total %.2f ms",
+    std::snprintf(caption, sizeof(caption), "Retiming budget %.2f ms | Combined budget %.2f ms",
         latestPoint.extraDelayUs / 1000.0,
         (latestPoint.bufferUs + latestPoint.extraDelayUs) / 1000.0);
     label(caption, left, height - S(160), labelColor);

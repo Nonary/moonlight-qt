@@ -332,7 +332,10 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
             // Preserve the historical V2 calibration identity now that its
             // queue policy is unconditional rather than a live preference.
             context += QStringLiteral("|mean-miss-queue-v2");
-            const auto recoveryPolicy = vrrTimingParametersForSession(config);
+            const auto cacheConfig = VrrPacingWorker::resolvedInputConfig(config);
+            const auto recoveryPolicy = vrrTimingParametersForSession(cacheConfig);
+            if (recoveryPolicy.playoutInputClockRelativeHistory >= 4)
+                context += QStringLiteral("|input-receive-drift-clock=%1").arg(recoveryPolicy.playoutInputClockRelativeHistory);
             if (recoveryPolicy.playoutInputHitchMissesOnly)
                 context += QStringLiteral("|input-hitch-misses=%1").arg(recoveryPolicy.playoutInputHitchMissesOnly);
             if (recoveryPolicy.playoutInputStableAdaptation)
@@ -353,7 +356,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
             if (smoothVrrFrameTiming) {
                 // The saved flag previously selected timestamp-following
                 // playout too. Do not cross-seed its readiness calibration.
-                const auto policy = vrrTimingParametersForSession(config);
+                const auto policy = vrrTimingParametersForSession(cacheConfig);
                 context += QStringLiteral("|frame-smoothing=%1-%2-%3|cadence=%4-%5")
                     .arg(policy.playoutSmoothingGainPerMille)
                     .arg(policy.playoutSmoothingPeriodAlphaPerMille)

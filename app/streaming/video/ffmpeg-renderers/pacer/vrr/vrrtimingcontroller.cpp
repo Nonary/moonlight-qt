@@ -224,6 +224,9 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutInputPercentileEnabled = config.experimentalInputPercentilePpm != 0;
     parameters.playoutInputHitchMissesOnly = parameters.playoutInputPercentileEnabled ? 10 : 0;
     parameters.playoutInputStableAdaptation = parameters.playoutInputPercentileEnabled ? 1 : 0;
+    // Record lifecycle semantics explicitly; missing fields in older captures
+    // retain their historical eviction and reacquisition behavior.
+    parameters.playoutInputLayerLifecycle = parameters.playoutInputPercentileEnabled ? 2 : 0;
     parameters.boundedCatchupEnabled = config.experimentalBoundedCatchup;
     parameters.normalizedSourceMapping = config.experimentalBoundedCatchup;
     if (parameters.boundedCatchupEnabled) {
@@ -231,7 +234,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         parameters.playoutCatchupCarryLimitPeriodPerMille = kCatchupCarryLimitPeriodPerMille;
     }
     if (parameters.playoutInputPercentileEnabled) {
-        parameters.playoutInputClockRelativeHistory = config.correctInputAccounting && config.experimentalBoundedCatchup ? 3 : 0;
+        parameters.playoutInputClockRelativeHistory = config.correctInputAccounting && config.experimentalBoundedCatchup ? 4 : 0;
         // Lateness within the physical VRR room is credited, scaled by the
         // profile's miss allowance: a credited late frame is shown late, an
         // interval stretch, so Low Latency (1%) takes the whole room, Balanced
@@ -588,6 +591,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_IntervalBuffer.reset();
         m_InputPercentileBuffer = Vrr13::InputPercentileBuffer{};
         m_InputCoverageHistory = {};
+        m_ReceiveDriftClock = {};
+        m_ReceiveDriftPacketValid = false;
         m_InputHeadroomUs = 0;
         m_InputLayers.clear();
         m_InputLayerPeriodUs = 0;
@@ -755,6 +760,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                                                  uint64_t nowUs)
 {
     m_Pending = PendingFrame {};
+    m_ReceiveDriftPacketValid = false;
     learnDecodeGpu(frame);
     m_SmoothingEngaged = false;
     if (m_Parameters.normalizedSourceMapping) {
@@ -856,6 +862,11 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         const uint64_t offsetClockUs = timeBasedOffset ?
             (m_Parameters.playoutOffsetSourceClock != 0 ? rtpUs : nowUs) :
             mappingUs;
+        // Mode 4 observes a physical receive/RTP clock before decoder service
+        // and adaptive timing are added. Invalid packets do not teach drift.
+        m_ReceiveDriftPacketValid = frame.timestampValid() && frame.receiveUs() != 0 &&
+            cadence.eligible && frame.lostPackets() == 0;
+        m_ReceiveDriftPacketOffsetUs = signedDifference(frame.receiveUs(), rtpUs);
         const int64_t appliedOffsetUs = observePlayoutOffset(
             offsetClockUs,
             offsetUs, rebased || cadence.eligible, cadence.phaseDiscontinuity);
@@ -2592,6 +2603,8 @@ void VrrTimingController::noteSpacingDeficit(uint64_t deficitUs)
 void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                                          uint64_t submissionUs, uint64_t actualSubmissionUs)
 {
+    m_InputAuditFeedbackFrame = m_Pending.valid ? m_Pending.smoothness.frame : 0;
+    m_InputAuditEligibilityReasons = (submitted?0ULL:1ULL) | (cancelled?2ULL:0ULL);
     if (!m_Pending.valid) {
         return;
     }
@@ -2674,6 +2687,17 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 const bool inputHitch = outcome.frame == m_Pending.smoothness.frame &&
                     outcome.attributedFrame == m_Pending.smoothness.frame &&
                     outcome.intervalErrorUs > toleranceUs && outcome.latenessUs > toleranceUs;
+                m_InputAuditEligibilityReasons |=
+                    (m_Pending.intervalValid?0ULL:4ULL) |
+                    (m_Pending.hasPreparationDuration?0ULL:8ULL) |
+                    (m_Pending.inputValid?0ULL:16ULL) | (p.eligible?0ULL:32ULL) |
+                    (capacity.averageValid?0ULL:64ULL) | (capacity.serviceOverloaded?128ULL:0ULL) |
+                    (inputHitch?0ULL:256ULL) |
+                    (m_Pending.intervalIntendedUs?0ULL:1024ULL);
+                if (m_Parameters.playoutInputHitchMissesOnly && m_Pending.inputRequiredUs > 0 &&
+                    uint64_t(m_Pending.inputRequiredUs) - std::min(uint64_t(m_Pending.inputRequiredUs),
+                        m_Parameters.playoutInputPercentileToleranceUs) > playoutDelayMaximumUs())
+                    m_InputAuditEligibilityReasons |= 512ULL;
                 m_InputPercentileBeforeUs = p.applied;
                 m_InputPercentileBuffer.setLearningTrim(
                     static_cast<size_t>(m_Parameters.playoutInputLearningTrim));
@@ -3330,6 +3354,10 @@ int64_t VrrTimingController::inputClockOffsetUs(uint64_t nowUs)
         m_InputClockLastOffsetUs = m_AppliedPlayoutOffsetUs;
         m_InputClockLastUs = m_InputDriftAnchorUs = nowUs;
         m_InputDriftAnchorRawUs = m_InputClockRawUs;
+        if (m_Parameters.playoutInputClockRelativeHistory == 4)
+            m_ReceiveDriftClock.advance(nowUs, m_ReceiveDriftPacketValid,
+                m_ReceiveDriftPacketOffsetUs, m_SourcePeriodUs, m_PlayoutOffsetEpoch,
+                m_Parameters.materialRateChangePercent);
         return m_InputClockCoordinateUs;
     }
     // A reseed is a sender clock jump, not movement of retained readiness:
@@ -3345,6 +3373,15 @@ int64_t VrrTimingController::inputClockOffsetUs(uint64_t nowUs)
     m_InputClockRawUs += deltaUs;
     m_InputClockCoordinateUs += deltaUs;
     if (nowUs <= m_InputClockLastUs) return m_InputClockCoordinateUs;
+
+    if (m_Parameters.playoutInputClockRelativeHistory == 4) {
+        m_InputClockLastUs = nowUs;
+        m_InputClockCoordinateUs -= m_ReceiveDriftClock.advance(nowUs,
+            m_ReceiveDriftPacketValid, m_ReceiveDriftPacketOffsetUs,
+            m_SourcePeriodUs, m_PlayoutOffsetEpoch,
+            m_Parameters.materialRateChangePercent);
+        return m_InputClockCoordinateUs;
+    }
 
     // Offset tracking follows host/client clock drift as well as mapping
     // movement. Drift moves future readiness by the same amount, so only the
@@ -3619,6 +3656,8 @@ VrrTimingController::InputLayerChange VrrTimingController::updateInputLayer(
     if (periodUs == 0) return InputLayerChange::None;
     if (m_InputLayerPeriodUs == 0) {
         m_InputLayerPeriodUs = periodUs;
+        m_InputLayerIdentity = ++m_NextInputLayerIdentity;
+        ++m_InputLayerCreates;
         return InputLayerChange::None;
     }
     if (within(m_InputLayerPeriodUs)) return InputLayerChange::None;
@@ -3626,8 +3665,12 @@ VrrTimingController::InputLayerChange VrrTimingController::updateInputLayer(
     // Layers whose evidence has aged out of their history are forgotten.
     for (auto it = m_InputLayers.begin(); it != m_InputLayers.end();) {
         const auto stats = it->buffer.stats();
-        const uint64_t lastUs = stats.lastInputObservationUs;
-        if (!lastUs || (nowUs > lastUs && nowUs - lastUs >= stats.windowUs)) it = m_InputLayers.erase(it);
+        const uint64_t lastUs = m_Parameters.playoutInputLayerLifecycle ?
+            it->buffer.lastEligibleObservationUs() : stats.lastInputObservationUs;
+        if (!lastUs || (nowUs > lastUs && nowUs - lastUs >= stats.windowUs)) {
+            ++m_InputLayerExpirations;
+            it = m_InputLayers.erase(it);
+        }
         else ++it;
     }
     auto stored = m_InputLayers.end();
@@ -3638,9 +3681,11 @@ VrrTimingController::InputLayerChange VrrTimingController::updateInputLayer(
     const bool restored = stored != m_InputLayers.end();
     Vrr13::InputPercentileBuffer next;
     uint64_t nextPeriodUs = periodUs;
+    uint64_t nextIdentity = 0;
     if (restored) {
         next = std::move(stored->buffer);
         nextPeriodUs = stored->periodUs;
+        nextIdentity = stored->identity;
         m_InputLayers.erase(stored);
         next.continueTotalsFrom(m_InputPercentileBuffer);
         if (confirmedLayers) next.breakAdjacency();
@@ -3654,6 +3699,10 @@ VrrTimingController::InputLayerChange VrrTimingController::updateInputLayer(
         // Lateness learned at a much slower rate (a loading screen, a menu)
         // says nothing about the faster one; start from fresh evidence.
         next.continueTotalsFrom(m_InputPercentileBuffer);
+        if (m_Parameters.playoutInputLayerLifecycle >= 2)
+            next.beginFreshLayerReacquisition(nowUs,
+                m_Parameters.playoutInputPercentileTargetPerMillion,
+                m_Parameters.playoutInputPercentileWindowUs);
     }
     const bool settled = m_InputPercentileBuffer.stats().eligible >=
         m_InputLayerEligibleAtStart + (fastLayers ? 8 : kInputLayerMinimumFrames);
@@ -3666,15 +3715,55 @@ VrrTimingController::InputLayerChange VrrTimingController::updateInputLayer(
                 }));
         }
         m_InputPercentileBuffer.prepareForLayerStorage();
-        m_InputLayers.push_back({m_InputLayerPeriodUs, std::move(m_InputPercentileBuffer)});
+        m_InputLayers.push_back({m_InputLayerPeriodUs, std::move(m_InputPercentileBuffer), m_InputLayerIdentity});
     }
     m_InputPercentileBuffer = std::move(next);
     m_InputLayerPeriodUs = nextPeriodUs;
+    ++m_InputLayerSwitches;
+    if (restored) ++m_InputLayerRestores;
+    else { nextIdentity = ++m_NextInputLayerIdentity; ++m_InputLayerCreates; }
+    m_InputLayerIdentity = nextIdentity;
     // A restored layer already earned retention. A short visit must not throw
     // away its trusted queue just because it has not collected eight new frames.
     m_InputLayerEligibleAtStart = fastLayers && restored ? 0 :
         m_InputPercentileBuffer.stats().eligible;
     return restored ? InputLayerChange::Restored : InputLayerChange::Created;
+}
+
+VrrBufferAuditSnapshot VrrTimingController::bufferAudit(uint64_t nowUs, uint64_t appliedUs) const
+{
+    VrrBufferAuditSnapshot a;
+    a.atUs = nowUs;
+    const auto s = m_InputPercentileBuffer.stats();
+    a.appliedUs=appliedUs; a.targetUs=s.targetUs; a.currentUs=s.currentUs;
+    a.layerId=m_InputLayerIdentity; a.layerPeriodUs=m_InputLayerPeriodUs;
+    a.layerSwitches=m_InputLayerSwitches; a.layerCreates=m_InputLayerCreates;
+    a.layerRestores=m_InputLayerRestores; a.layerExpirations=m_InputLayerExpirations;
+    a.cachedLayers=m_InputLayers.size(); a.lastEligibleUs=m_InputPercentileBuffer.lastEligibleObservationUs();
+    a.lastObservationUs=s.lastInputObservationUs;
+    a.eligibleAgeUs=a.lastEligibleUs && nowUs>=a.lastEligibleUs ? nowUs-a.lastEligibleUs : 0;
+    a.samples=s.samples; a.eligible=s.eligible; a.missed=s.missed;
+    a.windowUs=s.windowUs; a.probabilityPpm=s.probabilityPpm; a.toleranceUs=s.toleranceUs;
+    a.minimumUs=s.minimumUs; a.maximumUs=s.maximumUs; a.vrrHeadroomUs=s.vrrHeadroomUs;
+    a.rawQuantileUs=s.rawRequiredQuantileUs; a.unclippedTargetUs=s.headroomTargetUnclippedUs;
+    a.readinessBudgetUs=s.readinessBudgetUs; a.clockOffsetUs=s.clockOffsetUs;
+    a.reacquisitionRemaining=m_InputPercentileBuffer.reacquisitionRemaining();
+    a.reacquisitionUntilUs=m_InputPercentileBuffer.reacquisitionUntilUs();
+    a.feedbackFrame=m_InputAuditFeedbackFrame; a.eligibilityReasons=m_InputAuditEligibilityReasons;
+    const auto slew=m_InputPercentileBuffer.lastSlewAudit();
+    a.slewAtUs=slew.atUs; a.slewAuthorizedTargetUs=slew.authorizedTargetUs;
+    a.slewBeforeUs=slew.beforeUs; a.slewDeltaUs=slew.deltaUs;
+    a.flags=(m_InputPercentileBuffer.learning()?VrrBufferAuditSnapshot::Learning:0) |
+        (s.tailUncertain?VrrBufferAuditSnapshot::TailUncertain:0) |
+        (s.evidenceValid?VrrBufferAuditSnapshot::EvidenceValid:0) |
+        (s.clipped?VrrBufferAuditSnapshot::Clipped:0) |
+        (s.expiredUnknown?VrrBufferAuditSnapshot::ExpiredUnknown:0) |
+        (s.growthBlocked?VrrBufferAuditSnapshot::GrowthBlocked:0) |
+        (m_InputPercentileBuffer.layerTransitionActive()?VrrBufferAuditSnapshot::LayerTransition:0) |
+        (m_InputPercentileBuffer.fastLayerDrain()?VrrBufferAuditSnapshot::FastDrain:0) |
+        (a.reacquisitionRemaining && nowUs<a.reacquisitionUntilUs?VrrBufferAuditSnapshot::Reacquiring:0) |
+        (s.lastInputEligible?VrrBufferAuditSnapshot::LastInputEligible:0);
+    return a;
 }
 
 unsigned int VrrTimingController::playoutBandIndex() const

@@ -218,7 +218,12 @@ public:
         // Weight the score by evaluated time, not frame rate; gaps are unknown.
         // Revision 9 applies tolerance before averaging so clean intervals
         // cannot erase excess from isolated late/catch-up intervals.
-        auto& score = m_Score[(s.submitted / 100000) % m_Score.size()];
+        // Advance membership before replacing a ring bucket. No score is read
+        // by a decision until updateScore() below finishes the weighted fold.
+        prepareScore(s.submitted, scoreWindowUs);
+        const size_t scoreIndex = (s.submitted / ScoreBucketUs) % m_Score.size();
+        auto& score = m_Score[scoreIndex];
+        const ScoreBucket scoreBefore = score;
         if (score.tick != s.submitted / 100000) score = ScoreBucket{s.submitted / 100000};
         score.evaluated += actual;
         if (perIntervalExcess ? error > toleranceUs : pressure) score.failed += actual;
@@ -239,6 +244,7 @@ public:
         if (averageBufferControl ? pressure : (perIntervalExcess ? error > toleranceUs : pressure))
             score.bufferFailed += actual;
         if (severityWeighted) score.bufferWeightedLoss += actual * bufferLoss;
+        scoreChanged(scoreIndex, scoreBefore);
         updateScore(s.submitted, scoreWindowUs);
 
         // Revision 12 retains every observed adjacent interval in the long
@@ -420,21 +426,87 @@ private:
         uint64_t bufferFailed = 0;
         double bufferWeightedLoss = 0;
     };
-    void updateScore(uint64_t at, uint64_t windowUs) {
-        m_Stats.evaluatedUs = m_Stats.failedUs = 0;
-        m_Stats.weightedLossUs = 0;
-        m_Stats.bufferFailedUs = 0;
-        m_Stats.bufferWeightedLossUs = 0;
-        const uint64_t windowBuckets = std::clamp<uint64_t>(
-            (windowUs + ScoreBucketUs - 1) / ScoreBucketUs,
-            1, MaximumScoreBuckets);
+    bool scoreActive(const ScoreBucket& b, uint64_t tick, uint64_t window) const {
+        return tick >= b.tick && tick - b.tick < window;
+    }
+    void addScore(const ScoreBucket& b) {
+        m_Stats.evaluatedUs += b.evaluated;
+        m_Stats.failedUs += b.failed;
+        m_Stats.bufferFailedUs += b.bufferFailed;
+    }
+    void removeScore(const ScoreBucket& b) {
+        m_Stats.evaluatedUs -= b.evaluated;
+        m_Stats.failedUs -= b.failed;
+        m_Stats.bufferFailedUs -= b.bufferFailed;
+    }
+    void prepareScore(uint64_t at, uint64_t windowUs) {
+        const uint64_t window = std::clamp<uint64_t>(
+            (windowUs + ScoreBucketUs - 1) / ScoreBucketUs, 1, MaximumScoreBuckets);
         const uint64_t tick = at / ScoreBucketUs;
-        for (const auto& b : m_Score) {
-            if (tick >= b.tick && tick - b.tick < windowBuckets) {
-                m_Stats.evaluatedUs += b.evaluated; m_Stats.failedUs += b.failed;
+        if (!m_ScoreValid || window != m_ScoreWindow || tick < m_ScoreTick ||
+                tick - m_ScoreTick >= window) {
+            m_Stats.evaluatedUs = m_Stats.failedUs = m_Stats.bufferFailedUs = 0;
+            for (const auto& b : m_Score) if (scoreActive(b, tick, window)) addScore(b);
+        }
+        else if (tick != m_ScoreTick) {
+            // A reversed historical clock can leave future buckets in the ring.
+            // Re-add them when they become visible again, as the full scan did.
+            if (tick >= window) {
+                const uint64_t first = m_ScoreTick >= window ? m_ScoreTick - window + 1 : 0;
+                for (uint64_t t = first; t <= tick - window; ++t) {
+                    const auto& b = m_Score[t % m_Score.size()];
+                    if (b.tick == t) removeScore(b);
+                }
+            }
+            for (uint64_t t = m_ScoreTick + 1; t <= tick; ++t) {
+                const auto& b = m_Score[t % m_Score.size()];
+                if (b.tick == t) addScore(b);
+            }
+        }
+        m_ScoreValid = true; m_ScoreTick = tick; m_ScoreWindow = window;
+    }
+    void scoreChanged(size_t index, const ScoreBucket& before) {
+        if (scoreActive(before, m_ScoreTick, m_ScoreWindow)) removeScore(before);
+        const auto& after = m_Score[index];
+        if (scoreActive(after, m_ScoreTick, m_ScoreWindow)) addScore(after);
+        const uint64_t bit = uint64_t(1) << (index % 64);
+        auto& word = m_WeightedScoreBits[index / 64];
+        const bool was = (word & bit) != 0;
+        const bool now = after.weightedLoss != 0 || after.bufferWeightedLoss != 0;
+        if (now) word |= bit; else word &= ~bit;
+        if (was != now) m_WeightedScoreCount += now ? 1 : size_t(-1);
+    }
+    static unsigned firstScoreBit(uint64_t word) {
+        unsigned n = 0;
+        if (!(word & 0xffffffffULL)) { n += 32; word >>= 32; }
+        if (!(word & 0xffffULL)) { n += 16; word >>= 16; }
+        if (!(word & 0xffULL)) { n += 8; word >>= 8; }
+        if (!(word & 0xfULL)) { n += 4; word >>= 4; }
+        if (!(word & 0x3ULL)) { n += 2; word >>= 2; }
+        if (!(word & 0x1ULL)) ++n;
+        return n;
+    }
+    void updateScore(uint64_t at, uint64_t windowUs) {
+        prepareScore(at, windowUs);
+        m_Stats.weightedLossUs = m_Stats.bufferWeightedLossUs = 0;
+        const auto fold = [&](const ScoreBucket& b) {
+            if (scoreActive(b, m_ScoreTick, m_ScoreWindow)) {
                 m_Stats.weightedLossUs += b.weightedLoss;
-                m_Stats.bufferFailedUs += b.bufferFailed;
                 m_Stats.bufferWeightedLossUs += b.bufferWeightedLoss;
+            }
+        };
+        // Keep the exact old physical-index floating-point addition order.
+        // Skipping positive zero changes no bits; dense scores use the old scan.
+        if (m_WeightedScoreCount > MaximumScoreBuckets / 4) {
+            for (const auto& b : m_Score) fold(b);
+        }
+        else {
+            for (size_t i = 0; i < m_WeightedScoreBits.size(); ++i) {
+                uint64_t bits = m_WeightedScoreBits[i];
+                while (bits) {
+                    fold(m_Score[i * 64 + firstScoreBit(bits)]);
+                    bits &= bits - 1;
+                }
             }
         }
     }
@@ -442,6 +514,10 @@ private:
     // Keep the long score history off the controller's stack. The controller
     // is instantiated in several independent workers and test fixtures.
     std::vector<ScoreBucket> m_Score = std::vector<ScoreBucket>(MaximumScoreBuckets);
+    std::array<uint64_t, (MaximumScoreBuckets + 63) / 64> m_WeightedScoreBits{};
+    size_t m_WeightedScoreCount = 0;
+    uint64_t m_ScoreTick = 0, m_ScoreWindow = 0;
+    bool m_ScoreValid = false;
     AbsorbedJitter m_Input;
     Sample m_Previous;
     Stats m_Stats;

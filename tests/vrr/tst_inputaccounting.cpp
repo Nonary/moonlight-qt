@@ -135,11 +135,51 @@ void rateDropFollow() {
  check(toleranceLimited.latencyUs<=follow.latencyUs+500 && toleranceLimited.missed<=follow.missed+2,
        "T-per-frame layer draining retains prompt low-rate recovery without an instant downward step");
 }
+// End-to-end wiring regression: the packet/RTP clock is constant while
+// decoder service changes and actual source cadence moves within the same
+// cached band. Mode4 must not convert that service phase into oscillator drift.
+void decoderPhaseIsNotClockDrift() {
+ uint64_t legacySpan=0,receiveSpan=0;
+ for(uint64_t revision : {3u,4u}) {
+  VrrSessionConfig cfg;cfg.streamRateHz=116;cfg.displayRefreshHz=120;
+  cfg.latencyMode=1;cfg.experimentalInputPercentilePpm=1;
+  cfg.experimentalBoundedCatchup=true;cfg.smoothFrameTiming=false;
+  cfg.timingOptions={1000,9950,120,500};
+  auto policy=vrrTimingParametersForSession(cfg);policy.playoutInputClockRelativeHistory=revision;
+  VrrTimingController c(cfg,true,policy);
+  uint64_t ticks=0,submitted=0;int64_t lo=std::numeric_limits<int64_t>::max();
+  int64_t hi=std::numeric_limits<int64_t>::min();
+  for(int frame=1;frame<=18000;++frame) {
+   const uint64_t sourceUs=1000000+ticks*100/9;
+   const uint64_t seconds=(sourceUs-1000000)/1000000;
+   ticks+=seconds<60?776:900;
+   const uint64_t slot=1000000+ticks*100/9,receive=slot+2000;
+   const uint64_t phase=seconds>=20&&seconds<60?4000:0;
+   const uint64_t complete=receive+400+2000+phase;
+   PacedFrame f(nullptr,frame,uint32_t(ticks),true,receive+600);
+   f.setDeliveryTimeline(receive,receive+200,receive+400);
+   f.noteGpuReadyUs(complete);f.noteDecodeSyncWaitUs(complete-(receive+600));
+   const auto d=c.schedule(f,std::max(complete,submitted));
+   const uint64_t prepared=std::max(complete,d.renderStartUs)+500;
+   submitted=std::max(prepared,d.targetUs);
+   c.notePreparationDuration(500,0,prepared);c.noteSchedulerDelays(0,0,true);
+   c.noteSubmission(true,false,submitted,submitted);
+   if(seconds>=35&&seconds<=110) {
+    const int64_t relative=c.intervalStats().inputPercentile.clockOffsetUs-c.playoutOffsetUs();
+    lo=std::min(lo,relative);hi=std::max(hi,relative);
+   }
+  }
+  if(revision==3)legacySpan=uint64_t(hi-lo);else receiveSpan=uint64_t(hi-lo);
+ }
+ check(legacySpan>1000,"legacy drift fit mistakes a decoder phase for clock motion");
+ check(receiveSpan<=5,"receive clock preserves the packet clock across decoder phase and116->100 cadence");
+}
+
 int main(){
  VrrSessionConfig cfg;cfg.streamRateHz=76;cfg.displayRefreshHz=120;cfg.latencyMode=0;cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;cfg.timingOptions={4000,9995,300,500};
  auto p=vrrTimingParametersForSession(cfg);VrrTimingController c(cfg,true,p);
  check(p.playoutInputHitchMissesOnly==10,"new sessions use fast rate layers while historical clock comparisons remain explicit");
- check(p.playoutInputClockRelativeHistory==3&&p.playoutInputBoundedRecoveryCredit==0&&p.playoutInputRateDropSnap==1&&
+ check(p.playoutInputClockRelativeHistory==4&&p.playoutInputBoundedRecoveryCredit==0&&p.playoutInputRateDropSnap==1&&
        p.playoutInputLayerSeedRatioPerMille==1500&&p.playoutInputLearningTrim==1,"current main enables corrected accounting with physical recovery credit");
  check(p.playoutInputRecoveryCreditRoomPerMille==50&&c.recoveryHeadroomUs()>4800&&
        c.inputRecoveryCreditUs()+1>=c.recoveryHeadroomUs()/20&&c.inputRecoveryCreditUs()<=c.recoveryHeadroomUs()/20+1,"Smooth credits a twentieth of the physical VRR room");
@@ -161,6 +201,7 @@ int main(){
  InputPercentileBuffer signs;signs.reset(1000);observe(signs,1,-1000,100000);check(signs.stats().missed==0&&signs.stats().targetUs==1000,"negative normalized readiness invents no demand");observe(signs,2,2000,100000);check(signs.stats().missed==0,"exact B+T+credit equality is covered");observe(signs,3,2001,100000);check(signs.stats().missed==1,"strict boundary counts one microsecond excess");
  InputPercentileBuffer extremes;extremes.reset(1000);observe(extremes,1,std::numeric_limits<int64_t>::max()-5,100);check(extremes.stats().currentUs<=25000&&extremes.stats().clipped,"signed source-coordinate addition saturates at policy cap");extremes.advance(1020000,1000,25000,999500,300000000,1000,250,0,500,500,std::numeric_limits<int64_t>::min());check(extremes.stats().targetUs==25000,"signed projection saturates safely");
  Overlay::TimingGraphPoint g;g.sourceTimingValid=true;g.sourceTimeUs=100000;g.bufferUs=1000;g.inputPercentileEnabled=true;g.producerEligible=true;g.inputToleranceUs=500;g.inputVrrHeadroomUs=500;g.producerRequiredUs=-1000;auto graph=Overlay::bufferGraphSample(g);check(graph.producerUs==-1500&&!graph.producerMissed()&&graph.bufferUs==1000,"signed graph readiness remains separate from standing buffer");
+ decoderPhaseIsNotClockDrift();
  rateRoundTrip();
  clockDrift();
  rateDropFollow();

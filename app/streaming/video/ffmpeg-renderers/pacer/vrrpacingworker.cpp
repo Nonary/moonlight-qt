@@ -29,7 +29,7 @@ namespace {
 // MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER=0 restores the previous
 // revision-12 buffer, and MOONLIGHT_VRR_BOUNDED_CATCHUP=0 disables catch-up and
 // the normalized producer clock while keeping the adaptive buffer.
-VrrSessionConfig experimentalInputConfig(VrrSessionConfig config)
+VrrSessionConfig experimentalInputConfig(VrrSessionConfig config, bool logConfiguration = true)
 {
     const auto mode = qEnvironmentVariable("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER");
     if (mode == "0") return config;
@@ -41,7 +41,7 @@ VrrSessionConfig experimentalInputConfig(VrrSessionConfig config)
         uint64_t(config.timingOptions.resolved(config.latencyMode).targetHundredths) * 100;
     config.experimentalInputPercentileWindowUs =
         uint64_t(config.timingOptions.resolved(config.latencyMode).historySeconds) * 1000000;
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+    if (logConfiguration) SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "Adaptive buffer: profile smoothness %.2f%% selects input readiness percentile; history %llu s, rise %llu us/s, stable learned input target with 250 us/s release; layers at least 30 FPS apart, upward restore or normal downward drain; fixed 2T Absorb pad (input policy 10); interval severity score remains distinct",
         config.experimentalInputPercentilePpm / 10000.0,
         static_cast<unsigned long long>(config.experimentalInputPercentileWindowUs / 1000000),
@@ -122,6 +122,13 @@ constexpr char kTraceHeader[] =
     ",input_release_allowed,input_release_held,input_release_unknown,input_evidence_us,input_candidate_us,input_candidate_loss_per_million,input_current_loss_per_million"
     ",input_percentile_target_us,input_percentile_current_us,input_percentile_samples,input_percentile_window_us,input_percentile_probability_ppm,input_percentile_tail_uncertain,input_percentile_evidence_valid,input_percentile_clipped,input_percentile_expired_unknown,input_percentile_history_truncated,input_percentile_eligible,input_percentile_ineligible,input_percentile_absorbed,input_percentile_missed,input_percentile_raises,input_percentile_lowers,input_percentile_unknown_release,input_percentile_epoch_resets,input_percentile_recent_eligible,input_percentile_recent_absorbed,input_percentile_recent_missed,input_percentile_last_input_eligible,input_percentile_last_input_required_us,input_percentile_last_input_observation_us,input_percentile_growth_blocked,input_network_buffer_miss,input_decode_buffer_miss,input_buffer_miss_observation_us,input_percentile_hold_until_us,input_percentile_hold_remaining_us,input_percentile_last_buffer_miss_us,input_percentile_last_network_miss_us,input_percentile_last_decoder_miss_us,input_percentile_network_misses,input_percentile_decoder_misses,input_percentile_release_samples,input_percentile_release_misses,input_percentile_release_factor_ppm,input_percentile_effective_fall_rate_us_per_second,input_percentile_proposed_misses,input_percentile_effective_fall_rate_milli_us_per_second"
     ",trajectory_nominal_us,trajectory_existing_us,trajectory_target_us,trajectory_added_us,trajectory_carry_us,trajectory_minimum_interval_us,trajectory_physical_period_us,trajectory_allowance_us,trajectory_intended_interval_us,trajectory_plans,trajectory_limited,trajectory_resets,trajectory_resync_drops,trajectory_deferred,trajectory_continuity,trajectory_no_headroom,trajectory_resync_recommended,trajectory_resync_dropped,trajectory_resync_deferred,trajectory_successor_frame,trajectory_successor_proof"
+    ",trace_model_kind,buffer_audit_revision"
+#define VRR_BUFFER_BEFORE_HEADER(type, name, member) ",buffer_before_" #name
+    VRR_BUFFER_AUDIT_FIELDS(VRR_BUFFER_BEFORE_HEADER)
+#undef VRR_BUFFER_BEFORE_HEADER
+#define VRR_BUFFER_AFTER_HEADER(type, name, member) ",buffer_after_" #name
+    VRR_BUFFER_AUDIT_FIELDS(VRR_BUFFER_AFTER_HEADER)
+#undef VRR_BUFFER_AFTER_HEADER
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
 constexpr uint32_t kVrrWindowStateMask =
@@ -193,6 +200,11 @@ bool isUncPath(const QString& path)
 
 } // namespace
 
+VrrSessionConfig VrrPacingWorker::resolvedInputConfig(VrrSessionConfig config)
+{
+    return experimentalInputConfig(std::move(config), false);
+}
+
 VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
                                  const VrrSessionConfig& config,
                                  PacerTelemetry* telemetry) :
@@ -213,6 +225,7 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
     // Settings enables tracing after SDL initialization. SDL2-compat may cache
     // its environment, so read the current process value just like the path.
     m_DeepTraceEnabled = qEnvironmentVariable("MOONLIGHT_VRR_DEEP_TRACE").startsWith(QLatin1Char('1'));
+    m_BufferAuditEnabled = qEnvironmentVariable("MOONLIGHT_VRR_BUFFER_AUDIT") == QLatin1String("1");
     m_QueueCapacity = m_TimingController->queuedFrameCapacity();
 
     VrrTargetWaiterHooks hooks;
@@ -297,6 +310,8 @@ bool VrrPacingWorker::start()
 
     // Enable capture before the producer can submit its first frame. Opening
     // from run() left a small startup race that made session replay incomplete.
+    m_TraceParameters = m_TimingController->parameters();
+    m_TraceParameters.playoutDelayStartSeedUs = m_StartDelaySeedUs;
     openTraceIfRequested();
 
     m_WorkerThread = SDL_CreateThread(VrrPacingWorker::threadProc,
@@ -312,6 +327,9 @@ bool VrrPacingWorker::start()
     if (m_Telemetry != nullptr) {
         m_Telemetry->beginVrrSession();
     }
+#ifdef VRR_WORKER_REPLAY
+    replayStartReady.store(true);
+#endif
 
     return true;
 }
@@ -410,11 +428,16 @@ int VrrPacingWorker::threadProc(void* context)
 
 int VrrPacingWorker::run()
 {
+#if !defined(VRR_WORKER_REPLAY) && !defined(VRR_OFFLINE_TEST)
     const VideoThreadPriority priority("VRRPacer", VideoThreadPriority::Role::Deadline);
+#endif
 
     QueuedFrame reservedFrame;
     bool reservedDiscontinuity = false;
     while (!isStopping()) {
+#ifdef VRR_WORKER_REPLAY
+        if (replayBeforeDequeue) replayBeforeDequeue(replayContext, bool(reservedFrame));
+#endif
         consumeWindowStateNotifications();
 
         QueuedFrame queuedFrame;
@@ -519,6 +542,10 @@ int VrrPacingWorker::run()
         publishReceiveDeadline(frame, decision);
         noteSettledDelay(decisionTimeUs, decision.playoutDelayUs);
         FrameTelemetry telemetry;
+        if (m_BufferAuditEnabled && m_TraceAcceptingRows.load(std::memory_order_relaxed)) {
+            telemetry.bufferAuditValid = true;
+            telemetry.bufferBefore = m_TimingController->bufferAudit(decisionTimeUs, decision.playoutDelayUs);
+        }
         telemetry.preparedAhead = preparedAhead;
         if (preparedAhead) telemetry.preparationStage = queuedFrame.preparation->timing;
         telemetry.decodeSyncWaitUs = decodeSyncWaitUs;
@@ -1627,6 +1654,8 @@ void VrrPacingWorker::recordFrameCompletion(const QueuedFrame& queuedFrame,
         row.historyDurationUs = static_cast<uint64_t>(history.duration() / 1000);
         row.historyCanRelease = history.canRelease();
         row.bufferStats = m_TimingController->intervalStats();
+        if (telemetry.bufferAuditValid)
+            row.bufferAfter = m_TimingController->bufferAudit(LiGetMicroseconds(), decision.playoutDelayUs);
     }
     row.feedback = feedback;
     row.telemetry = telemetry;
@@ -1652,6 +1681,9 @@ int VrrPacingWorker::traceRun()
     TraceRow row;
     while (true) {
         if (m_TraceQueue->pop(row)) {
+#ifdef VRR_WORKER_REPLAY
+            replayTraceConsumed.fetch_add(1, std::memory_order_relaxed);
+#endif
             if (m_TraceAcceptingRows.load() ||
                     (m_TraceStopping.load() && !m_TraceWriteFailed && !m_TraceSizeCapped))
                 writeTraceRow(row);
@@ -1683,13 +1715,9 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     const VrrTimingDiagnostics& diagnostics = row.diagnostics;
     // The writer must never read mutable controller parameters. Reconstruct
     // this row's policy from immutable session settings and its captured mode.
-    auto traceConfig = m_Config;
-    traceConfig.latencyMode = row.latencyMode;
-    VrrTimingParameters parameters = vrrTimingParametersForSession(
-        traceConfig, m_NativeSynchronizedPresentation, m_NativeScheduledPresentation);
+    const VrrTimingParameters& parameters = m_TraceParameters;
     // Loaded before either worker starts; retain the actual startup input
     // without reading mutable controller state on the trace writer thread.
-    parameters.playoutDelayStartSeedUs = m_StartDelaySeedUs;
     const VrrPresentFeedback& feedback = row.feedback;
     const FrameTelemetry& telemetry = row.telemetry;
     const uint64_t nativePresentDurationUs =
@@ -2198,6 +2226,21 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(row.telemetry.trajectoryResyncDeferred);
     addSigned(row.telemetry.trajectorySuccessorFrame);
     addUnsigned(row.telemetry.trajectorySuccessorProof);
+#ifdef VRR_WORKER_REPLAY
+    addUnsigned(2); // Virtual production-worker closed loop, never a live capture.
+#else
+    addUnsigned(0);
+#endif
+    addUnsigned(row.telemetry.bufferAuditValid ? 1 : 0);
+    const auto addAudit = [&](const VrrBufferAuditSnapshot& audit) {
+#define VRR_WRITE_BUFFER_AUDIT(type, name, member) \
+        if constexpr (std::is_signed<type>::value) addSigned(audit.member); \
+        else addUnsigned(audit.member);
+        VRR_BUFFER_AUDIT_FIELDS(VRR_WRITE_BUFFER_AUDIT)
+#undef VRR_WRITE_BUFFER_AUDIT
+    };
+    addAudit(row.telemetry.bufferBefore);
+    addAudit(row.bufferAfter);
     line.append('\n');
 
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {
@@ -2469,6 +2512,11 @@ void VrrPacingWorker::closeTrace()
         m_TraceRowsEnqueued.exchange(0, std::memory_order_relaxed);
     const uint64_t arrivalsAllocated =
         m_TraceArrivalSequence.load(std::memory_order_relaxed);
+#ifdef VRR_WORKER_REPLAY
+    const bool replayHadTrace = m_TraceFile != nullptr;
+    const bool replayWasCapped = m_TraceSizeCapped;
+    bool replayCloseFailed = false;
+#endif
     if (m_TraceFile != nullptr) {
         if (m_TraceFormat == TraceFormat::Csv &&
                 std::fflush(m_TraceFile) != 0) {
@@ -2524,11 +2572,21 @@ void VrrPacingWorker::closeTrace()
 
     if (m_TraceFile != nullptr) {
         if (std::fclose(m_TraceFile) != 0) {
+#ifdef VRR_WORKER_REPLAY
+            replayCloseFailed = true;
+#endif
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "VRR trace close reported a write failure");
         }
         m_TraceFile = nullptr;
     }
+#ifdef VRR_WORKER_REPLAY
+    if (replayTraceResult) {
+        *replayTraceResult = replayHadTrace && !replayWasCapped &&
+            !m_TraceWriteFailed && !replayCloseFailed && droppedRows == 0 &&
+            arrivalsAllocated > 0 && rowsEnqueued == arrivalsAllocated;
+    }
+#endif
     m_TraceChunk.clear();
     m_TraceWriteFailed = false;
 }

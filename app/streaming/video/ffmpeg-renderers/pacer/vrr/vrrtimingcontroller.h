@@ -1,5 +1,7 @@
 #pragma once
+#include "bufferaudit.h"
 #include "inputlayercadence.h"
+#include "receivedriftclock.h"
 #include "inputcoveragehistory.h"
 #include "extrabufferslew.h"
 
@@ -51,6 +53,9 @@
     X(uint64_t, playout_input_rate_drop_snap, playoutInputRateDropSnap, 0) \
     /* Nonzero: a never-seen rate layer is seeded from the previous layer only */ \
     /* when that layer's period is at most this many per mille of the new one. */ \
+    /* 0: recorded diagnostic-age cache; 1: eligible-age expiry; */ \
+    /* 2: expiry plus bounded fresh-empty-layer reacquisition. */ \
+    X(uint64_t, playout_input_layer_lifecycle, playoutInputLayerLifecycle, 0) \
     X(uint64_t, playout_input_layer_seed_ratio_per_mille, playoutInputLayerSeedRatioPerMille, 0) \
     /* Input-buffer learning ignores the largest `trim` requirements until the */ \
     /* profile tail is supported. */ \
@@ -536,6 +541,7 @@ public:
     uint64_t headroomUs() const;
     uint64_t sourcePeriodUs() const;
     uint64_t inputLayerPeriodUs() const { return m_InputLayerPeriodUs; }
+    VrrBufferAuditSnapshot bufferAudit(uint64_t nowUs, uint64_t appliedUs) const;
     uint64_t displayPeriodUs() const;
     uint64_t guardUs() const;
     uint64_t renderLeadUs() const;
@@ -851,6 +857,9 @@ private:
     // Input history coordinate: applied offset movement minus the drift rate
     // (trailing least-squares slope in mode 3), continuous across reseeds.
     uint64_t m_PlayoutOffsetEpoch = 0;
+    Vrr13::ReceiveDriftClock m_ReceiveDriftClock;
+    bool m_ReceiveDriftPacketValid = false;
+    int64_t m_ReceiveDriftPacketOffsetUs = 0;
     bool m_InputClockValid = false;
     uint64_t m_InputClockEpoch = 0;
     int64_t m_InputClockLastOffsetUs = 0;
@@ -885,10 +894,16 @@ private:
     struct InputLayer {
         uint64_t periodUs = 0;
         Vrr13::InputPercentileBuffer buffer;
+        uint64_t identity = 0;
     };
     enum class InputLayerChange { None, Restored, Created };
     std::vector<InputLayer> m_InputLayers;
     uint64_t m_InputLayerPeriodUs = 0;
+    // Diagnostic identities/counters never participate in layer selection.
+    uint64_t m_InputLayerIdentity = 0, m_NextInputLayerIdentity = 0;
+    uint64_t m_InputLayerSwitches = 0, m_InputLayerCreates = 0;
+    uint64_t m_InputLayerRestores = 0, m_InputLayerExpirations = 0;
+    uint64_t m_InputAuditFeedbackFrame = 0, m_InputAuditEligibilityReasons = 0;
     uint64_t m_InputLayerEligibleAtStart = 0;
     Vrr13::InputLayerCadence m_InputLayerCadence;
     Vrr13::InputCoverageHistory m_InputCoverageHistory;
