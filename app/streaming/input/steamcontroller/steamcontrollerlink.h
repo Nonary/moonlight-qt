@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Steam Controller (2026) HID transport layer: one SteamControllerLink per open vendor interface
-// (the cable-connected unit's interface 0, or one of the wireless puck's interfaces 2..5), the
-// SteamControllerManager that enumerates and owns them, and the SteamHidTransport they talk
-// through. Port of the Android client's SteamControllerUsb: link setup through feature report 1,
-// keep-alives, the firmware attribute queries, the bounded output queue with stop priority,
-// rumble hold and the stop sequence. Everything is driven by explicit timestamps (handleReport,
-// service, stop) so the SDL runner threads and the unit tests share one implementation.
+// (the cable-connected unit's interface 0, one of the wireless puck's interfaces 2..5, or a
+// Bluetooth LE controller's HID-over-GATT device), the SteamControllerManager that enumerates
+// and owns them, and the SteamHidTransport they talk through. Port of the Android client's
+// SteamControllerUsb: link setup through feature report 1, keep-alives, the firmware attribute
+// queries, the bounded output queue with stop priority, rumble hold and the stop sequence; a
+// Bluetooth LE link additionally takes the host's Steam settings writes (the Android BLE
+// driver's relay) and its haptic knobs. Everything is driven by explicit timestamps
+// (handleReport, service, stop) so the SDL runner threads and the unit tests share one
+// implementation.
 #pragma once
 
 #include "steamcontrollerattributes.h"
@@ -26,6 +29,8 @@ struct SteamHidDeviceInfo {
     int interfaceNumber = -1;
     uint16_t usagePage = 0;
     uint16_t usage = 0;
+    enum Bus { BusUnknown = 0, BusUsb = 1, BusBluetooth = 2 };
+    int bus = BusUnknown;   // only SDL3's hidapi reports it; otherwise the product id tells
 };
 
 // One open HID handle. read() returns bytes read (buf[0] = report id), 0 on timeout, < 0 on error;
@@ -53,6 +58,7 @@ public:
     static constexpr int KEEPALIVE_MS = 1000;
     static constexpr int STALE_STATE_MS = 3000;
     static constexpr int MAX_OUTPUTS = 32;
+    static constexpr int MAX_HOST_SETTINGS = 16;   // queue slots host settings may hold (never evicted by haptics)
     static constexpr int OUTPUT_RETRY_MS = 40;
     static constexpr int OUTPUT_FAILURES_BEFORE_DISCONNECT = 3;
     static constexpr int RUMBLE_TICK_MS = 40;
@@ -75,20 +81,32 @@ public:
         virtual void linkAttributes(SteamControllerLink& link, int generation, const SteamControllerAttributes& attributes) = 0;
     };
 
+    enum Transport { TransportUsb, TransportPuck, TransportBle };
+
+    // bleSlot numbers a Bluetooth LE link (the manager hands out the lowest free one); USB and
+    // puck links are named by their interface.
     SteamControllerLink(int id, const SteamHidDeviceInfo& info, std::unique_ptr<SteamHidDevice> device,
-                        const SteamControllerConfig& config, int rumbleHoldMs, Listener* listener);
+                        const SteamControllerConfig& config, int rumbleHoldMs, Listener* listener, int bleSlot = 0);
     ~SteamControllerLink() override;
 
     int id() const { return m_Id; }
     const SteamHidDeviceInfo& info() const { return m_Info; }
     uint16_t productId() const { return m_Info.productId; }
-    bool isPuck() const { return m_Info.productId == SteamController::PRODUCT_PUCK; }
-    // Puck slot 0..3 (interface - 2) or 0 for the cable.
-    int slot() const { return isPuck() ? m_Info.interfaceNumber - 2 : 0; }
-    // "USB slot N" as the Android client names it, N = HID interface number.
+    Transport transport() const { return transportOf(m_Info.productId); }
+    static Transport transportOf(uint16_t productId);
+    bool isPuck() const { return transport() == TransportPuck; }
+    bool isBle() const { return transport() == TransportBle; }
+    // "USB cable", "wireless puck" or "Bluetooth LE" (arrival log).
+    const char* transportName() const;
+    // LI_SCATTR_TRANSPORT_* for the attributes packet.
+    uint8_t attributeTransport() const;
+    // Puck slot 0..3 (interface - 2), the Bluetooth LE slot, or 0 for the cable.
+    int slot() const { return isPuck() ? m_Info.interfaceNumber - 2 : isBle() ? m_BleSlot : 0; }
+    // "USB slot N" as the Android client names it (N = HID interface number), "Bluetooth LE slot N".
     const std::string& name() const { return m_Name; }
     const SteamControllerConfig& config() const { return m_Core.config(); }
-    uint16_t capabilities() const { return m_Core.capabilities(); }
+    // The core's set, plus LI_CCAP_STEAM_SETTINGS for a Bluetooth LE link (host settings relay).
+    uint16_t capabilities() const;
 
     // Reader thread: blocking read on the device (no lock; the device lives until stop()).
     int readReport(uint8_t* buffer, int length, int timeoutMs) { return m_Device ? m_Device->read(buffer, length, timeoutMs) : -1; }
@@ -108,6 +126,11 @@ public:
     bool steamHaptic(const uint8_t* report, int length, uint64_t nowMs, int expectedGeneration = 0);
     bool rumble(uint16_t lowFreqMotor, uint16_t highFreqMotor, uint64_t nowMs, int expectedGeneration = 0);
     bool setMotionRate(uint8_t motionType, uint16_t reportRateHz, int expectedGeneration = 0);
+    // A host's Steam settings write (ConnListenerSteamSettings). Only a Bluetooth LE link takes
+    // it (it advertises LI_CCAP_STEAM_SETTINGS): 0x8E is sent and followed by this link's own
+    // settings; 0x87 is sent minus HOST_SETTINGS_RESERVED. Both go through the output queue as
+    // feature report 1 writes that haptics cannot evict. False: not a BLE link, or rejected.
+    bool hostSettings(uint8_t command, int count, const uint8_t* triples, uint64_t nowMs, int expectedGeneration = 0);
     // The next report resends its state and pad DOWNs (after an announcement). Lock-free.
     void requestInputReset() { m_InputResetPending = true; }
     // Re-delivers the cached attributes and battery through the listener (after an announcement).
@@ -118,6 +141,7 @@ public:
     SteamControllerAttributes attributes() const;
     bool hasBattery() const;
     size_t queuedOutputs() const;
+    size_t queuedSettings() const;
 
     // Stop sequence (stream end): motors and pad engines off, lizard mode back on, link retired.
     // The reader and service threads must have stopped first.
@@ -140,15 +164,25 @@ private:
     void steamMotion(uint8_t motionType, float x, float y, float z) override;
     void steamBattery(uint8_t state, uint8_t percent) override;
 
-    struct Output { std::vector<uint8_t> data; uint64_t seq = 0; };
+    // An output report (written as is), or a 64-byte feature report 1 frame carrying host
+    // settings (sent with sendFeatureReport; never evicted by haptics).
+    struct Output { std::vector<uint8_t> data; uint64_t seq = 0; bool settings = false; };
 
     void connectLocked(uint64_t nowMs);
     void disconnectLocked(uint64_t nowMs);
     void writeFailedLocked(int generation, uint64_t nowMs);
     void writeSucceededLocked();
-    void enqueueLocked(std::vector<uint8_t> report, uint64_t nowMs);
+    void enqueueLocked(std::vector<uint8_t> report, uint64_t nowMs, bool settings = false);
+    // Bluetooth LE haptic knobs (config): 0x82 tick/click gain boost, 0x81 pulse on-time scale.
+    void adjustBleHapticLocked(std::vector<uint8_t>& report);
     void logLinkSettingsLocked(bool ok);
+    // [01][type][len][payload], zero padded to FEATURE_REPORT_SIZE.
+    static std::vector<uint8_t> featureFrame(uint8_t type, uint8_t length, const uint8_t* payload, int payloadLength);
+    // This link's own settings (lizard mode, IMU mode, Steam watchdog, and the BLE master gain
+    // when asked for), for setup/keep-alive (active) and the stop sequence (!active).
+    std::vector<uint8_t> linkSettingsFrame(bool active) const;
     bool configure(bool active);
+    bool sendFeature(const std::vector<uint8_t>& frame);
     bool featureQuery(uint8_t type, uint8_t length, const uint8_t* payload, int payloadLength, std::vector<uint8_t>& reply);
     void readAttributes(int generation);
     bool writeOutput(const std::vector<uint8_t>& report);
@@ -157,6 +191,7 @@ private:
 
     const int m_Id;
     const SteamHidDeviceInfo m_Info;
+    const int m_BleSlot;
     const std::string m_Name;
     std::unique_ptr<SteamHidDevice> m_Device;
     Listener* const m_Listener;
@@ -204,11 +239,14 @@ private:
     uint64_t m_SummaryDueMs = 0;
     unsigned m_SummaryReports = 0, m_SummaryRumble = 0;
     unsigned m_SummaryPulse[3] = {0, 0, 0}, m_SummaryCommand[3] = {0, 0, 0}, m_SummaryOther = 0;
+    unsigned m_SummarySettings = 0, m_SummaryAdjusted = 0;   // BLE: host settings relayed, haptics rewritten by the knobs
     bool m_SummaryLeftPad = false, m_SummaryRightPad = false;
 };
 
-// Enumerates the Steam Controller interfaces, opens the vendor collection of each and owns the
-// links. rescan()/service() are called by the runner's service thread (or the test).
+// Enumerates the Steam Controller interfaces (USB cable, puck slots, Bluetooth LE devices), opens
+// the vendor collection of each and owns the links. rescan()/service() are called by the
+// runner's service thread (or the test). A Bluetooth LE connect or disconnect is a HID device
+// appearing or vanishing, so the periodic rescan and the lost-device handling cover hot-plug.
 class SteamControllerManager {
 public:
     static constexpr int RESCAN_MS = 2000;

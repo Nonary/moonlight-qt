@@ -76,6 +76,9 @@
 #define SER_STEAMCONTROLLERGRIPS "steamcontrollergrips"
 #define SER_STEAMCONTROLLERRUMBLEHOLD "steamcontrollerrumblehold"
 #define SER_STEAMCONTROLLERSTICKSTRETCH "steamcontrollerstickstretch"
+#define SER_STEAMCONTROLLERHAPTICBOOST "steamcontrollerhapticboost"
+#define SER_STEAMCONTROLLERHAPTICPULSESCALE "steamcontrollerhapticpulsescale"
+#define SER_STEAMCONTROLLERHAPTICMASTERGAIN "steamcontrollerhapticmastergain"
 #define SER_KEEPAWAKE "keepawake"
 #define SER_LANGUAGE "language"
 #define SER_RENDERER "renderer"
@@ -251,6 +254,9 @@ void StreamingPreferences::reload()
                                                              static_cast<int>(SteamControllerGrips::SCG_PADDLES)).toInt());
     steamControllerRumbleHold = qMax(0, settings.value(SER_STEAMCONTROLLERRUMBLEHOLD, 500).toInt());
     steamControllerStickStretch = settings.value(SER_STEAMCONTROLLERSTICKSTRETCH, false).toBool();
+    steamControllerHapticBoost = qBound(0, settings.value(SER_STEAMCONTROLLERHAPTICBOOST, 0).toInt(), 30);
+    steamControllerHapticPulseScale = qBound(100, settings.value(SER_STEAMCONTROLLERHAPTICPULSESCALE, 100).toInt(), 400);
+    steamControllerHapticMasterGain = qBound(0, settings.value(SER_STEAMCONTROLLERHAPTICMASTERGAIN, 0).toInt(), 24);
     audioConfig = static_cast<AudioConfig>(settings.value(SER_AUDIOCFG,
                                                   static_cast<int>(AudioConfig::AC_STEREO)).toInt());
     videoCodecConfig = static_cast<VideoCodecConfig>(settings.value(SER_VIDEOCFG,
@@ -489,6 +495,9 @@ void StreamingPreferences::save()
     settings.setValue(SER_STEAMCONTROLLERGRIPS, static_cast<int>(steamControllerGrips));
     settings.setValue(SER_STEAMCONTROLLERRUMBLEHOLD, steamControllerRumbleHold);
     settings.setValue(SER_STEAMCONTROLLERSTICKSTRETCH, steamControllerStickStretch);
+    settings.setValue(SER_STEAMCONTROLLERHAPTICBOOST, steamControllerHapticBoost);
+    settings.setValue(SER_STEAMCONTROLLERHAPTICPULSESCALE, steamControllerHapticPulseScale);
+    settings.setValue(SER_STEAMCONTROLLERHAPTICMASTERGAIN, steamControllerHapticMasterGain);
 }
 
 void StreamingPreferences::setDiagnosticsStatus(const QString& message)

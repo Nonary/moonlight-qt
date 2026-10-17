@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Exercises the production Steam Controller (2026) decoder, attribute parser and HID link with a
 // fake transport and a virtual clock. No SDL, no device: the byte sequences are the Android
-// client's regression harness (tools/regression/test_steam_usb.py) and the real unit's replies.
+// client's regression harness (tools/regression/test_steam_usb.py), the real unit's replies and
+// the Android BLE driver's settings relay and haptic knobs (SteamControllerBle.java).
 #include "../../app/streaming/input/steamcontroller/steamcontrollerlink.h"
 #include "../../app/streaming/input/steamcontroller/steamcontrollerhost.h"
 
@@ -65,6 +66,12 @@ static std::string logLine(const char* needle)
     for (const std::string& line : g_Log) if (line.find(needle) != std::string::npos) return line;
     return std::string();
 }
+static std::string lastLogLine(const char* needle)
+{
+    for (auto it = g_Log.rbegin(); it != g_Log.rend(); ++it) if (it->find(needle) != std::string::npos) return *it;
+    return std::string();
+}
+static bool has(const std::string& line, const char* needle) { return line.find(needle) != std::string::npos; }
 
 // ----- fake HID -----
 struct FakeState {
@@ -457,7 +464,7 @@ static void testLink()
     io.add("puck/if2/col2", 0x1304, 2, 0x0001);
     io.add("puck/if2", 0x1304, 2, 0xFF00);
     io.add("puck/if4", 0x1304, 4, 0xFF00);
-    io.add("ble", 0x1303, 0, 0xFF00);
+    io.add("other-valve", 0x1305, 0, 0xFF00);   // a Valve PID the driver does not know
     io.add("old-dongle", 0x1142, 1, 0xFF00);
     io.probeFails = {"puck/if2/col1", "puck/if2/col2"};
     SteamHidDeviceInfo other; other.path = "other"; other.vendorId = 0x054c; other.productId = 0x1304; other.interfaceNumber = 2; other.usagePage = 0xFF00;
@@ -842,6 +849,353 @@ static void testHostFeedbackGeneration()
     link->stop(g_Now);
 }
 
+// A 64-byte feature report 1 frame from its leading bytes.
+static std::vector<uint8_t> frame64(const char* leading)
+{
+    std::vector<uint8_t> f = hex(leading);
+    f.resize(64, 0);
+    return f;
+}
+static std::shared_ptr<SteamControllerLink> byPath(SteamControllerManager& m, const char* path)
+{
+    for (auto& l : m.links()) if (l->info().path == path) return l;
+    throw std::runtime_error(std::string("no link for ") + path);
+}
+
+// The Bluetooth LE transport (PID 0x1303, HID-over-GATT): same protocol as USB plus the host
+// settings relay. Byte sequences are the Android BLE driver's (SteamControllerBle.java).
+static void testBle()
+{
+    const std::vector<uint8_t> usbSettings = frame64("018709090000301800470000");      // lizard 0, IMU 0x18, watchdog 0
+    const std::vector<uint8_t> usbStopSettings = frame64("018709090100300000470000");  // lizard 1, IMU 0
+    SteamControllerConfig cfg;   // defaults: motion on, split pads, no knobs
+    FakeTransport io;
+    // Windows/macOS: one path per top-level collection of the HID-over-GATT device, interface -1
+    // (a Bluetooth HID device has no USB interface); the vendor collection is the 0xFF00 one.
+    io.add("ble/a/col1", 0x1303, -1, 0x0001);
+    io.add("ble/a/col2", 0x1303, -1, 0x0001);
+    io.add("ble/a/col3", 0x1303, -1, 0xFF00);
+    // Linux: the single uhid hidraw node of a second paired controller, first collection's usage.
+    io.add("ble/b/hidraw7", 0x1303, 0, 0x0001);
+    io.add("ble/odd", 0x1303, 1, 0xFF00);   // no Bluetooth HID device has interface 1
+    io.probeFails = {"ble/a/col1", "ble/a/col2"};
+    io.state("ble/a/col3")->realUnit();
+    Events e;
+    SteamControllerManager m(io, cfg, 500, &e);
+    run(m);
+    auto links = m.links();
+    bool allBle = links.size() == 2;
+    for (auto& l : links) allBle &= l->isBle() && !l->isPuck() && l->transport() == SteamControllerLink::TransportBle;
+    check(allBle && io.opened.size() == 4 && !io.state("ble/odd")->open,
+          "both Bluetooth LE controllers (PID 0x1303, interface -1 and 0) are opened by usage page or by probing; interface 1 is not a candidate");
+    SteamHidDeviceInfo odd; odd.vendorId = 0x28DE; odd.productId = 0x1303; odd.interfaceNumber = -1;
+    SteamHidDeviceInfo odd2 = odd; odd2.interfaceNumber = 2;
+    check(SteamControllerManager::isCandidate(odd) && !SteamControllerManager::isCandidate(odd2), "isCandidate takes 0x1303 with interface -1 or 0 only");
+    auto a = byPath(m, "ble/a/col3"), b = byPath(m, "ble/b/hidraw7");
+    check(a->name() == "Bluetooth LE slot 0" && b->name() == "Bluetooth LE slot 1" && a->slot() == 0 && b->slot() == 1
+          && strcmp(a->transportName(), "Bluetooth LE") == 0 && a->attributeTransport() == LI_SCATTR_TRANSPORT_BLE,
+          "BLE links take the lowest free slot number, are named 'Bluetooth LE slot N' and report transport BLE");
+    check(has(logLine("opened ble/a/col3"), "(product 0x1303, interface -1, usage page 0xff00; usage page 0xff00) as Bluetooth LE slot 0")
+          && has(logLine("opened ble/b/hidraw7"), "accepted a feature report 1 read) as Bluetooth LE slot 1"),
+          "the opened lines name the collection pick and the Bluetooth LE slot");
+    check(a->capabilities() == (SteamControllerCore(cfg, nullptr).capabilities() | LI_CCAP_STEAM_SETTINGS)
+          && (a->capabilities() & LI_CCAP_STEAM_SETTINGS) != 0 && (SteamControllerCore(cfg, nullptr).capabilities() & LI_CCAP_STEAM_SETTINGS) == 0,
+          "a BLE link advertises the USB capability set plus STEAM_SETTINGS");
+
+    // Connect: report 0x45 (45 bytes after the id, same offsets as 0x42/0x47)
+    input(*a, state(0x45));
+    check(e.connected.size() == 1 && a->connected() && e.states == 1 && e.touch.size() == 2
+          && logCount("Steam Controller Bluetooth LE slot 0: controller connected (Bluetooth LE, link generation 1)") == 1,
+          "a 0x45 report connects the BLE link and its state and pads reach the listener");
+    check(has(logLine("Bluetooth LE slot 0: haptics:"), "0x82 gain boost +0 dB (ceiling +6 dB), 0x81 pulse on-time x1.0, master gain setting not written"),
+          "the BLE link logs its haptic knobs once per connect (defaults off)");
+    run(m);
+    auto st = io.state("ble/a/col3");
+    check(st->settingsWrites().size() == 1 && st->settingsWrites()[0] == usbSettings, "the BLE connect settings are byte-identical to USB (01 87 09 09 00 00 30 18 00 47 00 00)");
+    check(has(logLine("Bluetooth LE slot 0: link settings"), "link settings (feature report 1, interface 0): lizard mode 0, IMU mode 0x18, Steam watchdog 0 -> accepted"),
+          "the BLE settings line reads like the USB one");
+    auto q = st->queries();
+    check(q.size() == 4 && q[0][1] == 0x83 && q[0][2] == 0 && q[1][1] == 0xF2 && q[1][2] == 1 && q[1][3] == 0
+          && q[2][1] == 0xAE && q[2][2] == 0x15 && q[2][3] == 1 && q[3][1] == 0xAE && q[3][2] == 0x15 && q[3][3] == 0 && st->gets == 4,
+          "the BLE attribute queries are the USB ones (83 00, F2 01 00, AE 15 01, AE 15 00), one GET_REPORT each");
+    check(e.attrs.size() == 1 && e.attrs[0].second.transport == LI_SCATTR_TRANSPORT_BLE && e.attrs[0].second.unitSerial == "FXA9962403787"
+          && logCount("Steam Controller ble (Bluetooth LE slot 0): firmware build 2026-07-07") == 1,
+          "the attributes packet carries transport BLE (1) and the real unit's values");
+    uint8_t battery[15] = {0x43, 1, 77};
+    input(*a, std::vector<uint8_t>(battery, battery + 15));
+    check(e.battery == LI_BATTERY_STATE_DISCHARGING && e.percent == 77 && a->hasBattery(), "a 0x43 report over BLE sets the battery; without one it stays unknown");
+    g_Now += 1000; run(m);
+    check(st->settingsWrites().size() == 2 && st->settingsWrites()[1] == usbSettings && st->gets == 4, "the BLE keep-alive repeats the same frame every second");
+
+    // Host settings relay: 0x87 minus the reserved ids
+    st->features.clear();
+    const uint8_t triples[] = {9, 0, 0, 48, 0x18, 0, 71, 0, 0, 49, 2, 0, 52, 0xff, 0xff, 53, 0xff, 0xff, 41, 0x34, 0x12, 70, 5, 0, 79, 1, 0};
+    check(a->hostSettings(0x87, 9, triples, g_Now) && a->queuedSettings() == 1 && a->queuedOutputs() == 1, "a BLE link takes a host 0x87 write into the output queue as a settings entry");
+    run(m);
+    check(st->features.size() == 1 && st->features[0] == frame64("018709293412460500" "4f0100"),
+          "the kept triples go out as feature report 1 `01 87 09 29 34 12 46 05 00 4f 01 00`; 9, 48, 71, 49, 52 and 53 are dropped");
+    check(logCount("Steam Controller Bluetooth LE slot 0: host settings 0x87: 41=4660 70=5 79=1 (reserved, kept ours: 9 48 71 49 52 53)") == 1,
+          "the relay logs the applied and the reserved ids like the Android driver");
+    st->features.clear();
+    const uint8_t onlyReserved[] = {9, 1, 0, 52, 0xff, 0xff};
+    check(a->hostSettings(0x87, 2, onlyReserved, g_Now) && a->queuedSettings() == 0, "a write of reserved ids only is accepted but queues nothing");
+    run(m);
+    check(st->features.empty() && logCount("host settings 0x87: nothing to apply (reserved, kept ours: 9 52)") == 1, "nothing is written and the log says so");
+    const uint8_t unreserved[] = {41, 1, 0};
+    check(a->hostSettings(0x87, 1, unreserved, g_Now) && a->queuedSettings() == 1, "an unreserved id alone is applied");
+    run(m);
+    check(st->features.size() == 1 && st->features[0] == frame64("01870329" "0100") && logCount("host settings 0x87: 41=1") == 1, "a one-triple write has length 3 and no reserved note");
+    // 0x8E: reset, then this link's own settings right behind it
+    st->features.clear();
+    check(a->hostSettings(0x8E, 0, nullptr, g_Now) && a->queuedSettings() == 2, "0x8E queues the reset and the link settings");
+    run(m);
+    check(st->features.size() == 2 && st->features[0] == frame64("018e00") && st->features[1] == usbSettings
+          && logCount("Bluetooth LE slot 0: host settings 0x8e (load defaults), re-sending this link's setup") == 1,
+          "0x8E goes out as `01 8E 00` followed by the link settings");
+    check(!a->hostSettings(0x83, 0, nullptr, g_Now) && !a->hostSettings(0x87, 2, nullptr, g_Now) && !a->hostSettings(0x87, 9, triples, g_Now, 99)
+          && a->queuedSettings() == 0, "other commands, a missing payload and a stale generation are rejected");
+    uint8_t many[25 * 3];
+    for (int i = 0; i < 25; i++) { many[3 * i] = (uint8_t)(100 + i); many[3 * i + 1] = (uint8_t)i; many[3 * i + 2] = 0; }
+    st->features.clear(); a->hostSettings(0x87, 25, many, g_Now); run(m);
+    check(st->features.size() == 1 && st->features[0][2] == 60 && st->features[0][3] == 100 && st->features[0][60] == 119 && st->features[0][63] == 0,
+          "a write longer than the frame keeps the first 20 triples (61 payload bytes)");
+
+    // Queue class: settings are never evicted by haptics; only a settings flood evicts settings
+    st->features.clear(); st->writes.clear();
+    a->hostSettings(0x87, 1, unreserved, g_Now);
+    for (int i = 0; i < 100; i++) { auto p = pulse(1, 1); a->steamHaptic(p.data(), (int)p.size(), g_Now); }
+    check(a->queuedOutputs() <= 32 && a->queuedSettings() == 1, "a haptic burst fills the bounded queue around the settings write without evicting it");
+    run(m);
+    check(st->features.size() == 1 && st->features[0] == frame64("018703290100") && st->countWrites(0x81) == 31, "the settings write is sent and 31 of the 100 pulses survive the burst");
+    st->features.clear();
+    for (int i = 0; i < 20; i++) { uint8_t t[3] = {41, (uint8_t)i, 0}; a->hostSettings(0x87, 1, t, g_Now); }
+    check(a->queuedSettings() == 16, "a settings flood keeps the newest 16 writes (the Android reservation)");
+    run(m);
+    check(st->features.size() == 16 && st->features[0][4] == 4 && st->features[15][4] == 19, "a flood evicts the oldest settings first, in order");
+    st->features.clear(); st->writes.clear();
+    for (int i = 0; i < 16; i++) { uint8_t t[3] = {41, (uint8_t)i, 0}; a->hostSettings(0x87, 1, t, g_Now); }
+    auto stopPulse = pulse(0, 0);
+    a->steamHaptic(stopPulse.data(), (int)stopPulse.size(), g_Now);
+    for (int i = 0; i < 100; i++) { auto p = pulse(1, 1); a->steamHaptic(p.data(), (int)p.size(), g_Now); }
+    check(a->queuedOutputs() <= 32 && a->queuedSettings() == 16, "16 settings, a stop and a burst stay within the 32-entry queue");
+    run(m);
+    check(st->features.size() == 16 && st->wrote(stopPulse), "every settings write and the stop are sent; effects took the evictions");
+    // A failed settings write is one strike and is not replayed
+    st->features.clear(); st->failFeature = true;
+    a->hostSettings(0x87, 1, unreserved, g_Now); run(m);
+    check(a->connected() && a->queuedSettings() == 0 && logCount("Bluetooth LE: output failed on Bluetooth LE slot 0 (1 of 3)") == 1,
+          "a refused settings write counts as one output failure and is dropped");
+    st->failFeature = false;
+    // Summary line
+    for (int i = 0; i < 10; i++) input(*a, state(0x45));
+    g_Now += 10000; run(m);
+    check(has(lastLogLine("Bluetooth LE slot 0: 1 reports/s"), ", host settings ") && has(lastLogLine("Bluetooth LE slot 0: 1 reports/s"), ", adjusted 0"),
+          "the BLE summary line adds the host settings and adjusted counts");
+
+    // The host relay: through the registry for an announced BLE link; a USB link ignores it
+    FakeTransport uio;
+    uio.add("usb", 0x1302, 0, 0xFF00);
+    Events ue;
+    SteamControllerManager um(uio, cfg, 500, &ue);
+    run(um);
+    auto u = um.links()[0];
+    input(*u, state(0x42)); run(um);
+    {
+        SteamControllerHost host;
+        SteamControllerHost::setActiveGamepadMask(3);
+        host.announce(0, a, a->generation());
+        host.announce(1, u, u->generation());
+        st->features.clear(); uio.state("usb")->features.clear();
+        SteamControllerHost::clSteamSettings(0, 0x87, 3, triples + 18);
+        SteamControllerHost::clSteamSettings(1, 0x87, 3, triples + 18);
+        check(a->queuedSettings() == 1 && u->queuedSettings() == 0 && !u->hostSettings(0x87, 3, triples + 18, g_Now),
+              "clSteamSettings reaches the announced BLE link; a USB link refuses host settings");
+        SteamControllerHost::clSteamSettings(0, 0x8E, 0, nullptr);
+        check(a->queuedSettings() == 3 && u->queuedSettings() == 0, "clSteamSettings relays 0x8E too");
+        // The registry stamps the queue with the real clock: move the virtual clock past it to drain.
+        g_Now = std::max<uint64_t>(g_Now, nowMs() + 1);
+        run(m);
+        bool relayed = false, reset = false;
+        for (auto& f : st->features) { relayed |= f == frame64("018709293412460500" "4f0100"); reset |= f == frame64("018e00"); }
+        check(relayed && reset && a->queuedSettings() == 0 && uio.state("usb")->features.empty() && u->queuedSettings() == 0,
+              "the relayed 0x87 and 0x8E reach only the BLE controller");
+        host.retire(a, 0, 2); host.retire(u, 1, 0);
+    }
+
+    // Output failures retire a BLE slot with the BLE wording; the stop sequence is the USB one
+    st->writes.clear(); st->failWrite = true;
+    for (int i = 0; i < 3; i++) { auto p = pulse(0, 1); a->steamHaptic(p.data(), (int)p.size(), g_Now); run(m); }
+    check(!a->connected() && logCount("Steam Controller Bluetooth LE: output keeps failing on Bluetooth LE slot 0; retiring the slot") == 1,
+          "three failed BLE output transfers retire the slot with the Bluetooth LE wording");
+    st->failWrite = false; g_Now += 1000; input(*a, state(0x45)); run(m);
+    check(a->connected() && a->generation() == 3, "the BLE slot reconnects after the backoff");
+    g_Now += 3000; a->checkStale(g_Now);
+    check(!a->connected() && logCount("Bluetooth LE slot 0: no state report for 3000 ms; controller gone") == 1, "a silent BLE link is dropped after 3 s like USB");
+    input(*a, state(0x45)); run(m);
+    st->writes.clear(); st->features.clear();
+    m.stop(g_Now);
+    check(st->writes.size() == 5 && st->writes[0] == motorStop() && st->writes[4] == std::vector<uint8_t>{0x82, 1, 0, 0}
+          && st->features.size() == 1 && st->features[0] == usbStopSettings && !st->open,
+          "the BLE stop sequence is the USB one: motor stop, both pad stops, lizard mode back on");
+    um.stop(g_Now);
+    // Ignore list and reserved ids
+    std::string ignore = SDL_IGNORE_DEVICES;
+    check(has(ignore, "0x28de/0x1303") && has(ignore, "0x28de/0x1302") && has(ignore, "0x28de/0x1304"), "the SDL ignore list names the cable, Bluetooth LE and puck PIDs");
+    bool reservedSet = true;
+    for (int id = 0; id < 256; id++) {
+        bool expected = id == 9 || id == 48 || id == 71 || id == 49 || id == 52 || id == 53;
+        reservedSet &= isHostSettingReserved(id) == expected;
+    }
+    check(reservedSet, "the reserved host setting ids are exactly {9, 48, 71, 49, 52, 53}");
+}
+
+// The three Bluetooth LE haptic knobs (ported from the Android BLE driver): off by default, and
+// never applied to a USB or puck link in the same session.
+static void testBleHapticKnobs()
+{
+    auto twoLinks = [](const SteamControllerConfig& c, FakeTransport& io, Events& e) {
+        io.add("ble", 0x1303, -1, 0xFF00);
+        io.add("usb", 0x1302, 0, 0xFF00);
+        auto m = std::make_shared<SteamControllerManager>(io, c, 500, &e);
+        run(*m);
+        input(*byPath(*m, "ble"), state(0x45)); input(*byPath(*m, "usb"), state(0x42)); run(*m);
+        io.state("ble")->writes.clear(); io.state("usb")->writes.clear();
+        return m;
+    };
+    auto send = [](SteamControllerManager& m, const char* path, std::vector<uint8_t> r) {
+        auto l = byPath(m, path); l->steamHaptic(r.data(), (int)r.size(), g_Now); run(m);
+    };
+
+    // Boost: the signed gain byte of 0x82 ticks and clicks
+    {
+        SteamControllerConfig c; c.hapticBoostDb = 6;
+        FakeTransport io; Events e; auto m = twoLinks(c, io, e);
+        auto bs = io.state("ble"), us = io.state("usb");
+        send(*m, "ble", {0x82, 0, 2, 0xF2}); send(*m, "usb", {0x82, 0, 2, 0xF2});
+        check(bs->writes.back() == std::vector<uint8_t>{0x82, 0, 2, 0xF8} && us->writes.back() == std::vector<uint8_t>{0x82, 0, 2, 0xF2},
+              "+6 dB lifts Steam's -14 dB click to -8 dB on the BLE link and leaves the USB link's bytes alone");
+        send(*m, "ble", {0x82, 1, 1, 0x00});
+        check(bs->writes.back() == std::vector<uint8_t>{0x82, 1, 1, 0x06}, "a 0 dB tick becomes +6 dB");
+        send(*m, "ble", {0x82, 1, 1, 0xFF});
+        check(bs->writes.back() == std::vector<uint8_t>{0x82, 1, 1, 0x05}, "a -1 dB tick becomes +5 dB (signed arithmetic)");
+        send(*m, "ble", {0x82, 0, 2, 0x04});
+        check(bs->writes.back() == std::vector<uint8_t>{0x82, 0, 2, 0x06}, "the boost clamps at the firmware's +6 dB ceiling");
+        send(*m, "ble", {0x82, 0, 0, 0x00});
+        check(bs->writes.back() == std::vector<uint8_t>{0x82, 0, 0, 0x00}, "a 0x82 stop (command 0) is untouched");
+        send(*m, "ble", {0x82, 0, 3, 0xF2});
+        check(bs->writes.back() == std::vector<uint8_t>{0x82, 0, 3, 0xF2}, "other 0x82 commands are untouched");
+        send(*m, "ble", pulse(0, 1));
+        check(bs->writes.back() == pulse(0, 1), "the boost does not touch 0x81 pulses");
+        check(has(lastLogLine("Bluetooth LE slot 0: haptics:"), "0x82 gain boost +6 dB (ceiling +6 dB), 0x81 pulse on-time x1.0, master gain setting not written"),
+              "the connect line shows the boost");
+        g_Now += 10000; run(*m);
+        check(has(lastLogLine("Bluetooth LE slot 0: 0 reports/s"), ", adjusted 4") && has(lastLogLine("USB slot 0: 0 reports/s"), "other 0") && !has(lastLogLine("USB slot 0: 0 reports/s"), "adjusted"),
+              "the summary counts the four rewritten commands; the USB line is unchanged");
+        m->stop(g_Now);
+    }
+    {
+        SteamControllerConfig c; c.hapticBoostDb = 20;
+        FakeTransport io; Events e; auto m = twoLinks(c, io, e);
+        send(*m, "ble", {0x82, 0, 2, 0xF2}); check(io.state("ble")->writes.back()[3] == 0x06, "+20 dB puts a -14 dB click at the ceiling");
+        send(*m, "ble", {0x82, 1, 1, 0xE8}); check(io.state("ble")->writes.back()[3] == (uint8_t)(int8_t)-4, "+20 dB lifts a -24 dB tick to -4 dB");
+        m->stop(g_Now);
+    }
+    {
+        SteamControllerConfig c; c.hapticBoostDb = 99;   // clamped to 30
+        FakeTransport io; Events e; auto m = twoLinks(c, io, e);
+        check(byPath(*m, "ble")->config().hapticBoostDb == 30 && has(lastLogLine("Bluetooth LE slot 0: haptics:"), "boost +30 dB"), "an out-of-range boost is clamped to 30 dB");
+        send(*m, "ble", {0x82, 1, 1, 0xE8}); check(io.state("ble")->writes.back()[3] == 0x06, "+30 dB on -24 dB clamps to the ceiling");
+        m->stop(g_Now);
+    }
+
+    // Pulse scale: the on-time of 0x81 pulses
+    {
+        SteamControllerConfig c; c.hapticPulseScalePercent = 200;
+        FakeTransport io; Events e; auto m = twoLinks(c, io, e);
+        auto bs = io.state("ble"), us = io.state("usb");
+        std::vector<uint8_t> slide{0x81, 0, 0x90, 0x01, 0x00, 0x00, 0x01, 0x00};   // 400 us on, repeat 1
+        send(*m, "ble", slide); send(*m, "usb", slide);
+        check(bs->writes.back() == std::vector<uint8_t>{0x81, 0, 0x20, 0x03, 0x00, 0x00, 0x01, 0x00} && us->writes.back() == slide,
+              "200% doubles a 400 us slide pulse to 800 us (0x0320) on the BLE link only");
+        send(*m, "ble", {0x81, 1, 0x00, 0x90, 0x10, 0x00, 0x05, 0x00});
+        check(bs->writes.back() == std::vector<uint8_t>{0x81, 1, 0xFF, 0xFF, 0x10, 0x00, 0x05, 0x00}, "the scaled on-time is capped at 0xFFFF");
+        send(*m, "ble", {0x81, 1, 0x00, 0x00, 0x10, 0x00, 0x05, 0x00});
+        check(bs->writes.back() == std::vector<uint8_t>{0x81, 1, 0x00, 0x00, 0x10, 0x00, 0x05, 0x00}, "a zero on-time is untouched");
+        std::vector<uint8_t> stop{0x81, 0, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00};   // repeat 0: a stop
+        send(*m, "ble", stop);
+        check(bs->writes.back() == stop, "a zero-repeat stop is untouched");
+        send(*m, "ble", {0x82, 0, 2, 0xF2});
+        check(bs->writes.back() == std::vector<uint8_t>{0x82, 0, 2, 0xF2}, "the pulse scale does not touch 0x82 commands");
+        check(has(lastLogLine("Bluetooth LE slot 0: haptics:"), "0x81 pulse on-time x2.0"), "the connect line shows the pulse scale");
+        g_Now += 10000; run(*m);
+        check(has(lastLogLine("Bluetooth LE slot 0: 0 reports/s"), ", adjusted 2"), "two pulses were rewritten");
+        m->stop(g_Now);
+    }
+    {
+        SteamControllerConfig c; c.hapticPulseScalePercent = 300;
+        FakeTransport io; Events e; auto m = twoLinks(c, io, e);
+        send(*m, "ble", {0x81, 0, 0x90, 0x01, 0x00, 0x00, 0x01, 0x00});
+        check(io.state("ble")->writes.back()[2] == 0xB0 && io.state("ble")->writes.back()[3] == 0x04 && has(lastLogLine("Bluetooth LE slot 0: haptics:"), "x3.0"),
+              "300% makes 400 us into 1200 us (0x04B0)");
+        m->stop(g_Now);
+    }
+    {
+        SteamControllerConfig c; c.hapticPulseScalePercent = 50;   // clamped to 100
+        FakeTransport io; Events e; auto m = twoLinks(c, io, e);
+        std::vector<uint8_t> slide{0x81, 0, 0x90, 0x01, 0x00, 0x00, 0x01, 0x00};
+        send(*m, "ble", slide);
+        check(io.state("ble")->writes.back() == slide && byPath(*m, "ble")->config().hapticPulseScalePercent == 100, "a scale under 100% is clamped to 100% (no change)");
+        m->stop(g_Now);
+    }
+
+    // Master gain: setting 76 in the link's own settings, BLE only, cleared at stop
+    {
+        SteamControllerConfig c; c.hapticMasterGainDb = 12;
+        FakeTransport io; Events e;
+        io.add("ble", 0x1303, -1, 0xFF00);
+        io.add("usb", 0x1302, 0, 0xFF00);
+        SteamControllerManager m(io, c, 500, &e);
+        run(m);
+        auto bl = byPath(m, "ble"), ul = byPath(m, "usb");
+        input(*bl, state(0x45)); input(*ul, state(0x42)); run(m);
+        auto bs = io.state("ble"), us = io.state("usb");
+        const std::vector<uint8_t> gainSettings = frame64("01870c0900003018004700004c0c00");
+        check(bs->settingsWrites().size() == 1 && bs->settingsWrites()[0] == gainSettings, "the BLE link writes four triples: lizard 0, IMU 0x18, watchdog 0, master gain 76=12");
+        check(us->settingsWrites().size() == 1 && us->settingsWrites()[0] == frame64("018709090000301800470000"), "the USB link in the same session keeps the three-triple frame");
+        check(has(lastLogLine("Bluetooth LE slot 0: link settings"), "lizard mode 0, IMU mode 0x18, Steam watchdog 0, haptic master gain +12 dB -> accepted")
+              && has(lastLogLine("Bluetooth LE slot 0: haptics:"), "master gain setting 76=+12 dB")
+              && !has(lastLogLine("USB slot 0: link settings"), "master gain"),
+              "the settings and haptics lines show the master gain for the BLE link only");
+        g_Now += 1000; run(m);
+        check(bs->settingsWrites().size() == 2 && bs->settingsWrites()[1] == gainSettings, "the keep-alive repeats the four-triple frame");
+        bs->features.clear();
+        bl->hostSettings(0x8E, 0, nullptr, g_Now); run(m);
+        check(bs->features.size() == 2 && bs->features[1] == gainSettings, "the settings re-sent after a host 0x8E include the master gain");
+        bs->features.clear(); us->features.clear();
+        m.stop(g_Now);
+        check(bs->features.size() == 1 && bs->features[0] == frame64("01870c0901003000004700004c0000") && us->features[0] == frame64("018709090100300000470000"),
+              "the BLE stop frame clears the master gain (76=0); the USB stop frame is unchanged");
+    }
+    {
+        SteamControllerConfig c; c.hapticMasterGainDb = 99;   // clamped to 24
+        FakeTransport io; Events e; auto m = twoLinks(c, io, e);
+        check(io.state("ble")->settingsWrites()[0][13] == 24 && byPath(*m, "ble")->config().hapticMasterGainDb == 24, "an out-of-range master gain is clamped to 24 dB");
+        m->stop(g_Now);
+    }
+    // All three off: a BLE link's frames and reports are the USB ones (covered above); all three
+    // on together on a USB link change nothing.
+    {
+        SteamControllerConfig c; c.hapticBoostDb = 20; c.hapticPulseScalePercent = 300; c.hapticMasterGainDb = 12;
+        FakeTransport io; Events e; auto m = twoLinks(c, io, e);
+        auto us = io.state("usb");
+        send(*m, "usb", {0x82, 0, 2, 0xF2}); send(*m, "usb", {0x81, 0, 0x90, 0x01, 0x00, 0x00, 0x01, 0x00});
+        check(us->writes[0] == std::vector<uint8_t>{0x82, 0, 2, 0xF2} && us->writes[1] == std::vector<uint8_t>{0x81, 0, 0x90, 0x01, 0x00, 0x00, 0x01, 0x00}
+              && us->settingsWrites()[0] == frame64("018709090000301800470000") && byPath(*m, "usb")->capabilities() == SteamControllerCore(c, nullptr).capabilities(),
+              "the knobs never touch a USB link's reports, settings or capabilities");
+        m->stop(g_Now);
+    }
+}
+
 int main()
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -854,6 +1208,8 @@ int main()
         testMotionRateBounds();
         testOpenRetry();
         testHostFeedbackGeneration();
+        testBle();
+        testBleHapticKnobs();
     }
     catch (const std::exception& ex) {
         printf("FAIL exception: %s\n", ex.what());

@@ -12,33 +12,86 @@ const uint64_t NEVER = UINT64_MAX;
 
 std::vector<uint8_t> motorStop() { return std::vector<uint8_t>{OUT_RUMBLE, 0, 0, 0, 0, 0, 0, 0, 0, 0}; }
 
-std::string slotName(const SteamHidDeviceInfo& info)
+int clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// The BLE haptic knobs within the ranges the Android BLE driver accepts.
+SteamControllerConfig sanitized(SteamControllerConfig config)
+{
+    config.hapticBoostDb = clampInt(config.hapticBoostDb, 0, HAPTIC_GAIN_MAX_DB - HAPTIC_GAIN_MIN_DB);
+    config.hapticPulseScalePercent = clampInt(config.hapticPulseScalePercent, 100, 400);
+    config.hapticMasterGainDb = clampInt(config.hapticMasterGainDb, 0, 24);
+    return config;
+}
+
+std::string slotName(const SteamHidDeviceInfo& info, int bleSlot)
 {
     char buffer[32];
-    snprintf(buffer, sizeof(buffer), "USB slot %d", info.interfaceNumber < 0 ? 0 : info.interfaceNumber);
+    if (SteamControllerLink::transportOf(info.productId) == SteamControllerLink::TransportBle) {
+        snprintf(buffer, sizeof(buffer), "Bluetooth LE slot %d", bleSlot);
+    }
+    else {
+        snprintf(buffer, sizeof(buffer), "USB slot %d", info.interfaceNumber < 0 ? 0 : info.interfaceNumber);
+    }
     return buffer;
 }
 }
 
 SteamControllerLink::SteamControllerLink(int id, const SteamHidDeviceInfo& info, std::unique_ptr<SteamHidDevice> device,
-                                         const SteamControllerConfig& config, int rumbleHoldMs, Listener* listener)
+                                         const SteamControllerConfig& config, int rumbleHoldMs, Listener* listener, int bleSlot)
     : m_Id(id),
       m_Info(info),
-      m_Name(slotName(info)),
+      m_BleSlot(bleSlot < 0 ? 0 : bleSlot),
+      m_Name(slotName(info, m_BleSlot)),
       m_Device(std::move(device)),
       m_Listener(listener),
       m_RumbleHoldMs(rumbleHoldMs < 0 ? 0 : rumbleHoldMs),
-      m_Core(config, this)
+      m_Core(sanitized(config), this)
 {
 }
 
 SteamControllerLink::~SteamControllerLink() = default;
+
+SteamControllerLink::Transport SteamControllerLink::transportOf(uint16_t productId)
+{
+    return productId == PRODUCT_PUCK ? TransportPuck : productId == PRODUCT_BLE ? TransportBle : TransportUsb;
+}
+
+const char* SteamControllerLink::transportName() const
+{
+    switch (transport()) {
+    case TransportPuck: return "wireless puck";
+    case TransportBle: return "Bluetooth LE";
+    default: return "USB cable";
+    }
+}
+
+uint8_t SteamControllerLink::attributeTransport() const
+{
+    switch (transport()) {
+    case TransportPuck: return LI_SCATTR_TRANSPORT_PUCK;
+    case TransportBle: return LI_SCATTR_TRANSPORT_BLE;
+    default: return LI_SCATTR_TRANSPORT_USB;
+    }
+}
+
+uint16_t SteamControllerLink::capabilities() const
+{
+    // Over Bluetooth LE the controller boots with the firmware's defaults instead of the settings
+    // Steam writes over USB, so a BLE link takes the host's settings writes (as the Android BLE
+    // driver does); USB and puck links keep their own and do not advertise the capability.
+    return (uint16_t)(m_Core.capabilities() | (isBle() ? LI_CCAP_STEAM_SETTINGS : 0));
+}
 
 bool SteamControllerLink::connected() const { std::lock_guard<std::mutex> lock(m_Mutex); return m_Connected; }
 int SteamControllerLink::generation() const { std::lock_guard<std::mutex> lock(m_Mutex); return m_Generation; }
 SteamControllerAttributes SteamControllerLink::attributes() const { std::lock_guard<std::mutex> lock(m_Mutex); return m_Attributes; }
 bool SteamControllerLink::hasBattery() const { std::lock_guard<std::mutex> lock(m_Mutex); return m_HasBattery; }
 size_t SteamControllerLink::queuedOutputs() const { std::lock_guard<std::mutex> lock(m_Mutex); return m_Outputs.size(); }
+size_t SteamControllerLink::queuedSettings() const
+{
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    return (size_t)std::count_if(m_Outputs.begin(), m_Outputs.end(), [](const Output& o) { return o.settings; });
+}
 
 // ----- sink (core -> listener), called under m_Mutex -----
 
@@ -116,7 +169,7 @@ void SteamControllerLink::connectLocked(uint64_t nowMs)
     }
     m_Connected = true;
     m_Generation++;
-    m_Attributes = SteamControllerAttributes(isPuck() ? LI_SCATTR_TRANSPORT_PUCK : LI_SCATTR_TRANSPORT_USB);
+    m_Attributes = SteamControllerAttributes(attributeTransport());
     m_HasAttributes = false;
     m_HasBattery = false;
     m_Core.resetInputState();
@@ -125,7 +178,15 @@ void SteamControllerLink::connectLocked(uint64_t nowMs)
     m_KeepAliveDueMs = nowMs + KEEPALIVE_MS;
     m_SummaryDueMs = nowMs + SUMMARY_MS;
     logf(LogInfo, "Steam Controller %s: controller connected (%s, link generation %d)",
-         m_Name.c_str(), isPuck() ? "puck" : "cable", m_Generation);
+         m_Name.c_str(), isPuck() ? "puck" : isBle() ? "Bluetooth LE" : "cable", m_Generation);
+    if (isBle()) {
+        const SteamControllerConfig& c = m_Core.config();
+        char gain[32];
+        snprintf(gain, sizeof(gain), "76=+%d dB", c.hapticMasterGainDb);
+        logf(LogInfo, "Steam Controller %s: haptics: 0x82 gain boost +%d dB (ceiling +%d dB), 0x81 pulse on-time x%d.%d, master gain setting %s",
+             m_Name.c_str(), c.hapticBoostDb, HAPTIC_GAIN_MAX_DB, c.hapticPulseScalePercent / 100, (c.hapticPulseScalePercent % 100) / 10,
+             c.hapticMasterGainDb == 0 ? "not written" : gain);
+    }
     m_Listener->linkConnected(*this, m_Generation);
     if (wake) wake();
 }
@@ -145,7 +206,7 @@ void SteamControllerLink::disconnectLocked(uint64_t nowMs)
     // Release any touches the host still thinks are down, under the generation it knows.
     if (m_Connected) m_Core.releaseTouches();
     m_HasAttributes = false;
-    m_Attributes = SteamControllerAttributes(isPuck() ? LI_SCATTR_TRANSPORT_PUCK : LI_SCATTR_TRANSPORT_USB);
+    m_Attributes = SteamControllerAttributes(attributeTransport());
     m_HasBattery = false;
     m_Core.resetInputState();
     int retired = m_Generation;
@@ -175,11 +236,12 @@ void SteamControllerLink::writeFailedLocked(int generation, uint64_t nowMs)
 {
     if (!m_Stopped && m_Connected && m_Generation == generation) {
         if (++m_OutputFailures < OUTPUT_FAILURES_BEFORE_DISCONNECT) {
-            logf(LogWarn, "Steam Controller USB: output failed on interface %d (%d of %d)",
-                 m_Info.interfaceNumber, m_OutputFailures, OUTPUT_FAILURES_BEFORE_DISCONNECT);
+            if (isBle()) logf(LogWarn, "Steam Controller Bluetooth LE: output failed on %s (%d of %d)", m_Name.c_str(), m_OutputFailures, OUTPUT_FAILURES_BEFORE_DISCONNECT);
+            else logf(LogWarn, "Steam Controller USB: output failed on interface %d (%d of %d)", m_Info.interfaceNumber, m_OutputFailures, OUTPUT_FAILURES_BEFORE_DISCONNECT);
             return;
         }
-        logf(LogWarn, "Steam Controller USB: output keeps failing on interface %d; retiring the slot", m_Info.interfaceNumber);
+        if (isBle()) logf(LogWarn, "Steam Controller Bluetooth LE: output keeps failing on %s; retiring the slot", m_Name.c_str());
+        else logf(LogWarn, "Steam Controller USB: output keeps failing on interface %d; retiring the slot", m_Info.interfaceNumber);
         m_RetryAtMs = nowMs + KEEPALIVE_MS;
         disconnectLocked(nowMs);
     }
@@ -203,6 +265,9 @@ bool SteamControllerLink::steamHaptic(const uint8_t* report, int length, uint64_
         return false;
     }
     std::vector<uint8_t> copy(report, report + length);
+    if (isBle()) {
+        adjustBleHapticLocked(copy);
+    }
     if (id == OUT_RUMBLE) {
         m_HasRepeatingRumble = stopKey(copy) < 0;
         m_RepeatingRumble = copy;
@@ -216,6 +281,31 @@ bool SteamControllerLink::steamHaptic(const uint8_t* report, int length, uint64_
     enqueueLocked(std::move(copy), nowMs);
     if (wake) wake();
     return true;
+}
+
+void SteamControllerLink::adjustBleHapticLocked(std::vector<uint8_t>& r)
+{
+    const SteamControllerConfig& c = m_Core.config();
+    if (r[0] == OUT_HAPTIC_COMMAND && c.hapticBoostDb != 0 && (r[2] == HAPTIC_CMD_TICK || r[2] == HAPTIC_CMD_CLICK)) {
+        // The gain byte of a tick or click is signed dB: the boost lifts it toward the firmware's
+        // ceiling and keeps Steam's click-versus-tick balance below it. Stops (command 0) stay.
+        int gain = clampInt((int8_t)r[3] + c.hapticBoostDb, HAPTIC_GAIN_MIN_DB, HAPTIC_GAIN_MAX_DB);
+        if ((int8_t)r[3] != gain) {
+            r[3] = (uint8_t)(int8_t)gain;
+            m_SummaryAdjusted++;
+        }
+    }
+    else if (r[0] == OUT_PULSE && c.hapticPulseScalePercent != 100) {
+        // A pulse carries no gain: its strength is its on-time (Steam's slide texture is single
+        // 400 us pulses), so the scale lengthens that. Zero-repeat and zero-duration stops stay.
+        unsigned onUs = r[2] | (r[3] << 8), repeat = r[6] | (r[7] << 8);
+        if (onUs != 0 && repeat != 0) {
+            unsigned scaled = std::min<unsigned>(0xFFFF, onUs * (unsigned)c.hapticPulseScalePercent / 100);
+            r[2] = (uint8_t)scaled;
+            r[3] = (uint8_t)(scaled >> 8);
+            m_SummaryAdjusted++;
+        }
+    }
 }
 
 bool SteamControllerLink::rumble(uint16_t lowFreqMotor, uint16_t highFreqMotor, uint64_t nowMs, int expectedGeneration)
@@ -245,23 +335,39 @@ void SteamControllerLink::replayForArrival(int generation)
     if (m_HasBattery) m_Listener->linkBattery(*this, generation, m_BatteryState, m_BatteryPercent);
 }
 
-void SteamControllerLink::enqueueLocked(std::vector<uint8_t> report, uint64_t nowMs)
+void SteamControllerLink::enqueueLocked(std::vector<uint8_t> report, uint64_t nowMs, bool settings)
 {
-    int stop = stopKey(report);
-    // Latest rumble wins; duplicate stop packets need only one queue entry.
-    uint8_t id = report[0];
-    m_Outputs.erase(std::remove_if(m_Outputs.begin(), m_Outputs.end(), [&](const Output& old) {
-        return (id == OUT_RUMBLE && old.data[0] == OUT_RUMBLE) || (stop >= 0 && stopKey(old.data) == stop);
-    }), m_Outputs.end());
+    if (settings) {
+        // Host settings hold at most MAX_HOST_SETTINGS slots: only a settings flood evicts an
+        // older settings write (the Android BLE queue's reservation).
+        int count = 0;
+        auto oldest = m_Outputs.end();
+        for (auto it = m_Outputs.begin(); it != m_Outputs.end(); ++it) {
+            if (!it->settings) continue;
+            if (oldest == m_Outputs.end()) oldest = it;
+            count++;
+        }
+        if (count >= MAX_HOST_SETTINGS) m_Outputs.erase(oldest);
+    }
+    else {
+        int stop = stopKey(report);
+        // Latest rumble wins; duplicate stop packets need only one queue entry.
+        uint8_t id = report[0];
+        m_Outputs.erase(std::remove_if(m_Outputs.begin(), m_Outputs.end(), [&](const Output& old) {
+            return !old.settings && ((id == OUT_RUMBLE && old.data[0] == OUT_RUMBLE) || (stop >= 0 && stopKey(old.data) == stop));
+        }), m_Outputs.end());
+    }
     if ((int)m_Outputs.size() >= MAX_OUTPUTS) {
-        auto victim = std::find_if(m_Outputs.begin(), m_Outputs.end(), [](const Output& o) { return stopKey(o.data) < 0; });
-        // Stops are never evicted by effects. Each stop key is coalesced above.
+        auto victim = std::find_if(m_Outputs.begin(), m_Outputs.end(), [](const Output& o) { return !o.settings && stopKey(o.data) < 0; });
+        // Stops and host settings are never evicted by effects. Each stop key is coalesced above
+        // and settings are capped above, so together they always leave room for one more.
         if (victim == m_Outputs.end()) return;
         m_Outputs.erase(victim);
     }
     Output out;
     out.data = std::move(report);
     out.seq = ++m_OutputSeq;
+    out.settings = settings;
     m_Outputs.push_back(std::move(out));
     if (!m_DrainScheduled) {
         m_DrainScheduled = true;
@@ -272,49 +378,121 @@ void SteamControllerLink::enqueueLocked(std::vector<uint8_t> report, uint64_t no
 bool SteamControllerLink::writeOutput(const std::vector<uint8_t>& report)
 {
     // hidapi pads to the collection's output report length on Windows and reports that length;
-    // hidraw writes exactly these bytes.
+    // hidraw writes exactly these bytes. Over Bluetooth LE each output report id is its own GATT
+    // characteristic and hidapi still takes the id byte first, exactly as for USB.
     return m_Device && m_Device->write(report.data(), (int)report.size()) >= (int)report.size();
+}
+
+// ----- host settings relay (Bluetooth LE) -----
+
+bool SteamControllerLink::hostSettings(uint8_t command, int count, const uint8_t* triples, uint64_t nowMs, int expectedGeneration)
+{
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    if (!isBle() || m_Stopped || !m_Connected || (expectedGeneration != 0 && expectedGeneration != m_Generation)) {
+        return false;
+    }
+    if (command == CMD_LOAD_DEFAULT_SETTINGS) {
+        // Steam's exit: apply the reset, then this link's own settings right behind it so lizard
+        // mode and the watchdog do not come back for up to a keep-alive interval.
+        logf(LogInfo, "Steam Controller %s: host settings 0x8e (load defaults), re-sending this link's setup", m_Name.c_str());
+        enqueueLocked(featureFrame(CMD_LOAD_DEFAULT_SETTINGS, 0, nullptr, 0), nowMs, true);
+        enqueueLocked(linkSettingsFrame(true), nowMs, true);
+        m_SummarySettings++;
+        if (wake) wake();
+        return true;
+    }
+    if (command != CMD_SET_SETTINGS_VALUES || count < 0 || (count > 0 && triples == nullptr)) {
+        return false;
+    }
+    // The payload after [01][87][len] is 61 bytes: 20 triples at most.
+    if (count > (FEATURE_REPORT_SIZE - 3) / 3) count = (FEATURE_REPORT_SIZE - 3) / 3;
+    uint8_t payload[FEATURE_REPORT_SIZE];
+    int kept = 0;
+    std::string applied, reserved;
+    char item[16];
+    for (int i = 0; i < count; i++) {
+        int id = triples[3 * i];
+        int value = triples[3 * i + 1] | (triples[3 * i + 2] << 8);
+        if (isHostSettingReserved(id)) {
+            snprintf(item, sizeof(item), "%s%d", reserved.empty() ? "" : " ", id);
+            reserved += item;
+            continue;
+        }
+        payload[3 * kept] = (uint8_t)id;
+        payload[3 * kept + 1] = triples[3 * i + 1];
+        payload[3 * kept + 2] = triples[3 * i + 2];
+        kept++;
+        snprintf(item, sizeof(item), "%s%d=%d", applied.empty() ? "" : " ", id, value);
+        applied += item;
+    }
+    logf(LogInfo, "Steam Controller %s: host settings 0x87: %s%s%s%s", m_Name.c_str(), kept == 0 ? "nothing to apply" : applied.c_str(),
+         reserved.empty() ? "" : " (reserved, kept ours: ", reserved.c_str(), reserved.empty() ? "" : ")");
+    m_SummarySettings++;
+    if (kept == 0) {
+        return true;
+    }
+    enqueueLocked(featureFrame(CMD_SET_SETTINGS_VALUES, (uint8_t)(3 * kept), payload, 3 * kept), nowMs, true);
+    if (wake) wake();
+    return true;
 }
 
 // ----- link setup and attributes -----
 
-bool SteamControllerLink::configure(bool active)
+std::vector<uint8_t> SteamControllerLink::featureFrame(uint8_t type, uint8_t length, const uint8_t* payload, int payloadLength)
+{
+    std::vector<uint8_t> frame(FEATURE_REPORT_SIZE, 0);
+    frame[0] = FEATURE_REPORT_ID;
+    frame[1] = type;
+    frame[2] = length;
+    if (payloadLength > FEATURE_REPORT_SIZE - 3) payloadLength = FEATURE_REPORT_SIZE - 3;
+    if (payloadLength > 0 && payload != nullptr) memcpy(frame.data() + 3, payload, payloadLength);
+    return frame;
+}
+
+std::vector<uint8_t> SteamControllerLink::linkSettingsFrame(bool active) const
 {
     // HID feature report 1: SET_SETTINGS_VALUES (0x87), three (id, u16) triples, framed as Steam
     // frames it on the wire (SET_REPORT, 64 bytes starting 01 87). Lizard mode off and the raw
     // IMU on while active; lizard mode back on and the IMU off at stop. The firmware's Steam
     // watchdog (71) stays disabled: armed, it reverts the settings when it never sees Steam's
     // heartbeat, which turned the cable-connected unit's IMU off between keep-alives (fork.119).
-    uint8_t feature[FEATURE_REPORT_SIZE];
-    memset(feature, 0, sizeof(feature));
-    feature[0] = FEATURE_REPORT_ID;
-    feature[1] = CMD_SET_SETTINGS_VALUES;
-    feature[2] = 9;
-    feature[3] = SETTING_LIZARD_MODE;
-    feature[4] = active ? 0 : 1;
-    feature[6] = SETTING_IMU_MODE;
-    feature[7] = (active && m_Core.config().motion) ? IMU_MODE_RAW : 0;
-    feature[9] = SETTING_STEAM_WATCHDOG_ENABLE;
-    feature[10] = 0;
-    return m_Device && m_Device->sendFeatureReport(feature, sizeof(feature)) >= (int)sizeof(feature);
+    // Identical over USB, the puck and Bluetooth LE (the firmware takes 0x87 on feature report 1
+    // over HID-over-GATT; it is 0x8F and 0xEA it refuses there). A Bluetooth LE link with the
+    // master gain preference adds setting 76 as a fourth triple (and clears it at stop).
+    uint8_t payload[12] = {
+        SETTING_LIZARD_MODE, (uint8_t)(active ? 0 : 1), 0,
+        SETTING_IMU_MODE, (uint8_t)((active && m_Core.config().motion) ? IMU_MODE_RAW : 0), 0,
+        SETTING_STEAM_WATCHDOG_ENABLE, 0, 0,
+        SETTING_HAPTIC_MASTER_GAIN_DB, (uint8_t)(active ? m_Core.config().hapticMasterGainDb : 0), 0,
+    };
+    const uint8_t length = (isBle() && m_Core.config().hapticMasterGainDb != 0) ? 12 : 9;
+    return featureFrame(CMD_SET_SETTINGS_VALUES, length, payload, length);
+}
+
+bool SteamControllerLink::sendFeature(const std::vector<uint8_t>& frame)
+{
+    return m_Device && m_Device->sendFeatureReport(frame.data(), (int)frame.size()) >= (int)frame.size();
+}
+
+bool SteamControllerLink::configure(bool active)
+{
+    return sendFeature(linkSettingsFrame(active));
 }
 
 void SteamControllerLink::logLinkSettingsLocked(bool ok)
 {
     m_ConfigureState = ok ? 1 : 2;
-    logf(LogInfo, "Steam Controller %s: link settings (feature report 1, interface %d): lizard mode 0, IMU mode 0x%x, Steam watchdog 0 -> %s",
-         m_Name.c_str(), m_Info.interfaceNumber, m_Core.config().motion ? IMU_MODE_RAW : 0, ok ? "accepted" : "write failed");
+    char gain[48] = "";
+    if (isBle() && m_Core.config().hapticMasterGainDb != 0) {
+        snprintf(gain, sizeof(gain), ", haptic master gain +%d dB", m_Core.config().hapticMasterGainDb);
+    }
+    logf(LogInfo, "Steam Controller %s: link settings (feature report 1, interface %d): lizard mode 0, IMU mode 0x%x, Steam watchdog 0%s -> %s",
+         m_Name.c_str(), m_Info.interfaceNumber, m_Core.config().motion ? IMU_MODE_RAW : 0, gain, ok ? "accepted" : "write failed");
 }
 
 bool SteamControllerLink::featureQuery(uint8_t type, uint8_t length, const uint8_t* payload, int payloadLength, std::vector<uint8_t>& reply)
 {
-    uint8_t command[FEATURE_REPORT_SIZE];
-    memset(command, 0, sizeof(command));
-    command[0] = FEATURE_REPORT_ID;
-    command[1] = type;
-    command[2] = length;
-    if (payloadLength > 0) memcpy(command + 3, payload, payloadLength);
-    if (!m_Device || m_Device->sendFeatureReport(command, sizeof(command)) < (int)sizeof(command)) {
+    if (!sendFeature(featureFrame(type, length, payload, payloadLength))) {
         logf(LogWarn, "Steam Controller %s: attribute query 0x%02x not accepted", m_Name.c_str(), type);
         return false;
     }
@@ -340,7 +518,7 @@ void SteamControllerLink::readAttributes(int generation)
     // each asked the way Steam asks: SET_REPORT of the command on feature report 1, then
     // GET_REPORT of the same report for the reply. A failed query leaves its fields out of the
     // valid mask and does not count against the output budget.
-    SteamControllerAttributes attributes(isPuck() ? LI_SCATTR_TRANSPORT_PUCK : LI_SCATTR_TRANSPORT_USB);
+    SteamControllerAttributes attributes(attributeTransport());
     std::vector<uint8_t> reply;
     static const uint8_t subZero = 0, tagUnit = 1, tagBoard = 0;
     if (featureQuery(CMD_GET_ATTRIBUTES_VALUES, 0, nullptr, 0, reply)) attributes.parseAttributeValues(reply.data(), (int)reply.size());
@@ -352,7 +530,7 @@ void SteamControllerLink::readAttributes(int generation)
     if (m_Stopped || !m_Connected || m_Generation != generation) {
         return;   // a reading from a retired link is dropped
     }
-    const char* transport = isPuck() ? "puck" : "usb";
+    const char* transport = isPuck() ? "puck" : isBle() ? "ble" : "usb";
     logf(LogInfo, "Steam Controller %s (%s): %s", transport, m_Name.c_str(), attributes.describe().c_str());
     if (attributes.isEmpty()) {
         return;
@@ -434,9 +612,11 @@ uint64_t SteamControllerLink::service(uint64_t nowMs)
         else {
             std::vector<uint8_t> report = m_Outputs.front().data;
             const uint64_t seq = m_Outputs.front().seq;
+            const bool settings = m_Outputs.front().settings;
             m_DrainBusy = true;
             lock.unlock();
-            bool success = writeOutput(report);
+            // Host settings are feature report 1 frames (SET_REPORT), haptics output reports.
+            bool success = settings ? sendFeature(report) : writeOutput(report);
             lock.lock();
             m_DrainBusy = false;
             if (m_Stopped) return NEVER;
@@ -456,8 +636,9 @@ uint64_t SteamControllerLink::service(uint64_t nowMs)
                 }
                 // Retain an idempotent motor stop until it succeeds or the slot retires. Keeping it
                 // in the bounded queue also lets newer 0x80 rumble replace an obsolete stop. Failed
-                // effects are not replayed.
-                if (success || stopKey(report) < 0) {
+                // effects and failed settings writes are not replayed (the next keep-alive or host
+                // write supersedes them).
+                if (success || settings || stopKey(report) < 0) {
                     auto it = std::find_if(m_Outputs.begin(), m_Outputs.end(), [&](const Output& o) { return o.seq == seq; });
                     if (it != m_Outputs.end()) m_Outputs.erase(it);
                 }
@@ -486,14 +667,19 @@ uint64_t SteamControllerLink::logSummaryLocked(uint64_t nowMs)
     }
     unsigned haptics = m_SummaryRumble + m_SummaryOther;
     for (int i = 0; i < 3; i++) haptics += m_SummaryPulse[i] + m_SummaryCommand[i];
-    if (m_SummaryReports != 0 || haptics != 0) {
-        logf(LogInfo, "Steam Controller %s: %u reports/s, pads touched L %s R %s, host haptics: rumble %u, pulse L/R/both %u/%u/%u, command L/R/both %u/%u/%u, other %u",
+    if (m_SummaryReports != 0 || haptics != 0 || m_SummarySettings != 0) {
+        char ble[64] = "";
+        if (isBle()) {
+            // What only a Bluetooth LE link does: host settings relayed, haptics rewritten by the knobs.
+            snprintf(ble, sizeof(ble), ", host settings %u, adjusted %u", m_SummarySettings, m_SummaryAdjusted);
+        }
+        logf(LogInfo, "Steam Controller %s: %u reports/s, pads touched L %s R %s, host haptics: rumble %u, pulse L/R/both %u/%u/%u, command L/R/both %u/%u/%u, other %u%s",
              m_Name.c_str(), (unsigned)(m_SummaryReports * 1000 / SUMMARY_MS),
              m_SummaryLeftPad ? "yes" : "no", m_SummaryRightPad ? "yes" : "no",
              m_SummaryRumble, m_SummaryPulse[0], m_SummaryPulse[1], m_SummaryPulse[2],
-             m_SummaryCommand[0], m_SummaryCommand[1], m_SummaryCommand[2], m_SummaryOther);
+             m_SummaryCommand[0], m_SummaryCommand[1], m_SummaryCommand[2], m_SummaryOther, ble);
     }
-    m_SummaryReports = m_SummaryRumble = m_SummaryOther = 0;
+    m_SummaryReports = m_SummaryRumble = m_SummaryOther = m_SummarySettings = m_SummaryAdjusted = 0;
     for (int i = 0; i < 3; i++) m_SummaryPulse[i] = m_SummaryCommand[i] = 0;
     m_SummaryLeftPad = m_SummaryRightPad = false;
     m_SummaryDueMs = nowMs + SUMMARY_MS;
@@ -540,6 +726,7 @@ bool SteamControllerManager::isCandidate(const SteamHidDeviceInfo& info)
 {
     if (info.vendorId != VENDOR_VALVE) return false;
     if (info.productId == PRODUCT_WIRED) return info.interfaceNumber <= 0;   // -1 when the platform cannot tell
+    if (info.productId == PRODUCT_BLE) return info.interfaceNumber <= 0;     // Bluetooth HID has no USB interface (-1, or 0)
     if (info.productId == PRODUCT_PUCK) return info.interfaceNumber >= 2 && info.interfaceNumber <= 5;
     return false;
 }
@@ -602,7 +789,9 @@ void SteamControllerManager::rescan(uint64_t nowMs)
             // Windows and macOS list one path per top-level collection: the vendor collection is the
             // one on usage page 0xFF00 (the real unit has three; the vendor one is the third). Where
             // the usage is missing or describes the interface's first collection (Linux hidraw), the
-            // path that answers a feature report 1 read is the one.
+            // path that answers a feature report 1 read is the one. A Bluetooth LE controller
+            // (HID-over-GATT) enumerates the same way: per collection on Windows/macOS, one hidraw
+            // node (uhid) on Linux.
             std::unique_ptr<SteamHidDevice> device = m_Transport.open(info);
             if (!device) {
                 logf(LogWarn, "Steam Controller: cannot open %s (product 0x%04x, interface %d); check the hidraw permissions (udev rule) on Linux",
@@ -625,9 +814,16 @@ void SteamControllerManager::rescan(uint64_t nowMs)
             }
             SteamHidDeviceInfo opened_info = info;
             if (opened_info.interfaceNumber < 0) opened_info.interfaceNumber = 0;
-            auto link = std::make_shared<SteamControllerLink>(s_NextId++, opened_info, std::move(device), m_Config, m_RumbleHoldMs, m_Listener);
-            logf(LogInfo, "Steam Controller: opened %s (product 0x%04x, interface %d, usage page 0x%04x; %s) as %s",
-                 info.path.c_str(), info.productId, info.interfaceNumber, info.usagePage, how, link->name().c_str());
+            // Bluetooth LE controllers all enumerate with the same interface number: number them
+            // by the lowest slot no other BLE link holds.
+            int bleSlot = 0;
+            if (SteamControllerLink::transportOf(info.productId) == SteamControllerLink::TransportBle) {
+                while (std::any_of(m_Links.begin(), m_Links.end(), [&](const std::shared_ptr<SteamControllerLink>& l) { return l->isBle() && l->slot() == bleSlot; })) bleSlot++;
+            }
+            auto link = std::make_shared<SteamControllerLink>(s_NextId++, opened_info, std::move(device), m_Config, m_RumbleHoldMs, m_Listener, bleSlot);
+            const char* bus = info.bus == SteamHidDeviceInfo::BusBluetooth ? ", bus bluetooth" : info.bus == SteamHidDeviceInfo::BusUsb ? ", bus usb" : "";
+            logf(LogInfo, "Steam Controller: opened %s (product 0x%04x, interface %d, usage page 0x%04x%s; %s) as %s",
+                 info.path.c_str(), info.productId, info.interfaceNumber, info.usagePage, bus, how, link->name().c_str());
             m_Links.push_back(link);
             opened.push_back(link);
         }

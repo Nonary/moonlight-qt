@@ -145,17 +145,18 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
 
 #if HAVE_STEAM_CONTROLLER_DRIVER
     // The Steam Controller (2026) driver below opens the controller's vendor HID collection
-    // itself (cable: 28de:1302, wireless puck: 28de:1304). Keep SDL away from it: the ignore list
-    // covers the evdev/DirectInput view and SDL_HINT_JOYSTICK_HIDAPI_STEAM covers SDL 3.4's
-    // hidapi Triton driver, which claims both PIDs and would race us for the same reports and
-    // settings. (That hint also governs the 2015 Steam Controller dongle's hidapi driver.)
+    // itself (cable: 28de:1302, Bluetooth LE: 28de:1303, wireless puck: 28de:1304). Keep SDL
+    // away from it: the ignore list covers the evdev/DirectInput view and
+    // SDL_HINT_JOYSTICK_HIDAPI_STEAM covers SDL 3.4's hidapi Triton driver, which claims all
+    // three PIDs and would race us for the same reports and settings. (That hint also governs
+    // the 2015 Steam Controller dongle's hidapi driver.)
     m_SteamHintChanged = false;
     m_OldHidapiSteamHint = SDL_GetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM);
     if (prefs.steamControllerDriver) {
         if (!streamIgnoreDevices.isEmpty() && !streamIgnoreDevices.endsWith(',')) {
             streamIgnoreDevices += ',';
         }
-        streamIgnoreDevices += "0x28de/0x1302,0x28de/0x1304";
+        streamIgnoreDevices += SteamController::SDL_IGNORE_DEVICES;
         SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "0");
         m_SteamHintChanged = true;
     }
@@ -242,6 +243,9 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
                        prefs.steamControllerGrips == StreamingPreferences::SCG_OFF ? SteamControllerConfig::GripsOff :
                        SteamControllerConfig::GripsPaddles;
         config.stickStretch = prefs.steamControllerStickStretch;
+        config.hapticBoostDb = prefs.steamControllerHapticBoost;
+        config.hapticPulseScalePercent = prefs.steamControllerHapticPulseScale;
+        config.hapticMasterGainDb = prefs.steamControllerHapticMasterGain;
         m_SteamHost = new SteamControllerHost();
         SteamControllerHost::setActiveGamepadMask(m_GamepadMask);
         m_SteamController = new SteamControllerRunner(config, prefs.steamControllerRumbleHold, m_SteamHost);
