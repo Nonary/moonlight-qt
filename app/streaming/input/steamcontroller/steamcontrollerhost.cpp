@@ -146,14 +146,25 @@ void SteamControllerHost::clSteamHaptic(uint16_t controllerNumber, uint8_t lengt
 
 void SteamControllerHost::clSteamSettings(uint16_t controllerNumber, uint8_t command, uint8_t count, const uint8_t* triples)
 {
-    // USB and puck links do not take host settings writes (LI_CCAP_STEAM_SETTINGS is not
-    // advertised, as in the Android client); a host that sends them anyway is ignored.
-    (void)triples;
+    // A Bluetooth LE link advertises LI_CCAP_STEAM_SETTINGS and relays the write to its firmware
+    // (minus the reserved ids). USB and puck links do not take host settings writes, as in the
+    // Android client; a host that sends them anyway is ignored.
+    if (controllerNumber >= MAX_STEAM_SLOTS) return;
+    Entry entry;
+    {
+        Registry& r = registry();
+        std::lock_guard<std::mutex> lock(r.mutex);
+        if (!r.alive) return;
+        entry = r.entryFor(controllerNumber);
+    }
+    if (entry.link && entry.link->hostSettings(command, count, triples, SteamController::nowMs(), entry.generation)) {
+        return;
+    }
     static bool logged;
     if (!logged) {
         logged = true;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Steam Controller: ignoring host settings 0x%02x (%u triples) for player %u; USB/puck links keep their own link settings",
+                    "Steam Controller: ignoring host settings 0x%02x (%u triples) for player %u; only a Bluetooth LE link takes them (USB/puck links keep their own link settings)",
                     command, count, controllerNumber);
     }
 }

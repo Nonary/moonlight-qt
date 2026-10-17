@@ -84,13 +84,19 @@ namespace SteamController {
 
 constexpr uint16_t VENDOR_VALVE = 0x28DE;
 constexpr uint16_t PRODUCT_WIRED = 0x1302;   // controller on a USB cable (HID interface 0)
+constexpr uint16_t PRODUCT_BLE = 0x1303;     // controller paired over Bluetooth LE (HID-over-GATT; interface -1 or 0)
 constexpr uint16_t PRODUCT_PUCK = 0x1304;    // wireless receiver ("Proteus"), controllers on HID interfaces 2..5
 constexpr uint16_t VENDOR_USAGE_PAGE = 0xFF00;
+
+// SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES entry while the driver preference is on: SDL's own
+// joystick view of the three PIDs the driver opens itself.
+constexpr const char* SDL_IGNORE_DEVICES = "0x28de/0x1302,0x28de/0x1303,0x28de/0x1304";
 
 // Feature report 1 is the control channel: [01][type][len][payload...], 64 bytes, zero padded.
 constexpr uint8_t FEATURE_REPORT_ID = 0x01;
 constexpr int FEATURE_REPORT_SIZE = 64;
 constexpr uint8_t CMD_SET_SETTINGS_VALUES = 0x87;
+constexpr uint8_t CMD_LOAD_DEFAULT_SETTINGS = 0x8E;
 constexpr uint8_t CMD_GET_ATTRIBUTES_VALUES = 0x83;
 constexpr uint8_t CMD_GET_STRING_ATTRIBUTE = 0xAE;
 constexpr uint8_t CMD_GET_DEVICE_INFO = 0xF2;
@@ -102,12 +108,40 @@ constexpr uint8_t SETTING_LIZARD_MODE = 9;
 constexpr uint8_t SETTING_IMU_MODE = 48;
 constexpr uint8_t SETTING_STEAM_WATCHDOG_ENABLE = 71;
 constexpr uint8_t IMU_MODE_RAW = 0x18;   // RAW_ACCEL | RAW_GYRO
+// Further ids a host's settings write may name (hid-steam's Ibex enum).
+constexpr uint8_t SETTING_WIRELESS_PACKET_VERSION = 49;        // selects the state report format
+constexpr uint8_t SETTING_LEFT_TRACKPAD_CLICK_PRESSURE = 52;   // Steam writes 0xFFFF: the firmware never reports a click
+constexpr uint8_t SETTING_RIGHT_TRACKPAD_CLICK_PRESSURE = 53;
+constexpr uint8_t SETTING_HAPTIC_MASTER_GAIN_DB = 76;          // Steam never writes it; Bluetooth LE preference only
+
+// Setting ids a host's write (LI_CCAP_STEAM_SETTINGS, Bluetooth LE links only) never reaches
+// the controller with: the three the link owns (its keep-alive would fight the host over them),
+// the packet version (it changes the state report this driver parses) and the pad click
+// pressures (here the click bits are what the host gets). Same set as the Android BLE driver.
+constexpr uint8_t HOST_SETTINGS_RESERVED[] = {
+    SETTING_LIZARD_MODE, SETTING_IMU_MODE, SETTING_STEAM_WATCHDOG_ENABLE,
+    SETTING_WIRELESS_PACKET_VERSION, SETTING_LEFT_TRACKPAD_CLICK_PRESSURE, SETTING_RIGHT_TRACKPAD_CLICK_PRESSURE,
+};
+constexpr bool isHostSettingReserved(int id)
+{
+    for (uint8_t reserved : HOST_SETTINGS_RESERVED) {
+        if (reserved == id) return true;
+    }
+    return false;
+}
+
+// 0x82 haptic command: [id][side][command][gain dB, signed]. hid-steam documents the gain range
+// as -24..+6 dB; ticks and clicks are the commands Steam uses for the pads.
+constexpr uint8_t HAPTIC_CMD_TICK = 1;
+constexpr uint8_t HAPTIC_CMD_CLICK = 2;
+constexpr int HAPTIC_GAIN_MIN_DB = -24;
+constexpr int HAPTIC_GAIN_MAX_DB = 6;
 
 // Input reports (numbered; byte 0 is the id)
 constexpr uint8_t IN_STATE_WIRED = 0x42;        // 54 bytes
 constexpr uint8_t IN_BATTERY = 0x43;            // 15 bytes
 constexpr uint8_t IN_HAPTIC_ACK = 0x44;         // ignored
-constexpr uint8_t IN_STATE = 0x45;              // 46 bytes
+constexpr uint8_t IN_STATE = 0x45;              // 46 bytes (puck slots and the Bluetooth LE link)
 constexpr uint8_t IN_WIRELESS_EVENT = 0x46;     // [1] 1 disconnect, 2 connect
 constexpr uint8_t IN_STATE_TIMESTAMPED = 0x47;  // 46 bytes, pads shifted by 2
 constexpr uint8_t IN_WIRELESS_EVENT_ALT = 0x79;

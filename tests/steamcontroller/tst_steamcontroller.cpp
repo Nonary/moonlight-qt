@@ -457,7 +457,7 @@ static void testLink()
     io.add("puck/if2/col2", 0x1304, 2, 0x0001);
     io.add("puck/if2", 0x1304, 2, 0xFF00);
     io.add("puck/if4", 0x1304, 4, 0xFF00);
-    io.add("ble", 0x1303, 0, 0xFF00);
+    io.add("other-valve", 0x1305, 0, 0xFF00);   // a Valve PID the driver does not know
     io.add("old-dongle", 0x1142, 1, 0xFF00);
     io.probeFails = {"puck/if2/col1", "puck/if2/col2"};
     SteamHidDeviceInfo other; other.path = "other"; other.vendorId = 0x054c; other.productId = 0x1304; other.interfaceNumber = 2; other.usagePage = 0xFF00;

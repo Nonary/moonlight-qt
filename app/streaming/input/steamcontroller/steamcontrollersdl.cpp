@@ -44,6 +44,12 @@ public:
             info.interfaceNumber = d->interface_number;
             info.usagePage = d->usage_page;
             info.usage = d->usage;
+#if SDL_VERSION_ATLEAST(3, 0, 0)
+            // SDL3's hidapi names the bus; SDL2 (and sdl2-compat) does not, and the product id
+            // (0x1303) identifies the Bluetooth LE controller either way.
+            info.bus = d->bus_type == SDL_HID_API_BUS_BLUETOOTH ? SteamHidDeviceInfo::BusBluetooth :
+                       d->bus_type == SDL_HID_API_BUS_USB ? SteamHidDeviceInfo::BusUsb : SteamHidDeviceInfo::BusUnknown;
+#endif
             out.push_back(info);
         }
         SDL_hid_free_enumeration(list);

@@ -1301,7 +1301,7 @@ void SdlInputHandler::steamControllerConnected(const std::shared_ptr<SteamContro
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Gamepad %d (player %d) is: Steam Controller (2026) via %s, %s (VID/PID: 0x%.4x/0x%.4x) (caps 0x%x)",
-                i, state->index, link->isPuck() ? "wireless puck" : "USB cable", link->name().c_str(),
+                i, state->index, link->transportName(), link->name().c_str(),
                 SteamController::VENDOR_VALVE, link->productId(), link->capabilities());
 
     // Arrival with the mask including the new bit, then the cached attributes and battery.
