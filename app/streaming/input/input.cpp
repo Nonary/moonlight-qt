@@ -3,6 +3,7 @@
 #include "streaming/session.h"
 #include "settings/mappingmanager.h"
 #include "streaming/input/dualsensehaptics.h"
+#include "streaming/input/steamcontroller/steamcontrollerhost.h"
 #include "path.h"
 #include "utils.h"
 
@@ -142,6 +143,24 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     }
     streamIgnoreDevices += m_OldIgnoreDevices;
 
+#if HAVE_STEAM_CONTROLLER_DRIVER
+    // The Steam Controller (2026) driver below opens the controller's vendor HID collection
+    // itself (cable: 28de:1302, wireless puck: 28de:1304). Keep SDL away from it: the ignore list
+    // covers the evdev/DirectInput view and SDL_HINT_JOYSTICK_HIDAPI_STEAM covers SDL 3.4's
+    // hidapi Triton driver, which claims both PIDs and would race us for the same reports and
+    // settings. (That hint also governs the 2015 Steam Controller dongle's hidapi driver.)
+    m_SteamHintChanged = false;
+    m_OldHidapiSteamHint = SDL_GetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM);
+    if (prefs.steamControllerDriver) {
+        if (!streamIgnoreDevices.isEmpty() && !streamIgnoreDevices.endsWith(',')) {
+            streamIgnoreDevices += ',';
+        }
+        streamIgnoreDevices += "0x28de/0x1302,0x28de/0x1304";
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "0");
+        m_SteamHintChanged = true;
+    }
+#endif
+
     // STREAM_IGNORE_DEVICE_GUIDS allows to specify additional devices to be ignored when starting
     // the stream in case the scope of STREAM_GAMECONTROLLER_IGNORE_DEVICES is too broad. One such
     // case is "Steam Virtual Gamepad" where everything is under the same VID/PID, but different GUIDs.
@@ -210,10 +229,43 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     SDL_zero(m_LastTouchDownEvent);
     SDL_zero(m_LastTouchUpEvent);
     SDL_zero(m_TouchDownEvent);
+
+#if HAVE_STEAM_CONTROLLER_DRIVER
+    m_SteamHost = nullptr;
+    m_SteamController = nullptr;
+    SDL_zero(m_SteamLinkGeneration);
+    if (prefs.steamControllerDriver) {
+        SteamControllerConfig config;
+        config.motion = prefs.steamControllerMotion;
+        config.splitPads = prefs.steamControllerSplitPads;
+        config.grips = prefs.steamControllerGrips == StreamingPreferences::SCG_DS4 ? SteamControllerConfig::GripsDs4 :
+                       prefs.steamControllerGrips == StreamingPreferences::SCG_OFF ? SteamControllerConfig::GripsOff :
+                       SteamControllerConfig::GripsPaddles;
+        config.stickStretch = prefs.steamControllerStickStretch;
+        m_SteamHost = new SteamControllerHost();
+        SteamControllerHost::setActiveGamepadMask(m_GamepadMask);
+        m_SteamController = new SteamControllerRunner(config, prefs.steamControllerRumbleHold, m_SteamHost);
+    }
+#endif
 }
 
 SdlInputHandler::~SdlInputHandler()
 {
+#if HAVE_STEAM_CONTROLLER_DRIVER
+    // Nothing more goes to the host from the driver threads, then the stop sequence (motors
+    // off, lizard mode back on) runs before the devices close. This precedes LiStopConnection().
+    if (m_SteamHost != nullptr) {
+        m_SteamHost->shutdown();
+    }
+    delete m_SteamController;
+    m_SteamController = nullptr;
+    delete m_SteamHost;
+    m_SteamHost = nullptr;
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        m_SteamLinks[i].reset();
+    }
+#endif
+
     for (int i = 0; i < MAX_GAMEPADS; i++) {
         if (m_GamepadState[i].mouseEmulationTimer != 0) {
             Session::get()->notifyMouseEmulationMode(false);
@@ -252,6 +304,11 @@ SdlInputHandler::~SdlInputHandler()
     // Restore the ignored devices
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES, m_OldIgnoreDevices.toUtf8());
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT, m_OldIgnoreDevicesExcept.toUtf8());
+#if HAVE_STEAM_CONTROLLER_DRIVER
+    if (m_SteamHintChanged) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, m_OldHidapiSteamHint.toUtf8());
+    }
+#endif
 
 #ifdef STEAM_LINK
     // Hide SDL's cursor on Steam Link after quitting the stream.

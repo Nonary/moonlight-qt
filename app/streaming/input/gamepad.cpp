@@ -6,6 +6,7 @@
 #include "settings/mappingmanager.h"
 #include "streaming/input/dualsensehaptics.h"
 #include "streaming/input/gamepadstickmerge.h"
+#include "streaming/input/steamcontroller/steamcontrollerhost.h"
 
 #include <QtMath>
 
@@ -43,7 +44,7 @@ SdlInputHandler::findStateForGamepad(SDL_JoystickID id)
     int i;
 
     for (i = 0; i < MAX_GAMEPADS; i++) {
-        if (m_GamepadState[i].jsId == id) {
+        if (!m_GamepadState[i].steamOwned && m_GamepadState[i].jsId == id) {
             SDL_assert(!m_MultiController || m_GamepadState[i].index == i);
             return &m_GamepadState[i];
         }
@@ -611,6 +612,14 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
 {
     GamepadState* state;
 
+#if HAVE_STEAM_CONTROLLER_DRIVER
+    // Hot-plug hint for the Steam Controller (2026) driver (its own devices are hidden from SDL,
+    // so this mostly catches a hub or a puck arriving with other pads; the 2 s timer does the rest).
+    if (m_SteamController != nullptr) {
+        m_SteamController->requestRescan();
+    }
+#endif
+
     if (event->type == SDL_CONTROLLERDEVICEADDED) {
         int i;
         const char* name;
@@ -650,7 +659,7 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
 
         for (; i < MAX_GAMEPADS; i++) {
             SDL_assert(m_GamepadState[i].controller != controller);
-            if (m_GamepadState[i].controller == NULL) {
+            if (m_GamepadState[i].controller == NULL && !m_GamepadState[i].steamOwned) {
                 // Found an empty slot
                 break;
             }
@@ -766,6 +775,7 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
         else {
             SDL_assert(m_GamepadMask == 0x1);
         }
+        updateSteamGamepadMask();
 
         SDL_JoystickPowerLevel powerLevel = SDL_JoystickCurrentPowerLevel(SDL_GameControllerGetJoystick(state->controller));
 
@@ -815,6 +825,7 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
             else {
                 SDL_assert(m_GamepadMask == 0x1);
             }
+            updateSteamGamepadMask();
 
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Gamepad %d is gone",
@@ -867,6 +878,14 @@ void SdlInputHandler::rumble(unsigned short controllerNumber, unsigned short low
     if (controllerNumber >= MAX_GAMEPADS) {
         return;
     }
+
+#if HAVE_STEAM_CONTROLLER_DRIVER
+    // A Steam Controller (2026) slot takes plain rumble as a synthesized 0x80 report on its own
+    // writer, instead of SDL (which never opened it).
+    if (SteamControllerHost::rumble(controllerNumber, lowFreqMotor, highFreqMotor)) {
+        return;
+    }
+#endif
 
 #if SDL_VERSION_ATLEAST(2, 0, 9)
     // Host controllerNumber is the player index, not the SDL slot. In
@@ -993,6 +1012,11 @@ void SdlInputHandler::setMotionEventState(uint16_t controllerNumber, uint8_t mot
     if (controllerNumber >= MAX_GAMEPADS) {
         return;
     }
+
+#if HAVE_STEAM_CONTROLLER_DRIVER
+    // A Steam Controller (2026) slot decimates its 250 Hz IMU to this rate itself.
+    SteamControllerHost::setMotionEventState(controllerNumber, motionType, reportRateHz);
+#endif
 
 #if SDL_VERSION_ATLEAST(2, 0, 14)
     for (int i = 0; i < MAX_GAMEPADS; i++) {
@@ -1198,3 +1222,122 @@ int SdlInputHandler::getAttachedPlayStationGamepadMask()
 
     return mask;
 }
+
+void SdlInputHandler::updateSteamGamepadMask()
+{
+#if HAVE_STEAM_CONTROLLER_DRIVER
+    SteamControllerHost::setActiveGamepadMask((uint16_t)m_GamepadMask);
+#endif
+}
+
+void SdlInputHandler::handleSteamControllerEvent(SDL_UserEvent* event)
+{
+#if HAVE_STEAM_CONTROLLER_DRIVER
+    int linkId, generation, kind;
+    SteamControllerHost::unpackEvent(event->data1, event->data2, linkId, generation, kind);
+    if (m_SteamController == nullptr) {
+        return;
+    }
+    if (kind == SteamControllerHost::LinkConnected) {
+        std::shared_ptr<SteamControllerLink> link = m_SteamController->manager().find(linkId);
+        if (link) {
+            steamControllerConnected(link, generation);
+        }
+    }
+    else if (kind == SteamControllerHost::LinkDisconnected) {
+        steamControllerDisconnected(linkId, generation);
+    }
+#else
+    Q_UNUSED(event);
+#endif
+}
+
+#if HAVE_STEAM_CONTROLLER_DRIVER
+
+// Main thread: a Steam Controller (2026) link reported a controller. It shares the 16 slots and
+// the gamepad mask with the SDL controllers: next free slot in multi-controller mode, player 0 in
+// single-controller mode (its input is not merged with other pads, as in the Android client).
+void SdlInputHandler::steamControllerConnected(const std::shared_ptr<SteamControllerLink>& link, int generation)
+{
+    if (!link->connected() || link->generation() != generation) {
+        // Already gone again (or reconnected as a newer generation, whose own event follows)
+        return;
+    }
+
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        if (m_SteamLinks[i] == link) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Steam Controller %s: duplicate arrival for generation %d ignored",
+                        link->name().c_str(), generation);
+            return;
+        }
+    }
+
+    int i = 0;
+    for (; i < MAX_GAMEPADS; i++) {
+        if (m_GamepadState[i].controller == NULL && !m_GamepadState[i].steamOwned) {
+            break;
+        }
+    }
+    if (i == MAX_GAMEPADS) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "No open gamepad slots found for Steam Controller %s!", link->name().c_str());
+        return;
+    }
+
+    GamepadState* state = &m_GamepadState[i];
+    SDL_memset(state, 0, sizeof(*state));
+    state->steamOwned = true;
+    state->index = m_MultiController ? i : 0;
+    m_SteamLinks[i] = link;
+    m_SteamLinkGeneration[i] = generation;
+
+    if (m_MultiController) {
+        m_GamepadMask |= (1 << state->index);
+    }
+    else {
+        SDL_assert(m_GamepadMask == 0x1);
+    }
+    updateSteamGamepadMask();
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Gamepad %d (player %d) is: Steam Controller (2026) via %s, %s (VID/PID: 0x%.4x/0x%.4x) (caps 0x%x)",
+                i, state->index, link->isPuck() ? "wireless puck" : "USB cable", link->name().c_str(),
+                SteamController::VENDOR_VALVE, link->productId(), link->capabilities());
+
+    // Arrival with the mask including the new bit, then the cached attributes and battery.
+    m_SteamHost->announce((uint8_t)state->index, link, generation);
+}
+
+void SdlInputHandler::steamControllerDisconnected(int linkId, int generation)
+{
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        if (!m_SteamLinks[i] || m_SteamLinks[i]->id() != linkId || m_SteamLinkGeneration[i] != generation) {
+            continue;
+        }
+
+        GamepadState* state = &m_GamepadState[i];
+        std::shared_ptr<SteamControllerLink> link = m_SteamLinks[i];
+
+        if (m_MultiController) {
+            SDL_assert(m_GamepadMask & (1 << state->index));
+            m_GamepadMask &= ~(1 << state->index);
+        }
+        else {
+            SDL_assert(m_GamepadMask == 0x1);
+        }
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Gamepad %d is gone (Steam Controller %s)",
+                    state->index, link->name().c_str());
+
+        // Final zeroed event under the new mask, and no more forwarding for this link generation
+        m_SteamHost->retire(link, (uint8_t)state->index, (uint16_t)m_GamepadMask);
+
+        m_SteamLinks[i].reset();
+        m_SteamLinkGeneration[i] = 0;
+        SDL_memset(state, 0, sizeof(*state));
+        return;
+    }
+}
+
+#endif
