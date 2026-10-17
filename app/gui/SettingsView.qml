@@ -2653,6 +2653,349 @@ Flickable {
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("Allows Moonlight to capture gamepad inputs even if it's not the current window in focus")
                 }
+
+                CheckBox {
+                    id: steamControllerCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    text: qsTr("Drive a USB or puck-connected Steam Controller (2026) directly")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.steamControllerDriver
+                    onCheckedChanged: {
+                        StreamingPreferences.steamControllerDriver = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Announces a Steam Controller (2026) on a USB cable or the wireless puck to the host as a Steam Controller with both trackpads, gyro, grip sensors, battery and Steam haptics, and relays its firmware attributes.") + " " +
+                                  qsTr("A client PC running Steam owns the controller first; close Steam or stop Steam Input for it.") + "\n\n" +
+                                  qsTr("NEVER start a controller firmware update from Steam while streaming. The update would target the virtual controller on the host, not the real controller; it cannot succeed and may leave Steam confused. Update firmware with the controller connected directly to a PC running Steam.")
+                }
+
+                CheckBox {
+                    id: steamControllerMotionCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    enabled: steamControllerCheck.checked
+                    text: qsTr("Steam Controller: gyro and accelerometer")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.steamControllerMotion
+                    onCheckedChanged: {
+                        StreamingPreferences.steamControllerMotion = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Asks the firmware for the raw IMU and advertises motion to the host; the host decides when it wants the reports.")
+                }
+
+                CheckBox {
+                    id: steamControllerSplitPadsCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    enabled: steamControllerCheck.checked
+                    text: qsTr("Steam Controller: trackpads as DualShock touchpad halves")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.steamControllerSplitPads
+                    onCheckedChanged: {
+                        StreamingPreferences.steamControllerSplitPads = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Sends the left pad as finger 0 in the left half and the right pad as finger 1 in the right half of one touchpad, which a DualShock 4 emulation splits back.") + " " +
+                                  qsTr("Turn it off only for a host that understands two touchpads.")
+                }
+
+                Label {
+                    width: parent.width
+                    text: qsTr("Steam Controller: grip buttons")
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                    enabled: steamControllerCheck.checked
+                }
+
+                AutoResizingComboBox {
+                    id: steamControllerGripsComboBox
+                    enabled: steamControllerCheck.checked
+                    textRole: "text"
+
+                    // ignore setting the index at first, and actually set it when the component is loaded
+                    Component.onCompleted: {
+                        var saved_grips = StreamingPreferences.steamControllerGrips
+                        currentIndex = 0
+                        for (var i = 0; i < steamControllerGripsListModel.count; i++) {
+                            var el_grips = steamControllerGripsListModel.get(i).val;
+                            if (saved_grips === el_grips) {
+                                currentIndex = i
+                                break
+                            }
+                        }
+                        activated(currentIndex)
+                    }
+
+                    model: ListModel {
+                        id: steamControllerGripsListModel
+                        ListElement {
+                            text: qsTr("Paddles 1-4 (Xbox Elite style)")
+                            val: StreamingPreferences.SCG_PADDLES
+                        }
+                        ListElement {
+                            text: qsTr("DualShock extras (Share, touchpad click, L3, R3)")
+                            val: StreamingPreferences.SCG_DS4
+                        }
+                        ListElement {
+                            text: qsTr("Off")
+                            val: StreamingPreferences.SCG_OFF
+                        }
+                    }
+
+                    // ::onActivated must be used, as it only listens for when the index is changed by a human
+                    onActivated: {
+                        StreamingPreferences.steamControllerGrips = steamControllerGripsListModel.get(currentIndex).val
+                    }
+                }
+
+                Label {
+                    width: parent.width
+                    text: qsTr("Steam Controller: hold host rumble for")
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                    enabled: steamControllerCheck.checked
+                }
+
+                AutoResizingComboBox {
+                    id: steamControllerRumbleHoldComboBox
+                    enabled: steamControllerCheck.checked
+                    textRole: "text"
+
+                    Component.onCompleted: {
+                        var saved_hold = StreamingPreferences.steamControllerRumbleHold
+                        currentIndex = 1
+                        for (var i = 0; i < steamControllerRumbleHoldListModel.count; i++) {
+                            if (saved_hold === steamControllerRumbleHoldListModel.get(i).val) {
+                                currentIndex = i
+                                break
+                            }
+                        }
+                        activated(currentIndex)
+                    }
+
+                    model: ListModel {
+                        id: steamControllerRumbleHoldListModel
+                        ListElement {
+                            text: qsTr("250 ms")
+                            val: 250
+                        }
+                        ListElement {
+                            text: qsTr("500 ms (default)")
+                            val: 500
+                        }
+                        ListElement {
+                            text: qsTr("1 second")
+                            val: 1000
+                        }
+                        ListElement {
+                            text: qsTr("2 seconds")
+                            val: 2000
+                        }
+                        ListElement {
+                            text: qsTr("Unlimited (the host sends the stop)")
+                            val: 0
+                        }
+                    }
+
+                    onActivated: {
+                        StreamingPreferences.steamControllerRumbleHold = steamControllerRumbleHoldListModel.get(currentIndex).val
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("A rumble from the host is refreshed on the controller every 40 ms until this time passes, then the motors stop; choose Unlimited only when the host reliably sends a stop.")
+                }
+
+                CheckBox {
+                    id: steamControllerStickStretchCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    enabled: steamControllerCheck.checked
+                    text: qsTr("Steam Controller: stretch the sticks to the rim")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.steamControllerStickStretch
+                    onCheckedChanged: {
+                        StreamingPreferences.steamControllerStickStretch = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Divides each stick axis by the largest deflection seen this session and clamps to the unit circle. Off by default: Steam's own calibration expects the controller's native range.")
+                }
+
+                Label {
+                    width: parent.width
+                    text: qsTr("Steam Controller over Bluetooth LE: pad click boost")
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                    enabled: steamControllerCheck.checked
+                }
+
+                AutoResizingComboBox {
+                    id: steamControllerHapticBoostComboBox
+                    enabled: steamControllerCheck.checked
+                    textRole: "text"
+
+                    Component.onCompleted: {
+                        var saved_boost = StreamingPreferences.steamControllerHapticBoost
+                        currentIndex = 0
+                        for (var i = 0; i < steamControllerHapticBoostListModel.count; i++) {
+                            if (saved_boost === steamControllerHapticBoostListModel.get(i).val) {
+                                currentIndex = i
+                                break
+                            }
+                        }
+                        activated(currentIndex)
+                    }
+
+                    model: ListModel {
+                        id: steamControllerHapticBoostListModel
+                        ListElement {
+                            text: qsTr("Off (as Steam sends it)")
+                            val: 0
+                        }
+                        ListElement {
+                            text: qsTr("+6 dB")
+                            val: 6
+                        }
+                        ListElement {
+                            text: qsTr("+12 dB")
+                            val: 12
+                        }
+                        ListElement {
+                            text: qsTr("+20 dB (everything at the ceiling)")
+                            val: 20
+                        }
+                    }
+
+                    onActivated: {
+                        StreamingPreferences.steamControllerHapticBoost = steamControllerHapticBoostListModel.get(currentIndex).val
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Bluetooth LE only: added to the gain of Steam's trackpad tick and click commands, clamped to the firmware's +6 dB ceiling. USB and puck links are not affected.")
+                }
+
+                Label {
+                    width: parent.width
+                    text: qsTr("Steam Controller over Bluetooth LE: pad slide pulse length")
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                    enabled: steamControllerCheck.checked
+                }
+
+                AutoResizingComboBox {
+                    id: steamControllerHapticPulseScaleComboBox
+                    enabled: steamControllerCheck.checked
+                    textRole: "text"
+
+                    Component.onCompleted: {
+                        var saved_scale = StreamingPreferences.steamControllerHapticPulseScale
+                        currentIndex = 0
+                        for (var i = 0; i < steamControllerHapticPulseScaleListModel.count; i++) {
+                            if (saved_scale === steamControllerHapticPulseScaleListModel.get(i).val) {
+                                currentIndex = i
+                                break
+                            }
+                        }
+                        activated(currentIndex)
+                    }
+
+                    model: ListModel {
+                        id: steamControllerHapticPulseScaleListModel
+                        ListElement {
+                            text: qsTr("100% (as Steam sends it)")
+                            val: 100
+                        }
+                        ListElement {
+                            text: qsTr("150%")
+                            val: 150
+                        }
+                        ListElement {
+                            text: qsTr("200%")
+                            val: 200
+                        }
+                        ListElement {
+                            text: qsTr("300%")
+                            val: 300
+                        }
+                    }
+
+                    onActivated: {
+                        StreamingPreferences.steamControllerHapticPulseScale = steamControllerHapticPulseScaleListModel.get(currentIndex).val
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Bluetooth LE only: Steam's slide texture is 400 us pulses with no gain field, so this lengthens their on-time instead. Stops are untouched.")
+                }
+
+                Label {
+                    width: parent.width
+                    text: qsTr("Steam Controller over Bluetooth LE: haptic master gain")
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                    enabled: steamControllerCheck.checked
+                }
+
+                AutoResizingComboBox {
+                    id: steamControllerHapticMasterGainComboBox
+                    enabled: steamControllerCheck.checked
+                    textRole: "text"
+
+                    Component.onCompleted: {
+                        var saved_gain = StreamingPreferences.steamControllerHapticMasterGain
+                        currentIndex = 0
+                        for (var i = 0; i < steamControllerHapticMasterGainListModel.count; i++) {
+                            if (saved_gain === steamControllerHapticMasterGainListModel.get(i).val) {
+                                currentIndex = i
+                                break
+                            }
+                        }
+                        activated(currentIndex)
+                    }
+
+                    model: ListModel {
+                        id: steamControllerHapticMasterGainListModel
+                        ListElement {
+                            text: qsTr("Off (not written)")
+                            val: 0
+                        }
+                        ListElement {
+                            text: qsTr("+6 dB")
+                            val: 6
+                        }
+                        ListElement {
+                            text: qsTr("+12 dB")
+                            val: 12
+                        }
+                    }
+
+                    onActivated: {
+                        StreamingPreferences.steamControllerHapticMasterGain = steamControllerHapticMasterGainListModel.get(currentIndex).val
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Bluetooth LE only: written as the firmware's haptic master gain setting (76) with the link's own settings and cleared at stream end. Steam never writes it; if the firmware honours it, everything gets stronger and the two knobs above are unnecessary.")
+                }
             }
         }
 

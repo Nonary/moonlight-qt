@@ -80,9 +80,10 @@ jobs:
           module['post-install'] = [
               'python3 -m unittest discover -s scripts/tests -p test_amdgpu_header_compat.py',
               'g++ -std=c++17 -fsyntax-only -Iapp/streaming scripts/linux-gpu-capability.cpp',
-              'mkdir -p build/nightly-tests-updates build/nightly-tests-haptics build/nightly-tests-feedback build/nightly-tests-present build/nightly-tests-gpu',
+              'mkdir -p build/nightly-tests-updates build/nightly-tests-haptics build/nightly-tests-steamcontroller build/nightly-tests-feedback build/nightly-tests-present build/nightly-tests-gpu',
               'cd build/nightly-tests-updates && qmake ../../tests/updates/updates.pro CONFIG+=release && make -j2 && ./tst_autoupdatechecker',
               'cd build/nightly-tests-haptics && qmake ../../tests/haptics/haptics.pro CONFIG+=release && make -j2 && ./tst_dualsensehaptics',
+              'cd build/nightly-tests-steamcontroller && qmake ../../tests/steamcontroller/steamcontroller.pro CONFIG+=release && make -j2 && ./tst_steamcontroller',
               'cd build/nightly-tests-feedback && qmake ../../tests/vrr/waylandfeedback.pro && make -j2 && ./tst_waylandfeedback',
               'cd build/nightly-tests-present && qmake ../../tests/vrr/plvkpresentation.pro && make -j2 && ./tst_plvkpresentation',
               'cd build/nightly-tests-gpu && qmake ../../tests/vrr/gpuperformancehold.pro && make -j2 && ./tst_gpuperformancehold',

@@ -7,6 +7,7 @@ contains(CONFIG, tests) {
     SUBDIRS += updates
     SUBDIRS += vrr
     SUBDIRS += haptics
+    SUBDIRS += steamcontroller
     SUBDIRS += pyrowave
     toleranceInput.file = $$PWD/input/tolerance.pro
     SUBDIRS += toleranceInput
