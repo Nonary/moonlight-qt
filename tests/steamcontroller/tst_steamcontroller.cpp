@@ -1049,6 +1049,39 @@ static void testBle()
     check(reservedSet, "the reserved host setting ids are exactly {9, 48, 71, 49, 52, 53}");
 }
 
+// Reconnecting a slot must discard the old generation's output retry timer,
+// including when a stop was still waiting for a successful HID transfer.
+static void testReconnectOutputSchedule()
+{
+    for (uint16_t product : {PRODUCT_WIRED, PRODUCT_PUCK, PRODUCT_BLE}) {
+        FakeTransport io;
+        io.add("retry", product, product == PRODUCT_PUCK ? 2 : 0, VENDOR_USAGE_PAGE);
+        Events events;
+        SteamControllerConfig config;
+        SteamControllerManager manager(io, config, 500, &events);
+        run(manager);
+        auto link = manager.links()[0];
+        auto device = io.state("retry");
+        input(*link, state(0x45)); run(manager);
+        const int oldGeneration = link->generation();
+        device->failWrite = true;
+        link->rumble(0, 0, g_Now); run(manager);
+        check(link->queuedOutputs() == 1, "failed stop waits for its retry deadline");
+        input(*link, {IN_WIRELESS_EVENT, 1});
+        input(*link, state(0x45));
+        check(link->generation() != oldGeneration && link->queuedOutputs() == 0,
+              "reconnect retires the failed stop's generation and queue");
+        device->failWrite = false;
+        device->writes.clear();
+        auto fresh = pulse(0, 1);
+        link->steamHaptic(fresh.data(), (int)fresh.size(), g_Now);
+        run(manager);
+        check(device->writes.size() == 1 && device->writes[0] == fresh,
+              "new generation's first feedback is sent without the retired retry delay");
+        manager.stop(g_Now);
+    }
+}
+
 // The three Bluetooth LE haptic knobs (ported from the Android BLE driver): off by default, and
 // never applied to a USB or puck link in the same session.
 static void testBleHapticKnobs()
@@ -1210,6 +1243,7 @@ int main()
         testHostFeedbackGeneration();
         testBle();
         testBleHapticKnobs();
+        testReconnectOutputSchedule();
     }
     catch (const std::exception& ex) {
         printf("FAIL exception: %s\n", ex.what());

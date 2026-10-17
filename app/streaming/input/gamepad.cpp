@@ -1025,7 +1025,9 @@ void SdlInputHandler::setMotionEventState(uint16_t controllerNumber, uint8_t mot
             continue;
         }
 
-        uint8_t reportPeriodMs = reportRateHz ? (1000 / reportRateHz) : 0;
+        // Keep 1 Hz representable and reserve zero for disabled sensors. Round
+        // up so millisecond decimation never exceeds the requested frequency.
+        uint16_t reportPeriodMs = reportRateHz ? (uint16_t)((1000u + reportRateHz - 1u) / reportRateHz) : 0;
         switch (motionType) {
         case LI_MOTION_TYPE_ACCEL:
             state->accelReportPeriodMs = reportPeriodMs;

@@ -4935,7 +4935,7 @@ queued audio latency. Muting can suppress audio processing without retiming VRR.
 Input goes from SDL handlers to common-library input APIs and a separate sender.
 
 Steam Controller (2026) USB/puck/Bluetooth LE input also has a direct HID path
-(`app/streaming/input/steamcontroller`, based on `51a884d1`). The three
+(`app/streaming/input/steamcontroller`, reviewed against `88b21736`). The three
 transports (cable `28de:1302`, puck `28de:1304` interfaces 2..5, Bluetooth LE
 `28de:1303` as a HID-over-GATT device) share one link implementation over
 SDL's hidapi; only the Bluetooth LE link advertises `LI_CCAP_STEAM_SETTINGS`
@@ -4948,13 +4948,18 @@ link and its announced generation, releases the registry mutex, then validates
 that generation under the link mutex before changing haptics, settings or
 motion rates. This prevents an old arrival from controlling a replacement unit
 while SDL arrival/removal events are pending, without reversing the
-link-to-registry lock order. Motion intervals use 16 bits, round up to
-milliseconds and reserve zero for disabled sensors. Failed HID opens retry on
+link-to-registry lock order. Disconnect also clears the output drain schedule,
+so a replacement generation cannot inherit the retired stop's retry delay.
+Motion intervals use 16 bits, round up to milliseconds and reserve zero for
+disabled sensors in both this path and ordinary SDL gamepads. Failed HID opens retry on
 the manager's bounded rescan schedule, which also covers Bluetooth
 connect/disconnect (a HID device appearing or vanishing).
 `tests/steamcontroller` exercises the production registry,
 decoder and link with SDL/network/HID boundaries replaced by deterministic
 fakes; it does not establish physical controller behavior.
+`tests/input/test_gamepad_motion_rate.py` compiles the production SDL state and
+motion configuration/dispatch methods against fake SDL/network boundaries,
+covering both sensors, 1–65535 Hz boundaries, disable and SDL tick wrap.
 
 Windows/Linux DualSense waveform feedback (updated 2026-10-05) runs separately
 from video and ordinary stream audio. A Bluetooth Sony DualSense/Edge with an

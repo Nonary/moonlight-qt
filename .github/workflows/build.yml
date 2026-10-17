@@ -14,6 +14,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test-input-motion:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test SDL controller motion rates
+        env:
+          CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+        run: python3 tests/input/test_gamepad_motion_rate.py
+
   setup:
     runs-on: ubuntu-latest
     outputs:
