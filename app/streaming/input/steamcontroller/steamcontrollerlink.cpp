@@ -195,6 +195,8 @@ void SteamControllerLink::disconnectLocked(uint64_t nowMs)
 {
     (void)nowMs;
     m_Outputs.clear();
+    m_DrainScheduled = false;
+    m_DrainDueMs = 0;
     m_DrainBusy = false;
     m_ConfigureState = 0;
     m_ConfigurePending = false;
