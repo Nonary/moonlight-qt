@@ -323,6 +323,11 @@ StreamCommandLineParser::StreamCommandLineParser()
         {"fullscreen", StreamingPreferences::CSK_FULLSCREEN},
         {"always",     StreamingPreferences::CSK_ALWAYS},
     };
+    m_SteamControllerGripsMap = {
+        {"paddles", StreamingPreferences::SCG_PADDLES},
+        {"ds4",     StreamingPreferences::SCG_DS4},
+        {"off",     StreamingPreferences::SCG_OFF},
+    };
 }
 
 StreamCommandLineParser::~StreamCommandLineParser()
@@ -369,6 +374,12 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     parser.addToggleOption("background-gamepad", "background gamepad input");
     parser.addToggleOption("reverse-scroll-direction", "inverted scroll direction");
     parser.addToggleOption("swap-gamepad-buttons", "swap A/B and X/Y gamepad buttons (Nintendo-style)");
+    parser.addToggleOption("steam-controller", "the direct driver for a USB or puck-connected Steam Controller (2026)");
+    parser.addToggleOption("steam-controller-motion", "Steam Controller (2026) gyro and accelerometer");
+    parser.addToggleOption("steam-controller-split-pads", "Steam Controller (2026) trackpads as DualShock touchpad halves");
+    parser.addChoiceOption("steam-controller-grips", "Steam Controller (2026) grip buttons", m_SteamControllerGripsMap.keys());
+    parser.addValueOption("steam-controller-rumble-hold", "Steam Controller (2026) rumble hold in ms (0 = unlimited)");
+    parser.addToggleOption("steam-controller-stick-stretch", "Steam Controller (2026) stick rim stretch");
     parser.addToggleOption("keep-awake", "prevent display sleep while streaming");
     parser.addToggleOption("performance-overlay", "show performance overlay");
     parser.addToggleOption("hdr", "HDR streaming");
@@ -492,6 +503,18 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
 
     // Resolve --swap-gamepad-buttons and --no-swap-gamepad-buttons options
     preferences->swapFaceButtons = parser.getToggleOptionValue("swap-gamepad-buttons", preferences->swapFaceButtons);
+
+    // Resolve the Steam Controller (2026) driver options
+    preferences->steamControllerDriver = parser.getToggleOptionValue("steam-controller", preferences->steamControllerDriver);
+    preferences->steamControllerMotion = parser.getToggleOptionValue("steam-controller-motion", preferences->steamControllerMotion);
+    preferences->steamControllerSplitPads = parser.getToggleOptionValue("steam-controller-split-pads", preferences->steamControllerSplitPads);
+    if (parser.isSet("steam-controller-grips")) {
+        preferences->steamControllerGrips = mapValue(m_SteamControllerGripsMap, parser.getChoiceOptionValue("steam-controller-grips"));
+    }
+    if (parser.isSet("steam-controller-rumble-hold")) {
+        preferences->steamControllerRumbleHold = qMax(0, parser.getIntOption("steam-controller-rumble-hold"));
+    }
+    preferences->steamControllerStickStretch = parser.getToggleOptionValue("steam-controller-stick-stretch", preferences->steamControllerStickStretch);
 
     // Resolve --keep-awake and --no-keep-awake options
     preferences->keepAwake = parser.getToggleOptionValue("keep-awake", preferences->keepAwake);
