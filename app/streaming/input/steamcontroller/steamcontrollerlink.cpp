@@ -781,8 +781,22 @@ void SteamControllerManager::rescan(uint64_t nowMs)
             return std::none_of(infos.begin(), infos.end(), [&](const SteamHidDeviceInfo& i) { return i.path == path; });
         }), m_RejectedPaths.end());
 
+        // Linux hidraw (SDL3's hidapi) lists one entry per top-level collection of a node, all with
+        // the same path, keyboard and mouse collections first on the Bluetooth LE controller. Take a
+        // path's vendor collection entry when it has one, so a collection listed before it never
+        // probes, fails and rejects the path for it; otherwise one entry per path is probed.
+        std::vector<SteamHidDeviceInfo> candidates;
         for (const SteamHidDeviceInfo& info : infos) {
             if (!isCandidate(info)) continue;
+            if (std::any_of(candidates.begin(), candidates.end(), [&](const SteamHidDeviceInfo& c) { return c.path == info.path; })) continue;
+            if (info.usagePage != VENDOR_USAGE_PAGE &&
+                std::any_of(infos.begin(), infos.end(), [&](const SteamHidDeviceInfo& o) { return o.path == info.path && o.usagePage == VENDOR_USAGE_PAGE && isCandidate(o); })) {
+                continue;
+            }
+            candidates.push_back(info);
+        }
+
+        for (const SteamHidDeviceInfo& info : candidates) {
             // A path dropped in this pass (its reads failed) is retried at the next rescan, not now.
             bool known = std::any_of(m_Links.begin(), m_Links.end(), [&](const std::shared_ptr<SteamControllerLink>& l) { return l->info().path == info.path; })
                       || std::any_of(dropped.begin(), dropped.end(), [&](const std::shared_ptr<SteamControllerLink>& l) { return l->info().path == info.path; })
@@ -809,10 +823,27 @@ void SteamControllerManager::rescan(uint64_t nowMs)
                 memset(probe, 0, sizeof(probe));
                 probe[0] = FEATURE_REPORT_ID;
                 if (device->getFeatureReport(probe, sizeof(probe)) < 1) {
-                    m_RejectedPaths.push_back(info.path);
-                    continue;
+                    bool keep = false;
+#if defined(__linux__)
+                    // One hidraw node per Bluetooth LE controller on Linux (uhid): with no vendor
+                    // collection entry to go by and the probe unanswered (a GET_REPORT the Bluetooth
+                    // stack did not carry), the node is still the controller. Keep it and let the
+                    // link's own settings write say whether feature reports work on this stack.
+                    keep = SteamControllerLink::transportOf(info.productId) == SteamControllerLink::TransportBle && info.interfaceNumber <= 0;
+#endif
+                    if (!keep) {
+                        logf(LogInfo, "Steam Controller: %s (product 0x%04x, interface %d, usage page 0x%04x) did not answer a feature report 1 read; not the vendor collection, left alone until it is re-enumerated",
+                             info.path.c_str(), info.productId, info.interfaceNumber, info.usagePage);
+                        m_RejectedPaths.push_back(info.path);
+                        continue;
+                    }
+                    logf(LogWarn, "Steam Controller: %s (product 0x%04x, usage page 0x%04x) did not answer a feature report 1 read; kept as the Bluetooth LE controller's only hidraw node",
+                         info.path.c_str(), info.productId, info.usagePage);
+                    how = "Bluetooth LE node, feature report 1 read unanswered";
                 }
-                how = "accepted a feature report 1 read";
+                else {
+                    how = "accepted a feature report 1 read";
+                }
             }
             SteamHidDeviceInfo opened_info = info;
             if (opened_info.interfaceNumber < 0) opened_info.interfaceNumber = 0;

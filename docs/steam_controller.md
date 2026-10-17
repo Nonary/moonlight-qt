@@ -135,7 +135,14 @@ own settings and haptics.
 no USB interface number (`interface -1`); the vendor collection is the one on usage page
 `0xff00`, as over USB, and the other collections (keyboard, mouse) are refused by the feature
 report 1 probe. **Linux** exposes one `hidraw` node per Bluetooth controller through `uhid`
-(interface 0 or -1), which needs the udev rule above.
+(interface 0 or -1), which needs the udev rule above; SDL's hidapi lists that one node once per
+top-level collection (keyboard and mouse first, the vendor collection on usage page `0xff00`
+last), and the driver takes the vendor entry. If the stack lists no `0xff00` entry and the probe
+goes unanswered, the node is still kept as the controller (`kept as the Bluetooth LE
+controller's only hidraw node`) and the link settings line then says whether feature reports
+work on that stack. A node that is probed and refused is logged (`did not answer a feature
+report 1 read; not the vendor collection`), so a silent scan means nothing was enumerated:
+check `ls -l /dev/hidraw*` and the udev rule, and that the controller is connected in `bluetoothctl`.
 
 **Host settings relay.** A Vibepollo host forwards the settings writes Steam makes to the
 virtual controller (`ConnListenerSteamSettings`, command 0x87 with (id, u16) triples, or 0x8E
