@@ -3468,6 +3468,22 @@ response. It does not prove how a particular Sunshine/GFE version captures,
 timestamps, paces, or encodes in response. A refresh hint is not host/client
 clock synchronization.
 
+Successful launch/resume responses may include the optional direct-child
+`clientWarning=virtual_display_disabled_by_client`. `backend/launchwarning.h`
+accepts only the recognized code in bounded, well-formed successful XML with a
+stream-start flag. Unknown codes, duplicates, DTDs and malformed warnings are
+ignored without changing launch success. Text comes from the client's localized
+catalogue, never arbitrary host markup. `Session` retains it only after successful
+RTSP connection; the existing status overlay shows it once for ten seconds after
+the streaming window is ready and clears it at teardown. It neither reconnects
+nor opens a dialog. Other status sources retain their own state.
+
+This client does not currently send `virtualDisplay=0`; the warning receiver is
+protocol support, not evidence that ordinary Nonary sessions trigger it. A
+compatible caller must explicitly send that disable and implement the response
+extension. Unchanged third-party Artemis clients may ignore it. No client display
+preference or persistent configuration is added by this extension.
+
 ## 4. Packet ingress, frame assembly, and recovery
 
 The video receive thread reads UDP into staging buffers, optionally decrypts

@@ -4,6 +4,8 @@ TEMPLATE = subdirs
 CONFIG += ordered
 
 contains(CONFIG, tests) {
+    launchWarning.file = $$PWD/backend/launchwarning.pro
+    SUBDIRS += launchWarning
     SUBDIRS += updates
     SUBDIRS += vrr
     SUBDIRS += haptics

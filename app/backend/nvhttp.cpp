@@ -350,8 +350,10 @@ NvHTTP::startApp(QString verb,
                  int playStationGamepadMask,
                  bool persistGameControllersOnDisconnect,
                  bool clientVrrRequested,
-                 QString& rtspSessionUrl)
+                 QString& rtspSessionUrl,
+                 LaunchWarning::Code& launchWarning)
 {
+    launchWarning = LaunchWarning::Code::None;
     int riKeyId;
 
     memcpy(&riKeyId, streamConfig->remoteInputAesIv, sizeof(riKeyId));
@@ -394,6 +396,7 @@ NvHTTP::startApp(QString verb,
     verifyResponseStatus(response);
 
     rtspSessionUrl = getXmlString(response, "sessionUrl0");
+    launchWarning = LaunchWarning::parse(response);
 }
 
 void

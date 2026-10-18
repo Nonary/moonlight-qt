@@ -475,6 +475,9 @@ void OverlayManager::setStatusMessage(StatusSource source, const std::string& te
             if (!combined.empty() && !client.empty()) combined += "\n\n";
             combined += client;
         }
+        const auto& host = m_StatusMessages[static_cast<int>(StatusSource::HostLaunch)];
+        if (!combined.empty() && !host.empty()) combined += "\n\n";
+        combined += host;
         auto& overlay = m_Overlays[OverlayStatusUpdate];
         if (combined == overlay.text && overlay.enabled == !combined.empty()) return;
         SDL_utf8strlcpy(overlay.text, combined.c_str(), sizeof(overlay.text));

@@ -3,6 +3,7 @@
 #include "identitymanager.h"
 #include "nvapp.h"
 #include "nvaddress.h"
+#include "launchwarning.h"
 #include "streaming/video/pyrowave/pyrowavelinkpolicy.h"
 #include <atomic>
 #include <functional>
@@ -185,7 +186,8 @@ public:
              int playStationGamepadMask,
              bool persistGameControllersOnDisconnect,
              bool clientVrrRequested,
-             QString& rtspSessionUrl);
+             QString& rtspSessionUrl,
+             LaunchWarning::Code& launchWarning);
 
     QVector<NvApp>
     getAppList();

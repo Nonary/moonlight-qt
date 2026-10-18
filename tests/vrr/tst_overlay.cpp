@@ -730,6 +730,16 @@ int main(int argc, char** argv)
         manager.setStatusMessage(StatusSource::Mouse, "");
         assert(manager.getOverlayText(OverlayStatusUpdate) == "client pacing");
         manager.setStatusMessage(StatusSource::ClientPacing, "");
+        manager.setStatusMessage(StatusSource::HostLaunch, "host display warning");
+        assert(manager.getOverlayText(OverlayStatusUpdate) == "host display warning");
+        manager.setStatusMessage(StatusSource::Mouse, "mouse");
+        assert(manager.getOverlayText(OverlayStatusUpdate) == "mouse\n\nhost display warning");
+        manager.setStatusMessage(StatusSource::Network, "network loss");
+        manager.setStatusMessage(StatusSource::HostLaunch, "");
+        assert(manager.getOverlayText(OverlayStatusUpdate) == "mouse");
+        manager.setStatusMessage(StatusSource::Mouse, "");
+        assert(manager.getOverlayText(OverlayStatusUpdate) == "network loss");
+        manager.setStatusMessage(StatusSource::Network, "");
         const auto statusColor = manager.getOverlayColor(OverlayStatusUpdate);
         assert(statusColor.r > 0 && statusColor.g == 0 && statusColor.b == 0);
         assert(!manager.isOverlayEnabled(OverlayStatusUpdate));

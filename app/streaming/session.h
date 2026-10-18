@@ -314,6 +314,7 @@ private:
     int m_MouseEmulationRefCount;
     int m_FlushingWindowEventsRef;
     QStringList m_LaunchWarnings;
+    QString m_HostLaunchWarning;
     bool m_ShouldExit;
 
     bool m_AsyncConnectionSuccess;
