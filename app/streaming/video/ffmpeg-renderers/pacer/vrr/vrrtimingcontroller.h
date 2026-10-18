@@ -63,7 +63,7 @@
     X(uint64_t, playout_input_percentile_enabled, playoutInputPercentileEnabled, 0) \
     /* Only preventable input misses that caused an interval hitch score/grow. */ \
     X(uint64_t, playout_input_hitch_misses_only, playoutInputHitchMissesOnly, 0) \
-    /* Stable target adaptation is independent of miss eligibility. */ \
+    /* Stable adaptation: 1 holds raw plateaus; 2 permits bounded feedback trials. */ \
     X(uint64_t, playout_input_stable_adaptation, playoutInputStableAdaptation, 0) \
     X(uint64_t, playout_input_percentile_target_per_million, playoutInputPercentileTargetPerMillion, 990000) \
     X(uint64_t, playout_input_percentile_window_us, playoutInputPercentileWindowUs, 60000000) \

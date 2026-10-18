@@ -75,9 +75,11 @@ public:
     // 22:48/22:55 sessions; tracking the maximum missed 8 and 16.
     // A buffer resumed from evidence it already trusts skips learning.
     void endLearning() { m_Learning = false; }
-    // Keep the learned percentile and configured fall rate in charge. Miss
+    // Keep the learned percentile in charge of measured demand. Miss
     // eligibility and the evidence required for growth remain independent.
-    void setStableAdaptation(bool stable) { m_StableAdaptation = stable; }
+    // 1 preserves the recorded no-probe policy. Revision 2 separates
+    // finite clean-feedback trials from the unchanged ordinary release law.
+    void setStableAdaptation(uint64_t revision) { m_StableAdaptation = revision; }
     // While learning, ignore the largest `trim` requirements so one startup
     // or scene-load outlier cannot set protection.
     void setLearningTrim(size_t trim) { m_LearningTrim = trim; }
@@ -574,7 +576,8 @@ private:
         m_Stats.releaseFactorPpm = 1000000;
         m_Stats.effectiveFallRateUsPerSecond = m_FallRate;
         m_Stats.effectiveFallRateMilliUsPerSecond = m_FallRate * 1000;
-        if (canProbeRelease() && (m_HitchMissesOnly != 9 || m_EvidenceBackedRelease)) {
+        if (m_StableAdaptation < 2 && canProbeRelease() &&
+                (m_HitchMissesOnly != 9 || m_EvidenceBackedRelease)) {
             // Release at no more than 0.5% of source cadence, half the selected
             // tolerance, and the available VRR credit per interval. Presentation
             // recovery still enforces the shared physical/cadence floor.
@@ -590,7 +593,7 @@ private:
     }
     bool canProbeRelease() const {
         const uint64_t tail = 1000000 - m_Stats.probabilityPpm;
-        return !m_StableAdaptation && m_HitchMissesOnly >= 7 && m_ReleaseIntervalUs && m_Stats.vrrHeadroomUs &&
+        return m_StableAdaptation != 1 && m_HitchMissesOnly >= 7 && m_ReleaseIntervalUs && m_Stats.vrrHeadroomUs &&
             m_Stats.toleranceUs &&
             m_Stats.recentEligible && m_Stats.recentReleaseSamples >= 8 &&
             (m_HitchMissesOnly >= 9 ||
@@ -734,7 +737,7 @@ private:
             const uint64_t authorized = m_HitchMissesOnly >= 9 && m_Stats.recentReleaseMisses ?
                 std::max(m_Stats.currentUs, previousTargetUs) : m_Stats.currentUs;
             m_Stats.targetUs = std::min(m_Stats.targetUs, authorized);
-            if (m_HitchMissesOnly != 9 && canProbeRelease()) {
+            if (m_HitchMissesOnly != 9 && m_StableAdaptation < 2 && canProbeRelease()) {
                 // A raw late-input quantile is not proof that this protection
                 // remains necessary. Try a small reduction while actual input
                 // hitch coverage is healthy; fresh misses stop the probe.
@@ -757,9 +760,10 @@ private:
                     m_LayerTransitionTargetUs = std::min(m_LayerTransitionTargetUs, m_Stats.targetUs);
                 m_Stats.targetUs = std::clamp(m_LayerTransitionTargetUs, m_Stats.minimumUs, m_Stats.maximumUs);
             }
-            else if (m_HitchMissesOnly == 9) applyFeedbackBoundedRelease(atUs,
+            else if (m_HitchMissesOnly == 9 || m_StableAdaptation >= 2) applyFeedbackBoundedRelease(atUs,
                     std::clamp(requested, m_Stats.minimumUs, m_Stats.maximumUs));
-            if (m_HitchMissesOnly == 9) updateReleaseRate(m_Stats.recentReleaseMisses);
+            if (m_HitchMissesOnly == 9 || m_StableAdaptation >= 2)
+                updateReleaseRate(m_Stats.recentReleaseMisses);
         }
     }
     void move(uint64_t elapsed, bool growthAllowed) {
@@ -834,7 +838,7 @@ private:
             m_LayerTransitionActive = false;
     }
     int64_t m_SourceRelativeQuantileUs = 0, m_SourceRelativeMissQuantileUs = 0;
-    bool m_StableAdaptation = false;
+    uint64_t m_StableAdaptation = 0;
     uint64_t m_ReleaseIntervalUs = 0;
     uint64_t m_ReleaseStepRemainingUs = 0;
     uint64_t m_ReleaseTrialFloorUs = 0, m_ReleaseTrialAtUs = 0, m_ReleaseTrialEligible = 0;

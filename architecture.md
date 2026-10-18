@@ -1,3 +1,40 @@
+Bounded plateau recovery (2026-10-17, reconciled source baseline `2689cd7a`, originally `7d1148f9`): new adaptive
+sessions select `playout_input_stable_adaptation=2`, retaining input-hitch policy
+10 and the configured probability/history. Revision 1 remains explicit for
+historical exact replay.
+
+Revision 1 disabled all release probes to avoid oscillation, which also disabled
+measured-surplus acceleration and left a raw readiness quantile able to pin
+protection even without fresh preventable hitches. The completed
+`moonlight-pacing-20261017-171738-793163.vrrtrace` contains an 8,621 us plateau
+for 107.199018 s (frames 39926--51181), with the qualifying miss total unchanged
+at 372. SHA-256:
+`272a4d9927c706d860b912d6123a8f995a1b410494d8995756d9e2cc74b8f466`.
+The untouched capture passes both exact-baseline and sequence-integrity gates.
+This is separate from the initial presentation-starvation episode in that file.
+
+Revision 2 reuses finite feedback-qualified release trials: at most
+min(100 us, T/4), followed by at least one second and enough new eligible outcomes
+at the reduced buffer to support one expected tail observation (200 at 99.5%).
+A fresh qualifying miss cancels a trial and preserves the existing growth gate.
+Invalid observations and copied layer seeds cannot supply clean feedback.
+Both measured falling demand and trials retain the configured normal fall rate
+(250 us/s in this capture); the existing per-interval physical-room limit still
+applies. Ordinary release is unchanged. Trial reductions do not redefine the selected target, erase old misses,
+reset the rolling history, or continuously chase a lower buffer. Larger learned
+layers may still restore immediately; smaller layers drain normally and cannot
+save inherited excess as their own learned floor. Cache identity includes the
+stable-adaptation revision. Input buffer, extra delay and real decoder-to-CPU
+submission latency remain separate quantities.
+
+The compact numeric trace fixture retains all decisions from stream start.
+`tst_inputtracechunks` checks every revision-1 buffer state before scoring local
+revision-2 progress. It consumes recorded input and recorded submission feedback;
+it does not model alternate worker admission or physical display. Rolling 1/2/5/10
+second diagnostics complement, and never replace, the selected 120-second
+learning window. Startup presentation starvation is reported separately and is
+not repaired by this buffer adaptation change.
+
 ## Receive-clock correction (2026-10-17)
 
 New sessions select input clock-relative history revision4. Revisions0--3 keep

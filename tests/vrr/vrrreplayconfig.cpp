@@ -355,8 +355,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
-    if (value.playoutInputStableAdaptation > 1)
-        return fail("stable input adaptation must be 0 or 1");
+    if (value.playoutInputStableAdaptation > 2)
+        return fail("stable input adaptation must be between 0 and 2");
     if (value.playoutInputHitchMissesOnly > 10)
         return fail("input hitch-miss policy must be between 0 and 10");
     if (value.playoutPredictionOnly > 1 || value.playoutSubmissionEstimateFallback > 1 ||

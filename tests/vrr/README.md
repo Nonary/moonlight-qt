@@ -1927,3 +1927,48 @@ checks require old snapshots to default the flag to zero and reject values above
 one. The final comparison and stress artifacts are under
 `build/stable-buffer-recovery-20261017/`; rejected timing-recovery experiments
 are retained separately from the selected candidate.
+
+
+### Trace-derived plateau and local-progress regression
+
+`inputtracechunks.pro` builds `tst_inputtracechunks`. Run it with
+`tests/vrr/fixtures/buffer-drain-20261017.json.qz`. The fixture is a Qt-compressed
+JSON numeric projection of the completed source trace documented at the top of
+`architecture.md`; it includes its SHA-256, source/build identity limitations,
+initial readiness calibration and every controller decision from stream start.
+Per-column deltas reduce fixture size. No machine names, network addresses,
+access tokens or user configuration files are retained.
+
+The test runs the real `VrrTimingController`, first checking all historical
+revision-1 buffer states to validate pre-roll and chunk boundaries. Its progress
+assertions are behavioral: qualified clean feedback must permit a finite lower
+trial, with no 10-second local freeze. It also reports shorter rolling windows
+without changing the 99.5-percent/120-second control profile. Recorded submission
+feedback is distinct from a closed-loop fake presenter and from physical scanout.
+The initial recorded presentation-starvation episode remains a separate issue.
+
+Regenerate only from the same full source capture, after a successful exact and
+sequence-integrity gate:
+
+```sh
+python3 scripts/decode-vrr-trace.py /path/to/source.vrrtrace /tmp/source.csv
+python3 tests/vrr/make_input_trace_fixture.py /path/to/source.vrrtrace /tmp/source.csv tests/vrr/fixtures/buffer-drain-20261017.json.qz
+```
+
+Stable-adaptation revision 2 retains historical revision 1, allows finite
+feedback-qualified trials below a raw-input plateau, and preserves configured ordinary
+release for measured surplus. Config snapshots accept 0--2 and reject 3. The
+configured probability/history and observed coverage accounting remain unchanged.
+
+The independent progress audit is deliberately separate from the buffer gate:
+
+```sh
+tst_inputtracechunks tests/vrr/fixtures/buffer-drain-20261017.json.qz --require-recorded-progress
+```
+
+It currently exits 1 for the known startup episode. It requires nearly a full
+one-second span with at least eight distinct fresh decoder outputs and no
+presentation; an idle source or a raw long submission interval alone cannot
+trigger it. These are recorded outcomes, not candidate worker output. Existing
+worker tests exercise fake-presenter progress separately. The buffer change does
+not claim to fix the startup estimate/stale-discard loop.

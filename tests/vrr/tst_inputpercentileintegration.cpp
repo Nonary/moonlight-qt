@@ -359,6 +359,68 @@ void testStableTargetKeepsPreventableMissScoring() {
     observe(up,1,9000);up.transitionFrom(1000);
     check(up.stats().currentUs==6000,"larger learned layers still restore their existing protection immediately");
 }
+// Revision 2 restores progress without turning a clean raw-input plateau into
+// an unrestricted release ramp. Existing revision-1 expectations stay above.
+void testFeedbackValidatedStableRelease() {
+    const auto observe=[](InputPercentileBuffer& p,uint64_t f,int64_t required,
+                          bool hitch=false,bool valid=true,uint64_t room=1000) {
+        p.observe(f,1000000+f*10000,2000000+f*10000,required,valid,
+            1000,12000,995000,120000000,1000,250,0,500,room,0,hitch,10);
+    };
+    InputPercentileBuffer trial;trial.reset(8621);trial.setStableAdaptation(2);
+    for(uint64_t f=1;f<=200;++f) observe(trial,f,11000);
+    check(trial.stats().currentUs==8521 && trial.stats().missed==0,
+          "a clean raw-input plateau permits one finite 100 us trial, not a continuous drain");
+    const auto held=trial.stats().currentUs;
+    for(uint64_t f=201;f<=500;++f) observe(trial,f,11000,false,false);
+    check(trial.stats().currentUs==held && trial.stats().eligible==200,
+          "invalid outcomes cannot fund the tail support needed for another trial");
+    for(uint64_t f=501;f<=800;++f) observe(trial,f,11000);
+    check(trial.stats().currentUs<held && trial.stats().currentUs>=held-200,
+          "fresh feedback at the lower buffer permits another bounded trial");
+    const auto before=trial.stats();
+    observe(trial,801,11000,true);
+    check(trial.stats().missed==before.missed+1 && trial.stats().currentUs>=before.currentUs &&
+          trial.stats().currentUs<=before.currentUs+10,
+          "a fresh preventable hitch cancels release and retains normal bounded growth");
+    check(trial.stats().probabilityPpm==995000 && trial.stats().windowUs==120000000,
+          "feedback trials preserve the selected smoothness target and full learning window");
+    InputPercentileBuffer measured,recorded,noRoom;
+    measured.reset(8621);measured.setStableAdaptation(2);
+    recorded.reset(8621);recorded.setStableAdaptation(1);
+    noRoom.reset(8621);noRoom.setStableAdaptation(2);
+    uint64_t previous=8621;
+    for(uint64_t f=1;f<=250;++f) {
+        observe(measured,f,1500);observe(recorded,f,1500);observe(noRoom,f,9500,false,true,0);
+        const auto now=measured.stats().currentUs;
+        check(now<=previous && previous-now<=50,
+              "measured surplus obeys the normal 0.5-percent-per-interval recovery bound");
+        previous=now;
+        if(f==100) {
+            const auto saved=now;
+            auto delayed=measured;delayed.advance(2010000);delayed.advance(2020000);
+            check(saved-delayed.stats().currentUs<=50,
+                  "repeated decisions cannot spend the same interval allowance twice");
+        }
+    }
+    check(measured.stats().currentUs==recorded.stats().currentUs && recorded.stats().currentUs>7900,
+          "ordinary measured-surplus release remains identical to the configured 250 us/s historical law");
+    check(noRoom.stats().currentUs==8621,
+          "a plateau without physical recovery room cannot authorize speculative release");
+    // An interrupted lower-layer visit must save its own learned destination.
+    InputPercentileBuffer lower;lower.reset(1000);lower.setStableAdaptation(2);
+    // Support the selected tail with this layer's own low requirements first.
+    observe(lower,1,9500);
+    for(uint64_t f=2;f<=201;++f) observe(lower,f,1500);
+    lower.transitionFrom(8621);
+    for(uint64_t f=202;f<=301;++f) observe(lower,f,1500);
+    check(lower.stats().currentUs==8371,
+          "a lower layer retains the configured normal drain before storing its own learned destination");
+    lower.prepareForLayerStorage();
+    check(lower.stats().currentUs==1000 && lower.stats().targetUs==1000,
+          "a layer cache cannot turn inherited excess into a permanent learned floor");
+}
+
 void testSharedExtraBufferAllowance() {
     for(const uint64_t tolerance : {250,500,2000}) {
         Vrr13::ExtraBufferSlew slew;
@@ -1050,14 +1112,14 @@ void testOrdinaryVariationKeepsLayer() {
     }
 }
 
-void testFastControllerLayerRoundTrip(uint64_t version, bool bounded=false) {
+void testFastControllerLayerRoundTrip(uint64_t version, bool bounded=false, uint64_t stableRevision=1) {
     VrrSessionConfig session;session.streamRateHz=120;session.displayRefreshHz=120;
     session.latencyMode=1;session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=1;
     session.experimentalBoundedCatchup=bounded;
     session.timingOptions={1000,9950,120,500};
     auto policy=vrrTimingParametersForSession(session);
     policy.latencyFixEnabled=0;
-    policy.playoutInputHitchMissesOnly=version;policy.playoutInputStableAdaptation=version>=10;
+    policy.playoutInputHitchMissesOnly=version;policy.playoutInputStableAdaptation=version>=10?stableRevision:0;
     policy.playoutDelayStartSeedUs=4000;policy.playoutDelayMinimumUs=1000;
     policy.playoutDelayMaximumUs=12000;
     policy.playoutDelayMaximumPeriodPerMille=policy.playoutDelayCapSourcePeriodPerMille=0;
@@ -1217,7 +1279,7 @@ void testActualControllerRequiresAnInputHitch() {
     session.latencyMode=1;session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=1;
     session.timingOptions={1000,9950,10,500};
     auto base=vrrTimingParametersForSession(session);
-    check(base.playoutInputHitchMissesOnly==10 && base.playoutInputStableAdaptation==1,"production keeps preventable-miss scoring with stable target adaptation");
+    check(base.playoutInputHitchMissesOnly==10 && base.playoutInputStableAdaptation==2,"production keeps preventable-miss scoring with stable target adaptation");
     base.playoutDelayStartSeedUs=1000;base.playoutDelayMinimumUs=1000;base.playoutDelayMaximumUs=6000;
     base.playoutDelayMaximumPeriodPerMille=base.playoutDelayCapSourcePeriodPerMille=0;
     base.playoutInputLearningTrim=0;
@@ -1402,6 +1464,7 @@ int main() {
     testAsymmetricLayerBufferMovement();
     testNormalDrainAfterLayerRework();
     testStableTargetKeepsPreventableMissScoring();
+    testFeedbackValidatedStableRelease();
     testSharedExtraBufferAllowance();
     testOnlyPreventableHitchesScoreAndGrow();
     testAppliedProtectionFollowsClockCoordinate();
@@ -1419,6 +1482,7 @@ int main() {
     testFastControllerLayerRoundTrip(8,true);
     testFastControllerLayerRoundTrip(9);testFastControllerLayerRoundTrip(9,true);
     testFastControllerLayerRoundTrip(10);testFastControllerLayerRoundTrip(10,true);
+    testFastControllerLayerRoundTrip(10,false,2);testFastControllerLayerRoundTrip(10,true,2);
     testOrdinaryVariationKeepsLayer();
     testRateBaselineStepIsNotClockDrift();
     testActualControllerInputMissReleaseFeedbackApi();
