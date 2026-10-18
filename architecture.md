@@ -1,3 +1,82 @@
+Timing summary correction (2026-10-18, source baseline `fbbfd11f`):
+the normal summary now shows Client timing (CPU) and input coverage separately.
+The profile goal labels the severity-weighted CPU submission interval score;
+binary input coverage has no percentage goal label. The active goal solver
+models that interval score, not a count of covered inputs. An input can cross
+its buffer deadline yet be presented smoothly through bounded recovery; it is
+not a lost frame. Graph captions and detailed session logs use the same
+separation. No counters, exclusions, controller feedback or pacing change.
+The completed 16:37:36 session ended with 95.92% input coverage over 60 seconds
+(284 misses / 6960 eligible) and 98.73% Client timing against a 99% goal.
+These CPU/input metrics are separate from OS display feedback and optical
+smoothness. The user reports the current stream is improved; that observation
+is not a controlled optical comparison.
+
+Raw Wayland feedback diagnostics (2026-10-18, source baseline `fbbfd11f`):
+when the independent GPU trace is enabled, `PlVkRenderer::presentFrame()` now
+records every polled Wayland outcome before the existing controller filter.
+Events are `wayland_presented`, `wayland_discarded`, `wayland_reset`, and
+`wayland_unavailable`. `object_id` is the original presentation request ID;
+RTP/output fields are intentionally unknown, so join against the GPU `present`
+event's object ID rather than the current frame. `begin_us` is the converted
+reported display time (zero when unavailable), `end_us` is callback observation
+time; this pair is not a CPU operation duration. Columns a/b/c/d/e are refresh
+sequence, flags, refresh interval in ns, uncertainty in ns, and quality enum.
+`detail` records the existing filter reason. Existing feedback selection,
+presentation mode, clock checks, and all pacing/controller inputs are unchanged.
+Missing usable feedback identities alone cannot distinguish discarded frames
+from rejected timestamps; the new records retain that distinction. OS feedback
+still does not establish optical scanout.
+
+Queued recovery ceiling correction (2026-10-18, source baseline `fbbfd11f`):
+new worker sessions select `latched_floor_disabled=2`. Revision 1 removed the
+ordinary CPU-enqueue spacing floor for protected queue presents, but bounded
+PhaseTrajectory independently reintroduced that floor from the previous actual
+enqueue. Variable scheduler overshoot therefore became persistent recovery
+and could bypass the configured 4 ms / half-source-period intentional carry
+limit. Revision 2 caps that duplicate floor at the configured intentional carry
+ceiling only when the presenter can latch, the frame selects protected
+presentation, and no native future deadline is in use. The native queue owns
+display spacing; bounded recovery keeps its cadence regularization. Immediate presentation and
+native scheduled display deadlines retain their existing physical floors.
+Older captures with revision 0/1 replay unchanged. The calibration identity
+includes the revision. Live input was ~1 ms while recovery reached 6–7 ms;
+this supersedes earlier claims that the recovery cap bounded that path.
+
+Producer-clock collection correction (2026-10-18, source baseline `fbbfd11f`):
+new normalized-clock sessions record `normalized_source_intrinsic_decode_gpu=1`.
+The producer mapping uses GPU durations from frames whose completion collection
+began within 1 ms of decoder output. A later collection is an upper bound that
+can include our own pacing-queue residence, even when the API call takes more
+than 200 us. Such samples still appear in raw diagnostics but cannot advance
+the source clock. Until a prompt sample qualifies, immutable decoder output
+anchors the clock; the real readiness floor still waits for completion. A
+promptly observed genuinely long GPU decode retains its full service duration.
+The input estimator already uses this prompt-sample basis. Historical captures
+omitting the field retain the previous transform and replay unchanged. The
+calibration identity includes this revision. This addresses premature queue
+expiry caused by an artificially future source clock; age/capacity overload
+protection is retained. A live full-buffer capture showed queued images being
+expired before their mapped deadlines. Evidence and validation are in
+`build/vrr18-regression-20261018/`; fresh live behavior remains to be verified.
+
+VRR18 worker-smoothing restoration (2026-10-18, source baseline `fbbfd11f`):
+ordinary worker-paced Reduce judder selects the phase-locked revision-2
+smoother again (6 ms maximum lag, learned reserve up to 3 ms, established
+phase reset law). New sessions record `playout_smoothing_own_movement=1`.
+Smoothing follows its own bounded retiming law instead of the input policy's
+shared T/second movement budget. With T=500 us, that budget allowed only about
+4 us per 120 Hz frame and effectively suppressed source-cadence regularization.
+The ordinary revision-4 tolerance-only policy introduced after VRR18 is no
+longer selected for worker pacing. Native future-target sessions retain their
+revision-4 bounds; opt-in Absorb retains revision 7 and its fixed pad.
+Input sizing, packet-loss exclusions, buffer/queue caps, physical readiness,
+scanout floors and bounded catch-up remain separate. Calibration identity
+includes movement ownership. Captures omitting the new field default to zero
+and retain historical timing. This supersedes older ordinary-smoothing policy
+descriptions below. Replay and deterministic results are recorded in
+`tests/vrr/README.md`; physical smoothness requires a fresh live comparison.
+
 Client-timing goal solver (2026-10-17, source baseline `7d1148f9`): new
 adaptive sessions select `playout_input_goal_lambda` and replace the input
 readiness quantile with `InputGoalSolver` (`inputgoalbuffer.h`). Each 500 ms
@@ -6,9 +85,11 @@ pairs from the recent span, scores each interval like the Client timing
 severity score (loss min(1, (|error| - tolerance) / intended) of its duration)
 and takes the smallest 250 us grid buffer whose loss is within 70% of the
 profile's allowed loss. Only network and decode readiness count as lateness.
-When no buffer up to the cap meets the goal, it takes the global argmax of
-score minus a per-millisecond price (0.5, 0.3 and 0.1 percentage points for
-99%, 99.5% and 99.9%+), so an unreachable goal does not pin the cap. Spans are
+New sessions set `playout_input_goal_unpriced=1`: when no buffer up to the
+cap meets the goal, choose the best achievable timing score, preferring the
+smallest buffer on ties. The latency-price fallback is disabled for production;
+older captures default this flag to zero and retain their recorded price for
+exact replay. Existing buffer caps and rise/fall rates remain. Spans are
 20/60/120 s for those goals; the buffer rises 4 ms/s and falls 1 ms/s.
 `playout_input_intrinsic_decode_gpu=1` bounds decode readiness at decoder
 output plus the median GPU decode time of frames collected within 1 ms of
@@ -18,6 +99,25 @@ allowance is two source frames instead of four (preset revision 4 migrates the
 exact revision-3 tuples). `VrrSessionConfig::inputGoalSolver=false` selects
 the historical quantile policy; captures without the new fields replay
 unchanged.
+
+Preparation prediction progress (2026-10-17, source baseline `7d1148f9`):
+new sessions select `preparation_prediction_lead=1`. Render-start scheduling
+reserves at least the same typical CPU preparation cost that target construction
+adds. The GPU readiness lead remains bounded to one source period; the measured
+CPU preparation prediction may exceed that bound. Preparation-on-arrival can
+still spend the existing playout delay. Presentation targets, physical spacing
+floors, stale admission checks, source ownership and buffer adaptation are unchanged.
+
+Previously a lone 29--45 ms startup sample moved the target forward by its full
+cost while render start subtracted at most one source period plus playout delay.
+The worker deliberately waited, rejected the now-stale image before rendering,
+and never collected a replacement preparation sample. Reserving the predicted
+cost starts preparation early enough to let learning and presentation progress.
+The full measured cost remains available to overload/capacity policy; it is not
+clipped or replaced with an invented fast sample. This addresses the observed
+client loop, not the unresolved driver/setup cost that triggered it. Historical
+captures without the parameter select zero and retain the old scheduling law.
+Software regressions and live-validation status are recorded in tests/vrr/README.md.
 
 Stable input adaptation (2026-10-17, based on `181415ec`): new adaptive
 sessions retain input-hitch scoring policy 10 and additionally select

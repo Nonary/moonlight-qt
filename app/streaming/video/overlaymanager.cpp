@@ -328,7 +328,7 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
         std::snprintf(caption, sizeof(caption), "Tolerance %.2f ms | Dashed buffer + tolerance %.2f ms",
             latestPoint.inputToleranceUs / 1000.0, latestInput.bufferLimitUs / 1000.0);
         label(caption, left, height - S(140), labelColor);
-        std::snprintf(caption, sizeof(caption), "Coverage target %.2f%% / %llu s | Pacing carry %.2f ms",
+        std::snprintf(caption, sizeof(caption), "Profile goal %.2f%% / %llu s | Pacing carry %.2f ms",
             latestPoint.inputProbabilityPpm / 10000.0,
             static_cast<unsigned long long>(latestPoint.inputWindowUs / 1000000),
             latestPoint.trajectoryCarryUs / 1000.0);
@@ -338,7 +338,7 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
             std::snprintf(coverage, sizeof(coverage), "%.2f%%",
                 100.0 * (latestPoint.inputSamples - std::min(latestPoint.inputSamples, latestPoint.inputMissed)) / latestPoint.inputSamples);
         else std::snprintf(coverage, sizeof(coverage), "N/A");
-        std::snprintf(caption, sizeof(caption), "Coverage (%llus) %s | frames %llu | absorbed %llu | misses %llu",
+        std::snprintf(caption, sizeof(caption), "Input coverage (%llus) %s | frames %llu | absorbed %llu | misses %llu",
             static_cast<unsigned long long>((latestPoint.inputCoverageWindowUs ?
                 latestPoint.inputCoverageWindowUs : latestPoint.inputWindowUs) / 1000000), coverage,
             static_cast<unsigned long long>(latestPoint.inputSamples),

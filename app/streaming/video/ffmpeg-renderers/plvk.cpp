@@ -2422,6 +2422,35 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& reques
         // Return the oldest usable completion; subsequent submissions drain
         // delayed feedback in order without collapsing intervals.
         while (m_PresentationFeedback->poll(sample)) {
+            // Keep every native outcome in the independent GPU trace before
+            // filtering it for controller use. Otherwise missing identities
+            // cannot distinguish discarded images from rejected timestamps.
+            if (m_GpuTrace) {
+                const char* event = "wayland_unavailable";
+                const char* reason = "unavailable";
+                switch (sample.outcome) {
+                case Vrr13::Outcome::Presented:
+                    event = "wayland_presented";
+                    reason = sample.presented <= 0 || sample.presented > sample.observed ?
+                        "invalid_timestamp" :
+                        sample.observed - sample.presented > 100 * Vrr13::Millisecond ?
+                        "stale" : sample.uncertainty > 500000 ? "uncertain" : "accepted";
+                    break;
+                case Vrr13::Outcome::Discarded:
+                    event = "wayland_discarded"; reason = "discarded"; break;
+                case Vrr13::Outcome::Reset:
+                    event = "wayland_reset"; reason = "clock_or_output_reset"; break;
+                case Vrr13::Outcome::Unavailable:
+                    break;
+                }
+                GpuTrace::Row row{event, -1, 0,
+                    sample.presented > 0 ? uint64_t(sample.presented / 1000) : 0,
+                    sample.observed > 0 ? uint64_t(sample.observed / 1000) : 0,
+                    sample.id, int64_t(sample.sequence), int64_t(sample.flags),
+                    int64_t(sample.refresh), sample.uncertainty, int64_t(sample.quality)};
+                SDL_strlcpy(row.detail, reason, sizeof(row.detail));
+                m_GpuTrace->record(row);
+            }
             if (sample.outcome != Vrr13::Outcome::Presented ||
                 sample.presented <= 0 || sample.presented > sample.observed ||
                 sample.observed - sample.presented > 100 * Vrr13::Millisecond ||

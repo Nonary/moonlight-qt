@@ -21,21 +21,21 @@ int main(int argc, char** argv)
     s.present.intervals = 3300; s.present.misses = 33; s.present.hitches = 1; s.present.worstAddedUs = 4200;
     s.present.lastObservedUs = s.nowUs = 10000000;
     auto text = formatVrr(s);
-    // Each current value shares one line with its target.
-    assert(has(text, "VRR buffer: 5.70 ms (target 5.42) | coverage 99.95% / 99.95% target\n"));
+    // Only the CPU interval score shares a line with the profile timing goal.
+    assert(has(text, "VRR buffer: 5.70 ms (target 5.42) | Client timing (CPU): collecting / 99.95% target\nInput coverage: 99.95%\n"));
     assert(has(text, "Present timing issues (30s): 1.00% >0.50 ms | hitches 1 | worst +4.2 ms\n"));
     assert(has(text, "Extra delay: 0.00 ms (smoothing/recovery) | Planned total: 5.70 ms\n"));
-    assert(std::count(text.begin(), text.end(), '\n') == 3);
+    assert(std::count(text.begin(), text.end(), '\n') == 4);
     if (argc > 1 && std::string(argv[1]) == "--fixture") { std::cout << text; return 0; }
 
     // A short reporting window responds independently of the profile history.
     s.input.reportingWindowUs=10000000;s.input.reportingEligible=1000;
     s.input.reportingMissed=0;
-    assert(has(formatVrr(s), "coverage (10s) 100.00% / 99.95% | 300s 99.95%"));
+    assert(has(formatVrr(s), "Input coverage (10s): 100.00% | 300s 99.95%"));
     s.input.reportingMissed=2;
-    assert(has(formatVrr(s), "coverage (10s) 99.80% / 99.95% | 300s 99.95%"));
+    assert(has(formatVrr(s), "Input coverage (10s): 99.80% | 300s 99.95%"));
     s.input.reportingEligible=0;
-    assert(has(formatVrr(s), "coverage (10s) N/A / 99.95% | 300s 99.95%"));
+    assert(has(formatVrr(s), "Input coverage (10s): N/A | 300s 99.95%"));
     s.input.reportingWindowUs=0;
 
     // A legitimate measured zero differs from missing or stale feedback.
@@ -62,14 +62,25 @@ int main(int argc, char** argv)
     s.bufferUs = 5700;
     s.smoothingUs = 0;
     s.input.recentEligible = 0;
-    assert(has(formatVrr(s), "| coverage N/A / 99.95% target\n"));
+    assert(has(formatVrr(s), "Input coverage: N/A\n"));
     s.atLimit = true;
     assert(has(formatVrr(s), "VRR buffer: 5.70 ms at limit (target 5.42 learning) | "));
-    // Revision-12 buffer: the client timing score takes coverage's place.
+    // The CPU interval score remains visible without adaptive input coverage.
     s.adaptive = false; s.atLimit = false;
-    assert(has(formatVrr(s), "VRR buffer: 5.70 ms | client timing collecting / 99.95% target\n"));
+    assert(has(formatVrr(s), "VRR buffer: 5.70 ms | Client timing (CPU): collecting / 99.95% target\n"));
     s.clientTimingValid = true; s.clientTimingPercent = 99.53;
-    assert(has(formatVrr(s), "VRR buffer: 5.70 ms | client timing 99.53% / 99.95% target\n"));
+    assert(has(formatVrr(s), "VRR buffer: 5.70 ms | Client timing (CPU): 99.53% / 99.95% target\n"));
+    assert(!has(formatVrr(s), "Input coverage"));
+    const auto nonadaptive = formatVrr(s);
+    assert(std::count(nonadaptive.begin(), nonadaptive.end(), '\n') == 3);
+    // Completed live run: binary coverage and weighted timing legitimately diverge.
+    s.adaptive = true; s.targetPpm = 990000;
+    s.clientTimingPercent = 98.73;
+    s.input.recentEligible = 6960; s.input.recentMissed = 284;
+    const auto divergent = formatVrr(s);
+    assert(has(divergent, "Client timing (CPU): 98.73% / 99.00% target\n"));
+    assert(has(divergent, "Input coverage: 95.92%\n"));
+    assert(!has(divergent, "95.92% / 99.00%"));
     s.vrr = false;
     assert(formatVrr(s) == "VRR pacing: inactive\n");
 

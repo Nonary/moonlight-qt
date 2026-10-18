@@ -63,6 +63,8 @@
     /* Nonzero: client-timing goal solver; thousandths of a percentage point */ \
     /* of score each further millisecond must recover when the goal is unreachable. */ \
     X(uint64_t, playout_input_goal_lambda, playoutInputGoalLambda, 0) \
+    /* Ignore the historical latency price when choosing an unreachable goal. */ \
+    X(uint64_t, playout_input_goal_unpriced, playoutInputGoalUnpriced, 0) \
     X(uint64_t, playout_input_goal_window_us, playoutInputGoalWindowUs, 0) \
     /* Share of the goal's allowed loss the solver aims for; 0 aims at the goal. */ \
     X(uint64_t, playout_input_goal_tail_per_mille, playoutInputGoalTailPerMille, 0) \
@@ -287,6 +289,7 @@
     X(uint64_t, loose_headroom_display_periods, looseHeadroomDisplayPeriods, 2) \
     X(uint64_t, base_guard_divisor, baseGuardDivisor, 96) \
     X(uint64_t, preparation_initial_sample_excluded, preparationInitialSampleExcluded, 0) \
+    X(uint64_t, preparation_prediction_lead, preparationPredictionLead, 0) \
     X(uint64_t, playout_delay_start_seed_us, playoutDelayStartSeedUs, 0) \
     X(uint64_t, playout_epoch_rate_ratio_per_mille, playoutEpochRateRatioPerMille, 0) \
     X(uint64_t, playout_epoch_sustain_us, playoutEpochSustainUs, 0) \
@@ -294,7 +297,11 @@
     X(uint64_t, playout_epoch_confirm_us, playoutEpochConfirmUs, 0) \
     X(uint64_t, playout_smoothing_readiness_bound, playoutSmoothingReadinessBound, 0) \
     /* Native future deadlines use the logical display clock, not CPU enqueue. */ \
-    X(uint64_t, native_scheduled_presentation, nativeScheduledPresentation, 0)
+    X(uint64_t, native_scheduled_presentation, nativeScheduledPresentation, 0) \
+    /* Worker-paced smoothing uses its own bounded retiming law, not T/second. */ \
+    X(uint64_t, playout_smoothing_own_movement, playoutSmoothingOwnMovement, 0) \
+    /* Producer-clock GPU service is learned only from prompt collection. */ \
+    X(uint64_t, normalized_source_intrinsic_decode_gpu, normalizedSourceIntrinsicDecodeGpu, 0)
 
 // Every value that changes VRR policy remains replaceable by replay without
 // rebuilding the controller. Production callers use these defaults.

@@ -79,10 +79,11 @@ public:
     void setStableAdaptation(bool stable) { m_StableAdaptation = stable; }
     // Nonzero lambda selects the client-timing goal solver: the target is the
     // smallest buffer meeting the goal over the last windowUs of inputs, or
-    // the best trade at `lambda` when the goal is out of reach. The solver aims
+    // the best achievable score when unpriced (historical captures use lambda). It aims
     // at tailPerMille of the goal's allowed loss, so reacting after a window
     // dips still leaves the session at the goal.
-    void setGoalSolver(uint64_t lambda, uint64_t windowUs, uint64_t tailPerMille = 1000) {
+    void setGoalSolver(uint64_t lambda, uint64_t windowUs, uint64_t tailPerMille = 1000, bool unpriced = false) {
+        m_GoalUnpriced = unpriced;
         m_GoalLambda = lambda; m_GoalWindowUs = windowUs; m_GoalTailPerMille = std::clamp<uint64_t>(tailPerMille, 1, 1000);
     }
     // While learning, ignore the largest `trim` requirements so one startup
@@ -752,7 +753,7 @@ private:
         m_Learning = false;
         const uint64_t aimPpm = 1000000 - (1000000 - m_Stats.probabilityPpm) * m_GoalTailPerMille / 1000;
         const auto solution = m_GoalSolver.solve(aimPpm, m_Stats.toleranceUs, m_GoalLambda,
-            m_Stats.minimumUs, m_Stats.maximumUs, GoalStepUs);
+            m_Stats.minimumUs, m_Stats.maximumUs, GoalStepUs, m_GoalUnpriced);
         m_Stats.headroomTargetUnclippedUs = solution.bufferUs;
         m_Stats.clipped = !solution.goalReachable;
         m_Stats.targetUs = std::clamp(solution.bufferUs, m_Stats.minimumUs, m_Stats.maximumUs);
@@ -843,6 +844,7 @@ private:
     static constexpr uint64_t GoalMinimumCoverageUs = 1000000;
     static constexpr uint64_t GoalStepUs = 250;
     uint64_t m_GoalLambda = 0, m_GoalWindowUs = 0, m_GoalTailPerMille = 1000;
+    bool m_GoalUnpriced = false;
     InputGoalSolver m_GoalSolver;
     Stats m_Stats;
     uint64_t m_FirstObservationUs = 0, m_LastObservationUs = 0, m_LastEligibleUs = 0;

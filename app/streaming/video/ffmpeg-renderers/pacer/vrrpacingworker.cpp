@@ -44,10 +44,9 @@ VrrSessionConfig experimentalInputConfig(VrrSessionConfig config)
     if (config.inputGoalSolver) {
         const auto target = config.experimentalInputPercentilePpm;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "Adaptive buffer: client-timing goal %.2f%% (network and decode jitter only); least buffer meeting it over the last %llu s, aiming at 70%% of the allowed loss; beyond reach each ms must recover %.1f points; rise 4 ms/s, fall 1 ms/s; history %llu s",
+            "Adaptive buffer: client-timing goal %.2f%% (network and decode jitter only); least buffer meeting it over the last %llu s, aiming at 70%% of the allowed loss; beyond reach maximize timing quality within the buffer cap; rise 4 ms/s, fall 1 ms/s; history %llu s",
             target / 10000.0,
             static_cast<unsigned long long>(target >= 999000 ? 120 : target >= 995000 ? 60 : 20),
-            target >= 999000 ? 0.1 : target >= 995000 ? 0.3 : 0.5,
             static_cast<unsigned long long>(config.experimentalInputPercentileWindowUs / 1000000));
     }
     else SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,

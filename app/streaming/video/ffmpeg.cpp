@@ -1508,7 +1508,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 reason = "Shrinking - experimental input percentile needs less headroom";
                 break;
             case Action::InputPercentileHold:
-                reason = "Steady - profile input percentile met";
+                reason = "Steady - learned input target met";
                 break;
             case Action::InputPercentileBackoff:
                 reason = "Shrinking slowly - recent input misses exceed profile allowance";
@@ -1565,7 +1565,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             if (interval.inputPercentileEnabled) {
                 const auto& input = interval.inputPercentile;
                 ret = snprintf(&output[offset], length - offset,
-                    "Adaptive buffer | profile %.2f%% frame-coverage percentile | target %.2f ms | %llu samples / %llu s%s%s\n"
+                    "Adaptive input buffer | profile %.2f%% | target %.2f ms | %llu samples / %llu s%s%s\n"
                     "Window measured frames %llu | absorbed %llu | missed %llu | interval severity score distinct\n"
                     "Frame lateness %.2f ms | buffer target %.2f ms | tolerance %.2f ms | growth %s\n"
                     "Release %.1f us/s | last-second inputs %llu / misses %llu | proposed misses %llu\n"
@@ -1642,7 +1642,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 else snprintf(presentTiming, sizeof(presentTiming), "unavailable");
                 if (advancedStats) {
                     ret = snprintf(&output[offset], length - offset,
-                        "Client timing: %s (target %.2f%%)\n"
+                        "Client timing (CPU submissions): %s (target %.2f%%)\n"
                         "Scored time: %.1fs / %s history (gaps excluded)\n"
                         "Timing error (1s avg): %s | Allowed: %.2f ms | Drops (30s): %llu\n"
                         "Present timing issues (30s): %s\n",
@@ -1655,7 +1655,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 }
                 else {
                     ret = snprintf(&output[offset], length - offset,
-                        "VRR pacing: %s | Client timing: %s / %.2f%% target%s\n"
+                        "VRR pacing: %s | Client timing (CPU submissions): %s / %.2f%% target%s\n"
                         "Scored time: %.1fs / %s history (gaps excluded)\n"
                         "Client interval error (1s): %s | Tolerance: %.2f ms | Dropped (30s): %llu\n"
                         "Present timing issues (30s): %s\n",

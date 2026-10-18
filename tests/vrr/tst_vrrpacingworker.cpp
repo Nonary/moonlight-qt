@@ -152,6 +152,81 @@ PacedFrame frame(int number, TrackedFrameLifetime& lifetime)
                                  lifetime);
 }
 
+class ResumePreparationPresenter : public FakeVrrFramePresenter {
+public:
+    explicit ResumePreparationPresenter(uint64_t poison, uint64_t steady = 400) :
+        poisonUs(poison), steadyUs(steady) {}
+    VrrPrepareResult prepareFrame(AVFrame* input, uint64_t boundary,
+                                  const VrrPresentRequest& request) override
+    {
+        const unsigned count = ++preparations;
+        const auto cost = count == 1 ? 400000 : count == 2 ? 400 : count == 3 ? poisonUs : steadyUs;
+        std::this_thread::sleep_for(std::chrono::microseconds(cost));
+        setPresentCancelled(count == 2);
+        return FakeVrrFramePresenter::prepareFrame(input, boundary, request);
+    }
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        auto result = FakeVrrFramePresenter::presentAdaptive(request);
+        if (result.presented && !result.cancelled) {
+            std::lock_guard<std::mutex> lock(progressLock);
+            normalPresentations.push_back(result.submissionTimeUs);
+        }
+        return result;
+    }
+    const uint64_t poisonUs;
+    const uint64_t steadyUs;
+    std::atomic_uint preparations {0};
+    std::mutex progressLock;
+    std::vector<uint64_t> normalPresentations;
+};
+
+void testResumePreparationKeepsWorkerPresenting()
+{
+    for (const uint64_t poisonUs : {29081u, 42248u, 45002u, 40000u}) {
+        resetFakeClock();
+        const bool overload = poisonUs == 40000;
+        ResumePreparationPresenter backend(poisonUs, overload ? 40000 : 400);
+        auto config = enabledConfig();
+        config.streamRateHz = 116;
+        config.latencyMode = 1;
+        PacerTelemetry telemetry;
+        constexpr int count = 160;
+        TrackedFrameLifetime lifetime[count];
+        {
+            VrrPacingWorker worker(&backend, config, &telemetry);
+            expect(worker.start(), "resume preparation worker must start");
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < count; ++i) {
+                const uint32_t ticks = uint32_t(uint64_t(i) * 90000 / 116);
+                std::this_thread::sleep_until(start +
+                    std::chrono::microseconds(uint64_t(ticks) * 100 / 9));
+                worker.submit(makeTrackedPacedFrame(i + 1, ticks, LiGetMicroseconds(), lifetime[i]));
+            }
+            // Inspect before the source stops supplying successors: otherwise
+            // hasQueuedFrame()==false alone can accidentally rescue the bug.
+            std::lock_guard<std::mutex> lock(backend.progressLock);
+            expect(backend.normalPresentations.size() >= (overload ? 8u : 40u),
+                   "the real worker must keep presenting while 116 FPS successors continue arriving");
+            if (backend.normalPresentations.size() >= 3) {
+                expect(backend.normalPresentations[2] - backend.normalPresentations[1] <= 250000,
+                       "the real worker must recover within 250 ms of the poisoned preparation");
+                uint64_t worstGapUs = 0;
+                for (size_t i = 1; i < backend.normalPresentations.size(); ++i)
+                    worstGapUs = std::max(worstGapUs,
+                        backend.normalPresentations[i] - backend.normalPresentations[i - 1]);
+                expect(worstGapUs <= 250000,
+                       "recurrent loss of worker presentation progress must fail even if average throughput passes");
+            }
+        }
+        if (overload)
+            expect(telemetryStats(telemetry).vrrPacingDroppedFrames > 0,
+                   "sustained real overload must continue shedding work while presenting");
+        for (const auto& item : lifetime)
+            expect(item.releases == 1, "resume recovery must release each admitted or shed image exactly once");
+    }
+}
+
 class PreparedFramePresenter : public FakeVrrFramePresenter {
 public:
     struct Ticket : VrrPreparedFrame {
@@ -868,6 +943,16 @@ void runLatencyFixQueuedRecovery(int streamRateHz, bool enabled,
         expect(backend.waitForPrepareCount(2),
                "a retained successor must reach preparation after the first present");
         const std::vector<int> prepared = backend.preparedFrames();
+        if (prepared.size() != 2 || prepared[0] != 1 || prepared[1] != (replaceQueued ? 3 : 2)) {
+            const auto stats = telemetryStats(telemetry);
+            const auto points = telemetry.timingGraphSnapshot().points;
+            std::fprintf(stderr, "queue boundary: rate=%d mode=%d fix=%d age=%u expectedReplace=%d prepared=%d buffer=%llu carry=%llu extra=%llu\n",
+                         streamRateHz, latencyMode, enabled, agePerMille, replaceQueued,
+                         prepared.size() > 1 ? prepared[1] : -1,
+                         (unsigned long long)stats.vrrAppliedBufferUs,
+                         (unsigned long long)(points.empty() ? 0 : points.back().trajectoryCarryUs),
+                         (unsigned long long)stats.vrrAppliedSmoothingUs);
+        }
         expect(prepared.size() == 2 && prepared[0] == 1 &&
                    prepared[1] == (replaceQueued ? 3 : 2),
                "the selected latency policy must control stale replacement before preparation");
@@ -897,8 +982,11 @@ void testLatencyFixQueuedRecovery()
 {
     runLatencyFixQueuedRecovery(120, true, true);
     runLatencyFixQueuedRecovery(116, true, true);
-    runLatencyFixQueuedRecovery(120, true, true, 2500);
-    runLatencyFixQueuedRecovery(116, true, true, 2500);
+    // Admission protects learned input delay plus up to one source period
+    // of retained recovery. At 2.5 periods this fixture can be exactly on
+    // that protected boundary; use genuine overload beyond it instead.
+    runLatencyFixQueuedRecovery(120, true, true, 3500);
+    runLatencyFixQueuedRecovery(116, true, true, 3500);
     runLatencyFixQueuedRecovery(120, false, true);
     runLatencyFixQueuedRecovery(110, true, true);
     runLatencyFixQueuedRecovery(120, true, false);
@@ -3505,7 +3593,8 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
            "captured calibration must restore prior history without inventing fresh successes");
     expect(fields.value(columns.indexOf("param_playout_prediction_only")) == "1" &&
                fields.value(columns.indexOf("param_playout_responsive_buffer")) == "12" &&
-               fields.value(columns.indexOf("param_playout_smoothing_windowed_cadence")) == "4" &&
+               fields.value(columns.indexOf("param_playout_smoothing_windowed_cadence")) == "2" &&
+               fields.value(columns.indexOf("param_playout_smoothing_own_movement")) == "1" &&
                fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "0",
            "capture must identify production interval-quality adaptation for exact replay");
     expect(header.contains("frame_receive_us") &&
@@ -3725,6 +3814,8 @@ void testExperimentalInputPercentileActivationTrace()
     const bool expectedBoundedCatchup = qEnvironmentVariable("MOONLIGHT_VRR_BOUNDED_CATCHUP")!="0";
     for (size_t caseIndex=0;caseIndex<std::size(cases);++caseIndex) {
         resetFakeClock();
+        // Delivery stages precede output even when setup takes <800 us.
+        g_TestClockOffsetUs.store(1000000);
         QTemporaryDir directory;
         expect(directory.isValid(), "adaptive activation trace needs a temporary directory");
         const QString tracePath = directory.filePath("experimental-worker.vrrtrace");
@@ -3745,12 +3836,23 @@ void testExperimentalInputPercentileActivationTrace()
         {
             VrrPacingWorker worker(&backend, config, &telemetry);
             expect(worker.start(), "experimental adaptive worker must start");
+            uint64_t sourceOriginUs = 0;
             for (int i = 0; i < 3; ++i) {
                 if(caseIndex==4 && i>0) g_TestClockOffsetUs.fetch_add(40000);
                 auto input = frame(i + 1, lifetime[i]);
+                if (i == 0) sourceOriginUs = input.decoderOutputUs();
                 input.setDeliveryTimeline(input.decoderOutputUs()-800,input.decoderOutputUs()-600,input.decoderOutputUs()-500);
                 if(caseIndex==4 && i==1) input.setDeliveryTimeline(input.decoderOutputUs()-1000,input.decoderOutputUs()-500,input.decoderOutputUs()-200);
-                if(caseIndex==4 && i==2) input.setDeliveryTimeline(input.decoderOutputUs()-70000,input.decoderOutputUs()-69000,input.decoderOutputUs()-200);
+                if (caseIndex == 4 && i == 2) {
+                    // Network follows the known 60 FPS source slot; decode
+                    // is late. An offset from current output accidentally
+                    // made network late too when worker waits grew longer.
+                    const uint64_t sourceSlotUs = sourceOriginUs + uint64_t(i) * 1000000 / 60;
+                    expect(sourceSlotUs <= input.decoderOutputUs() - 200,
+                           "decode-only fixture must preserve causal delivery ordering");
+                    input.setDeliveryTimeline(sourceSlotUs - 800, sourceSlotUs - 600,
+                                              input.decoderOutputUs() - 200);
+                }
                 worker.submit(std::move(input));
                 expect(backend.waitForPresentCount(size_t(i + 1)),
                        "adaptive activation fixture must present each input");
@@ -4184,6 +4286,12 @@ int main()
     if(qEnvironmentVariable("MOONLIGHT_VRR_TEST_TRAJECTORY_RESERVATION_ONLY")=="1") {
         testTrajectoryReadySuccessorReservation();SDL_Quit();return failures?1:0;
     }
+    if (qEnvironmentVariable("MOONLIGHT_VRR_TEST_RESUME_ONLY") == "1") {
+        testResumePreparationKeepsWorkerPresenting();
+        SDL_Quit();
+        return failures ? 1 : 0;
+    }
+    runNamed("testResumePreparationKeepsWorkerPresenting()", [&] { testResumePreparationKeepsWorkerPresenting(); });
     runNamed("testPreparedFramesOverlapAndTrace()", [&] { testPreparedFramesOverlapAndTrace(); });
     runNamed("testSlowPreparedFramesKeepPresenting()", [&] { testSlowPreparedFramesKeepPresenting(); });
     runNamed("testPreparedFrameCancellationAndBound()", [&] { testPreparedFrameCancellationAndBound(); });

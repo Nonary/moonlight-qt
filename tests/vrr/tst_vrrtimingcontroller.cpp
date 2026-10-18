@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <vector>
@@ -36,11 +37,13 @@ VrrSessionConfig config(int streamRateHz = 60, int displayRefreshHz = 120)
 }
 
 // Explicit recorded Reduce judder revision 2. These historical performance and
-// replay fixtures retain their original 6/3 ms policy; production revision 4
-// has separate source-gap boundary/provenance coverage in tst_sourcegapsmoothing.
+// replay fixtures retain their original 6/3 ms policy and historical movement
+// attribution. Production worker pacing restores this smoother with its own movement.
 VrrTimingParameters recordedJudderParameters(const VrrSessionConfig& session)
 {
     auto policy = vrrTimingParametersForSession(session);
+    policy.playoutSmoothingOwnMovement = 0;
+    policy.playoutSmoothingReadinessBound = session.smoothFrameTiming ? 1 : 0;
     policy.playoutSmoothingWindowedCadence = 2;
     policy.playoutSmoothingMaxLagUs = 6000;
     if (session.smoothFrameTiming) {
@@ -310,7 +313,7 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
                lowLatencyPolicy.playoutDelaySlewAcrossBands == 1 &&
                lowLatencyPolicy.rateCandidateMinimumUs == 200000 &&
                lowLatencyPolicy.playoutStallBurstExclusion == 1 &&
-               lowLatencyPolicy.latchedFloorDisabled == 1 &&
+               lowLatencyPolicy.latchedFloorDisabled == 2 &&
                lowLatencyPolicy.pacingLatencyExtraPeriodNumerator == 0 &&
                lowLatencyPolicy.pacingLatencyQueueModeExtra == 0 &&
                lowLatencyPolicy.readinessLowPercentile == 0 &&
@@ -2936,9 +2939,10 @@ void testNativeScheduledRetimingBounds()
         expect(scheduled.playoutSmoothingWindowedCadence == 4 &&
                    scheduled.playoutSmoothingMaxLagUs == tolerance &&
                    scheduled.playoutSmoothingReserveMaxUs == 0 &&
-                   paced.playoutSmoothingWindowedCadence == 4 &&
-                   paced.playoutSmoothingMaxLagUs == tolerance && paced.playoutSmoothingReserveMaxUs == 0,
-               "native and worker-paced Reduce judder must share one tolerance with no standing reserve");
+                   paced.playoutSmoothingWindowedCadence == 2 &&
+                   paced.playoutSmoothingMaxLagUs == 6000 && paced.playoutSmoothingReserveMaxUs == 3000 &&
+                   paced.playoutSmoothingOwnMovement == 1 && scheduled.playoutSmoothingOwnMovement == 0,
+               "native deadlines retain their bound while worker-paced smoothing owns its bounded retiming");
         VrrTimingController controller(session, true, scheduled);
         uint32_t ticks = 0;
         uint64_t previousTarget = 0;
@@ -4841,7 +4845,7 @@ void testPredictionOnlyBufferAdaptation()
            "prediction-only profiles must remain loadable for trace initialization");
 }
 
-void testProductionSmoothFrameTiming()
+void testHistoricalSourceGapSmoothFrameTiming()
 {
     // Approx. 77 FPS with alternating 11/15 ms source intervals. Exercise
     // the actual session resolver and adaptive buffer at every latency preset.
@@ -4855,7 +4859,17 @@ void testProductionSmoothFrameTiming()
             auto session = config(120, 120);
             session.latencyMode = mode;
             session.smoothFrameTiming = enabled != 0;
-            const auto policy = vrrTimingParametersForSession(session);
+            auto policy = vrrTimingParametersForSession(session);
+            policy.playoutSmoothingOwnMovement = 0;
+            policy.playoutSmoothingReadinessBound = enabled ? 1 : 0;
+            policy.playoutSmoothingWindowedCadence = enabled ? 4 : 2;
+            policy.playoutSmoothingMaxLagUs = enabled ? session.timingOptions.resolved(mode).toleranceUs : 6000;
+            policy.playoutSmoothingReserveMaxUs = 0;
+            policy.playoutSmoothingReserveToleranceUs = 0;
+            policy.playoutSmoothingReservePercentilePerMille = 0;
+            policy.playoutSmoothingReserveReleaseUsPerSecond = 0;
+            policy.playoutSmoothingPeriodFeedbackPerMillion = 0;
+            policy.playoutSmoothingResetSlewUs = 0;
             const auto tolerance = uint64_t(session.timingOptions.resolved(mode).toleranceUs);
             expect(policy.playoutSmoothingGainPerMille == (enabled ? 150 : 0) &&
                        policy.playoutSmoothingPeriodAlphaPerMille == 25 &&
@@ -4930,6 +4944,157 @@ void testProductionSmoothFrameTiming()
         expect(results[1].latency <= results[0].latency + results[1].samples * tolerance,
                "source-gap smoothing must add at most one tolerance average latency under alternating host jitter");
     }
+}
+
+void testQueuedCeilingRecoveryCannotRatchet()
+{
+    uint64_t maximumCarry[2] = {};
+    for (int corrected : {0, 1}) {
+        auto session = config(120, 120);
+        session.smoothFrameTiming = false;
+        session.experimentalBoundedCatchup = true;
+        session.experimentalInputPercentilePpm = 990000;
+        session.latencyMode = 2;
+        auto policy = vrrTimingParametersForSession(session);
+        policy.latchedFloorDisabled = corrected ? 2 : 1;
+        VrrTimingController controller(session, true, policy);
+        uint64_t previous = 0;
+        for (int i = 0; i < 18000; ++i) {
+            const auto decoded = decodedTimeForRtp(1000000, uint32_t(i * 750));
+            const auto now = std::max(decoded, previous);
+            const auto d = controller.schedule(frame(i + 1, uint32_t(i * 750), true, decoded), now);
+            // A stable 120 FPS source and ordinary variable wake-up overshoot.
+            // The protected native queue spaces display; enqueue time is not
+            // an additional physical display deadline.
+            const uint64_t overshoot = 100 + uint64_t(i % 7) * 100;
+            const auto submitted = std::max(d.targetUs, now + 1000) + overshoot;
+            expect(i == 0 || d.latchedPresentation, "ceiling recovery must retain native queue protection");
+            controller.notePreparationDuration(1000);
+            controller.noteSubmission(true, false, submitted);
+            previous = submitted;
+            if (i > 300) maximumCarry[corrected] = std::max(maximumCarry[corrected], d.trajectory.carryUs);
+        }
+    }
+    std::fprintf(stderr, "queued ceiling maximum recovery carry: %llu -> %llu us\n",
+                 static_cast<unsigned long long>(maximumCarry[0]),
+                 static_cast<unsigned long long>(maximumCarry[1]));
+    expect(maximumCarry[0] > 4000 && maximumCarry[1] <= 4000,
+           "protected queue must not reimpose CPU overshoot above intentional recovery cap");
+    // Removing the duplicate floor is limited to queue-owned presentation.
+    // Compare both revisions with immediate and explicit future deadlines.
+    for (bool nativeDeadline : {false, true}) {
+        auto session = config(120, 120);
+        session.smoothFrameTiming = false;
+        session.experimentalBoundedCatchup = true;
+        auto oldPolicy = vrrTimingParametersForSession(session, nativeDeadline, nativeDeadline);
+        oldPolicy.latchedFloorDisabled = 1;
+        auto newPolicy = oldPolicy;
+        newPolicy.latchedFloorDisabled = 2;
+        VrrTimingController oldController(session, nativeDeadline, oldPolicy);
+        VrrTimingController newController(session, nativeDeadline, newPolicy);
+        for (int i = 0; i < 300; ++i) {
+            const auto decoded = decodedTimeForRtp(1000000, uint32_t(i * 750));
+            const auto input = frame(i + 1, uint32_t(i * 750), true, decoded);
+            const auto a = oldController.schedule(input, decoded);
+            const auto b = newController.schedule(input, decoded);
+            expect(a.targetUs == b.targetUs && a.requestedPhaseTargetUs == b.requestedPhaseTargetUs,
+                   "immediate and future-deadline physical floors must remain identical");
+            const auto submitted = std::max(a.targetUs, decoded + 1000) + uint64_t(i % 7) * 100;
+            oldController.noteSubmission(true, false, submitted);
+            newController.noteSubmission(true, false, submitted);
+        }
+    }
+}
+
+void testProducerClockExcludesLateGpuCollection()
+{
+    uint64_t worstClockSkew[2] = {};
+    for (int corrected : {0, 1}) {
+        auto session = config(120, 120);
+        session.smoothFrameTiming = false;
+        session.experimentalBoundedCatchup = true;
+        auto policy = vrrTimingParametersForSession(session);
+        policy.normalizedSourceIntrinsicDecodeGpu = corrected;
+        policy.playoutOffsetWindowUs = 250000;
+        VrrTimingController controller(session, true, policy);
+        for (int i = 0; i < 1200; ++i) {
+            const uint64_t output = 1000000 + uint64_t(i) * 8333;
+            const uint64_t completion = output + (i < 8 ? 500 : 15500);
+            auto input = frame(i + 1, uint32_t(i * 750), true, output);
+            input.setDeliveryTimeline(output - 900, output - 800, output - 500);
+            input.noteGpuReadyUs(completion);
+            input.noteDecodeSyncWaitUs(500);
+            const auto d = controller.schedule(input, completion);
+            const auto submitted = std::max(d.targetUs, completion + 1000);
+            expect(submitted >= completion,
+                   "producer clock correction must retain actual GPU readiness");
+            if (i > 600 && d.sourceTimeUs > output)
+                worstClockSkew[corrected] = std::max(worstClockSkew[corrected], d.sourceTimeUs - output);
+            controller.notePreparationDuration(1000);
+            controller.noteSubmission(true, false, submitted);
+        }
+    }
+    std::fprintf(stderr, "late GPU collection clock skew: %llu -> %llu us\n",
+                 static_cast<unsigned long long>(worstClockSkew[0]),
+                 static_cast<unsigned long long>(worstClockSkew[1]));
+    expect(worstClockSkew[0] > 8000 && worstClockSkew[1] < 2000,
+           "late collection must not move the producer clock forward by our own queue residence");
+
+    auto session = config(120, 120);
+    session.smoothFrameTiming = false;
+    session.experimentalBoundedCatchup = true;
+    VrrTimingController controller(session, true, vrrTimingParametersForSession(session));
+    auto input = frame(1, 750, true, 1000000);
+    input.setDeliveryTimeline(999000, 999200, 999500);
+    input.noteGpuReadyUs(1015500);
+    input.noteDecodeSyncWaitUs(15500);
+    const auto d = controller.schedule(input, 1015500);
+    expect(d.sourceTimeUs >= 1014000,
+           "promptly observed genuine long GPU service must remain in the producer clock");
+}
+
+void testProductionWorkerSmoothingOwnsMovement()
+{
+    // Alternating 11/15 ms source intervals require sub-millisecond retiming
+    // every frame. A T/second adaptation budget allows only a few us instead.
+    uint64_t jerk[2] = {};
+    for (int own : {0, 1}) {
+        auto session = config(120, 120);
+        session.smoothFrameTiming = true;
+        auto policy = vrrTimingParametersForSession(session);
+        expect(policy.playoutSmoothingOwnMovement == 1 &&
+                   policy.playoutSmoothingWindowedCadence == 2 &&
+                   policy.playoutSmoothingMaxLagUs == 6000 &&
+                   policy.playoutSmoothingReserveMaxUs == 3000,
+               "ordinary worker smoothing must restore the bounded VRR18 retiming policy");
+        policy.playoutInputHitchMissesOnly = 10;
+        policy.playoutSmoothingOwnMovement = own;
+        VrrTimingController controller(session, true, policy);
+        uint32_t ticks = 0;
+        uint64_t previous = 0, previousInterval = 0;
+        for (int i = 0; i < 1200; ++i) {
+            ticks += i % 2 ? 1350 : 990;
+            const auto decoded = decodedTimeForRtp(1000000, ticks);
+            const auto now = std::max(decoded, previous);
+            const auto d = controller.schedule(frame(i + 1, ticks, true, decoded), now);
+            const auto ready = std::max(now, d.renderStartUs) + 1000;
+            const auto submitted = std::max(d.targetUs, ready);
+            controller.notePreparationDuration(1000);
+            controller.noteSubmission(true, false, submitted);
+            expect(submitted >= decoded && submitted - decoded <= 40000 &&
+                       std::abs(d.cadenceSmoothingUs) <= 9000,
+                   "restored smoothing must retain readiness, bounded phase and latency");
+            const auto interval = submitted - previous;
+            if (i > 300) jerk[own] += interval > previousInterval ?
+                interval - previousInterval : previousInterval - interval;
+            previousInterval = interval;
+            previous = submitted;
+        }
+    }
+    std::fprintf(stderr, "worker smoothing movement: jerk %llu -> %llu us\n",
+                 static_cast<unsigned long long>(jerk[0]), static_cast<unsigned long long>(jerk[1]));
+    expect(jerk[1] * 2 < jerk[0],
+           "the production smoother must actually remove source wobble instead of spending T/second");
 }
 
 void testProductionPreservesRelativeGameSpacing()
@@ -6776,6 +6941,91 @@ void testInitialPreparationIsNotTypicalRender()
            "renderer setup in the first preparation must not become typical render cost");
 }
 
+// Exercise the production admission-age drop rule with a continuous 116 FPS
+// source and one interval of ordinary worker queue residence. The recorded
+// policy starves it through its own render-start wait, despite fresh admission.
+void testPreparationPredictionCannotStarveAdmission()
+{
+    for (const uint64_t poisonUs : {29081u, 42248u, 45002u}) {
+        for (const bool corrected : {false, true}) {
+            auto session = config(116, 120);
+            session.latencyMode = 1;
+            auto parameters = vrrTimingParametersForSession(session);
+            parameters.preparationPredictionLead = corrected;
+            VrrTimingController controller(session, true, parameters);
+            const uint64_t originUs = 1000000;
+            uint64_t nowUs = originUs, lastPresentUs = 0, poisonedAtUs = 0;
+            uint64_t recoveryUs = 0, maximumGapUs = 0, maximumLatencyUs = 0;
+            unsigned preparations = 0, consecutiveStale = 0, longestStale = 0;
+            std::vector<uint64_t> presentations;
+            while (nowUs < originUs + 12000000) {
+                const uint64_t newest = (nowUs - originUs) * 116 / 1000000;
+                const uint64_t ordinal = newest > 0 ? newest - 1 : 0;
+                const uint64_t arrivalUs = originUs + (ordinal * 1000000 + 115) / 116;
+                auto input = frame(int(ordinal + 1), uint32_t(ordinal * 90000 / 116), true, arrivalUs);
+                const auto decision = controller.schedule(input, nowUs);
+                const auto protectionUs = decision.playoutDelayUs +
+                    std::min(decision.trajectory.carryUs, decision.sourcePeriodUs);
+                // The selected image was fresh before this deliberate wait.
+                expect(!VrrFrameDropPolicy::beforeRender(decision, controller.displayPeriodUs(),
+                           nowUs - arrivalUs, false, true, protectionUs, true),
+                       "the continuous-source fixture must admit a fresh frame before waiting");
+                nowUs = std::max(nowUs, decision.renderStartUs);
+                const bool successor = nowUs >= originUs + ((ordinal + 1) * 1000000 + 115) / 116;
+                if (successor && VrrFrameDropPolicy::afterRenderWait(
+                        decision, arrivalUs, nowUs, false, true, 0, protectionUs)) {
+                    longestStale = std::max(longestStale, ++consecutiveStale);
+                    controller.noteSubmission(false, false, 0);
+                }
+                else {
+                    consecutiveStale = 0;
+                    ++preparations;
+                    const uint64_t costUs = preparations == 1 ? 400000 :
+                        preparations == 2 ? 400 : preparations == 3 ? poisonUs : 400;
+                    nowUs += costUs;
+                    controller.notePreparationDuration(costUs, 0, nowUs);
+                    nowUs = std::max(nowUs, decision.targetUs);
+                    const bool cancelled = preparations == 2;
+                    controller.noteSubmission(true, cancelled, nowUs);
+                    if (!cancelled) {
+                        if (lastPresentUs) maximumGapUs = std::max(maximumGapUs, nowUs - lastPresentUs);
+                        lastPresentUs = nowUs;
+                        presentations.push_back(nowUs);
+                        if (preparations == 3) poisonedAtUs = nowUs;
+                        if (preparations == 4) recoveryUs = nowUs - poisonedAtUs;
+                        if (preparations > 3) maximumLatencyUs = std::max(maximumLatencyUs, nowUs - arrivalUs);
+                    }
+                }
+                // Advance to a new actual source arrival; never invent frames
+                // during a source gap or repeatedly schedule the same identity.
+                nowUs = std::max(nowUs, originUs + ((ordinal + 2) * 1000000 + 115) / 116);
+            }
+            if (!corrected) {
+                std::printf("historical poison=%llu preparations=%u stale=%u typical=%llu recovery=%llu\n", (unsigned long long)poisonUs, preparations, longestStale, (unsigned long long)controller.typicalRenderUs(), (unsigned long long)recoveryUs);
+                expect(longestStale >= 2,
+                       "historical prediction must repeatedly discard fresh frames after its own wait");
+                continue;
+            }
+            expect(recoveryUs > 0 && recoveryUs <= 250000 && maximumGapUs <= 250000,
+                   "cold-render prediction must recover presentation within 250 ms without a rate change");
+            expect(longestStale == 0 && controller.typicalRenderUs() <= 1000,
+                   "fresh frames must keep preparing until fast samples replace the poisoned estimate");
+            expect(maximumLatencyUs <= 100000,
+                   "progress recovery must retain an explicit 100 ms startup latency bound");
+            for (const uint64_t windowUs : {1000000u, 2000000u, 5000000u, 10000000u}) {
+                for (uint64_t endUs = originUs + windowUs; endUs <= originUs + 12000000; endUs += 10000) {
+                    const auto it = std::upper_bound(presentations.begin(), presentations.end(), endUs - windowUs);
+                    expect(it != presentations.end() && *it <= endUs,
+                           "every complete 1/2/5/10 second diagnostic window must contain presentation progress");
+                }
+            }
+            std::printf("preparation recovery: poison=%llu gap=%llu latency=%llu stale_cluster=%u\n",
+                        (unsigned long long)poisonUs, (unsigned long long)maximumGapUs,
+                        (unsigned long long)maximumLatencyUs, longestStale);
+        }
+    }
+}
+
 void testStartDelaySeedReplacesGenericStart()
 {
     auto session = config(120, 120);
@@ -7670,6 +7920,10 @@ void testAbsorbLocalCadencePreservesVariableAndQuantizedSources()
 
 int main()
 {
+    if (std::getenv("MOONLIGHT_VRR_TEST_RESUME_ONLY")) {
+        testPreparationPredictionCannotStarveAdmission();
+        return failures ? 1 : 0;
+    }
     testAbsorbTracksUniformSourceRateBeforeLongFitCatchesUp();
     testAbsorbLocalCadencePreservesVariableAndQuantizedSources();
     testPresentTiming();
@@ -7719,6 +7973,7 @@ int main()
     testHistoryControlsBufferRelease();
     testAlternatingSlowCadenceLeavesFastRate();
     testInitialPreparationIsNotTypicalRender();
+    testPreparationPredictionCannotStarveAdmission();
     testIntervalBufferRestoreHoldsRestoredTarget();
     testStartDelaySeedReplacesGenericStart();
     testIntervalBufferAboveTargetDipDoesNotEraseRecovery();
@@ -7753,7 +8008,10 @@ int main()
     testNativeHitchGatesPadding();
     testDelayedDisplayEventsAgreeAcrossBackends();
     testProductionPreservesRelativeGameSpacing();
-    testProductionSmoothFrameTiming();
+    testHistoricalSourceGapSmoothFrameTiming();
+    testProductionWorkerSmoothingOwnsMovement();
+    testProducerClockExcludesLateGpuCollection();
+    testQueuedCeilingRecoveryCannotRatchet();
     testReduceJudderReserveCoversQuantizedCadence();
     testReduceJudderReserveIgnoresDeliveryJitter();
     testReduceJudderReserveReleases();

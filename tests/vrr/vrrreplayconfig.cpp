@@ -355,6 +355,10 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
+    if (value.latchedFloorDisabled > 2)
+        return fail("latched_floor_disabled revision must be 0..2");
+    if (value.preparationPredictionLead > 1)
+        return fail("preparation prediction lead must be 0 or 1");
     if (value.playoutInputStableAdaptation > 1)
         return fail("stable input adaptation must be 0 or 1");
     if (value.playoutInputHitchMissesOnly > 10)
@@ -394,8 +398,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
         return fail("experimental input percentile requires revision12+, prediction-only, explicit90..99.99% INPUT coverage,10..300s history,250..1000us/s rise and250us/s fall (goal solver: rise to 4000, fall to 1000)");
     }
     if (value.playoutInputGoalLambda > 100000 || value.playoutInputGoalWindowUs > 300000000 ||
-            value.playoutInputIntrinsicDecodeGpu > 1 || value.playoutInputGoalTailPerMille > 1000) {
-        return fail("playout_input_goal_lambda must be 0..100000, playout_input_goal_window_us 0..300000000, playout_input_goal_tail_per_mille 0..1000 and playout_input_intrinsic_decode_gpu 0 or 1");
+            value.playoutInputIntrinsicDecodeGpu > 1 || value.playoutInputGoalUnpriced > 1 || value.playoutInputGoalTailPerMille > 1000) {
+        return fail("playout_input_goal_lambda must be 0..100000, playout_input_goal_window_us 0..300000000, playout_input_goal_tail_per_mille 0..1000; playout_input_intrinsic_decode_gpu and playout_input_goal_unpriced must be 0 or 1");
     }
     if (value.baseGuardDivisor == 0 ||
             value.pacingLatencyExtraPeriodDenominator == 0 ||
@@ -618,6 +622,12 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.playoutSmoothingResetSlewUs > 100000) {
         return fail("playout_smoothing_reset_slew_us must be in 0..100000");
+    }
+    if (value.normalizedSourceIntrinsicDecodeGpu > 1) {
+        return fail("normalized_source_intrinsic_decode_gpu must be 0 or 1");
+    }
+    if (value.playoutSmoothingOwnMovement > 1) {
+        return fail("playout_smoothing_own_movement must be 0 or 1");
     }
     if (value.playoutSmoothingReadinessBound > 1) {
         return fail("playout_smoothing_readiness_bound must be 0 or 1");

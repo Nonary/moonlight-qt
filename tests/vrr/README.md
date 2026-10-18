@@ -1,5 +1,12 @@
 # VRR deterministic tests
 
+`tst_performancestats` keeps binary input coverage independent of the weighted
+Client timing (CPU) score in adaptive and nonadaptive summaries. Its completed-run
+fixture displays 95.92% coverage alongside 98.73% timing / 99% target, preserving
+both values and assigning the goal only to timing. Missing/short-window input
+samples and missing/stale display feedback remain explicit. This formatting
+change does not alter scoring, controller adaptation or presentation.
+
 `tst_vrrtimingcontroller` also exercises the source-relative cadence detector:
 constant latency, genuine irregular/51 ms source intervals, isolated late/catch-up
 pairs versus recurring oscillation, 60/90/120/144/240 FPS, uncertainty bounds
@@ -1927,3 +1934,197 @@ checks require old snapshots to default the flag to zero and reject values above
 one. The final comparison and stress artifacts are under
 `build/stable-buffer-recovery-20261017/`; rejected timing-recovery experiments
 are retained separately from the selected candidate.
+
+
+### Startup preparation prediction and presentation progress (2026-10-17)
+
+`preparation_prediction_lead=1` reserves the typical preparation prediction in
+render-start scheduling, matching the cost included in the target. Historical
+snapshots without this field use zero. The input-buffer policy and its configured
+120 s/99.50% target in the captured failures are independent and unchanged.
+
+`testPreparationPredictionCannotStarveAdmission` exercises continuous 116 FPS
+arrivals, ordinary queue residence, excluded cold setup, a canceled fast render,
+and the captured 29,081/42,248/45,002 us startup costs. The historical controller
+policy must reproduce repeated stale rejection after its own deliberate wait;
+the real-worker regression reproduces sustained starvation before the fix.
+The corrected policy must recover within 250 ms,
+replace the poisoned estimate, respect a 100 ms post-poison startup latency bound,
+and make progress in every complete rolling 1/2/5/10 s diagnostic window.
+`testResumePreparationKeepsWorkerPresenting` repeats the sequence through the real
+worker with continuing arrivals, checks recovery and recurring submission gaps,
+and verifies every frame is released exactly once. Both executables support
+`MOONLIGHT_VRR_TEST_RESUME_ONLY=1` for the focused regressions.
+
+These tests prove software progress, not physical display timing or live resume
+reliability. No application installation/restart is part of this change. Shader
+setup/texture allocation remains a trigger hypothesis, not an established cause
+of the expensive preparation calls.
+
+Validation: the focused worker regression fails in all three startup cases before
+the scheduling fix and passes afterward, including a sustained 40 ms overload
+case that must still shed frames. The full controller suite, 48 replay-config
+checks, rate/render/D3D11-binding and Vulkan presentation/swapchain suites pass.
+The full worker suite retains five failures in the existing queued-recovery and
+causal input-event fixtures; an isolated build of the unchanged `7d1148f9`
+controller reproduces those same five failures. They are not resolved here.
+
+Both completed preserved resume captures pass exact baseline and sequence
+integrity with the final replay build. The one-parameter candidate retains fixed
+admission and recorded drop dispositions, so it cannot establish counterfactual
+presentation recovery; use the real-worker regression for that proof. Startup
+stress bounds include the recorded 362--457 ms cold render (mean <=200 ms,
+p99 <=500 ms), are separate from the <=100 ms deterministic post-poison bound,
+and are not normal operating latency limits. Artifacts are isolated under
+`build/resume-starvation-tests/`. The installed application remains unchanged;
+repeated live resume/fresh-launch verification is outstanding.
+
+
+### Unpriced input-goal fallback (2026-10-18)
+
+New sessions set `playout_input_goal_unpriced=1`. If no candidate meets the
+client-timing goal, the solver selects the smallest buffer with the best
+achievable score inside the existing cap, without subtracting a latency price.
+The goal, recent window, input eligibility, cap and rise/fall rates are unchanged.
+Calibration uses a new identity. Historical traces without the field retain
+zero and their recorded priced fallback for exact replay.
+
+The input-percentile integration suite covers growth against an unreachable
+goal despite the historical price, minimum-buffer ties, ordinary recent-jitter
+growth/release and production selection. Replay-config tests cover the new
+field, historical default and rejection of invalid values. These deterministic
+checks do not establish live smoothness or physical display timing.
+
+Validation: native application build and offscreen help pass. Input-percentile
+integration, timing controller, rate policy, replay config (49 cases) and input
+accounting pass. The worker has five failing assertions; an isolated build with
+only the new unpriced flag disabled reproduces the identical five messages.
+The newest completed connection-2 capture passes exact baseline and sequence
+integrity with exit zero. Nominal and four same-fault matched comparisons have
+zero modeled interval violations and no worker saturation; mean latency changes
+by at most 164 us and p99 by at most 30 us. The initial fault assertions against
+nominal latency fail for both policies; same-fault control-relative bounds are
+recorded separately, and their large synthetic latency is not normal operation.
+Artifacts: `build/unpriced-goal-checks/`. Live validation remains pending.
+
+
+### VRR18 smoothing and producer-clock regression correction (2026-10-18)
+
+Comparison baseline: `v6.1.0-vrr18` (`1ad5848b`). The matched 116 FPS
+connection and completed 120 FPS connection have clean footers, zero writer
+row drops, sequence integrity, and exact baseline reproduction. A separate
+completed 120 FPS Absorb capture (`connection-6`) also passes both exact gates.
+The exact same frozen inputs are used for each policy comparison; the exported
+VRR18 policy is a source-policy comparison, not a live old-binary A/B.
+
+Ordinary worker-paced Reduce judder restores revision 2's 6 ms lag and learned
+3 ms reserve. `playout_smoothing_own_movement=1` lets that law own its bounded
+retiming instead of applying the adaptive-buffer T/second movement limit too.
+Native future-target timing keeps its existing revision-4 bound. Absorb stays
+revision 7. The new field defaults to zero in historical captures.
+
+`normalized_source_intrinsic_decode_gpu=1` uses promptly collected decode
+service for the normalized producer clock, matching the existing input basis.
+A late API collection no longer counts intentional queue residence as GPU
+service in that clock. Unknown service uses decoder output for the clock until
+qualified, while actual completion still constrains readiness. The deterministic
+late-collection fixture reduces artificial source-clock lead from 15,200 to
+200 us and separately preserves genuine, promptly observed 15.5 ms GPU service.
+Cache identity includes the effective clock revision, including the environment
+switches resolved later by the worker.
+
+Final combined replay on the 116 FPS capture reduces modeled presented-jerk
+pairs over 2 ms from 80 to 9 per mille. Mean decode-to-submission falls from
+16.672 to 15.091 ms; p99 falls from 29.206 to 23.200 ms. Sender-spacing residual
+p99 changes from 0.963 to 7.002 ms: smoothing intentionally trades stamp fidelity
+for interval regularity, so that field is not used as a smoothness verdict.
+On the completed 120 FPS capture, jerk changes from 4 to 3 per mille, mean
+latency from 18.408 to 15.685 ms, and p99 from 31.417 to 27.614 ms. Neither
+candidate saturates, and explicit nominal latency/interval bounds pass.
+Matched decision/preparation/submission/scheduler fault comparisons pass zero
+modeled interval violations and control-relative latency bounds; the large
+synthetic fault tails are not normal operating latency.
+
+The full-buffer live case showed 956 client queue/admission drops in a sampled
+3,600 rows, mostly `queue_stale`, with 13.377 ms input protection and a mapped
+source clock about 14 ms ahead of frame arrival. With investigation builds
+paused, queue dropping persisted. Extrapolating the next matched frame's mapping
+places some expired images roughly 6 ms before their nominal deadline. Fixed
+recorded-admission replay reduces mean latency from 28.121 to 21.701 ms with
+the clock correction. It cannot prove recovery of previously discarded frames.
+Worker-mode replay returns exit 5 because its capacity audit has evictions;
+those worker scenarios do not establish counterfactual queue recovery.
+
+All eight affected controller, replay-config (50 cases), real-worker,
+input-percentile integration, input-accounting, rate, render-policy and binding
+suites pass on final source. The formerly failing worker assertions now pass.
+The application build, final incremental check and offscreen help pass.
+The next normal application launch uses the rebuilt binary; reconnecting inside
+an already running process retains its old executable. Fresh live confirmation
+of visible smoothness and queue-drop recovery is still required. Evidence is in
+`build/vrr18-regression-20261018/`.
+
+### Queued recovery ceiling, 2026-10-18
+
+A fresh 120 FPS Low Latency capture with Reduce judder disabled held input
+near 1–1.25 ms while recovery reached 6.4–7.3 ms. The actual source cadence
+was near 120 FPS. `latched_floor_disabled=1` removed the ordinary enqueue
+floor but PhaseTrajectory reintroduced the previous actual enqueue plus one
+physical period as an uncapped ownership floor. Ordinary variable wake-up
+overshoot could therefore exceed the configured intentional carry ceiling.
+
+Worker production now selects revision 2. For a latch-capable presenter and a
+protected queued frame, without native future deadlines, that floor retains
+its cadence regularization within the configured carry budget (4 ms and at
+most half a source period). Immediate and native scheduled physical floors
+are unchanged. Historical revisions 0/1 remain explicit and replayable; the
+calibration identity changes. The controller regression runs a constant 120 FPS
+source with variable 100–700 us enqueue overshoot and requires carry <=4 ms;
+separate cases compare immediate and future-deadline targets across revisions.
+
+Artifacts: `build/vrr18-regression-20261018/fresh-live/`. On the frozen live
+snapshot, the full recorded controller policy with only the floor revision
+changed has presented jerk >2 ms of 1 per mille for both policies (p99
+505 -> 502 us), sender-spacing residual p99 269 -> 267 us, mean
+decode-to-submission 13.432 -> 10.958 ms, p99 14.978 -> 12.202 ms, and
+maximum planned extra delay 7.370 -> 4.000 ms. Four matched execution-fault
+pairs pass zero modeled interval violations, mean <=25 ms, and p99 <=60 ms
+without saturation. These are exploratory fixed-admission software results:
+the live snapshot has no clean-close footer. The freshly enumerated newest
+completed capture (`ceiling-completed-provenance.json`) has sequence integrity
+but fails strict baseline on one wait-boundary timestamp inconsistency;
+its controller targets and required diagnostics match exactly. It is not a
+strict A/B baseline. Older frozen 116/120 captures are separate compatibility
+checks, not evidence about this live session. A fresh process and live display
+comparison remain necessary before claiming visible improvement.
+
+Worker fixture follow-up: the latency-fix overload case now uses 3.5 source
+periods instead of 2.5, which can sit exactly on the permitted input-plus-carry
+age boundary. It still verifies replacement, ordering, drop count, and exact
+frame release. The decode-only event fixture anchors packet delivery to its
+known 60 FPS source slot rather than subtracting an arbitrary duration from
+late output; real worker waits previously made that nominally decode-only
+sample network-late too. A positive clock epoch prevents startup timestamp
+underflow. Event classification assertions are retained.
+
+### Final local validation and timing summary, 2026-10-18
+
+The user reports improved live streaming with the current pacing corrections.
+This is user observation rather than a controlled optical A/B. The latest
+completed session selected for the timing audit is
+`moonlight-pacing-20261018-163736-2005827.vrrtrace`, SHA-256
+`5041b7f04a2467e73cd630a944d42264177afa7e24a18152c915a3eaa68ab514`.
+It passes `--require-exact-baseline` with exit zero, `baseline_exact=true`,
+`recorded_sequence_integrity_valid=true`, a clean footer and zero dropped rows.
+Its final 60-second input coverage is 95.92% (284 misses / 6960 eligible),
+while the distinct CPU interval severity score is 98.73% against a 99% goal.
+Input misses do not establish dropped frames or failed visible presentation.
+The normal summary now displays both independently; graph and log labels no
+longer describe the interval-score goal as a frame-coverage percentile.
+
+After the final reporting edit, the six required controller/rate/worker/replay
+config/render/binding suites, replay help, performance-summary regression,
+incremental Linux application build and offscreen startup smoke all pass.
+No pacing or counter calculation changed for the reporting correction. Results
+are under `build/coverage-audit-20261018/`. A running process retains the old
+executable; the next normal launch picks up the rebuilt summary.

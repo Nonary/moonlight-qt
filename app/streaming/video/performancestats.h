@@ -22,7 +22,7 @@ struct Snapshot {
     uint64_t targetPpm = 0, toleranceUs = 0;
     uint64_t nowUs = 0;
     Vrr13::InputPercentileBuffer::Stats input;
-    // Without the adaptive buffer: the interval-policy client timing score.
+    // Interval-policy CPU submission score, independent of input coverage.
     bool clientTimingValid = false;
     double clientTimingPercent = 0;
     // Display error added after submission, judged against the plan. Source
@@ -39,7 +39,7 @@ inline std::string formatVrr(const Snapshot& s)
 {
     if (!s.vrr) return "VRR pacing: inactive\n";
 
-    char buffer[96], coverage[192], present[128], text[640];
+    char buffer[96], coverage[192] = {}, timing[128], present[128], text[768];
     const double totalMs = (s.bufferUs + s.smoothingUs) / 1000.0;
     if (s.adaptive && s.input.samples)
         std::snprintf(buffer, sizeof(buffer), "%.2f ms%s (target %.2f%s)",
@@ -49,16 +49,16 @@ inline std::string formatVrr(const Snapshot& s)
         std::snprintf(buffer, sizeof(buffer), "%.2f ms%s",
             s.bufferUs / 1000.0, s.atLimit ? " at limit" : "");
 
-    // Each current value shares a line with its target. Coverage counts clean
-    // plus absorbed inputs over the profile history.
+    // The goal belongs to the severity-weighted interval score. Binary input
+    // coverage is independent: recovery may still present an uncovered input smoothly.
     const double target = s.targetPpm / 10000.0;
     if (s.adaptive) {
         if (s.input.recentEligible) {
             const auto covered = s.input.recentEligible - std::min(s.input.recentMissed, s.input.recentEligible);
-            std::snprintf(coverage, sizeof(coverage), "coverage %.2f%% / %.2f%% target",
-                100.0 * double(covered) / double(s.input.recentEligible), target);
+            std::snprintf(coverage, sizeof(coverage), "Input coverage: %.2f%%\n",
+                100.0 * double(covered) / double(s.input.recentEligible));
         }
-        else std::snprintf(coverage, sizeof(coverage), "coverage N/A / %.2f%% target", target);
+        else std::snprintf(coverage, sizeof(coverage), "Input coverage: N/A\n");
         if (s.input.reportingWindowUs) {
             char recent[32], history[32];
             const auto percent=[](char* out, uint64_t count, uint64_t misses) {
@@ -67,15 +67,15 @@ inline std::string formatVrr(const Snapshot& s)
             };
             percent(recent, s.input.reportingEligible, s.input.reportingMissed);
             percent(history, s.input.recentEligible, s.input.recentMissed);
-            std::snprintf(coverage, sizeof(coverage), "coverage (%llus) %s / %.2f%% | %llus %s",
-                static_cast<unsigned long long>(s.input.reportingWindowUs/1000000), recent, target,
+            std::snprintf(coverage, sizeof(coverage), "Input coverage (%llus): %s | %llus %s\n",
+                static_cast<unsigned long long>(s.input.reportingWindowUs/1000000), recent,
                 static_cast<unsigned long long>(s.input.windowUs/1000000), history);
         }
     }
-    else if (s.clientTimingValid)
-        std::snprintf(coverage, sizeof(coverage), "client timing %.2f%% / %.2f%% target",
+    if (s.clientTimingValid)
+        std::snprintf(timing, sizeof(timing), "Client timing (CPU): %.2f%% / %.2f%% target",
             s.clientTimingPercent, target);
-    else std::snprintf(coverage, sizeof(coverage), "client timing collecting / %.2f%% target", target);
+    else std::snprintf(timing, sizeof(timing), "Client timing (CPU): collecting / %.2f%% target", target);
 
     if (s.present.intervals && fresh(s.present.lastObservedUs, s.nowUs))
         std::snprintf(present, sizeof(present), "%.2f%% >%.2f ms | hitches %llu | worst +%.1f ms",
@@ -87,9 +87,10 @@ inline std::string formatVrr(const Snapshot& s)
 
     std::snprintf(text, sizeof(text),
         "VRR buffer: %s | %s\n"
+        "%s"
         "Extra delay: %.2f ms (smoothing/recovery) | Planned total: %.2f ms\n"
         "Present timing issues (30s): %s\n",
-        buffer, coverage, s.smoothingUs / 1000.0, totalMs, present);
+        buffer, timing, coverage, s.smoothingUs / 1000.0, totalMs, present);
     return text;
 }
 }

@@ -337,6 +337,16 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                 context += QStringLiteral("|input-hitch-misses=%1").arg(recoveryPolicy.playoutInputHitchMissesOnly);
             if (recoveryPolicy.playoutInputStableAdaptation)
                 context += QStringLiteral("|stable-input-adaptation=%1").arg(recoveryPolicy.playoutInputStableAdaptation);
+            // The worker resolves adaptive/clock environment switches after
+            // this key is built. Include their effective clock revision here
+            // rather than the pre-worker config's disabled initializer.
+            const bool intrinsicProducerClock =
+                qEnvironmentVariable("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER") != "0" &&
+                qEnvironmentVariable("MOONLIGHT_VRR_BOUNDED_CATCHUP") != "0";
+            context += QStringLiteral("|queued-recovery-floor-v2|producer-clock-intrinsic-gpu-v1=%1")
+                .arg(intrinsicProducerClock ? 1 : 0);
+            if (recoveryPolicy.playoutInputGoalUnpriced)
+                context += QStringLiteral("|input-goal-unpriced-v1");
             context += QStringLiteral("|late-recovery=%1|buffer-ratio=%2")
                 .arg(recoveryPolicy.playoutLateRecovery)
                 .arg(recoveryPolicy.playoutDelayMaximumPeriodPerMille);
@@ -371,6 +381,9 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                     context += QStringLiteral("|absorb-microstutter=%1-%2")
                         .arg(policy.playoutSmoothingAbsorbReserveUs)
                         .arg(policy.playoutSmoothingAbsorbReservePeriodPerMille);
+                }
+                if (policy.playoutSmoothingOwnMovement != 0) {
+                    context += QStringLiteral("|smoothing-own-movement-v1");
                 }
                 if (policy.playoutSmoothingReadinessBound != 0) {
                     context += QStringLiteral("|smoothing-readiness-bound=%1")

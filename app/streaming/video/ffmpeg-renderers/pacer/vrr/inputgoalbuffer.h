@@ -12,9 +12,8 @@ namespace Vrr13 {
 // min(1, (|error| - tolerance) / intended) of its duration. Lateness is input
 // (network and decode) readiness relative to the unbuffered slot.
 //
-// When no buffer up to the maximum meets the goal, B is bought only while each
-// further millisecond still recovers `lambda` thousandths of a percentage
-// point of the score, so an unreachable goal does not pin the maximum.
+// When no buffer meets the goal, choose the smallest buffer with the best
+// achievable score. Historical captures retain their recorded latency price.
 class InputGoalSolver {
 public:
     void clear() { m_Pairs.clear(); m_IntendedUs = 0; }
@@ -45,7 +44,7 @@ public:
     }
     struct Solution { uint64_t bufferUs = 0; bool goalReachable = true; };
     Solution solve(uint64_t probabilityPpm, uint64_t toleranceUs, uint64_t lambda,
-                   uint64_t minimumUs, uint64_t maximumUs, uint64_t stepUs) const {
+                   uint64_t minimumUs, uint64_t maximumUs, uint64_t stepUs, bool unpriced = false) const {
         const double allowed = double(1000000 - std::min<uint64_t>(probabilityPpm, 1000000)) / 1e6;
         stepUs = std::max<uint64_t>(stepUs, 1);
         Solution best{minimumUs, false};
@@ -53,7 +52,8 @@ public:
         for (uint64_t b = minimumUs;; b = std::min(maximumUs, b + stepUs)) {
             const double lost = loss(b, toleranceUs);
             if (lost <= allowed) return {b, true};
-            const double value = -100.0 * lost - double(lambda) / 1000.0 * double(b) / 1000.0;
+            const double value = -100.0 * lost -
+                (unpriced ? 0.0 : double(lambda) / 1000.0 * double(b) / 1000.0);
             if (value > bestValue) { bestValue = value; best.bufferUs = b; }
             if (b >= maximumUs) break;
         }

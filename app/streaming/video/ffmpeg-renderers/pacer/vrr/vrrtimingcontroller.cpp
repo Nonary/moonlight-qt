@@ -226,6 +226,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutInputStableAdaptation = parameters.playoutInputPercentileEnabled ? 1 : 0;
     parameters.boundedCatchupEnabled = config.experimentalBoundedCatchup;
     parameters.normalizedSourceMapping = config.experimentalBoundedCatchup;
+    parameters.normalizedSourceIntrinsicDecodeGpu = config.experimentalBoundedCatchup;
     if (parameters.boundedCatchupEnabled) {
         parameters.playoutCatchupCarryLimitUs = kCatchupCarryLimitUs;
         parameters.playoutCatchupCarryLimitPeriodPerMille = kCatchupCarryLimitPeriodPerMille;
@@ -253,12 +254,12 @@ VrrTimingParameters vrrTimingParametersForSession(
             config.experimentalInputPercentileRiseUsPerSecond, 250, 1000);
         // Meet the profile's client-timing goal with the least buffer over a
         // recent span, aiming at 70% of its allowed loss because growth
-        // follows a dip. When the goal is out of reach, stop buying buffer once
-        // a millisecond recovers less than the profile's price: 0.5, 0.3 and
-        // 0.1 percentage points for 99%, 99.5% and 99.9%+ goals.
+        // follows a dip. If the goal is unreachable, maximize timing quality
+        // within the existing cap without a latency-price penalty.
         const auto target = parameters.playoutInputPercentileTargetPerMillion;
         if (config.inputGoalSolver) {
         parameters.playoutInputGoalLambda = target >= 999000 ? 100 : target >= 995000 ? 300 : 500;
+        parameters.playoutInputGoalUnpriced = 1;
         parameters.playoutInputGoalWindowUs = target >= 999000 ? 120000000 :
             target >= 995000 ? 60000000 : 20000000;
         parameters.playoutInputGoalTailPerMille = 700;
@@ -380,8 +381,9 @@ VrrTimingParameters vrrTimingParametersForSession(
         parameters.playoutResponsiveBuffer >= 6 && config.smoothFrameTiming ? 1 : 0;
     // Absorb revision 7 retains wider phase-locked smoothing, qualifying and
     // reseeding uniform local source runs before the longer rate fit catches
-    // up. Ordinary Reduce judder uses its tolerance-bounded source-gap policy;
-    // historical parameter snapshots retain their explicit revisions.
+    // up. Worker-paced Reduce judder restores the VRR18 phase-locked law;
+    // native future-target sessions retain their tolerance-bound policy.
+    // Historical parameter snapshots retain their explicit revisions.
     parameters.playoutSmoothingWindowedCadence = 2;
     if (config.smoothFrameTiming && config.absorbMicrostutter) {
         parameters.playoutSmoothingWindowedCadence = 7;
@@ -396,7 +398,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         parameters.playoutSmoothingReservePercentilePerMille = 0;
         parameters.playoutSmoothingReserveReleaseUsPerSecond = 0;
     }
-    else if (config.smoothFrameTiming) {
+    else if (config.smoothFrameTiming && nativeScheduledPresentation) {
         // T is both the untouched source-gap band and the entire retained
         // phase budget. Correct only excess beyond T, by at most T per gap.
         // Clean gaps retain the phase: recentering or a learned reserve would
@@ -409,6 +411,14 @@ VrrTimingParameters vrrTimingParametersForSession(
         parameters.playoutSmoothingReservePercentilePerMille = 0;
         parameters.playoutSmoothingReserveReleaseUsPerSecond = 0;
         parameters.playoutSmoothingResetSlewUs = 0;
+    }
+    else if (config.smoothFrameTiming) {
+        // Restore the worker-paced VRR18 phase-locked smoother. Its 6 ms lag,
+        // learned reserve and reset law already bound retiming. Applying the
+        // adaptive buffer's T/second movement budget as well reduced a 500 us
+        // tolerance to roughly 4 us per frame and passed source jitter through.
+        parameters.playoutSmoothingOwnMovement = 1;
+        parameters.playoutSmoothingReadinessBound = 0;
     }
     // Four consecutive intervals qualify the new window. Source-rate changes
     // already have their own confirmation gate; another 200 ms without
@@ -436,6 +446,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.renderStartMinimumLeadUs = kRenderStartMinimumLeadUs;
     parameters.renderLeadFloorUs = kRenderLeadFloorUs;
     parameters.preparationInitialSampleExcluded = 1;
+    parameters.preparationPredictionLead = 1;
     // A source-rate epoch of at least 1.5x returns to the delay previously
     // sustained at that rate; decreases slew so a restore is not a jump.
     parameters.playoutEpochRateRatioPerMille = 1500;
@@ -449,7 +460,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.candidateCadenceRatioNumerator = 5;
     parameters.candidateCadenceRatioDenominator = 4;
     parameters.playoutStallBurstExclusion = 1;
-    parameters.latchedFloorDisabled = 1;
+    parameters.latchedFloorDisabled = nativeScheduledPresentation ? 1 : 2;
     // A latched present flips no earlier than one display period after the
     // previous flip, not at its call. Anchoring the next tearing present to
     // the call let it flip inside the panel's minimum period after a late or
@@ -770,7 +781,20 @@ uint64_t VrrTimingController::sourceMappingUs(const PacedFrame& frame) const
         // PyroWave's decoder output is GPU submission, not completion, so the
         // service cost ends at the (estimated) decode completion. Using output
         // planned frames ~4 ms before they could be decoded (2026-10-10).
-        return frame.reassembledUs() + (estimatedDecodeCompleteUs(frame) - frame.decodeSubmitUs());
+        uint64_t completionUs = estimatedDecodeCompleteUs(frame);
+        if (m_Parameters.normalizedSourceIntrinsicDecodeGpu) {
+            // A wait sampled after collection can include our intentional
+            // pacing-queue residence. Even a >200 us API call does not turn
+            // that residence into measured GPU service. Use promptly collected
+            // decode durations for this clock, as input readiness already does.
+            // Without a qualified sample, anchor at immutable decoder output;
+            // the scheduling readiness floor still waits for real completion.
+            completionUs = frame.decoderOutputUs();
+            if (m_DecodeIntrinsicUs) completionUs = std::min(frame.decodeCompleteUs(),
+                saturatingAdd(frame.decoderOutputUs(), m_DecodeIntrinsicUs));
+        }
+        return saturatingAdd(frame.reassembledUs(),
+            completionUs - std::min(completionUs, frame.decodeSubmitUs()));
     }
     return raw;
 }
@@ -1049,7 +1073,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             intervalQualityToleranceUs(m_Parameters), int64_t(absorbReserveUs()),
             m_BufferLayerChanged, m_BufferLayerDrain && m_Parameters.playoutInputHitchMissesOnly < 10,
             m_Parameters.playoutInputHitchMissesOnly < 10);
-        smoothingUs = m_ExtraBufferSlew.smoothing(smoothingUs);
+        if (!m_Parameters.playoutSmoothingOwnMovement)
+            smoothingUs = m_ExtraBufferSlew.smoothing(smoothingUs);
         m_LastSmoothingRetimingUs = smoothingUs - int64_t(smoothingReserveUs);
     }
     const uint64_t renderOffsetUs = m_Parameters.playoutPredictionEnabled ? typicalRenderUs() : m_RenderLeadUs;
@@ -1271,9 +1296,22 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         // catch-up room at 116 FPS on 120 Hz, so carry lingered; remove the
         // smallest recent overshoot, which the next submission also incurs.
         const uint64_t anchorUs = spacingAnchorUs();
-        const uint64_t ownershipFloor = m_HaveLastSubmission ?
+        // Revision 1 omitted the enqueue floor above but reintroduced it
+        // here without a carry cap. Keep its cadence regularization within
+        // the intentional recovery budget when the protected native queue
+        // owns physical spacing. Immediate and future-deadline paths still
+        // require their full physical ownership floor.
+        uint64_t ownershipFloor = m_HaveLastSubmission ?
             saturatingAdd(anchorUs - std::min(anchorUs, m_PhaseTrajectory.minimumRecentLatenessUs()),
                           m_DisplayPeriodUs) : 0;
+        const bool queueOwnsSpacing = m_Parameters.latchedFloorDisabled >= 2 &&
+            m_CanLatchPresentation && m_LatchedPresentation &&
+            !m_Parameters.nativeScheduledPresentation;
+        if (queueOwnsSpacing) {
+            const uint64_t limitUs = catchupCarryLimitUs();
+            const uint64_t carryUs = limitUs ? std::min(limitUs, m_SourcePeriodUs) : m_SourcePeriodUs;
+            ownershipFloor = std::min(ownershipFloor, saturatingAdd(originalTargetUs, carryUs));
+        }
         trajectory = m_PhaseTrajectory.plan(uint64_t(frame.frameNumber()),
             addSigned(m_SourceTimeUs, smoothingUs), originalTargetUs, targetUs,
             saturatingAdd(nowUs, saturatingAdd(renderOffsetUs, m_Parameters.presentationSafetyUs)),
@@ -1309,13 +1347,21 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         saturatingAdd(saturatingAdd(m_RenderLeadUs,
                                     m_RenderWakeLeadUs),
                       gpuReadinessLeadUs));
-    uint64_t renderStartUs = targetUs > totalLeadUs ?
-        targetUs - totalLeadUs : 0;
+    // Target construction includes the full typical preparation cost. Reserve
+    // that same cost here even when a startup sample exceeds one source period.
+    // Otherwise our own wait can age every admitted image past the stale limit
+    // before it is rendered, preventing any new sample from correcting the
+    // prediction. GPU-readiness learning keeps its separate source-period cap.
+    const uint64_t preparationLeadUs =
+        m_Parameters.preparationPredictionLead && m_Parameters.playoutPredictionEnabled ?
+            std::max(totalLeadUs, renderOffsetUs) : totalLeadUs;
+    uint64_t renderStartUs = targetUs > preparationLeadUs ?
+        targetUs - preparationLeadUs : 0;
     if (timestampPlayout && m_Parameters.playoutPrepareOnArrival != 0) {
         // Preparation may use the existing playout interval. Native image
         // acquisition can still apply backpressure; the presentation target
         // remains unchanged regardless of when that acquisition completes.
-        const uint64_t arrivalLeadUs = saturatingAdd(totalLeadUs,
+        const uint64_t arrivalLeadUs = saturatingAdd(preparationLeadUs,
                                                      playoutDelayUs);
         renderStartUs = targetUs > arrivalLeadUs ?
             targetUs - arrivalLeadUs : 0;
@@ -1327,7 +1373,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         // learned preparation budget back to a fixed 2.5 ms. Increasing the
         // playout buffer cannot repair that loss of rendering opportunity.
         const uint64_t minimumLeadUs = m_Parameters.renderStartPreserveLearnedLead ?
-            std::max(m_Parameters.renderStartMinimumLeadUs, totalLeadUs) :
+            std::max(m_Parameters.renderStartMinimumLeadUs, preparationLeadUs) :
             m_Parameters.renderStartMinimumLeadUs;
         const uint64_t latestStartUs =
             targetUs > minimumLeadUs ? targetUs - minimumLeadUs : 0;
@@ -2710,7 +2756,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_InputPercentileBuffer.setStableAdaptation(m_Parameters.playoutInputStableAdaptation != 0);
                 m_InputPercentileBuffer.setGoalSolver(m_Parameters.playoutInputGoalLambda,
                     m_Parameters.playoutInputGoalWindowUs,
-                    m_Parameters.playoutInputGoalTailPerMille ? m_Parameters.playoutInputGoalTailPerMille : 1000);
+                    m_Parameters.playoutInputGoalTailPerMille ? m_Parameters.playoutInputGoalTailPerMille : 1000,
+                    m_Parameters.playoutInputGoalUnpriced != 0);
                 m_InputPercentileBuffer.observe(m_Pending.smoothness.frame,
                     enqueueUs ? enqueueUs : m_Pending.inputObservationUs,
                     m_Pending.intervalIntendedUs, m_Pending.inputRequiredUs, validInput,
@@ -4244,7 +4291,8 @@ void VrrTimingController::updatePlayoutHistory(
                 m_InputPercentileBuffer.setStableAdaptation(m_Parameters.playoutInputStableAdaptation != 0);
                 m_InputPercentileBuffer.setGoalSolver(m_Parameters.playoutInputGoalLambda,
                     m_Parameters.playoutInputGoalWindowUs,
-                    m_Parameters.playoutInputGoalTailPerMille ? m_Parameters.playoutInputGoalTailPerMille : 1000);
+                    m_Parameters.playoutInputGoalTailPerMille ? m_Parameters.playoutInputGoalTailPerMille : 1000,
+                    m_Parameters.playoutInputGoalUnpriced != 0);
                 m_InputPercentileBuffer.advance(nowUs, playoutDelayMinimumUs(),
                     playoutDelayMaximumUs(), m_Parameters.playoutInputPercentileTargetPerMillion,
                     m_Parameters.playoutInputPercentileWindowUs,

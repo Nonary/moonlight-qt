@@ -1382,9 +1382,16 @@ static void testGoalSolverPricesUnreachableGoals() {
     check(!cheap.goalReachable && !dear.goalReachable,"an unreachable goal is reported");
     check(cheap.bufferUs==0,"a high price buys no buffer when buffer cannot reach the goal");
     check(dear.bufferUs==8620,"a negligible price buys the best buffer within the maximum");
+    const auto unpriced=solver.solve(995000,500,100000,0,8620,250,true);
+    check(!unpriced.goalReachable && unpriced.bufferUs==8620,
+          "production removes the latency-price veto and protects as much as the cap permits");
+    Vrr13::InputGoalSolver flat; flat.add(12000,24000,8333,500);
+    const auto plateau=flat.solve(995000,500,100000,1000,8620,250,true);
+    check(!plateau.goalReachable && plateau.bufferUs==1000,
+          "equal timing scores prefer the smallest buffer");
 }
 static void testGoalBufferFollowsRecentJitter() {
-    Vrr13::InputPercentileBuffer buffer; buffer.setStableAdaptation(true); buffer.setGoalSolver(300,20000000,1000);
+    Vrr13::InputPercentileBuffer buffer; buffer.setStableAdaptation(true); buffer.setGoalSolver(300,20000000,1000,true);
     uint64_t t=1000000,frame=0,slot=1000000;
     auto feed=[&](int seconds,int spikeEvery){for(int i=0;i<seconds*120;++i){t+=8333;slot+=8333;++frame;
         const int64_t late=spikeEvery&&frame%spikeEvery==0?5000:0;
@@ -1406,10 +1413,10 @@ static void testProductionUsesGoalSolver() {
         session.timingOptions=VrrTimingOptions::preset(e.mode);
         const auto policy=vrrTimingParametersForSession(session);
         check(policy.playoutInputGoalLambda==e.lambda && policy.playoutInputGoalWindowUs==e.windowUs &&
-              policy.playoutInputGoalTailPerMille==700 && policy.playoutInputIntrinsicDecodeGpu==1 &&
+              policy.playoutInputGoalUnpriced==1 && policy.playoutInputGoalTailPerMille==700 && policy.playoutInputIntrinsicDecodeGpu==1 &&
               policy.playoutInputPercentileRiseUsPerSecond==4000 && policy.playoutInputPercentileFallUsPerSecond==1000 &&
               policy.playoutDelayMaximumPeriodPerMille==e.capPerMille,
-              "each production profile prices the goal solver and keeps its buffer cap");
+              "each production profile disables the latency price and keeps its buffer cap");
         session.inputGoalSolver=false;
         const auto legacy=vrrTimingParametersForSession(session);
         check(legacy.playoutInputGoalLambda==0 && legacy.playoutInputIntrinsicDecodeGpu==0 &&
