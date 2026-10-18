@@ -22,7 +22,7 @@ constexpr uint64_t kPlayoutStartUs = 6000;
 constexpr uint64_t kPlayoutMinimumUs = 1000;
 constexpr uint64_t kPlayoutMaximumUs = 8000;
 // Profile buffer allowances are measured in fitted source frames, independent
-// of display refresh: half for Low Latency, one for Balanced, four for Smooth.
+// of display refresh: half for Low Latency, one for Balanced, two for Smooth.
 // Every profile waits in the same four-frame queue and differs only in how
 // much of it its delay ceiling uses. With three frames, Balanced's 16 ms
 // ceiling filled the queue budget near 120 FPS, so capacity rather than the
@@ -251,6 +251,21 @@ VrrTimingParameters vrrTimingParametersForSession(
             uint64_t(options.historySeconds) * 1000000, 10000000, 300000000);
         parameters.playoutInputPercentileRiseUsPerSecond = std::clamp<uint64_t>(
             config.experimentalInputPercentileRiseUsPerSecond, 250, 1000);
+        // Meet the profile's client-timing goal with the least buffer over a
+        // recent span, aiming at 70% of its allowed loss because growth
+        // follows a dip. When the goal is out of reach, stop buying buffer once
+        // a millisecond recovers less than the profile's price: 0.5, 0.3 and
+        // 0.1 percentage points for 99%, 99.5% and 99.9%+ goals.
+        const auto target = parameters.playoutInputPercentileTargetPerMillion;
+        if (config.inputGoalSolver) {
+        parameters.playoutInputGoalLambda = target >= 999000 ? 100 : target >= 995000 ? 300 : 500;
+        parameters.playoutInputGoalWindowUs = target >= 999000 ? 120000000 :
+            target >= 995000 ? 60000000 : 20000000;
+        parameters.playoutInputGoalTailPerMille = 700;
+        parameters.playoutInputIntrinsicDecodeGpu = 1;
+        parameters.playoutInputPercentileRiseUsPerSecond = 4000;
+        parameters.playoutInputPercentileFallUsPerSecond = 1000;
+        }
     }
     // Late-frame recovery is independent of optional source-cadence smoothing.
     parameters.playoutCatchupPerMille = 20;
@@ -402,7 +417,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutMetronomeEnabled = 0;
     parameters.playoutDelayStartPeriodPerMille = kPlayoutStartPeriodPerMille;
     // The maximum and cap both express the selected total buffer in source
-    // frames: half for Low Latency, one for Balanced, four for Smooth. Use the
+    // frames: half for Low Latency, one for Balanced, two for Smooth. Use the
     // fitted source period, never the display refresh, for this allowance.
     parameters.playoutDelayMaximumPeriodPerMille =
         options.bufferPerMille;
@@ -734,6 +749,15 @@ void VrrTimingController::learnDecodeGpu(const PacedFrame& frame)
     const auto middle = sorted.begin() + m_DecodeGpuCount / 2;
     std::nth_element(sorted.begin(), middle, sorted.begin() + m_DecodeGpuCount);
     m_DecodeGpuTypicalUs = *middle;
+    const uint64_t collectedUs = complete - std::min(complete, frame.decodeSyncWaitUs());
+    if (collectedUs > output + PromptCollectionUs) return;
+    m_DecodeIntrinsicSamples[m_DecodeIntrinsicNext] = complete - output;
+    m_DecodeIntrinsicNext = (m_DecodeIntrinsicNext + 1) % m_DecodeIntrinsicSamples.size();
+    m_DecodeIntrinsicCount = std::min(m_DecodeIntrinsicCount + 1, m_DecodeIntrinsicSamples.size());
+    auto intrinsic = m_DecodeIntrinsicSamples;
+    const auto intrinsicMiddle = intrinsic.begin() + m_DecodeIntrinsicCount / 2;
+    std::nth_element(intrinsic.begin(), intrinsicMiddle, intrinsic.begin() + m_DecodeIntrinsicCount);
+    m_DecodeIntrinsicUs = *intrinsicMiddle;
 }
 
 uint64_t VrrTimingController::sourceMappingUs(const PacedFrame& frame) const
@@ -1448,7 +1472,12 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     // buffer must cover. Completions observed after a queue wait are bounded
     // by output + typical GPU time so our own queueing is not counted.
     const auto inputBacklog = saturatingAdd(frame.decoderQueueUs(), frame.decodeHoldUs());
-    const auto decodeReadyUs = estimatedDecodeCompleteUs(frame);
+    auto decodeReadyUs = estimatedDecodeCompleteUs(frame);
+    // A decode observed only after the worker collected the frame finished
+    // behind our own queue, not its network or decode cost.
+    if (m_Parameters.playoutInputIntrinsicDecodeGpu && m_DecodeIntrinsicUs && frame.decoderOutputUs())
+        decodeReadyUs = std::max(frame.reassembledUs(),
+            std::min(decodeReadyUs, saturatingAdd(frame.decoderOutputUs(), m_DecodeIntrinsicUs)));
     const auto inputReadyUs = decodeReadyUs - std::min(decodeReadyUs, inputBacklog);
     m_Pending.inputRequiredUs = signedDifference(inputReadyUs, m_Pending.inputSlotUs);
     m_Pending.inputValid = frame.reassembledUs() != 0 &&
@@ -2679,6 +2708,9 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                     static_cast<size_t>(m_Parameters.playoutInputLearningTrim));
                 const auto inputBefore = m_InputPercentileBuffer.stats();
                 m_InputPercentileBuffer.setStableAdaptation(m_Parameters.playoutInputStableAdaptation != 0);
+                m_InputPercentileBuffer.setGoalSolver(m_Parameters.playoutInputGoalLambda,
+                    m_Parameters.playoutInputGoalWindowUs,
+                    m_Parameters.playoutInputGoalTailPerMille ? m_Parameters.playoutInputGoalTailPerMille : 1000);
                 m_InputPercentileBuffer.observe(m_Pending.smoothness.frame,
                     enqueueUs ? enqueueUs : m_Pending.inputObservationUs,
                     m_Pending.intervalIntendedUs, m_Pending.inputRequiredUs, validInput,
@@ -4210,6 +4242,9 @@ void VrrTimingController::updatePlayoutHistory(
                     else m_InputRateDropAtUs = 0;
                 }
                 m_InputPercentileBuffer.setStableAdaptation(m_Parameters.playoutInputStableAdaptation != 0);
+                m_InputPercentileBuffer.setGoalSolver(m_Parameters.playoutInputGoalLambda,
+                    m_Parameters.playoutInputGoalWindowUs,
+                    m_Parameters.playoutInputGoalTailPerMille ? m_Parameters.playoutInputGoalTailPerMille : 1000);
                 m_InputPercentileBuffer.advance(nowUs, playoutDelayMinimumUs(),
                     playoutDelayMaximumUs(), m_Parameters.playoutInputPercentileTargetPerMillion,
                     m_Parameters.playoutInputPercentileWindowUs,

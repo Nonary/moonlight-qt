@@ -900,7 +900,7 @@ void testProbabilitySupportAndCap() {
 void testFactoryProfileOwnsAdaptiveTarget() {
     for(int mode:{0,1,2}) {
         for(int custom:{0,9900,9950,9999,-1,12,10000,999999}) {
-            VrrSessionConfig session;session.streamRateHz=120;session.displayRefreshHz=144;
+            VrrSessionConfig session;session.inputGoalSolver=false;session.streamRateHz=120;session.displayRefreshHz=144;
             session.latencyMode=mode;session.timingOptions.targetHundredths=custom;
             session.timingOptions.historySeconds=custom==0?0:200;
             session.experimentalInputPercentileWindowUs=30000000;
@@ -921,13 +921,13 @@ void testFactoryProfileOwnsAdaptiveTarget() {
                 "adaptive activation preserves selected target in interval severity diagnostics");
         }
     }
-    VrrSessionConfig user;user.experimentalInputPercentilePpm=1;user.timingOptions.toleranceUs=750;
+    VrrSessionConfig user;user.inputGoalSolver=false;user.experimentalInputPercentilePpm=1;user.timingOptions.toleranceUs=750;
     user.timingOptions.targetHundredths=9950;user.timingOptions.historySeconds=200;
     const auto userPolicy=vrrTimingParametersForSession(user);
     check(userPolicy.playoutInputPercentileToleranceUs==750 && userPolicy.playoutInputPercentileTargetPerMillion==995000 &&
         userPolicy.playoutInputPercentileWindowUs==200000000,"actual750us user profile sizes the adaptive quantile without changing99.50percent/200s");
     for(int history:{0,1,10,200,300,999}) {
-        VrrSessionConfig session;session.latencyMode=1;session.experimentalInputPercentilePpm=1;
+        VrrSessionConfig session;session.inputGoalSolver=false;session.latencyMode=1;session.experimentalInputPercentilePpm=1;
         session.timingOptions.historySeconds=history;session.experimentalInputPercentileWindowUs=30000000;
         const auto policy=vrrTimingParametersForSession(session);
         check(policy.playoutInputPercentileWindowUs==uint64_t(session.timingOptions.resolved(1).historySeconds)*1000000,
@@ -937,7 +937,7 @@ void testFactoryProfileOwnsAdaptiveTarget() {
 void testActualControllerRateBandsRestoreProtection() {
     // The user's round trip: 120 FPS needs buffer, 30 FPS needs none (and has
     // less lateness, as in the 22:55 capture), then back to 120 FPS.
-    VrrSessionConfig session;session.streamRateHz=120;session.displayRefreshHz=144;
+    VrrSessionConfig session;session.inputGoalSolver=false;session.streamRateHz=120;session.displayRefreshHz=144;
     session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=995000;
     session.timingOptions={1000,9950,60,500};
     auto policy=vrrTimingParametersForSession(session);
@@ -993,7 +993,7 @@ void testActualControllerRateBandsRestoreProtection() {
 
 void testOrdinaryVariationKeepsLayer() {
     for (const uint64_t version : {7,8,9}) {
-        VrrSessionConfig session;session.streamRateHz=116;session.displayRefreshHz=120;
+        VrrSessionConfig session;session.inputGoalSolver=false;session.streamRateHz=116;session.displayRefreshHz=120;
         session.experimentalInputPercentilePpm=1;session.timingOptions={1000,9950,120,500};
         auto policy=vrrTimingParametersForSession(session);
         policy.playoutInputHitchMissesOnly=version;policy.playoutInputStableAdaptation=version>=10;policy.latencyFixEnabled=0;
@@ -1051,7 +1051,7 @@ void testOrdinaryVariationKeepsLayer() {
 }
 
 void testFastControllerLayerRoundTrip(uint64_t version, bool bounded=false) {
-    VrrSessionConfig session;session.streamRateHz=120;session.displayRefreshHz=120;
+    VrrSessionConfig session;session.inputGoalSolver=false;session.streamRateHz=120;session.displayRefreshHz=120;
     session.latencyMode=1;session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=1;
     session.experimentalBoundedCatchup=bounded;
     session.timingOptions={1000,9950,120,500};
@@ -1113,7 +1113,7 @@ void testFastControllerLayerRoundTrip(uint64_t version, bool bounded=false) {
 
 void testRateBaselineStepIsNotClockDrift() {
     const auto run=[](uint64_t version,int64_t driftPpm=0) {
-        VrrSessionConfig session;session.streamRateHz=90;session.displayRefreshHz=120;
+        VrrSessionConfig session;session.inputGoalSolver=false;session.streamRateHz=90;session.displayRefreshHz=120;
         session.experimentalBoundedCatchup=true;
         session.experimentalInputPercentilePpm=995000;session.timingOptions={1000,9950,120,500};
         auto policy=vrrTimingParametersForSession(session);
@@ -1154,7 +1154,7 @@ void testRateBaselineStepIsNotClockDrift() {
           "after the rate baseline settles, genuine clock drift is learned again in both directions");
 }
 void testActualControllerInputMissReleaseFeedbackApi() {
-    VrrSessionConfig session;session.streamRateHz=60;session.displayRefreshHz=120;
+    VrrSessionConfig session;session.inputGoalSolver=false;session.streamRateHz=60;session.displayRefreshHz=120;
     VrrTimingController ordinary(session);
     ordinary.noteInputBufferMiss(1000000,true,true);
     check(ordinary.intervalStats().inputPercentile.cumulativeNetworkMisses==0 &&
@@ -1182,7 +1182,7 @@ void testActualControllerInputMissReleaseFeedbackApi() {
         "actual full controller reset clears input diagnostics");
 }
 void testActualControllerRepeatedZeroTimestampDrops() {
-    VrrSessionConfig session;session.streamRateHz=60;session.displayRefreshHz=120;
+    VrrSessionConfig session;session.inputGoalSolver=false;session.streamRateHz=60;session.displayRefreshHz=120;
     session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=990000;
     session.experimentalInputPercentileWindowUs=30000000;
     session.timingOptions.historySeconds=30;
@@ -1210,7 +1210,7 @@ void testActualControllerRepeatedZeroTimestampDrops() {
         "repeated zero-timestamp drops and phase resets release obsolete seed after history expiry and fall slew");
 }
 void testActualControllerRequiresAnInputHitch() {
-    VrrSessionConfig session;session.streamRateHz=100;session.displayRefreshHz=240;
+    VrrSessionConfig session;session.inputGoalSolver=false;session.streamRateHz=100;session.displayRefreshHz=240;
     session.latencyMode=1;session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=1;
     session.timingOptions={1000,9950,10,500};
     auto base=vrrTimingParametersForSession(session);
@@ -1260,7 +1260,7 @@ void testActualControllerRequiresAnInputHitch() {
 }
 
 void testActualControllerPostInputErrorsCannotInflateBuffer() {
-    VrrSessionConfig session;session.streamRateHz=60;session.displayRefreshHz=120;
+    VrrSessionConfig session;session.inputGoalSolver=false;session.streamRateHz=60;session.displayRefreshHz=120;
     session.latencyMode=1;session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=1;
     session.timingOptions={1000,9950,10,500};
     auto policy=vrrTimingParametersForSession(session);
@@ -1295,7 +1295,7 @@ void testActualControllerPostInputErrorsCannotInflateBuffer() {
         "own buffering and rebases preserve raw causal input requirement under downstream errors");
 }
 void testActualControllerOptInAndEligibility() {
-    VrrSessionConfig baseline;baseline.streamRateHz=120;baseline.displayRefreshHz=144;
+    VrrSessionConfig baseline;baseline.inputGoalSolver=false;baseline.streamRateHz=120;baseline.displayRefreshHz=144;
     baseline.smoothFrameTiming=false;
     VrrTimingController production(baseline);
     check(!production.intervalStats().inputPercentileEnabled,"default production controller keeps percentile mode disabled");
@@ -1359,6 +1359,65 @@ void testActualControllerOptInAndEligibility() {
 #endif
 
 }
+static void testGoalSolverMeetsGoalWithLeastBuffer() {
+    // 1000 pairs at 8333 us; every 100th frame arrives 6 ms late.
+    Vrr13::InputGoalSolver solver; int64_t previous=0;
+    for(int i=1;i<=1000;++i){const int64_t late=i%100==0?6000:0;solver.add(previous,late,8333,500);previous=late;}
+    check(solver.jitterPairs()==19,"goal solver keeps only pairs whose lateness differs beyond tolerance");
+    const auto met=solver.solve(995000,500,300,0,8620,250);
+    check(met.goalReachable && solver.loss(met.bufferUs,500)<=0.005 &&
+          (met.bufferUs==0 || solver.loss(met.bufferUs-250,500)>0.005),
+          "goal solver returns the smallest grid buffer that meets the goal");
+    check(met.bufferUs<6000,"a 99.5% goal tolerates part of a 2% late tail without covering all of it");
+    const auto strict=solver.solve(999500,500,300,0,8620,250);
+    check(strict.goalReachable && strict.bufferUs>=5500 && strict.bufferUs<=6000,
+          "a 99.95% goal covers the late frames to within the tolerance");
+}
+static void testGoalSolverPricesUnreachableGoals() {
+    // Half the frames arrive 12 ms late: an 8.6 ms maximum reduces but cannot remove the loss.
+    Vrr13::InputGoalSolver solver; int64_t previous=0;
+    for(int i=1;i<=1000;++i){const int64_t late=i%2?12000:0;solver.add(previous,late,8333,500);previous=late;}
+    const auto cheap=solver.solve(995000,500,100000,0,8620,250);
+    const auto dear=solver.solve(995000,500,1,0,8620,250);
+    check(!cheap.goalReachable && !dear.goalReachable,"an unreachable goal is reported");
+    check(cheap.bufferUs==0,"a high price buys no buffer when buffer cannot reach the goal");
+    check(dear.bufferUs==8620,"a negligible price buys the best buffer within the maximum");
+}
+static void testGoalBufferFollowsRecentJitter() {
+    Vrr13::InputPercentileBuffer buffer; buffer.setStableAdaptation(true); buffer.setGoalSolver(300,20000000,1000);
+    uint64_t t=1000000,frame=0,slot=1000000;
+    auto feed=[&](int seconds,int spikeEvery){for(int i=0;i<seconds*120;++i){t+=8333;slot+=8333;++frame;
+        const int64_t late=spikeEvery&&frame%spikeEvery==0?5000:0;
+        buffer.advance(t,0,8620,995000,60000000,4000,1000,0,500,0,0,10);
+        buffer.observe(frame,t,slot,late,true,0,8620,995000,60000000,4000,1000,0,500,0,0,late>500,10);}};
+    feed(30,50);
+    const uint64_t grown=buffer.stats().currentUs;
+    check(grown>=3500 && grown<=5000,"recurring 5 ms spikes above the goal's tail grow the buffer to cover them");
+    feed(60,0);
+    check(buffer.stats().currentUs==0,"clean input releases the buffer once the spikes leave the solver window");
+}
+
+#ifdef INPUT_PERCENTILE_CONTROLLER_TEST
+static void testProductionUsesGoalSolver() {
+    struct Expect { int mode; uint64_t lambda, windowUs, capPerMille; };
+    for(const auto e:{Expect{2,500,20000000,500},Expect{1,300,60000000,1000},Expect{0,100,120000000,2000}}){
+        VrrSessionConfig session;session.streamRateHz=116;session.displayRefreshHz=120;session.latencyMode=e.mode;
+        session.experimentalInputPercentilePpm=1;session.experimentalBoundedCatchup=true;
+        session.timingOptions=VrrTimingOptions::preset(e.mode);
+        const auto policy=vrrTimingParametersForSession(session);
+        check(policy.playoutInputGoalLambda==e.lambda && policy.playoutInputGoalWindowUs==e.windowUs &&
+              policy.playoutInputGoalTailPerMille==700 && policy.playoutInputIntrinsicDecodeGpu==1 &&
+              policy.playoutInputPercentileRiseUsPerSecond==4000 && policy.playoutInputPercentileFallUsPerSecond==1000 &&
+              policy.playoutDelayMaximumPeriodPerMille==e.capPerMille,
+              "each production profile prices the goal solver and keeps its buffer cap");
+        session.inputGoalSolver=false;
+        const auto legacy=vrrTimingParametersForSession(session);
+        check(legacy.playoutInputGoalLambda==0 && legacy.playoutInputIntrinsicDecodeGpu==0 &&
+              legacy.playoutInputPercentileFallUsPerSecond==250,"the quantile policy remains selectable");
+    }
+}
+#endif
+
 int main() {
     testFastLayerCadence();testConfirmedLayerCadence();testContinuousCoverage();testResponsiveCoverageReporting();
     testGradualLayerGrowthAndHealthyRelease();
@@ -1375,6 +1434,10 @@ int main() {
     testVrrHeadroomAbsorbsLateness();testPhaseBreakKeepsEvidenceAndHeadroomLossRestores();testStartupLearning();
     testQuantileAndClock();testBudgetAndSignedOffsets();testInputToleranceBoundaryAndNormalization();testSlewBoundsAndReset();
     testInvalidCapacityAndExpiry();testProbabilitySupportAndCap();testHistoryAgingWithoutEligibleInput();testNoRunawayAndQualifiedGrowth();testUnthrottledInputPercentileRelease();
+    testGoalSolverMeetsGoalWithLeastBuffer();testGoalSolverPricesUnreachableGoals();testGoalBufferFollowsRecentJitter();
+#ifdef INPUT_PERCENTILE_CONTROLLER_TEST
+    testProductionUsesGoalSolver();
+#endif
 #ifdef INPUT_PERCENTILE_CONTROLLER_TEST
     testFactoryProfileOwnsAdaptiveTarget();
     testActualControllerOptInAndEligibility();

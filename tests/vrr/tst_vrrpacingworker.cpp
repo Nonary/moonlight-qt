@@ -3615,7 +3615,7 @@ void testTrajectoryReadySuccessorReservation() {
     QTemporaryDir directory;const auto path=directory.filePath("trajectory-reservation.vrrtrace");qputenv("MOONLIGHT_VRR_TRACE",QFile::encodeName(path));
     NativeScheduledPresenter backend;backend.lateAttempt=64;backend.lateExtraUs=1000;backend.blockDecodeFrame(65);
     PacerTelemetry telemetry;TrackedFrameLifetime life[66];
-    auto config=enabledConfig();config.streamRateHz=120;config.displayRefreshHz=120;
+    auto config=enabledConfig();config.streamRateHz=120;config.displayRefreshHz=120;config.inputGoalSolver=false;
     config.timingOptions.targetHundredths=9950;config.timingOptions.historySeconds=200;
     {
         VrrPacingWorker worker(&backend,config,&telemetry);expect(worker.start(),"trajectory reservation worker starts");

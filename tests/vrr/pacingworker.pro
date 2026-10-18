@@ -60,3 +60,4 @@ HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/absorbedji
            $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/intervalbuffer.h
 
 HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h
+HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputgoalbuffer.h

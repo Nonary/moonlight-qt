@@ -9,7 +9,7 @@ int fail=0;
 void check(bool b,const char* msg){if(!b){std::fprintf(stderr,"FAIL: %s\n",msg);++fail;}}
 void observe(InputPercentileBuffer& b,uint64_t f,int64_t req,int64_t clock,uint64_t room=500,uint64_t window=300000000){b.observe(f,1000000+f*10000,2000000+f*10000,req,true,1000,25000,999500,window,1000,250,0,500,room,clock);}
 void rateRoundTrip() {
- VrrSessionConfig cfg;cfg.streamRateHz=116;cfg.displayRefreshHz=120;
+ VrrSessionConfig cfg;cfg.inputGoalSolver=false;cfg.streamRateHz=116;cfg.displayRefreshHz=120;
  cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;
  cfg.smoothFrameTiming=false;cfg.timingOptions={4000,9995,300,500};
  auto policy=vrrTimingParametersForSession(cfg);policy.playoutDelayStartSeedUs=1000;
@@ -40,7 +40,7 @@ void rateRoundTrip() {
 }
 struct DriftRun{double meanUs;uint64_t missed,eligible;};
 DriftRun driftRun(bool correct,double ppm,bool sparseEarly=false) {
- VrrSessionConfig cfg;cfg.streamRateHz=116;cfg.displayRefreshHz=120;
+ VrrSessionConfig cfg;cfg.inputGoalSolver=false;cfg.streamRateHz=116;cfg.displayRefreshHz=120;
  cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;cfg.correctInputAccounting=correct;
  cfg.smoothFrameTiming=false;cfg.timingOptions={4000,9995,300,500};
  auto policy=vrrTimingParametersForSession(cfg);policy.playoutDelayStartSeedUs=1000;
@@ -87,7 +87,7 @@ struct DropRun{double latencyUs;uint64_t missed,eligible;};
 // source then drops abruptly to 30 FPS without early frames: the mapping slews
 // 8 ms later over seconds and the evidence needs 8 ms less buffer.
 DropRun rateDropRun(bool follow,uint64_t version=6) {
- VrrSessionConfig cfg;cfg.streamRateHz=116;cfg.displayRefreshHz=120;
+ VrrSessionConfig cfg;cfg.inputGoalSolver=false;cfg.streamRateHz=116;cfg.displayRefreshHz=120;
  cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;
  cfg.smoothFrameTiming=false;cfg.timingOptions={4000,9995,300,500};
  auto policy=vrrTimingParametersForSession(cfg);policy.playoutDelayStartSeedUs=1000;
@@ -136,7 +136,7 @@ void rateDropFollow() {
        "T-per-frame layer draining retains prompt low-rate recovery without an instant downward step");
 }
 int main(){
- VrrSessionConfig cfg;cfg.streamRateHz=76;cfg.displayRefreshHz=120;cfg.latencyMode=0;cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;cfg.timingOptions={4000,9995,300,500};
+ VrrSessionConfig cfg;cfg.inputGoalSolver=false;cfg.streamRateHz=76;cfg.displayRefreshHz=120;cfg.latencyMode=0;cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;cfg.timingOptions={4000,9995,300,500};
  auto p=vrrTimingParametersForSession(cfg);VrrTimingController c(cfg,true,p);
  check(p.playoutInputHitchMissesOnly==10,"new sessions use fast rate layers while historical clock comparisons remain explicit");
  check(p.playoutInputClockRelativeHistory==3&&p.playoutInputBoundedRecoveryCredit==0&&p.playoutInputRateDropSnap==1&&

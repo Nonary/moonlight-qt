@@ -54,6 +54,7 @@ HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/absorbedji
            $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/intervalbuffer.h
 
 HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h
+HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputgoalbuffer.h
 
 HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/phasetrajectory.h \
            $$PWD/../../app/streaming/video/ffmpeg-renderers/vrrpreparedframe.h

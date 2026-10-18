@@ -60,6 +60,15 @@
     X(uint64_t, playout_input_hitch_misses_only, playoutInputHitchMissesOnly, 0) \
     /* Stable target adaptation is independent of miss eligibility. */ \
     X(uint64_t, playout_input_stable_adaptation, playoutInputStableAdaptation, 0) \
+    /* Nonzero: client-timing goal solver; thousandths of a percentage point */ \
+    /* of score each further millisecond must recover when the goal is unreachable. */ \
+    X(uint64_t, playout_input_goal_lambda, playoutInputGoalLambda, 0) \
+    X(uint64_t, playout_input_goal_window_us, playoutInputGoalWindowUs, 0) \
+    /* Share of the goal's allowed loss the solver aims for; 0 aims at the goal. */ \
+    X(uint64_t, playout_input_goal_tail_per_mille, playoutInputGoalTailPerMille, 0) \
+    /* Nonzero: input readiness uses decoder output plus the GPU decode time */ \
+    /* of promptly collected frames, so pacing-queue gating is not jitter. */ \
+    X(uint64_t, playout_input_intrinsic_decode_gpu, playoutInputIntrinsicDecodeGpu, 0) \
     X(uint64_t, playout_input_percentile_target_per_million, playoutInputPercentileTargetPerMillion, 990000) \
     X(uint64_t, playout_input_percentile_window_us, playoutInputPercentileWindowUs, 60000000) \
     X(uint64_t, playout_input_percentile_tolerance_us, playoutInputPercentileToleranceUs, 0) \
@@ -899,6 +908,13 @@ private:
     std::array<uint64_t, 64> m_DecodeGpuSamples {};
     size_t m_DecodeGpuNext = 0, m_DecodeGpuCount = 0;
     uint64_t m_DecodeGpuTypicalUs = 0;
+    // The same durations restricted to frames the worker collected within
+    // PromptCollectionUs of decoder output: their decode was not held back
+    // behind earlier queued frames.
+    static constexpr uint64_t PromptCollectionUs = 1000;
+    std::array<uint64_t, 64> m_DecodeIntrinsicSamples {};
+    size_t m_DecodeIntrinsicNext = 0, m_DecodeIntrinsicCount = 0;
+    uint64_t m_DecodeIntrinsicUs = 0;
     uint64_t m_InputPercentileBeforeUs = 0;
     // Interval-buffer demand remembered per source-rate epoch, keyed by
     // quarter-octave rate bucket.

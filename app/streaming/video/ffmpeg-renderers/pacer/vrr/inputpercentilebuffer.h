@@ -1,4 +1,5 @@
 #pragma once
+#include "inputgoalbuffer.h"
 #include <algorithm>
 #include <cstdint>
 #include <deque>
@@ -76,6 +77,14 @@ public:
     // Keep the learned percentile and configured fall rate in charge. Miss
     // eligibility and the evidence required for growth remain independent.
     void setStableAdaptation(bool stable) { m_StableAdaptation = stable; }
+    // Nonzero lambda selects the client-timing goal solver: the target is the
+    // smallest buffer meeting the goal over the last windowUs of inputs, or
+    // the best trade at `lambda` when the goal is out of reach. The solver aims
+    // at tailPerMille of the goal's allowed loss, so reacting after a window
+    // dips still leaves the session at the goal.
+    void setGoalSolver(uint64_t lambda, uint64_t windowUs, uint64_t tailPerMille = 1000) {
+        m_GoalLambda = lambda; m_GoalWindowUs = windowUs; m_GoalTailPerMille = std::clamp<uint64_t>(tailPerMille, 1, 1000);
+    }
     // While learning, ignore the largest `trim` requirements so one startup
     // or scene-load outlier cannot set protection.
     void setLearningTrim(size_t trim) { m_LearningTrim = trim; }
@@ -313,7 +322,7 @@ public:
         // policy. They remain raw diagnostics, not failures or invented clean
         // samples in the preventable-miss goal.
         const bool eligible = valid && slotUs &&
-            (!m_HitchMissesOnly || headroom <= m_Stats.maximumUs);
+            (!m_HitchMissesOnly || m_GoalLambda || headroom <= m_Stats.maximumUs);
         m_Stats.lastInputEligible = eligible;
         const bool absorbed = eligible && headroom > 0 && headroom <= m_Stats.currentUs;
         const bool missed = eligible && headroom > m_Stats.currentUs &&
@@ -599,6 +608,10 @@ private:
             else m_ReleaseFraction = 0;
             return;
         }
+        if (m_GoalLambda) {
+            evaluateGoal(atUs);
+            return;
+        }
         const uint64_t tail = 1000000 - probabilityPpm;
         const uint64_t needed = (1000000 + tail - 1) / tail;
         const bool belowMissGoal = m_Stats.recentEligible &&
@@ -706,6 +719,44 @@ private:
             if (m_HitchMissesOnly == 9) updateReleaseRate(m_Stats.recentReleaseMisses);
         }
     }
+    void evaluateGoal(uint64_t atUs) {
+        if (m_LastEvaluationUs && atUs - m_LastEvaluationUs < GoalEvaluationIntervalUs &&
+                m_EvaluatedProbabilityPpm == m_Stats.probabilityPpm && m_EvaluatedWindowUs == m_Stats.windowUs)
+            return;
+        m_LastEvaluationUs = atUs;
+        m_EvaluatedProbabilityPpm = m_Stats.probabilityPpm;
+        m_EvaluatedWindowUs = m_Stats.windowUs;
+        const uint64_t spanUs = std::min(m_GoalWindowUs ? m_GoalWindowUs : m_Stats.windowUs, m_Stats.windowUs);
+        // Retained requirements live in the source coordinate; project them
+        // into the current mapping as the quantile policy does.
+        const auto lateness = [&](const Sample& sample) {
+            return offsetDifference(offsetDifference(sample.required, m_Stats.clockOffsetUs),
+                                    m_Stats.readinessBudgetUs);
+        };
+        m_GoalSolver.clear();
+        const Sample* previous = nullptr;
+        for (const auto& sample : m_Samples) {
+            if (sample.seed || atUs - sample.at >= spanUs) { previous = nullptr; continue; }
+            if (previous && sample.epoch == previous->epoch && sample.slot > previous->slot &&
+                    sample.slot - previous->slot < 1000000)
+                m_GoalSolver.add(lateness(*previous), lateness(sample), sample.slot - previous->slot,
+                                 m_Stats.toleranceUs);
+            previous = &sample;
+        }
+        m_Stats.validPairCoverageUs = m_GoalSolver.intendedUs();
+        m_Stats.tailUncertain = m_GoalSolver.intendedUs() < GoalMinimumCoverageUs;
+        if (m_Stats.tailUncertain) {
+            m_Stats.targetUs = m_Stats.currentUs;
+            return;
+        }
+        m_Learning = false;
+        const uint64_t aimPpm = 1000000 - (1000000 - m_Stats.probabilityPpm) * m_GoalTailPerMille / 1000;
+        const auto solution = m_GoalSolver.solve(aimPpm, m_Stats.toleranceUs, m_GoalLambda,
+            m_Stats.minimumUs, m_Stats.maximumUs, GoalStepUs);
+        m_Stats.headroomTargetUnclippedUs = solution.bufferUs;
+        m_Stats.clipped = !solution.goalReachable;
+        m_Stats.targetUs = std::clamp(solution.bufferUs, m_Stats.minimumUs, m_Stats.maximumUs);
+    }
     void move(uint64_t elapsed, bool growthAllowed) {
         const int direction = m_Stats.targetUs > m_Stats.currentUs ? 1 :
             m_Stats.targetUs < m_Stats.currentUs ? -1 : 0;
@@ -713,6 +764,18 @@ private:
         m_Direction = direction;
         m_Stats.growthBlocked = direction > 0 && !growthAllowed;
         if (!direction || (direction > 0 && !growthAllowed)) return;
+        if (m_GoalLambda) {
+            // The solver already priced the target; slew at the plain rates.
+            m_ReleaseFraction += elapsed * (direction > 0 ? m_RiseRate : m_FallRate);
+            const uint64_t step = m_ReleaseFraction / 1000000;
+            m_ReleaseFraction %= 1000000;
+            const uint64_t distance = direction > 0 ? m_Stats.targetUs - m_Stats.currentUs :
+                m_Stats.currentUs - m_Stats.targetUs;
+            const uint64_t movement = std::min(step, distance);
+            if (direction > 0) { m_Stats.currentUs += movement; if (movement) ++m_Stats.raises; }
+            else { m_Stats.currentUs -= movement; if (movement) ++m_Stats.lowers; }
+            return;
+        }
         if (direction < 0 && m_RateDropDrain &&
             m_Stats.currentUs - m_Stats.targetUs > m_Stats.toleranceUs) m_RateDropFastDrain = true;
         if (direction < 0 && m_HitchMissesOnly == 9 && fastLayerDrain()) {
@@ -776,6 +839,11 @@ private:
     bool m_RateDropDrain = false, m_RateDropFastDrain = false;
     struct Sample { uint64_t at, slot; int64_t required; uint64_t epoch; bool absorbed, missed; bool seed = false; };
     std::deque<Sample> m_Samples;
+    static constexpr uint64_t GoalEvaluationIntervalUs = 500000;
+    static constexpr uint64_t GoalMinimumCoverageUs = 1000000;
+    static constexpr uint64_t GoalStepUs = 250;
+    uint64_t m_GoalLambda = 0, m_GoalWindowUs = 0, m_GoalTailPerMille = 1000;
+    InputGoalSolver m_GoalSolver;
     Stats m_Stats;
     uint64_t m_FirstObservationUs = 0, m_LastObservationUs = 0, m_LastEligibleUs = 0;
     uint64_t m_LastClockUs = 0, m_RiseRate = 0, m_FallRate = 0;

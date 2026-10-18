@@ -3513,10 +3513,9 @@ void testPerFrameLatchIncludesSafetyHeadroom()
 
 void testSmoothQueueReachesItsCeilingNearRefresh()
 {
-    // At 116/120 with Reduce judder, three waiting frames minus the render
-    // lead and the 6 ms retiming budget clipped Smooth to ~16.9 ms (about two
-    // frames). Smooth's fourth waiting frame restores its 24 ms ceiling; the
-    // other profiles keep the historical three.
+    // At 116/120 with Reduce judder, the shared four-frame queue must still
+    // leave Smooth its full two-frame ceiling after the render lead and the
+    // retiming budget.
     for (int mode : {0, 1, 2}) {
         auto session = config(116, 120);
         session.latencyMode = mode;
@@ -3531,8 +3530,8 @@ void testSmoothQueueReachesItsCeilingNearRefresh()
         expect(controller.queuedFrameCapacity() == 4u,
                "every profile must wait in the same four-frame queue");
         if (mode == 0) {
-            expect(d.playoutDelayMaximumUs >= 23500,
-                   "Smooth must reach its 24 ms ceiling at 116 FPS with Reduce judder enabled");
+            expect(d.playoutDelayMaximumUs >= 16500,
+                   "Smooth must reach its two-frame ceiling at 116 FPS with Reduce judder enabled");
         }
         expect(d.playoutDelayMaximumUs <= controller.playoutQueueLimitUs(),
                "the delay ceiling must stay inside the queue budget");
@@ -4939,9 +4938,9 @@ void testProductionPreservesRelativeGameSpacing()
     session.smoothFrameTiming = false;
     auto policy = vrrTimingParametersForSession(session);
     expect(policy.playoutDelayMaximumUs == policy.playoutDelayMinimumUs &&
-               policy.playoutDelayMaximumPeriodPerMille == 4000 &&
-               policy.playoutDelayCapSourcePeriodPerMille == 4000,
-           "production Smooth must allow four fitted source periods");
+               policy.playoutDelayMaximumPeriodPerMille == 2000 &&
+               policy.playoutDelayCapSourcePeriodPerMille == 2000,
+           "production Smooth must allow two fitted source periods");
     // Hold padding constant to isolate the spacing contract from adaptation.
     policy.playoutDelayMaximumPeriodPerMille = 0;
     policy.playoutDelayCapSourcePeriodPerMille = 0;
@@ -5203,10 +5202,10 @@ void testLatencyPresetsAcrossSourceAndDisplayRates()
         const auto ordinaryPolicy = vrrTimingParametersForSession(ordinarySession);
         expect(ordinaryPolicy.latencyFixEnabled == 1 &&
                    ordinaryPolicy.latencyFixAllRates == 1 &&
-                   ordinaryPolicy.playoutDelayCapSourcePeriodPerMille == 4000 &&
+                   ordinaryPolicy.playoutDelayCapSourcePeriodPerMille == 2000 &&
                    ordinaryPolicy.playoutDelayMaximumUs == ordinaryPolicy.playoutDelayMinimumUs &&
-                   ordinaryPolicy.playoutDelayMaximumPeriodPerMille == 4000,
-               "Smooth must allow four fitted source frames within capacity limits");
+                   ordinaryPolicy.playoutDelayMaximumPeriodPerMille == 2000,
+               "Smooth must allow two fitted source frames within capacity limits");
         for (int mode : {1, 2}) {
             auto session = ordinarySession;
             session.latencyMode = mode;

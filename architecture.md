@@ -1,3 +1,24 @@
+Client-timing goal solver (2026-10-17, source baseline `7d1148f9`): new
+adaptive sessions select `playout_input_goal_lambda` and replace the input
+readiness quantile with `InputGoalSolver` (`inputgoalbuffer.h`). Each 500 ms
+the buffer models a frame shown at slot + max(B, lateness) over adjacent input
+pairs from the recent span, scores each interval like the Client timing
+severity score (loss min(1, (|error| - tolerance) / intended) of its duration)
+and takes the smallest 250 us grid buffer whose loss is within 70% of the
+profile's allowed loss. Only network and decode readiness count as lateness.
+When no buffer up to the cap meets the goal, it takes the global argmax of
+score minus a per-millisecond price (0.5, 0.3 and 0.1 percentage points for
+99%, 99.5% and 99.9%+), so an unreachable goal does not pin the cap. Spans are
+20/60/120 s for those goals; the buffer rises 4 ms/s and falls 1 ms/s.
+`playout_input_intrinsic_decode_gpu=1` bounds decode readiness at decoder
+output plus the median GPU decode time of frames collected within 1 ms of
+output, because PyroWave GPU decode does not complete until the worker
+collects the frame; that pacing-queue delay is not input jitter. Smooth's
+allowance is two source frames instead of four (preset revision 4 migrates the
+exact revision-3 tuples). `VrrSessionConfig::inputGoalSolver=false` selects
+the historical quantile policy; captures without the new fields replay
+unchanged.
+
 Stable input adaptation (2026-10-17, based on `181415ec`): new adaptive
 sessions retain input-hitch scoring policy 10 and additionally select
 `playout_input_stable_adaptation=1`. This supersedes the release behavior below.

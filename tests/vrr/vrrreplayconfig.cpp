@@ -388,9 +388,14 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
          value.playoutInputPercentileWindowUs < 10000000 ||
          value.playoutInputPercentileWindowUs > 300000000 ||
          value.playoutInputPercentileRiseUsPerSecond < 250 ||
-         value.playoutInputPercentileRiseUsPerSecond > 1000 ||
-         value.playoutInputPercentileFallUsPerSecond != 250)) {
-        return fail("experimental input percentile requires revision12+, prediction-only, explicit90..99.99% INPUT coverage,10..300s history,250..1000us/s rise and250us/s fall");
+         value.playoutInputPercentileRiseUsPerSecond > (value.playoutInputGoalLambda ? 4000 : 1000) ||
+         value.playoutInputPercentileFallUsPerSecond < 250 ||
+         value.playoutInputPercentileFallUsPerSecond > (value.playoutInputGoalLambda ? 1000 : 250))) {
+        return fail("experimental input percentile requires revision12+, prediction-only, explicit90..99.99% INPUT coverage,10..300s history,250..1000us/s rise and250us/s fall (goal solver: rise to 4000, fall to 1000)");
+    }
+    if (value.playoutInputGoalLambda > 100000 || value.playoutInputGoalWindowUs > 300000000 ||
+            value.playoutInputIntrinsicDecodeGpu > 1 || value.playoutInputGoalTailPerMille > 1000) {
+        return fail("playout_input_goal_lambda must be 0..100000, playout_input_goal_window_us 0..300000000, playout_input_goal_tail_per_mille 0..1000 and playout_input_intrinsic_decode_gpu 0 or 1");
     }
     if (value.baseGuardDivisor == 0 ||
             value.pacingLatencyExtraPeriodDenominator == 0 ||

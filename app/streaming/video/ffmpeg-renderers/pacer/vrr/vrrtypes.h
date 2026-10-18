@@ -45,6 +45,9 @@ struct VrrSessionConfig {
     // profile smoothness target supplies probability (never this marker value).
     // Main policy; a diagnostic control can select historical accounting.
     bool correctInputAccounting = true;
+    // Client-timing goal solver for the input buffer; off selects the
+    // historical quantile policy for comparisons.
+    bool inputGoalSolver = true;
     bool experimentalBoundedCatchup = false;
     uint64_t experimentalInputPercentilePpm = 0;
     uint64_t experimentalInputPercentileWindowUs = 60000000;
