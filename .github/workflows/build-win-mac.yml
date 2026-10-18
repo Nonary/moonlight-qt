@@ -274,6 +274,12 @@ jobs:
         env:
           QT_PATH: ${{ github.workspace }}\..\Qt\${{ matrix.qt_version }}\msvc2022_arm64\bin
 
+      - name: Test macOS bundle integrity and unsigned publisher policy
+        if: runner.os == 'macOS'
+        timeout-minutes: 2
+        shell: bash
+        run: python3 -B -m unittest discover -s scripts/tests -p test_macos_bundle_signature.py -v
+
       - name: Build Package
         shell: pwsh
         run: |
@@ -307,6 +313,7 @@ jobs:
           trap 'hdiutil detach "$mount"' EXIT
           app="$mount/Moonlight.app"
           test -d "$app"
+          codesign --verify --deep --strict "$app"
           lipo "$app/Contents/MacOS/Moonlight" -verify_arch x86_64 arm64
           version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
           test "$version" = "$(cat app/version.txt)"

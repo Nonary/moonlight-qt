@@ -223,7 +223,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutAbsorbedJitterRelease = 0;
     parameters.playoutInputPercentileEnabled = config.experimentalInputPercentilePpm != 0;
     parameters.playoutInputHitchMissesOnly = parameters.playoutInputPercentileEnabled ? 10 : 0;
-    parameters.playoutInputStableAdaptation = parameters.playoutInputPercentileEnabled ? 2 : 0;
+    parameters.playoutInputStableAdaptation = parameters.playoutInputPercentileEnabled ? 5 : 0;
     // Record lifecycle semantics explicitly; missing fields in older captures
     // retain their historical eviction and reacquisition behavior.
     parameters.playoutInputLayerLifecycle = parameters.playoutInputPercentileEnabled ? 2 : 0;
@@ -2703,6 +2703,9 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                     static_cast<size_t>(m_Parameters.playoutInputLearningTrim));
                 const auto inputBefore = m_InputPercentileBuffer.stats();
                 m_InputPercentileBuffer.setStableAdaptation(m_Parameters.playoutInputStableAdaptation);
+                if (m_Parameters.playoutInputStableAdaptation >= 4)
+                    m_InputCoverageHistory.advance(enqueueUs ? enqueueUs : m_Pending.inputObservationUs,
+                        m_Parameters.playoutInputPercentileWindowUs);
                 m_InputPercentileBuffer.observe(m_Pending.smoothness.frame,
                     enqueueUs ? enqueueUs : m_Pending.inputObservationUs,
                     m_Pending.intervalIntendedUs, m_Pending.inputRequiredUs, validInput,
@@ -2713,7 +2716,9 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                     m_Parameters.playoutInputPercentileFallUsPerSecond,
                     m_Pending.inputReadinessBudgetUs, m_Parameters.playoutInputPercentileToleranceUs,
                     inputRecoveryCreditUs(), m_Pending.inputClockOffsetUs, inputHitch,
-                    inputHitchPolicy(m_Pending.inputObservationUs));
+                    inputHitchPolicy(m_Pending.inputObservationUs),
+                    !m_InputCoverageHistory.belowGoal(m_Parameters.playoutInputPercentileTargetPerMillion),
+                    m_InputCoverageHistory.estimateProbability(m_Parameters.playoutInputPercentileTargetPerMillion));
                 if (m_Parameters.playoutInputHitchMissesOnly >= 8) {
                     const auto inputAfter = m_InputPercentileBuffer.stats();
                     m_InputCoverageHistory.observe(enqueueUs ? enqueueUs : m_Pending.inputObservationUs,
@@ -4306,7 +4311,9 @@ void VrrTimingController::updatePlayoutHistory(
                     m_Parameters.playoutInputPercentileFallUsPerSecond,
                     m_ReadinessBudgetUs, m_Parameters.playoutInputPercentileToleranceUs,
                     vrrHeadroomUs, inputClockOffsetUs(nowUs),
-                    inputHitchPolicy(nowUs));
+                    inputHitchPolicy(nowUs),
+                    !m_InputCoverageHistory.belowGoal(m_Parameters.playoutInputPercentileTargetPerMillion),
+                    m_InputCoverageHistory.estimateProbability(m_Parameters.playoutInputPercentileTargetPerMillion));
                 m_InputPercentileBuffer.raiseForHeadroomLoss(lostHeadroomUs);
                 if (layerChange != InputLayerChange::None) {
                     m_InputPercentileBuffer.transitionFrom(previousLayerBufferUs);

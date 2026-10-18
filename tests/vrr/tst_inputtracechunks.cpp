@@ -31,6 +31,18 @@ static std::vector<Sample> run(const QJsonObject& fixture,bool validate) {
   p.playoutInputStableAdaptation=vrrTimingParametersForSession(production).playoutInputStableAdaptation;
  }
  const auto revision=p.playoutInputStableAdaptation;
+ uint64_t heldChecks=0,heldViolations=0;
+ const auto belowGoal=[](const Vrr13::InputPercentileBuffer::Stats& stats) {
+  return stats.recentEligible && stats.recentMissed*1000000 >
+      stats.recentEligible*(1000000-stats.probabilityPpm);
+ };
+ const auto checkHold=[&](const Vrr13::InputPercentileBuffer::Stats& before,
+                          const Vrr13::InputPercentileBuffer::Stats& after) {
+  if(revision==4 && belowGoal(before) && belowGoal(after)) {
+   ++heldChecks;
+   heldViolations+=after.currentUs<before.currentUs;
+  }
+ };
  VrrTimingController c(s,fixture["can_latch"].toInt(),p);
  std::vector<int64_t> profile;for(const auto v:fixture["initial_profile"].toArray())profile.push_back(int64_t(v.toDouble()));
  check(c.loadPlayoutHistory(profile),"starting calibration must load before the first frame");
@@ -46,7 +58,9 @@ static std::vector<Sample> run(const QJsonObject& fixture,bool validate) {
   frame.noteGpuReadyUs(n("decode_complete_us"));frame.setLostPackets(uint32_t(n("lost_packets")));frame.noteDecodeSyncWaitUs(n("decode_sync_wait_us"));
   frame.setDeliveryTimeline(n("frame_receive_us"),n("frame_reassembled_us"),n("decode_submit_us"));frame.setDecodeHoldUs(n("decode_hold_us"));
   if(n("external_rebase_applied"))c.rebase();
+  const auto beforeSchedule=c.intervalStats().inputPercentile;
   const auto d=c.schedule(frame,at);
+  checkHold(beforeSchedule,c.intervalStats().inputPercentile);
   if(n("trajectory_resync_dropped"))c.noteTrajectoryResyncDrop();
   if(n("trajectory_resync_deferred"))c.noteTrajectoryDeferred();
   if(n("input_buffer_miss_observation_us")&&(n("input_network_buffer_miss")||n("input_decode_buffer_miss")))c.noteInputBufferMiss(n("input_buffer_miss_observation_us"),n("input_network_buffer_miss"),n("input_decode_buffer_miss"));
@@ -64,19 +78,27 @@ static std::vector<Sample> run(const QJsonObject& fixture,bool validate) {
    const auto st=c.intervalStats().inputPercentile;
    const bool same=st.currentUs==n("input_percentile_current_us")&&st.targetUs==n("input_percentile_target_us")&&st.eligible==n("input_percentile_eligible")&&st.missed==n("input_percentile_missed")&&st.samples==n("input_percentile_samples");
    if(validate&&!same&&mismatches++<3)std::fprintf(stderr,"state drift frame %llu buffer=%llu/%llu target=%llu/%llu eligible=%llu/%llu missed=%llu/%llu samples=%llu/%llu\n",(unsigned long long)no,(unsigned long long)st.currentUs,(unsigned long long)n("input_percentile_current_us"),(unsigned long long)st.targetUs,(unsigned long long)n("input_percentile_target_us"),(unsigned long long)st.eligible,(unsigned long long)n("input_percentile_eligible"),(unsigned long long)st.missed,(unsigned long long)n("input_percentile_missed"),(unsigned long long)st.samples,(unsigned long long)n("input_percentile_samples"));
-   samples.push_back({at,no,st.currentUs,st.targetUs,st.missed,st.eligible,bool(n("presented")),st.recentReleaseSamples>=8 && st.recentReleaseMisses==0 && st.validPairCoverageUs>=500000 && st.vrrHeadroomUs && st.currentUs>st.minimumUs && st.targetUs<=st.currentUs,n("decoder_output_us"),n("submission_boundary_us"),d.targetUs,c.intervalStats().update.intervalErrorUs,c.intervalStats().update.latenessUs});
+   samples.push_back({at,no,st.currentUs,st.targetUs,st.missed,st.eligible,bool(n("presented")),(revision!=4 || !belowGoal(st)) && st.recentReleaseSamples>=8 && st.recentReleaseMisses==0 && st.validPairCoverageUs>=500000 && st.vrrHeadroomUs && st.currentUs>st.minimumUs && (revision>=5?st.targetUs<st.currentUs:st.targetUs<=st.currentUs),n("decoder_output_us"),n("submission_boundary_us"),d.targetUs,c.intervalStats().update.intervalErrorUs,c.intervalStats().update.latenessUs});
   };
+  const auto beforeSubmission=c.intervalStats().inputPercentile;
   if(stale)compare();
   if(afterWait){if(c.latencyFixActive()||p.playoutMetronomeEnabled)c.noteSubmission(false,false,0);else c.rebase();}
   else {
    if(n("native_flip_protection_latched"))c.noteNativeFlipProtection(n("native_flip_protection_reference_us"));
    c.noteSubmission(n("presented"),n("cancelled"),n("scheduling_boundary_us")?n("scheduling_boundary_us"):n("submission_boundary_us"),n("submission_boundary_us"));
   }
+  checkHold(beforeSubmission,c.intervalStats().inputPercentile);
   if(!stale)compare();
   // This Linux recording has fixed presentation mode and no controller-owned
   // display floor. Display reports are not substituted for input evidence.
  }
  if(validate){std::fprintf(stderr,"recorded revision %llu: %zu decisions, %llu state mismatches\n",(unsigned long long)revision,samples.size(),(unsigned long long)mismatches);check(mismatches==0,"full pre-roll and each chunk boundary must reproduce recorded buffer state");}
+ if(revision==4) {
+  std::fprintf(stderr,"selected-window hold: %llu checked states, %llu downward violations\n",
+      (unsigned long long)heldChecks,(unsigned long long)heldViolations);
+  check(heldChecks>1000 && heldViolations==0,
+      "real controller must preserve protection below the full session goal at decision and submission");
+ }
  return samples;
 }
 int main(int argc,char** argv) {
@@ -101,7 +123,23 @@ int main(int argc,char** argv) {
  longest=std::max(longest,(end-1)->at-lastChange);
  std::fprintf(stderr,"reported segment: start=%llu minimum=%llu final=%llu maximum wait for lower buffer=%llu us, misses=%llu\n",(unsigned long long)begin->buffer,(unsigned long long)low,(unsigned long long)(end-1)->buffer,(unsigned long long)longest,(unsigned long long)((end-1)->missed-begin->missed));
  check(low+100<=begin->buffer,"107s of qualified clean feedback must permit a bounded downward trial below the stale plateau");
- check(longest<=10000000,"no 10s local window may pin obsolete protection after qualified clean feedback");
+ const uint64_t finalRevision=vrrTimingParametersForSession([] {
+  VrrSessionConfig config;config.experimentalInputPercentilePpm=1;return config;
+ }()).playoutInputStableAdaptation;
+ if(finalRevision<5)
+  check(longest<=10000000,"no 10s local window may pin obsolete protection after qualified clean feedback");
+ else {
+  const auto& final=*(end-1);
+  const uint64_t error=final.buffer>final.target?final.buffer-final.target:final.target-final.buffer;
+  std::fprintf(stderr,"rolling convergence: final target=%llu us, applied=%llu us, error=%llu us\n",
+      (unsigned long long)final.target,(unsigned long long)final.buffer,(unsigned long long)error);
+  // A computed percentile is a destination, not permission to probe below it.
+  auto recent=end-1;
+  while(recent!=begin && final.at-recent->at<1000000)--recent;
+  check(error<=500 || (final.buffer>final.target && recent->buffer>final.buffer),
+      "moving rolling demand either settles within tolerance or retains downward convergence");
+  check(longest<=10000000,"rolling convergence has no frame-count pause while below the computed target");
+ }
 
  // Short diagnostics do not redefine the selected 120-second probability.
  for(const auto value:fixture["segments"].toArray()) {

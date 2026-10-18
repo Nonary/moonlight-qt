@@ -1,3 +1,75 @@
+Rolling required-buffer convergence (2026-10-17, revision 5): new adaptive
+sessions select `playout_input_stable_adaptation=5`. This replaces revision 4's
+hard historical-score hold and revision 3's speculative plateau reductions.
+The active cadence layer retains each eligible frame's budget-adjusted required
+protection duration as observed, expiring by the user's configured history (10--300 s;
+120 s is only the Balanced preset). Copied seeds, invalid observations and
+unmatched epoch boundaries do not supply modeled clean intervals.
+
+For a constant candidate buffer, the input-only model propagates outstanding
+lateness using each interval's bounded recovery room. A new input can cause a
+stretch above tolerance only when it exceeds the preceding carried requirement
+by more than tolerance. Such an interval contributes its required protection;
+other matched intervals contribute zero. Proven same-frame actual input hitches
+override a modeled recovery assumption, so estimated carry cannot hide a measured
+protection requirement. The selected rolling percentile is the
+smallest buffer covering the user's configured share of modeled intervals.
+Steady late input therefore does not manufacture recurring hitch pressure.
+Old requirements are not reprojected into today's clock mapping: the estimate
+answers what protection the retained frames needed when they were delivered.
+Candidate scoring recomputes outcomes at the candidate size, rather than counting
+past misses recorded at different applied buffers. Actual outcome reporting stays
+separate. A fresh actual eligible preventable hitch still authorizes upward
+protection; raw harmless input alone cannot buy additional standing latency.
+
+The full session history calibrates the modeled allowance against actual goal
+error. Below goal, modeled tail allowance becomes user_tail^2/actual_miss_rate;
+at or above goal it is exactly the user's allowance. This continuous correction
+permits some modeled misses and helps a deficient window recover without a hard
+hold. A real full-window deficit also authorizes the measured rolling estimate
+for growth; clean input while at goal cannot buy unrelated standing latency.
+Actual reporting and the user-selected goal/window are unchanged.
+
+Downward movement converges proportionally toward the estimate, capped by the
+existing configured fall rate. Upward movement keeps the established rise rate
+so an asymptotic approach cannot prolong proven misses. The release time
+constant is history/30, bounded
+to 1--10 s (60/120/300 s presets give 2/4/10 s). Fractional movement is preserved
+and the release rate tapers near the target. The old below-goal hold and 200-frame wait
+are absent. Larger learned layers retain immediate upward restoration; smaller
+layers converge normally. Historical revisions 0--4 retain exact replay behavior;
+calibration identity includes the revision. This input model does not resimulate
+worker admission, GPU contention, compositor timing or physical scanout.
+
+Selected-window release gate (2026-10-17, revision 4): new adaptive sessions
+select `playout_input_stable_adaptation=4`. The full session coverage history
+(Balanced: 99.5% over 120 seconds), aged on the session clock across source-rate
+layers, now gates downward input-buffer movement. A below-goal window
+holds applied protection, including lower measured demand and lower-layer
+drain. A new qualifying miss also prevents that observation from releasing.
+Growth keeps its existing eligibility and measured-demand rules. Meeting the
+selected goal resumes revision-3 continuous release at the configured fall rate,
+without a 200-frame wait, a replacement fixed hold, or accumulated drain credit.
+The 10-second displayed score and one-second local feedback cannot override this
+gate. Empty history retains ordinary obsolete-seed expiry; it is not counted
+as clean evidence for a probe. Historical revisions 0--3 retain their recorded behavior for exact replay;
+calibration identity already includes the revision. Target demand may remain
+below the held buffer. This is an input-buffer policy, not a guarantee that the
+selected score is achievable or proof of physical display smoothness.
+
+Continuous plateau release (2026-10-17): new adaptive sessions select
+`playout_input_stable_adaptation=3`. This supersedes revision 2 below.
+Qualified clean feedback can continuously lower a retained raw-input plateau
+at the configured fall rate (normally 250 us/s). The 100 us / T/4 target
+lookahead no longer starts a one-second / 200-eligible-frame waiting period
+after each completed reduction. No replacement ten-second clean hold is added.
+The existing eligibility, fresh qualifying-miss feedback, physical recovery
+room, per-interval movement allowance, ordinary growth and layer restore rules
+remain unchanged. The configured smoothness target and learning window are
+unchanged; this is not the proposed ten-second proportional-score controller.
+Historical revisions 0--2 retain their recorded behavior. Existing calibration
+identity includes the stable-adaptation revision. Live smoothness is unverified.
+
 Bounded plateau recovery (2026-10-17, reconciled source baseline `2689cd7a`, originally `7d1148f9`): new adaptive
 sessions select `playout_input_stable_adaptation=2`, retaining input-hitch policy
 10 and the configured probability/history. Revision 1 remains explicit for

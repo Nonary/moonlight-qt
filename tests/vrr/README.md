@@ -1,3 +1,24 @@
+Validation (2026-10-17): nine new frame-rate/goal combinations fail under
+revision 2 and pass under revision 3, each releasing 1000 us over four qualified
+seconds. Seven controller/lifecycle/trace/config/render suites pass. The worker
+suite has five failures reproduced in the unchanged revision-2 executable;
+these are not repaired or hidden by this change. Application build and installed
+offscreen help pass. The completed 18:35 session (183256 rows, SHA-256
+17a9307f8db8cfa657b57a46bbc5b7cb4c23fc9e5f41cebb3e9f62f0a17f41af)
+passes exact baseline and recorded-sequence integrity with both replay builds.
+Nominal mean decoder-to-submission latency falls 10.756 to 10.375 ms; modeled
+presented interval changes over 2 ms rise 8.2% to 9.6%. Nominal and all four
+injected-fault cases satisfy unchanged-policy mean/p99 latency bounds and zero
+modeled interval violations without reported worker saturation. Initial 100 ms
+fault p99 bounds failed in both policies (312.8--401 ms); matched fault bounds
+are diagnostic limits, not normal operating latency. No physical-display or
+fresh live A/B claim is made. Evidence: build/no-frame-wait-20261017.
+
+Continuous release regression (2026-10-17): lifecycle coverage checks
+time-based plateau drain at 20/30/116 FPS and 99/99.5/99.95 percent goals,
+invalid feedback, absent recovery room, and fresh qualifying misses.
+Historical revision-2 finite-trial tests remain unchanged.
+
 # VRR deterministic tests
 
 `tst_vrrtimingcontroller` also exercises the source-relative cadence detector:
@@ -1972,3 +1993,16 @@ presentation; an idle source or a raw long submission interval alone cannot
 trigger it. These are recorded outcomes, not candidate worker output. Existing
 worker tests exercise fake-presenter progress separately. The buffer change does
 not claim to fix the startup estimate/stale-discard loop.
+
+Revision 4 gates every ordinary input-buffer downward move on the full session
+coverage goal, retaining revision 3 continuous release with no 200-frame wait.
+`tst_inputpercentileintegration` exercises below-goal holds, short-window clean
+feedback, measured-demand/layer drain, expiry and immediate bounded recovery.
+Recorded revisions 0--3 retain their original behavior.
+
+Revision 5 replaces the hard score hold with a cadence-aware required-buffer
+percentile using configured history/goal and proportional convergence. The
+focused integration test checks the threshold model against independent
+constant-buffer simulation, minimum percentile solutions, steady late delivery,
+seed exclusion, 10/30/60/120/300-second expiry, low-FPS progress without 200
+frames, and tapered approach without overshoot. Historical 0--4 remain explicit.

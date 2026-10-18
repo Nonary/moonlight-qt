@@ -3,7 +3,7 @@
 #include <deque>
 
 namespace Vrr13 {
-// Reporting only. Each actual eligible outcome enters once and ages on the
+// Session coverage. Each actual eligible outcome enters once and ages on the
 // session clock, independent of which rate layer currently owns adaptation.
 class InputCoverageHistory {
 public:
@@ -30,6 +30,16 @@ public:
         m_ReportingOutcomes.push_back({nowUs, absorbed, missed});
         m_ReportingAbsorbed += absorbed; m_ReportingMissed += missed;
         while (m_ReportingOutcomes.size() > InputPercentileBuffer::MaximumSamples) popReporting();
+    }
+    // The full selected window authorizes revision-4 release. The separate
+    // short reporting window never controls this gate. An empty window has
+    // no failing score; existing unknown-history expiry still applies.
+    bool belowGoal(uint64_t probabilityPpm) const {
+        const uint64_t tail = 1000000 - std::clamp<uint64_t>(probabilityPpm, 1, 999999);
+        return !m_Outcomes.empty() && m_Missed * 1000000 > m_Outcomes.size() * tail;
+    }
+    uint64_t estimateProbability(uint64_t probabilityPpm) const {
+        return InputBufferEstimate::calibratedProbability(probabilityPpm, m_Outcomes.size(), m_Missed);
     }
     void report(InputPercentileBuffer::Stats& stats, bool responsive = false) const {
         stats.recentEligible = m_Outcomes.size();

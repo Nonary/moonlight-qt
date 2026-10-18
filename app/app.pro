@@ -327,6 +327,7 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/absorbedjitter.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/inputbufferestimate.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/bufferaudit.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/rollingquantile.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/phasetrajectory.h \
