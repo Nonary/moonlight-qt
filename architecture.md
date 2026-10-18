@@ -4908,6 +4908,27 @@ worker run, and rejects focus loss during frame delivery.
 
 ### Linux Vulkan presentation
 
+Offscreen target contract (issue #18 investigation, source baseline `fbbfd11f`,
+2026-10-18): both deferred Mailbox rendering and opt-in off-thread preparation
+create targets with renderable, blit-source and blit-destination access.
+libplacebo clears uncovered letterbox/pillarbox pixels using a destination blit;
+renderable plus blit-source access alone leaves that clear invalid. Both paths
+use `plVkOffscreenRenderTargetParams()` to preserve the acquired target's size
+and format and request the required access. The offscreen software-Vulkan
+regression checks actual rendering and border/interior pixel readback, including
+odd target extents. Omitting destination access reproduces the reported clear
+validation and leaves old border pixels; enabling it clears them correctly.
+
+This establishes a target-access correction, not the reported fractional-scale
+SIGSEGV's cause. The first deferred-path frame uses a real swapchain image and
+seeds the offscreen template for later frames. Both vrr18 and current code query
+`SDL_Vulkan_GetDrawableSize()` before every swapchain resize/acquire, and a failed
+resize skips acquisition. A dropped resize event during startup does not prove
+that the swapchain remains unsized. The reporter's exact Flatpak commit and
+resolved faulting stack, current reproduction and physical display behavior
+remain unverified; the isolated regression uses libplacebo 7.360.1 rather than
+the reporter's libplacebo 365.
+
 Linux package capabilities must be qualified independently of launch/version.
 The daily.183 AppImage disabled Moonlight Wayland, lacked matching Qt Wayland
 plugins, and built SDL without its Wayland backend; its X11 launch test did not

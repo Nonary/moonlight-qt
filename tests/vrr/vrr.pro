@@ -26,6 +26,8 @@ unix:!macx:packagesExist(libplacebo) {
     SUBDIRS += plvkpresentation
     plvkswapchain.file = $$PWD/plvkswapchain.pro
     SUBDIRS += plvkswapchain
+    plvkoffscreen.file = $$PWD/plvkoffscreen.pro
+    SUBDIRS += plvkoffscreen
 }
 
 unix:!macx:packagesExist(sdl2) {

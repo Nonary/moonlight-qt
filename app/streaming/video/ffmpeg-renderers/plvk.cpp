@@ -1402,12 +1402,7 @@ bool PlVkRenderer::acquirePendingSwapchainFrame(
         if (m_DeferredTemplateValid) {
             m_DeferredTemplate = m_SwapchainFrame;
             m_DeferredTemplate.fbo = nullptr;
-            m_DeferredTextureParams = {};
-            m_DeferredTextureParams.w = fbo->params.w;
-            m_DeferredTextureParams.h = fbo->params.h;
-            m_DeferredTextureParams.format = fbo->params.format;
-            m_DeferredTextureParams.renderable = true;
-            m_DeferredTextureParams.blit_src = true;
+            m_DeferredTextureParams = plVkOffscreenRenderTargetParams(fbo);
         }
     }
 #endif
@@ -1859,12 +1854,7 @@ void PlVkRenderer::updatePreparationTarget()
     if (!m_PreparationTargetValid) return;
     m_PreparationTarget = m_SwapchainFrame;
     m_PreparationTarget.fbo = nullptr; // Never hand a swapchain texture across threads.
-    m_PreparationTextureParams = {};
-    m_PreparationTextureParams.w = texture->params.w;
-    m_PreparationTextureParams.h = texture->params.h;
-    m_PreparationTextureParams.format = texture->params.format;
-    m_PreparationTextureParams.renderable = true;
-    m_PreparationTextureParams.blit_src = true;
+    m_PreparationTextureParams = plVkOffscreenRenderTargetParams(texture);
 }
 
 int PlVkRenderer::preparationThreadProc(void* opaque)

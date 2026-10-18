@@ -21,6 +21,27 @@ Historical revision-2 finite-trial tests remain unchanged.
 
 # VRR deterministic tests
 
+`tst_plvkoffscreen` is an offscreen Vulkan integration test. It renders through
+libplacebo using the production offscreen-target parameter builder, then reads
+back full-coverage, letterbox and pillarbox outputs. Red previous-frame pixels
+must become black borders while the green video interior remains intact, with
+no libplacebo errors. The odd target extents exercise border clearing without
+requiring a Wayland compositor or assuming a fractional-scale drawable size.
+Use a software Vulkan ICD to keep it separate from the live display, for example
+inside the development container (set the ICD path for that environment):
+
+```sh
+mkdir -p build/tests-plvkoffscreen
+cd build/tests-plvkoffscreen
+qmake6 ../../tests/vrr/plvkoffscreen.pro
+make -j1
+VK_DRIVER_FILES=/path/to/lvp_icd.json LP_NUM_THREADS=1 ./tst_plvkoffscreen
+```
+
+This test requires libplacebo and a usable Vulkan ICD; initialization failure
+is a test failure. It establishes clear access and pixels, not compositor
+behavior, physical VRR or issue #18's reported SIGSEGV.
+
 `tst_vrrtimingcontroller` also exercises the source-relative cadence detector:
 constant latency, genuine irregular/51 ms source intervals, isolated late/catch-up
 pairs versus recurring oscillation, 60/90/120/144/240 FPS, uncertainty bounds
