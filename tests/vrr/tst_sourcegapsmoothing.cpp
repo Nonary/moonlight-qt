@@ -75,6 +75,9 @@ VrrTimingParameters revision5Policy(const VrrSessionConfig& session, bool synchr
                                     bool scheduled = false)
 {
     auto p = vrrTimingParametersForSession(session, synchronized, scheduled);
+    // This recording predates stable adaptation. Do not inherit today's
+    // rolling input-buffer policy into its historical reserve assertions.
+    p.playoutInputStableAdaptation = 0;
     p.playoutInputHitchMissesOnly = 0;
     if (p.playoutInputPercentileEnabled) p.playoutInputBoundedRecoveryCredit = 1;
     p.playoutInputLayerSeedRatioPerMille = p.playoutInputLearningTrim = 0;

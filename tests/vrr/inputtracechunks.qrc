@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/inputtracechunks">
+        <file alias="buffer-drain.json.qz" compress="0">fixtures/buffer-drain-20261017.json.qz</file>
+    </qresource>
+</RCC>
