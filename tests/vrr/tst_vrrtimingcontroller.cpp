@@ -313,7 +313,7 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
                lowLatencyPolicy.playoutDelaySlewAcrossBands == 1 &&
                lowLatencyPolicy.rateCandidateMinimumUs == 200000 &&
                lowLatencyPolicy.playoutStallBurstExclusion == 1 &&
-               lowLatencyPolicy.latchedFloorDisabled == 2 &&
+               lowLatencyPolicy.latchedFloorDisabled == 3 &&
                lowLatencyPolicy.pacingLatencyExtraPeriodNumerator == 0 &&
                lowLatencyPolicy.pacingLatencyQueueModeExtra == 0 &&
                lowLatencyPolicy.readinessLowPercentile == 0 &&
@@ -4946,6 +4946,64 @@ void testHistoricalSourceGapSmoothFrameTiming()
     }
 }
 
+void testWithinToleranceCannotCreateQueuedRecovery()
+{
+    auto session = config(120, 120);
+    session.smoothFrameTiming = false;
+    session.experimentalBoundedCatchup = true;
+    session.experimentalInputPercentilePpm = 990000;
+    session.latencyMode = 2;
+    const auto policy = vrrTimingParametersForSession(session);
+    VrrTimingController controller(session, true, policy);
+    uint64_t previous = 0, previousNominal = 0;
+    uint64_t maximumCarry = 0, maximumIntervalError = 0;
+    for (int i = 0; i < 6000; ++i) {
+        const auto decoded = decodedTimeForRtp(1000000, uint32_t(i * 750));
+        const auto now = std::max(decoded, previous);
+        const auto d = controller.schedule(frame(i + 1, uint32_t(i * 750), true, decoded), now);
+        const uint64_t overshoot = i % 2 ? 300 : 100;
+        const auto submitted = std::max(d.targetUs, now + 1000) + overshoot;
+        if (i > 0) {
+            const auto actual = submitted - previous;
+            const auto intended = d.originalTargetUs - previousNominal;
+            maximumIntervalError = std::max(maximumIntervalError,
+                std::max(actual, intended) - std::min(actual, intended));
+        }
+        if (i > 300) {
+            maximumCarry = std::max(maximumCarry, d.trajectory.carryUs);
+            expect(d.latchedPresentation, "within-tolerance fixture must retain native queue protection");
+        }
+        controller.notePreparationDuration(1000);
+        controller.noteSubmission(true, false, submitted);
+        previous = submitted;
+        previousNominal = d.originalTargetUs;
+    }
+    std::fprintf(stderr, "within-tolerance interval error=%llu us, recovery carry=%llu us\n",
+        static_cast<unsigned long long>(maximumIntervalError),
+        static_cast<unsigned long long>(maximumCarry));
+    expect(maximumIntervalError <= policy.playoutIntervalToleranceUs,
+        "every measured interval in the regression must remain within the selected tolerance");
+    expect(maximumCarry == 0,
+        "within-tolerance timing must not manufacture queued recovery delay");
+
+    // Retain the recovery trigger: exactly T is accepted, while a real
+    // beyond-T event still creates bounded carry on the existing trajectory.
+    for (uint64_t lateness : {499, 500, 501}) {
+        Vrr13::PhaseTrajectory trajectory;
+        uint64_t carry = 0;
+        for (uint64_t i = 0; i < 100; ++i) {
+            const uint64_t slot = 1000000 + i * 8333;
+            const auto planned = trajectory.plan(i + 1, slot, slot, slot,
+                slot, 8333, 0, 500, 8333, true, 4000);
+            carry = std::max(carry, planned.carryUs);
+            const uint64_t submitted = planned.targetUs + (i == 50 ? lateness : 0);
+            trajectory.commit(i + 1, slot, submitted, submitted, true, false, true);
+        }
+        expect(carry == (lateness > 500 ? lateness : 0),
+            "recovery must accept exact tolerance and retain genuine above-tolerance carry");
+    }
+}
+
 void testQueuedCeilingRecoveryCannotRatchet()
 {
     uint64_t maximumCarry[2] = {};
@@ -4989,7 +5047,7 @@ void testQueuedCeilingRecoveryCannotRatchet()
         auto oldPolicy = vrrTimingParametersForSession(session, nativeDeadline, nativeDeadline);
         oldPolicy.latchedFloorDisabled = 1;
         auto newPolicy = oldPolicy;
-        newPolicy.latchedFloorDisabled = 2;
+        newPolicy.latchedFloorDisabled = 3;
         VrrTimingController oldController(session, nativeDeadline, oldPolicy);
         VrrTimingController newController(session, nativeDeadline, newPolicy);
         for (int i = 0; i < 300; ++i) {
@@ -5057,44 +5115,47 @@ void testProductionWorkerSmoothingOwnsMovement()
 {
     // Alternating 11/15 ms source intervals require sub-millisecond retiming
     // every frame. A T/second adaptation budget allows only a few us instead.
-    uint64_t jerk[2] = {};
-    for (int own : {0, 1}) {
-        auto session = config(120, 120);
-        session.smoothFrameTiming = true;
-        auto policy = vrrTimingParametersForSession(session);
-        expect(policy.playoutSmoothingOwnMovement == 1 &&
-                   policy.playoutSmoothingWindowedCadence == 2 &&
-                   policy.playoutSmoothingMaxLagUs == 6000 &&
-                   policy.playoutSmoothingReserveMaxUs == 3000,
-               "ordinary worker smoothing must restore the bounded VRR18 retiming policy");
-        policy.playoutInputHitchMissesOnly = 10;
-        policy.playoutSmoothingOwnMovement = own;
-        VrrTimingController controller(session, true, policy);
-        uint32_t ticks = 0;
-        uint64_t previous = 0, previousInterval = 0;
-        for (int i = 0; i < 1200; ++i) {
-            ticks += i % 2 ? 1350 : 990;
-            const auto decoded = decodedTimeForRtp(1000000, ticks);
-            const auto now = std::max(decoded, previous);
-            const auto d = controller.schedule(frame(i + 1, ticks, true, decoded), now);
-            const auto ready = std::max(now, d.renderStartUs) + 1000;
-            const auto submitted = std::max(d.targetUs, ready);
-            controller.notePreparationDuration(1000);
-            controller.noteSubmission(true, false, submitted);
-            expect(submitted >= decoded && submitted - decoded <= 40000 &&
-                       std::abs(d.cadenceSmoothingUs) <= 9000,
-                   "restored smoothing must retain readiness, bounded phase and latency");
-            const auto interval = submitted - previous;
-            if (i > 300) jerk[own] += interval > previousInterval ?
-                interval - previousInterval : previousInterval - interval;
-            previousInterval = interval;
-            previous = submitted;
+    for (bool absorb : {false, true}) {
+        uint64_t jerk[2] = {};
+        for (int own : {0, 1}) {
+            auto session = config(120, 120);
+            session.smoothFrameTiming = true;
+            session.absorbMicrostutter = absorb;
+            auto policy = vrrTimingParametersForSession(session);
+            expect(policy.playoutSmoothingOwnMovement == 1 &&
+                       policy.playoutSmoothingWindowedCadence == (absorb ? 7u : 2u) &&
+                       policy.playoutSmoothingMaxLagUs == (absorb ? 1000u : 6000u) &&
+                       policy.playoutSmoothingReserveMaxUs == (absorb ? 0u : 3000u),
+                   "both worker smoothing paths must own their existing bounded retiming");
+            policy.playoutInputHitchMissesOnly = 10;
+            policy.playoutSmoothingOwnMovement = own;
+            VrrTimingController controller(session, true, policy);
+            uint32_t ticks = 0;
+            uint64_t previous = 0, previousInterval = 0;
+            for (int i = 0; i < 1200; ++i) {
+                ticks += i % 2 ? 1350 : 990;
+                const auto decoded = decodedTimeForRtp(1000000, ticks);
+                const auto now = std::max(decoded, previous);
+                const auto d = controller.schedule(frame(i + 1, ticks, true, decoded), now);
+                const auto ready = std::max(now, d.renderStartUs) + 1000;
+                const auto submitted = std::max(d.targetUs, ready);
+                controller.notePreparationDuration(1000);
+                controller.noteSubmission(true, false, submitted);
+                expect(submitted >= decoded && submitted - decoded <= 40000 &&
+                           std::abs(d.cadenceSmoothingUs) <= 9000,
+                       "restored smoothing must retain readiness, bounded phase and latency");
+                const auto interval = submitted - previous;
+                if (i > 300) jerk[own] += interval > previousInterval ?
+                    interval - previousInterval : previousInterval - interval;
+                previousInterval = interval;
+                previous = submitted;
+            }
         }
+        std::fprintf(stderr, "worker smoothing movement (absorb=%d): jerk %llu -> %llu us\n", int(absorb),
+                     static_cast<unsigned long long>(jerk[0]), static_cast<unsigned long long>(jerk[1]));
+        expect(absorb ? jerk[1] * 4 < jerk[0] * 3 : jerk[1] * 2 < jerk[0],
+               "both production smoothers must remove source wobble instead of spending T/second");
     }
-    std::fprintf(stderr, "worker smoothing movement: jerk %llu -> %llu us\n",
-                 static_cast<unsigned long long>(jerk[0]), static_cast<unsigned long long>(jerk[1]));
-    expect(jerk[1] * 2 < jerk[0],
-           "the production smoother must actually remove source wobble instead of spending T/second");
 }
 
 void testProductionPreservesRelativeGameSpacing()
@@ -7924,6 +7985,11 @@ int main()
         testPreparationPredictionCannotStarveAdmission();
         return failures ? 1 : 0;
     }
+    if (std::getenv("MOONLIGHT_VRR_TEST_TOLERANCE_RECOVERY_ONLY")) {
+        testWithinToleranceCannotCreateQueuedRecovery();
+        return failures ? 1 : 0;
+    }
+    testWithinToleranceCannotCreateQueuedRecovery();
     testAbsorbTracksUniformSourceRateBeforeLongFitCatchesUp();
     testAbsorbLocalCadencePreservesVariableAndQuantizedSources();
     testPresentTiming();

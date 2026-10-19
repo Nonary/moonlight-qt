@@ -2128,3 +2128,93 @@ incremental Linux application build and offscreen startup smoke all pass.
 No pacing or counter calculation changed for the reporting correction. Results
 are under `build/coverage-audit-20261018/`. A running process retains the old
 executable; the next normal launch picks up the rebuilt summary.
+
+### Recovery must require a beyond-tolerance event (2026-10-18)
+
+`testWithinToleranceCannotCreateQueuedRecovery` reproduces false growth from
+in-tolerance 100/300 us CPU wake-up variation on a constant 120 FPS source.
+Before the fix, measured interval error is at most 205 us while recovery carry
+reaches 4000 us against a 500 us tolerance. Revision 3 removes the duplicate
+queued CPU ownership floor; the same fixture stays within 201 us and retains
+zero recovery carry. Direct 499/500/501 us boundaries separately retain the
+existing strict trigger and genuine bounded recovery. Immediate and native
+future-deadline fixtures compare unchanged physical targets across revisions.
+Replay-config tests retain historical revisions 0--2 and reject revisions >3.
+
+The candidate changes neither Reduce judder nor Absorb, input eligibility,
+scoring or configured buffering caps. It does not bypass PhaseTrajectory or
+turn off recovery. Capture selection, exact baseline, matched comparison and
+execution-fault results are recorded under `build/queue-owned-recovery-20261018/`.
+The newer active capture is excluded from completed-baseline proof.
+
+The completed 16:37:36 capture (SHA-256
+`5041b7f04a2467e73cd630a944d42264177afa7e24a18152c915a3eaa68ab514`)
+passes the final exact-baseline and sequence-integrity gates. Matched recorded
+revision 2 vs revision 3 gives modeled presented jerk >2 ms of 50 -> 53 per
+mille (p99 3547 -> 3580 us), sender residual p99 2042 -> 2063 us, mean
+latency 7.766 -> 7.755 ms and p99 12.551 -> 12.532 ms. Four matched decision,
+preparation, submission and scheduler-fault pairs all pass zero modeled
+interval violations, mean <=25 ms and p99 <=60 ms without saturation. This
+116 FPS capture has little retained recovery and is not evidence of a large
+latency reduction or improved visible smoothness.
+
+A separate frozen active 120 FPS snapshot has no clean-close footer and fails
+the strict fidelity/integrity gates; it is exploratory only. On identical
+recorded inputs, revision 3 changes modeled median extra delay 4.995 -> 1.028 ms,
+mean latency 12.321 -> 9.106 ms and p99 18.823 -> 16.934 ms. Presented jerk
+>2 ms changes 36 -> 38 per mille (p99 3425 -> 3631 us), sender residual p99
+1649 -> 1846 us, with zero modeled interval violations and no saturation.
+These results support removing false recovery demand while exposing a small
+modeled cadence tradeoff; they do not prove a live display improvement.
+
+Final validation: all six required VRR suites and replay help pass after the
+last test edit. The regression also checks every startup interval, with a
+maximum 201 us error and zero carry on the corrected policy. The finished
+comparison and eight fault scenarios pass; the final exact baseline retains
+both integrity flags. The local application build and offscreen help pass,
+SHA-256 `2df65b4d5853d4b34c1d295a6486fb80016fa80552a80c300c2e67f64b246d0f`.
+The running stream was left on its old `(deleted)` executable; a full normal
+app relaunch is required. The combined follow-up includes this recovery fix.
+
+### Absorb must execute its bounded smoothing (2026-10-18)
+
+The live judder report ran binary SHA-256
+`2df65b4d5853d4b34c1d295a6486fb80016fa80552a80c300c2e67f64b246d0f`.
+Its capture selected Absorb revision 7 but `playout_smoothing_own_movement=0`.
+The ordinary Reduce judder restoration had left Absorb on the T/second shared
+movement limiter, allowing only ~4 us/frame at 120 FPS with T=500 us. Worker
+Absorb now owns its existing bounded retiming; no lag/reserve limit is raised.
+Native future-deadline behavior and historical flags remain unchanged.
+
+The production smoother fixture now covers ordinary Reduce judder and Absorb,
+requiring a real reduction in alternating-source interval jerk, readiness and
+latency bounds, and each path's configured lag/reserve. Replay-config checks
+cover worker ownership and unchanged native future deadlines.
+
+Newest completed capture at selection:
+`moonlight-pacing-20261018-203430-2058514.vrrtrace`, SHA-256
+`af4829c4d0708625d33b4f5d0061d9eb3d7850f3c87eacacb7c9f1233cb26790`.
+Its untouched exact baseline and sequence integrity pass with exit zero.
+Same-input replay changes presented jerk >2 ms from 190 to 71 per mille
+(p99 4646 -> 4279 us), sender-spacing residual p99 2253 -> 2295 us,
+mean decode-to-submission 6.533 -> 6.359 ms and p99 12.823 -> 12.937 ms.
+A separate active snapshot is exploratory only; it changes jerk 312 -> 234
+per mille and mean latency 13.983 -> 14.063 ms, with the same 28.986 ms p99.
+Neither scenario saturates or violates modeled interval bounds. This is
+software/model evidence and does not establish live display improvement.
+
+The matched last-60-second raw OS feedback has no discarded presentation
+identities in either span. The source/RTP cadence varies below requested
+120 FPS in both, so these are not matched live workload A/Bs. No upstream
+fault or literal tearing is inferred from large intervals alone. Raw GPU
+feedback, identity joins, frozen inputs, provenance and results are under
+`build/judder-after-tolerance-20261018/`.
+
+Final combined revision-3/Absorb comparison reproduces the 190 -> 71 per mille
+jerk result on the exact completed baseline. Four same-fault pairs pass zero
+modeled interval violations, explicit mean <=25 ms / p99 <=60 ms latency bounds
+and no saturation. The final exact replay preserves both integrity flags.
+Application build and offscreen help pass; binary SHA-256
+`e6f5b755c5a0d47c05ca66b89d315b23aa31a5673fcc74579bd0861477d765e6`.
+The active process was not stopped or restarted. Visible smoothness and literal
+tearing remain live observations to check after a full application relaunch.

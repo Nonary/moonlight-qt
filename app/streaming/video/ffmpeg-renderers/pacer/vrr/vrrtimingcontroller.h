@@ -222,6 +222,7 @@
     X(uint64_t, render_start_after_submission_us, renderStartAfterSubmissionUs, 0) \
     X(uint64_t, render_start_minimum_lead_us, renderStartMinimumLeadUs, 1500) \
     X(uint64_t, playout_stall_burst_exclusion, playoutStallBurstExclusion, 0) \
+    /* Revisions 2/3 cap/remove the duplicate queued CPU ownership floor. */ \
     X(uint64_t, latched_floor_disabled, latchedFloorDisabled, 0) \
     /* Zero anchors display spacing at every Present call; one anchors a */ \
     /* latched present at its predicted flip (prior anchor + display period). */ \

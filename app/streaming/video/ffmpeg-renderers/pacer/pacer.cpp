@@ -343,7 +343,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
             const bool intrinsicProducerClock =
                 qEnvironmentVariable("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER") != "0" &&
                 qEnvironmentVariable("MOONLIGHT_VRR_BOUNDED_CATCHUP") != "0";
-            context += QStringLiteral("|queued-recovery-floor-v2|producer-clock-intrinsic-gpu-v1=%1")
+            context += QStringLiteral("|queued-recovery-floor-v3|producer-clock-intrinsic-gpu-v1=%1")
                 .arg(intrinsicProducerClock ? 1 : 0);
             if (recoveryPolicy.playoutInputGoalUnpriced)
                 context += QStringLiteral("|input-goal-unpriced-v1");

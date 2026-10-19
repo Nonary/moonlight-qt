@@ -1,3 +1,33 @@
+Absorb movement ownership correction (2026-10-18, source baseline `0d805c4c`
+plus queued-floor revision 3): ordinary Reduce judder was restored to its own
+bounded movement, but Absorb still passed through ExtraBufferSlew's T/second
+budget. At 120 FPS / T=500 us, that permitted only about 4 us per frame and
+left most source-spacing variation unsmoothed despite Absorb being enabled.
+Worker-paced Absorb now selects `playout_smoothing_own_movement=1` too. Its
+revision-7 algorithm, 2T fixed pad/lag settings, readiness attribution, queue
+limits and recovery tolerance gate are unchanged. Native future-target Absorb
+retains its previous movement ownership. Existing captured flags still restore
+exactly; the existing smoothing-own-movement cache identity distinguishes the
+new selection. This supersedes earlier statements that Absorb retains shared
+movement. OS presentation feedback remains diagnostic, not optical proof.
+
+Queued recovery tolerance gate correction (2026-10-18, source baseline `0d805c4c`):
+worker sessions now select `latched_floor_disabled=3`. The revision-2 cap
+prevented unbounded duplicate-floor growth but did not qualify its demand:
+a protected queued frame still inherited previous CPU enqueue spacing through
+an ownership floor, independently of PhaseTrajectory's tolerance gate. The
+regression runs a constant 120 FPS source with alternating 100/300 us wake-up
+lateness; every measured interval stays within 205 us of its intended cadence,
+yet revision 2 accumulates 4 ms carry against a 500 us tolerance. Revision 3
+removes only that duplicate floor when the native queue owns spacing. The
+ordinary PhaseTrajectory plan/commit, above-tolerance trigger, carry ceiling
+and drain remain; immediate presentation and native future deadlines keep
+their full physical floors. Reduce judder, Absorb and input sizing are unchanged.
+The same fixture now has <=201 us interval error and zero recovery carry.
+Exact 500 us remains accepted and 501 us still creates real trajectory carry.
+Revisions 0--2 replay unchanged, and the calibration identity includes revision 3.
+This supersedes the revision-2 ownership-floor policy described below.
+
 Timing summary correction (2026-10-18, source baseline `fbbfd11f`):
 the normal summary now shows Client timing (CPU) and input coverage separately.
 The profile goal labels the severity-weighted CPU submission interval score;

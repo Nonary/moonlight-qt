@@ -129,6 +129,8 @@ void VrrReplayConfigTest::windowedSmoothingPolicyRoundTrip()
     QCOMPARE(parameters.playoutSmoothingWindowedCadence, uint64_t(2));
     VrrSessionConfig absorbing;
     absorbing.absorbMicrostutter = true;
+    QCOMPARE(vrrTimingParametersForSession(absorbing).playoutSmoothingOwnMovement, uint64_t(1));
+    QCOMPARE(vrrTimingParametersForSession(absorbing, true, true).playoutSmoothingOwnMovement, uint64_t(0));
     VrrTimingParameters absorbed;
     QVERIFY2(applyVrrReplayControllerSnapshot(
         vrrTimingParametersToJson(vrrTimingParametersForSession(absorbing)), absorbed, error), qPrintable(error));
@@ -283,16 +285,16 @@ void VrrReplayConfigTest::intrinsicProducerClockRoundTrip()
 void VrrReplayConfigTest::queuedRecoveryFloorRoundTrip()
 {
     const auto production = vrrTimingParametersForSession(VrrSessionConfig{});
-    QCOMPARE(production.latchedFloorDisabled, uint64_t(2));
+    QCOMPARE(production.latchedFloorDisabled, uint64_t(3));
     QCOMPARE(vrrTimingParametersForSession(VrrSessionConfig{}, true, true).latchedFloorDisabled, uint64_t(1));
     VrrTimingParameters restored;
     QString error;
-    for (int revision : {0, 1, 2}) {
+    for (int revision : {0, 1, 2, 3}) {
         QVERIFY2(applyVrrReplayControllerSnapshot({{"latched_floor_disabled", revision}}, restored, error), qPrintable(error));
         QCOMPARE(restored.latchedFloorDisabled, uint64_t(revision));
     }
-    QVERIFY(!applyVrrReplayControllerSnapshot({{"latched_floor_disabled", 3}}, restored, error));
-    QCOMPARE(restored.latchedFloorDisabled, uint64_t(2));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"latched_floor_disabled", 4}}, restored, error));
+    QCOMPARE(restored.latchedFloorDisabled, uint64_t(3));
 }
 
 void VrrReplayConfigTest::unpricedGoalRoundTrip()

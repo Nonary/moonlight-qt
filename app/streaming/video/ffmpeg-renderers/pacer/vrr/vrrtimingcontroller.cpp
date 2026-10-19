@@ -387,13 +387,18 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutSmoothingWindowedCadence = 2;
     if (config.smoothFrameTiming && config.absorbMicrostutter) {
         parameters.playoutSmoothingWindowedCadence = 7;
+        // Absorb already bounds its retiming and fixed reserve. Charging its
+        // corrections to the input policy's T/second movement budget reduces
+        // a 500 us tolerance to ~4 us/frame at 120 FPS and passes jitter through.
+        // Native future deadlines retain their existing movement policy.
+        parameters.playoutSmoothingOwnMovement = nativeScheduledPresentation ? 0 : 1;
         parameters.playoutSmoothingAbsorbReserveUs = uint64_t(options.toleranceUs) * 2;
         parameters.playoutSmoothingAbsorbReservePeriodPerMille = 0;
         parameters.playoutSmoothingResetSlewUs = std::min<uint64_t>(
             kPlayoutSmoothingResetSlewUs, std::max<uint64_t>(1, options.toleranceUs / 2));
         parameters.playoutSmoothingMaxLagUs = uint64_t(options.toleranceUs) * 2;
         // Absorb has a fixed 2T pad. It cannot acquire a separate learned
-        // reserve on top of that pad, outside the shared slew budget.
+        // reserve on top of that pad.
         parameters.playoutSmoothingReserveMaxUs = 0;
         parameters.playoutSmoothingReservePercentilePerMille = 0;
         parameters.playoutSmoothingReserveReleaseUsPerSecond = 0;
@@ -460,7 +465,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.candidateCadenceRatioNumerator = 5;
     parameters.candidateCadenceRatioDenominator = 4;
     parameters.playoutStallBurstExclusion = 1;
-    parameters.latchedFloorDisabled = nativeScheduledPresentation ? 1 : 2;
+    parameters.latchedFloorDisabled = nativeScheduledPresentation ? 1 : 3;
     // A latched present flips no earlier than one display period after the
     // previous flip, not at its call. Anchoring the next tearing present to
     // the call let it flip inside the panel's minimum period after a late or
@@ -1307,7 +1312,15 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         const bool queueOwnsSpacing = m_Parameters.latchedFloorDisabled >= 2 &&
             m_CanLatchPresentation && m_LatchedPresentation &&
             !m_Parameters.nativeScheduledPresentation;
-        if (queueOwnsSpacing) {
+        if (queueOwnsSpacing && m_Parameters.latchedFloorDisabled >= 3) {
+            // The queue already owns physical display spacing. Reapplying a
+            // raw CPU-enqueue floor here bypasses PhaseTrajectory::commit()'s
+            // tolerance gate: even entirely in-tolerance wake-up variation
+            // accumulates recovery. Keep genuine beyond-tolerance trajectory
+            // recovery below, with its existing carry cap and drain law.
+            ownershipFloor = 0;
+        }
+        else if (queueOwnsSpacing) {
             const uint64_t limitUs = catchupCarryLimitUs();
             const uint64_t carryUs = limitUs ? std::min(limitUs, m_SourcePeriodUs) : m_SourcePeriodUs;
             ownershipFloor = std::min(ownershipFloor, saturatingAdd(originalTargetUs, carryUs));

@@ -355,8 +355,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
-    if (value.latchedFloorDisabled > 2)
-        return fail("latched_floor_disabled revision must be 0..2");
+    if (value.latchedFloorDisabled > 3)
+        return fail("latched_floor_disabled revision must be 0..3");
     if (value.preparationPredictionLead > 1)
         return fail("preparation prediction lead must be 0 or 1");
     if (value.playoutInputStableAdaptation > 1)
