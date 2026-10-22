@@ -1604,7 +1604,16 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                     static_cast<unsigned long long>(input.cumulativeDecoderMisses));
                 if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
                 offset += ret;
-                if (input.adaptationRevision >= 7) {
+                if (input.adaptationRevision >= 13) {
+                    ret = snprintf(&output[offset], length - offset,
+                        "Hitch budget: buffer %.2f ms keeps predicted hitches within the allowance | %llu frames / %llu s\n",
+                        input.hitchRequirementMeanUs / 1000.0,
+                        static_cast<unsigned long long>(input.hitchRequirementSamples),
+                        static_cast<unsigned long long>(input.windowUs / 1000000));
+                    if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
+                    offset += ret;
+                }
+                else if (input.adaptationRevision >= 7) {
                     ret = snprintf(&output[offset], length - offset,
                         "Hitch estimate: average required protection %.2f ms + tolerance reserve %.2f ms | %llu %s / %llu s\n",
                         input.hitchRequirementMeanUs / 1000.0, input.toleranceUs / 1000.0,

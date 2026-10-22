@@ -1,5 +1,7 @@
 #pragma once
 #include "inputpercentilebuffer.h"
+#include "rollingquantile.h"
+#include <cmath>
 #include <deque>
 #include <vector>
 
@@ -59,7 +61,11 @@ public:
             return;
         }
         const uint64_t required = absorbed || missed ? requiredProtectionUs : 0;
-        m_Outcomes.push_back({nowUs, absorbed, missed, required});
+        m_Outcomes.push_back({nowUs, absorbed, missed, required, requiredProtectionUs});
+        if (requiredProtectionUs) {
+            m_Needs.add(int64_t(std::min<uint64_t>(requiredProtectionUs, INT64_MAX)));
+            m_Breaches += !absorbed;
+        }
         if (required) {
             m_DisturbanceRequiredSumUs += double(required); ++m_DisturbanceRequiredSamples;
             if (missed) { m_HitchRequiredSumUs += double(required); ++m_HitchRequiredSamples; }
@@ -90,6 +96,25 @@ public:
     uint64_t disturbanceRequiredSamples() const { return m_DisturbanceRequiredSamples; }
     uint64_t eligible() const { return m_Outcomes.size() + m_LostCause.size(); }
     uint64_t missed() const { return m_Missed; }
+    // Smallest buffer whose predicted hitches over the window fit the goal's
+    // allowance less half its Poisson deviation. A frame needing more than B
+    // would have broken through B; the window's hitches per breakthrough
+    // (VRR room hides some) scales that count to hitches. The estimate does
+    // not depend on the applied buffer, so it moves only as evidence ages.
+    // Returns false while the window holds no eligible outcome.
+    bool hitchBudgetBuffer(uint64_t probabilityPpm, uint64_t& bufferUs) const {
+        const uint64_t samples = eligible();
+        if (!samples) return false;
+        const uint64_t tail = 1000000 - std::clamp<uint64_t>(probabilityPpm, 1, 999999);
+        const double allowed = double(samples) * double(tail) / 1000000.0;
+        const double budget = std::max(0.0, allowed - std::sqrt(allowed) / 2);
+        const double perBreach = m_Breaches >= 10 ?
+            std::max(0.05, double(m_Missed) / double(m_Breaches)) : 1.0;
+        const size_t breaches = size_t(budget / perBreach);
+        bufferUs = breaches >= m_Needs.size() ? 0 :
+            uint64_t(std::max<int64_t>(0, m_Needs.atRank(m_Needs.size() - breaches)));
+        return true;
+    }
     bool lostCauseActive() const { return m_LostCauseActive; }
     // Earliest outcome of the current lost-cause span; 0 when inactive.
     uint64_t lostCauseSinceUs() const { return m_LostCauseActive ? m_LostCauseSinceUs : 0; }
@@ -111,7 +136,7 @@ public:
         }
     }
 private:
-    struct Outcome { uint64_t atUs; bool absorbed, missed; uint64_t requiredUs = 0; };
+    struct Outcome { uint64_t atUs; bool absorbed, missed; uint64_t requiredUs = 0, needUs = 0; };
     struct Recent { uint64_t atUs; bool missed; };
     void classifyLostCause(uint64_t nowUs, bool missed) {
         m_Recent.push_back({nowUs, missed});
@@ -136,6 +161,10 @@ private:
         const Outcome& front = outcomes.front();
         m_Absorbed -= front.absorbed;
         m_Missed -= front.missed;
+        if (front.needUs) {
+            m_Needs.remove(int64_t(std::min<uint64_t>(front.needUs, INT64_MAX)));
+            m_Breaches -= !front.absorbed;
+        }
         if (const uint64_t required = front.requiredUs) {
             m_DisturbanceRequiredSumUs -= double(required);
             if (!--m_DisturbanceRequiredSamples) m_DisturbanceRequiredSumUs = 0;
@@ -161,5 +190,9 @@ private:
     bool m_LostCauseEnabled = false, m_LostCauseActive = false;
     double m_HitchRequiredSumUs = 0, m_DisturbanceRequiredSumUs = 0;
     uint64_t m_HitchRequiredSamples = 0, m_DisturbanceRequiredSamples = 0;
+    // Every eligible outcome's needed protection (nonzero only), and how
+    // many of those exceeded the buffer applied at the time.
+    ExactRollingQuantile m_Needs;
+    uint64_t m_Breaches = 0;
 };
 }

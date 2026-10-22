@@ -95,7 +95,13 @@ public:
     // cannot authorize release below it. Revision 9 also releases while the
     // goal is met and that demand is at or above the applied buffer.
     // Revision 10 sizes the same way; the controller's coverage history gives
-    // lost-cause spans short retention (InputCoverageHistory).
+    // lost-cause spans short retention (InputCoverageHistory). Revision 11
+    // holds while window misses are within one standard deviation of the
+    // allowed count, growing or releasing only outside it. Revision 12 grows
+    // beyond half a standard deviation and releases beyond a full one.
+    // Revision 13 replaces both means and the band with one target, the
+    // smallest buffer whose predicted window hitches fit the allowance
+    // (InputCoverageHistory::hitchBudgetBuffer), approached proportionally.
     void setStableAdaptation(uint64_t revision) {
         m_StableAdaptation = m_Stats.adaptationRevision = revision;
     }
@@ -103,6 +109,11 @@ public:
         m_HaveHitchEstimate = true;
         m_HitchRequiredSumUs = requiredSumUs;
         m_HitchRequiredSamples = samples;
+    }
+    // Revision 13 target: the controller's hitch-budget buffer estimate.
+    void setHitchBudgetBuffer(bool valid, uint64_t bufferUs) {
+        m_HaveHitchBudget = valid;
+        m_HitchBudgetUs = bufferUs;
     }
     void setDisturbanceEstimate(double requiredSumUs, uint64_t samples) {
         m_HaveDisturbanceEstimate = true;
@@ -796,16 +807,56 @@ private:
         }
         const uint64_t tail = 1000000 - probabilityPpm;
         const uint64_t needed = (1000000 + tail - 1) / tail;
+        if (m_StableAdaptation >= 13) {
+            // Switching between a hitch mean and a disturbance mean overshot
+            // in both directions behind the window's lag: 1.2 <-> 4.8 ms at
+            // 99.5%/120 s while this estimate drifted 1.3-4.0 ms.
+            const uint64_t held = std::min(m_Stats.currentUs, m_Stats.maximumUs);
+            m_Stats.validPairCoverageUs = m_ValidPairCoverageUs;
+            m_Stats.hitchRequirementFromMisses = false;
+            if (!m_HaveHitchBudget) {
+                m_Stats.tailUncertain = true;
+                m_Stats.targetUs = held;
+                return;
+            }
+            m_Stats.hitchRequirementMeanUs = m_HitchBudgetUs;
+            m_Stats.hitchRequirementSamples = m_HitchEligible;
+            m_Stats.rawRequiredQuantileUs = int64_t(std::min(m_HitchBudgetUs, uint64_t(INT64_MAX)));
+            m_Stats.headroomTargetUnclippedUs = m_HitchBudgetUs;
+            m_Stats.tailUncertain = false;
+            m_Stats.evidenceValid = true;
+            m_Stats.clipped = m_HitchBudgetUs > m_Stats.maximumUs;
+            m_Stats.targetUs = std::clamp(m_HitchBudgetUs, m_Stats.minimumUs, m_Stats.maximumUs);
+            if (m_Stats.targetUs < m_Stats.currentUs && !m_Stats.expiredUnknown &&
+                (!m_PreviousValid || !m_LastEligibleUs || atUs < m_LastEligibleUs ||
+                 atUs - m_LastEligibleUs >= 100000))
+                m_Stats.targetUs = held;
+            return;
+        }
         if (m_StableAdaptation >= 8) {
             const uint64_t eligible = m_HaveHitchCoverage ? m_HitchEligible : m_Stats.recentEligible;
             const uint64_t missed = m_HaveHitchCoverage ? m_HitchMissed : m_Stats.recentMissed;
             const bool goalMet = !eligible || missed * 1000000 <= eligible * tail;
+            bool failing = !goalMet, releasing = goalMet;
+            if (m_StableAdaptation >= 11 && eligible) {
+                // Window misses are roughly Poisson about the allowance, so
+                // near the goal one miss arriving or expiring flipped the
+                // verdict and swung the target between the two means below
+                // (1.7 <-> 6 ms at 99.5%/120 s). Act only outside one
+                // standard deviation of the allowed count; hold within it.
+                const double allowed = double(eligible) * double(tail) / 1000000.0;
+                const double band = std::max(1.0, std::sqrt(allowed));
+                // Revision 12 grows at half that deviation so the hold rests
+                // at or above the goal; release still needs a full one.
+                failing = double(missed) > allowed + (m_StableAdaptation >= 12 ? band / 2 : band);
+                releasing = double(missed) < allowed - band;
+            }
             // Failing: size growth from what the breakthrough hitches needed.
             // Met: release toward what all disturbances needed on average.
-            const uint64_t count = !goalMet ?
+            const uint64_t count = failing ?
                 (m_HaveHitchEstimate ? m_HitchRequiredSamples : m_MissedRequirements.size()) :
                 (m_HaveDisturbanceEstimate ? m_DisturbanceRequiredSamples : m_LocalDisturbanceRequiredSamples);
-            const double sum = !goalMet ?
+            const double sum = failing ?
                 (m_HaveHitchEstimate ? m_HitchRequiredSumUs : m_LocalHitchRequiredSumUs) :
                 (m_HaveDisturbanceEstimate ? m_DisturbanceRequiredSumUs : m_LocalDisturbanceRequiredSumUs);
             const double average = count ? std::max(0.0, sum / double(count)) : 0;
@@ -813,7 +864,7 @@ private:
             const uint64_t requested = mean + std::min(m_Stats.toleranceUs, UINT64_MAX - mean);
             m_Stats.hitchRequirementMeanUs = mean;
             m_Stats.hitchRequirementSamples = count;
-            m_Stats.hitchRequirementFromMisses = !goalMet;
+            m_Stats.hitchRequirementFromMisses = failing;
             m_Stats.rawRequiredQuantileUs = int64_t(std::min(mean, uint64_t(INT64_MAX)));
             m_Stats.headroomTargetUnclippedUs = requested;
             m_Stats.validPairCoverageUs = m_ValidPairCoverageUs;
@@ -822,9 +873,11 @@ private:
             m_Stats.clipped = requested > m_Stats.maximumUs;
             const uint64_t demand = std::clamp(requested, m_Stats.minimumUs, m_Stats.maximumUs);
             const uint64_t held = std::min(m_Stats.currentUs, m_Stats.maximumUs);
-            m_Stats.targetUs = goalMet ? std::min(demand, held) : std::max(demand, held);
+            m_Stats.targetUs = failing ? std::max(demand, held) :
+                releasing ? std::min(demand, held) : held;
             const uint64_t allowance = eligible * tail, loss = missed * 1000000;
-            if (m_StableAdaptation >= 9 && eligible && loss < allowance && held > m_Stats.minimumUs) {
+            if (m_StableAdaptation >= 9 && eligible && releasing && loss < allowance &&
+                    held > m_Stats.minimumUs) {
                 // A met goal proves the applied buffer sufficient, not the
                 // demand estimate. Keep releasing in proportion to the unused
                 // miss budget so the buffer settles at the goal instead of
@@ -1155,7 +1208,8 @@ private:
     bool m_HaveHitchEstimate = false;
     double m_HitchRequiredSumUs = 0, m_LocalHitchRequiredSumUs = 0;
     uint64_t m_HitchRequiredSamples = 0;
-    bool m_HaveDisturbanceEstimate = false;
+    bool m_HaveDisturbanceEstimate = false, m_HaveHitchBudget = false;
+    uint64_t m_HitchBudgetUs = 0;
     double m_DisturbanceRequiredSumUs = 0, m_LocalDisturbanceRequiredSumUs = 0;
     uint64_t m_DisturbanceRequiredSamples = 0, m_LocalDisturbanceRequiredSamples = 0;
     bool m_HaveHitchCoverage = false;

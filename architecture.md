@@ -1,3 +1,40 @@
+Hitch-budget target (2026-10-22, `playout_input_stable_adaptation=13`):
+revisions 8--12 drive the buffer toward one of two means, the breakthrough
+hitch mean when failing and the all-disturbance mean when met, gated in
+11/12 by a Poisson band. Both means lie far from the buffer that meets the
+goal, so behind the window's lag the buffer overshot both ways: in the 16:53
+capture (99.50% / 120 s, revision 12) it cycled 1.2 <-> 4.8 ms. Revision 13
+has one target. The coverage history keeps every eligible outcome's needed
+protection (excess over tolerance on the unbuffered slot basis) in an exact
+rolling order index and counts breakthroughs (need above the buffer applied
+then). For a candidate buffer B, frames needing more than B would have broken
+through; the window's hitches per breakthrough (at least 10 breakthroughs,
+floor 0.05, otherwise 1) converts that to predicted hitches. The target is
+the smallest B whose predicted hitches fit the allowance less half its
+Poisson deviation (eligible x allowance - sqrt(that)/2). It does not depend on
+the applied buffer and moves only as outcomes age in or out; computed offline
+on the 16:53 capture it drifted 1.3--4.0 ms in steps of tens to hundreds of
+microseconds while revision 12 swung 1.2 <-> 4.8 ms. The existing
+proportional, rate-limited actuator approaches it in both directions;
+lost-cause outcomes still leave after 10 s. Revision 12 replays unchanged.
+
+Goal deadband (2026-10-22, `playout_input_stable_adaptation=11`): revisions
+8--10 switch the target between the breakthrough-hitch mean (goal failing) and
+the disturbance mean (goal met). With coverage sitting on the goal, single
+misses arriving or expiring flipped the verdict. In the 16:28 capture (99.50%
+/ 120 s) coverage stayed at 99.48--99.53% while the target alternated
+~1.7 <-> ~6 ms and the buffer swung 1.8 -> 5.6 -> 3.3 -> 5.1 -> 1.8 ms.
+Revision 11 treats window misses as Poisson about the allowed count
+(eligible x allowance) and holds the applied buffer while the count is within
+one standard deviation (at least one miss) of it; it grows toward the hitch
+mean only above that band and releases (including revision 9's
+surplus-proportional step) only below it. Revision 10 replays unchanged.
+Revision 12 makes the band lopsided: growth starts at half a standard
+deviation above the allowed count, release still at a full one below. In the
+16:36 capture revision 11 rested at 99.40--99.48% against a 99.50% goal;
+the lopsided band rests at or slightly above the goal with the same
+hysteresis against single-miss flips. Revision 11 replays unchanged.
+
 Lost-cause spans (2026-10-22, `playout_input_stable_adaptation=10`): sizing is
 unchanged from revision 9, but the session coverage history classifies each
 eligible outcome against the last second of eligible outcomes. When at least

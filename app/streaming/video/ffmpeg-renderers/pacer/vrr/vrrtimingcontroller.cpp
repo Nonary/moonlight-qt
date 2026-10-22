@@ -226,7 +226,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     // smaller layer. Draining at the release law kept a rate drop's moved
     // mapping as several ms of excess latency for 25-30 s (f96b0524).
     parameters.playoutInputHitchMissesOnly = parameters.playoutInputPercentileEnabled ? 11 : 0;
-    parameters.playoutInputStableAdaptation = parameters.playoutInputPercentileEnabled ? 10 : 0;
+    parameters.playoutInputStableAdaptation = parameters.playoutInputPercentileEnabled ? 13 : 0;
     // Record lifecycle semantics explicitly; missing fields in older captures
     // retain their historical eviction and reacquisition behavior.
     parameters.playoutInputLayerLifecycle = parameters.playoutInputPercentileEnabled ? 2 : 0;
@@ -2967,6 +2967,12 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                     m_InputCoverageHistory.hitchRequiredSumUs(), m_InputCoverageHistory.hitchRequiredSamples());
                 m_InputPercentileBuffer.setDisturbanceEstimate(
                     m_InputCoverageHistory.disturbanceRequiredSumUs(), m_InputCoverageHistory.disturbanceRequiredSamples());
+                {
+                    uint64_t hitchBudgetUs = 0;
+                    const bool hitchBudget = m_InputCoverageHistory.hitchBudgetBuffer(
+                        m_Parameters.playoutInputPercentileTargetPerMillion, hitchBudgetUs);
+                    m_InputPercentileBuffer.setHitchBudgetBuffer(hitchBudget, hitchBudgetUs);
+                }
                 m_InputPercentileBuffer.observe(m_Pending.smoothness.frame,
                     enqueueUs ? enqueueUs : m_Pending.inputObservationUs,
                     m_Pending.intervalIntendedUs, m_Pending.inputRequiredUs, validInput,
@@ -4613,6 +4619,12 @@ void VrrTimingController::updatePlayoutHistory(
                     m_InputCoverageHistory.hitchRequiredSumUs(), m_InputCoverageHistory.hitchRequiredSamples());
                 m_InputPercentileBuffer.setDisturbanceEstimate(
                     m_InputCoverageHistory.disturbanceRequiredSumUs(), m_InputCoverageHistory.disturbanceRequiredSamples());
+                {
+                    uint64_t hitchBudgetUs = 0;
+                    const bool hitchBudget = m_InputCoverageHistory.hitchBudgetBuffer(
+                        m_Parameters.playoutInputPercentileTargetPerMillion, hitchBudgetUs);
+                    m_InputPercentileBuffer.setHitchBudgetBuffer(hitchBudget, hitchBudgetUs);
+                }
                 m_InputPercentileBuffer.advance(nowUs, playoutDelayMinimumUs(),
                     playoutDelayMaximumUs(), m_Parameters.playoutInputPercentileTargetPerMillion,
                     m_Parameters.playoutInputPercentileWindowUs,
