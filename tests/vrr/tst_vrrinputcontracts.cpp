@@ -45,7 +45,7 @@ RunResult runSustainedDownstreamLoad(bool injectInputHitches)
     // source of slack rather than a fabricated local/source clock offset.
     policy.playoutDelayStartSeedUs = 6000;
     check(policy.playoutInputHitchMissesOnly == 11 &&
-          policy.playoutInputStableAdaptation == 5,
+          policy.playoutInputStableAdaptation == 10,
           "integration uses the selected production input policy");
     VrrTimingController controller(session, true, policy);
     uint64_t previousSubmission = 0;

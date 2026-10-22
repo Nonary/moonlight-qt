@@ -226,7 +226,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     // smaller layer. Draining at the release law kept a rate drop's moved
     // mapping as several ms of excess latency for 25-30 s (f96b0524).
     parameters.playoutInputHitchMissesOnly = parameters.playoutInputPercentileEnabled ? 11 : 0;
-    parameters.playoutInputStableAdaptation = parameters.playoutInputPercentileEnabled ? 5 : 0;
+    parameters.playoutInputStableAdaptation = parameters.playoutInputPercentileEnabled ? 10 : 0;
     // Record lifecycle semantics explicitly; missing fields in older captures
     // retain their historical eviction and reacquisition behavior.
     parameters.playoutInputLayerLifecycle = parameters.playoutInputPercentileEnabled ? 2 : 0;
@@ -239,7 +239,11 @@ VrrTimingParameters vrrTimingParametersForSession(
     // Policy 2 keeps the phase late frames forced, as fixed refresh keeps a
     // queued frame: policy 1 shed it with a skip per late frame (12 a minute
     // at one 4 ms late frame per 5 s) where fixed refresh showed none.
-    parameters.playoutCeilingPhaseReplacement = 2;
+    // Policy 3 expires that kept phase 5 s after the last late frame that
+    // raised it, draining at the interval tolerance per frame, and lets the
+    // trajectory repay carry at the full tolerance per frame where the panel
+    // has room.
+    parameters.playoutCeilingPhaseReplacement = 3;
     // Small encoded frames finish the host's paced send early; they must not
     // pull the playout offset ahead of the full-size frames that follow.
     parameters.playoutOffsetSendSpanNormalization = 1;
@@ -437,7 +441,8 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.renderStartAfterSubmissionUs = 0;
     parameters.renderStartMinimumLeadUs = kRenderStartMinimumLeadUs;
     parameters.renderLeadFloorUs = kRenderLeadFloorUs;
-    parameters.preparationInitialSampleExcluded = 1;
+    // 2 also bounds the predicted render cost; see typicalRenderUs().
+    parameters.preparationInitialSampleExcluded = 2;
     // A source-rate epoch of at least 1.5x returns to the delay previously
     // sustained at that rate; decreases slew so a restore is not a jump.
     parameters.playoutEpochRateRatioPerMille = 1500;
@@ -607,6 +612,7 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_IntervalBuffer.reset();
         m_InputPercentileBuffer = Vrr13::InputPercentileBuffer{};
         m_InputCoverageHistory = {};
+        m_ScoreExcludedThroughUs = 0;
         m_ReceiveDriftClock = {};
         m_ReceiveDriftPacketValid = false;
         m_InputHeadroomUs = 0;
@@ -650,7 +656,7 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     }
     m_SmoothingEngaged = false;
     m_LastSmoothingRetimingUs = 0;
-    m_CeilingEarnedPhaseUs = 0;
+    m_CeilingEarnedPhaseUs = m_CeilingEarnedPeakUs = m_CeilingEarnedAtUs = 0;
     m_CeilingLastPhaseValid = false;
     m_CeilingShedding = false;
     m_CeilingFramesSinceShed = SIZE_MAX / 2;
@@ -1335,9 +1341,20 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         // catch-up room at 116 FPS on 120 Hz, so carry lingered; remove the
         // smallest recent overshoot, which the next submission also incurs.
         const uint64_t anchorUs = spacingAnchorUs();
-        const uint64_t ownershipFloor = m_HaveLastSubmission ?
+        uint64_t ownershipFloor = m_HaveLastSubmission ?
             saturatingAdd(anchorUs - std::min(anchorUs, m_PhaseTrajectory.minimumRecentLatenessUs()),
                           m_DisplayPeriodUs) : 0;
+        if (m_Parameters.playoutCeilingPhaseReplacement >= 3 && m_LatchedPresentation &&
+                m_PhaseTrajectory.anchoredAt(uint64_t(frame.frameNumber()) - 1)) {
+            // The latched anchor is max(submission, anchor + period); less
+            // a jittery per-frame overshoot it ratchets on every drop in
+            // lateness (~8 us a frame at 120/120: a 1 ms/s climb shed by a
+            // skip every few seconds). A latched present cannot flip early,
+            // so anchor on the previous frame's committed phase: its plan,
+            // or where it actually went when genuinely late.
+            ownershipFloor = saturatingAdd(m_PhaseTrajectory.anchorUs(), m_DisplayPeriodUs);
+        }
+        m_PhaseTrajectory.setDrainAtAllowance(m_Parameters.playoutCeilingPhaseReplacement >= 3);
         trajectory = m_PhaseTrajectory.plan(uint64_t(frame.frameNumber()),
             addSigned(m_SourceTimeUs, smoothingUs), originalTargetUs, targetUs,
             saturatingAdd(nowUs, saturatingAdd(renderOffsetUs, m_Parameters.presentationSafetyUs)),
@@ -1575,6 +1592,17 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         const uint64_t budgetUs = m_Parameters.playoutSmoothingGainPerMille == 0 ? 0 :
             fixedAbsorbPolicy() ? absorbReserveUs() : smoothingPhaseLimitUs();
         uint64_t keptUs = budgetUs;
+        if (m_Parameters.playoutCeilingPhaseReplacement >= 3 && m_CeilingEarnedPeakUs &&
+                nowUs > saturatingAdd(m_CeilingEarnedAtUs, kCeilingEarnedHoldUs)) {
+            // Earned phase is protection for recurring late frames, not a
+            // high-water mark. Unused for the hold, it decays so the standing
+            // rule below can shed it with one replacement; policy 2 kept the
+            // session maximum and never shed again at 120/120.
+            // Drain at the interval tolerance per source frame.
+            const uint64_t decayUs = (nowUs - m_CeilingEarnedAtUs - kCeilingEarnedHoldUs) /
+                std::max<uint64_t>(1, m_SourcePeriodUs) * intervalQualityToleranceUs(m_Parameters);
+            m_CeilingEarnedPhaseUs = m_CeilingEarnedPeakUs - std::min(m_CeilingEarnedPeakUs, decayUs);
+        }
         if (m_Parameters.playoutCeilingPhaseReplacement >= 2) {
             // Fixed refresh rides out a late frame on a queued refresh of
             // latency and repeats or drops only beyond it. Shedding the phase
@@ -1635,8 +1663,11 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             // stamps or a presenter's guard spacing: earning those let native
             // scheduled presentation hold 6.8 ms under 1 ms stamp jitter.
             else if (m_CeilingLastPhaseValid && physicalUs - removableUs > kSourceDisplacementUs &&
-                    physicalUs > saturatingAdd(m_CeilingLastPhaseUs, kSourceDisplacementUs))
+                    physicalUs > saturatingAdd(m_CeilingLastPhaseUs, kSourceDisplacementUs)) {
                 m_CeilingEarnedPhaseUs = std::max(m_CeilingEarnedPhaseUs, std::min(physicalUs, m_DisplayPeriodUs));
+                m_CeilingEarnedPeakUs = m_CeilingEarnedPhaseUs;
+                m_CeilingEarnedAtUs = nowUs;
+            }
             m_CeilingLastPhaseUs = physicalUs;
             m_CeilingLastRemovableUs = removableUs;
             m_CeilingLastPhaseValid = true;
@@ -2930,6 +2961,12 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 if (m_Parameters.playoutInputStableAdaptation >= 4)
                     m_InputCoverageHistory.advance(enqueueUs ? enqueueUs : m_Pending.inputObservationUs,
                         m_Parameters.playoutInputPercentileWindowUs);
+                m_InputPercentileBuffer.setHitchCoverage(
+                    m_InputCoverageHistory.eligible(), m_InputCoverageHistory.missed());
+                m_InputPercentileBuffer.setHitchEstimate(
+                    m_InputCoverageHistory.hitchRequiredSumUs(), m_InputCoverageHistory.hitchRequiredSamples());
+                m_InputPercentileBuffer.setDisturbanceEstimate(
+                    m_InputCoverageHistory.disturbanceRequiredSumUs(), m_InputCoverageHistory.disturbanceRequiredSamples());
                 m_InputPercentileBuffer.observe(m_Pending.smoothness.frame,
                     enqueueUs ? enqueueUs : m_Pending.inputObservationUs,
                     m_Pending.intervalIntendedUs, m_Pending.inputRequiredUs, validInput,
@@ -2945,10 +2982,21 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                     m_InputCoverageHistory.estimateProbability(m_Parameters.playoutInputPercentileTargetPerMillion));
                 if (m_Parameters.playoutInputHitchMissesOnly >= 8) {
                     const auto inputAfter = m_InputPercentileBuffer.stats();
+                    m_InputCoverageHistory.setLostCause(m_Parameters.playoutInputStableAdaptation >= 10,
+                        m_Parameters.playoutInputPercentileTargetPerMillion);
                     m_InputCoverageHistory.observe(enqueueUs ? enqueueUs : m_Pending.inputObservationUs,
                         m_Parameters.playoutInputPercentileWindowUs,
                         inputAfter.eligible == inputBefore.eligible + 1,
-                        inputAfter.absorbed > inputBefore.absorbed, inputAfter.missed > inputBefore.missed);
+                        inputAfter.absorbed > inputBefore.absorbed, inputAfter.missed > inputBefore.missed,
+                        inputAfter.lastInputRequiredUs > int64_t(m_Parameters.playoutInputPercentileToleranceUs) ?
+                            uint64_t(inputAfter.lastInputRequiredUs) - m_Parameters.playoutInputPercentileToleranceUs : 0);
+                    // A lost-cause span is not scored either. The score was
+                    // already updated for this frame, so remove it with the
+                    // rest of the span; later frames are removed as they come.
+                    if (const uint64_t sinceUs = m_InputCoverageHistory.lostCauseSinceUs()) {
+                        m_IntervalBuffer.excludeScoreSince(std::max(sinceUs, m_ScoreExcludedThroughUs));
+                        m_ScoreExcludedThroughUs = enqueueUs ? enqueueUs : m_Pending.inputObservationUs;
+                    }
                 }
             }
         }
@@ -3367,6 +3415,20 @@ uint64_t VrrTimingController::headroomUs() const
 
 uint64_t VrrTimingController::typicalRenderUs() const
 {
+    if (m_Parameters.preparationInitialSampleExcluded >= 2) {
+        // A median of two or three warm-up preparations can exceed the stale
+        // horizon. Every target then lands past it, each frame is dropped
+        // before preparing, no new sample arrives, and video stays frozen
+        // (23-27 ms warm-up samples froze 6 of 9 starts on 2026-10-22). Use
+        // the bounded lead until preparation history exists, and never
+        // predict more than a source period: such a frame is better late
+        // than discarded.
+        constexpr size_t kMinimumPreparationSamples = 8;
+        if (m_PreparationDurations.size() < kMinimumPreparationSamples) return m_RenderLeadUs;
+        const uint64_t periodUs = std::max(m_SourcePeriodUs, m_DisplayPeriodUs);
+        return std::clamp<uint64_t>(percentile(m_PreparationDurations, 50), 100,
+                                    periodUs ? std::max<uint64_t>(periodUs, 100) : 100000);
+    }
     return m_PreparationDurations.empty() ? m_RenderLeadUs :
         std::clamp<uint64_t>(percentile(m_PreparationDurations, 50), 100, 100000);
 }
@@ -4545,6 +4607,12 @@ void VrrTimingController::updatePlayoutHistory(
                     else m_InputRateDropAtUs = 0;
                 }
                 m_InputPercentileBuffer.setStableAdaptation(m_Parameters.playoutInputStableAdaptation);
+                m_InputPercentileBuffer.setHitchCoverage(
+                    m_InputCoverageHistory.eligible(), m_InputCoverageHistory.missed());
+                m_InputPercentileBuffer.setHitchEstimate(
+                    m_InputCoverageHistory.hitchRequiredSumUs(), m_InputCoverageHistory.hitchRequiredSamples());
+                m_InputPercentileBuffer.setDisturbanceEstimate(
+                    m_InputCoverageHistory.disturbanceRequiredSumUs(), m_InputCoverageHistory.disturbanceRequiredSamples());
                 m_InputPercentileBuffer.advance(nowUs, playoutDelayMinimumUs(),
                     playoutDelayMaximumUs(), m_Parameters.playoutInputPercentileTargetPerMillion,
                     m_Parameters.playoutInputPercentileWindowUs,

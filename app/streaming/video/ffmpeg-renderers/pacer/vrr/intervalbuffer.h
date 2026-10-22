@@ -406,6 +406,21 @@ public:
         m_ReleaseFraction = 0;
     }
     Stats stats() const { return m_Stats; }
+    // Remove scored time from sinceUs through the current bucket, as if it
+    // were a gap. Used for lost-cause spans, where interval loss reflects a
+    // client failing wholesale rather than the smoothness a buffer controls.
+    void excludeScoreSince(uint64_t sinceUs) {
+        if (!m_ScoreValid) return;
+        const uint64_t oldest = m_ScoreTick >= m_ScoreWindow ? m_ScoreTick - m_ScoreWindow + 1 : 0;
+        for (uint64_t t = std::max(sinceUs / ScoreBucketUs, oldest); t <= m_ScoreTick; ++t) {
+            const size_t index = t % m_Score.size();
+            if (m_Score[index].tick != t) continue;
+            const ScoreBucket before = m_Score[index];
+            m_Score[index] = ScoreBucket{t};
+            scoreChanged(index, before);
+        }
+        updateScore(m_ScoreTick * ScoreBucketUs, m_Stats.scoreWindowUs);
+    }
     void breakSequence() {
         m_Input.reset();
         m_Window = {}; m_First = m_ReleaseFraction = m_SequenceSamples = 0; m_HavePrevious = false;

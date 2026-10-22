@@ -645,6 +645,9 @@ private:
     // and removable phase, and the phase of the frame the current shed replaced.
     uint64_t m_CeilingEarnedPhaseUs = 0, m_CeilingLastPhaseUs = 0, m_CeilingLastRemovableUs = 0;
     uint64_t m_CeilingShedFromUs = 0;
+    // Policy 3: earned phase as last raised, and when.
+    uint64_t m_CeilingEarnedPeakUs = 0, m_CeilingEarnedAtUs = 0;
+    static constexpr uint64_t kCeilingEarnedHoldUs = 5000000;
     size_t m_CeilingFramesSinceShed = SIZE_MAX / 2;
     bool m_CeilingLastPhaseValid = false, m_CeilingShedding = false;
     bool m_BufferLayerChanged = false, m_BufferLayerDrain = false;
@@ -957,6 +960,8 @@ private:
     uint64_t m_InputLayerEligibleAtStart = 0;
     Vrr13::InputLayerCadence m_InputLayerCadence;
     Vrr13::InputCoverageHistory m_InputCoverageHistory;
+    // Lost-cause score exclusion already applied through this time.
+    uint64_t m_ScoreExcludedThroughUs = 0;
     InputLayerChange updateInputLayer(uint64_t nowUs, const CadenceObservation& cadence);
     uint64_t inputHitchPolicy(uint64_t nowUs) const;
     // Reassembly-to-decode queue time excluded from input readiness as client

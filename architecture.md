@@ -1,3 +1,169 @@
+Lost-cause spans (2026-10-22, `playout_input_stable_adaptation=10`): sizing is
+unchanged from revision 9, but the session coverage history classifies each
+eligible outcome against the last second of eligible outcomes. When at least
+20 outcomes are present and misses reach four times the profile allowance
+(at least 10%), the second is a lost-cause span: the client is failing
+wholesale (warm-up, overload), not showing a tail a buffer trims. Its outcomes,
+including the second that revealed it, move to a 10 s retention store. They
+still count toward coverage and the hitch/disturbance means, so the buffer can
+grow in response, but they leave the history after 10 s instead of the
+selected history (300 s). The same span is removed from the client timing
+score as an unscored gap. In the 15:48 capture the first ~20 s ran 10--22%
+misses per second; 197 such misses held the 300 s goal failing until ~45 s and
+kept the target alternating between the hitch mean (~6 ms) and disturbance
+mean (~2 ms) for minutes. A level shift that a larger buffer can fix keeps
+producing misses, so it stays in coverage and still drives growth. The
+overlay coverage line shows retained lost-cause outcomes. Revision 9 replays
+unchanged.
+
+Startup render-prediction lock (2026-10-22, `preparation_initial_sample_excluded=2`):
+with prediction enabled the target is at least now + typicalRenderUs(), the
+median of learned preparation durations (first sample excluded). Warm-up
+preparations of 23--27 ms left medians of two samples near 27 ms, so every
+target landed past the stale horizon (two source periods), each frame was
+dropped after its render wait without preparing, and no further sample could
+lower the median: 6 of 9 connection starts from 15:27 froze at ~0.6 FPS with
+~99% client-pacing drops (earlier starts had 15 ms warm-ups and escaped).
+Value 2 uses the bounded render lead until eight preparations exist and caps
+the prediction at one source/display period. Value 1 replays unchanged.
+
+Expiring ceiling phase (2026-10-22, ceiling replacement policy 3): at the
+display ceiling (source period within 0.1% of the display period) policy 2
+kept the on-screen phase late input forced, up to a refresh, as protection.
+That earned phase was a session high-water mark, reset only by a controller
+reset. In the 15:10 capture (1440p AV1, 120 FPS on 120 Hz, rev-9 input buffer)
+the buffer released 7.8 -> 1.0 ms, standing-phase replacements stopped after
+36 s, and trajectory carry rose to 4--6 ms for the remaining ~200 s because
+each late frame raised the threshold the standing rule must exceed. Policy 3
+holds earned phase for 5 s after the late frame that last raised it, then
+decays it at the interval tolerance per source frame; the phase trajectory
+also repays carry at up to the full tolerance per successor (instead of 1/32
+of the carry), still bounded by the panel's fastest refresh; a new late frame raises it from the decayed value. Late
+frames recurring within the hold keep the protection (no skip per late
+frame); otherwise the existing 32-frame standing rule sheds the phase with one
+proven-ready replacement. Policy 2 remains replayable unchanged.
+
+Policy 3 also changes the trajectory's ownership floor while presentation is
+latched. The floor was the latched spacing anchor, max(previous submission
+boundary, anchor + display period), less the smallest recent overshoot. A max
+chain minus a jittering per-frame lateness ratchets later on every drop in
+lateness. In the 15:27 and 15:40 captures (1440p AV1, host mean 8334.1 us on
+8333 us, submission-boundary lateness 280--600 us) targets were spaced ~8342
+us, phase climbed ~1 ms/s to 4--5 ms and a replacement shed it every ~5--6 s.
+Latched presents cannot flip before the panel allows, so policy 3 floors a
+latched frame continuous with its predecessor at the trajectory's committed
+anchor (the previous plan, or its actual submission less the usual overshoot
+when genuinely late beyond the allowance) plus one display period. Unlatched
+and discontinuous frames keep the original floor.
+
+Met-goal release (2026-10-22, revision-8 follow-up): new adaptive sessions
+select `playout_input_stable_adaptation=9`. Revision 8 targeted
+`min(disturbance mean + reserve, applied)` while the goal was met, so whenever
+that demand was at or above the applied buffer the target equalled it and the
+buffer froze: growth was refused by the met goal and release by the demand.
+Connection 19 of the 2026-10-22 11:50 session (1440p AV1, 94.95% / 300 s)
+held 1.928 ms for about 18 minutes at roughly 97.5% coverage. Revision 9 keeps
+revision 8's targets and additionally, while the goal is met, steps the target
+below the applied buffer by the fall rate times a history/30 time constant
+(1--10 s) times the unused fraction of the miss allowance. The buffer therefore
+keeps releasing until coverage approaches the goal; growth still requires a
+failing goal. Revision 8 remains replayable unchanged.
+
+The overlay's input coverage line now reports inputs excluded from scoring in
+the short reporting window (over the buffer maximum or without valid timing).
+In the same session, 4K 4:4:4 10-bit PyroWave connections 7 and 9 ran with a
+standing one-frame pacing queue: decoder output to dequeue about 10 ms, then a
+6.5 ms GPU completion wait, against 0.5 ms and 4.7 ms in connection 5 with the
+same format. Required protection of 8--19 ms exceeded the ~4.2 ms buffer
+maximum, so nearly every input was excluded; coverage stopped changing and the
+lateness appeared as retiming (phase trajectory carry, 7--10 ms medians). This
+matches the known GPU capacity limit for that format near 120 FPS; intervals
+with ~104 FPS source cadence returned to ~8 ms decode latency. It is not a
+buffer sizing defect.
+
+Disturbance-mean release (2026-10-21, revision-7 follow-up): new adaptive
+sessions select `playout_input_stable_adaptation=8`. Revision 7 averaged only
+breakthrough hitches, and a breakthrough by definition required more than the
+applied buffer, so that mean never fell below the buffer while any miss stayed
+in the window. The capture after its install held 4.011 ms for about 85 s for that reason,
+although the counted events stretched intervals by under 1 ms.
+
+Revision 8 keeps the same per-event requirement (R minus tolerance on the
+unbuffered basis) and the same reserve, but chooses the averaged set by
+coverage. While selected-history coverage fails the goal, the target is the
+breakthrough-hitch mean plus reserve and may only rise. While the goal is met,
+the target is the mean over every disturbance, absorbed or missed, plus
+reserve, and may only fall. Membership of that set does not depend on the
+applied buffer, so release is no longer pinned by retained misses. Late inputs
+that VRR room hid (neither absorbed nor a qualifying hitch) stay excluded.
+Revision 7 remains replayable unchanged.
+
+Rolling mean hitch sizing (2026-10-21, source baseline `b35ce457` plus
+revision-6 follow-up): new adaptive sessions select
+`playout_input_stable_adaptation=7`. This supersedes revision 6's retained
+maximum target and score-driven release speed. That policy kept about 13.1 ms
+in the 21:42 capture through a long clean span because its historical 120 s
+coverage stayed below goal, even with recent coverage at 100%.
+
+The controller now averages the minimum protection actually required by
+eligible, qualifying input hitches over the user's selected history, using the
+same session-wide history as coverage. Clean outcomes, invalid input, copied
+rate-layer seeds and arbitrary raw readiness do not become hitch-size samples.
+Each measured requirement is on the original unbuffered input-slot basis:
+R minus the tolerated excess, not a residual blindly added to the current
+buffer. The target is that arithmetic mean plus one tolerance reserve, bounded
+by the existing minimum/maximum. Thus a 3 ms mean requirement and 1 ms tolerance
+request 4 ms. Requirements expire individually by observation time. No hitch
+samples request only the tolerance reserve, subject to the normal minimum.
+
+Coverage can refuse an upward target while the selected goal is already met;
+it does not multiply buffer demand, set release speed, or freeze release toward
+a lower measured requirement because old outcomes remain below goal. Both
+upward and downward movement converge proportionally, with the existing rise
+and fall ceilings and a history/30 time constant bounded to 1--10 s. Learning,
+saved layers, headroom-loss restoration and pending-release shortcuts cannot
+jump the input buffer. Rate-layer changes preserve applied protection and use
+the session estimate; the T-per-frame layer drain is disabled for revision 7.
+Physical readiness, queue capacity, source cadence and trajectory recovery stay
+separate and may affect measured total latency independently.
+
+Session-history sums/counts update incrementally; there is no per-frame scan
+of the full history. The session log explicitly reports the hitch mean, reserve
+and sample count. The 10 s / selected-history percentages remain actual coverage
+outcomes, distinct from the CPU Client timing severity score. An arithmetic
+mean plus reserve is a sizing policy, not a mathematical guarantee about all
+tail events. Historical revisions 0--6 remain unchanged for exact replay; the
+existing revision-based calibration identity distinguishes revision 7. GPU
+collection/readiness measurement is unchanged by this sizing correction.
+
+Hitch-governed input adaptation (2026-10-21, source baseline `b35ce457`):
+new adaptive sessions select `playout_input_stable_adaptation=6`. This supersedes
+revision 5's modeled-readiness percentile as the source of buffer demand.
+The actual eligible preventable-input-hitch coverage over the user's selected
+history, shared across source-rate layers, governs adaptation. The displayed
+120-second percentage uses these same outcomes; CPU interval severity remains
+a separate Client timing metric.
+
+When actual misses exceed the configured allowance, the buffer can grow only
+toward protection directly authorized by fresh qualifying hitches. A newly
+proven requirement cannot be trimmed away by an older miss percentile while
+the actual goal is failing. Harmless late readiness cannot enlarge the authorized
+destination. A reduced safety cap still drains excess protection even during a
+deficit. When coverage
+exceeds the goal, release is continuous at the configured fall rate multiplied
+by the unused fraction of the hitch allowance: 99.70% coverage against 99.50%
+uses 40% of that rate. Equality holds the buffer. An allowed isolated hitch does
+not authorize growth or a clean-window reset. Invalid observations supply no
+clean outcomes and stop speculative release; fully expired evidence retains the
+existing unknown-history expiry behavior. Upward saved-layer restoration is
+also blocked while actual session coverage meets the goal. Caps, physical
+readiness, queue safety, source cadence and presentation recovery remain separate.
+
+The existing rise/fall bounds and proportional near-minimum taper remain.
+Historical revisions 0--5 replay unchanged; the existing revision-based
+calibration identity separates the new policy. This correction does not change
+the decode-completion measurement or establish physical display improvement.
+
 PyroWave producer-clock queue-residence correction (2026-10-21, source baseline
 `04ad823f`): new bounded-catch-up sessions select
 `normalized_source_intrinsic_decode_gpu=1`. The normalized producer clock uses
