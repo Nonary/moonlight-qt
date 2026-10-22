@@ -137,6 +137,9 @@ private:
     int m_ConsecutiveFailedDecodes;
     Pacer* m_Pacer;
     BandwidthTracker m_BwTracker;
+    uint64_t m_LastReceivedVideoBytes = 0;
+    uint64_t m_LastReceivedVideoBytesTimeUs = 0;
+    double m_ReceivedVideoMbps = 0;
     VIDEO_STATS m_ActiveWndVideoStats;
     VIDEO_STATS m_LastWndVideoStats;
     VIDEO_STATS m_GlobalVideoStats;

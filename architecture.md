@@ -5788,6 +5788,17 @@ history meets the target, qualified recovery and the gradual release rate
 still apply. Historical score debt alone never authorizes growth.
 Historical revisions retain their recorded averaging/control behavior for exact replay.
 
+The performance overlay also reports received video bitrate in Mbps, excluding
+FEC and transport overhead, using the existing bandwidth tracker's recent
+completed buckets (approximately 2.5 seconds), refreshed with the stats text.
+This measures delivered encoded video rather than the configured bitrate target.
+A second `Video traffic` row uses a synchronized cumulative receive-byte counter
+in moonlight-common-c, sampled about once per second. It includes FEC, RTP
+headers, encryption and discarded video datagrams, but excludes UDP/IP/link
+headers and audio. It is measured before decryption and stale-packet rejection;
+it is not inferred from the configured FEC percentage. The two rows use
+different averaging windows and must not be subtracted to claim a pure FEC rate.
+
 The normal overlay retains Moonlight's original performance rows and incoming
 host smoothness, then appends three compact VRR lines for buffer/coverage, extra delay/planned
 total, and plan-referenced display timing. Decoder skips and detailed controller breakdowns

@@ -1324,28 +1324,18 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
     if (stats.receivedFps > 0) {
         if (m_VideoDecoderCtx != nullptr || m_PyroWaveActive) {
-#ifdef DISPLAY_BITRATE
-            double avgVideoMbps = m_BwTracker.GetAverageMbps();
-            double peakVideoMbps = m_BwTracker.GetPeakMbps();
-#endif
-
             ret = snprintf(&output[offset],
                            length - offset,
                            "Video stream: %dx%d %.2f FPS (Codec: %s)\n"
-#ifdef DISPLAY_BITRATE
-                           "Bitrate: %.1f Mbps, Peak (%us): %.1f\n"
-#endif
+                           "Video bitrate: %.1f Mbps (excluding FEC)\n"
+                           "Video traffic: %.1f Mbps (including FEC and packet overhead)\n"
                            ,
                            m_VideoDecoderCtx != nullptr ? m_VideoDecoderCtx->width : m_OriginalVideoWidth,
                            m_VideoDecoderCtx != nullptr ? m_VideoDecoderCtx->height : m_OriginalVideoHeight,
                            stats.totalFps,
-                           codecString
-#ifdef DISPLAY_BITRATE
-                           ,
-                           avgVideoMbps,
-                           m_BwTracker.GetWindowSeconds(),
-                           peakVideoMbps
-#endif
+                           codecString,
+                           m_BwTracker.GetAverageMbps(),
+                           m_ReceivedVideoMbps
                            );
             if (ret < 0 || ret >= length - offset) {
                 SDL_assert(false);
@@ -3111,6 +3101,20 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     }
 
     m_BwTracker.AddBytes(du->fullLength);
+
+    // Sample receive-side traffic independently of reassembled video size.
+    // The counter includes parity and packets discarded before decoding.
+    const uint64_t trafficNowUs = LiGetMicroseconds();
+    if (!m_TestOnly && (m_LastReceivedVideoBytesTimeUs == 0 ||
+            trafficNowUs - m_LastReceivedVideoBytesTimeUs >= 1000000)) {
+        const uint64_t receivedBytes = LiGetReceivedVideoBytes();
+        if (m_LastReceivedVideoBytesTimeUs != 0) {
+            m_ReceivedVideoMbps = (receivedBytes - m_LastReceivedVideoBytes) * 8.0 /
+                (trafficNowUs - m_LastReceivedVideoBytesTimeUs);
+        }
+        m_LastReceivedVideoBytes = receivedBytes;
+        m_LastReceivedVideoBytesTimeUs = trafficNowUs;
+    }
 
     // Observe every delivered PyroWave frame before stale-frame shedding or
     // decoding. Missing detail can shimmer without dropping a whole frame.
