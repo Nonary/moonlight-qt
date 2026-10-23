@@ -39,6 +39,7 @@
     X(uint64_t, playout_absorbed_jitter_release, playoutAbsorbedJitterRelease, 0) \
     X(uint64_t, bounded_catchup_enabled, boundedCatchupEnabled, 0) \
     X(uint64_t, normalized_source_mapping, normalizedSourceMapping, 0) \
+    X(uint64_t, normalized_source_intrinsic_decode_gpu, normalizedSourceIntrinsicDecodeGpu, 0) \
     /* Zero preserves historical capture accounting. */ \
     /* 1 = raw applied offset; 2 = minus median per-second drift; */ \
     /* 3 = minus least-squares drift over the trailing 120 s. */ \
@@ -290,7 +291,19 @@
     X(uint64_t, playout_epoch_confirm_us, playoutEpochConfirmUs, 0) \
     X(uint64_t, playout_smoothing_readiness_bound, playoutSmoothingReadinessBound, 0) \
     /* Native future deadlines use the logical display clock, not CPU enqueue. */ \
-    X(uint64_t, native_scheduled_presentation, nativeScheduledPresentation, 0)
+    X(uint64_t, native_scheduled_presentation, nativeScheduledPresentation, 0) \
+    /* At the display ceiling, standing retiming beyond its budget plus T */ \
+    /* requests a ready-successor replacement. 0: native scheduled smoothing */ \
+    /* revisions 8/9 only (recorded); 1: every presentation path and mode; */ \
+    /* 2: also keeps phase late input forced (up to a refresh) and replaces */ \
+    /* beyond a refresh at once, so late frames cost fewer skips than fixed */ \
+    /* refresh's repeats and drops. */ \
+    X(uint64_t, playout_ceiling_phase_replacement, playoutCeilingPhaseReplacement, 0) \
+    /* Nonzero: a frame whose packets arrived over a much shorter span than */ \
+    /* usual teaches the playout offset as if it had the usual span. A small */ \
+    /* encoded frame finishes the host's paced send early; it is not proof */ \
+    /* that the next full-size frame can be shown earlier. */ \
+    X(uint64_t, playout_offset_send_span_normalization, playoutOffsetSendSpanNormalization, 0)
 
 // Every value that changes VRR policy remains replaceable by replay without
 // rebuilding the controller. Production callers use these defaults.
@@ -394,6 +407,9 @@ struct VrrTimingDecision {
     // tick. Non-zero means a fresher successor, if one is already queued,
     // should be shown instead.
     uint64_t missedTicks = 0;
+    // Longest the worker may wait for a ready successor when replacement is
+    // recommended; 0 keeps its default of two source periods (20 ms cap).
+    uint64_t replacementWaitUs = 0;
 
     uint64_t renderStartUs = 0;
     uint64_t targetUs = 0;
@@ -485,8 +501,26 @@ public:
         if (m_Parameters.playoutInputPercentileEnabled)
             m_InputPercentileBuffer.noteBufferMiss(atUs, networkMiss, decoderMiss);
     }
-    void noteTrajectoryResyncDrop() { m_PhaseTrajectory.noteResyncDrop(); }
-    void noteTrajectoryDeferred() { m_PhaseTrajectory.noteDeferred(); }
+    void noteTrajectoryResyncDrop() {
+        m_PhaseTrajectory.noteResyncDrop();
+        m_FullRatePhaseCount = 0;
+        // The replacement is the step that sheds held phase; slewing recovery
+        // back down at T/s would re-impose the delay it just removed, and a
+        // pending input release would otherwise need a replacement of its own
+        // every half millisecond instead of riding on this one.
+        if (m_Parameters.playoutCeilingPhaseReplacement != 0) {
+            m_ExtraBufferSlew.shedRecovery();
+            if (m_Parameters.playoutInputPercentileEnabled) m_InputPercentileBuffer.takePendingRelease();
+        }
+        // The successor's phase is measured against the last shown frame; the
+        // step between them is the shed, not new input lateness.
+        m_CeilingLastPhaseValid = false;
+    }
+    void noteTrajectoryDeferred() {
+        m_PhaseTrajectory.noteDeferred();
+        m_FullRatePhaseCount = 0;
+        m_CeilingShedding = false;
+    }
     Vrr13::PhaseTrajectory::Stats trajectoryStats() const { return m_PhaseTrajectory.stats(); }
     void notePresentation(const Vrr13::PresentationObservation& observation);
     uint64_t nativeCadenceIntervals() const { return m_NativeCadenceIntervals; }
@@ -572,11 +606,15 @@ public:
     uint64_t playoutDelayUs() const;
     // Learned Reduce judder readiness reserve; already included in each
     // decision's cadenceSmoothingUs, never in playoutDelayUs.
-    uint64_t smoothingReserveUs() const { return m_Parameters.playoutSmoothingWindowedCadence == 7 ?
+    uint64_t smoothingReserveUs() const { return fixedAbsorbPolicy() ?
         absorbReserveUs() : m_SmoothingReserveUs; }
     // Absorb microstutter reserve at the current source period; included in
     // each revision-5 decision's cadenceSmoothingUs, never in playoutDelayUs.
     uint64_t absorbReserveUs() const;
+    bool fixedAbsorbPolicy() const {
+        return m_Parameters.playoutSmoothingWindowedCadence == 7 ||
+            m_Parameters.playoutSmoothingWindowedCadence == 8;
+    }
     // Revision 5 retained phase limit at the current source period.
     uint64_t smoothingPhaseLimitUs() const;
     unsigned int playoutBandIndex() const;
@@ -598,6 +636,20 @@ public:
 private:
     Vrr13::PhaseTrajectory m_PhaseTrajectory;
     Vrr13::ExtraBufferSlew m_ExtraBufferSlew;
+    // A whole source-jitter cycle must show excess phase before replacement.
+    // Individual early stamps can legitimately need more physical spacing.
+    std::array<uint64_t, 32> m_FullRatePhase {};
+    size_t m_FullRatePhaseCount = 0, m_FullRatePhaseNext = 0;
+    // Ceiling policy 2: on-screen phase late input forced (at most a refresh),
+    // kept as protection instead of shed, the previous shown frame's on-screen
+    // and removable phase, and the phase of the frame the current shed replaced.
+    uint64_t m_CeilingEarnedPhaseUs = 0, m_CeilingLastPhaseUs = 0, m_CeilingLastRemovableUs = 0;
+    uint64_t m_CeilingShedFromUs = 0;
+    // Policy 3: earned phase as last raised, and when.
+    uint64_t m_CeilingEarnedPeakUs = 0, m_CeilingEarnedAtUs = 0;
+    static constexpr uint64_t kCeilingEarnedHoldUs = 5000000;
+    size_t m_CeilingFramesSinceShed = SIZE_MAX / 2;
+    bool m_CeilingLastPhaseValid = false, m_CeilingShedding = false;
     bool m_BufferLayerChanged = false, m_BufferLayerDrain = false;
     bool m_HaveMappingBasis = false;
     bool m_CorrectedMappingBasis = false;
@@ -739,6 +791,7 @@ private:
     uint64_t sourceMappingUs(const PacedFrame& frame) const;
     uint64_t estimatedDecodeCompleteUs(const PacedFrame& frame) const;
     void learnDecodeGpu(const PacedFrame& frame);
+    uint64_t sendSpanCorrectionUs(const PacedFrame& frame);
     CadenceObservation observeCadence(const PacedFrame& frame);
     void observeRtpCadence(uint32_t rtpDelta,
                            CadenceObservation& observation);
@@ -907,13 +960,28 @@ private:
     uint64_t m_InputLayerEligibleAtStart = 0;
     Vrr13::InputLayerCadence m_InputLayerCadence;
     Vrr13::InputCoverageHistory m_InputCoverageHistory;
+    // Lost-cause score exclusion already applied through this time.
+    uint64_t m_ScoreExcludedThroughUs = 0;
     InputLayerChange updateInputLayer(uint64_t nowUs, const CadenceObservation& cadence);
     uint64_t inputHitchPolicy(uint64_t nowUs) const;
+    // Reassembly-to-decode queue time excluded from input readiness as client
+    // backlog. Policy 11 keeps the recent typical handoff in readiness.
+    uint64_t inputDecoderBacklogUs(const PacedFrame& frame);
+    std::deque<uint64_t> m_DecoderQueueHistory;
     // Exact GPU decode durations (decoder output -> completion) from frames
     // the worker blocked on; their median estimates unobserved completions.
     std::array<uint64_t, 64> m_DecodeGpuSamples {};
     size_t m_DecodeGpuNext = 0, m_DecodeGpuCount = 0;
     uint64_t m_DecodeGpuTypicalUs = 0;
+    static constexpr uint64_t PromptCollectionUs = 1000;
+    std::array<uint64_t, 64> m_DecodeIntrinsicSamples {};
+    size_t m_DecodeIntrinsicNext = 0, m_DecodeIntrinsicCount = 0;
+    uint64_t m_DecodeIntrinsicUs = 0;
+    // First-to-last packet span of recent loss-free frames; their median is
+    // the typical paced send of a full-size frame.
+    std::array<uint32_t, 512> m_SendSpanSamples {};
+    size_t m_SendSpanNext = 0, m_SendSpanCount = 0;
+    uint64_t m_SendSpanTypicalUs = 0;
     uint64_t m_InputPercentileBeforeUs = 0;
     // Interval-buffer demand remembered per source-rate epoch, keyed by
     // quarter-octave rate bucket.

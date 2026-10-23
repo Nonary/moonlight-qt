@@ -1,3 +1,4 @@
+#include "assertions.h"
 #include "streaming/kwinscanoutguard.h"
 #include "protocols/kde-output-device-v2-server-protocol.h"
 #include "protocols/kde-output-management-v2-server-protocol.h"

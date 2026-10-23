@@ -2933,10 +2933,10 @@ void testNativeScheduledRetimingBounds()
         const auto scheduled = vrrTimingParametersForSession(session, true, true);
         const auto paced = vrrTimingParametersForSession(session, true, false);
         const auto tolerance = uint64_t(session.timingOptions.resolved(mode).toleranceUs);
-        expect(scheduled.playoutSmoothingWindowedCadence == 4 &&
+        expect(scheduled.playoutSmoothingWindowedCadence == 9 &&
                    scheduled.playoutSmoothingMaxLagUs == tolerance &&
                    scheduled.playoutSmoothingReserveMaxUs == 0 &&
-                   paced.playoutSmoothingWindowedCadence == 4 &&
+                   paced.playoutSmoothingWindowedCadence == 9 &&
                    paced.playoutSmoothingMaxLagUs == tolerance && paced.playoutSmoothingReserveMaxUs == 0,
                "native and worker-paced Reduce judder must share one tolerance with no standing reserve");
         VrrTimingController controller(session, true, scheduled);
@@ -4862,7 +4862,7 @@ void testProductionSmoothFrameTiming()
                        policy.playoutSmoothingPeriodAlphaPerMille == 25 &&
                        policy.playoutSmoothingRecoveryUs == 0 &&
                        policy.playoutSmoothingMaxLagUs == (enabled ? tolerance : 6000) &&
-                       policy.playoutSmoothingWindowedCadence == (enabled ? 4U : 2U) &&
+                       policy.playoutSmoothingWindowedCadence == (enabled ? 9U : 2U) &&
                        policy.playoutSmoothingRecenterPerMille == 0 &&
                        policy.playoutSmoothingAbsorbReserveUs == 0 &&
                        policy.playoutSmoothingPeriodFeedbackPerMillion == 0 &&
@@ -7669,6 +7669,53 @@ void testAbsorbLocalCadencePreservesVariableAndQuantizedSources()
     }
 }
 
+void testProducerClockExcludesLateGpuCollection()
+{
+    uint64_t worstClockSkew[2] = {};
+    for (int corrected : {0, 1}) {
+        auto session = config(120, 120);
+        session.smoothFrameTiming = false;
+        session.experimentalBoundedCatchup = true;
+        auto policy = vrrTimingParametersForSession(session);
+        policy.normalizedSourceIntrinsicDecodeGpu = corrected;
+        policy.playoutOffsetWindowUs = 250000;
+        VrrTimingController controller(session, true, policy);
+        for (int i = 0; i < 1200; ++i) {
+            const uint64_t output = 1000000 + uint64_t(i) * 8333;
+            const uint64_t completion = output + (i < 8 ? 500 : 15500);
+            auto input = frame(i + 1, uint32_t(i * 750), true, output);
+            input.setDeliveryTimeline(output - 900, output - 800, output - 500);
+            input.noteGpuReadyUs(completion);
+            input.noteDecodeSyncWaitUs(500);
+            const auto d = controller.schedule(input, completion);
+            const auto submitted = std::max(d.targetUs, completion + 1000);
+            expect(submitted >= completion,
+                   "producer clock correction must retain actual GPU readiness");
+            if (i > 600 && d.sourceTimeUs > output)
+                worstClockSkew[corrected] = std::max(worstClockSkew[corrected], d.sourceTimeUs - output);
+            controller.notePreparationDuration(1000);
+            controller.noteSubmission(true, false, submitted);
+        }
+    }
+    std::fprintf(stderr, "late GPU collection clock skew: %llu -> %llu us\n",
+                 static_cast<unsigned long long>(worstClockSkew[0]),
+                 static_cast<unsigned long long>(worstClockSkew[1]));
+    expect(worstClockSkew[0] > 8000 && worstClockSkew[1] < 2000,
+           "late collection must not move the producer clock forward by our own queue residence");
+
+    auto session = config(120, 120);
+    session.smoothFrameTiming = false;
+    session.experimentalBoundedCatchup = true;
+    VrrTimingController controller(session, true, vrrTimingParametersForSession(session));
+    auto input = frame(1, 750, true, 1000000);
+    input.setDeliveryTimeline(999000, 999200, 999500);
+    input.noteGpuReadyUs(1015500);
+    input.noteDecodeSyncWaitUs(15500);
+    const auto d = controller.schedule(input, 1015500);
+    expect(d.sourceTimeUs >= 1014000,
+           "promptly observed genuine long GPU service must remain in the producer clock");
+}
+
 int main()
 {
     testAbsorbTracksUniformSourceRateBeforeLongFitCatchesUp();
@@ -7842,5 +7889,6 @@ int main()
     testNativeScheduledFailureAndCancellationDoNotConsumeSlots();
     testNativeScheduledSlowerCadenceAndOverloadAdmission();
     testRuntimeParametersChangePolicy();
+    testProducerClockExcludesLateGpuCollection();
     return failures == 0 ? 0 : 1;
 }

@@ -13,7 +13,8 @@ SOURCES += \
 
 HEADERS += \
     $$PWD/vrrreplayconfig.h \
-    $$PWD/vrrreplaymodel.h
+    $$PWD/vrrreplaymodel.h \
+    $$PWD/vrrreplaymetrics.h
 
 win32 {
     contains(QT_ARCH, x86_64) {

@@ -5,8 +5,8 @@
 
 namespace Vrr13 {
 // One movement allowance for intentional extra delay. Recorded policy 9
-// also charges input-buffer movement; policy 10 leaves input adaptation to
-// its normal release law without accumulating extra-delay movement debt.
+// also charges input-buffer movement; policies 10 and 11 leave input
+// adaptation to its own laws without accumulating extra-delay movement debt.
 // Physical readiness/ownership floors are applied by the caller after
 // this policy: a frame cannot be displayed before it exists or owns scanout.
 class ExtraBufferSlew {
@@ -47,6 +47,8 @@ public:
     uint64_t recovery(uint64_t desiredUs) {
         return uint64_t(move(m_RecoveryUs, int64_t(desiredUs), m_FastRecovery));
     }
+    // A ready-successor replacement removes held recovery phase at once.
+    void shedRecovery() { m_RecoveryUs = 0; m_FastRecovery = false; }
     bool draining(int64_t smoothingUs, uint64_t recoveryUs) const {
         return m_SmoothingUs > smoothingUs || m_RecoveryUs > int64_t(recoveryUs);
     }

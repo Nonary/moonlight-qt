@@ -1,3 +1,4 @@
+#include "assertions.h"
 #include "../../app/streaming/video/ffmpeg-renderers/vulkantiming.h"
 #include <algorithm>
 #include <cassert>

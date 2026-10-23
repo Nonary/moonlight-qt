@@ -1,3 +1,4 @@
+#include "assertions.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profile.h"
 #include <QCoreApplication>

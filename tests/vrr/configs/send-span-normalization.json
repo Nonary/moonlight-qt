@@ -1,0 +1,25 @@
+{
+  "config_schema": 1,
+  "scenarios": [
+    {
+      "name": "session-policy-raw-span",
+      "mode": "fixed",
+      "base": "session",
+      "parameters": {
+        "controller": {
+          "playout_offset_send_span_normalization": 0
+        }
+      }
+    },
+    {
+      "name": "session-policy",
+      "mode": "fixed",
+      "base": "session",
+      "parameters": {
+        "controller": {
+          "playout_offset_send_span_normalization": 1
+        }
+      }
+    }
+  ]
+}

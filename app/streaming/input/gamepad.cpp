@@ -1,5 +1,6 @@
-#include <ControllerHaptics.h>
 #include "streaming/session.h"
+#include <ControllerHaptics.h>
+#include <ControllerSpeakerPcm.h>
 
 #include <Limelight.h>
 #include "SDL_compat.h"
@@ -573,11 +574,14 @@ void SdlInputHandler::sendControllerArrival(GamepadState* state)
     uint8_t type = moonlightControllerType(state->controller);
 
     if (state->hapticsAttached) capabilities |= LI_CCAP_HAPTICS_PCM;
+    const uint64_t speakerOwner = DualSenseHaptics::speakerOwner(state->index);
+    if (state->speakerPcmAttached && speakerOwner && type == LI_CTYPE_PS)
+      capabilities |= LI_CCAP_PS_SPEAKER_PCM;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Sending controller arrival: player %d type %u caps 0x%x buttons 0x%x",
                 state->index, type, capabilities, supportedButtonFlags);
-    LiSendControllerArrivalEvent(state->index, m_GamepadMask, type, supportedButtonFlags, capabilities);
+    LiSendControllerSpeakerArrivalEvent(state->index, m_GamepadMask, type, supportedButtonFlags, capabilities, speakerOwner);
 #else
     Q_UNUSED(state);
 #endif
@@ -764,6 +768,8 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
         }
 
         state->hapticsAttached = DualSenseHaptics::attach(state->index, state->controller);
+        state->speakerPcmAttached =
+            DualSenseHaptics::speakerReady(state->index);
 
         // Add this gamepad to the gamepad mask
         if (m_MultiController) {

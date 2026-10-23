@@ -78,13 +78,6 @@ CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
 #else
     nullptr,
 #endif
-#if STEAM_CONTROLLER_LI_EXTENSIONS
-    // Steam Controller (2026) haptic and settings relays, delivered straight to the driver's
-    // registry (not through the SDL event queue: haptics are latency sensitive and the driver
-    // has its own writer thread).
-    SteamControllerHost::clSteamHaptic,
-    SteamControllerHost::clSteamSettings,
-#endif
 };
 
 Session* Session::s_ActiveSession;
@@ -1982,9 +1975,26 @@ bool Session::startConnectionAsync()
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave pacing hints: link %d Mbps, calibrated pace %d Mbps",
                     m_StreamConfig.pyrowaveLinkMbps, m_StreamConfig.pyrowavePaceMbps);
     }
-    int err = LiStartConnection(&hostInfo, &m_StreamConfig, &k_ConnCallbacks,
-                                &m_VideoCallbacks, &m_AudioCallbacks,
-                                NULL, 0, NULL, 0);
+    // The Steam Controller (2026) haptic and settings relays are registered here rather than in
+    // k_ConnCallbacks, which keeps its V1 layout. They are delivered straight to the driver's
+    // registry (not through the SDL event queue: haptics are latency sensitive and the driver
+    // has its own writer thread).
+    int err = LiStartConnectionWithSteamController(&hostInfo, &m_StreamConfig,
+                                                   &k_ConnCallbacks,
+                                                   &m_VideoCallbacks,
+                                                   &m_AudioCallbacks,
+                                                   NULL, 0, NULL, 0,
+#if defined(Q_OS_WIN) && SDL_VERSION_ATLEAST(2, 24, 0)
+                                                   DualSenseHaptics::receiveSpeaker,
+#else
+                                                   nullptr,
+#endif
+#if STEAM_CONTROLLER_LI_EXTENSIONS
+                                                   SteamControllerHost::clSteamHaptic,
+                                                   SteamControllerHost::clSteamSettings);
+#else
+                                                   nullptr, nullptr);
+#endif
     if (err != 0) {
         // We already displayed an error dialog in the stage failure
         // listener.

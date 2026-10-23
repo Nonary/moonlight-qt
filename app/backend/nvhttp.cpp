@@ -1,5 +1,6 @@
 #include "nvcomputer.h"
 #include "pyrowaveudpprobe.h"
+#include "poweractions.h"
 #include <Limelight.h>
 
 #include <QDebug>
@@ -608,6 +609,31 @@ void NvHTTP::handleSslErrors(QNetworkReply* reply, const QList<QSslError>& error
     }
 }
 
+void NvHTTP::requestHostSleep()
+{
+    // Keep both requests bound to the endpoint and identity confirmed by the user.
+    const auto pairedServerCert = m_ServerCert;
+    const auto endpoint = m_BaseUrlHttps;
+    if (pairedServerCert.isNull()) throw std::runtime_error("Pair with the host before requesting sleep.");
+    // Tokens are obtained only after confirmation and never retained for a retry.
+    auto* discovery = openConnection(endpoint, "power-actions/v1", {},
+                                     REQUEST_TIMEOUT_MS, NVLL_NONE, {}, true,
+                                     QNetworkAccessManager::GetOperation, pairedServerCert);
+    const QString capabilityXml = QString::fromUtf8(discovery->readAll());
+    const int discoveryStatus = discovery->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    delete discovery;
+    if (discoveryStatus != 200) throw std::runtime_error("The host rejected sleep discovery.");
+    const QString token = PowerActions::confirmedToken(capabilityXml);
+    auto* action = openConnection(endpoint, "power-actions/v1/sleep", "token=" + token,
+                                  REQUEST_TIMEOUT_MS, NVLL_NONE, {}, true,
+                                  QNetworkAccessManager::PostOperation, pairedServerCert);
+    const QString acceptanceXml = QString::fromUtf8(action->readAll());
+    const int actionStatus = action->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    delete action;
+    if (actionStatus != 202 || !PowerActions::accepted(acceptanceXml))
+        throw std::runtime_error("The host did not acknowledge sleep acceptance. Confirm again before another attempt.");
+}
+
 QString
 NvHTTP::openConnectionToString(QUrl baseUrl,
                                QString command,
@@ -638,7 +664,10 @@ NvHTTP::openConnection(QUrl baseUrl,
                        QString arguments,
                        int timeoutMs,
                        NvLogLevel logLevel,
-                       const std::function<QString(QNetworkReply*)>& receiveHeaders)
+                       const std::function<QString(QNetworkReply*)>& receiveHeaders,
+                       bool powerAction,
+                       QNetworkAccessManager::Operation operation,
+                       QSslCertificate pairedServerCert)
 {
     // Port must be set
     Q_ASSERT(baseUrl.port(0) != 0);
@@ -648,11 +677,21 @@ NvHTTP::openConnection(QUrl baseUrl,
     url.setPath("/" + command);
 
     // Use a placeholder UID for GFE allow them to quit games for each other.
-    url.setQuery("uniqueid=" + (m_UseTrueUid ? IdentityManager::get()->getUniqueId() : "0123456789ABCDEF") +
+    if (powerAction) {
+        if (baseUrl.scheme() != "https" || pairedServerCert.isNull())
+            throw std::runtime_error("Sleep requires pinned paired HTTPS.");
+        url.setQuery(arguments);
+    } else url.setQuery("uniqueid=" + (m_UseTrueUid ? IdentityManager::get()->getUniqueId() : "0123456789ABCDEF") +
                  "&uuid=" + QUuid::createUuid().toRfc4122().toHex() +
                  ((arguments != nullptr) ? ("&" + arguments) : ""));
 
     QNetworkRequest request(url);
+    if (powerAction) {
+        // Never follow a redirect with the certificate or replay a power POST.
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+        if (operation == QNetworkAccessManager::PostOperation)
+            request.setHeader(QNetworkRequest::ContentTypeHeader, "application/x-www-form-urlencoded");
+    }
 
     // Add our client certificate
     request.setSslConfiguration(IdentityManager::get()->getSslConfig());
@@ -669,8 +708,49 @@ NvHTTP::openConnection(QUrl baseUrl,
     request.setAttribute(QNetworkRequest::ConnectionCacheExpiryTimeoutSecondsAttribute, 0);
 #endif
 
-    auto sslErrorsConnection = connect(m_Nam, &QNetworkAccessManager::sslErrors, this, &NvHTTP::handleSslErrors);
-    QNetworkReply* reply = m_Nam->get(request);
+    // QNetworkReply::encrypted is not emitted when a pooled connection is reused.
+    // Each power request owns a fresh manager, so its first connection must emit
+    // encrypted before HTTP data. No generic/past request can lend it a connection.
+    auto* network = m_Nam;
+    bool pairedPeerVerified = false;
+    bool powerConnectionUsed = false;
+    bool powerReplayPrevented = false;
+    QMetaObject::Connection pairedPeerConnection;
+    if (powerAction) {
+        network = new QNetworkAccessManager(this);
+        network->setProxy(QNetworkProxy::NoProxy);
+        pairedPeerConnection = connect(network, &QNetworkAccessManager::encrypted, network,
+                [pairedServerCert, &pairedPeerVerified, &powerConnectionUsed, &powerReplayPrevented](QNetworkReply* encryptedReply) {
+            // Qt may replay even an empty POST after a lost response. A power
+            // transaction allows only its first TLS connection to send HTTP.
+            if (powerConnectionUsed) {
+                powerReplayPrevented = true;
+                encryptedReply->abort();
+                return;
+            }
+            powerConnectionUsed = true;
+            pairedPeerVerified = encryptedReply->sslConfiguration().peerCertificate() == pairedServerCert;
+            if (!pairedPeerVerified) encryptedReply->abort();
+        });
+    }
+    QMetaObject::Connection sslErrorsConnection;
+    if (powerAction) {
+        sslErrorsConnection = connect(network, &QNetworkAccessManager::sslErrors, network,
+                [pairedServerCert](QNetworkReply* sslReply, const QList<QSslError>& errors) {
+            // A paired self-signed cert may have verification errors. Default CA
+            // trust never replaces the separate exact paired-leaf comparison.
+            if (sslReply->sslConfiguration().peerCertificate() != pairedServerCert) return;
+            for (const auto& error : errors) {
+                if (error.certificate() != pairedServerCert) return;
+            }
+            sslReply->ignoreSslErrors(errors);
+        });
+    } else {
+        sslErrorsConnection = connect(network, &QNetworkAccessManager::sslErrors, this, &NvHTTP::handleSslErrors);
+    }
+    QNetworkReply* reply = operation == QNetworkAccessManager::PostOperation
+        ? network->post(request, QByteArray()) : network->get(request);
+    if (powerAction) connect(reply, &QObject::destroyed, network, &QObject::deleteLater);
 
     // Run the request with a timeout if requested
     QEventLoop loop;
@@ -720,9 +800,19 @@ NvHTTP::openConnection(QUrl baseUrl,
 
 #if QT_VERSION < QT_VERSION_CHECK(6, 3, 0)
     // If we couldn't use fine-grained connection idle timeouts, kill them all now
-    m_Nam->clearAccessCache();
+    network->clearAccessCache();
 #endif
     disconnect(sslErrorsConnection);
+    disconnect(pairedPeerConnection);
+    if (powerReplayPrevented) {
+        delete reply;
+        throw QtNetworkReplyException(QNetworkReply::RemoteHostClosedError,
+            tr("The sleep request was not acknowledged. Automatic retry was prevented."));
+    }
+    if (powerAction && !pairedPeerVerified) {
+        delete reply;
+        throw std::runtime_error("The sleep peer did not match the paired host certificate.");
+    }
 
     if (!headerError.isEmpty()) {
         delete reply;
@@ -746,6 +836,13 @@ NvHTTP::openConnection(QUrl baseUrl,
                 tr("PyroWave UDP test: %1").arg(reason));
             delete reply;
             throw exception;
+        }
+        if (powerAction) {
+            const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            const auto error = reply->error();
+            delete reply;
+            if (status >= 400) throw GfeHttpResponseException(status, tr("The host refused sleep. Check permission and end all host sessions before confirming again."));
+            throw QtNetworkReplyException(error, tr("The sleep request was not acknowledged. No automatic retry will occur."));
         }
         if (logLevel >= NvLogLevel::NVLL_ERROR) {
             qWarning() << command << "request failed with error:" << reply->error();

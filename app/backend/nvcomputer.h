@@ -105,6 +105,7 @@ public:
     QString gpuModel;
     bool isSupportedServerVersion;
     // Optional /serverinfo extension; absent fields never imply integration.
+    bool sleepActionSupportedAndAllowed = false;
     bool frameLimiterSupported = false;
     bool frameLimiterEnabled = false;
     bool virtualDisplayFrameLimiterEnabled = false;

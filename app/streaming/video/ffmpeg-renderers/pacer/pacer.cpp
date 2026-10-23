@@ -338,6 +338,8 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                 context += QStringLiteral("|input-receive-drift-clock=%1").arg(recoveryPolicy.playoutInputClockRelativeHistory);
             if (recoveryPolicy.playoutInputHitchMissesOnly)
                 context += QStringLiteral("|input-hitch-misses=%1").arg(recoveryPolicy.playoutInputHitchMissesOnly);
+            if (recoveryPolicy.normalizedSourceIntrinsicDecodeGpu)
+                context += QStringLiteral("|intrinsic-producer-clock=%1").arg(recoveryPolicy.normalizedSourceIntrinsicDecodeGpu);
             if (recoveryPolicy.playoutInputStableAdaptation)
                 context += QStringLiteral("|stable-input-adaptation=%1").arg(recoveryPolicy.playoutInputStableAdaptation);
             context += QStringLiteral("|late-recovery=%1|buffer-ratio=%2")

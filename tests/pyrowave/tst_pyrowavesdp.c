@@ -1,5 +1,7 @@
 #include "Limelight-internal.h"
+#include "ControllerSpeakerPcm.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +12,7 @@ STREAM_CONFIGURATION StreamConfig;
 CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
 DECODER_RENDERER_CALLBACKS VideoCallbacks;
 AUDIO_RENDERER_CALLBACKS AudioCallbacks;
+ConnListenerControllerSpeakerPcm ControllerSpeakerPcmCallback;
 int NegotiatedVideoFormat;
 struct sockaddr_storage RemoteAddr;
 uint16_t RtspPortNumber = 48010;
@@ -66,6 +69,43 @@ static char* generateSdp(int format, int compression, int linkMbps) {
     return sdp;
 }
 
+static void speakerCallback(uint16_t controller, uint64_t owner,
+                            uint32_t generation, uint32_t sequence,
+                            uint64_t position, uint16_t flags,
+                            const uint8_t* pcm, uint16_t frames) {
+    (void)controller; (void)owner; (void)generation; (void)sequence;
+    (void)position; (void)flags; (void)pcm; (void)frames;
+    EXPECT(false, "SDP generation must not invoke the speaker renderer");
+}
+
+static void checkSpeakerNegotiation(void) {
+    const char* attribute = "a=x-ml-general.featureFlags:";
+    const uint32_t baseFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;
+    for (int enabled = 0; enabled < 3; enabled++) {
+        // Exercise registration and subsequent removal, not just zero startup state.
+        ControllerSpeakerPcmCallback = enabled == 1 ? speakerCallback : NULL;
+        char* sdp = generateSdp(VIDEO_FORMAT_H264, 0, 1000);
+        if (sdp == NULL) continue;
+        const char* line = strstr(sdp, attribute);
+        uint32_t flags = 0;
+        EXPECT(line != NULL && sscanf(line + strlen(attribute), "%" SCNu32, &flags) == 1,
+               "Sunshine SDP contains parseable client capabilities");
+        EXPECT(flags == (baseFlags | (enabled == 1 ? ML_FF_CONTROLLER_SPEAKER_PCM : 0)),
+               "Speaker capability follows renderer registration without changing other flags");
+        free(sdp);
+    }
+    AppVersionQuad[3] = 0;
+    ControllerSpeakerPcmCallback = speakerCallback;
+    char* sdp = generateSdp(VIDEO_FORMAT_H264, 0, 1000);
+    if (sdp != NULL) {
+        EXPECT(strstr(sdp, attribute) == NULL,
+               "Non-Sunshine hosts do not receive Sunshine speaker capabilities");
+        free(sdp);
+    }
+    AppVersionQuad[3] = -1;
+    ControllerSpeakerPcmCallback = NULL;
+}
+
 int main(void) {
     const int pyrowaveFormats[] = {
         VIDEO_FORMAT_PYROWAVE, VIDEO_FORMAT_PYROWAVE_444,
@@ -73,6 +113,8 @@ int main(void) {
     };
     const int fallbackFormats[] = {VIDEO_FORMAT_H264, VIDEO_FORMAT_H265, VIDEO_FORMAT_AV1_MAIN8};
     unsigned int i;
+
+    checkSpeakerNegotiation();
 
     for (i = 0; i < sizeof(pyrowaveFormats) / sizeof(pyrowaveFormats[0]); i++) {
         char* normal = generateSdp(pyrowaveFormats[i], 0, 1000);

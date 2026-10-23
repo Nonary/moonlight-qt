@@ -78,16 +78,25 @@ inline std::string formatVrr(const Snapshot& s)
         }
         else std::snprintf(coverage, sizeof(coverage), "coverage N/A / %.2f%% target", target);
         if (s.input.reportingWindowUs) {
-            char recent[32], history[32];
+            char recent[32], history[32], excluded[64] = "";
+            // Inputs over the buffer limit or without valid timing are not
+            // scored; show them so overload cannot read as clean coverage.
+            if (s.input.reportingIneligible)
+                std::snprintf(excluded, sizeof(excluded), " | %llu excluded (over limit/unmeasured)",
+                    static_cast<unsigned long long>(s.input.reportingIneligible));
+            else if (s.input.lostCauseRetained)
+                std::snprintf(excluded, sizeof(excluded), " | %s%llu lost-cause (kept 10 s)",
+                    s.input.lostCauseActive ? "now " : "",
+                    static_cast<unsigned long long>(s.input.lostCauseRetained));
             const auto percent=[](char* out, uint64_t count, uint64_t misses) {
                 if (count) std::snprintf(out, 32, "%.2f%%", 100.0 * double(count-std::min(count,misses))/double(count));
                 else std::snprintf(out, 32, "N/A");
             };
             percent(recent, s.input.reportingEligible, s.input.reportingMissed);
             percent(history, s.input.recentEligible, s.input.recentMissed);
-            std::snprintf(coverage, sizeof(coverage), "coverage (%llus) %s / %.2f%% | %llus %s",
+            std::snprintf(coverage, sizeof(coverage), "coverage (%llus) %s / %.2f%% | %llus %s%s",
                 static_cast<unsigned long long>(s.input.reportingWindowUs/1000000), recent, target,
-                static_cast<unsigned long long>(s.input.windowUs/1000000), history);
+                static_cast<unsigned long long>(s.input.windowUs/1000000), history, excluded);
         }
     }
     else if (s.clientTimingValid)

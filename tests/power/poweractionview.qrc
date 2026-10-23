@@ -1,0 +1,6 @@
+<RCC><qresource prefix="/res">
+<file alias="no_app_image.png">../../app/res/no_app_image.png</file>
+<file alias="baseline-error_outline-24px.svg">../../app/res/baseline-error_outline-24px.svg</file>
+<file alias="baseline-help_outline-24px.svg">../../app/res/baseline-help_outline-24px.svg</file>
+<file alias="baseline-check_circle_outline-24px.svg">../../app/res/baseline-check_circle_outline-24px.svg</file>
+</qresource></RCC>

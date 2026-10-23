@@ -147,7 +147,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Nightly updater tests failed: $LASTEXITCODE" }
 
       - name: Test VRR diagnostics (Windows x64)
-        timeout-minutes: 5
+        timeout-minutes: 10
         if: runner.os == 'Windows'
         shell: pwsh
         env:
@@ -158,22 +158,21 @@ jobs:
         run: |
           $deploy = (Resolve-Path build/deploy-x64-release).Path
           $env:Path = "$deploy;$env:QT_PATH;$env:Path"
-          $tests = Get-ChildItem build/tests-vrr/vrr/release/tst_*.exe
-          if ($tests.Count -lt 9 -or -not ($tests.Name -contains 'tst_vrrdiagnostics.exe')) { throw "Missing VRR test executables" }
-          foreach ($test in $tests) {
-            Write-Host "Running $($test.Name)"
-            if ($test.Name -eq 'tst_overlay.exe') {
-              & $test.FullName (Resolve-Path app).Path
-            } elseif ($test.Name -in @('tst_vrrratepolicy.exe', 'tst_vrrreplayconfig.exe', 'tst_vrrdiagnostics.exe')) {
-              & $test.FullName -o '-,txt'
-            } else {
-              & $test.FullName
-            }
-            if ($LASTEXITCODE -ne 0) { throw "$($test.Name) failed: $LASTEXITCODE" }
-            Write-Host "Passed $($test.Name)"
-          }
+          python -m unittest discover -s tests/vrr -p test_trace_contract_runner.py -v
+          if ($LASTEXITCODE -ne 0) { throw "Trace contract runner checks failed" }
+          python tests/vrr/run_trace_contracts.py --bin-dir build/tests-vrr/vrr/release --app-dir app --output-dir build/trace-contracts
+          if ($LASTEXITCODE -ne 0) { throw "Trace regression contracts failed" }
           python tests/vrr/check_diagnostic_zip.py build/diagnostic-fixture.zip
           if ($LASTEXITCODE -ne 0) { throw "Diagnostic export ZIP validation failed" }
+
+      - name: Retain trace regression evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v6
+        with:
+          name: VRR-trace-contracts-${{ matrix.os }}-${{ matrix.qt_version }}
+          path: build/trace-contracts
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Test integrated settings and handshake fixes (Windows x64)
         if: runner.os == 'Windows'

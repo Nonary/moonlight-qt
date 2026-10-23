@@ -41,6 +41,12 @@ void AppModel::initialize(ComputerManager* computerManager, int computerIndex, b
 
     updateAppList(m_Computer->appList);
     updateFrameLimiterCapabilities();
+    updateSleepAction();
+    const QString uuid = m_Computer->uuid;
+    connect(m_ComputerManager, &ComputerManager::hostSleepCompleted, this,
+            [this, uuid](const QString& completedUuid, const QString& error) {
+        if (completedUuid == uuid) emit hostSleepCompleted(error);
+    });
 }
 
 int AppModel::getRunningAppId()
@@ -63,7 +69,8 @@ QString AppModel::getRunningAppName()
 
 Session* AppModel::createSessionForApp(int appIndex)
 {
-    Q_ASSERT(appIndex < m_VisibleApps.count());
+    // The synthetic power row must never construct a streaming Session.
+    if (appIndex < 0 || appIndex >= m_VisibleApps.count()) return nullptr;
     NvApp app = m_VisibleApps.at(appIndex);
 
     return new Session(m_Computer, app);
@@ -87,7 +94,7 @@ int AppModel::rowCount(const QModelIndex &parent) const
     if (parent.isValid())
         return 0;
 
-    return m_VisibleApps.count();
+    return m_VisibleApps.count() + (m_SleepActionVisible ? 1 : 0);
 }
 
 QVariant AppModel::data(const QModelIndex &index, int role) const
@@ -95,7 +102,17 @@ QVariant AppModel::data(const QModelIndex &index, int role) const
     if (!index.isValid())
         return QVariant();
 
-    Q_ASSERT(index.row() < m_VisibleApps.count());
+    if (index.row() == m_VisibleApps.count() && m_SleepActionVisible) {
+        switch (role) {
+        case NameRole: return tr("Put PC to Sleep");
+        case BoxArtRole: return QUrl("qrc:/res/no_app_image.png");
+        case SleepActionRole: return true;
+        case AppIdRole: return 0; // No real app ID; never sent to a host.
+        case RunningRole: case HiddenRole: case DirectLaunchRole: case AppCollectorGameRole: return false;
+        default: return QVariant();
+        }
+    }
+    if (index.row() < 0 || index.row() >= m_VisibleApps.count()) return QVariant();
     NvApp app = m_VisibleApps.at(index.row());
 
     switch (role)
@@ -115,6 +132,8 @@ QVariant AppModel::data(const QModelIndex &index, int role) const
         return app.directLaunch;
     case AppCollectorGameRole:
         return app.isAppCollectorGame;
+    case SleepActionRole:
+        return false;
     default:
         return QVariant();
     }
@@ -131,6 +150,7 @@ QHash<int, QByteArray> AppModel::roleNames() const
     names[AppIdRole] = "appid";
     names[DirectLaunchRole] = "directLaunch";
     names[AppCollectorGameRole] = "appCollectorGame";
+    names[SleepActionRole] = "sleepAction";
 
     return names;
 }
@@ -138,6 +158,26 @@ QHash<int, QByteArray> AppModel::roleNames() const
 void AppModel::quitRunningApp()
 {
     m_ComputerManager->quitRunningApp(m_Computer);
+}
+
+void AppModel::updateSleepAction()
+{
+    QReadLocker lock(&m_Computer->lock);
+    const bool visible = m_Computer->sleepActionSupportedAndAllowed;
+    lock.unlock(); // Model notifications can re-enter UI/backend code.
+    if (visible == m_SleepActionVisible) return;
+    const int row = m_VisibleApps.count();
+    if (visible) beginInsertRows(QModelIndex(), row, row);
+    else beginRemoveRows(QModelIndex(), row, row);
+    m_SleepActionVisible = visible;
+    if (visible) endInsertRows();
+    else endRemoveRows();
+}
+
+void AppModel::requestHostSleep()
+{
+    if (!m_SleepActionVisible || !m_ComputerManager->requestHostSleep(m_Computer))
+        emit hostSleepCompleted(tr("Sleep is unavailable or a request is already pending."));
 }
 
 bool AppModel::isAppCurrentlyVisible(const NvApp& app)
@@ -229,7 +269,7 @@ void AppModel::updateAppList(QVector<NvApp> newList)
 
 void AppModel::setAppHidden(int appIndex, bool hidden)
 {
-    Q_ASSERT(appIndex < m_VisibleApps.count());
+    if (appIndex < 0 || appIndex >= m_VisibleApps.count()) return;
     int appId = m_VisibleApps.at(appIndex).id;
 
     {
@@ -248,7 +288,7 @@ void AppModel::setAppHidden(int appIndex, bool hidden)
 
 void AppModel::setAppDirectLaunch(int appIndex, bool directLaunch)
 {
-    Q_ASSERT(appIndex < m_VisibleApps.count());
+    if (appIndex < 0 || appIndex >= m_VisibleApps.count()) return;
     int appId = m_VisibleApps.at(appIndex).id;
 
     {
@@ -280,6 +320,7 @@ void AppModel::handleComputerStateChanged(NvComputer* computer)
     }
 
     updateFrameLimiterCapabilities();
+    updateSleepAction();
 
     // If the computer has gone offline or we've been unpaired,
     // signal the UI so we can go back to the PC view.

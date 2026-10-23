@@ -1,3 +1,4 @@
+#include "assertions.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/receivedriftclock.h"
 #include <cassert>
 #include <cstdint>

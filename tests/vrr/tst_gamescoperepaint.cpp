@@ -1,3 +1,4 @@
+#include "assertions.h"
 #include "streaming/video/ffmpeg-renderers/gamescoperepaint.h"
 #include "streaming/video/ffmpeg-renderers/protocols/gamescope-private-client-protocol.h"
 #include <wayland-server.h>

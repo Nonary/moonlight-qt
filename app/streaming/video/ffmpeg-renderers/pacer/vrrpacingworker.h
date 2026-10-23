@@ -87,6 +87,12 @@ private:
         PacedFrame frame;
         FrameTraceContext trace;
         std::shared_ptr<VrrPreparedFrame> preparation;
+        // A replacement proof may synchronize decode before the next loop.
+        // Preserve its service and observation boundary instead of observing
+        // that already-completed GPU work again after the current frame.
+        VrrDecodeReadiness reservedReadiness;
+        uint64_t reservedReadinessObservedUs = 0;
+        bool reservedReadinessValid = false;
 
         QueuedFrame() = default;
         QueuedFrame(QueuedFrame&&) = default;
@@ -208,7 +214,7 @@ private:
     bool dequeueFrame(QueuedFrame& frame, bool& queueDiscontinuity);
     bool hasQueuedFrame();
     bool reserveReadySuccessor(bool preparedCurrent, QueuedFrame& frame,
-                               bool& queueDiscontinuity);
+                               bool& queueDiscontinuity, unsigned waitMs = 0);
     void discardQueuedFrames(bool countDrops,
                              TraceDisposition disposition);
     uint32_t consumeWindowStateNotifications();

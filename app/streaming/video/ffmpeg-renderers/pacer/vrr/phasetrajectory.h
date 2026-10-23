@@ -64,8 +64,9 @@ public:
             m_Stats.intendedIntervalUs = interval;
             // physicalPeriod bounds the repayment to the available VRR room.
             const uint64_t previousCarry = m_Anchor > m_CommittedNominal ? m_Anchor - m_CommittedNominal : 0;
-            const uint64_t drain = std::min(allowance, std::max(interval * MinimumDrainPerMille / 1000,
-                                                                previousCarry / DrainCarryDivisor));
+            const uint64_t drain = m_DrainAtAllowance ? std::min(allowance, previousCarry) :
+                std::min(allowance, std::max(interval * MinimumDrainPerMille / 1000,
+                                             previousCarry / DrainCarryDivisor));
             m_Stats.minimumIntervalUs = std::max(physicalPeriod,
                 interval > drain ? interval - drain : 0);
             const uint64_t phaseFloor = add(m_Anchor, m_Stats.minimumIntervalUs);
@@ -128,6 +129,9 @@ public:
         m_Stats.carryUs = target - std::min(target, m_Stats.nominalUs);
     }
     void noteDeferred() { ++m_Stats.deferred; }
+    // Repay up to the whole allowance per successor rather than 1/32 of the
+    // carry; still bounded by the panel's fastest refresh.
+    void setDrainAtAllowance(bool enabled) { m_DrainAtAllowance = enabled; }
     void breakSequence() {
         if (m_HaveAnchor) ++m_Stats.resets;
         m_HaveAnchor = false;
@@ -142,6 +146,10 @@ public:
         if (!m_LatenessCount) return 0;
         return *std::min_element(m_Lateness.begin(), m_Lateness.begin() + m_LatenessCount);
     }
+    // Committed phase of `frame`: its planned target, or its actual
+    // submission less the usual overshoot when beyond the allowance.
+    bool anchoredAt(uint64_t frame) const { return m_HaveAnchor && m_Frame == frame; }
+    uint64_t anchorUs() const { return m_Anchor; }
 private:
     uint64_t latenessBaseline() const {
         if (!m_LatenessCount) return 0;
@@ -160,6 +168,6 @@ private:
     // Recent submission lateness; a scheduler property, kept across breaks.
     std::array<uint64_t, 31> m_Lateness{};
     size_t m_LatenessNext = 0, m_LatenessCount = 0;
-    bool m_HaveAnchor = false;
+    bool m_HaveAnchor = false, m_DrainAtAllowance = false;
 };
 }

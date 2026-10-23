@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 namespace {
 int failures = 0;
@@ -69,7 +70,7 @@ void testConsecutiveGaps()
 
 // Recorded revision 5 (daily.188): source-gap phase correction with an
 // optional standing reserve, on that release's input accounting. Production
-// uses tolerance-bounded revision 4; these fixtures keep revision 5
+// uses tolerance-bounded revision 9; these fixtures keep revision 5
 // explicit so its recorded behavior stays covered.
 VrrTimingParameters revision5Policy(const VrrSessionConfig& session, bool synchronized = false,
                                     bool scheduled = false)
@@ -294,7 +295,7 @@ void testPolicyAndInvalidTimestamps()
         for (bool native : {false, true}) {
             const auto live = vrrTimingParametersForSession(session, native, native);
             expect(live.playoutIntervalToleranceUs == uint64_t(tolerance) &&
-                   live.playoutSmoothingWindowedCadence == 4 &&
+                   live.playoutSmoothingWindowedCadence == 9 &&
                    live.playoutSmoothingMaxLagUs == uint64_t(tolerance) &&
                    live.playoutSmoothingRecenterPerMille == 0 &&
                    live.playoutSmoothingMaxLagPeriodPerMille == 0 &&
@@ -304,7 +305,7 @@ void testPolicyAndInvalidTimestamps()
                    live.playoutSmoothingResetSlewUs == 0,
                    "production Reduce judder must ignore errors within T and share one T phase budget on every presenter");
             const auto recorded = revision4Policy(session);
-            expect(live.playoutSmoothingWindowedCadence == recorded.playoutSmoothingWindowedCadence &&
+            expect(live.playoutSmoothingWindowedCadence == 9 && recorded.playoutSmoothingWindowedCadence == 4 &&
                    live.playoutSmoothingMaxLagUs == recorded.playoutSmoothingMaxLagUs,
                    "production must select the tested one-tolerance source-gap contract");
             const auto p = revision5Policy(session, native, native);
@@ -426,7 +427,7 @@ void testAbsorbPolicySelection()
     for (bool native : {false, true}) {
         const auto liveRj = vrrTimingParametersForSession(absorbSession(true, false), native, native);
         const auto liveAbsorb = vrrTimingParametersForSession(absorbSession(true, true), native, native);
-        expect(liveAbsorb.playoutSmoothingWindowedCadence == 7 &&
+        expect(liveAbsorb.playoutSmoothingWindowedCadence == 8 &&
                    liveAbsorb.playoutSmoothingGainPerMille == liveRj.playoutSmoothingGainPerMille &&
                    liveAbsorb.playoutSmoothingMaxLagUs == 2 * liveAbsorb.playoutIntervalToleranceUs &&
                    liveAbsorb.playoutSmoothingReserveMaxUs == 0 &&
@@ -462,6 +463,7 @@ void testFixedPadAndSharedLiveSlew()
         session.experimentalBoundedCatchup=true;
         session.timingOptions={4000,9950,120,tolerance};
         auto p=vrrTimingParametersForSession(session);
+        p.playoutSmoothingWindowedCadence=7; // Recorded shared-slew contract.
         p.playoutInputHitchMissesOnly=version;p.playoutInputStableAdaptation=0;
         p.playoutDelayStartSeedUs=4000;
         VrrTimingController c(session,true,p);
@@ -533,6 +535,371 @@ void testAbsorbReserveIsStandingLatency()
         plain.noteSubmission(true, false, da.targetUs);
         absorbing.noteSubmission(true, false, db.targetUs);
     }
+}
+
+void testFixedReserveAbsorbsIsolatedDisplacements()
+{
+    for (bool native : {false, true}) for (int fps : {90, 116}) {
+        auto session = absorbSession(true, true);
+        session.streamRateHz = fps;
+        session.displayRefreshHz = 120;
+        uint64_t legacyWorst = 0, currentWorst = 0;
+        for (uint64_t revision : {7, 8}) {
+            auto policy = vrrTimingParametersForSession(session, native, native);
+            policy.playoutSmoothingWindowedCadence = revision;
+            // Isolate absorption from input-buffer learning and clock fitting.
+            policy.playoutDelayAdaptive = 0;
+            policy.sourcePlayoutDelayUs = 1000;
+            policy.playoutOffsetSlewUsPerSecond = 0;
+            policy.playoutOffsetSlewUs = 0;
+            VrrTimingController controller(session, true, policy);
+            uint64_t previousTarget = 0, previousInterval = 0, worstJerk = 0;
+            uint64_t maximumLatency = 0;
+            for (int frame = 0; frame < 1800; ++frame) {
+                // A one-millisecond source displacement followed by a return
+                // to cadence, including operation near the display ceiling.
+                const uint32_t stamp = uint32_t(uint64_t(frame + 1) * 90000 / fps +
+                    (frame > 300 && frame % 20 == 5 ? 90 : 0));
+                const uint64_t source = 1000000 + uint64_t(stamp) * 100 / 9;
+                const uint64_t ready = source + 1000;
+                PacedFrame input(nullptr, frame, stamp, true, ready);
+                input.setDeliveryTimeline(ready, ready, ready);
+                const auto d = controller.schedule(input, ready);
+                expect(d.targetUs >= ready, "fixed absorption cannot present before readiness");
+                expect(d.cadenceSmoothingUs >= 0 && d.cadenceSmoothingUs <= 1000,
+                       "fixed absorption never increases its one-millisecond reserve");
+                if (frame > 400) {
+                    const auto interval = d.targetUs - previousTarget;
+                    if (previousInterval)
+                        worstJerk = std::max(worstJerk, interval > previousInterval ?
+                            interval - previousInterval : previousInterval - interval);
+                    previousInterval = interval;
+                    maximumLatency = std::max(maximumLatency, d.targetUs - ready);
+                    if (revision == 8) {
+                        expect(d.plannedExtraDelayUs() <= 1000,
+                               "isolated absorption must bound the actual displayed retiming budget");
+                        expect(uint64_t(d.cadenceSmoothingUs) + d.recoveryAddedUs <= 1000,
+                               "smoothing and deliberate recovery share the fixed reserve");
+                        expect(d.targetUs - previousTarget >= controller.displayPeriodUs(),
+                               "spending the reserve must retain physical display spacing");
+                        expect(d.targetUs - ready < 6000,
+                               "sustained full-rate absorption must not accumulate six milliseconds of latency");
+                    }
+                }
+                previousTarget = d.targetUs;
+                controller.notePreparationDuration(500);
+                controller.noteSubmission(true, false, d.targetUs);
+            }
+            (revision == 7 ? legacyWorst : currentWorst) = worstJerk;
+            std::fprintf(stderr, "fixed reserve %d FPS (%s, revision %llu): jerk %llu us, max ready-to-submit %llu us\n",
+                fps, native ? "scheduled" : "worker", static_cast<unsigned long long>(revision),
+                static_cast<unsigned long long>(worstJerk), static_cast<unsigned long long>(maximumLatency));
+        }
+        expect(legacyWorst >= 1000, "recorded slow slew must reproduce the unabsorbed displacement");
+        expect(currentWorst < legacyWorst / 2,
+               "fixed reserve must absorb short source displacement on the affected frames");
+    }
+}
+
+void testLiveAdaptiveRetimingBudget()
+{
+    for (bool scheduled : {false, true}) for (int fps : {116, 120}) {
+        auto session = absorbSession(true, true);
+        session.streamRateHz = fps;
+        session.displayRefreshHz = 120;
+        auto policy = vrrTimingParametersForSession(session, scheduled, scheduled);
+        policy.playoutDelayStartSeedUs = 6000;
+        VrrTimingController controller(session, true, policy);
+        uint64_t lastAccepted = 0, maxExtra = 0, maxCombined = 0, finalExtra = 0;
+        unsigned sustainedExcess = 0, replacements = 0;
+        for (int i = 0; i < 12000; ++i) {
+            const uint32_t stamp = uint32_t(uint64_t(i + 1) * 90000 / fps);
+            const uint64_t source = 1000000 + uint64_t(stamp) * 100 / 9;
+            const uint64_t ready = source + 1500 + (i % 7) * 20;
+            PacedFrame input(nullptr, i, stamp, true, ready);
+            input.setDeliveryTimeline(source + 200, source + 400, source + 500);
+            const uint64_t now = scheduled ? ready : std::max(ready, lastAccepted);
+            const auto d = controller.schedule(input, now);
+            if (d.trajectory.resyncRecommended) {
+                std::fprintf(stderr, "phase replacement frame %d: input %llu extra %llu period %llu floor %llu\n",
+                    i, static_cast<unsigned long long>(d.playoutDelayUs),
+                    static_cast<unsigned long long>(d.plannedExtraDelayUs()),
+                    static_cast<unsigned long long>(d.sourcePeriodUs),
+                    static_cast<unsigned long long>(d.presentationFloorPushUs));
+                // The worker can replace this slot only after reserving a
+                // ready successor. This closed-loop source supplies the next
+                // completed frame; no feedback is invented for a skipped slot.
+                ++replacements;
+                controller.noteTrajectoryResyncDrop();
+                controller.noteSubmission(false, false, 0);
+                continue;
+            }
+            const uint64_t enqueue = scheduled ? std::max(now + 500, d.targetUs - 1000) : d.targetUs + 80;
+            lastAccepted = scheduled ? std::max(enqueue, d.targetUs) : enqueue;
+            controller.notePreparationDuration(500, 0, now + 500);
+            controller.noteSchedulerDelays(0, 0, true);
+            controller.noteSubmission(true, false, lastAccepted, enqueue);
+            if (i > 3000) {
+                finalExtra = d.plannedExtraDelayUs();
+                maxExtra = std::max(maxExtra, finalExtra);
+                maxCombined = std::max(maxCombined, d.playoutDelayUs + finalExtra);
+                sustainedExcess += finalExtra > controller.absorbReserveUs() + 500;
+            }
+        }
+        std::fprintf(stderr, "adaptive retiming %d FPS (%s): final %llu, max %llu, combined %llu us, excess frames %u, replacements %u\n",
+            fps, scheduled ? "scheduled" : "DXGI", static_cast<unsigned long long>(finalExtra),
+            static_cast<unsigned long long>(maxExtra), static_cast<unsigned long long>(maxCombined), sustainedExcess, replacements);
+        expect(sustainedExcess == 0,
+               "the displayed retiming budget must not retain drained input protection at sustained full rate");
+        expect(maxCombined < 6000, "settled full-rate combined budget must not retain the old six-millisecond seed");
+        expect(replacements <= 8, "phase recovery must be exceptional, not recurring frame shedding");
+    }
+}
+
+struct ContinuousJitterResult {
+    uint64_t jerkP99 = 0, latencyP99 = 0, meanLatency = 0, maxBudget = 0;
+    unsigned corrections = 0, replacements = 0;
+};
+
+ContinuousJitterResult continuousJitter(bool absorb, bool scheduled, int fps, uint64_t revision)
+{
+    auto session = absorbSession(true, absorb);
+    session.streamRateHz = fps;
+    session.displayRefreshHz = 120;
+    auto policy = vrrTimingParametersForSession(session, scheduled, scheduled);
+    policy.playoutSmoothingWindowedCadence = revision;
+    // Recorded revisions predate ceiling replacement on every path.
+    if (revision < 8) policy.playoutCeilingPhaseReplacement = 0;
+    policy.playoutDelayStartSeedUs = 2000;
+    VrrTimingController controller(session, true, policy);
+    // Every gap differs by 0.5--1 ms from the source grid. The displacement
+    // stays bounded: this is a jittered game, not a permanently slower game.
+    constexpr uint32_t offsets[] = {0,45,90,45,0,90,0,45};
+    std::vector<uint64_t> jerk, latency;
+    uint64_t previous = 0, priorInterval = 0, accepted = 0;
+    ContinuousJitterResult result;
+    for (int i = 0; i < 6000; ++i) {
+        const uint32_t stamp = uint32_t(uint64_t(i + 1) * 90000 / fps) + offsets[i % 8];
+        const uint64_t source = 1000000 + uint64_t(stamp) * 100 / 9;
+        const uint64_t ready = source + 1500 + (i % 7) * 20;
+        PacedFrame frame(nullptr, i, stamp, true, ready);
+        frame.setDeliveryTimeline(source + 200, source + 400, source + 500);
+        const uint64_t now = scheduled ? ready : std::max(ready, accepted);
+        const auto d = controller.schedule(frame, now);
+        if (d.trajectory.resyncRecommended) {
+            ++result.replacements;
+            controller.noteTrajectoryResyncDrop();
+            controller.noteSubmission(false, false, 0);
+            continue;
+        }
+        const uint64_t enqueue = scheduled ? std::max(now + 500, d.targetUs - 1000) : d.targetUs + 80;
+        accepted = scheduled ? std::max(enqueue, d.targetUs) : enqueue;
+        if (i > 1000) {
+            const uint64_t interval = accepted - previous;
+            if (priorInterval)
+                jerk.push_back(interval > priorInterval ? interval - priorInterval : priorInterval - interval);
+            priorInterval = interval;
+            latency.push_back(accepted - ready);
+            result.maxBudget = std::max(result.maxBudget, d.plannedExtraDelayUs());
+            result.corrections += std::abs(d.cadenceSmoothingUs - int64_t(absorb ? 1000 : 0)) > 100;
+        }
+        previous = accepted;
+        controller.notePreparationDuration(500, 0, now + 500);
+        controller.noteSchedulerDelays(0, 0, true);
+        controller.noteSubmission(true, false, accepted, enqueue);
+    }
+    std::sort(jerk.begin(), jerk.end());
+    std::sort(latency.begin(), latency.end());
+    result.jerkP99 = jerk[jerk.size() * 99 / 100];
+    result.latencyP99 = latency[latency.size() * 99 / 100];
+    for (const auto us : latency) result.meanLatency += us;
+    result.meanLatency /= latency.size();
+    return result;
+}
+
+void testContinuousGameJitterAndLatency()
+{
+    for (bool scheduled : {false, true}) for (int fps : {90,116,120}) for (bool absorb : {false,true}) {
+        const auto before = continuousJitter(absorb, scheduled, fps, absorb ? 7 : 4);
+        const auto after = continuousJitter(absorb, scheduled, fps, absorb ? 8 : 9);
+        if (!scheduled) {
+            expect(before.jerkP99 >= 1700,
+                   "the recorded actuator must reproduce unabsorbed continuous game jitter");
+            if (!absorb && fps == 120)
+                expect(before.latencyP99 >= 6000,
+                       "the recorded full-rate policy must reproduce the latency regression");
+        }
+        std::fprintf(stderr, "continuous jitter %d FPS %s %s: jerk %llu -> %llu, latency mean %llu -> %llu p99 %llu -> %llu, budget %llu, corrections %u replacements %u\n",
+            fps, scheduled ? "scheduled" : "DXGI", absorb ? "Absorb" : "Reduce judder",
+            static_cast<unsigned long long>(before.jerkP99), static_cast<unsigned long long>(after.jerkP99),
+            static_cast<unsigned long long>(before.meanLatency), static_cast<unsigned long long>(after.meanLatency),
+            static_cast<unsigned long long>(before.latencyP99), static_cast<unsigned long long>(after.latencyP99),
+            static_cast<unsigned long long>(after.maxBudget), after.corrections, after.replacements);
+        expect(after.corrections > 1000, "continuous jitter must actually engage the smoother on individual frames");
+        expect(before.jerkP99 > 1100 ? after.jerkP99 < before.jerkP99 * 8 / 10 :
+                   after.jerkP99 <= std::max<uint64_t>(before.jerkP99, 1000),
+               "reduce game jitter, while preserving already display-smoothed cadence within two tolerances");
+        expect(after.meanLatency <= before.meanLatency + 1000 && after.latencyP99 < 6000,
+               "continuous smoothing must not reintroduce a six-millisecond latency plateau");
+        expect(after.maxBudget <= uint64_t(scheduled && fps == 120 ? 3000 : absorb ? 1500 : 1000),
+               "the actual displayed retiming budget must stay bounded with adaptive buffering enabled");
+    }
+}
+
+enum class BufferDisturbance { RandomJitter, DeliveryBurst, SubmissionBurst,
+    RateTransition, SourcePause, TimestampBreak, ClockDrift };
+
+struct BufferContractResult {
+    uint64_t latencyP99 = 0, maxBudget = 0, combinedBudget = 0, peakLatency = 0, lateRunUs = 0;
+    unsigned replacements = 0, settledReplacements = 0, longestLateRun = 0;
+    unsigned readinessViolations = 0, spacingViolations = 0, intentViolations = 0;
+    unsigned pauseReplacements = 0, timestampReplacements = 0, fallbackFrames = 0;
+};
+
+BufferContractResult bufferDisturbance(BufferDisturbance disturbance, bool scheduled,
+    bool absorb, int fps, int tolerance, uint64_t seed, bool smoothing = true)
+{
+    auto session = absorbSession(smoothing, absorb);
+    session.streamRateHz = fps;
+    session.displayRefreshHz = 120;
+    session.timingOptions.toleranceUs = tolerance;
+    auto policy = vrrTimingParametersForSession(session, scheduled, scheduled);
+    policy.playoutDelayStartSeedUs = seed;
+    VrrTimingController controller(session, true, policy);
+    BufferContractResult result;
+    std::vector<uint64_t> latency;
+    // Cross uint32 RTP rollover while the source clock remains monotonic.
+    uint64_t sourceTicks = uint64_t(UINT32_MAX) - 90000, accepted = 0;
+    uint64_t priorGrid = 0, lateRunStartUs = 0;
+    uint32_t random = 0x74ad39b1;
+    unsigned lateRun = 0;
+    const uint64_t intentBudget = smoothing ? uint64_t(tolerance) * (absorb ? 2 : 1) : 0;
+    for (int i = 0; i < 12000; ++i) {
+        const bool lowerRate = disturbance == BufferDisturbance::RateTransition && i >= 3000 && i < 4200;
+        const int sourceFps = lowerRate ? 60 : fps;
+        // Rational increments avoid a permanently slow 116 FPS test clock.
+        const uint64_t grid = uint64_t(i + 1) * 90000 / sourceFps;
+        sourceTicks += lowerRate || (disturbance == BufferDisturbance::RateTransition && i == 4200) ?
+            uint64_t(90000 / sourceFps) : grid - priorGrid;
+        priorGrid = grid;
+        if (disturbance == BufferDisturbance::SourcePause && i == 3500) sourceTicks += 4500;
+        random ^= random << 13; random ^= random >> 17; random ^= random << 5;
+        const uint64_t displacement = disturbance == BufferDisturbance::RandomJitter ? (random % 3) * 45 : 0;
+        const uint64_t ticks = sourceTicks + displacement;
+        const uint64_t source = 1000000 + ticks * 100 / 9;
+        const uint64_t drift = disturbance == BufferDisturbance::ClockDrift ? uint64_t(i) * 2 : 0;
+        const uint64_t burst = disturbance == BufferDisturbance::DeliveryBurst &&
+            i >= 3500 && i < 3503 ? 3000 : 0;
+        const uint64_t ready = source + drift + 1500 + burst;
+        const bool timestampValid = disturbance != BufferDisturbance::TimestampBreak || i < 3500 || i >= 3503;
+        PacedFrame frame(nullptr, i, uint32_t(ticks), timestampValid, ready);
+        frame.setDeliveryTimeline(source + drift + 200, source + drift + 400, source + drift + 500);
+        if (disturbance == BufferDisturbance::TimestampBreak && i == 3500) controller.rebase();
+        const uint64_t now = scheduled ? ready : std::max(ready, accepted);
+        const auto d = controller.schedule(frame, now);
+        result.readinessViolations += d.targetUs < ready;
+        // A missing source clock uses the existing fallback trajectory, not
+        // the timestamp reserve. Still check its real latency/recovery below;
+        // do not silently drop those frames from the observed contract.
+        const bool timestampPlayout = timestampValid && (d.usedRtpTimestamp || d.rebased);
+        if (timestampPlayout)
+            result.intentViolations += smoothing ?
+                uint64_t(std::max<int64_t>(0, d.cadenceSmoothingUs)) + d.recoveryAddedUs > intentBudget :
+                d.cadenceSmoothingUs != 0;
+        else {
+            ++result.fallbackFrames;
+            result.intentViolations += d.cadenceSmoothingUs != 0 || d.recoveryAddedUs > d.sourcePeriodUs;
+        }
+        if (d.trajectory.resyncRecommended) {
+            ++result.replacements;
+            result.settledReplacements += i >= 10000;
+            result.pauseReplacements += disturbance == BufferDisturbance::SourcePause && i == 3500;
+            result.timestampReplacements += !timestampValid;
+            controller.noteTrajectoryResyncDrop();
+            controller.noteSubmission(false, false, 0);
+            continue;
+        }
+        if (scheduled && accepted)
+            result.spacingViolations += d.targetUs < accepted + controller.displayPeriodUs();
+        const uint64_t enqueue = scheduled ? std::max(now + 500, d.targetUs - 1000) : d.targetUs + 80;
+        const uint64_t submissionDelay = disturbance == BufferDisturbance::SubmissionBurst &&
+            i >= 3500 && i < 3503 ? 3000 : 0;
+        accepted = (scheduled ? std::max(enqueue, d.targetUs) : enqueue) + submissionDelay;
+        result.peakLatency = std::max(result.peakLatency, accepted - ready);
+        if (i >= 3000) {
+            lateRun = accepted - ready >= 6000 ? lateRun + 1 : 0;
+            if (lateRun == 1) lateRunStartUs = ready;
+            if (lateRun) result.lateRunUs = std::max(result.lateRunUs, ready - lateRunStartUs);
+            result.longestLateRun = std::max(result.longestLateRun, lateRun);
+        }
+        if (i >= 10000) {
+            latency.push_back(accepted - ready);
+            result.maxBudget = std::max(result.maxBudget, d.plannedExtraDelayUs());
+            result.combinedBudget = std::max(result.combinedBudget, d.playoutDelayUs + d.plannedExtraDelayUs());
+        }
+        controller.notePreparationDuration(500, 0, now + 500);
+        controller.noteSchedulerDelays(0, 0, true);
+        controller.noteSubmission(true, false, accepted, enqueue);
+    }
+    expect(!latency.empty(), "buffer contract must reach the measured settled window");
+    std::sort(latency.begin(), latency.end());
+    if (!latency.empty()) result.latencyP99 = latency[latency.size() * 99 / 100];
+    return result;
+}
+
+void testBufferDisturbanceContracts()
+{
+    unsigned cases = 0;
+    uint64_t worstP99 = 0, worstCombined = 0, worstPeak = 0, worstLateDuration = 0;
+    unsigned worstLateRun = 0;
+    for (auto disturbance : {BufferDisturbance::RandomJitter, BufferDisturbance::DeliveryBurst,
+            BufferDisturbance::SubmissionBurst, BufferDisturbance::RateTransition,
+            BufferDisturbance::SourcePause, BufferDisturbance::TimestampBreak, BufferDisturbance::ClockDrift})
+        for (bool scheduled : {false, true}) for (bool absorb : {false, true})
+            for (int tolerance : {250, 500, 1000}) for (int fps : {116, 120}) for (uint64_t seed : {0, 6000}) {
+        const auto before = failures;
+        const auto r = bufferDisturbance(disturbance, scheduled, absorb, fps, tolerance, seed);
+        expect(r.readinessViolations == 0, "buffer recovery must respect each matching frame's readiness");
+        expect(r.spacingViolations == 0, "native buffer recovery must respect actual prior acceptance, not CPU enqueue");
+        expect(r.intentViolations == 0, "smoothing and deliberate recovery must share their positive budget during faults too");
+        expect(r.pauseReplacements == 0 && r.timestampReplacements == 0,
+               "missing source output and invalid source stamps cannot authorize a phase replacement");
+        if (disturbance == BufferDisturbance::TimestampBreak)
+            expect(r.fallbackFrames >= 3, "timestamp interruption must actually exercise the fallback path");
+        expect(r.latencyP99 < 6000 && r.combinedBudget < 6000,
+               "disturbance recovery must not leave six milliseconds of latency or combined buffer budget");
+        const uint64_t budget = uint64_t(tolerance) * (absorb ? 2 : 1);
+        // At the physical ceiling an unabsorbed 1 ms source displacement
+        // cannot be repaid by displaying faster. Its ownership phase is not
+        // proportional to a smaller configured tolerance.
+        const uint64_t physicalDisplacement = scheduled && fps == 120 &&
+            disturbance == BufferDisturbance::RandomJitter ? 1000 : 0;
+        expect(r.maxBudget <= budget + std::max(uint64_t(tolerance) * 3, physicalDisplacement),
+               "settled displayed retiming must be bounded, including ownership phase");
+        expect(r.lateRunUs < 500000, "a finite disturbance must not become a half-second six-millisecond latency plateau");
+        expect(r.peakLatency < 25000, "startup and fault intervals must not hide an unbounded latency spike outside the settled percentile");
+        expect(r.replacements <= 24 && r.settledReplacements <= 1,
+               "buffer recovery must not hide a standing fault by continually replacing frames");
+        if (failures != before)
+            std::fprintf(stderr, "buffer case kind=%d scheduled=%d absorb=%d fps=%d T=%d seed=%llu: p99=%llu graph=%llu combined=%llu late-run=%u replacements=%u/%u readiness=%u spacing=%u intent=%u\n",
+                int(disturbance), scheduled, absorb, fps, tolerance, static_cast<unsigned long long>(seed),
+                static_cast<unsigned long long>(r.latencyP99), static_cast<unsigned long long>(r.maxBudget),
+                static_cast<unsigned long long>(r.combinedBudget), r.longestLateRun,
+                r.replacements, r.settledReplacements, r.readinessViolations, r.spacingViolations, r.intentViolations);
+        worstP99 = std::max(worstP99, r.latencyP99);
+        worstCombined = std::max(worstCombined, r.combinedBudget);
+        worstPeak = std::max(worstPeak, r.peakLatency);
+        worstLateDuration = std::max(worstLateDuration, r.lateRunUs);
+        worstLateRun = std::max(worstLateRun, r.longestLateRun);
+        ++cases;
+    }
+    for (bool scheduled : {false, true}) {
+        const auto off = bufferDisturbance(BufferDisturbance::RandomJitter, scheduled, true, 116, 500, 2000, false);
+        expect(off.intentViolations == 0, "Absorb without Reduce judder must remain inactive throughout a jittered stream");
+    }
+    std::fprintf(stderr, "Buffer disturbance contracts: %u live-policy cases and two disabled controls; worst settled p99=%llu combined=%llu us, startup/fault peak=%llu us, longest >=6ms run=%u frames / %llu us\n",
+        cases, static_cast<unsigned long long>(worstP99), static_cast<unsigned long long>(worstCombined),
+        static_cast<unsigned long long>(worstPeak), worstLateRun, static_cast<unsigned long long>(worstLateDuration));
 }
 
 struct DisplacedResult {
@@ -731,6 +1098,10 @@ int main()
     testRevision5Recentering();
     testRevision5PresentableFloor();
     testAbsorbPolicySelection();
+    testFixedReserveAbsorbsIsolatedDisplacements();
+    testLiveAdaptiveRetimingBudget();
+    testContinuousGameJitterAndLatency();
+    testBufferDisturbanceContracts();
     testFixedPadAndSharedLiveSlew();
     testAbsorbReserveIsStandingLatency();
     testDisplacedFramesAreAbsorbed();

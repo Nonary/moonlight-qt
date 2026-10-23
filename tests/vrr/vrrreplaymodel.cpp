@@ -25,7 +25,8 @@ bool vrrDecodeReadinessOrderValid(uint64_t decoderOutputUs, uint64_t readyUs,
                                   bool decisionValid,
                                   bool readinessExcludesQueue,
                                   bool readinessUsesPostWaitClock,
-                                  bool completionObserved)
+                                  bool completionObserved,
+                                  bool readinessStateAvailable)
 {
     if (!decoderOutputUs || decoderOutputUs > arrivalUs || readyUs < decoderOutputUs)
         return false;
@@ -33,6 +34,15 @@ bool vrrDecodeReadinessOrderValid(uint64_t decoderOutputUs, uint64_t readyUs,
     if (completionObserved) {
         return decisionValid && dequeueUs >= arrivalUs && readyUs >= dequeueUs &&
             decodeWaitUs <= readyUs - dequeueUs;
+    }
+    if (readinessStateAvailable && readinessUsesPostWaitClock && decodeWaitUs != 0 &&
+            readyUs == decoderOutputUs) {
+        // A failed wait is service time, not proof that decoding completed.
+        // Current traces explicitly distinguish that state. Retain the CPU
+        // output boundary and audit the wait against the full worker interval;
+        // historical captures without this field keep their stricter rule.
+        return decisionValid && dequeueUs >= arrivalUs && decisionUs >= dequeueUs &&
+            decodeWaitUs <= decisionUs - dequeueUs;
     }
     if (readinessUsesPostWaitClock) {
         return decisionValid ?

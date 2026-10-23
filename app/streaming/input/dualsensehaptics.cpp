@@ -16,11 +16,14 @@
 #endif
 #include "dualsensehaptics.h"
 #include <ControllerHaptics.h>
+#include <ControllerSpeakerPcm.h>
 
 #if (defined(__linux__) || defined(_WIN32) || defined(MOONLIGHT_HAPTICS_TEST)) && SDL_VERSION_ATLEAST(2, 24, 0)
 #include "dualsensehid.h"
 #include "../../../third-party/saxense/packet.h"
 #include <array>
+#include <atomic>
+#include <limits>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -43,19 +46,71 @@ struct Chunk {
     std::array<uint8_t, ML_HAPTICS_MAX_FRAMES * ML_HAPTICS_FRAME_BYTES> pcm;
 };
 
+struct SpeakerChunk {
+  uint32_t generation;
+  uint32_t sequence;
+  uint64_t samplePosition;
+  uint16_t frames;
+  uint16_t flags;
+  Clock::time_point received;
+  std::array<uint8_t, ML_SPEAKER_PCM_MAX_FRAMES * ML_SPEAKER_PCM_FRAME_BYTES>
+      pcm;
+};
+
 // Input side shared by every transport. Workers own conversion and pacing.
+std::atomic<uint64_t> nextSpeakerOwnerToken{0};
+uint64_t allocateSpeakerOwner(std::atomic<uint64_t>& counter) {
+  auto previous = counter.load(std::memory_order_relaxed);
+  for (;;) {
+    if (previous == std::numeric_limits<uint64_t>::max()) return 0;
+    if (counter.compare_exchange_weak(previous, previous + 1, std::memory_order_relaxed))
+      return previous + 1;
+  }
+}
+
 struct Backend {
+    std::atomic<uint64_t> speakerOwnerToken{allocateSpeakerOwner(nextSpeakerOwnerToken)};
+    // Dedicated device-submission gate. Never acquire it under registryMutex.
+    std::mutex speakerSubmissionMutex;
     std::mutex mutex;
     std::deque<Chunk> queue;
+    std::deque<SpeakerChunk> speakerQueue;
     bool stopped = false;
     bool failed = false;
     bool waveformMode = false;
     Clock::time_point lastNonzero {};
     uint32_t latestSequence = 0;
     bool haveInputSequence = false;
+    uint32_t speakerGeneration = 0;
+    uint32_t speakerLatestSequence = 0;
+    uint64_t speakerNextSamplePosition = 0;
+    bool haveSpeakerSequence = false;
+    bool haveSpeakerSamplePosition = false;
+    Clock::time_point lastSpeakerPacket{};
 
     virtual ~Backend() = default;
     virtual void notify() = 0; // Called with mutex held.
+    virtual bool speakerOutputReady() const { return false; }
+
+    template<class Submit>
+    bool submitSpeakerFrame(uint64_t owner, Submit submit) {
+        std::lock_guard<std::mutex> submission(speakerSubmissionMutex);
+        // The callback performs the actual device submission while this gate
+        // is held. A stale owner must render no speaker samples, but may still
+        // submit independent actuator output.
+        return submit(owner != 0 && owner == speakerOwnerToken.load());
+    }
+
+    void resetSpeakerOwner() {
+        std::lock_guard<std::mutex> submission(speakerSubmissionMutex);
+        std::lock_guard<std::mutex> guard(mutex);
+        speakerOwnerToken = allocateSpeakerOwner(nextSpeakerOwnerToken);
+        speakerQueue.clear();
+        speakerGeneration = 0;
+        haveSpeakerSequence = false;
+        haveSpeakerSamplePosition = false;
+        notify();
+    }
 
     bool playing() {
         std::lock_guard<std::mutex> guard(mutex);
@@ -87,6 +142,63 @@ struct Backend {
         memcpy(chunk.pcm.data(), pcm, frames * 4);
         queue.push_back(chunk);
         notify();
+    }
+
+    void receiveSpeaker(uint64_t owner, uint32_t generation, uint32_t sequence,
+                        uint64_t samplePosition, uint16_t flags,
+                        const uint8_t *pcm, uint16_t frames) {
+      // Dropping one bounded audio block is preferable to stalling control.
+      std::unique_lock<std::mutex> guard(mutex, std::try_to_lock);
+      if (!guard.owns_lock()) return;
+      if (!owner || owner != speakerOwnerToken.load()) return;
+      if (stopped || failed || !speakerOutputReady() || !pcm || frames == 0 ||
+          frames > ML_SPEAKER_PCM_MAX_FRAMES || generation == 0 ||
+          (flags & ~ML_SPEAKER_PCM_FLAG_DISCONTINUITY) != 0)
+        return;
+
+      if (speakerGeneration != generation) {
+        if (speakerGeneration != 0 &&
+            int32_t(generation - speakerGeneration) <= 0)
+          return;
+        speakerGeneration = generation;
+        speakerQueue.clear();
+        haveSpeakerSequence = false;
+        haveSpeakerSamplePosition = false;
+      }
+      if (haveSpeakerSequence && int32_t(sequence - speakerLatestSequence) <= 0)
+        return;
+      if (haveSpeakerSamplePosition &&
+          samplePosition < speakerNextSamplePosition &&
+          !(flags & ML_SPEAKER_PCM_FLAG_DISCONTINUITY))
+        return;
+
+      SpeakerChunk chunk{};
+      chunk.generation = generation;
+      chunk.sequence = sequence;
+      chunk.samplePosition = samplePosition;
+      chunk.frames = frames;
+      chunk.flags = flags;
+      chunk.received = Clock::now();
+      memcpy(chunk.pcm.data(), pcm, frames * ML_SPEAKER_PCM_FRAME_BYTES);
+      if ((flags & ML_SPEAKER_PCM_FLAG_DISCONTINUITY) ||
+          (haveSpeakerSamplePosition &&
+           samplePosition != speakerNextSamplePosition)) {
+        // Keep the new packet but remove queued pre-gap samples. The render
+        // worker also clears its local FIFO when it observes this boundary.
+        speakerQueue.clear();
+        chunk.flags |= ML_SPEAKER_PCM_FLAG_DISCONTINUITY;
+      }
+      if (speakerQueue.size() >= 8) {
+        speakerQueue.clear();
+        chunk.flags |= ML_SPEAKER_PCM_FLAG_DISCONTINUITY;
+      }
+      speakerLatestSequence = sequence;
+      haveSpeakerSequence = true;
+      speakerNextSamplePosition = samplePosition + frames;
+      haveSpeakerSamplePosition = true;
+      lastSpeakerPacket = chunk.received;
+      speakerQueue.push_back(chunk);
+      notify();
     }
 };
 
@@ -235,6 +347,7 @@ struct WasapiPlayback final : Backend {
     }
 
     void notify() override { SetEvent(dataEvent); }
+    bool speakerOutputReady() const override { return true; }
 
     bool open(ComPtr<IAudioClient>& client, ComPtr<IAudioRenderClient>& render,
               HANDLE audioEvent, UINT32& bufferFrames) {
@@ -320,16 +433,39 @@ struct WasapiPlayback final : Backend {
         constexpr size_t prebufferFrames = 480;   // 10 ms absorbs packet jitter.
         constexpr size_t maxFrames = 48 * 40;     // Bound queued playout latency.
         constexpr auto prebufferTimeout = std::chrono::milliseconds(10);
-        std::vector<int16_t> fifo;
-        fifo.reserve((maxFrames + ML_HAPTICS_MAX_FRAMES) * 2);
+        std::vector<int16_t> actuatorFifo;
+        std::vector<int16_t> speakerFifo;
+        actuatorFifo.reserve((maxFrames + ML_HAPTICS_MAX_FRAMES) * 2);
+        speakerFifo.reserve((maxFrames + ML_SPEAKER_PCM_MAX_FRAMES) * 2);
+        std::vector<int16_t> actuatorFrame(bufferFrames * 2);
+        std::vector<int16_t> speakerFrame(bufferFrames * 2);
+        std::vector<float> outputFrame(bufferFrames * 4);
         uint32_t expected = 0;
         bool haveSequence = false;
         bool active = false;
         bool started = false;
         auto startBy = Clock::now();
+        uint64_t renderedSpeakerOwner = 0;
+        uint32_t speakerGeneration = 0;
+        uint64_t speakerExpectedPosition = 0;
+        bool haveSpeakerPosition = false;
+        bool speakerActive = false;
+        bool speakerStarted = false;
+        auto speakerStartBy = Clock::now();
+        auto speakerLastPacket = Clock::time_point{};
         const HANDLE events[] = {dataEvent, audioEvent};
         std::unique_lock<std::mutex> lock(mutex);
         while (!stopped && !failed) {
+            // Reconnect can rotate a retained endpoint without recreating this
+            // worker. Discard its private FIFO at the next synchronized turn.
+            if (renderedSpeakerOwner != speakerOwnerToken) {
+              renderedSpeakerOwner = speakerOwnerToken;
+              speakerFifo.clear();
+              speakerGeneration = 0;
+              haveSpeakerPosition = false;
+              speakerActive = speakerStarted = false;
+              speakerLastPacket = {};
+            }
             if (!active && !queue.empty()) {
                 // Clear SDL's remembered emulated rumble, as on Bluetooth.
                 lock.unlock();
@@ -339,6 +475,11 @@ struct WasapiPlayback final : Backend {
                 waveformMode = true;
                 startBy = Clock::now() + prebufferTimeout;
             }
+            if (!speakerActive && !speakerQueue.empty()) {
+              speakerActive = true;
+              speakerStarted = false;
+              speakerStartBy = Clock::now() + prebufferTimeout;
+            }
             const auto now = Clock::now();
             while (!queue.empty()) {
                 const Chunk& chunk = queue.front();
@@ -347,58 +488,135 @@ struct WasapiPlayback final : Backend {
                 // a discontinuity rather than replaying pre-loss feedback.
                 const bool late = haveSequence && int32_t(chunk.sequence - expected) < 0;
                 if (stale || (!late && haveSequence && chunk.sequence != expected)) {
-                    fifo.clear();
-                    haveSequence = false;
+                  actuatorFifo.clear();
+                  haveSequence = false;
                 }
                 if (!stale && !late) {
                     expected = chunk.sequence + 1; haveSequence = true;
                     for (unsigned i = 0; i < chunk.frames * 2u; ++i)
-                        fifo.push_back(int16_t(MlHapticsRead16(chunk.pcm.data() + i * 2)));
+                      actuatorFifo.push_back(
+                          int16_t(MlHapticsRead16(chunk.pcm.data() + i * 2)));
                 }
                 queue.pop_front();
             }
-            if (fifo.size() > maxFrames * 2)
-                fifo.erase(fifo.begin(), fifo.end() - prebufferFrames * 2);
+            while (!speakerQueue.empty()) {
+              const SpeakerChunk &chunk = speakerQueue.front();
+              const bool stale = now - chunk.received > staleChunk;
+              if (chunk.generation != speakerGeneration) {
+                speakerFifo.clear();
+                speakerGeneration = chunk.generation;
+                haveSpeakerPosition = false;
+              }
+              const bool discontinuity =
+                  (chunk.flags & ML_SPEAKER_PCM_FLAG_DISCONTINUITY) != 0;
+              if (stale || discontinuity ||
+                  (haveSpeakerPosition &&
+                   chunk.samplePosition != speakerExpectedPosition)) {
+                speakerFifo.clear();
+                haveSpeakerPosition = false;
+              }
+              if (!stale) {
+                speakerExpectedPosition = chunk.samplePosition + chunk.frames;
+                haveSpeakerPosition = true;
+                for (unsigned i = 0; i < chunk.frames * 2u; ++i)
+                  speakerFifo.push_back(
+                      int16_t(MlSpeakerRead16(chunk.pcm.data() + i * 2)));
+                speakerLastPacket = chunk.received;
+                speakerActive = true;
+              }
+              speakerQueue.pop_front();
+            }
+            if (actuatorFifo.size() > maxFrames * 2)
+              actuatorFifo.erase(actuatorFifo.begin(),
+                                 actuatorFifo.end() - prebufferFrames * 2);
+            if (speakerFifo.size() > maxFrames * 2)
+              speakerFifo.erase(speakerFifo.begin(),
+                                speakerFifo.end() - prebufferFrames * 2);
             if (active && now - lastNonzero > idleTimeout) {
                 // Already-submitted samples drain; afterwards the engine renders silence.
-                fifo.clear();
+                actuatorFifo.clear();
                 active = false; started = false; haveSequence = false;
                 waveformMode = false;
+            }
+            if (speakerActive && speakerLastPacket != Clock::time_point{} &&
+                now - speakerLastPacket > idleTimeout) {
+              speakerFifo.clear();
+              speakerActive = false;
+              speakerStarted = false;
+              haveSpeakerPosition = false;
             }
             lock.unlock();
 
             bool success = true;
-            if (active && !started && (fifo.size() >= prebufferFrames * 2 || now >= startBy)) started = true;
-            if (started && !fifo.empty()) {
+            if (active && !started &&
+                (actuatorFifo.size() >= prebufferFrames * 2 || now >= startBy))
+              started = true;
+            if (speakerActive && !speakerStarted &&
+                (speakerFifo.size() >= prebufferFrames * 2 ||
+                 now >= speakerStartBy))
+              speakerStarted = true;
+            success = submitSpeakerFrame(renderedSpeakerOwner, [&](bool ownerMatches) {
+              if (!ownerMatches) {
+                speakerFifo.clear();
+                speakerActive = speakerStarted = false;
+                haveSpeakerPosition = false;
+              }
+              if ((started && !actuatorFifo.empty()) ||
+                  (speakerStarted && !speakerFifo.empty())) {
                 UINT32 padding = 0;
-                BYTE* buffer = nullptr;
-                success = SUCCEEDED(client->GetCurrentPadding(&padding)) && padding <= bufferFrames;
-                const UINT32 frames = success ?
-                    std::min<UINT32>(bufferFrames - padding, UINT32(fifo.size() / 2)) : 0;
+                BYTE *buffer = nullptr;
+                success = SUCCEEDED(client->GetCurrentPadding(&padding)) &&
+                          padding <= bufferFrames;
+                const UINT32 availableFrames = std::max<UINT32>(
+                    started ? UINT32(actuatorFifo.size() / 2) : 0,
+                    speakerStarted ? UINT32(speakerFifo.size() / 2) : 0);
+                const UINT32 frames =
+                    success ? std::min<UINT32>(bufferFrames - padding,
+                                               availableFrames)
+                            : 0;
                 if (frames) {
-                    success = SUCCEEDED(render->GetBuffer(frames, &buffer));
-                    if (success) {
-                        float* out = reinterpret_cast<float*>(buffer);
-                        for (UINT32 f = 0; f < frames; ++f) {
-                            out[f * 4 + 0] = 0.0f;
-                            out[f * 4 + 1] = 0.0f;
-                            out[f * 4 + 2] = fifo[f * 2] / 32768.0f;
-                            out[f * 4 + 3] = fifo[f * 2 + 1] / 32768.0f;
-                        }
-                        success = SUCCEEDED(render->ReleaseBuffer(frames, 0));
-                        fifo.erase(fifo.begin(), fifo.begin() + frames * 2);
-                    }
+                  success = SUCCEEDED(render->GetBuffer(frames, &buffer));
+                  if (success) {
+                    const size_t samples = frames * 2u;
+                    std::fill_n(speakerFrame.begin(), samples, int16_t{});
+                    std::fill_n(actuatorFrame.begin(), samples, int16_t{});
+                    const size_t speakerSamples =
+                        speakerStarted ? std::min(samples, speakerFifo.size())
+                                       : 0;
+                    const size_t actuatorSamples =
+                        started ? std::min(samples, actuatorFifo.size()) : 0;
+                    std::copy_n(speakerFifo.begin(), speakerSamples,
+                                speakerFrame.begin());
+                    std::copy_n(actuatorFifo.begin(), actuatorSamples,
+                                actuatorFrame.begin());
+                    MlSpeakerPcmRouteFourChannel(speakerFrame.data(),
+                                                 actuatorFrame.data(),
+                                                 outputFrame.data(), frames);
+                    std::memcpy(buffer, outputFrame.data(),
+                                frames * 4u * sizeof(float));
+                    success = SUCCEEDED(render->ReleaseBuffer(frames, 0));
+                    if (speakerSamples)
+                      speakerFifo.erase(speakerFifo.begin(),
+                                        speakerFifo.begin() + speakerSamples);
+                    if (actuatorSamples)
+                      actuatorFifo.erase(actuatorFifo.begin(),
+                                         actuatorFifo.begin() + actuatorSamples);
+                  }
                 }
-            }
+              }
+              return success;
+            });
             // While active, also wake for engine periods and idle/prebuffer
             // deadlines. Idle workers sleep until a packet or stop request.
-            const DWORD wait = active ? WaitForMultipleObjects(2, events, FALSE, 5) :
-                WaitForSingleObject(dataEvent, INFINITE);
+            const DWORD wait = (active || speakerActive)
+                                   ? WaitForMultipleObjects(2, events, FALSE, 5)
+                                   : WaitForSingleObject(dataEvent, INFINITE);
 
             lock.lock();
             failed = !success || wait == WAIT_FAILED;
         }
         queue.clear();
+        speakerQueue.clear();
         waveformMode = false;
         lock.unlock();
         if (failed) SDL_LogWarn(SDL_LOG_CATEGORY_INPUT, "DualSense waveform output failed; reconnect the controller to retry");
@@ -408,6 +626,8 @@ struct WasapiPlayback final : Backend {
 
 std::mutex registryMutex;
 std::array<std::shared_ptr<Backend>, 16> registry;
+std::array<uint32_t, 16> speakerGenerationFloor{};
+std::array<std::weak_ptr<Backend>, 16> speakerGenerationOwner{};
 #ifdef _WIN32
 std::shared_ptr<Backend> openUsb(SDL_GameController* controller, const char* path) {
     auto playback = std::make_shared<WasapiPlayback>();
@@ -475,15 +695,77 @@ bool DualSenseHaptics::playing(unsigned slot) {
     return registry[slot]->playing();
 }
 
+uint64_t DualSenseHaptics::speakerOwner(unsigned slot) {
+  std::lock_guard<std::mutex> lock(registryMutex);
+  if (slot >= registry.size() || !registry[slot]) return 0;
+  return registry[slot]->speakerOwnerToken;
+}
+
+bool DualSenseHaptics::speakerReady(unsigned slot) {
+  std::lock_guard<std::mutex> lock(registryMutex);
+  if (slot >= registry.size() || !registry[slot])
+    return false;
+  return registry[slot]->speakerOutputReady();
+}
+
+void DualSenseHaptics::resetSpeakerGenerationFloor() {
+  std::array<std::shared_ptr<Backend>, 16> retained;
+  {
+    std::lock_guard<std::mutex> lock(registryMutex);
+    retained = registry;
+  }
+  // Waiting for in-flight device I/O must not hold the global registry lock.
+  // Each retained owner survives this wait through its shared_ptr snapshot.
+  for (auto &backend : retained) {
+    if (backend) backend->resetSpeakerOwner();
+  }
+  // Clear admission floors only after rotations. Packets arriving during the
+  // reset cannot leave an old-generation floor behind for the new owner.
+  std::lock_guard<std::mutex> lock(registryMutex);
+  speakerGenerationFloor.fill(0);
+  speakerGenerationOwner.fill({});
+}
+
 void DualSenseHaptics::receive(uint16_t slot, uint32_t sequence, const uint8_t* pcm, uint16_t frames) {
     if (!pcm || frames == 0 || frames > ML_HAPTICS_MAX_FRAMES) return;
     std::lock_guard<std::mutex> lock(registryMutex);
     if (slot >= registry.size() || !registry[slot]) return;
     registry[slot]->receive(sequence, pcm, frames);
 }
+
+void DualSenseHaptics::receiveSpeaker(uint16_t slot, uint64_t owner, uint32_t generation,
+                                      uint32_t sequence,
+                                      uint64_t samplePosition, uint16_t flags,
+                                      const uint8_t *pcm, uint16_t frames) {
+  if (!pcm || frames == 0 || frames > ML_SPEAKER_PCM_MAX_FRAMES)
+    return;
+  std::unique_lock<std::mutex> lock(registryMutex, std::try_to_lock);
+  if (!lock.owns_lock()) return;
+  if (slot >= registry.size() || !registry[slot])
+    return;
+  if (!owner || registry[slot]->speakerOwnerToken != owner) return;
+  auto &floor = speakerGenerationFloor[slot];
+  if (speakerGenerationOwner[slot].lock() != registry[slot]) floor = 0;
+  if (floor != 0) {
+    if (int32_t(generation - floor) < 0)
+      return;
+    if (generation == floor &&
+        speakerGenerationOwner[slot].lock() != registry[slot])
+      return;
+  }
+  floor = generation;
+  speakerGenerationOwner[slot] = registry[slot];
+  registry[slot]->receiveSpeaker(owner, generation, sequence, samplePosition, flags,
+                                 pcm, frames);
+}
 #else
 bool DualSenseHaptics::attach(unsigned, SDL_GameController*) { return false; }
 void DualSenseHaptics::detach(unsigned) {}
 bool DualSenseHaptics::playing(unsigned) { return false; }
 void DualSenseHaptics::receive(uint16_t, uint32_t, const uint8_t*, uint16_t) {}
+bool DualSenseHaptics::speakerReady(unsigned) { return false; }
+void DualSenseHaptics::resetSpeakerGenerationFloor() {}
+uint64_t DualSenseHaptics::speakerOwner(unsigned) { return 0; }
+void DualSenseHaptics::receiveSpeaker(uint16_t, uint64_t, uint32_t, uint32_t, uint64_t,
+                                      uint16_t, const uint8_t *, uint16_t) {}
 #endif

@@ -1,5 +1,6 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
 #include "../../app/streaming/video/timinggraph.h"
+#include "vrrproductionsession.h"
 #include <cstdio>
 #include <limits>
 #include <random>
@@ -174,11 +175,56 @@ void decoderPhaseIsNotClockDrift() {
  check(legacySpan>1000,"legacy drift fit mistakes a decoder phase for clock motion");
  check(receiveSpan<=5,"receive clock preserves the packet clock across decoder phase and116->100 cadence");
 }
+// 2026-10-20 4K PyroWave: a full frame's ~620 packets are paced over 3.35 ms,
+// while an occasional small frame finishes its send in 0.3 ms, so its last
+// packet arrives ~3 ms early. Bursts of them pulled the playout offset's
+// window minimum earlier; the full frames after them measured late and grew
+// the buffer by 2-3 ms for its whole 120 s history although none was shown
+// late. `latencyDropUs` instead moves every full frame earlier for good.
+struct SpanRun{uint64_t peakBufferUs,missed;double tailLatencyUs;};
+SpanRun sendSpanRun(uint64_t normalization,bool bursts,uint64_t latencyDropUs=0,bool sustainedSmall=false) {
+ auto cfg=vrrProductionSession(1,120,120);
+ auto policy=vrrTimingParametersForSession(cfg);policy.playoutDelayStartSeedUs=1000;
+ policy.playoutOffsetSendSpanNormalization=normalization;
+ VrrTimingController c(cfg,true,policy);uint64_t slot=1000000,submitted=0,peak=0;uint32_t pts=0;
+ std::mt19937_64 rng(11);std::uniform_int_distribution<uint64_t> jitter(0,500);
+ const uint64_t period=9091,frames=110*240;double tail=0;uint64_t tailCount=0,missedBefore=0;
+ for(uint64_t frame=0;frame<frames;++frame) {
+  slot+=period;pts+=818;const uint64_t second=frame/110;
+  const bool late=second>=120;
+  const bool small=(bursts&&late&&second%30<2&&frame%2==0)||(sustainedSmall&&late&&second<150);
+  const uint64_t receive=slot+2000-(small?500:0)+jitter(rng)-(late?latencyDropUs:0);
+  const uint64_t reassembled=receive+(small?300:3350),submit=reassembled+100,ready=submit+600;
+  PacedFrame f(nullptr,int(frame),pts,true,ready);f.setDeliveryTimeline(receive,reassembled,submit);
+  const auto d=c.schedule(f,std::max(ready,submitted));
+  const uint64_t prepared=std::max(ready,d.renderStartUs)+500;
+  submitted=std::max(prepared,d.targetUs);c.notePreparationDuration(500,0,prepared);
+  c.noteSchedulerDelays(0,0,true);c.noteSubmission(true,false,submitted,submitted);
+  if(frame+1==120*110) missedBefore=c.intervalStats().inputPercentile.missed;
+  if(late) peak=std::max(peak,d.playoutDelayUs);
+  if(second>=225&&!small){tail+=double(submitted-ready);++tailCount;}
+ }
+ return {peak,c.intervalStats().inputPercentile.missed-missedBefore,tail/tailCount};
+}
+void smallFramesDoNotMoveOffset() {
+ const auto quiet=sendSpanRun(1,false),raw=sendSpanRun(0,true),fixed=sendSpanRun(1,true);
+ std::printf("small-frame bursts: buffer peak quiet %llu, raw %llu (%llu misses), normalized %llu (%llu misses)\n",
+  (unsigned long long)quiet.peakBufferUs,(unsigned long long)raw.peakBufferUs,(unsigned long long)raw.missed,
+  (unsigned long long)fixed.peakBufferUs,(unsigned long long)fixed.missed);
+ check(raw.peakBufferUs>=quiet.peakBufferUs+1500,"fixture reproduces the small-frame buffer rise without normalization");
+ check(fixed.peakBufferUs<=quiet.peakBufferUs+300&&fixed.missed<=quiet.missed+5,"small early frames do not pull the offset ahead of full frames");
+ const auto dropRaw=sendSpanRun(0,false,3000),dropFixed=sendSpanRun(1,false,3000);
+ std::printf("lasting 3 ms latency drop: tail ready-to-present raw %.0f us, normalized %.0f us\n",dropRaw.tailLatencyUs,dropFixed.tailLatencyUs);
+ check(dropFixed.tailLatencyUs<=dropRaw.tailLatencyUs+200,"a real latency drop of full frames is still adopted");
+ const auto allSmallRaw=sendSpanRun(0,false,0,true),allSmallFixed=sendSpanRun(1,false,0,true);
+ check(allSmallFixed.peakBufferUs<=allSmallRaw.peakBufferUs+300,"a sustained small-frame scene becomes the typical span");
+}
 
 int main(){
+ smallFramesDoNotMoveOffset();
  VrrSessionConfig cfg;cfg.streamRateHz=76;cfg.displayRefreshHz=120;cfg.latencyMode=0;cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;cfg.timingOptions={4000,9995,300,500};
  auto p=vrrTimingParametersForSession(cfg);VrrTimingController c(cfg,true,p);
- check(p.playoutInputHitchMissesOnly==10,"new sessions use fast rate layers while historical clock comparisons remain explicit");
+ check(p.playoutInputHitchMissesOnly==11,"new sessions use fast rate layers while historical clock comparisons remain explicit");
  check(p.playoutInputClockRelativeHistory==4&&p.playoutInputBoundedRecoveryCredit==0&&p.playoutInputRateDropSnap==1&&
        p.playoutInputLayerSeedRatioPerMille==1500&&p.playoutInputLearningTrim==1,"current main enables corrected accounting with physical recovery credit");
  check(p.playoutInputRecoveryCreditRoomPerMille==50&&c.recoveryHeadroomUs()>4800&&

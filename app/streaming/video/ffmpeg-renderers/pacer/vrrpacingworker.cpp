@@ -18,6 +18,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <thread>
 #include <utility>
@@ -42,7 +43,7 @@ VrrSessionConfig experimentalInputConfig(VrrSessionConfig config, bool logConfig
     config.experimentalInputPercentileWindowUs =
         uint64_t(config.timingOptions.resolved(config.latencyMode).historySeconds) * 1000000;
     if (logConfiguration) SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Adaptive buffer: profile smoothness %.2f%% selects input readiness percentile; history %llu s, rise %llu us/s, rolling cadence-aware required-buffer percentile over the selected history with gradual convergence, without a hard score hold or per-trial waits (stable revision 5); layers at least 30 FPS apart, upward restore or normal downward drain; fixed 2T Absorb pad (input policy 10); interval severity score remains distinct",
+        "Adaptive buffer: profile %.2f%% selects actual preventable-hitch coverage; history %llu s, rise %llu us/s, selected-window mean protection plus one tolerance reserve sizes demand: breakthrough hitches while coverage fails, all absorbed and missed disturbances while it is met, releasing in proportion to unused miss budget even when that demand is not lower; coverage can refuse growth; proportional convergence in both directions without jump restores or per-frame layer drain lost-cause seconds (misses over 4x the allowance, at least 10%) retained 10 s and not scored; target the smallest buffer whose predicted window hitches (breakthroughs scaled by hitches per breakthrough) fit the allowance less half its deviation, approached proportionally (stable revision 13); layers at least 30 FPS apart; fixed 2T Absorb pad (input policy 11); display-ceiling phase replacement on every presentation path, keeping late-input phase up to a refresh, expiring 5 s after the last late frame at tolerance per frame, trajectory repaying up to tolerance per frame (ceiling policy 3); interval severity score remains distinct",
         config.experimentalInputPercentilePpm / 10000.0,
         static_cast<unsigned long long>(config.experimentalInputPercentileWindowUs / 1000000),
         static_cast<unsigned long long>(std::clamp<uint64_t>(config.experimentalInputPercentileRiseUsPerSecond, 250, 1000)));
@@ -449,7 +450,8 @@ int VrrPacingWorker::run()
         else if (!dequeueFrame(queuedFrame, queueDiscontinuity)) {
             break;
         }
-        queuedFrame.trace.dequeueUs = LiGetMicroseconds();
+        if (queuedFrame.trace.dequeueUs == 0)
+            queuedFrame.trace.dequeueUs = LiGetMicroseconds();
         queuedFrame.trace.queueDiscontinuity = queueDiscontinuity;
         PacedFrame& frame = queuedFrame.frame;
 
@@ -511,8 +513,11 @@ int VrrPacingWorker::run()
             noteDrop();
             continue;
         }
-        const auto decodeReadiness = preparedAhead ? VrrDecodeReadiness{} :
-            m_Presenter->observeDecodeReadiness(frame.frame(), frame.decodeBoundary());
+        auto decodeReadiness = preparedAhead ? VrrDecodeReadiness{} :
+            queuedFrame.reservedReadinessValid ? queuedFrame.reservedReadiness :
+                m_Presenter->observeDecodeReadiness(frame.frame(), frame.decodeBoundary());
+        if (!queuedFrame.reservedReadinessValid)
+            decodeReadiness.waitUs += queuedFrame.reservedReadiness.waitUs;
         const uint64_t decodeSyncWaitUs = decodeReadiness.waitUs;
         frame.noteDecodeSyncWaitUs(decodeSyncWaitUs);
         if (decodeReadiness.asynchronousOutput) {
@@ -526,7 +531,8 @@ int VrrPacingWorker::run()
             // wait. Adding the wait duration to decoder output is wrong when
             // the frame already spent time in the pacing queue: it can place
             // completion before the worker even began waiting.
-            frame.noteGpuReadyUs(LiGetMicroseconds());
+            frame.noteGpuReadyUs(queuedFrame.reservedReadinessValid ?
+                queuedFrame.reservedReadinessObservedUs : LiGetMicroseconds());
         }
 
         if (m_RebaseOnNextFrame) {
@@ -586,7 +592,12 @@ int VrrPacingWorker::run()
         }
 
         if (decision.trajectory.resyncRecommended) {
-            if (reserveReadySuccessor(preparedAhead, reservedFrame, reservedDiscontinuity)) {
+            const auto& policy = m_TimingController->parameters();
+            const uint64_t waitUs = decision.replacementWaitUs != 0 ? decision.replacementWaitUs :
+                policy.playoutSmoothingWindowedCadence >= 8 || policy.playoutCeilingPhaseReplacement != 0 ?
+                    std::min<uint64_t>(20000, decision.sourcePeriodUs * 2) : 0;
+            const unsigned replacementWaitMs = unsigned((waitUs + 999) / 1000);
+            if (reserveReadySuccessor(preparedAhead, reservedFrame, reservedDiscontinuity, replacementWaitMs)) {
                 telemetry.trajectorySuccessorFrame = reservedFrame.frame.frameNumber();
                 telemetry.trajectorySuccessorProof = reservedFrame.preparation ? 1 : 2;
                 telemetry.staleCheckUs = LiGetMicroseconds();
@@ -1269,21 +1280,44 @@ bool VrrPacingWorker::hasQueuedFrame()
 
 bool VrrPacingWorker::reserveReadySuccessor(bool preparedCurrent,
                                            QueuedFrame& frame,
-                                           bool& queueDiscontinuity)
+                                           bool& queueDiscontinuity,
+                                           unsigned waitMs)
 {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs);
     QMutexLocker lock(&m_FrameQueueLock);
+    while (waitMs && m_FrameQueue.empty() && !isStopping() && !m_Suspended.load() &&
+            m_PendingWindowStateFlags.load() == 0 && std::chrono::steady_clock::now() < deadline)
+        m_FrameQueueNotEmpty.wait(&m_FrameQueueLock, 1);
     if (m_FrameQueue.empty()) return false;
     const auto& next = m_FrameQueue.front();
     const bool ready = next.preparation ? next.preparation->readyForPresentation() :
         !preparedCurrent && next.frame.decoderOutputComplete();
-    if (!ready) return false;
+    if (!ready && !waitMs) return false;
     // Transfer ownership under the proof's queue lock. A concurrent producer
     // must not evict the proven replacement between checking and dropping.
     queueDiscontinuity = m_QueueDiscontinuity.exchange(false);
     frame = std::move(m_FrameQueue.front());
     m_FrameQueue.pop_front();
     m_FrameQueueDepth.store(m_FrameQueue.size(), std::memory_order_relaxed);
-    return true;
+    lock.unlock();
+    if (ready) return true;
+    // The reserved image remains owned even on failure. Present the current
+    // image and process this successor normally next; never drop an image on
+    // the strength of queue presence alone.
+    if (frame.preparation) {
+        while (!frame.preparation->readyForPresentation() && !isStopping() &&
+                !presentationSuspended() && m_PendingWindowStateFlags.load() == 0 &&
+                std::chrono::steady_clock::now() < deadline)
+            SDL_Delay(1);
+        return frame.preparation->readyForPresentation();
+    }
+    if (preparedCurrent || isStopping() || presentationSuspended()) return false;
+    frame.trace.dequeueUs = LiGetMicroseconds();
+    frame.reservedReadiness = m_Presenter->observeDecodeReadiness(
+        frame.frame.frame(), frame.frame.decodeBoundary());
+    frame.reservedReadinessObservedUs = LiGetMicroseconds();
+    frame.reservedReadinessValid = frame.reservedReadiness.completionObserved;
+    return frame.reservedReadiness.completionObserved;
 }
 
 void VrrPacingWorker::discardQueuedFrames(

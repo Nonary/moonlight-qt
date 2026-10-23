@@ -355,10 +355,10 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
-    if (value.playoutInputStableAdaptation > 5)
-        return fail("stable input adaptation must be between 0 and 5");
-    if (value.playoutInputHitchMissesOnly > 10)
-        return fail("input hitch-miss policy must be between 0 and 10");
+    if (value.playoutInputStableAdaptation > 13)
+        return fail("stable input adaptation must be between 0 and 13");
+    if (value.playoutInputHitchMissesOnly > 11)
+        return fail("input hitch-miss policy must be between 0 and 11");
     if (value.playoutPredictionOnly > 1 || value.playoutSubmissionEstimateFallback > 1 ||
             value.playoutRequireDisplayEvents > 1 ||
             value.playoutNativeHitchAdaptation > 1 || value.playoutReadinessDrivenAdaptation > 1 ||
@@ -370,6 +370,7 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.playoutInputPercentileEnabled > 1 ||
             value.playoutInputBoundedRecoveryCredit > 1 ||
             value.playoutInputRateDropSnap > 1 ||
+            value.playoutOffsetSendSpanNormalization > 1 ||
             value.playoutGpuReadinessAdaptation > 1) {
         return fail("prediction-only, display event requirement, native hitch adaptation, readiness adaptation, stable smoothness reference, learned preparation lead, observed-period cap, capacity telemetry, absorbed jitter release, and GPU readiness flags must be 0 or 1");
     }
@@ -568,8 +569,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             (value.playoutLateRecovery && value.playoutCatchupPerMille == 0)) {
         return fail("playout_late_recovery must be 0 or 1 and requires nonzero catchup");
     }
-    if (value.playoutSmoothingWindowedCadence > 7) {
-        return fail("playout_smoothing_windowed_cadence must be in 0..7");
+    if (value.playoutSmoothingWindowedCadence > 9) {
+        return fail("playout_smoothing_windowed_cadence must be in 0..9");
     }
     // Revisions before 5 ignore these, so historical snapshots may be layered
     // over current values.
@@ -613,6 +614,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.playoutSmoothingResetSlewUs > 100000) {
         return fail("playout_smoothing_reset_slew_us must be in 0..100000");
+    }
+    if (value.normalizedSourceIntrinsicDecodeGpu > 1) {
+        return fail("normalized_source_intrinsic_decode_gpu must be 0 or 1");
     }
     if (value.playoutSmoothingReadinessBound > 1) {
         return fail("playout_smoothing_readiness_bound must be 0 or 1");

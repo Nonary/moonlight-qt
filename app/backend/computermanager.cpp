@@ -699,6 +699,48 @@ void ComputerManager::quitRunningApp(NvComputer* computer)
     QThreadPool::globalInstance()->start(quit);
 }
 
+class PendingSleepTask : public QObject, public QRunnable
+{
+    Q_OBJECT
+public:
+    PendingSleepTask(NvAddress address, uint16_t port, QSslCertificate certificate)
+        : m_Address(address), m_Port(port), m_Certificate(certificate) {}
+signals:
+    void completed(QString error);
+private:
+    void run() override
+    {
+        QString error;
+        try {
+            NvHTTP http(m_Address, m_Port, m_Certificate, true);
+            http.requestHostSleep();
+        } catch (const std::exception& e) {
+            error = tr("Sleep was not acknowledged: %1\nThe host may be offline. No automatic retry will occur.").arg(QString::fromUtf8(e.what()));
+        }
+        emit completed(error);
+    }
+    NvAddress m_Address;
+    uint16_t m_Port;
+    QSslCertificate m_Certificate;
+};
+
+bool ComputerManager::requestHostSleep(NvComputer* computer)
+{
+    QReadLocker lock(&computer->lock);
+    const QString uuid = computer->uuid;
+    if (m_PendingSleepRequests.contains(uuid) || computer->state != NvComputer::CS_ONLINE ||
+        computer->pairState != NvComputer::PS_PAIRED || !computer->sleepActionSupportedAndAllowed) return false;
+    m_PendingSleepRequests.insert(uuid);
+    // Snapshot transport state; the worker never retains a possibly deleted computer.
+    auto* task = new PendingSleepTask(computer->activeAddress, computer->activeHttpsPort, computer->serverCert);
+    connect(task, &PendingSleepTask::completed, this, [this, uuid](const QString& error) {
+        m_PendingSleepRequests.remove(uuid);
+        emit hostSleepCompleted(uuid, error);
+    });
+    QThreadPool::globalInstance()->start(task);
+    return true;
+}
+
 void ComputerManager::stopPollingAsync()
 {
     QWriteLocker lock(&m_Lock);

@@ -253,6 +253,7 @@ HEADERS += \
     backend/nvcomputer.h \
     backend/framelimitercapabilities.h \
     backend/nvhttp.h \
+    backend/poweractions.h \
     backend/launchwarning.h \
     backend/pyrowaveudpprobe.h \
     backend/nvpairingmanager.h \

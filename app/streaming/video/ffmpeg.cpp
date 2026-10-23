@@ -1510,13 +1510,18 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 reason = "Holding - current frame timing is outside the target";
                 break;
             case Action::InputPercentileGrow:
-                reason = "Increasing - experimental input percentile needs headroom";
+                reason = interval.inputPercentile.adaptationRevision >= 7 ?
+                    "Converging upward - average hitch protection plus tolerance reserve" :
+                    "Increasing - experimental input percentile needs headroom";
                 break;
             case Action::InputPercentileRelease:
-                reason = "Shrinking - experimental input percentile needs less headroom";
+                reason = interval.inputPercentile.adaptationRevision >= 7 ?
+                    "Converging downward - average hitch protection plus tolerance reserve" :
+                    "Shrinking - experimental input percentile needs less headroom";
                 break;
             case Action::InputPercentileHold:
-                reason = "Steady - profile input percentile met";
+                reason = interval.inputPercentile.adaptationRevision >= 7 ?
+                    "Steady - no additional buffer requested" : "Steady - profile input percentile met";
                 break;
             case Action::InputPercentileBackoff:
                 reason = "Shrinking slowly - recent input misses exceed profile allowance";
@@ -1573,12 +1578,14 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             if (interval.inputPercentileEnabled) {
                 const auto& input = interval.inputPercentile;
                 ret = snprintf(&output[offset], length - offset,
-                    "Adaptive buffer | profile %.2f%% frame-coverage percentile | target %.2f ms | %llu samples / %llu s%s%s\n"
+                    "Adaptive buffer | profile %.2f%% %s | target %.2f ms | %llu samples / %llu s%s%s\n"
                     "Window measured frames %llu | absorbed %llu | missed %llu | interval severity score distinct\n"
                     "Frame lateness %.2f ms | buffer target %.2f ms | tolerance %.2f ms | growth %s\n"
                     "Release %.1f us/s | last-second inputs %llu / misses %llu | proposed misses %llu\n"
                     "Network misses %llu | decode misses %llu (stage totals)\n",
-                    input.probabilityPpm / 10000.0, input.targetUs / 1000.0,
+                    input.probabilityPpm / 10000.0,
+                    input.adaptationRevision >= 7 ? "hitch-coverage goal; mean + reserve sizing" : "frame-coverage percentile",
+                    input.targetUs / 1000.0,
                     static_cast<unsigned long long>(input.samples),
                     static_cast<unsigned long long>(input.windowUs / 1000000),
                     input.tailUncertain ? " | tail uncertain" : "",
@@ -1597,6 +1604,26 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                     static_cast<unsigned long long>(input.cumulativeDecoderMisses));
                 if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
                 offset += ret;
+                if (input.adaptationRevision >= 13) {
+                    ret = snprintf(&output[offset], length - offset,
+                        "Hitch budget: buffer %.2f ms keeps predicted hitches within the allowance | %llu frames / %llu s\n",
+                        input.hitchRequirementMeanUs / 1000.0,
+                        static_cast<unsigned long long>(input.hitchRequirementSamples),
+                        static_cast<unsigned long long>(input.windowUs / 1000000));
+                    if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
+                    offset += ret;
+                }
+                else if (input.adaptationRevision >= 7) {
+                    ret = snprintf(&output[offset], length - offset,
+                        "Hitch estimate: average required protection %.2f ms + tolerance reserve %.2f ms | %llu %s / %llu s\n",
+                        input.hitchRequirementMeanUs / 1000.0, input.toleranceUs / 1000.0,
+                        static_cast<unsigned long long>(input.hitchRequirementSamples),
+                        input.adaptationRevision >= 8 && !input.hitchRequirementFromMisses ?
+                            "disturbances" : "hitches",
+                        static_cast<unsigned long long>(input.windowUs / 1000000));
+                    if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
+                    offset += ret;
+                }
             }
         }
         if (stats.vrrReadiness.samples == 0) {

@@ -21,6 +21,179 @@ Historical revision-2 finite-trial tests remain unchanged.
 
 # VRR deterministic tests
 
+## Adaptive buffer regression gate
+
+`tst_vrrbufferregressions` is the fast check to run after any change to the
+input buffer, its rate layers, catch-up, smoothing or ceiling replacement. It takes about 9 s (its
+scenarios run in parallel) and covers every preset (Low Latency, Balanced,
+Smooth) with smoothing off, Reduce judder (the default) and Absorb, each for a
+presenter that can latch (Windows D3D11) and one that cannot (Linux Vulkan
+present modes without latch protection; results labeled `@no-latch`).
+
+```text
+build\tests-vrr\vrr\release\tst_vrrbufferregressions.exe              # everything
+build\tests-vrr\vrr\release\tst_vrrbufferregressions.exe rate-drop    # one scenario
+build\tests-vrr\vrr\release\tst_vrrbufferregressions.exe --strict     # known regressions fail too
+```
+
+It exists because earlier buffer regression tests kept passing while the
+same bugs returned. Each was written against the policy revision current at
+the time (`playoutInputHitchMissesOnly` 0-9, stable adaptation 1/2), and most
+whole-controller tests built a default `VrrSessionConfig`. Those defaults
+leave bounded catch-up, the receive clock, profile-scaled recovery credit,
+layer seeding and learning trim switched off. The live worker switches them
+all on, so a new default revision began with no coverage for old bugs.
+
+The gate avoids both problems:
+
+- Every controller is built through `vrrproductionsession.h`, which mirrors
+  `VrrPacingWorker::resolvedInputConfig()`.
+  `tst_vrrpacingworker::testProductionSessionHelperMatchesWorker` compares
+  every resolved timing parameter with the worker's, so they cannot drift.
+  Use this header in any new controller-level test of live behavior.
+- No contract pins a revision. A newly selected default inherits them all.
+- Visible hitches are measured from the simulated presentation (stretched
+  intervals beyond T), not from the controller's own miss counters.
+- Bounds come from the documented policy (250 us/s release law with its
+  window/30 time constant, rise rate, profile allowance, T and 2T budgets)
+  plus stated slack, not from whatever the implementation produced.
+
+| Scenario | Contract | Regression it guards |
+| --- | --- | --- |
+| `start-release` | cold-start and cached starting delay drain to the floor at the release law; never faster than the fall rate | Codex paced-attack revision 2 floating at its start; stale plateaus (2ccca878, 0d2f9adc) |
+| `within-allowance` | misses inside the profile allowance buy no latency | buffers that looked too high |
+| `earn-protection` | late input beyond the allowance earns protection at the rise rate, keeps hitches inside the allowance, never exceeds lateness beyond T | 5b062c4b slow relearning, blocked growth, over-buffering |
+| `plateau-history` | protection holds while its evidence is inside the history, releases once it expires, does not oscillate | 2ccca878, 0d2f9adc, 7d1148f9 |
+| `rate-round-trip` | a slower rate adds no delay, layer steps stay within T, a returning rate restores protection at once and keeps its evidence for the rest of its history | 5b062c4b, 1a5bef09, 181415ec |
+| `ordinary-variation` | a 116 -> 90 -> 116 FPS ramp and random 90-116 FPS dwell (with the long tails that once switched a 91 FPS layer) never switch layers, keep protection, and scale with a larger need like a steady rate; three-frame stall excursions cost no protection | 1a5bef09 false mid-band switches holding the buffer flat |
+| `display-ceiling` | at exactly 120 FPS on 120 Hz, a released starting delay reaches the screen, retiming and latency stay inside the budget or the phase late frames forced (at most a refresh), and late frames under a refresh cost no replacement | 2026-10-20 capture: 5 ms of retiming for minutes on DXGI; ceiling policy 1's skip per late frame |
+| `versus-fixed-refresh` | at the ceiling, no more visible events than the fixed-refresh pacer model (mean over 16 vsync phases), less latency, no larger disturbance, no freeze longer than its worst hold plus a refresh, and replacement requests without a ready successor stay rare; late frames of 4, 8 and 10 ms and 2% of frames 2 ms late | ceiling policy 1: 12 skips a minute where fixed refresh shows none |
+| `versus-fixed-refresh-stall` | the same against 25 ms stalls and 20 ms latency steps (plain and opening with a bunched pair); a latency step stalls for at most the step plus a refresh | burst shedding that would discard every frame of a latency step |
+| `versus-fixed-refresh-captures` | on recorded arrival timelines from two 2026-10-20 captures (`capturespans.h`), no more visible stutter than fixed refresh at 120 FPS intervals, and no more stutter or replacements than ceiling policy 1 | policy 1's 31 events where fixed refresh shows 6; shedding without the 32-frame rate limit (49 replacements in the lossy span); dropping the decode guard |
+| `rate-drop` | a rate drop that moves the mapping gives the excess back promptly | f96b0524 |
+| `clock-drift` | +/-50 ppm drift neither ratchets nor erodes retained protection | 409a5661 |
+| `loss-and-downstream` | lost-packet frames, slow preparation and client decoder backlog above the typical handoff buy no input buffer | 39d10abf, post-input work, own backlog |
+| `catch-up-carry` | carry drains between late frames despite wake-up overshoot | 3c32553e |
+| `invalid-expiry` | protection expires through ineligible frames and repeated epochs | 75e97d26 |
+| `smoothing-budget` | Reduce judder (T) and Absorb (2T) stay inside their budgets, buy no input buffer, and actually even out short/long pairs | smoothing revisions 8/9 and the T-per-second actuator they replaced |
+
+Contracts the shipped policy violates today are listed in `g_Known` with their
+evidence. They print as `KNOWN` on every run without failing the gate, so CI
+and nightly releases keep running. `--strict` fails them. Once none of an
+entry's checks fail, the gate fails with `FIXED KNOWN REGRESSION` until the
+entry is deleted, so a fix hardens the contract instead of leaving it advisory.
+The first entry, `rate-drop`, found that input policy 10 drained layer
+decreases at the normal release law, bringing back f96b0524's excess latency
+after an abrupt rate drop; policy 11 fixed it and the entry was deleted. The
+open entries share one cause: a presenter that cannot latch cannot show every
+frame at exactly its maximum refresh. In `display-ceiling@no-latch` the
+resulting service overload blocks input evidence, so the starting delay never
+releases. In `versus-fixed-refresh@no-latch` and its `-stall` and `-captures`
+variants the presenter replaces about one frame in 48, where fixed refresh's
+FIFO vsync shows almost none (see architecture.md, "Display-ceiling policy
+2"). One more entry is not about ceiling replacement:
+`versus-fixed-refresh-captures/0420-lossy`. In that lossy recorded span,
+fixed refresh's deeper queue shows 28 visible events against Balanced's 54
+(policy 1: 56), because the adaptive buffer does not rise fast enough for
+chaos.
+
+The simulation follows the worker's call order with deterministic input. Every
+frame carries the 0.1 ms reassembly-to-decode handoff measured in real
+captures. A latched present reaches the screen no sooner than one refresh after
+the previous flip, as the controller's spacing anchor models, and latency and
+hitches are scored from that time: scoring present calls hid the 2026-10-20
+plateau because a budget-capped plan looked healthy. A recommended replacement
+discards the frame for its successor exactly as the worker does: within the
+decision's wait (two source periods, or a quarter refresh for a late frame,
+rounded up to whole milliseconds), with the successor as late as the input says.
+A request that finds no successor holds the frame for the whole wait. The
+fixed-refresh model follows `Pacer::handleVsync` on the same arrivals. It
+measures controller decisions, not driver scheduling or optical scanout.
+
+## Trace questions and their regression contracts
+
+The trace checklist is an outcome checklist, not just a list of internal caps.
+The following mapping is the maintained entry point when turning a trace
+finding into a regression. Add a deterministic reproducer with a known expected
+outcome and a fault/negative control; do not replace a missing expectation with
+"the current implementation produced this number."
+
+`tst_vrrinputcontracts` adds whole-controller checks for sustained downstream
+work versus genuine input-caused misses, rational source cadence near
+60/144/240 Hz display ceilings, and expiry of earned protection through packet
+loss and recurring source epochs. Its event loop records actual preparation,
+wait and submission times; it bounds source-to-target, source-to-submission
+and decoder-output-to-submission separately. Fractional-rate cases must also
+prove that the measured source period is near the claimed display ceiling.
+The input contracts also require the scheduled frame delay to acquire earned
+protection and release obsolete protection; changes in observer counters alone
+cannot satisfy them. Isolated controller mutations pinning that output to the
+floor or old seed are rejected by these assertions.
+These supplement the 336 disturbance cases rather than replace their smoothing
+and retiming checks.
+
+| Trace question | Stable coverage |
+| --- | --- |
+| Is the source actually irregular or running at a lower rate? | `tst_incomingframetiming`, controller cadence/rate tests, `tst_vrrtracemetrics::testSourceGapsAndLateDeliveryHaveDifferentDenominators` |
+| Is output even, or does it merely match jittery sender stamps? | `tst_vrrtracemetrics::testSenderFidelityAndPresentedEvennessAreDifferent`, continuous game jitter in `tst_sourcegapsmoothing` |
+| Are the reported p99.5/p99.9/p99.95 and missing samples trustworthy? | `tst_vrrtracemetrics::testTailStatisticsAndMissingDurations` using the actual replay histogram |
+| Did source, delivery, CPU enqueue or display timing change? | `tst_vrrtracemetrics::testGraphLanesAgainstMatchingSourceFrames`, `tst_overlay::testLaneIntervals`, controller source-referenced cadence detector |
+| Does OS feedback belong to this image and display epoch? | `tst_overlay::testConfirmedDisplayRefresh`, worker delayed-display/epoch fixtures, native scheduling/clock audits in `tst_vrrreplayconfig` |
+| Are red input markers using the matching frame's actual allowance? | `tst_vrrtracemetrics::testRedMarkersCannotBeHiddenByExtraBudgetOrLateTargets`, overlay producer/raw-stage coverage tests |
+| Are smoothing and recovery active without a permanent latency penalty? | `tst_sourcegapsmoothing::testContinuousGameJitterAndLatency`, `testLiveAdaptiveRetimingBudget`, `testBufferDisturbanceContracts` |
+| Can adaptation inflate from render work, packet loss or its own backlog? | `tst_vrrbufferregressions` loss-and-downstream on the live policy, input eligibility/service tests in `tst_inputpercentileintegration` and `tst_inputaccounting`, recorded `tst_inputtracechunks` fixtures |
+| Do histories release, expire and restore rate-layer protection correctly? | `tst_vrrbufferregressions` (live policy, every preset and smoothing mode), rolling required-buffer and layer tests in `tst_inputpercentileintegration`, receive-clock tests, `tst_vrrcacheidentity` |
+| Do actual measured waits reconcile with processing/queue/render stats? | `tst_performancestats`, worker decode-readiness and retried-wait fixtures |
+| Can recovery replace only a proven-ready image without losing ownership? | `tst_vrrpacingworker::testFixedReserveReplacementRequiresReadySuccessor`, prepared/suspend/shutdown tests, `tst_phasetrajectory` |
+| Are modeled spacing, raster bounds and native protection valid? | `tst_dxgipresent`, `tst_presentationclock`, raster/native/lifecycle audits in `tst_vrrreplayconfig` |
+| Is replay complete and exact rather than merely producing a JSON file? | Four generated worker fixtures through `run_trace_contracts.py`; explicit process-exit, sequence, timestamp, row, session and exact-state gates |
+| Did release compilation silently disable the tests? | Assertion-source audit in `test_trace_contract_runner.py` and an executing assertion sentinel in `tst_vrrtracemetrics` |
+
+Run the complete trace-related gate with the Qt/deployed runtime on `PATH`:
+
+```text
+python tests/vrr/run_trace_contracts.py --bin-dir build/tests-vrr/vrr/release --app-dir app --output-dir build/trace-contracts
+```
+
+It requires named critical suites, runs all other built VRR suites as well,
+exports four fresh readiness traces and requires exact replay of each. It
+also changes a reservation's successor identity, readiness-proof kind and
+successor existence in three copies of the ready fixture. Their row accounting
+and decoded hashes remain valid. Each must exit with exact-baseline failure
+and a controller-lifecycle violation, so an unrelated parse/hash failure cannot
+satisfy the negative control. The replay joins a reservation to its owned next
+image and checks prepared or retained-decode readiness evidence. Stop/suspend
+may terminally discard that image without a second stage report. A later
+completion recheck is an upper bound and does not disprove readiness already
+known on admission.
+
+Every invocation gets a new artifact directory; old traces/JSON cannot satisfy a
+missing result. The root `summary.json` is marked incomplete before work starts
+and records the final status and per-suite results. Windows CI uses this same
+gate. Python guard tests run with `python -m unittest discover -s tests/vrr -p
+test_trace_contract_runner.py -v`.
+
+The guard tests drive the runner itself through stale exports, missing or
+malformed zero-exit JSON, contradictory frame counts, failed replay processes,
+timeouts and inherited subset flags. Exact replay population means scheduled
+frames, not all delivered rows: producer-side terminal rows may never reach
+scheduling, and scheduled frames may be dropped before presentation. Missing
+local timestamps break metric adjacency, while a source/RTP origin of zero
+remains valid. Identity, uncertainty, duplicate evidence, clock restart and
+rolling-expiry controls cover cases where a plausible graph alone is misleading.
+
+Scoring-test effectiveness was checked with isolated release-build mutations:
+erased presented jerk, hidden late arrivals, floor-rounded percentile ranks,
+bridged unavailable timestamps, requested instead of applied buffering,
+ignored image identity, ignored uncertainty and disabled assertions. All eight
+faults compiled and failed explicit assertions. The original implementation
+passed. This is concrete fault-detection evidence, not an exhaustive guarantee
+against every possible defect.
+
+These contracts verify software decisions, evidence and models. Driver-specific
+scheduling, real monitor scanout/VRR and optical smoothness still require a live
+capture or hardware measurement; a passing model cannot establish those facts.
+
 `tst_plvkoffscreen` is an offscreen Vulkan integration test. It renders through
 libplacebo using the production offscreen-target parameter builder, then reads
 back full-coverage, letterbox and pillarbox outputs. Red previous-frame pixels
@@ -56,9 +229,9 @@ records `lost_packets`; replay restores that frame input so loss-affected
 delivery cannot falsely grow the interval buffer. Historical captures without
 the column retain zero-loss input and may require separately documented log
 reconstruction. The deep and warm-history fixtures carry loss through exact
-replay. Native scheduled retiming is capped at 2 ms while worker-paced sessions
-retain their wider quantized-source policy; runtime tests cover deadline floors
-and reserve bounds across source rates and presets.
+replay. Current deliberate retiming uses T for ordinary Reduce judder and a 2T
+reserve for Absorb; mandatory readiness and display ownership can exceed these
+intent bounds. Runtime tests cover actual graph budgets and deadline floors.
 
 Windows D3D11 VRR defaults to waitable DXGI queue admission, with ordinary DXGI
 as fallback. `MOONLIGHT_VRR_COMPOSITION=1` explicitly requests composition;
@@ -1155,14 +1328,16 @@ must still pass before treating a capture as an A/B reference. The replay's
 explicitly set both parameters above to zero to evaluate timestamp-following
 candidates.
 
-With Reduce judder enabled, production selects source-gap revision 4. The
+With ordinary Reduce judder enabled, production selects source-gap revision 9. The
 resolved preset/custom tolerance T is both the untouched source-gap band and
 the shared retained phase limit. Correct only error beyond T, by at most T per
 gap, retaining phase within [-T,+T]. Gaps within T retain the previous phase so
 their spacing is unchanged. There is no standing smoothing reserve, period
 blending or recentering. Source/cadence resets clear the phase. Known readiness,
 input buffering, display spacing and late recovery can still constrain actual
-presentation independently; T does not cap total client latency.
+presentation independently; T does not cap total client latency. Revision 9
+applies the bounded phase immediately instead of passing it through the old
+T-per-second smoothing actuator.
 
 `tst_sourcegapsmoothing` exercises the actual production session policy, with
 below/at/above-T RTP boundaries, consecutive excess gaps, clean gaps after a
@@ -1170,9 +1345,10 @@ correction, changing decode/network readiness, preset/custom tolerances and
 native/worker selection. Recorded revision-4 and revision-5 policies remain
 explicitly selectable for their historical fixtures and exact replay.
 
-The separately enabled Absorb microstutter option selects revision-6 local
-cadence tracking around the gain smoother, with its wider learned reserve
-(at most 5 ms at p99.5) and 8 ms lag.
+The separately enabled Absorb microstutter option selects revision 8, with
+qualified local cadence tracking and a fixed 2T reserve. It spends the whole
+displacement that fits inside that reserve on the affected frame. Deliberate
+recovery shares the unused positive phase budget.
 Historical gain/reserve tests explicitly select the recorded policy. Reserve
 and retiming are recorded in `cadence_smoothing_us`, separately from
 `playout_delay_us`; captures retain their own resolved parameter snapshots.
@@ -1921,6 +2097,53 @@ release is at most min(1 ms,T/2) per frame; ordinary Reduce judder stays revisio
 4, and explicit historical revisions remain covered.
 
 
+### Fixed-reserve absorption (smoothing revision 8)
+
+New Absorb sessions retain the fixed 2T reserve and fully spend it on individual
+frames without the historical T/s occupancy limiter. Ordinary Reduce judder
+selects revision 9, applying revision 4's bounded phase on the affected frame.
+Deliberate recovery shares unused positive phase. Mandatory readiness/display
+floors are separate. Recorded revisions through 7 retain their old behavior.
+
+`sourcegapsmoothing` retains isolated displacement coverage and compares old/new
+policies on 0.5--1 ms variation every frame at 90/116/120 FPS on 120 Hz. The
+continuous test keeps adaptive buffering, clock adjustment and actual feedback
+enabled, measures presented-interval changes and actual `plannedExtraDelayUs()`,
+and bounds processing p99 below 6 ms. A seeded 100-second full-rate fixture
+guards against input protection turning into permanent native ownership phase.
+The native replacement trigger requires a whole 32-frame window above budget;
+it must not replace each ordinary high point of game jitter. Worker tests prove
+ready-successor reservation, fallback on unavailable readiness, single decode
+observation and exactly-once frame release. Synthetic latency bounds do not
+apply to injected GPU/OS faults or establish physical scanout smoothness.
+
+`testBufferDisturbanceContracts` extends this to 336 live-policy cases: seven
+disturbances, two presenters, ordinary/Absorb, 250/500/1000 us tolerances,
+116/120 FPS and zero/6000 us startup seeds. Every 12000-frame run crosses RTP
+rollover. The disturbances are deterministic nonperiodic source jitter,
+three-frame decode-output and submission delays, 60 FPS and return, a source
+pause, missing timestamps with rebase, and clock drift. It checks readiness,
+native accepted-time spacing, positive intent, actual graph/combined budget,
+settled processing p99 below 6 ms, startup/fault peak below 25 ms, less than
+500 ms of continuous processing delay above 6 ms after warmup, and replacement
+counts. The 25 ms peak bound is a startup/injected-fault safety bound, not normal
+operating latency. Invalid timestamp fallback is checked separately from the
+timestamp reserve; it must still recover without a standing delay. Two disabled
+controls require zero smoothing even when Absorb is selected.
+
+The worker's fixed-reserve fixture covers unavailable proof, immediate proof,
+400 us successful waits, and 250 us failed reservations retried successfully.
+Wait cost must appear once (500 us for the two-attempt case), completion must
+remain within the owning frame's lifecycle, unavailable successors cannot
+authorize replacement, presentation must progress and every frame must be
+released exactly once. `MOONLIGHT_VRR_TEST_EXPORT_FIXED_RESERVE_TRACE` exports
+`-ready`, `-unverified`, `-waited`, and `-retried` fixtures for strict replay.
+Replay's readiness audit distinguishes explicit unverified wait service from
+completion proof: an unchanged output boundary is legal only with the explicit
+state field and enough elapsed worker time. Negative cases retain rejection of
+missing-state legacy evidence, impossible wait duration, wrong ordering and a
+false completion claim.
+
 ### Tolerance-limited buffer regression build (input policy 9)
 
 `inputpercentileintegration` covers the 30 FPS layer-separation gate, real fast
@@ -1949,6 +2172,24 @@ allowances, fresh-miss interruption and input/extra-delay independence. Policy 9
 fixtures retain its historical slow trials and T/frame layer drain. Live-controller
 round trips cover policy 10 with smoothing on and off. Replay configuration
 round-trips policies 9 and 10 and rejects unsupported versions.
+
+### Rate-drop layer drain (input policy 11)
+
+Policy 11 is policy 10 plus policy 9's drain of a smaller layer by at most T per
+fresh frame. `tst_vrrbufferregressions` rate-drop showed policy 10 keeping a rate
+drop's moved mapping as 3-4.6 ms of excess latency for 15 s (f96b0524); policy 11
+clears it within about 3 s, and rate-round-trip still bounds each layer step by
+T. Explicit policy-10 fixtures, including the recorded `inputtracechunks`
+capture, keep the release-law drain. Replay configuration accepts 0-11.
+
+Policy 11 also keeps the steady reassembly-to-decode handoff in input readiness.
+The 2026-10-19 capture spends 75-207 us there on every frame (p10-p99); earlier
+policies excluded all of it as backlog, although the mapping includes it, so
+every requirement read about 0.1 ms low. Only queue time above the median of
+the last 64 frames is now backlog. With that handoff, the gate's earn-protection
+hitch rate rises above the allowance under the old accounting; decoder-backlog
+spikes still buy no buffer. The ordinary-variation scenario checks that the
+faster drain cannot fire inside one operating band.
 
 Coverage reporting has a separate 10 s window alongside the selected learning
 history. Tests cover fresh misses, expiry, invalid and stale callbacks, no fake

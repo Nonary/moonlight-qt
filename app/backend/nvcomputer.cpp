@@ -1,4 +1,5 @@
 #include "nvcomputer.h"
+#include "poweractions.h"
 #include "framelimitercapabilities.h"
 #include "nvapp.h"
 #include "settings/compatfetcher.h"
@@ -170,6 +171,8 @@ NvComputer::NvComputer(NvHTTP& http, QString serverInfo)
     else {
         this->maxLumaPixelsHEVC = 0;
     }
+
+    this->sleepActionSupportedAndAllowed = PowerActions::advertised(serverInfo);
 
     const auto limiter = FrameLimiterCapabilities::fromServerInfo(serverInfo);
     this->frameLimiterSupported = limiter.supported;
@@ -576,6 +579,7 @@ bool NvComputer::update(const NvComputer& that)
     ASSIGN_IF_CHANGED(serverCodecModeSupport);
     ASSIGN_IF_CHANGED(pyrowaveHostLinkMbps);
     ASSIGN_IF_CHANGED(pyrowaveCompressionVersion);
+    ASSIGN_IF_CHANGED(sleepActionSupportedAndAllowed);
     ASSIGN_IF_CHANGED(frameLimiterSupported);
     ASSIGN_IF_CHANGED(frameLimiterEnabled);
     ASSIGN_IF_CHANGED(virtualDisplayFrameLimiterEnabled);

@@ -16,6 +16,7 @@ class SteamControllerLink;
 struct GamepadState {
     SDL_GameController* controller;
     bool hapticsAttached;
+    bool speakerPcmAttached;
     SDL_JoystickID jsId;
     short index;
     // Owned by the Steam Controller (2026) driver, not SDL: controller stays null and the SDL

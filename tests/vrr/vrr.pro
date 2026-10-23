@@ -13,6 +13,8 @@ SUBDIRS += dxgipresent
 
 presentationclock.file = $$PWD/presentationclock.pro
 SUBDIRS += presentationclock
+tracemetrics.file = $$PWD/tracemetrics.pro
+SUBDIRS += tracemetrics
 compositionpresentpolicy.file = $$PWD/compositionpresentpolicy.pro
 SUBDIRS += compositionpresentpolicy
 
@@ -100,6 +102,11 @@ phasetrajectory.file = $$PWD/phasetrajectory.pro
 SUBDIRS += phasetrajectory
 inputpercentileintegration.file = $$PWD/inputpercentileintegration.pro
 SUBDIRS += inputpercentileintegration
+inputcontracts.file = $$PWD/inputcontracts.pro
+SUBDIRS += inputcontracts
+# Production-policy buffer regression gate; fast enough to run on every build.
+bufferregressions.file = $$PWD/bufferregressions.pro
+SUBDIRS += bufferregressions
 rollingquantile.file = $$PWD/rollingquantile.pro
 SUBDIRS += rollingquantile
 

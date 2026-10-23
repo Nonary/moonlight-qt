@@ -1,3 +1,4 @@
+#include "assertions.h"
 #include "streaming/video/ffmpeg-renderers/waylandfeedback/wayland.h"
 #include <wayland-server.h>
 #include <sys/socket.h>
