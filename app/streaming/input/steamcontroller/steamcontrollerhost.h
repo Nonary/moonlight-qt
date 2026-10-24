@@ -46,6 +46,15 @@ public:
     static bool rumble(uint16_t controllerNumber, uint16_t lowFreqMotor, uint16_t highFreqMotor);
     static bool setMotionEventState(uint16_t controllerNumber, uint8_t motionType, uint16_t reportRateHz);
 
+    // ----- main thread (SdlInputHandler focus notifications) -----
+    // The raw HID links follow the background gamepad preference like SDL's pads do
+    // (SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS): with it off, input stops reaching the host
+    // while the window has no focus. On loss every announced slot gets one neutral state and a
+    // cancel of its pad touches; held-back state is remembered per slot and the last one is
+    // replayed on regain. Transport, keep-alives and host feedback are untouched.
+    static void notifyWindowFocus(bool focused, bool backgroundGamepad);
+    static bool inputSuppressed();
+
     // ----- SteamControllerLink::Listener (driver threads) -----
     void linkConnected(SteamControllerLink& link, int generation) override;
     void linkDisconnected(SteamControllerLink& link, int generation) override;

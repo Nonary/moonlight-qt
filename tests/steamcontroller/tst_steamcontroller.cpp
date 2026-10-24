@@ -17,12 +17,26 @@
 
 using namespace SteamController;
 
-// Network boundary only: execute the real registry and link bodies without a stream.
+// Network boundary only: execute the real registry and link bodies without a stream. What the
+// host bridge sends is recorded so the focus policy can be checked.
+struct HostState { short number, mask; int flags; uint8_t lt, rt; short lsX, lsY, rsX, rsY; };
+struct HostTouch { uint8_t number, event, pad; uint32_t pointer; };
+static std::vector<HostState> g_HostStates;
+static std::vector<HostTouch> g_HostTouches;
+static int g_HostMotions;
 extern "C" {
 int LiSendControllerArrivalEvent(uint8_t, uint16_t, uint8_t, uint32_t, uint16_t) { return 0; }
-int LiSendMultiControllerEvent(short, short, int, unsigned char, unsigned char, short, short, short, short) { return 0; }
-int LiSendControllerTouchEvent2(uint8_t, uint8_t, uint8_t, uint32_t, float, float, float) { return 0; }
-int LiSendControllerMotionEvent(uint8_t, uint8_t, float, float, float) { return 0; }
+int LiSendMultiControllerEvent(short number, short mask, int flags, unsigned char lt, unsigned char rt, short lsX, short lsY, short rsX, short rsY)
+{
+    g_HostStates.push_back({number, mask, flags, lt, rt, lsX, lsY, rsX, rsY});
+    return 0;
+}
+int LiSendControllerTouchEvent2(uint8_t number, uint8_t event, uint8_t pad, uint32_t pointer, float, float, float)
+{
+    g_HostTouches.push_back({number, event, pad, pointer});
+    return 0;
+}
+int LiSendControllerMotionEvent(uint8_t, uint8_t, float, float, float) { g_HostMotions++; return 0; }
 int LiSendControllerBatteryEvent(uint8_t, uint8_t, uint8_t) { return 0; }
 #if STEAM_CONTROLLER_LI_EXTENSIONS
 int LiSendSteamControllerAttributesEvent(uint8_t, const LI_STEAM_CONTROLLER_ATTRIBUTES*) { return 0; }
@@ -898,6 +912,80 @@ static std::shared_ptr<SteamControllerLink> byPath(SteamControllerManager& m, co
     throw std::runtime_error(std::string("no link for ") + path);
 }
 
+// Raw HID input follows the background gamepad preference like SDL's pads: with it off, focus
+// loss neutralizes every announced slot and holds input back until focus returns, when the last
+// state is replayed; with it on, nothing changes. Feedback and the link itself are untouched.
+static void testHostFocusPolicy()
+{
+    SteamControllerHost host;
+    SteamControllerHost::setActiveGamepadMask(1);
+    auto device = std::make_shared<FakeState>();
+    SteamHidDeviceInfo info;
+    info.productId = PRODUCT_PUCK;
+    info.interfaceNumber = 2;
+    auto link = std::make_shared<SteamControllerLink>(1003, info,
+        std::unique_ptr<SteamHidDevice>(new FakeDevice(device)), SteamControllerConfig{}, 500, &host);
+    std::vector<uint8_t> a = state(0x45), b = state(0x45);
+    b[2] ^= 0x02;   // B toggled: two distinct states to alternate
+    input(*link, a);
+    host.announce(0, link, link->generation());
+
+    g_HostStates.clear(); g_HostTouches.clear(); g_HostMotions = 0;
+    input(*link, b);
+    check(g_HostStates.size() == 1 && g_HostStates[0].number == 0 && g_HostStates[0].flags != 0 && !SteamControllerHost::inputSuppressed(),
+          "with focus, a report reaches the host as a controller state");
+    const HostState focused = g_HostStates[0];
+
+    // Background gamepad input on: focus loss changes nothing.
+    g_HostStates.clear(); g_HostTouches.clear();
+    SteamControllerHost::notifyWindowFocus(false, true);
+    input(*link, a);
+    check(g_HostStates.size() == 1 && g_HostStates[0].flags != 0 && !SteamControllerHost::inputSuppressed(),
+          "focus loss with background gamepad input on neutralizes nothing and keeps forwarding input");
+    SteamControllerHost::notifyWindowFocus(true, true);
+
+    // Background gamepad input off: neutralize on loss, hold, replay on regain.
+    g_HostStates.clear(); g_HostTouches.clear(); g_HostMotions = 0;
+    SteamControllerHost::notifyWindowFocus(false, false);
+    bool neutral = g_HostStates.size() == 1 && g_HostStates[0].number == 0 && g_HostStates[0].mask == 1 && g_HostStates[0].flags == 0
+                   && g_HostStates[0].lt == 0 && g_HostStates[0].rt == 0 && g_HostStates[0].lsX == 0 && g_HostStates[0].lsY == 0
+                   && g_HostStates[0].rsX == 0 && g_HostStates[0].rsY == 0;
+    bool cancelled = g_HostTouches.size() == 2 && g_HostTouches[0].event == LI_TOUCH_EVENT_CANCEL_ALL && g_HostTouches[0].pad == 0
+                     && g_HostTouches[1].event == LI_TOUCH_EVENT_CANCEL_ALL && g_HostTouches[1].pad == 1;
+    check(neutral && cancelled && SteamControllerHost::inputSuppressed(),
+          "focus loss with background gamepad input off sends one neutral state and cancels both pads of each announced slot");
+    g_HostStates.clear(); g_HostTouches.clear(); g_HostMotions = 0;
+    input(*link, imu(0x45));
+    input(*link, b);
+    check(g_HostStates.empty() && g_HostTouches.empty() && g_HostMotions == 0,
+          "while unfocused, state, pad touches and motion are held back");
+    auto effect = pulse(0, 1);
+    SteamControllerHost::clSteamHaptic(0, (uint8_t)effect.size(), effect.data());
+    check(link->queuedOutputs() == 1 && SteamControllerHost::rumble(0, 100, 200) && link->connected(),
+          "host feedback and the link are not gated by focus");
+    SteamControllerHost::notifyWindowFocus(true, false);
+    check(g_HostStates.size() == 1 && g_HostStates[0].flags == focused.flags && g_HostStates[0].lsX == focused.lsX
+          && g_HostStates[0].rt == focused.rt && !SteamControllerHost::inputSuppressed(),
+          "focus regained replays the last held state once");
+    g_HostStates.clear();
+    SteamControllerHost::notifyWindowFocus(true, false);
+    check(g_HostStates.empty(), "a repeated focus notification replays nothing");
+    input(*link, a);
+    check(g_HostStates.size() == 1 && g_HostStates[0].flags != 0, "input flows again after focus returns");
+
+    // A slot retired while unfocused still sends its final zeroed state; shutdown clears the policy.
+    SteamControllerHost::notifyWindowFocus(false, false);
+    g_HostStates.clear();
+    host.retire(link, 0, 0);
+    check(g_HostStates.size() == 1 && g_HostStates[0].flags == 0 && g_HostStates[0].mask == 0, "retiring a slot while unfocused still zeroes it under the new mask");
+    host.shutdown();
+    SteamControllerHost::notifyWindowFocus(true, false);
+    SteamControllerHost host2;
+    check(!SteamControllerHost::inputSuppressed(), "a new session's registry starts unsuppressed");
+    host2.shutdown();
+    link->stop(g_Now);
+}
+
 // The Bluetooth LE transport (PID 0x1303, HID-over-GATT): same protocol as USB plus the host
 // settings relay. Byte sequences are the Android BLE driver's (SteamControllerBle.java).
 static void testBle()
@@ -1353,6 +1441,7 @@ int main()
         testOpenRetry();
         testHostFeedbackGeneration();
         testRumbleRoute();
+        testHostFocusPolicy();
         testBle();
         testBleHapticKnobs();
         testReconnectOutputSchedule();

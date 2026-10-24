@@ -46,6 +46,9 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
 
     // Allow gamepad input when the app doesn't have focus if requested
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, prefs.backgroundGamepad ? "1" : "0");
+    // The Steam Controller (2026) links bypass SDL and follow the same preference through
+    // notifyFocusLost()/notifyFocusGained().
+    m_BackgroundGamepad = prefs.backgroundGamepad;
 
 #if !SDL_VERSION_ATLEAST(2, 0, 15)
     // For older versions of SDL (2.0.14 and earlier), use SDL_HINT_GRAB_KEYBOARD
@@ -384,10 +387,22 @@ void SdlInputHandler::notifyFocusLost()
     // Raise all keys that are currently pressed. If we don't do this, certain keys
     // used in shortcuts that cause focus loss (such as Alt+Tab) may get stuck down.
     raiseAllKeys();
+
+#if HAVE_STEAM_CONTROLLER_DRIVER
+    // Raw HID gamepad input follows the background gamepad preference like SDL's pads.
+    if (m_SteamHost != nullptr) {
+        SteamControllerHost::notifyWindowFocus(false, m_BackgroundGamepad);
+    }
+#endif
 }
 
 void SdlInputHandler::notifyFocusGained()
 {
+#if HAVE_STEAM_CONTROLLER_DRIVER
+    if (m_SteamHost != nullptr) {
+        SteamControllerHost::notifyWindowFocus(true, m_BackgroundGamepad);
+    }
+#endif
 }
 
 bool SdlInputHandler::isCaptureActive()

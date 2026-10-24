@@ -16,11 +16,17 @@ struct Entry {
     std::shared_ptr<SteamControllerLink> link;
     int generation = 0;
     uint8_t number = 0;
+    // The last state the link reported under this announcement, replayed when input resumes.
+    bool haveState = false;
+    int buttonFlags = 0;
+    uint8_t lt = 0, rt = 0;
+    short lsX = 0, lsY = 0, rsX = 0, rsY = 0;
 };
 
 struct Registry {
     std::mutex mutex;
     bool alive = false;
+    bool suppressed = false;      // window unfocused with background gamepad input off
     uint16_t mask = 0;
     std::vector<Entry> entries;   // announced links
 
@@ -30,6 +36,13 @@ struct Registry {
             if (e.link.get() == &link && e.generation == generation) return e.number;
         }
         return -1;
+    }
+    // Under mutex: the announcement of this link's generation, or null.
+    Entry* find(const SteamControllerLink& link, int generation) {
+        for (Entry& e : entries) {
+            if (e.link.get() == &link && e.generation == generation) return &e;
+        }
+        return nullptr;
     }
     // Under mutex: the link announced as this controller number (the first in single-controller mode).
     Entry entryFor(uint16_t number) const {
@@ -52,6 +65,7 @@ SteamControllerHost::SteamControllerHost()
     Registry& r = registry();
     std::lock_guard<std::mutex> lock(r.mutex);
     r.alive = true;
+    r.suppressed = false;   // a new session starts from the focus notifications it receives
 }
 
 SteamControllerHost::~SteamControllerHost()
@@ -198,6 +212,38 @@ bool SteamControllerHost::setMotionEventState(uint16_t controllerNumber, uint8_t
     return true;
 }
 
+// ----- focus policy (main thread) -----
+
+void SteamControllerHost::notifyWindowFocus(bool focused, bool backgroundGamepad)
+{
+    const bool suppress = !focused && !backgroundGamepad;
+    Registry& r = registry();
+    std::lock_guard<std::mutex> lock(r.mutex);
+    if (r.suppressed == suppress) return;
+    r.suppressed = suppress;
+    if (!r.alive) return;
+    for (const Entry& e : r.entries) {
+        if (suppress) {
+            // A button, stick or finger held across the focus change must not stay down on the
+            // host: neutral state, and every touch of both pads cancelled.
+            LiSendMultiControllerEvent((short)e.number, (short)r.mask, 0, 0, 0, 0, 0, 0, 0);
+            LiSendControllerTouchEvent2((uint8_t)e.number, LI_TOUCH_EVENT_CANCEL_ALL, 0, 0, 0.0f, 0.0f, 0.0f);
+            LiSendControllerTouchEvent2((uint8_t)e.number, LI_TOUCH_EVENT_CANCEL_ALL, 1, 0, 0.0f, 0.0f, 0.0f);
+        }
+        else if (e.haveState) {
+            // The controller may have moved while nothing was forwarded: resume from its last state.
+            LiSendMultiControllerEvent((short)e.number, (short)r.mask, e.buttonFlags, e.lt, e.rt, e.lsX, e.lsY, e.rsX, e.rsY);
+        }
+    }
+}
+
+bool SteamControllerHost::inputSuppressed()
+{
+    Registry& r = registry();
+    std::lock_guard<std::mutex> lock(r.mutex);
+    return r.suppressed;
+}
+
 // ----- listener (driver threads, link mutex held) -----
 
 void SteamControllerHost::linkConnected(SteamControllerLink& link, int generation)
@@ -215,9 +261,14 @@ void SteamControllerHost::linkState(SteamControllerLink& link, int generation, i
 {
     Registry& r = registry();
     std::lock_guard<std::mutex> lock(r.mutex);
-    int number = r.alive ? r.numberFor(link, generation) : -1;
-    if (number < 0) return;
-    LiSendMultiControllerEvent((short)number, (short)r.mask, buttonFlags, lt, rt, lsX, lsY, rsX, rsY);
+    Entry* e = r.alive ? r.find(link, generation) : nullptr;
+    if (e == nullptr) return;
+    // Remembered even while held back, so a focus regain resumes from the current state.
+    e->haveState = true;
+    e->buttonFlags = buttonFlags; e->lt = lt; e->rt = rt;
+    e->lsX = lsX; e->lsY = lsY; e->rsX = rsX; e->rsY = rsY;
+    if (r.suppressed) return;
+    LiSendMultiControllerEvent((short)e->number, (short)r.mask, buttonFlags, lt, rt, lsX, lsY, rsX, rsY);
 }
 
 void SteamControllerHost::linkTouch(SteamControllerLink& link, int generation, uint8_t touchpadIndex, uint8_t eventType,
@@ -226,7 +277,7 @@ void SteamControllerHost::linkTouch(SteamControllerLink& link, int generation, u
     Registry& r = registry();
     std::lock_guard<std::mutex> lock(r.mutex);
     int number = r.alive ? r.numberFor(link, generation) : -1;
-    if (number < 0) return;
+    if (number < 0 || r.suppressed) return;
     LiSendControllerTouchEvent2((uint8_t)number, eventType, touchpadIndex, pointerId, x, y, pressure);
 }
 
@@ -235,7 +286,7 @@ void SteamControllerHost::linkMotion(SteamControllerLink& link, int generation, 
     Registry& r = registry();
     std::lock_guard<std::mutex> lock(r.mutex);
     int number = r.alive ? r.numberFor(link, generation) : -1;
-    if (number < 0) return;
+    if (number < 0 || r.suppressed) return;
     LiSendControllerMotionEvent((uint8_t)number, motionType, x, y, z);
 }
 

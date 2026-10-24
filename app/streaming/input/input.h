@@ -237,6 +237,7 @@ private:
 #endif
     QStringList m_IgnoreDeviceGuids;
     StreamingPreferences::CaptureSysKeysMode m_CaptureSystemKeysMode;
+    bool m_BackgroundGamepad;
     int m_MouseCursorCapturedVisibilityState;
 
     struct {
