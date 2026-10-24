@@ -1978,7 +1978,7 @@ bool Session::startConnectionAsync()
     // The Steam Controller (2026) haptic and settings relays are registered here rather than in
     // k_ConnCallbacks, which keeps its V1 layout. They are delivered straight to the driver's
     // registry (not through the SDL event queue: haptics are latency sensitive and the driver
-    // has its own writer thread).
+    // has its own writer thread). The extended common-c is required (steamcontrollerprotocol.h).
     int err = LiStartConnectionWithSteamController(&hostInfo, &m_StreamConfig,
                                                    &k_ConnCallbacks,
                                                    &m_VideoCallbacks,
@@ -1989,12 +1989,8 @@ bool Session::startConnectionAsync()
 #else
                                                    nullptr,
 #endif
-#if STEAM_CONTROLLER_LI_EXTENSIONS
                                                    SteamControllerHost::clSteamHaptic,
                                                    SteamControllerHost::clSteamSettings);
-#else
-                                                   nullptr, nullptr);
-#endif
     if (err != 0) {
         // We already displayed an error dialog in the stage failure
         // listener.

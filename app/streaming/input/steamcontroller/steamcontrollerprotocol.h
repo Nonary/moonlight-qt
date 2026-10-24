@@ -2,21 +2,21 @@
 // Steam Controller (2026) wire constants shared by the decoder, the HID link and the host bridge.
 //
 // The protocol surface towards the host is the Steam extension of moonlight-common-c
-// (jlobue10/moonlight-common-c, branch mac-pyrowave-steam). The numeric contract is restated
-// here under #ifndef so the client builds against a common-c that predates it and still puts
-// the same values on the wire; the two parts that need code in common-c (the attributes packet
-// and the two listener callbacks) compile only when the extended header is present, which
-// STEAM_CONTROLLER_LI_EXTENSIONS reports.
+// (jlobue10/moonlight-common-c, branch mac-pyrowave-steam), which the submodule pins. The client
+// requires it: the session starts the connection through LiStartConnectionWithSteamController()
+// and the attributes packet and the two listener callbacks have no fallback. The numeric
+// contract is restated below so the decoder's wire values are visible here; the pinned header
+// defines the same values.
 #pragma once
 
 #include <Limelight.h>
 #include <cstdint>
 
-#ifdef LI_CCAP_STEAM_ATTRIBUTES
-#define STEAM_CONTROLLER_LI_EXTENSIONS 1
-#else
-#define STEAM_CONTROLLER_LI_EXTENSIONS 0
+#ifndef LI_CCAP_STEAM_ATTRIBUTES
+#error "moonlight-common-c without the Steam Controller extension: build against the pinned submodule (jlobue10/moonlight-common-c, branch mac-pyrowave-steam)"
 #endif
+// Always 1: the extension is required (above). Kept for the remaining guards.
+#define STEAM_CONTROLLER_LI_EXTENSIONS 1
 
 #ifndef LI_CTYPE_STEAM
 #define LI_CTYPE_STEAM 0x04

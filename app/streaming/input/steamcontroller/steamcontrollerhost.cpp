@@ -254,13 +254,8 @@ void SteamControllerHost::linkAttributes(SteamControllerLink& link, int generati
     std::lock_guard<std::mutex> lock(r.mutex);
     int number = r.alive ? r.numberFor(link, generation) : -1;
     if (number < 0) return;
-#if STEAM_CONTROLLER_LI_EXTENSIONS
     LI_STEAM_CONTROLLER_ATTRIBUTES li = attributes.toLi();
     int err = LiSendSteamControllerAttributesEvent((uint8_t)number, &li);
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Steam Controller %s: firmware attributes sent for player %d (valid mask 0x%02x, rc %d)",
                 link.name().c_str(), number, attributes.validMask, err);
-#else
-    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Steam Controller %s: firmware attributes read (valid mask 0x%02x) but this build's moonlight-common-c cannot send them",
-                link.name().c_str(), attributes.validMask);
-#endif
 }
