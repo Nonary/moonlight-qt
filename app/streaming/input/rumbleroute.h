@@ -25,13 +25,13 @@ inline std::vector<int> sdlSlots(const std::vector<Pad>& pads, int player)
     for (const Pad& pad : pads) {
         if (pad.player == player && pad.ps5) { preferPs5 = true; break; }
     }
-    std::vector<int> slots;
+    std::vector<int> matched;   // not 'slots': that is a Qt keyword macro in the app build
     for (const Pad& pad : pads) {
         if (pad.player != player) continue;
         if (preferPs5 && !pad.ps5) continue;
-        slots.push_back(pad.slot);
+        matched.push_back(pad.slot);
     }
-    return slots;
+    return matched;
 }
 
 // Whether anything took the request: a Steam link, an SDL pad, or both.

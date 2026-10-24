@@ -908,9 +908,9 @@ void SdlInputHandler::rumble(unsigned short controllerNumber, unsigned short low
                             SDL_GameControllerGetType(m_GamepadState[i].controller) == SDL_CONTROLLER_TYPE_PS5});
         }
     }
-    const std::vector<int> slots = RumbleRoute::sdlSlots(pads, controllerNumber);
-    const bool routed = RumbleRoute::routed(steamTook, slots);
-    for (const int i : slots) {
+    const std::vector<int> targets = RumbleRoute::sdlSlots(pads, controllerNumber);
+    const bool routed = RumbleRoute::routed(steamTook, targets);
+    for (const int i : targets) {
         GamepadState* state = &m_GamepadState[i];
         if (DualSenseHaptics::playing(controllerNumber)) continue;
         const int rc = SDL_GameControllerRumble(state->controller, lowFreqMotor, highFreqMotor, 30000);

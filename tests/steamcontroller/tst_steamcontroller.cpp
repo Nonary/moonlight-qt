@@ -885,8 +885,8 @@ static void testRumbleRoute()
     host.announce(0, link, link->generation());
 
     const bool steamTook = SteamControllerHost::rumble(0, 100, 200);
-    auto slots = RumbleRoute::sdlSlots(mixed, 0);
-    check(steamTook && link->queuedOutputs() == 1 && slots == std::vector<int>{1} && RumbleRoute::routed(steamTook, slots),
+    auto routeSlots = RumbleRoute::sdlSlots(mixed, 0);
+    check(steamTook && link->queuedOutputs() == 1 && routeSlots == std::vector<int>{1} && RumbleRoute::routed(steamTook, routeSlots),
           "a Steam link and an SDL pad sharing player 0 both take the host's rumble");
     check(RumbleRoute::sdlSlots(deckAndDualSense, 0) == std::vector<int>{1},
           "a PS5 pad on the player wins over the Deck's pad, as before");
