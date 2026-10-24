@@ -20,6 +20,14 @@ struct SteamControllerConfig {
     int hapticBoostDb = 0;           // added to the signed gain byte of Steam's 0x82 ticks/clicks (clamped to -24..+6 dB)
     int hapticPulseScalePercent = 100; // applied to the on-time (u16, bytes 2-3) of 0x81 pulses, capped at 0xFFFF
     int hapticMasterGainDb = 0;      // written as setting 76 in the link's own settings (0 = not written)
+
+    // Enumeration policy for a Bluetooth LE node that does not answer the feature report 1 probe.
+    // Linux lists one hidraw node per controller (uhid) with no vendor collection entry, and a
+    // GET_REPORT the Bluetooth stack does not carry leaves the probe unanswered: keeping the node
+    // accepts the controller anyway and lets its own settings write tell. Windows and macOS list
+    // one path per collection, where an unanswered probe is a keyboard or mouse collection and
+    // is never kept. The runner sets the platform default; tests exercise both.
+    bool keepUnansweredBleNodes = false;
 };
 
 // Receives what one controller decoded. Values are already in the Moonlight wire convention:

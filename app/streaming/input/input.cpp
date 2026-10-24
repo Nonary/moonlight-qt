@@ -248,6 +248,10 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
         config.hapticBoostDb = prefs.steamControllerHapticBoost;
         config.hapticPulseScalePercent = prefs.steamControllerHapticPulseScale;
         config.hapticMasterGainDb = prefs.steamControllerHapticMasterGain;
+#if defined(Q_OS_LINUX)
+        // One hidraw node per Bluetooth LE controller (uhid): keep it when its probe is unanswered.
+        config.keepUnansweredBleNodes = true;
+#endif
         m_SteamHost = new SteamControllerHost();
         SteamControllerHost::setActiveGamepadMask(m_GamepadMask);
         m_SteamController = new SteamControllerRunner(config, prefs.steamControllerRumbleHold, m_SteamHost);

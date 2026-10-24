@@ -1259,22 +1259,49 @@ static void testSamePathCollections()
     check(io.state("usb/mouse-only")->gets == 1 && manager.links().size() == 1, "a rejected path stays rejected while it is still enumerated");
     manager.stop(SteamControllerManager::RESCAN_MS);
 
-#if defined(__linux__)
-    // Linux only: a Bluetooth LE node with no vendor collection entry and an unanswered probe is
-    // still the controller (one hidraw per controller) and is kept, with a warning.
+    // The unanswered-probe policy is the manager's, not the build platform's, so both are run here.
+    // Linux policy (the runner's default there): a Bluetooth LE node with no vendor collection
+    // entry and an unanswered probe is still the controller (one hidraw per controller) and is
+    // kept, with a warning.
     FakeTransport io2;
     io2.add("ble/hidraw14", PRODUCT_BLE, -1, 0x0001);
     io2.probeFails = {"ble/hidraw14"};
     g_Log.clear();
     Events events2;
-    SteamControllerManager manager2(io2, SteamControllerConfig{}, 500, &events2);
+    SteamControllerConfig keepCfg;
+    keepCfg.keepUnansweredBleNodes = true;
+    SteamControllerManager manager2(io2, keepCfg, 500, &events2);
     run(manager2);
     check(manager2.links().size() == 1 && manager2.links()[0]->isBle()
           && has(logLine("opened ble/hidraw14"), "Bluetooth LE node, feature report 1 read unanswered) as Bluetooth LE slot 0")
           && !logLine("kept as the Bluetooth LE controller's only hidraw node").empty(),
-          "Linux keeps a Bluetooth LE node whose probe is unanswered, and says so");
+          "the keep policy keeps a Bluetooth LE node whose probe is unanswered, and says so");
     manager2.stop(0);
-#endif
+    // Windows/macOS policy (the default): the same node is a collection that did not answer and
+    // is rejected, with the log line, until it is re-enumerated. A USB node is never kept either way.
+    FakeTransport io3;
+    io3.add("ble/hidraw15", PRODUCT_BLE, -1, 0x0001);
+    io3.add("usb/if0", PRODUCT_WIRED, 0, 0x0001);
+    io3.probeFails = {"ble/hidraw15", "usb/if0"};
+    g_Log.clear();
+    Events events3;
+    SteamControllerManager manager3(io3, SteamControllerConfig{}, 500, &events3);
+    run(manager3);
+    check(manager3.links().empty()
+          && has(logLine("ble/hidraw15 (product 0x1303, interface -1, usage page 0x0001) did not answer"), "not the vendor collection, left alone until it is re-enumerated")
+          && logLine("kept as the Bluetooth LE controller's only hidraw node").empty(),
+          "the default policy rejects the same unanswered Bluetooth LE node");
+    manager3.stop(0);
+    FakeTransport io4;
+    io4.add("usb/if0", PRODUCT_WIRED, 0, 0x0001);
+    io4.probeFails = {"usb/if0"};
+    g_Log.clear();
+    Events events4;
+    SteamControllerManager manager4(io4, keepCfg, 500, &events4);
+    run(manager4);
+    check(manager4.links().empty() && !logLine("usb/if0 (product 0x1302, interface 0, usage page 0x0001) did not answer").empty(),
+          "the keep policy applies to Bluetooth LE nodes only; an unanswered USB collection is still rejected");
+    manager4.stop(0);
 }
 
 int main()

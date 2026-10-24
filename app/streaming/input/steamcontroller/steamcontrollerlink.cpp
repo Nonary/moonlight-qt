@@ -823,14 +823,14 @@ void SteamControllerManager::rescan(uint64_t nowMs)
                 memset(probe, 0, sizeof(probe));
                 probe[0] = FEATURE_REPORT_ID;
                 if (device->getFeatureReport(probe, sizeof(probe)) < 1) {
-                    bool keep = false;
-#if defined(__linux__)
-                    // One hidraw node per Bluetooth LE controller on Linux (uhid): with no vendor
-                    // collection entry to go by and the probe unanswered (a GET_REPORT the Bluetooth
-                    // stack did not carry), the node is still the controller. Keep it and let the
-                    // link's own settings write say whether feature reports work on this stack.
-                    keep = SteamControllerLink::transportOf(info.productId) == SteamControllerLink::TransportBle && info.interfaceNumber <= 0;
-#endif
+                    // Policy, not platform: one hidraw node per Bluetooth LE controller (Linux uhid)
+                    // with no vendor collection entry to go by and the probe unanswered (a GET_REPORT
+                    // the Bluetooth stack did not carry) is still the controller when the config says
+                    // so; the link's own settings write then says whether feature reports work on
+                    // this stack. Per-collection enumeration (Windows, macOS) leaves it off.
+                    const bool keep = m_Config.keepUnansweredBleNodes &&
+                                      SteamControllerLink::transportOf(info.productId) == SteamControllerLink::TransportBle &&
+                                      info.interfaceNumber <= 0;
                     if (!keep) {
                         logf(LogInfo, "Steam Controller: %s (product 0x%04x, interface %d, usage page 0x%04x) did not answer a feature report 1 read; not the vendor collection, left alone until it is re-enumerated",
                              info.path.c_str(), info.productId, info.interfaceNumber, info.usagePage);
