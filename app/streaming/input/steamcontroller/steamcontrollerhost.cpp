@@ -21,6 +21,8 @@ struct Entry {
     int buttonFlags = 0;
     uint8_t lt = 0, rt = 0;
     short lsX = 0, lsY = 0, rsX = 0, rsY = 0;
+    // A gyro sample reached the host under this announcement: it is zeroed on focus loss.
+    bool gyroSeen = false;
 };
 
 struct Registry {
@@ -229,10 +231,23 @@ void SteamControllerHost::notifyWindowFocus(bool focused, bool backgroundGamepad
             LiSendMultiControllerEvent((short)e.number, (short)r.mask, 0, 0, 0, 0, 0, 0, 0);
             LiSendControllerTouchEvent2((uint8_t)e.number, LI_TOUCH_EVENT_CANCEL_ALL, 0, 0, 0.0f, 0.0f, 0.0f);
             LiSendControllerTouchEvent2((uint8_t)e.number, LI_TOUCH_EVENT_CANCEL_ALL, 1, 0, 0.0f, 0.0f, 0.0f);
+            if (e.gyroSeen) {
+                // The host keeps the last gyro sample alive with fresh timestamps, so an always-on
+                // gyro mapping would keep turning: an unfocused controller is not rotating as far
+                // as the host is concerned (common-c's input stream sends zero gyro the same way).
+                LiSendControllerMotionEvent((uint8_t)e.number, LI_MOTION_TYPE_GYRO, 0.0f, 0.0f, 0.0f);
+            }
         }
-        else if (e.haveState) {
-            // The controller may have moved while nothing was forwarded: resume from its last state.
-            LiSendMultiControllerEvent((short)e.number, (short)r.mask, e.buttonFlags, e.lt, e.rt, e.lsX, e.lsY, e.rsX, e.rsY);
+        else {
+            if (e.haveState) {
+                // The controller may have moved while nothing was forwarded: resume from its last state.
+                LiSendMultiControllerEvent((short)e.number, (short)r.mask, e.buttonFlags, e.lt, e.rt, e.lsX, e.lsY, e.rsX, e.rsY);
+            }
+            // The host cancelled every contact and the decoder's dedup moved on while nothing was
+            // forwarded: the link's next report resends its state, a fresh DOWN for every finger
+            // on the pads (held across the change or begun while unfocused) and the current
+            // motion sample. Lock-free, so it is safe to request under the registry mutex.
+            e.link->requestInputReset();
         }
     }
 }
@@ -285,9 +300,11 @@ void SteamControllerHost::linkMotion(SteamControllerLink& link, int generation, 
 {
     Registry& r = registry();
     std::lock_guard<std::mutex> lock(r.mutex);
-    int number = r.alive ? r.numberFor(link, generation) : -1;
-    if (number < 0 || r.suppressed) return;
-    LiSendControllerMotionEvent((uint8_t)number, motionType, x, y, z);
+    Entry* e = r.alive ? r.find(link, generation) : nullptr;
+    if (e == nullptr) return;
+    if (motionType == LI_MOTION_TYPE_GYRO) e->gyroSeen = true;
+    if (r.suppressed) return;
+    LiSendControllerMotionEvent((uint8_t)e->number, motionType, x, y, z);
 }
 
 void SteamControllerHost::linkBattery(SteamControllerLink& link, int generation, uint8_t state, uint8_t percent)

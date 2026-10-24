@@ -23,6 +23,8 @@ struct HostState { short number, mask; int flags; uint8_t lt, rt; short lsX, lsY
 struct HostTouch { uint8_t number, event, pad; uint32_t pointer; };
 static std::vector<HostState> g_HostStates;
 static std::vector<HostTouch> g_HostTouches;
+struct HostMotion { uint8_t number, type; float x, y, z; };
+static std::vector<HostMotion> g_HostMotionLog;
 static int g_HostMotions;
 extern "C" {
 int LiSendControllerArrivalEvent(uint8_t, uint16_t, uint8_t, uint32_t, uint16_t) { return 0; }
@@ -36,7 +38,12 @@ int LiSendControllerTouchEvent2(uint8_t number, uint8_t event, uint8_t pad, uint
     g_HostTouches.push_back({number, event, pad, pointer});
     return 0;
 }
-int LiSendControllerMotionEvent(uint8_t, uint8_t, float, float, float) { g_HostMotions++; return 0; }
+int LiSendControllerMotionEvent(uint8_t number, uint8_t type, float x, float y, float z)
+{
+    g_HostMotions++;
+    g_HostMotionLog.push_back({number, type, x, y, z});
+    return 0;
+}
 int LiSendControllerBatteryEvent(uint8_t, uint8_t, uint8_t) { return 0; }
 #if STEAM_CONTROLLER_LI_EXTENSIONS
 int LiSendSteamControllerAttributesEvent(uint8_t, const LI_STEAM_CONTROLLER_ATTRIBUTES*) { return 0; }
@@ -986,6 +993,88 @@ static void testHostFocusPolicy()
     link->stop(g_Now);
 }
 
+// Focus transitions and the pads/IMU: a finger held across the change (or set down while
+// unfocused) gets a fresh DOWN on regain rather than a MOVE the host would reject after
+// CANCEL_ALL; the gyro is zeroed on loss and the current sample is resent on regain even when
+// unchanged. Both pad modes.
+static void testHostFocusTouchAndMotion()
+{
+    for (bool split : {true, false}) {
+        SteamControllerConfig cfg;
+        cfg.splitPads = split;
+        const uint8_t rightPad = split ? 0 : 1;        // the right pad's touchpad index
+        const uint32_t rightPointer = split ? 1 : 0;   // and its pointer id
+        auto downsOn = [&](uint8_t pad, uint32_t pointer) {
+            int n = 0;
+            for (const HostTouch& t : g_HostTouches) if (t.event == LI_TOUCH_EVENT_DOWN && t.pad == pad && t.pointer == pointer) n++;
+            return n;
+        };
+        auto moves = [&]() { int n = 0; for (const HostTouch& t : g_HostTouches) if (t.event == LI_TOUCH_EVENT_MOVE) n++; return n; };
+        auto gyros = [&](bool zero) {
+            int n = 0;
+            for (const HostMotion& m : g_HostMotionLog)
+                if (m.type == LI_MOTION_TYPE_GYRO && m.number == 0 && ((m.x == 0 && m.y == 0 && m.z == 0) == zero)) n++;
+            return n;
+        };
+
+        SteamControllerHost host;
+        SteamControllerHost::setActiveGamepadMask(1);
+        auto device = std::make_shared<FakeState>();
+        SteamHidDeviceInfo info;
+        info.productId = PRODUCT_PUCK;
+        info.interfaceNumber = 2;
+        auto link = std::make_shared<SteamControllerLink>(1004 + (split ? 0 : 1), info,
+            std::unique_ptr<SteamHidDevice>(new FakeDevice(device)), cfg, 500, &host);
+        std::vector<uint8_t> held = imu(0x45);                 // both pads touched, nonzero IMU
+        std::vector<uint8_t> lifted = imu(0x45);
+        lifted[4] &= (uint8_t)~0x20; lifted[5] &= (uint8_t)~0x02;   // BTN_RPAD_TOUCH (21), BTN_LPAD_TOUCH (25) cleared
+        input(*link, held);
+        host.announce(0, link, link->generation());
+        SteamControllerHost::setMotionEventState(0, LI_MOTION_TYPE_GYRO, 100);
+        g_Now += 20;
+        g_HostTouches.clear(); g_HostMotionLog.clear();
+        input(*link, held);
+        check(downsOn(0, 0) == 1 && downsOn(rightPad, rightPointer) == 1 && gyros(false) == 1,
+              split ? "split pads: the report after the announcement puts both fingers down and reports the gyro"
+                    : "dual pads: the report after the announcement puts both fingers down and reports the gyro");
+
+        // Finger held across the focus change, gyro nonzero at the time of loss.
+        g_HostTouches.clear(); g_HostMotionLog.clear(); g_HostStates.clear();
+        SteamControllerHost::notifyWindowFocus(false, false);
+        check(gyros(true) == 1 && gyros(false) == 0 && g_HostTouches.size() == 2 && g_HostTouches[0].event == LI_TOUCH_EVENT_CANCEL_ALL,
+              "focus loss zeroes the gyro of a slot that reported motion, after cancelling its touches");
+        g_Now += 20;
+        input(*link, held);
+        check(g_HostTouches.size() == 2 && g_HostMotionLog.size() == 1, "a held finger and the gyro are held back while unfocused");
+        g_HostTouches.clear(); g_HostMotionLog.clear(); g_HostStates.clear();
+        SteamControllerHost::notifyWindowFocus(true, false);
+        g_Now += 20;
+        input(*link, held);   // unchanged finger positions, unchanged gyro sample
+        check(downsOn(0, 0) == 1 && downsOn(rightPad, rightPointer) == 1 && moves() == 0,
+              "focus regained re-establishes a finger held across the change with a fresh DOWN, not a MOVE");
+        check(gyros(false) == 1 && gyros(true) == 0, "focus regained resends the current gyro sample even though it is unchanged");
+        check(g_HostStates.size() == 2 && g_HostStates[0].flags != 0 && g_HostStates[1].flags != 0,
+              "the held state is replayed at once and resent by the next report");
+
+        // Contact begun while unfocused.
+        g_Now += 20;
+        input(*link, lifted);
+        g_HostTouches.clear(); g_HostMotionLog.clear();
+        SteamControllerHost::notifyWindowFocus(false, false);
+        g_Now += 20;
+        input(*link, held);   // the finger comes down while unfocused
+        check(g_HostTouches.size() == 2 && downsOn(0, 0) == 0, "a contact begun while unfocused is not forwarded");
+        g_HostTouches.clear();
+        SteamControllerHost::notifyWindowFocus(true, false);
+        g_Now += 20;
+        input(*link, held);
+        check(downsOn(0, 0) == 1 && downsOn(rightPad, rightPointer) == 1 && moves() == 0,
+              "a contact begun while unfocused gets its DOWN when focus returns");
+        host.shutdown();
+        link->stop(g_Now);
+    }
+}
+
 // The Bluetooth LE transport (PID 0x1303, HID-over-GATT): same protocol as USB plus the host
 // settings relay. Byte sequences are the Android BLE driver's (SteamControllerBle.java).
 static void testBle()
@@ -1442,6 +1531,7 @@ int main()
         testHostFeedbackGeneration();
         testRumbleRoute();
         testHostFocusPolicy();
+        testHostFocusTouchAndMotion();
         testBle();
         testBleHapticKnobs();
         testReconnectOutputSchedule();
