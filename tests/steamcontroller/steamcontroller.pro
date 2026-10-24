@@ -11,7 +11,8 @@ SOURCES += tst_steamcontroller.cpp \
     ../../app/streaming/input/steamcontroller/steamcontrollercore.cpp \
     ../../app/streaming/input/steamcontroller/steamcontrollerlink.cpp \
     ../../app/streaming/input/steamcontroller/steamcontrollerhost.cpp
-HEADERS += ../../app/streaming/input/steamcontroller/steamcontrollerprotocol.h \
+HEADERS += ../../app/streaming/input/rumbleroute.h \
+    ../../app/streaming/input/steamcontroller/steamcontrollerprotocol.h \
     ../../app/streaming/input/steamcontroller/steamcontrollerattributes.h \
     ../../app/streaming/input/steamcontroller/steamcontrollercore.h \
     ../../app/streaming/input/steamcontroller/steamcontrollerlink.h \

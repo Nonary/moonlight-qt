@@ -7,7 +7,10 @@
 #include "settings/mappingmanager.h"
 #include "streaming/input/dualsensehaptics.h"
 #include "streaming/input/gamepadstickmerge.h"
+#include "streaming/input/rumbleroute.h"
 #include "streaming/input/steamcontroller/steamcontrollerhost.h"
+
+#include <vector>
 
 #include <QtMath>
 
@@ -885,39 +888,30 @@ void SdlInputHandler::rumble(unsigned short controllerNumber, unsigned short low
         return;
     }
 
+    bool steamTook = false;
 #if HAVE_STEAM_CONTROLLER_DRIVER
     // A Steam Controller (2026) slot takes plain rumble as a synthesized 0x80 report on its own
-    // writer, instead of SDL (which never opened it).
-    if (SteamControllerHost::rumble(controllerNumber, lowFreqMotor, highFreqMotor)) {
-        return;
-    }
+    // writer, instead of SDL (which never opened it). That does not end the request: an SDL pad
+    // can share its player number (single-controller mode), and it rumbles below as well.
+    steamTook = SteamControllerHost::rumble(controllerNumber, lowFreqMotor, highFreqMotor);
 #endif
 
 #if SDL_VERSION_ATLEAST(2, 0, 9)
     // Host controllerNumber is the player index, not the SDL slot. In
     // single-controller mode the Deck occupies slot 0 and DualSense slot 1
     // while both report player 0, so indexing by slot would rumble the Deck.
-    bool preferPs5 = false;
+    // RumbleRoute::sdlSlots holds that decision (PS5 pads win) so it is testable.
+    std::vector<RumbleRoute::Pad> pads;
     for (int i = 0; i < MAX_GAMEPADS; i++) {
-        if (m_GamepadState[i].controller != nullptr &&
-            m_GamepadState[i].index == (short)controllerNumber &&
-            SDL_GameControllerGetType(m_GamepadState[i].controller) == SDL_CONTROLLER_TYPE_PS5) {
-            preferPs5 = true;
-            break;
+        if (m_GamepadState[i].controller != nullptr) {
+            pads.push_back({i, m_GamepadState[i].index,
+                            SDL_GameControllerGetType(m_GamepadState[i].controller) == SDL_CONTROLLER_TYPE_PS5});
         }
     }
-
-    bool routed = false;
-    for (int i = 0; i < MAX_GAMEPADS; i++) {
+    const std::vector<int> slots = RumbleRoute::sdlSlots(pads, controllerNumber);
+    const bool routed = RumbleRoute::routed(steamTook, slots);
+    for (const int i : slots) {
         GamepadState* state = &m_GamepadState[i];
-        if (state->controller == nullptr || state->index != (short)controllerNumber) {
-            continue;
-        }
-        if (preferPs5 && SDL_GameControllerGetType(state->controller) != SDL_CONTROLLER_TYPE_PS5) {
-            continue;
-        }
-
-        routed = true;
         if (DualSenseHaptics::playing(controllerNumber)) continue;
         const int rc = SDL_GameControllerRumble(state->controller, lowFreqMotor, highFreqMotor, 30000);
 
@@ -943,6 +937,10 @@ void SdlInputHandler::rumble(unsigned short controllerNumber, unsigned short low
                     controllerNumber);
     }
 #else
+    // The legacy haptics path has no player fan-out; a Steam slot that took the request is done.
+    if (steamTook) {
+        return;
+    }
     // Check if the controller supports haptics (and if the controller exists at all)
     SDL_Haptic* haptic = m_GamepadState[controllerNumber].haptic;
     if (haptic == nullptr) {

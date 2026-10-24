@@ -236,6 +236,7 @@ HEADERS += \
     streaming/input/steamcontroller/steamcontrollerattributes.h \
     streaming/input/steamcontroller/steamcontrollercore.h \
     streaming/input/steamcontroller/steamcontrollerlink.h \
+    streaming/input/rumbleroute.h \
     streaming/input/steamcontroller/steamcontrollerhost.h \
     streaming/input/steamcontroller/steamcontrollersdl.h \
     streaming/input/gamepadstickmerge.h \

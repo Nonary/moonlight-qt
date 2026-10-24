@@ -3,6 +3,7 @@
 // fake transport and a virtual clock. No SDL, no device: the byte sequences are the Android
 // client's regression harness (tools/regression/test_steam_usb.py), the real unit's replies and
 // the Android BLE driver's settings relay and haptic knobs (SteamControllerBle.java).
+#include "../../app/streaming/input/rumbleroute.h"
 #include "../../app/streaming/input/steamcontroller/steamcontrollerlink.h"
 #include "../../app/streaming/input/steamcontroller/steamcontrollerhost.h"
 
@@ -849,6 +850,41 @@ static void testHostFeedbackGeneration()
     link->stop(g_Now);
 }
 
+// Host rumble reaches every local device that reports the player, with a Steam link and an SDL
+// pad sharing player 0 (single-controller mode) both taking it; the PS5 preference is unchanged.
+static void testRumbleRoute()
+{
+    using RumbleRoute::Pad;
+    const std::vector<Pad> mixed = {{1, 0, false}};                 // slot 1: an SDL pad on player 0
+    const std::vector<Pad> deckAndDualSense = {{0, 0, false}, {1, 0, true}};
+    const std::vector<Pad> twoPlain = {{0, 0, false}, {2, 0, false}, {3, 1, false}};
+
+    SteamControllerHost host;
+    SteamControllerHost::setActiveGamepadMask(3);
+    auto device = std::make_shared<FakeState>();
+    SteamHidDeviceInfo info;
+    info.productId = PRODUCT_PUCK;
+    info.interfaceNumber = 2;
+    auto link = std::make_shared<SteamControllerLink>(1002, info,
+        std::unique_ptr<SteamHidDevice>(new FakeDevice(device)), SteamControllerConfig{}, 500, &host);
+    input(*link, state(0x45));
+    host.announce(0, link, link->generation());
+
+    const bool steamTook = SteamControllerHost::rumble(0, 100, 200);
+    auto slots = RumbleRoute::sdlSlots(mixed, 0);
+    check(steamTook && link->queuedOutputs() == 1 && slots == std::vector<int>{1} && RumbleRoute::routed(steamTook, slots),
+          "a Steam link and an SDL pad sharing player 0 both take the host's rumble");
+    check(RumbleRoute::sdlSlots(deckAndDualSense, 0) == std::vector<int>{1},
+          "a PS5 pad on the player wins over the Deck's pad, as before");
+    check(RumbleRoute::sdlSlots(twoPlain, 0) == (std::vector<int>{0, 2}) && RumbleRoute::sdlSlots(twoPlain, 1) == std::vector<int>{3},
+          "without a PS5 pad every SDL pad mapped to the player rumbles, and other players' pads do not");
+    check(RumbleRoute::sdlSlots(mixed, 1).empty() && !RumbleRoute::routed(false, RumbleRoute::sdlSlots(mixed, 1))
+          && RumbleRoute::routed(SteamControllerHost::rumble(0, 0, 0), RumbleRoute::sdlSlots(mixed, 1)),
+          "a player nobody reports is unrouted unless a Steam link took it");
+    host.shutdown();
+    link->stop(g_Now);
+}
+
 // A 64-byte feature report 1 frame from its leading bytes.
 static std::vector<uint8_t> frame64(const char* leading)
 {
@@ -1316,6 +1352,7 @@ int main()
         testMotionRateBounds();
         testOpenRetry();
         testHostFeedbackGeneration();
+        testRumbleRoute();
         testBle();
         testBleHapticKnobs();
         testReconnectOutputSchedule();
