@@ -212,7 +212,9 @@ jobs:
 
       - name: Test Steam Controller (2026) driver (Windows x64)
         timeout-minutes: 2
-        if: runner.os == 'Windows'
+        # Runs whenever its binary was built, so an earlier test step's failure (the VRR trace
+        # contracts, for example) does not leave this suite unrun and the job's result silent on it.
+        if: always() && runner.os == 'Windows' && hashFiles('build/tests-vrr/steamcontroller/release/tst_steamcontroller.exe') != ''
         shell: pwsh
         run: |
           $deploy = (Resolve-Path build/deploy-x64-release).Path

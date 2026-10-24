@@ -23,6 +23,28 @@ jobs:
           CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
         run: python3 tests/input/test_gamepad_motion_rate.py
 
+  # The Steam Controller (2026) driver suite natively on Linux under ASan/UBSan: the manager's
+  # enumeration policies are exercised for both platforms' HID layouts, and the suite does not
+  # depend on the Windows job, where an earlier test step can fail first.
+  test-steam-controller:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Test the Steam Controller (2026) driver (Linux, ASan/UBSan)
+        run: |
+          g++ -std=c++17 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -DMOONLIGHT_STEAMCONTROLLER_TEST \
+            -Itests/steamcontroller/support -Iapp -Imoonlight-common-c/moonlight-common-c/src \
+            tests/steamcontroller/tst_steamcontroller.cpp \
+            app/streaming/input/steamcontroller/steamcontrollerattributes.cpp \
+            app/streaming/input/steamcontroller/steamcontrollercore.cpp \
+            app/streaming/input/steamcontroller/steamcontrollerlink.cpp \
+            app/streaming/input/steamcontroller/steamcontrollerhost.cpp \
+            -pthread -o build-tst_steamcontroller
+          ./build-tst_steamcontroller
+
   setup:
     runs-on: ubuntu-latest
     outputs:
