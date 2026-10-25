@@ -115,6 +115,9 @@ void SdlInputHandler::performSpecialKeyCombo(KeyCombo combo)
         if (!SDL_GetRelativeMouseMode()) {
             m_MouseCursorCapturedVisibilityState = !m_MouseCursorCapturedVisibilityState;
             SDL_ShowCursor(m_MouseCursorCapturedVisibilityState);
+
+            // While we draw the host's cursor locally, that cursor stays shown
+            updateLocalCursor();
         }
         else {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,

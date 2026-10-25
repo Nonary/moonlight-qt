@@ -243,6 +243,11 @@ private:
 
     bool isAutomaticMouseModeActive();
 
+    void publishMouseModeStatus();
+
+    static
+    void clearMouseModeStatus();
+
     void evaluateCursorMode();
 
     void applyCursorMode(CursorModePolicy::Mode mode, CursorModePolicy::Mode previous);

@@ -31,7 +31,6 @@ enum MouseModeStatusBits {
 };
 
 enum MouseModeFallbackReason {
-    MMFR_SETTING_OFF,
     MMFR_HOST_UNSUPPORTED,
     MMFR_WAITING_FOR_HOST,
     MMFR_HOST_UNAVAILABLE,
@@ -78,8 +77,6 @@ QString SdlInputHandler::getMouseModeStatus()
     }
 
     switch ((status >> MMS_REASON_SHIFT) & 0x3) {
-    case MMFR_SETTING_OFF:
-        return text + " (automatic mode is off)";
     case MMFR_HOST_UNSUPPORTED:
         return text + " (fallback: host does not support automatic mode)";
     case MMFR_WAITING_FOR_HOST:
@@ -353,14 +350,27 @@ void SdlInputHandler::evaluateCursorMode()
         m_CursorModeTimer = 0;
     }
 
-    int status = (m_AbsoluteMouseMode ? MMS_ABSOLUTE : 0) |
+    publishMouseModeStatus();
+}
+
+void SdlInputHandler::clearMouseModeStatus()
+{
+    s_MouseModeStatus.store(-1, std::memory_order_relaxed);
+}
+
+void SdlInputHandler::publishMouseModeStatus()
+{
+    // With the setting off the overlay is unchanged.
+    int status = -1;
+    if (m_AutomaticMouseMode) {
+        status = (m_AbsoluteMouseMode ? MMS_ABSOLUTE : 0) |
                  (isHostCursorDrawnLocally() ? MMS_LOCAL_CURSOR : 0) |
                  ((int)m_CursorDecision.source << MMS_SOURCE_SHIFT);
-    if (m_CursorDecision.source == Source::Fallback) {
-        int reason = !m_AutomaticMouseMode ? MMFR_SETTING_OFF :
-                     !m_HostCursorSupported ? MMFR_HOST_UNSUPPORTED :
-                     !m_HostCursorReady ? MMFR_WAITING_FOR_HOST : MMFR_HOST_UNAVAILABLE;
-        status |= reason << MMS_REASON_SHIFT;
+        if (m_CursorDecision.source == Source::Fallback) {
+            int reason = !m_HostCursorSupported ? MMFR_HOST_UNSUPPORTED :
+                         !m_HostCursorReady ? MMFR_WAITING_FOR_HOST : MMFR_HOST_UNAVAILABLE;
+            status |= reason << MMS_REASON_SHIFT;
+        }
     }
     s_MouseModeStatus.store(status, std::memory_order_relaxed);
 }
