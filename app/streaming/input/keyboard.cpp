@@ -70,14 +70,42 @@ void SdlInputHandler::performSpecialKeyCombo(KeyCombo combo)
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Detected mouse mode toggle combo");
 
+        if (isAutomaticMouseModeActive()) {
+            // In automatic mode, switch to the other mode and keep it until unlocked
+            m_CursorPolicy.lock(m_CursorDecision.mode == CursorModePolicy::Mode::Absolute ?
+                                    CursorModePolicy::Mode::Relative : CursorModePolicy::Mode::Absolute);
+            evaluateCursorMode();
+            break;
+        }
+
         // Uncapture input
         setCaptureActive(false);
 
         // Toggle mouse mode
         m_AbsoluteMouseMode = !m_AbsoluteMouseMode;
+        m_FallbackAbsoluteMouseMode = m_AbsoluteMouseMode;
 
         // Recapture input
         setCaptureActive(true);
+        evaluateCursorMode();
+        break;
+
+    case KeyComboToggleMouseModeLock:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Detected mouse mode lock combo");
+
+        if (m_CursorPolicy.isLocked()) {
+            m_CursorPolicy.unlock();
+        }
+        else if (isAutomaticMouseModeActive()) {
+            m_CursorPolicy.lock(m_CursorDecision.mode);
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Automatic mouse mode is not active for this session");
+            break;
+        }
+        evaluateCursorMode();
         break;
 
     case KeyComboToggleCursorHide:

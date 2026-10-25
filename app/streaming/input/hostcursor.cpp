@@ -5,9 +5,16 @@
 #include "SDL_compat.h"
 #include "streaming/streamutils.h"
 
-// Client-side cursor (Vibeshine extension). The host reports its cursor's shape,
-// visibility, clip and host-originated moves; in absolute mouse mode we draw it as
-// the local OS cursor and the host leaves it out of the video.
+#include <atomic>
+
+// Client-side cursor and automatic mouse mode (Vibeshine extension). The host reports
+// its cursor's shape, visibility, clip and host-originated moves. While the host cursor
+// is visible and free we use absolute input and draw it as the local OS cursor (the
+// host leaves it out of the video); while a game hides or locks it we use relative
+// input. See CursorModePolicy for the switching rules.
+
+using CursorModePolicy::Mode;
+using CursorModePolicy::Source;
 
 // Shapes kept per session. Each unique shape is sent once per subscription.
 #define HOST_CURSOR_MAX_SHAPES 64
@@ -15,20 +22,87 @@
 // How often we may ask the host again for a shape a state names but we lack.
 #define HOST_CURSOR_RESEND_INTERVAL_MS 1000
 
+// Packed mouse mode for the stats overlay, which runs on the decoder thread.
+enum MouseModeStatusBits {
+    MMS_ABSOLUTE = 0x01,
+    MMS_LOCAL_CURSOR = 0x02,
+    MMS_SOURCE_SHIFT = 2,       // CursorModePolicy::Source
+    MMS_REASON_SHIFT = 4,       // MouseModeFallbackReason when the source is Fallback
+};
+
+enum MouseModeFallbackReason {
+    MMFR_SETTING_OFF,
+    MMFR_HOST_UNSUPPORTED,
+    MMFR_WAITING_FOR_HOST,
+    MMFR_HOST_UNAVAILABLE,
+};
+
+static std::atomic<int> s_MouseModeStatus { -1 };
+
 static HostCursorMath::Rect toMathRect(const SDL_Rect& rect)
 {
     return { rect.x, rect.y, rect.w, rect.h };
 }
 
-void SdlInputHandler::startHostCursor()
+static const char* modeName(Mode mode)
 {
-    if (!(LiGetHostFeatureFlags() & LI_FF_HOST_CURSOR)) {
-        return;
+    switch (mode) {
+    case Mode::Absolute:
+        return "absolute";
+    case Mode::Relative:
+        return "relative";
+    default:
+        return "fallback";
+    }
+}
+
+QString SdlInputHandler::getMouseModeStatus()
+{
+    int status = s_MouseModeStatus.load(std::memory_order_relaxed);
+    if (status < 0) {
+        return QString();
     }
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Host supports the client-side cursor; subscribing");
-    m_HostCursorSupported = true;
-    updateHostCursorControl();
+    QString text = QString("Mouse mode: %1").arg((status & MMS_ABSOLUTE) ? "absolute" : "relative");
+    if (status & MMS_LOCAL_CURSOR) {
+        text += ", local cursor";
+    }
+
+    switch ((Source)((status >> MMS_SOURCE_SHIFT) & 0x3)) {
+    case Source::Automatic:
+        return text + " (automatic)";
+    case Source::Locked:
+        return text + " (locked)";
+    default:
+        break;
+    }
+
+    switch ((status >> MMS_REASON_SHIFT) & 0x3) {
+    case MMFR_SETTING_OFF:
+        return text + " (automatic mode is off)";
+    case MMFR_HOST_UNSUPPORTED:
+        return text + " (fallback: host does not support automatic mode)";
+    case MMFR_WAITING_FOR_HOST:
+        return text + " (fallback: waiting for the host cursor)";
+    default:
+        return text + " (fallback: host cursor unavailable)";
+    }
+}
+
+void SdlInputHandler::startHostCursor()
+{
+    // With automatic mode off, or a host without the extension, nothing here is
+    // ever enabled and the mouse behaves exactly as before.
+    if (m_AutomaticMouseMode && (LiGetHostFeatureFlags() & LI_FF_HOST_CURSOR)) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Host supports automatic mouse mode; subscribing to the host cursor");
+        m_HostCursorSupported = true;
+        updateHostCursorControl();
+    }
+    else if (m_AutomaticMouseMode) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Host does not support automatic mouse mode; using the regular mouse mode");
+    }
+
+    evaluateCursorMode();
 }
 
 SDL_Rect SdlInputHandler::getVideoRegion()
@@ -46,11 +120,15 @@ SDL_Rect SdlInputHandler::getVideoRegion()
     return dst;
 }
 
+bool SdlInputHandler::isAutomaticMouseModeActive()
+{
+    return m_CursorDecision.mode != Mode::Fallback;
+}
+
 bool SdlInputHandler::isHostCursorDrawingWanted()
 {
-    // We draw the cursor whenever we are the one positioning it with absolute input.
-    return m_HostCursorSupported && m_HostCursorReady && m_AbsoluteMouseMode && isCaptureActive() &&
-           !(m_HostCursorState.flags & LI_HOST_CURSOR_FALLBACK);
+    // We draw the cursor whenever automatic mode has us positioning it with absolute input.
+    return m_HostCursorSupported && m_CursorDecision.mode == Mode::Absolute && m_AbsoluteMouseMode && isCaptureActive();
 }
 
 bool SdlInputHandler::isHostCursorDrawnLocally()
@@ -104,10 +182,10 @@ void SdlInputHandler::updateLocalCursor(int mouseInVideoRegion)
     }
 }
 
-void SdlInputHandler::warpToHostCursor()
+void SdlInputHandler::warpToHostCursor(bool modeSwitch)
 {
-    // Only move the user's cursor when it is ours to move: the window is focused
-    // and the cursor is over the video.
+    // Only move the user's cursor when it is ours to move: the window is focused and,
+    // outside a switch back from relative mode, the cursor is over the video.
     if (!m_HostCursorHasPosition || !(SDL_GetWindowFlags(m_Window) & SDL_WINDOW_INPUT_FOCUS) ||
             SDL_GetMouseFocus() != m_Window) {
         return;
@@ -122,7 +200,7 @@ void SdlInputHandler::warpToHostCursor()
 
     int mouseX, mouseY;
     SDL_GetMouseState(&mouseX, &mouseY);
-    if (!isMouseInVideoRegion(mouseX, mouseY)) {
+    if (!modeSwitch && !isMouseInVideoRegion(mouseX, mouseY)) {
         return;
     }
 
@@ -134,6 +212,28 @@ void SdlInputHandler::warpToHostCursor()
     }
 
     SDL_WarpMouseInWindow(m_Window, target.x, target.y);
+}
+
+bool SdlInputHandler::getHostCursorClipRect(SDL_Rect* rect)
+{
+    const LI_HOST_CURSOR_STATE& state = m_HostCursorState;
+    if (!isHostCursorDrawingWanted() || !(state.flags & LI_HOST_CURSOR_HAS_CLIP)) {
+        return false;
+    }
+
+    HostCursorMath::Rect clip = HostCursorMath::streamRectToWindow(toMathRect(getVideoRegion()),
+                                                                   state.referenceWidth, state.referenceHeight,
+                                                                   state.clipLeft, state.clipTop,
+                                                                   state.clipRight, state.clipBottom);
+    if (clip.w <= 0 || clip.h <= 0) {
+        return false;
+    }
+
+    rect->x = clip.x;
+    rect->y = clip.y;
+    rect->w = clip.w;
+    rect->h = clip.h;
+    return true;
 }
 
 SDL_Cursor* SdlInputHandler::getHostSdlCursor()
@@ -207,6 +307,104 @@ void SdlInputHandler::freeHostSdlCursors()
     }
 }
 
+Uint32 SdlInputHandler::cursorModeTimerCallback(Uint32, void*)
+{
+    // Runs on SDL's timer thread: only hand the work to the main thread.
+    SDL_Event event = {};
+    event.type = SDL_USEREVENT;
+    event.user.code = SDL_CODE_HOST_CURSOR_TICK;
+    SDL_PushEvent(&event);
+    return 0;
+}
+
+void SdlInputHandler::handleHostCursorTick()
+{
+    m_CursorModeTimer = 0;
+    evaluateCursorMode();
+}
+
+void SdlInputHandler::evaluateCursorMode()
+{
+    const Uint32 now = SDL_GetTicks();
+    const Mode previous = m_CursorDecision.mode;
+    m_CursorDecision = m_CursorPolicy.update(now);
+
+    if (m_CursorDecision.mode != previous) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Mouse mode: %s -> %s (%s)",
+                    modeName(previous), modeName(m_CursorDecision.mode),
+                    m_CursorDecision.source == Source::Locked ? "locked" : "automatic");
+        applyCursorMode(m_CursorDecision.mode, previous);
+    }
+
+    // One timer for the earliest pending switch.
+    if (m_CursorDecision.nextUpdateMs != 0) {
+        if (m_CursorModeTimer == 0 || m_CursorModeTimerDue != m_CursorDecision.nextUpdateMs) {
+            if (m_CursorModeTimer != 0) {
+                SDL_RemoveTimer(m_CursorModeTimer);
+            }
+            Uint32 delay = (Uint32)qMax<int32_t>(1, (int32_t)(m_CursorDecision.nextUpdateMs - now));
+            m_CursorModeTimer = SDL_AddTimer(delay, cursorModeTimerCallback, nullptr);
+            m_CursorModeTimerDue = m_CursorDecision.nextUpdateMs;
+        }
+    }
+    else if (m_CursorModeTimer != 0) {
+        SDL_RemoveTimer(m_CursorModeTimer);
+        m_CursorModeTimer = 0;
+    }
+
+    int status = (m_AbsoluteMouseMode ? MMS_ABSOLUTE : 0) |
+                 (isHostCursorDrawnLocally() ? MMS_LOCAL_CURSOR : 0) |
+                 ((int)m_CursorDecision.source << MMS_SOURCE_SHIFT);
+    if (m_CursorDecision.source == Source::Fallback) {
+        int reason = !m_AutomaticMouseMode ? MMFR_SETTING_OFF :
+                     !m_HostCursorSupported ? MMFR_HOST_UNSUPPORTED :
+                     !m_HostCursorReady ? MMFR_WAITING_FOR_HOST : MMFR_HOST_UNAVAILABLE;
+        status |= reason << MMS_REASON_SHIFT;
+    }
+    s_MouseModeStatus.store(status, std::memory_order_relaxed);
+}
+
+void SdlInputHandler::applyCursorMode(Mode mode, Mode previous)
+{
+    const bool absolute = mode == Mode::Absolute ? true :
+                          mode == Mode::Relative ? false : m_FallbackAbsoluteMouseMode;
+    const bool focused = (SDL_GetWindowFlags(m_Window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+
+    if (absolute != m_AbsoluteMouseMode) {
+        const bool captured = isCaptureActive();
+        if (captured) {
+            setCaptureActive(false);
+        }
+
+        m_AbsoluteMouseMode = absolute;
+
+        // Back to absolute: put the local cursor where the host cursor is before
+        // capture resumes, so absolute input picks up from there.
+        if (mode == Mode::Absolute && captured && focused) {
+            warpToHostCursor(true);
+        }
+
+        // Unfocused, relative input waits for a click (as game mode always has);
+        // absolute input needs no grab.
+        if (captured && (focused || absolute)) {
+            setCaptureActive(true);
+        }
+    }
+
+    // The host's first state puts a focused window straight into absolute mode,
+    // without the click relative mode needs to capture.
+    if (!m_AutomaticCaptureDone && previous == Mode::Fallback && mode == Mode::Absolute) {
+        m_AutomaticCaptureDone = true;
+        if (focused && !isCaptureActive()) {
+            setCaptureActive(true);
+        }
+    }
+
+    updateHostCursorControl();
+    updatePointerRegionLock();
+}
+
 void SdlInputHandler::handleHostCursorShape(const LI_HOST_CURSOR_SHAPE* shape)
 {
     if (!m_HostCursorSupported) {
@@ -253,6 +451,9 @@ void SdlInputHandler::handleHostCursorState(const LI_HOST_CURSOR_STATE* state)
         return;
     }
 
+    const bool clipChanged = (state->flags & LI_HOST_CURSOR_HAS_CLIP) != (m_HostCursorState.flags & LI_HOST_CURSOR_HAS_CLIP) ||
+                             state->clipLeft != m_HostCursorState.clipLeft || state->clipTop != m_HostCursorState.clipTop ||
+                             state->clipRight != m_HostCursorState.clipRight || state->clipBottom != m_HostCursorState.clipBottom;
     m_HostCursorState = *state;
     if (state->flags & LI_HOST_CURSOR_HAS_POSITION) {
         m_HostCursorHasPosition = true;
@@ -260,9 +461,19 @@ void SdlInputHandler::handleHostCursorState(const LI_HOST_CURSOR_STATE* state)
         m_HostCursorY = state->y;
     }
 
+    const Uint32 now = SDL_GetTicks();
+    const bool visible = state->flags & LI_HOST_CURSOR_VISIBLE;
+    m_CursorPolicy.setHostState(now, !(state->flags & LI_HOST_CURSOR_FALLBACK), visible,
+                                state->flags & LI_HOST_CURSOR_HAS_CLIP,
+                                state->clipRight - state->clipLeft, state->clipBottom - state->clipTop,
+                                state->referenceWidth, state->referenceHeight);
+    if (visible && (state->flags & LI_HOST_CURSOR_HAS_POSITION) && !(state->flags & LI_HOST_CURSOR_RESYNC)) {
+        m_CursorPolicy.noteHostPosition(now, state->x, state->y);
+    }
+    evaluateCursorMode();
+
     // A state may name a shape we never received (or evicted); ask for it again.
     if (state->shapeId != 0 && !m_HostCursorShapes.contains(state->shapeId)) {
-        Uint32 now = SDL_GetTicks();
         if (state->shapeId != m_HostCursorResendId ||
                 SDL_TICKS_PASSED(now, m_HostCursorResendTime + HOST_CURSOR_RESEND_INTERVAL_MS)) {
             int flags = m_HostCursorControlSent >= 0 ? m_HostCursorControlSent : LI_HOST_CURSOR_CONTROL_SUBSCRIBE;
@@ -278,5 +489,10 @@ void SdlInputHandler::handleHostCursorState(const LI_HOST_CURSOR_STATE* state)
         warpToHostCursor();
     }
 
-    updateLocalCursor();
+    if (clipChanged) {
+        updatePointerRegionLock();
+    }
+    else {
+        updateLocalCursor();
+    }
 }

@@ -40,9 +40,6 @@
 #define SDL_CODE_GAMECONTROLLER_SET_MOTION_EVENT_STATE 103
 #define SDL_CODE_GAMECONTROLLER_SET_CONTROLLER_LED 104
 #define SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS 105
-// 106 is SDL_CODE_STEAM_CONTROLLER_LINK (steamcontrollerhost.h)
-#define SDL_CODE_HOST_CURSOR_STATE 107
-#define SDL_CODE_HOST_CURSOR_SHAPE 108
 
 #include <openssl/rand.h>
 
@@ -2036,8 +2033,15 @@ bool Session::startConnectionAsync()
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave pacing hints: link %d Mbps, calibrated pace %d Mbps",
                     m_StreamConfig.pyrowaveLinkMbps, m_StreamConfig.pyrowavePaceMbps);
     }
-    // Host cursor state and shapes (Vibeshine extension). Nothing arrives until we subscribe.
-    LiSetHostCursorCallbacks(clHostCursorState, clHostCursorShape);
+    // Host cursor state and shapes for automatic mouse mode (Vibeshine extension).
+    // Nothing arrives until the input handler subscribes; with the setting off we
+    // never subscribe and register nothing.
+    if (m_Preferences->automaticMouseMode) {
+        LiSetHostCursorCallbacks(clHostCursorState, clHostCursorShape);
+    }
+    else {
+        LiSetHostCursorCallbacks(nullptr, nullptr);
+    }
 
     // The Steam Controller (2026) haptic and settings relays are registered here rather than in
     // k_ConnCallbacks, which keeps its V1 layout. They are delivered straight to the driver's
@@ -2477,6 +2481,9 @@ void Session::exec()
             case SDL_CODE_HOST_CURSOR_SHAPE:
                 m_InputHandler->handleHostCursorShape((const LI_HOST_CURSOR_SHAPE*)event.user.data1);
                 SDL_free(event.user.data1);
+                break;
+            case SDL_CODE_HOST_CURSOR_TICK:
+                m_InputHandler->handleHostCursorTick();
                 break;
             default:
                 SDL_assert(false);

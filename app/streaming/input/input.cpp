@@ -44,7 +44,13 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
       m_HostCursorControlSent(-1),
       m_HostCursorResendId(0),
       m_HostCursorResendTime(0),
-      m_HostSdlCursorScale(0)
+      m_HostSdlCursorScale(0),
+      m_AutomaticMouseMode(prefs.automaticMouseMode),
+      m_FallbackAbsoluteMouseMode(prefs.absoluteMouseMode),
+      m_AutomaticCaptureDone(false),
+      m_CursorDecision { CursorModePolicy::Mode::Fallback, CursorModePolicy::Source::Fallback, 0 },
+      m_CursorModeTimer(0),
+      m_CursorModeTimerDue(0)
 {
     SDL_zero(m_HostCursorState);
     DualSenseHaptics::resetSpeakerGenerationFloor();
@@ -146,6 +152,12 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     m_SpecialKeyCombos[KeyComboToggleTimingGraph].keyCode = SDLK_f;
     m_SpecialKeyCombos[KeyComboToggleTimingGraph].scanCode = SDL_SCANCODE_F;
     m_SpecialKeyCombos[KeyComboToggleTimingGraph].enabled = true;
+
+    m_SpecialKeyCombos[KeyComboToggleMouseModeLock].keyCombo = KeyComboToggleMouseModeLock;
+    m_SpecialKeyCombos[KeyComboToggleMouseModeLock].keyCode = SDLK_a;
+    m_SpecialKeyCombos[KeyComboToggleMouseModeLock].scanCode = SDL_SCANCODE_A;
+    // With automatic mode off the combo still reaches the host, as before.
+    m_SpecialKeyCombos[KeyComboToggleMouseModeLock].enabled = m_AutomaticMouseMode;
 
     m_OldIgnoreDevices = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES);
     m_OldIgnoreDevicesExcept = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT);
@@ -309,6 +321,7 @@ SdlInputHandler::~SdlInputHandler()
     SDL_RemoveTimer(m_LeftButtonReleaseTimer);
     SDL_RemoveTimer(m_RightButtonReleaseTimer);
     SDL_RemoveTimer(m_DragTimer);
+    SDL_RemoveTimer(m_CursorModeTimer);
 
     // Host cursor shapes live only as long as the session.
     freeHostSdlCursors();

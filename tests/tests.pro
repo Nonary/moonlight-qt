@@ -20,6 +20,10 @@ contains(CONFIG, tests) {
     SUBDIRS += gamepadStickMerge
     hostCursor.file = $$PWD/input/hostcursor.pro
     SUBDIRS += hostCursor
+    cursorModePolicy.file = $$PWD/input/cursormodepolicy.pro
+    SUBDIRS += cursorModePolicy
+    autoMousePreferences.file = $$PWD/input/automousepreferences.pro
+    SUBDIRS += autoMousePreferences
     calibrationHosts.file = $$PWD/qml/calibration-hosts.pro
     SUBDIRS += calibrationHosts
     macx {
