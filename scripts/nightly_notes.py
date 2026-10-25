@@ -121,10 +121,12 @@ def moonlight_notes(repo, tag, version, previous, commits, compare, ancestor):
         notes += ['', 'Windows, Mac and AppImage users of 6.1.0-daily.182 or earlier must download this update manually once; automatic nightly update notifications work after upgrading.']
     notes += ['', f'[SHA256 checksums](https://github.com/{repo}/releases/download/{tag}/SHA256SUMS)',
               '', '### Linux installation', '',
-              'Download either Linux x86_64 package below. For Flatpak, install Flatpak through your distribution\'s software manager first, then run:',
+              'Download the Linux package for your architecture below (Flatpak is also built for aarch64). For Flatpak, install Flatpak through your distribution\'s software manager first, then run:',
               '', '```sh',
               'flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo',
               f'flatpak install --user --reinstall ./Moonlight-{version}-x86_64.flatpak',
+              '# On arm64 devices, use the aarch64 bundle instead:',
+              f'# flatpak install --user --reinstall ./Moonlight-{version}-aarch64.flatpak',
               'flatpak run --user com.moonlight_stream.Moonlight//master', '```', '',
               'This nightly uses the `master` branch; the regular Flathub package uses `stable`. To update a Flatpak nightly, repeat the install command with the newer downloaded bundle. On Steam Deck, install in Desktop Mode and add this nightly branch to Steam.',
               '', 'For AppImage:', '', '```sh',
