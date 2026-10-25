@@ -35,8 +35,18 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
       m_RightButtonReleaseTimer(0),
       m_DragTimer(0),
       m_DragButton(0),
-      m_NumFingersDown(0)
+      m_NumFingersDown(0),
+      m_HostCursorSupported(false),
+      m_HostCursorReady(false),
+      m_HostCursorHasPosition(false),
+      m_HostCursorX(0),
+      m_HostCursorY(0),
+      m_HostCursorControlSent(-1),
+      m_HostCursorResendId(0),
+      m_HostCursorResendTime(0),
+      m_HostSdlCursorScale(0)
 {
+    SDL_zero(m_HostCursorState);
     DualSenseHaptics::resetSpeakerGenerationFloor();
 
     // System keys are always captured when running without a DE
@@ -300,6 +310,9 @@ SdlInputHandler::~SdlInputHandler()
     SDL_RemoveTimer(m_RightButtonReleaseTimer);
     SDL_RemoveTimer(m_DragTimer);
 
+    // Host cursor shapes live only as long as the session.
+    freeHostSdlCursors();
+
 #if !SDL_VERSION_ATLEAST(2, 0, 9)
     SDL_QuitSubSystem(SDL_INIT_HAPTIC);
     SDL_assert(!SDL_WasInit(SDL_INIT_HAPTIC));
@@ -511,7 +524,15 @@ void SdlInputHandler::setCaptureActive(bool active)
         else {
             SDL_SetRelativeMouseMode(SDL_FALSE);
         }
+
+        // Uncaptured, the window shows the normal cursor and the video shows the host's
+        if (m_HostCursorSupported) {
+            SDL_SetCursor(SDL_GetDefaultCursor());
+        }
     }
+
+    // Tell the host whether we draw the cursor now
+    updateHostCursorControl();
 
     // Update mouse pointer region constraints
     updatePointerRegionLock();
