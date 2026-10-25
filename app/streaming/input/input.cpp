@@ -325,6 +325,7 @@ SdlInputHandler::~SdlInputHandler()
 
     // Host cursor shapes live only as long as the session.
     freeHostSdlCursors();
+    clearMouseModeStatus();
 
 #if !SDL_VERSION_ATLEAST(2, 0, 9)
     SDL_QuitSubSystem(SDL_INIT_HAPTIC);
@@ -546,6 +547,7 @@ void SdlInputHandler::setCaptureActive(bool active)
 
     // Tell the host whether we draw the cursor now
     updateHostCursorControl();
+    publishMouseModeStatus();
 
     // Update mouse pointer region constraints
     updatePointerRegionLock();
