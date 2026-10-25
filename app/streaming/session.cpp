@@ -282,6 +282,30 @@ void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlag
     if (SDL_PushEvent(&setControllerLEDEvent) <= 0) SDL_free(state);
 }
 
+void Session::clHostCursorState(const LI_HOST_CURSOR_STATE* state)
+{
+    // Called on the control receive thread. Log transitions, not every position update.
+    static uint8_t lastFlags = 0xFF;
+    static uint32_t lastShapeId;
+    const uint8_t flags = state->flags & ~(LI_HOST_CURSOR_HAS_POSITION | LI_HOST_CURSOR_RESYNC);
+    if ((state->flags & LI_HOST_CURSOR_RESYNC) || flags != lastFlags || state->shapeId != lastShapeId) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Host cursor state %u: flags 0x%02x, shape %u, position %d,%d, reference %ux%u, scale %.3f, clip %d,%d-%d,%d",
+                    state->sequence, state->flags, state->shapeId, state->x, state->y,
+                    state->referenceWidth, state->referenceHeight, state->scaleQ16 / 65536.0,
+                    state->clipLeft, state->clipTop, state->clipRight, state->clipBottom);
+        lastFlags = flags;
+        lastShapeId = state->shapeId;
+    }
+}
+
+void Session::clHostCursorShape(const LI_HOST_CURSOR_SHAPE* shape)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Host cursor shape %u: %ux%u, hotspot %u,%u",
+                shape->shapeId, shape->width, shape->height, shape->hotspotX, shape->hotspotY);
+}
+
 bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             StreamingPreferences::RendererSelection renderer,
                             SDL_Window* window, int videoFormat, int width, int height,
@@ -1975,6 +1999,9 @@ bool Session::startConnectionAsync()
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave pacing hints: link %d Mbps, calibrated pace %d Mbps",
                     m_StreamConfig.pyrowaveLinkMbps, m_StreamConfig.pyrowavePaceMbps);
     }
+    // Host cursor state and shapes (Vibeshine extension). Nothing arrives until we subscribe.
+    LiSetHostCursorCallbacks(clHostCursorState, clHostCursorShape);
+
     // The Steam Controller (2026) haptic and settings relays are registered here rather than in
     // k_ConnCallbacks, which keeps its V1 layout. They are delivered straight to the driver's
     // registry (not through the SDL event queue: haptics are latency sensitive and the driver
@@ -1995,6 +2022,11 @@ bool Session::startConnectionAsync()
         // We already displayed an error dialog in the stage failure
         // listener.
         return false;
+    }
+
+    if (LiGetHostFeatureFlags() & LI_FF_HOST_CURSOR) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Host supports client-side cursor; subscribing");
+        LiSendHostCursorControl(LI_HOST_CURSOR_CONTROL_SUBSCRIBE, 0);
     }
 
     m_HostLaunchWarning = LaunchWarning::text(launchWarning);
