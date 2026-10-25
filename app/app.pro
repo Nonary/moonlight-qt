@@ -272,6 +272,7 @@ HEADERS += \
     diagnostics/gputrace.h \
     diagnostics/diagnosticzip.h \
     streaming/input/dualsensehaptics.h \
+    streaming/input/cursormodepolicy.h \
     streaming/input/hostcursormath.h \
     streaming/input/input.h \
     streaming/session.h \

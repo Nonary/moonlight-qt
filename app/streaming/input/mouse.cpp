@@ -281,6 +281,17 @@ void SdlInputHandler::updatePointerRegionLock()
                                     (fullscreenFlags != 0 && SDL_GetNumVideoDisplays() == 1);
     }
 
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    // A host application confining its visible cursor (an RTS keeping it inside its
+    // window) confines ours to the same part of the video.
+    SDL_Rect hostClip;
+    if (isCaptureActive() && getHostCursorClipRect(&hostClip)) {
+        SDL_SetWindowMouseRect(m_Window, &hostClip);
+        updateLocalCursor();
+        return;
+    }
+#endif
+
     // If region lock is enabled, grab the cursor so it can't accidentally leave our window.
     if (isCaptureActive() && m_PointerRegionLockActive) {
 #if SDL_VERSION_ATLEAST(2, 0, 18)
