@@ -8,6 +8,7 @@
 #include "steamcontroller/steamcontrollersdl.h"
 
 #include <Limelight.h>
+#include "cursormodepolicy.h"
 
 #include <QHash>
 #include <QList>
@@ -69,6 +70,11 @@ struct GamepadState {
 
 #define GAMEPAD_HAPTIC_SIMPLE_HIFREQ_MOTOR_WEIGHT 0.33
 #define GAMEPAD_HAPTIC_SIMPLE_LOWFREQ_MOTOR_WEIGHT 0.8
+
+// SDL_USEREVENT codes for the client-side cursor (106 is SDL_CODE_STEAM_CONTROLLER_LINK)
+#define SDL_CODE_HOST_CURSOR_STATE 107
+#define SDL_CODE_HOST_CURSOR_SHAPE 108
+#define SDL_CODE_HOST_CURSOR_TICK 109
 
 class SdlInputHandler
 {
@@ -158,6 +164,13 @@ public:
 
     void handleHostCursorShape(const LI_HOST_CURSOR_SHAPE* shape);
 
+    // SDL_CODE_HOST_CURSOR_TICK: a pending automatic mouse mode switch is due.
+    void handleHostCursorTick();
+
+    // Automatic mouse mode, for the stats overlay; safe to call from any thread.
+    static
+    QString getMouseModeStatus();
+
     static
     QString getUnmappedGamepads();
 
@@ -175,6 +188,7 @@ private:
         KeyComboQuitAndExit,
         KeyComboToggleKeyboardGrab,
         KeyComboToggleTimingGraph,
+        KeyComboToggleMouseModeLock,
         KeyComboMax
     };
 
@@ -225,7 +239,18 @@ private:
 
     void updateHostCursorControl();
 
-    void warpToHostCursor();
+    void warpToHostCursor(bool modeSwitch = false);
+
+    bool isAutomaticMouseModeActive();
+
+    void evaluateCursorMode();
+
+    void applyCursorMode(CursorModePolicy::Mode mode, CursorModePolicy::Mode previous);
+
+    bool getHostCursorClipRect(SDL_Rect* rect);
+
+    static
+    Uint32 cursorModeTimerCallback(Uint32 interval, void* param);
 
     SDL_Cursor* getHostSdlCursor();
 
@@ -316,6 +341,14 @@ private:
     QList<uint32_t> m_HostCursorShapeOrder;
     QHash<uint32_t, SDL_Cursor*> m_HostSdlCursors;
     double m_HostSdlCursorScale;
+
+    bool m_AutomaticMouseMode;
+    bool m_FallbackAbsoluteMouseMode;
+    bool m_AutomaticCaptureDone;
+    CursorModePolicy::Policy m_CursorPolicy;
+    CursorModePolicy::Decision m_CursorDecision;
+    SDL_TimerID m_CursorModeTimer;
+    uint32_t m_CursorModeTimerDue;
 
     static const int k_ButtonMap[];
 };

@@ -53,8 +53,8 @@ inline Rect streamRectToWindow(const Rect& video, int referenceWidth, int refere
     r.y = std::clamp(a.y, video.y, video.y + video.h);
     r.w = std::clamp(b.x, video.x, video.x + video.w) - r.x;
     r.h = std::clamp(b.y, video.y, video.y + video.h) - r.y;
-    r.w = std::max(r.w, 0);
-    r.h = std::max(r.h, 0);
+    r.w = (std::max)(r.w, 0);
+    r.h = (std::max)(r.h, 0);
     return r;
 }
 
@@ -94,12 +94,12 @@ inline std::vector<uint8_t> scaleBgra(const uint8_t* src, int width, int height,
     for (int oy = 0; oy < outHeight; oy++) {
         double fy = std::clamp((oy + 0.5) * sy - 0.5, 0.0, (double)(height - 1));
         int y0 = (int)fy;
-        int y1 = std::min(y0 + 1, height - 1);
+        int y1 = (std::min)(y0 + 1, height - 1);
         double ty = fy - y0;
         for (int ox = 0; ox < outWidth; ox++) {
             double fx = std::clamp((ox + 0.5) * sx - 0.5, 0.0, (double)(width - 1));
             int x0 = (int)fx;
-            int x1 = std::min(x0 + 1, width - 1);
+            int x1 = (std::min)(x0 + 1, width - 1);
             double tx = fx - x0;
 
             const uint8_t* p[4] = {
