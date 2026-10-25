@@ -156,8 +156,9 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     m_SpecialKeyCombos[KeyComboToggleMouseModeLock].keyCombo = KeyComboToggleMouseModeLock;
     m_SpecialKeyCombos[KeyComboToggleMouseModeLock].keyCode = SDLK_a;
     m_SpecialKeyCombos[KeyComboToggleMouseModeLock].scanCode = SDL_SCANCODE_A;
-    // With automatic mode off the combo still reaches the host, as before.
-    m_SpecialKeyCombos[KeyComboToggleMouseModeLock].enabled = m_AutomaticMouseMode;
+    // Enabled by startHostCursor() only when automatic mode is available, so on
+    // other hosts (or with the setting off) the combo still reaches the host.
+    m_SpecialKeyCombos[KeyComboToggleMouseModeLock].enabled = false;
 
     m_OldIgnoreDevices = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES);
     m_OldIgnoreDevicesExcept = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT);

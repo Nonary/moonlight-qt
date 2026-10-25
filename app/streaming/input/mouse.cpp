@@ -97,6 +97,11 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
     // We should not reference the original event anymore
     event = nullptr;
 
+    // Mouse motion settles whether a pointer hidden while typing was a game capturing it
+    if (m_HostCursorSupported && m_CursorPolicy.noteLocalMouseMotion(SDL_GetTicks())) {
+        evaluateCursorMode();
+    }
+
     if (m_AbsoluteMouseMode) {
         int windowWidth, windowHeight;
         SDL_GetWindowSize(m_Window, &windowWidth, &windowHeight);

@@ -6,6 +6,7 @@
 #include "streaming/streamutils.h"
 
 #include <atomic>
+#include <climits>
 
 // Client-side cursor and automatic mouse mode (Vibeshine extension). The host reports
 // its cursor's shape, visibility, clip and host-originated moves. While the host cursor
@@ -93,6 +94,7 @@ void SdlInputHandler::startHostCursor()
     if (m_AutomaticMouseMode && (LiGetHostFeatureFlags() & LI_FF_HOST_CURSOR)) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Host supports automatic mouse mode; subscribing to the host cursor");
         m_HostCursorSupported = true;
+        m_SpecialKeyCombos[KeyComboToggleMouseModeLock].enabled = true;
         updateHostCursorControl();
     }
     else if (m_AutomaticMouseMode) {
@@ -473,9 +475,11 @@ void SdlInputHandler::handleHostCursorState(const LI_HOST_CURSOR_STATE* state)
 
     const Uint32 now = SDL_GetTicks();
     const bool visible = state->flags & LI_HOST_CURSOR_VISIBLE;
+    // The parser guarantees an ordered clip, not a small one: subtract in 64 bits.
+    const int clipWidth = (int)std::clamp<int64_t>((int64_t)state->clipRight - state->clipLeft, 0, INT_MAX);
+    const int clipHeight = (int)std::clamp<int64_t>((int64_t)state->clipBottom - state->clipTop, 0, INT_MAX);
     m_CursorPolicy.setHostState(now, !(state->flags & LI_HOST_CURSOR_FALLBACK), visible,
-                                state->flags & LI_HOST_CURSOR_HAS_CLIP,
-                                state->clipRight - state->clipLeft, state->clipBottom - state->clipTop,
+                                state->flags & LI_HOST_CURSOR_HAS_CLIP, clipWidth, clipHeight,
                                 state->referenceWidth, state->referenceHeight);
     if (visible && (state->flags & LI_HOST_CURSOR_HAS_POSITION) && !(state->flags & LI_HOST_CURSOR_RESYNC)) {
         m_CursorPolicy.noteHostPosition(now, state->x, state->y);
