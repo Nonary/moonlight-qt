@@ -1536,6 +1536,25 @@ bool Session::validateLaunch(SDL_Window* testWindow)
 }
 
 
+// Host cursor events pushed after the event loop stopped would otherwise leak their
+// payloads or reach the next session; SDL_FilterEvents() drops them under SDL's lock.
+static int dropHostCursorEvents(void*, SDL_Event* event)
+{
+    if (event->type != SDL_USEREVENT) {
+        return 1;
+    }
+    switch (event->user.code) {
+    case SDL_CODE_HOST_CURSOR_STATE:
+    case SDL_CODE_HOST_CURSOR_SHAPE:
+        SDL_free(event->user.data1);
+        return 0;
+    case SDL_CODE_HOST_CURSOR_TICK:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
 class DeferredSessionCleanupTask : public QRunnable
 {
 public:
@@ -1575,6 +1594,9 @@ private:
 
         // Finish cleanup of the connection state
         LiStopConnection();
+
+        // No more host cursor callbacks can run now
+        SDL_FilterEvents(dropHostCursorEvents, nullptr);
 
         // Perform a best-effort app quit
         if (shouldQuit) {

@@ -37,8 +37,10 @@ inline Point streamToWindow(const Rect& video, int referenceWidth, int reference
     if (referenceWidth <= 0 || referenceHeight <= 0) {
         return p;
     }
-    p.x = video.x + (int)std::lround((double)x * video.w / referenceWidth);
-    p.y = video.y + (int)std::lround((double)y * video.h / referenceHeight);
+    // Host coordinates are int32 and may be far off the stream; keep the result in int range.
+    const double limit = 1e9;
+    p.x = video.x + (int)std::lround(std::clamp((double)x * video.w / referenceWidth, -limit, limit));
+    p.y = video.y + (int)std::lround(std::clamp((double)y * video.h / referenceHeight, -limit, limit));
     return p;
 }
 

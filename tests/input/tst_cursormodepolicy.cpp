@@ -205,6 +205,54 @@ static void testLocks()
     require(p.update(7001 + kMinDwellMs + kExitRelativeMs).mode == Mode::Absolute, "returns to the host's mode");
 }
 
+static void testHideWhileTyping()
+{
+    // "Hide pointer while typing": the cursor vanishes right after a key press.
+    Policy p = readyAbsolute(0);
+    p.noteLocalKey(1000);
+    host(p, 1010, false);
+    Decision d = p.update(1010);
+    require(d.mode == Mode::Absolute && d.nextUpdateMs == 0, "a hide while typing does not start a switch");
+    require(p.update(5000).mode == Mode::Absolute, "and typing on never switches");
+
+    // The first mouse move makes the host show the pointer again: still absolute.
+    require(p.noteLocalMouseMotion(5000), "motion settles a typing hide");
+    d = p.update(5000);
+    require(d.mode == Mode::Absolute && d.nextUpdateMs == 5000 + kTypingRevealMs, "the motion starts the reveal wait");
+    host(p, 5030, true);
+    require(p.update(5030).mode == Mode::Absolute && p.update(5030).nextUpdateMs == 0, "pointer back: no switch");
+    require(!p.noteLocalMouseMotion(5040), "visible cursor: motion needs no update");
+
+    // A game hiding the cursor after a key press (resuming with Enter) switches once
+    // the mouse moves and the cursor stays hidden.
+    Policy q = readyAbsolute(0);
+    q.noteLocalKey(1000);
+    host(q, 1100, false);
+    q.update(1100);
+    require(q.noteLocalMouseMotion(2000), "motion after a typing hide");
+    q.update(2000);
+    require(q.update(2000 + kTypingRevealMs - 1).mode == Mode::Absolute, "reveal wait");
+    require(q.update(2000 + kTypingRevealMs).mode == Mode::Relative, "still hidden after moving -> relative");
+
+    // A hide long after the last key press is an ordinary hide.
+    Policy r = readyAbsolute(0);
+    r.noteLocalKey(1000);
+    host(r, 1000 + kTypingHideWindowMs + 1, false);
+    r.update(1000 + kTypingHideWindowMs + 1);
+    require(r.update(1000 + kTypingHideWindowMs + 1 + kEnterRelativeMs).mode == Mode::Relative, "an ordinary hide switches");
+}
+
+static void testLongSessionsKeepSwitching()
+{
+    // More than 2^31 ms after the last switch the dwell must not look like the future.
+    Policy p = readyAbsolute(0);
+    const uint32_t later = 0x90000000u;
+    host(p, later, false);
+    Decision d = p.update(later);
+    require(d.nextUpdateMs == later + kEnterRelativeMs, "dwell long satisfied");
+    require(p.update(later + kEnterRelativeMs).mode == Mode::Relative, "switches after 24.8+ days");
+}
+
 static void testTickWrap()
 {
     const uint32_t start = 0xFFFFFFF0u;
@@ -227,6 +275,8 @@ int main()
     testClips();
     testRecentring();
     testLocks();
+    testHideWhileTyping();
+    testLongSessionsKeepSwitching();
     testTickWrap();
     if (g_Failures == 0) {
         std::printf("PASS cursor mode policy\n");
