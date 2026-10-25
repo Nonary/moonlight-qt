@@ -7,7 +7,13 @@
 #include "dualsensetriggers.h"
 #include "steamcontroller/steamcontrollersdl.h"
 
+#include <Limelight.h>
+
+#include <QHash>
+#include <QList>
+
 #include <memory>
+#include <vector>
 
 class SteamControllerHost;
 class SteamControllerLink;
@@ -144,6 +150,14 @@ public:
 
     void updatePointerRegionLock();
 
+    // Client-side cursor (hostcursor.cpp), on the main thread. startHostCursor()
+    // subscribes when the host supports it; until then the handlers do nothing.
+    void startHostCursor();
+
+    void handleHostCursorState(const LI_HOST_CURSOR_STATE* state);
+
+    void handleHostCursorShape(const LI_HOST_CURSOR_SHAPE* shape);
+
     static
     QString getUnmappedGamepads();
 
@@ -192,6 +206,32 @@ private:
     void handleRelativeFingerEvent(SDL_TouchFingerEvent* event);
 
     void performSpecialKeyCombo(KeyCombo combo);
+
+    struct HostCursorShape {
+        int width;
+        int height;
+        int hotspotX;
+        int hotspotY;
+        std::vector<uint8_t> pixels;
+    };
+
+    SDL_Rect getVideoRegion();
+
+    bool isHostCursorDrawingWanted();
+
+    bool isHostCursorDrawnLocally();
+
+    void updateLocalCursor(int mouseInVideoRegion = -1);
+
+    void updateHostCursorControl();
+
+    void warpToHostCursor();
+
+    SDL_Cursor* getHostSdlCursor();
+
+    void freeHostSdlCursor(uint32_t shapeId);
+
+    void freeHostSdlCursors();
 
     static
     Uint32 longPressTimerCallback(Uint32 interval, void* param);
@@ -262,6 +302,20 @@ private:
     SDL_TimerID m_DragTimer;
     char m_DragButton;
     int m_NumFingersDown;
+
+    bool m_HostCursorSupported;
+    bool m_HostCursorReady;
+    LI_HOST_CURSOR_STATE m_HostCursorState;
+    bool m_HostCursorHasPosition;
+    int32_t m_HostCursorX;
+    int32_t m_HostCursorY;
+    int m_HostCursorControlSent;
+    uint32_t m_HostCursorResendId;
+    Uint32 m_HostCursorResendTime;
+    QHash<uint32_t, HostCursorShape> m_HostCursorShapes;
+    QList<uint32_t> m_HostCursorShapeOrder;
+    QHash<uint32_t, SDL_Cursor*> m_HostSdlCursors;
+    double m_HostSdlCursorScale;
 
     static const int k_ButtonMap[];
 };

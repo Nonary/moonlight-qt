@@ -139,7 +139,13 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
 
         // Adjust the cursor visibility if applicable
         if (mouseInVideoRegion ^ m_MouseWasInVideoRegion) {
-            SDL_ShowCursor((mouseInVideoRegion && m_MouseCursorCapturedVisibilityState == SDL_DISABLE) ? SDL_DISABLE : SDL_ENABLE);
+            if (m_HostCursorSupported) {
+                // The host's cursor inside the video, the normal cursor outside it
+                updateLocalCursor(mouseInVideoRegion);
+            }
+            else {
+                SDL_ShowCursor((mouseInVideoRegion && m_MouseCursorCapturedVisibilityState == SDL_DISABLE) ? SDL_DISABLE : SDL_ENABLE);
+            }
             if (!mouseInVideoRegion && buttonState != 0) {
                 // If we still have a button pressed on leave, wait for that to come up
                 // before we stop sending mouse position events.
@@ -309,4 +315,7 @@ void SdlInputHandler::updatePointerRegionLock()
         SDL_SetWindowGrab(m_Window, SDL_FALSE);
 #endif
     }
+
+    // The video region may have changed size, and the local cursor's size with it
+    updateLocalCursor();
 }

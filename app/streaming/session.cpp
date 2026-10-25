@@ -40,6 +40,9 @@
 #define SDL_CODE_GAMECONTROLLER_SET_MOTION_EVENT_STATE 103
 #define SDL_CODE_GAMECONTROLLER_SET_CONTROLLER_LED 104
 #define SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS 105
+// 106 is SDL_CODE_STEAM_CONTROLLER_LINK (steamcontrollerhost.h)
+#define SDL_CODE_HOST_CURSOR_STATE 107
+#define SDL_CODE_HOST_CURSOR_SHAPE 108
 
 #include <openssl/rand.h>
 
@@ -297,6 +300,21 @@ void Session::clHostCursorState(const LI_HOST_CURSOR_STATE* state)
         lastFlags = flags;
         lastShapeId = state->shapeId;
     }
+
+    // The main thread owns the cursor and the input handler; it frees the copy.
+    LI_HOST_CURSOR_STATE* copy = (LI_HOST_CURSOR_STATE*)SDL_malloc(sizeof(*copy));
+    if (copy == nullptr) {
+        return;
+    }
+    *copy = *state;
+
+    SDL_Event event = {};
+    event.type = SDL_USEREVENT;
+    event.user.code = SDL_CODE_HOST_CURSOR_STATE;
+    event.user.data1 = copy;
+    if (SDL_PushEvent(&event) <= 0) {
+        SDL_free(copy);
+    }
 }
 
 void Session::clHostCursorShape(const LI_HOST_CURSOR_SHAPE* shape)
@@ -304,6 +322,25 @@ void Session::clHostCursorShape(const LI_HOST_CURSOR_SHAPE* shape)
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Host cursor shape %u: %ux%u, hotspot %u,%u",
                 shape->shapeId, shape->width, shape->height, shape->hotspotX, shape->hotspotY);
+
+    // One allocation: the shape header followed by its pixels, freed by the main thread.
+    size_t pixelBytes = (size_t)shape->width * shape->height * 4;
+    LI_HOST_CURSOR_SHAPE* copy = (LI_HOST_CURSOR_SHAPE*)SDL_malloc(sizeof(*copy) + pixelBytes);
+    if (copy == nullptr) {
+        return;
+    }
+    *copy = *shape;
+    uint8_t* pixels = (uint8_t*)(copy + 1);
+    SDL_memcpy(pixels, shape->pixels, pixelBytes);
+    copy->pixels = pixels;
+
+    SDL_Event event = {};
+    event.type = SDL_USEREVENT;
+    event.user.code = SDL_CODE_HOST_CURSOR_SHAPE;
+    event.user.data1 = copy;
+    if (SDL_PushEvent(&event) <= 0) {
+        SDL_free(copy);
+    }
 }
 
 bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
@@ -2024,11 +2061,6 @@ bool Session::startConnectionAsync()
         return false;
     }
 
-    if (LiGetHostFeatureFlags() & LI_FF_HOST_CURSOR) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Host supports client-side cursor; subscribing");
-        LiSendHostCursorControl(LI_HOST_CURSOR_CONTROL_SUBSCRIBE, 0);
-    }
-
     m_HostLaunchWarning = LaunchWarning::text(launchWarning);
     emit connectionStarted();
     return true;
@@ -2226,6 +2258,9 @@ void Session::exec()
     }
 
     m_InputHandler->setWindow(m_Window);
+
+    // The connection is up: subscribe to the host cursor if the host offers it
+    m_InputHandler->startHostCursor();
 
     QSvgRenderer svgIconRenderer(QString(":/res/moonlight.svg"));
     QImage svgImage(ICON_SIZE, ICON_SIZE, QImage::Format_RGBA8888);
@@ -2434,6 +2469,14 @@ void Session::exec()
                 break;
             case SDL_CODE_STEAM_CONTROLLER_LINK:
                 m_InputHandler->handleSteamControllerEvent(&event.user);
+                break;
+            case SDL_CODE_HOST_CURSOR_STATE:
+                m_InputHandler->handleHostCursorState((const LI_HOST_CURSOR_STATE*)event.user.data1);
+                SDL_free(event.user.data1);
+                break;
+            case SDL_CODE_HOST_CURSOR_SHAPE:
+                m_InputHandler->handleHostCursorShape((const LI_HOST_CURSOR_SHAPE*)event.user.data1);
+                SDL_free(event.user.data1);
                 break;
             default:
                 SDL_assert(false);

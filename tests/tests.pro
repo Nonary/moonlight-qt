@@ -18,6 +18,8 @@ contains(CONFIG, tests) {
     SUBDIRS += toleranceInput
     gamepadStickMerge.file = $$PWD/input/gamepadstickmerge.pro
     SUBDIRS += gamepadStickMerge
+    hostCursor.file = $$PWD/input/hostcursor.pro
+    SUBDIRS += hostCursor
     calibrationHosts.file = $$PWD/qml/calibration-hosts.pro
     SUBDIRS += calibrationHosts
     macx {
