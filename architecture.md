@@ -5730,6 +5730,8 @@ extension with Vibeshine hosts; its design is Vibeshine's
   - `app/streaming/input/cursormodepolicy.h` holds every tuning constant: enter
     relative after 60 ms hidden or locked, return after 100 ms visible and free, and
     at least 150 ms between switches.
+  - A hide that starts within 1 s of a key press (the OS hiding the pointer while
+    typing) waits for mouse motion and then 120 ms of the cursor staying hidden.
   - A pending switch is driven by an SDL timer that pushes `SDL_CODE_HOST_CURSOR_TICK`.
   - `hostcursor.cpp` applies modes through the existing `setCaptureActive()` and
     `m_AbsoluteMouseMode`. A return to absolute warps the local cursor to the host
