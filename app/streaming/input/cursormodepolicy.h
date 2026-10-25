@@ -20,6 +20,12 @@ constexpr uint32_t kEnterRelativeMs = 60;
 constexpr uint32_t kExitRelativeMs = 100;
 // Minimum time between automatic switches, whatever the host does.
 constexpr uint32_t kMinDwellMs = 150;
+// Windows can hide the pointer while the user types ("Hide pointer while typing").
+// A hide that starts within this long of a key press is not a game capturing the
+// mouse until the mouse moves and the cursor stays hidden for kTypingRevealMs: the
+// host shows the pointer again on the first move.
+constexpr uint32_t kTypingHideWindowMs = 1000;
+constexpr uint32_t kTypingRevealMs = 120;
 // A clip smaller than this in both dimensions is a lock (FPS games), not a
 // confinement (RTS games keep a visible cursor inside their window).
 constexpr double kTightClipFraction = 0.10;
@@ -57,7 +63,14 @@ public:
                       bool hasClip, int clipWidth, int clipHeight,
                       int referenceWidth, int referenceHeight)
     {
-        (void)nowMs;
+        if (visible) {
+            m_TypingHide = false;
+        }
+        else if (m_Visible || !m_Available) {
+            // The cursor just disappeared. Was the user typing?
+            m_TypingHide = m_HasKey && nowMs - m_LastKeyMs <= kTypingHideWindowMs;
+            m_TypingHideMoved = false;
+        }
         m_Available = available;
         m_Visible = visible;
         m_HasClip = hasClip;
@@ -65,6 +78,24 @@ public:
         m_ClipHeight = clipHeight;
         m_ReferenceWidth = referenceWidth;
         m_ReferenceHeight = referenceHeight;
+    }
+
+    // Local input. Key presses mark hides that may be the OS hiding the pointer while
+    // typing; mouse motion ends that doubt. Returns true when update() must run now.
+    void noteLocalKey(uint32_t nowMs)
+    {
+        m_HasKey = true;
+        m_LastKeyMs = nowMs;
+    }
+
+    bool noteLocalMouseMotion(uint32_t nowMs)
+    {
+        if (!m_TypingHide || m_TypingHideMoved) {
+            return false;
+        }
+        (void)nowMs;
+        m_TypingHideMoved = true;
+        return true;
     }
 
     // A position the host reported while its cursor was visible.
@@ -126,8 +157,13 @@ public:
                 m_PendingMode = desired;
                 m_PendingSinceMs = nowMs;
             }
-            const uint32_t delay = desired == Mode::Relative ? kEnterRelativeMs : kExitRelativeMs;
-            const uint32_t due = latest(m_PendingSinceMs + delay, m_LastSwitchMs + kMinDwellMs);
+            const uint32_t delay = desired == Mode::Absolute ? kExitRelativeMs :
+                                   m_TypingHide ? kTypingRevealMs : kEnterRelativeMs;
+            uint32_t due = m_PendingSinceMs + delay;
+            // Elapsed time is unsigned, so this holds however long since the last switch.
+            if (nowMs - m_LastSwitchMs < kMinDwellMs) {
+                due = latest(due, m_LastSwitchMs + kMinDwellMs);
+            }
             if (reached(nowMs, due)) {
                 switchTo(desired, nowMs);
             }
@@ -215,7 +251,11 @@ private:
     bool wantsRelative(uint32_t nowMs, uint32_t& recentreExpiry) const
     {
         recentreExpiry = 0;
-        if (!m_Visible || tightlyClipped()) {
+        if (!m_Visible) {
+            // A pointer hidden while typing counts once the mouse has moved.
+            return !m_TypingHide || m_TypingHideMoved;
+        }
+        if (tightlyClipped()) {
             return true;
         }
         return recentring(nowMs, recentreExpiry);
@@ -231,6 +271,11 @@ private:
 
     std::array<Report, 16> m_Reports {};
     size_t m_NextReport = 0;
+
+    bool m_HasKey = false;
+    uint32_t m_LastKeyMs = 0;
+    bool m_TypingHide = false;
+    bool m_TypingHideMoved = false;
 
     bool m_Locked = false;
     Mode m_LockedMode = Mode::Absolute;
