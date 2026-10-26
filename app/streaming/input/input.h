@@ -250,6 +250,10 @@ private:
 
     void evaluateCursorMode();
 
+    void scheduleCursorModeTimer();
+
+    void noteMouseButtons();
+
     void applyCursorMode(CursorModePolicy::Mode mode, CursorModePolicy::Mode previous);
 
     bool getHostCursorClipRect(SDL_Rect* rect);
@@ -354,6 +358,10 @@ private:
     CursorModePolicy::Decision m_CursorDecision;
     SDL_TimerID m_CursorModeTimer;
     uint32_t m_CursorModeTimerDue;
+    bool m_ClientDrawsGraceActive;
+    uint32_t m_ClientDrawsSinceMs;
+    bool m_HasAbsoluteSyncPoint;
+    SDL_Point m_AbsoluteSyncPoint;
 
     static const int k_ButtonMap[];
 };
