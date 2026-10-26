@@ -5728,8 +5728,10 @@ extension with Vibeshine hosts; its design is Vibeshine's
     `SDL_CODE_HOST_CURSOR_STATE`/`SHAPE` events for the main thread.
 - **Policy.**
   - `app/streaming/input/cursormodepolicy.h` holds every tuning constant: enter
-    relative after 60 ms hidden or locked, return after 100 ms visible and free, and
-    at least 150 ms between switches.
+    relative after 60 ms hidden or locked, return after 50 ms visible and free, and
+    at least 100 ms between switches. The return waits while any mouse button is
+    held (an MMO camera drag), and drops the mouse motion queued by leaving
+    relative mode before syncing the host to the warp target.
   - A hide that starts within 1 s of a key press (the OS hiding the pointer while
     typing) waits for mouse motion and then 120 ms of the cursor staying hidden.
   - A pending switch is driven by an SDL timer that pushes `SDL_CODE_HOST_CURSOR_TICK`.
@@ -5740,7 +5742,8 @@ extension with Vibeshine hosts; its design is Vibeshine's
   - In absolute mode the host shape is an SDL colour cursor, scaled by
     `scaleQ16 × video width / reference width`.
   - The host stops compositing (`CLIENT_DRAWS`) unless another session still needs
-    it (`COMPOSITED`).
+    it (`COMPOSITED`). The local cursor shows as soon as `CLIENT_DRAWS` is sent; if
+    the host still reports `COMPOSITED` 300 ms later it is hidden again.
   - A large host clip confines the local cursor through `SDL_SetWindowMouseRect`.
 - **Overrides.** Ctrl+Alt+Shift+M locks the other mode; Ctrl+Alt+Shift+A locks or
   unlocks the current one.

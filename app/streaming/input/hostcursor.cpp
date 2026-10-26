@@ -23,6 +23,11 @@ using CursorModePolicy::Source;
 // How often we may ask the host again for a shape a state names but we lack.
 #define HOST_CURSOR_RESEND_INTERVAL_MS 1000
 
+// After asking the host to stop drawing the cursor we show ours at once rather than
+// wait a round trip for its confirmation. If the host still composites it this long
+// afterwards, another client needs it in the video and ours is hidden again.
+#define HOST_CURSOR_COMPOSITE_GRACE_MS 300
+
 // Packed mouse mode for the stats overlay, which runs on the decoder thread.
 enum MouseModeStatusBits {
     MMS_ABSOLUTE = 0x01,
@@ -132,11 +137,17 @@ bool SdlInputHandler::isHostCursorDrawingWanted()
 
 bool SdlInputHandler::isHostCursorDrawnLocally()
 {
-    // While the host still composites the cursor (it has not processed our request
-    // yet, or another client needs it in the video), the video cursor is the one shown.
-    return isHostCursorDrawingWanted() &&
-           (m_HostCursorState.flags & LI_HOST_CURSOR_VISIBLE) &&
-           !(m_HostCursorState.flags & LI_HOST_CURSOR_COMPOSITED);
+    if (!isHostCursorDrawingWanted() || !(m_HostCursorState.flags & LI_HOST_CURSOR_VISIBLE)) {
+        return false;
+    }
+    if (!(m_HostCursorState.flags & LI_HOST_CURSOR_COMPOSITED)) {
+        return true;
+    }
+
+    // The host still composites the cursor: it has not processed our request yet
+    // (show ours anyway for the grace period), or another client needs it in the video.
+    return m_ClientDrawsGraceActive &&
+           !SDL_TICKS_PASSED(SDL_GetTicks(), m_ClientDrawsSinceMs + HOST_CURSOR_COMPOSITE_GRACE_MS);
 }
 
 void SdlInputHandler::updateHostCursorControl()
@@ -155,6 +166,12 @@ void SdlInputHandler::updateHostCursorControl()
                     "Host cursor: %s draws the cursor",
                     (flags & LI_HOST_CURSOR_CONTROL_CLIENT_DRAWS) ? "client" : "host");
         m_HostCursorControlSent = flags;
+
+        m_ClientDrawsGraceActive = (flags & LI_HOST_CURSOR_CONTROL_CLIENT_DRAWS) != 0;
+        if (m_ClientDrawsGraceActive) {
+            m_ClientDrawsSinceMs = SDL_GetTicks();
+            scheduleCursorModeTimer();
+        }
     }
 }
 
@@ -206,6 +223,12 @@ void SdlInputHandler::warpToHostCursor(bool modeSwitch)
     HostCursorMath::Point target = HostCursorMath::streamToWindow(toMathRect(getVideoRegion()),
                                                                   state.referenceWidth, state.referenceHeight,
                                                                   m_HostCursorX, m_HostCursorY);
+    if (modeSwitch) {
+        // setCaptureActive() syncs the host to this point rather than reading the
+        // cursor back, which macOS may not have updated yet.
+        m_AbsoluteSyncPoint = { target.x, target.y };
+        m_HasAbsoluteSyncPoint = true;
+    }
     if (qAbs(target.x - mouseX) <= 1 && qAbs(target.y - mouseY) <= 1) {
         return;
     }
@@ -316,10 +339,58 @@ Uint32 SdlInputHandler::cursorModeTimerCallback(Uint32, void*)
     return 0;
 }
 
+void SdlInputHandler::noteMouseButtons()
+{
+    if (!m_HostCursorSupported) {
+        return;
+    }
+
+    // A return to absolute input waits until every button is up, so an MMO camera
+    // drag ends as a drag rather than a jump. Runs after the button event was sent,
+    // so the release reaches the host before any switch.
+    const bool held = SDL_GetMouseState(nullptr, nullptr) != 0;
+    m_CursorPolicy.setMouseButtonsHeld(held);
+    if (!held) {
+        evaluateCursorMode();
+    }
+}
+
 void SdlInputHandler::handleHostCursorTick()
 {
     m_CursorModeTimer = 0;
     evaluateCursorMode();
+
+    // The composite grace period may have just ended
+    updateLocalCursor();
+}
+
+void SdlInputHandler::scheduleCursorModeTimer()
+{
+    // One timer for the earliest of: a pending mode switch, and the end of the grace
+    // period while the host still reports compositing a cursor we already show.
+    const Uint32 now = SDL_GetTicks();
+    uint32_t due = m_CursorDecision.nextUpdateMs;
+    if (m_ClientDrawsGraceActive && (m_HostCursorState.flags & LI_HOST_CURSOR_COMPOSITED)) {
+        const uint32_t graceEnd = m_ClientDrawsSinceMs + HOST_CURSOR_COMPOSITE_GRACE_MS;
+        if (!SDL_TICKS_PASSED(now, graceEnd) && (due == 0 || SDL_TICKS_PASSED(due, graceEnd))) {
+            due = graceEnd;
+        }
+    }
+
+    if (due != 0) {
+        if (m_CursorModeTimer == 0 || m_CursorModeTimerDue != due) {
+            if (m_CursorModeTimer != 0) {
+                SDL_RemoveTimer(m_CursorModeTimer);
+            }
+            Uint32 delay = (Uint32)qMax<int32_t>(1, (int32_t)(due - now));
+            m_CursorModeTimer = SDL_AddTimer(delay, cursorModeTimerCallback, nullptr);
+            m_CursorModeTimerDue = due;
+        }
+    }
+    else if (m_CursorModeTimer != 0) {
+        SDL_RemoveTimer(m_CursorModeTimer);
+        m_CursorModeTimer = 0;
+    }
 }
 
 void SdlInputHandler::evaluateCursorMode()
@@ -336,21 +407,7 @@ void SdlInputHandler::evaluateCursorMode()
         applyCursorMode(m_CursorDecision.mode, previous);
     }
 
-    // One timer for the earliest pending switch.
-    if (m_CursorDecision.nextUpdateMs != 0) {
-        if (m_CursorModeTimer == 0 || m_CursorModeTimerDue != m_CursorDecision.nextUpdateMs) {
-            if (m_CursorModeTimer != 0) {
-                SDL_RemoveTimer(m_CursorModeTimer);
-            }
-            Uint32 delay = (Uint32)qMax<int32_t>(1, (int32_t)(m_CursorDecision.nextUpdateMs - now));
-            m_CursorModeTimer = SDL_AddTimer(delay, cursorModeTimerCallback, nullptr);
-            m_CursorModeTimerDue = m_CursorDecision.nextUpdateMs;
-        }
-    }
-    else if (m_CursorModeTimer != 0) {
-        SDL_RemoveTimer(m_CursorModeTimer);
-        m_CursorModeTimer = 0;
-    }
+    scheduleCursorModeTimer();
 
     publishMouseModeStatus();
 }
@@ -397,11 +454,20 @@ void SdlInputHandler::applyCursorMode(Mode mode, Mode previous)
             warpToHostCursor(true);
         }
 
+        // Leaving relative mode and warping queue mouse motion carrying positions
+        // from before the switch. The first absolute update would send the last of
+        // them, jumping the host cursor (and, mid-drag in a game, its camera).
+        if (absolute) {
+            SDL_PumpEvents();
+            SDL_FlushEvent(SDL_MOUSEMOTION);
+        }
+
         // Unfocused, relative input waits for a click (as game mode always has);
         // absolute input needs no grab.
         if (captured && (focused || absolute)) {
             setCaptureActive(true);
         }
+        m_HasAbsoluteSyncPoint = false;
     }
 
     // The host's first state puts a focused window straight into absolute mode,

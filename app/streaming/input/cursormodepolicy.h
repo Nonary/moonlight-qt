@@ -17,9 +17,9 @@ namespace CursorModePolicy {
 // input, and visible and free this long before we switch back. Games that hide the
 // cursor for a moment (an MMO click, a loading flicker) never switch.
 constexpr uint32_t kEnterRelativeMs = 60;
-constexpr uint32_t kExitRelativeMs = 100;
+constexpr uint32_t kExitRelativeMs = 50;
 // Minimum time between automatic switches, whatever the host does.
-constexpr uint32_t kMinDwellMs = 150;
+constexpr uint32_t kMinDwellMs = 100;
 // Windows can hide the pointer while the user types ("Hide pointer while typing").
 // A hide that starts within this long of a key press is not a game capturing the
 // mouse until the mouse moves and the cursor stays hidden for kTypingRevealMs: the
@@ -105,6 +105,14 @@ public:
         m_NextReport = (m_NextReport + 1) % m_Reports.size();
     }
 
+    // While a mouse button is held (an MMO camera drag, firing a weapon) the return to
+    // absolute input waits for the release: switching mid-drag turns the rest of the
+    // drag into a jump. Call update() again after the release.
+    void setMouseButtonsHeld(bool held)
+    {
+        m_ButtonsHeld = held;
+    }
+
     void lock(Mode mode)
     {
         m_Locked = true;
@@ -165,7 +173,11 @@ public:
                 due = latest(due, m_LastSwitchMs + kMinDwellMs);
             }
             if (reached(nowMs, due)) {
-                switchTo(desired, nowMs);
+                if (desired != Mode::Absolute || !m_ButtonsHeld) {
+                    switchTo(desired, nowMs);
+                }
+                // Otherwise due but held until the buttons come up; the caller
+                // updates again on the release.
             }
             else {
                 next = next ? earliest(next, due) : due;
@@ -271,6 +283,8 @@ private:
 
     std::array<Report, 16> m_Reports {};
     size_t m_NextReport = 0;
+
+    bool m_ButtonsHeld = false;
 
     bool m_HasKey = false;
     uint32_t m_LastKeyMs = 0;
