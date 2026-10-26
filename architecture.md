@@ -5729,9 +5729,11 @@ extension with Vibeshine hosts; its design is Vibeshine's
 - **Policy.**
   - `app/streaming/input/cursormodepolicy.h` holds every tuning constant: enter
     relative after 60 ms hidden or locked, return after 50 ms visible and free, and
-    at least 100 ms between switches. The return waits while any mouse button is
-    held (an MMO camera drag), and drops the mouse motion queued by leaving
-    relative mode before syncing the host to the warp target.
+    at least 100 ms between switches. Once the mouse moves with a button held (an
+    MMO camera drag), a hide or lock switches to relative at once, before that
+    motion is sent; the return waits until every button is up, and drops the mouse
+    motion queued by leaving relative mode before syncing the host to the warp
+    target.
   - A hide that starts within 1 s of a key press (the OS hiding the pointer while
     typing) waits for mouse motion and then 120 ms of the cursor staying hidden.
   - A pending switch is driven by an SDL timer that pushes `SDL_CODE_HOST_CURSOR_TICK`.

@@ -15,7 +15,8 @@ namespace CursorModePolicy {
 // All tuning lives here.
 // The host cursor must look hidden/locked this long before we switch to relative
 // input, and visible and free this long before we switch back. Games that hide the
-// cursor for a moment (an MMO click, a loading flicker) never switch.
+// cursor for a moment (an MMO click, a loading flicker) never switch. A drag is the
+// exception: see setMouseButtonsHeld().
 constexpr uint32_t kEnterRelativeMs = 60;
 constexpr uint32_t kExitRelativeMs = 50;
 // Minimum time between automatic switches, whatever the host does.
@@ -67,8 +68,9 @@ public:
             m_TypingHide = false;
         }
         else if (m_Visible || !m_Available) {
-            // The cursor just disappeared. Was the user typing?
-            m_TypingHide = m_HasKey && nowMs - m_LastKeyMs <= kTypingHideWindowMs;
+            // The cursor just disappeared. Was the user typing? Not if they are
+            // holding a mouse button: the application took the mouse for a drag.
+            m_TypingHide = !m_ButtonsHeld && m_HasKey && nowMs - m_LastKeyMs <= kTypingHideWindowMs;
             m_TypingHideMoved = false;
         }
         m_Available = available;
@@ -81,7 +83,8 @@ public:
     }
 
     // Local input. Key presses mark hides that may be the OS hiding the pointer while
-    // typing; mouse motion ends that doubt. Returns true when update() must run now.
+    // typing; mouse motion ends that doubt, and marks a held button as a drag.
+    // Returns true when update() must run now, before the motion is sent.
     void noteLocalKey(uint32_t nowMs)
     {
         m_HasKey = true;
@@ -90,12 +93,17 @@ public:
 
     bool noteLocalMouseMotion(uint32_t nowMs)
     {
-        if (!m_TypingHide || m_TypingHideMoved) {
-            return false;
-        }
         (void)nowMs;
-        m_TypingHideMoved = true;
-        return true;
+        bool changed = false;
+        if (m_ButtonsHeld && !m_Dragging) {
+            m_Dragging = true;
+            changed = true;
+        }
+        if (m_TypingHide && !m_TypingHideMoved) {
+            m_TypingHideMoved = true;
+            changed = true;
+        }
+        return changed;
     }
 
     // A position the host reported while its cursor was visible.
@@ -105,12 +113,21 @@ public:
         m_NextReport = (m_NextReport + 1) % m_Reports.size();
     }
 
-    // While a mouse button is held (an MMO camera drag, firing a weapon) the return to
-    // absolute input waits for the release: switching mid-drag turns the rest of the
-    // drag into a jump. Call update() again after the release.
+    // Mouse buttons decide how drags switch (an MMO camera drag, a 3D viewport):
+    // - Once the mouse moves with a button held, a hide or lock switches to relative
+    //   input at once, skipping the delay and the dwell. Until the switch, our absolute
+    //   positions land on a cursor the game keeps putting back, and every one of them
+    //   turns the camera by the whole distance moved so far.
+    // - The return to absolute input waits for the release: switching mid-drag turns
+    //   the rest of the drag into a jump. That also stops a drag from flapping.
+    // A click that doesn't move keeps the usual delays. Call update() again after the
+    // release.
     void setMouseButtonsHeld(bool held)
     {
-        m_ButtonsHeld = held;
+        if (held != m_ButtonsHeld) {
+            m_ButtonsHeld = held;
+            m_Dragging = false;
+        }
     }
 
     void lock(Mode mode)
@@ -165,11 +182,13 @@ public:
                 m_PendingMode = desired;
                 m_PendingSinceMs = nowMs;
             }
+            const bool dragCapture = desired == Mode::Relative && m_Dragging && !m_TypingHide;
             const uint32_t delay = desired == Mode::Absolute ? kExitRelativeMs :
-                                   m_TypingHide ? kTypingRevealMs : kEnterRelativeMs;
+                                   m_TypingHide ? kTypingRevealMs :
+                                   dragCapture ? 0 : kEnterRelativeMs;
             uint32_t due = m_PendingSinceMs + delay;
             // Elapsed time is unsigned, so this holds however long since the last switch.
-            if (nowMs - m_LastSwitchMs < kMinDwellMs) {
+            if (!dragCapture && nowMs - m_LastSwitchMs < kMinDwellMs) {
                 due = latest(due, m_LastSwitchMs + kMinDwellMs);
             }
             if (reached(nowMs, due)) {
@@ -285,6 +304,7 @@ private:
     size_t m_NextReport = 0;
 
     bool m_ButtonsHeld = false;
+    bool m_Dragging = false;    // the mouse moved since the buttons went down
 
     bool m_HasKey = false;
     uint32_t m_LastKeyMs = 0;
