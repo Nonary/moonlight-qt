@@ -4,9 +4,14 @@
 #include "SDL_compat.h"
 #include "streaming/streamutils.h"
 
+#include <QScopeGuard>
+
 void SdlInputHandler::handleMouseButtonEvent(SDL_MouseButtonEvent* event)
 {
     int button;
+
+    // Automatic mouse mode sees the new button state once this event is handled
+    auto noteButtons = qScopeGuard([this] { noteMouseButtons(); });
 
     if (event->which == SDL_TOUCH_MOUSEID) {
         // Ignore synthetic mouse events

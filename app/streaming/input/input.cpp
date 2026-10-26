@@ -50,7 +50,11 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
       m_AutomaticCaptureDone(false),
       m_CursorDecision { CursorModePolicy::Mode::Fallback, CursorModePolicy::Source::Fallback, 0 },
       m_CursorModeTimer(0),
-      m_CursorModeTimerDue(0)
+      m_CursorModeTimerDue(0),
+      m_ClientDrawsGraceActive(false),
+      m_ClientDrawsSinceMs(0),
+      m_HasAbsoluteSyncPoint(false),
+      m_AbsoluteSyncPoint { 0, 0 }
 {
     SDL_zero(m_HostCursorState);
     DualSenseHaptics::resetSpeakerGenerationFloor();
@@ -509,14 +513,22 @@ void SdlInputHandler::setCaptureActive(bool active)
             int mouseX, mouseY;
             int windowX, windowY;
 
-            // We have to use SDL_GetGlobalMouseState() because macOS may not reflect
-            // the new position of the mouse when outside the window.
-            SDL_GetGlobalMouseState(&mouseX, &mouseY);
+            if (m_HasAbsoluteSyncPoint) {
+                // Automatic mouse mode just warped the cursor to the host's position
+                mouseX = m_AbsoluteSyncPoint.x;
+                mouseY = m_AbsoluteSyncPoint.y;
+                m_HasAbsoluteSyncPoint = false;
+            }
+            else {
+                // We have to use SDL_GetGlobalMouseState() because macOS may not reflect
+                // the new position of the mouse when outside the window.
+                SDL_GetGlobalMouseState(&mouseX, &mouseY);
 
-            // Convert global mouse state to window-relative
-            SDL_GetWindowPosition(m_Window, &windowX, &windowY);
-            mouseX -= windowX;
-            mouseY -= windowY;
+                // Convert global mouse state to window-relative
+                SDL_GetWindowPosition(m_Window, &windowX, &windowY);
+                mouseX -= windowX;
+                mouseY -= windowY;
+            }
 
             if (isMouseInVideoRegion(mouseX, mouseY)) {
                 // Synthesize a mouse event to synchronize the cursor

@@ -128,6 +128,19 @@ static void testFlappingHostDoesNotFlap()
         last = m;
     }
     require(switches == 5, "1 s hides switch once per hide and once per show");
+
+    // A game in relative mode that flashes its cursor for a frame or two (a loading
+    // screen) stays relative: the return delay is longer than the flash.
+    Policy r;
+    host(r, 0, false);
+    r.update(0);
+    for (uint32_t t = 1000; t < 3000; t += 250) {
+        host(r, t, true);
+        r.update(t);
+        host(r, t + kExitRelativeMs - 20, false);
+        require(r.update(t + kExitRelativeMs - 20).mode == Mode::Relative, "a brief cursor flash stays relative");
+        require(r.update(t + 200).mode == Mode::Relative, "and stays relative after it");
+    }
 }
 
 static void testClips()
@@ -242,6 +255,45 @@ static void testHideWhileTyping()
     require(r.update(1000 + kTypingHideWindowMs + 1 + kEnterRelativeMs).mode == Mode::Relative, "an ordinary hide switches");
 }
 
+static void testHeldButtonDefersReturnToAbsolute()
+{
+    // An MMO camera drag: the game hides the cursor while the right button is held,
+    // and may show it again before the button is released. Switching back to
+    // absolute mid-drag would turn the rest of the drag into a jump.
+    Policy p;
+    host(p, 0, false);
+    p.update(0);  // relative
+    p.setMouseButtonsHeld(true);
+    host(p, 1000, true);
+    p.update(1000);
+    Decision d = p.update(1000 + kExitRelativeMs);
+    require(d.mode == Mode::Relative && d.nextUpdateMs == 0, "no return to absolute while a button is held");
+    require(p.update(5000).mode == Mode::Relative, "however long it is held");
+
+    // Released after the cursor has long been visible: switch at once.
+    p.setMouseButtonsHeld(false);
+    require(p.update(5001).mode == Mode::Absolute, "released: absolute immediately");
+
+    // Released before the return delay has run: the delay still applies.
+    Policy q;
+    host(q, 0, false);
+    q.update(0);
+    q.setMouseButtonsHeld(true);
+    host(q, 1000, true);
+    q.update(1000);
+    q.setMouseButtonsHeld(false);
+    d = q.update(1010);
+    require(d.mode == Mode::Relative && d.nextUpdateMs == 1000 + kExitRelativeMs, "release before the delay waits it out");
+    require(q.update(1000 + kExitRelativeMs).mode == Mode::Absolute, "then switches");
+
+    // Entering relative mid-drag is what makes camera drags work, so it is not held.
+    Policy r = readyAbsolute(0);
+    r.setMouseButtonsHeld(true);
+    host(r, 1000, false);
+    r.update(1000);
+    require(r.update(1000 + kEnterRelativeMs).mode == Mode::Relative, "relative while a button is held");
+}
+
 static void testLongSessionsKeepSwitching()
 {
     // More than 2^31 ms after the last switch the dwell must not look like the future.
@@ -276,6 +328,7 @@ int main()
     testRecentring();
     testLocks();
     testHideWhileTyping();
+    testHeldButtonDefersReturnToAbsolute();
     testLongSessionsKeepSwitching();
     testTickWrap();
     if (g_Failures == 0) {
