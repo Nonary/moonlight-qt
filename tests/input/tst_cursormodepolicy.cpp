@@ -294,6 +294,80 @@ static void testHeldButtonDefersReturnToAbsolute()
     require(r.update(1000 + kEnterRelativeMs).mode == Mode::Relative, "relative while a button is held");
 }
 
+static void testDragSwitchesAtOnce()
+{
+    // An MMO camera drag starting: right button down, the mouse moves, and the game
+    // hides its cursor. Every absolute position sent until the switch turns the camera
+    // by the whole distance moved so far, so a drag skips the delay.
+    Policy p = readyAbsolute(0);
+    p.setMouseButtonsHeld(true);
+    require(p.noteLocalMouseMotion(1000), "the first motion with a button held starts a drag");
+    require(!p.noteLocalMouseMotion(1001), "later motion needs no update");
+    require(p.update(1001).mode == Mode::Absolute, "cursor still visible: no switch");
+    host(p, 1020, false);
+    require(p.update(1020).mode == Mode::Relative, "hidden during a drag: relative at once");
+
+    // The hide arrives before the mouse moves: the first motion switches, before it is sent.
+    Policy q = readyAbsolute(0);
+    q.setMouseButtonsHeld(true);
+    host(q, 1000, false);
+    Decision d = q.update(1000);
+    require(d.mode == Mode::Absolute && d.nextUpdateMs == 1000 + kEnterRelativeMs, "a held click is not a drag yet");
+    require(q.noteLocalMouseMotion(1010), "motion makes it one");
+    require(q.update(1010).mode == Mode::Relative, "relative before the motion is sent");
+
+    // A click that doesn't move keeps the delay, so a short one never switches.
+    Policy r = readyAbsolute(0);
+    r.setMouseButtonsHeld(true);
+    host(r, 1000, false);
+    r.update(1000);
+    r.setMouseButtonsHeld(false);
+    host(r, 1030, true);
+    require(r.update(1030).mode == Mode::Absolute && r.update(5000).mode == Mode::Absolute, "a click never switches");
+
+    // Motion before the press doesn't make a drag.
+    Policy s = readyAbsolute(0);
+    require(!s.noteLocalMouseMotion(900), "motion without a button needs no update");
+    s.setMouseButtonsHeld(true);
+    host(s, 1000, false);
+    require(s.update(1000).mode == Mode::Absolute, "pressed but not moved since");
+
+    // Running with a key held, then steering with the right button: a hide that starts
+    // during a drag is not a typing hide.
+    Policy t = readyAbsolute(0);
+    t.noteLocalKey(1000);
+    t.setMouseButtonsHeld(true);
+    t.noteLocalMouseMotion(1100);
+    host(t, 1120, false);
+    require(t.update(1120).mode == Mode::Relative, "a drag right after a key press switches at once");
+
+    // A hide that started while typing still waits for the reveal, drag or not.
+    Policy u = readyAbsolute(0);
+    u.noteLocalKey(1000);
+    host(u, 1010, false);
+    u.update(1010);
+    u.setMouseButtonsHeld(true);
+    require(u.noteLocalMouseMotion(1500), "motion during a typing hide");
+    d = u.update(1500);
+    require(d.mode == Mode::Absolute && d.nextUpdateMs == 1500 + kTypingRevealMs, "the reveal wait still applies");
+
+    // Dragging again just after the last drag ended: the dwell doesn't hold it.
+    Policy v = readyAbsolute(0);
+    v.setMouseButtonsHeld(true);
+    v.noteLocalMouseMotion(1000);
+    host(v, 1000, false);
+    require(v.update(1000).mode == Mode::Relative, "first drag");
+    v.setMouseButtonsHeld(false);
+    host(v, 1200, true);
+    v.update(1200);
+    const uint32_t back = 1200 + kExitRelativeMs;
+    require(v.update(back).mode == Mode::Absolute, "released: absolute");
+    v.setMouseButtonsHeld(true);
+    v.noteLocalMouseMotion(back + 10);
+    host(v, back + 20, false);
+    require(v.update(back + 20).mode == Mode::Relative, "a second drag inside the dwell switches at once");
+}
+
 static void testLongSessionsKeepSwitching()
 {
     // More than 2^31 ms after the last switch the dwell must not look like the future.
@@ -329,6 +403,7 @@ int main()
     testLocks();
     testHideWhileTyping();
     testHeldButtonDefersReturnToAbsolute();
+    testDragSwitchesAtOnce();
     testLongSessionsKeepSwitching();
     testTickWrap();
     if (g_Failures == 0) {

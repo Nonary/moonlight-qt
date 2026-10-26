@@ -345,9 +345,10 @@ void SdlInputHandler::noteMouseButtons()
         return;
     }
 
-    // A return to absolute input waits until every button is up, so an MMO camera
-    // drag ends as a drag rather than a jump. Runs after the button event was sent,
-    // so the release reaches the host before any switch.
+    // A drag switches to relative input at once if the game takes the mouse, and
+    // returns to absolute input only when every button is up, so an MMO camera drag
+    // starts and ends without a jump. Runs after the button event was sent, so the
+    // release reaches the host before any switch.
     const bool held = SDL_GetMouseState(nullptr, nullptr) != 0;
     m_CursorPolicy.setMouseButtonsHeld(held);
     if (!held) {
