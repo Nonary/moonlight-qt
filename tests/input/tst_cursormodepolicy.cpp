@@ -174,6 +174,27 @@ static void testClips()
     require(r.noteLocalMouseMotion(1001) && r.update(1001).mode == Mode::Relative, "empty clip -> relative");
 }
 
+static void testClipConfinement()
+{
+    // Only a visible cursor kept inside a large rect confines the local cursor.
+    Policy p = readyAbsolute();
+    require(!p.hostClipConfinesCursor(0), "no clip, nothing to confine");
+    host(p, true, 800, 600);
+    require(p.hostClipConfinesCursor(0), "RTS window clip confines");
+
+    // MSFS's right-drag hides the cursor and locks it to one pixel. Pinning the local
+    // cursor there stopped all motion, so it never switched to relative.
+    host(p, true, 1, 1);
+    require(!p.hostClipConfinesCursor(0), "a lock doesn't confine");
+    host(p, false, 1, 1);
+    require(!p.hostClipConfinesCursor(0), "a hidden locked cursor doesn't confine");
+    host(p, false, 800, 600);
+    require(!p.hostClipConfinesCursor(0), "a hidden cursor doesn't confine");
+
+    p.setHostState(false, true, true, 800, 600, kWidth, kHeight);
+    require(!p.hostClipConfinesCursor(0), "nothing confines in fallback");
+}
+
 static void testRecentring()
 {
     Policy p = readyAbsolute();
@@ -249,6 +270,7 @@ int main()
     testFollowsEveryChange();
     testHeldButtonDefersReturnToAbsolute();
     testClips();
+    testClipConfinement();
     testRecentring();
     testLocks();
     testTickWrap();
