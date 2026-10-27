@@ -224,16 +224,6 @@ void SdlInputHandler::handleKeyEvent(SDL_KeyboardEvent* event)
         return;
     }
 
-    // Typing can make the host OS hide its pointer; automatic mouse mode must not
-    // mistake that for a game capturing the mouse.
-    if (m_HostCursorSupported && event->state == SDL_PRESSED &&
-            event->keysym.sym != SDLK_LCTRL && event->keysym.sym != SDLK_RCTRL &&
-            event->keysym.sym != SDLK_LSHIFT && event->keysym.sym != SDLK_RSHIFT &&
-            event->keysym.sym != SDLK_LALT && event->keysym.sym != SDLK_RALT &&
-            event->keysym.sym != SDLK_LGUI && event->keysym.sym != SDLK_RGUI) {
-        m_CursorPolicy.noteLocalKey(SDL_GetTicks());
-    }
-
     // Check for our special key combos
     if ((event->state == SDL_PRESSED) &&
             (event->keysym.mod & KMOD_CTRL) &&
