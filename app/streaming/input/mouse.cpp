@@ -31,8 +31,10 @@ void SdlInputHandler::handleMouseButtonEvent(SDL_MouseButtonEvent* event)
         // Not capturing
         return;
     }
-    else if (m_AbsoluteMouseMode && !isMouseInVideoRegion(event->x, event->y) && event->state == SDL_PRESSED) {
-        // Ignore button presses outside the video region, but allow button releases
+    else if (m_AbsoluteMouseMode && !isMouseInVideoRegion(event->x, event->y) && event->state == SDL_PRESSED &&
+             !isAwaitingRelativeMouse()) {
+        // Ignore button presses outside the video region, but allow button releases.
+        // A game holding a hidden or locked cursor gets them wherever ours rests.
         return;
     }
 
@@ -103,9 +105,14 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
     event = nullptr;
 
     // The first motion after the host hides or locks its cursor switches to relative
-    // input before it is sent, so the game gets it as relative motion.
-    if (m_HostCursorSupported && m_CursorPolicy.noteLocalMouseMotion(SDL_GetTicks())) {
+    // input before it is sent, so the game gets it as relative motion. Not in an
+    // unfocused window, where relative input would wait for a click.
+    if (m_HostCursorSupported && (SDL_GetWindowFlags(m_Window) & SDL_WINDOW_INPUT_FOCUS) &&
+            m_CursorPolicy.noteLocalMouseMotion(SDL_GetTicks())) {
         evaluateCursorMode();
+        if (!isCaptureActive()) {
+            return;
+        }
     }
 
     if (m_AbsoluteMouseMode) {
@@ -182,7 +189,7 @@ void SdlInputHandler::handleMouseWheelEvent(SDL_MouseWheelEvent* event)
         return;
     }
 
-    if (m_AbsoluteMouseMode) {
+    if (m_AbsoluteMouseMode && !isAwaitingRelativeMouse()) {
         int mouseX, mouseY;
         SDL_GetMouseState(&mouseX, &mouseY);
         if (!isMouseInVideoRegion(mouseX, mouseY)) {

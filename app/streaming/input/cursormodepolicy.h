@@ -47,7 +47,9 @@ struct Decision {
 // - Relative input starts with the first mouse motion after the host hides or locks
 //   its cursor, and that motion is already sent as relative. Until the mouse moves
 //   both modes send the same thing, so waiting costs nothing, and an app that only
-//   hides the cursor (Windows while typing, a video player) doesn't grab the pointer.
+//   hides the cursor (Windows while typing, a video player) doesn't grab the pointer
+//   until the mouse moves over the stream. Such an app shows its cursor again on
+//   that motion, and absolute input returns a round trip later.
 // - Absolute input returns as soon as the host cursor is visible and free, except
 //   while a mouse button is held: a game may show its cursor before a camera drag
 //   ends, and switching mid-drag turns the rest of the drag into a jump.
@@ -79,13 +81,25 @@ public:
     // sent: the host wants relative input and this is the first motion since.
     bool noteLocalMouseMotion(uint32_t nowMs)
     {
-        uint32_t recentreExpiry;
-        if (!m_Available || m_Locked || m_Mode != Mode::Absolute || m_Moved ||
-                !wantsRelative(nowMs, recentreExpiry)) {
+        if (m_Moved || !awaitingRelative(nowMs)) {
             return false;
         }
         m_Moved = true;
         return true;
+    }
+
+    // Whether the host cursor is hidden, locked or being recentred.
+    bool hostWantsRelative(uint32_t nowMs) const
+    {
+        uint32_t recentreExpiry;
+        return wantsRelative(nowMs, recentreExpiry);
+    }
+
+    // Still in absolute mode while automatic mode wants relative: the next mouse
+    // motion switches. Input meanwhile is meant for a game holding its cursor.
+    bool awaitingRelative(uint32_t nowMs) const
+    {
+        return m_Available && !m_Locked && m_Mode == Mode::Absolute && hostWantsRelative(nowMs);
     }
 
     // Whether the local cursor should be confined to the host's clip: a visible cursor
@@ -94,8 +108,7 @@ public:
     // switches to relative input.
     bool hostClipConfinesCursor(uint32_t nowMs) const
     {
-        uint32_t recentreExpiry;
-        return m_Available && m_HasClip && !wantsRelative(nowMs, recentreExpiry);
+        return m_Available && m_HasClip && !hostWantsRelative(nowMs);
     }
 
     // Call update() again when the buttons come up.

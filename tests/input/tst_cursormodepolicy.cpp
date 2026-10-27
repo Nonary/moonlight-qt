@@ -91,6 +91,31 @@ static void testRelativeOnFirstMotion()
     require(!r.noteLocalMouseMotion(1020), "and motion needs no update");
 }
 
+static void testAwaitingRelative()
+{
+    // Between the host hiding its cursor and the first motion, clicks and the wheel
+    // are meant for the game (the client doesn't drop them in the letterbox).
+    Policy p = readyAbsolute();
+    require(!p.awaitingRelative(0) && !p.hostWantsRelative(0), "visible cursor: nothing pending");
+    host(p, false);
+    p.update(100);
+    require(p.awaitingRelative(100) && p.hostWantsRelative(100), "hidden, mouse still: awaiting relative");
+    p.noteLocalMouseMotion(200);
+    p.update(200);
+    require(!p.awaitingRelative(200) && p.hostWantsRelative(200), "relative now: no longer awaiting");
+
+    // A lock to absolute, or fallback, never awaits relative.
+    Policy q = readyAbsolute();
+    q.lock(Mode::Absolute);
+    host(q, false);
+    q.update(100);
+    require(!q.awaitingRelative(100), "locked absolute doesn't await relative");
+    q.setHostState(false, false, false, 0, 0, kWidth, kHeight);
+    q.unlock();
+    q.update(200);
+    require(!q.awaitingRelative(200), "fallback doesn't await relative");
+}
+
 static void testAbsoluteImmediately()
 {
     Policy p = readyRelative();
@@ -266,6 +291,7 @@ int main()
 {
     testFallbackUntilAvailable();
     testRelativeOnFirstMotion();
+    testAwaitingRelative();
     testAbsoluteImmediately();
     testFollowsEveryChange();
     testHeldButtonDefersReturnToAbsolute();
