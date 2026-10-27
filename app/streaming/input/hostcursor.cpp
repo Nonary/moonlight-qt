@@ -359,15 +359,24 @@ void SdlInputHandler::noteMouseButtons()
 void SdlInputHandler::handleHostCursorTick()
 {
     m_CursorModeTimer = 0;
+    if (m_ClientDrawsGraceActive && SDL_TICKS_PASSED(SDL_GetTicks(), m_ClientDrawsSinceMs + HOST_CURSOR_COMPOSITE_GRACE_MS)) {
+        m_ClientDrawsGraceActive = false;
+    }
     evaluateCursorMode();
 
-    // The composite grace period may have just ended
-    updateLocalCursor();
+    // Recentring may have just expired, which can confine the cursor again, or the
+    // composite grace period may have just ended
+    updatePointerRegionLock();
+}
+
+bool SdlInputHandler::isAwaitingRelativeMouse()
+{
+    return m_HostCursorSupported && m_CursorPolicy.awaitingRelative(SDL_GetTicks());
 }
 
 void SdlInputHandler::scheduleCursorModeTimer()
 {
-    // One timer for the earliest of: a pending mode switch, and the end of the grace
+    // One timer for the earliest of: recentring expiring, and the end of the grace
     // period while the host still reports compositing a cursor we already show.
     const Uint32 now = SDL_GetTicks();
     uint32_t due = m_CursorDecision.nextUpdateMs;
@@ -566,9 +575,18 @@ void SdlInputHandler::handleHostCursorState(const LI_HOST_CURSOR_STATE* state)
         }
     }
 
+    // The host confirmed it stopped compositing; the grace period is over.
+    if (!(state->flags & LI_HOST_CURSOR_COMPOSITED)) {
+        m_ClientDrawsGraceActive = false;
+    }
+
     updateHostCursorControl();
 
-    if ((state->flags & LI_HOST_CURSOR_HAS_POSITION) && isHostCursorDrawnLocally()) {
+    // Not while the host wants relative input (a visible cursor locked or recentred):
+    // the warp's motion event would be the first motion, switching to relative and
+    // sending the warp distance to the game as a mouse move.
+    if ((state->flags & LI_HOST_CURSOR_HAS_POSITION) && isHostCursorDrawnLocally() &&
+            !m_CursorPolicy.hostWantsRelative(now)) {
         warpToHostCursor();
     }
 

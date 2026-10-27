@@ -164,7 +164,7 @@ public:
 
     void handleHostCursorShape(const LI_HOST_CURSOR_SHAPE* shape);
 
-    // SDL_CODE_HOST_CURSOR_TICK: a pending automatic mouse mode switch is due.
+    // SDL_CODE_HOST_CURSOR_TICK: recentring expired or the composite grace period ended.
     void handleHostCursorTick();
 
     // Automatic mouse mode, for the stats overlay; safe to call from any thread.
@@ -253,6 +253,9 @@ private:
     void scheduleCursorModeTimer();
 
     void noteMouseButtons();
+
+    // Absolute mode while automatic mode waits for motion to switch to relative
+    bool isAwaitingRelativeMouse();
 
     void applyCursorMode(CursorModePolicy::Mode mode, CursorModePolicy::Mode previous);
 
