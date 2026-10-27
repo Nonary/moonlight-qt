@@ -88,6 +88,16 @@ public:
         return true;
     }
 
+    // Whether the local cursor should be confined to the host's clip: a visible cursor
+    // kept inside a large rect (an RTS window). A lock or a hidden cursor is not
+    // confined, since pinning the local cursor would stop the very motion that
+    // switches to relative input.
+    bool hostClipConfinesCursor(uint32_t nowMs) const
+    {
+        uint32_t recentreExpiry;
+        return m_Available && m_HasClip && !wantsRelative(nowMs, recentreExpiry);
+    }
+
     // Call update() again when the buttons come up.
     void setMouseButtonsHeld(bool held)
     {

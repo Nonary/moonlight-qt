@@ -239,7 +239,8 @@ void SdlInputHandler::warpToHostCursor(bool modeSwitch)
 bool SdlInputHandler::getHostCursorClipRect(SDL_Rect* rect)
 {
     const LI_HOST_CURSOR_STATE& state = m_HostCursorState;
-    if (!isHostCursorDrawingWanted() || !(state.flags & LI_HOST_CURSOR_HAS_CLIP)) {
+    if (!isHostCursorDrawingWanted() || !(state.flags & LI_HOST_CURSOR_HAS_CLIP) ||
+            !m_CursorPolicy.hostClipConfinesCursor(SDL_GetTicks())) {
         return false;
     }
 
@@ -529,7 +530,9 @@ void SdlInputHandler::handleHostCursorState(const LI_HOST_CURSOR_STATE* state)
         return;
     }
 
-    const bool clipChanged = (state->flags & LI_HOST_CURSOR_HAS_CLIP) != (m_HostCursorState.flags & LI_HOST_CURSOR_HAS_CLIP) ||
+    // Confinement depends on the clip and on whether the cursor is visible.
+    const bool confinementMayChange = (state->flags & LI_HOST_CURSOR_HAS_CLIP) != (m_HostCursorState.flags & LI_HOST_CURSOR_HAS_CLIP) ||
+                             (state->flags & LI_HOST_CURSOR_VISIBLE) != (m_HostCursorState.flags & LI_HOST_CURSOR_VISIBLE) ||
                              state->clipLeft != m_HostCursorState.clipLeft || state->clipTop != m_HostCursorState.clipTop ||
                              state->clipRight != m_HostCursorState.clipRight || state->clipBottom != m_HostCursorState.clipBottom;
     m_HostCursorState = *state;
@@ -569,7 +572,7 @@ void SdlInputHandler::handleHostCursorState(const LI_HOST_CURSOR_STATE* state)
         warpToHostCursor();
     }
 
-    if (clipChanged) {
+    if (confinementMayChange) {
         updatePointerRegionLock();
     }
     else {
