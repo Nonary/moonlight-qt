@@ -2,6 +2,7 @@
 
 // Automatic mouse mode: picks absolute input with a local cursor while the host
 // cursor is visible and free, and relative input while a game hides or locks it.
+// It follows the host without delays, as a local mouse would.
 // Pure logic with explicit timestamps (no SDL/Qt), unit tested in
 // tests/input/cursormodepolicy.pro. See Vibeshine's docs/client-cursor-design.md.
 
@@ -13,20 +14,6 @@
 namespace CursorModePolicy {
 
 // All tuning lives here.
-// The host cursor must look hidden/locked this long before we switch to relative
-// input, and visible and free this long before we switch back. Games that hide the
-// cursor for a moment (an MMO click, a loading flicker) never switch. A drag is the
-// exception: see setMouseButtonsHeld().
-constexpr uint32_t kEnterRelativeMs = 60;
-constexpr uint32_t kExitRelativeMs = 50;
-// Minimum time between automatic switches, whatever the host does.
-constexpr uint32_t kMinDwellMs = 100;
-// Windows can hide the pointer while the user types ("Hide pointer while typing").
-// A hide that starts within this long of a key press is not a game capturing the
-// mouse until the mouse moves and the cursor stays hidden for kTypingRevealMs: the
-// host shows the pointer again on the first move.
-constexpr uint32_t kTypingHideWindowMs = 1000;
-constexpr uint32_t kTypingRevealMs = 120;
 // A clip smaller than this in both dimensions is a lock (FPS games), not a
 // confinement (RTS games keep a visible cursor inside their window).
 constexpr double kTightClipFraction = 0.10;
@@ -56,23 +43,22 @@ struct Decision {
     uint32_t nextUpdateMs;
 };
 
+// Switching rules:
+// - Relative input starts with the first mouse motion after the host hides or locks
+//   its cursor, and that motion is already sent as relative. Until the mouse moves
+//   both modes send the same thing, so waiting costs nothing, and an app that only
+//   hides the cursor (Windows while typing, a video player) doesn't grab the pointer.
+// - Absolute input returns as soon as the host cursor is visible and free, except
+//   while a mouse button is held: a game may show its cursor before a camera drag
+//   ends, and switching mid-drag turns the rest of the drag into a jump.
 class Policy {
 public:
     // The latest host state. `available` is false until the host's first full state
     // and while it reports FALLBACK. Clip sizes are in stream pixels.
-    void setHostState(uint32_t nowMs, bool available, bool visible,
+    void setHostState(bool available, bool visible,
                       bool hasClip, int clipWidth, int clipHeight,
                       int referenceWidth, int referenceHeight)
     {
-        if (visible) {
-            m_TypingHide = false;
-        }
-        else if (m_Visible || !m_Available) {
-            // The cursor just disappeared. Was the user typing? Not if they are
-            // holding a mouse button: the application took the mouse for a drag.
-            m_TypingHide = !m_ButtonsHeld && m_HasKey && nowMs - m_LastKeyMs <= kTypingHideWindowMs;
-            m_TypingHideMoved = false;
-        }
         m_Available = available;
         m_Visible = visible;
         m_HasClip = hasClip;
@@ -82,30 +68,6 @@ public:
         m_ReferenceHeight = referenceHeight;
     }
 
-    // Local input. Key presses mark hides that may be the OS hiding the pointer while
-    // typing; mouse motion ends that doubt, and marks a held button as a drag.
-    // Returns true when update() must run now, before the motion is sent.
-    void noteLocalKey(uint32_t nowMs)
-    {
-        m_HasKey = true;
-        m_LastKeyMs = nowMs;
-    }
-
-    bool noteLocalMouseMotion(uint32_t nowMs)
-    {
-        (void)nowMs;
-        bool changed = false;
-        if (m_ButtonsHeld && !m_Dragging) {
-            m_Dragging = true;
-            changed = true;
-        }
-        if (m_TypingHide && !m_TypingHideMoved) {
-            m_TypingHideMoved = true;
-            changed = true;
-        }
-        return changed;
-    }
-
     // A position the host reported while its cursor was visible.
     void noteHostPosition(uint32_t nowMs, int x, int y)
     {
@@ -113,21 +75,23 @@ public:
         m_NextReport = (m_NextReport + 1) % m_Reports.size();
     }
 
-    // Mouse buttons decide how drags switch (an MMO camera drag, a 3D viewport):
-    // - Once the mouse moves with a button held, a hide or lock switches to relative
-    //   input at once, skipping the delay and the dwell. Until the switch, our absolute
-    //   positions land on a cursor the game keeps putting back, and every one of them
-    //   turns the camera by the whole distance moved so far.
-    // - The return to absolute input waits for the release: switching mid-drag turns
-    //   the rest of the drag into a jump. That also stops a drag from flapping.
-    // A click that doesn't move keeps the usual delays. Call update() again after the
-    // release.
+    // Local mouse motion. Returns true when update() must run before the motion is
+    // sent: the host wants relative input and this is the first motion since.
+    bool noteLocalMouseMotion(uint32_t nowMs)
+    {
+        uint32_t recentreExpiry;
+        if (!m_Available || m_Locked || m_Mode != Mode::Absolute || m_Moved ||
+                !wantsRelative(nowMs, recentreExpiry)) {
+            return false;
+        }
+        m_Moved = true;
+        return true;
+    }
+
+    // Call update() again when the buttons come up.
     void setMouseButtonsHeld(bool held)
     {
-        if (held != m_ButtonsHeld) {
-            m_ButtonsHeld = held;
-            m_Dragging = false;
-        }
+        m_ButtonsHeld = held;
     }
 
     void lock(Mode mode)
@@ -155,55 +119,37 @@ public:
     {
         if (!m_Available) {
             m_Mode = Mode::Fallback;
-            m_Pending = false;
+            m_Moved = false;
             return { Mode::Fallback, Source::Fallback, 0 };
         }
 
         if (m_Locked) {
-            switchTo(m_LockedMode, nowMs);
+            m_Mode = m_LockedMode;
+            m_Moved = false;
             return { m_Mode, Source::Locked, 0 };
         }
 
         uint32_t recentreExpiry = 0;
-        const Mode desired = wantsRelative(nowMs, recentreExpiry) ? Mode::Relative : Mode::Absolute;
-        uint32_t next = recentreExpiry;
+        const bool relative = wantsRelative(nowMs, recentreExpiry);
 
         if (m_Mode == Mode::Fallback) {
-            // Leaving fallback (the first host state, a host fallback ending): there is
-            // nothing to debounce against, so take the host's state as it is.
-            switchTo(desired, nowMs);
+            // Leaving fallback (the first host state, a host fallback ending) there is
+            // no absolute input in progress to keep, so take the host's state as it is.
+            m_Mode = relative ? Mode::Relative : Mode::Absolute;
         }
-        else if (desired == m_Mode) {
-            m_Pending = false;
+        else if (relative && m_Mode == Mode::Absolute) {
+            if (m_Moved) {
+                m_Mode = Mode::Relative;
+            }
         }
-        else {
-            if (!m_Pending || m_PendingMode != desired) {
-                m_Pending = true;
-                m_PendingMode = desired;
-                m_PendingSinceMs = nowMs;
-            }
-            const bool dragCapture = desired == Mode::Relative && m_Dragging && !m_TypingHide;
-            const uint32_t delay = desired == Mode::Absolute ? kExitRelativeMs :
-                                   m_TypingHide ? kTypingRevealMs :
-                                   dragCapture ? 0 : kEnterRelativeMs;
-            uint32_t due = m_PendingSinceMs + delay;
-            // Elapsed time is unsigned, so this holds however long since the last switch.
-            if (!dragCapture && nowMs - m_LastSwitchMs < kMinDwellMs) {
-                due = latest(due, m_LastSwitchMs + kMinDwellMs);
-            }
-            if (reached(nowMs, due)) {
-                if (desired != Mode::Absolute || !m_ButtonsHeld) {
-                    switchTo(desired, nowMs);
-                }
-                // Otherwise due but held until the buttons come up; the caller
-                // updates again on the release.
-            }
-            else {
-                next = next ? earliest(next, due) : due;
-            }
+        else if (!relative && m_Mode == Mode::Relative && !m_ButtonsHeld) {
+            m_Mode = Mode::Absolute;
         }
 
-        return { m_Mode, Source::Automatic, next };
+        if (!relative || m_Mode != Mode::Absolute) {
+            m_Moved = false;
+        }
+        return { m_Mode, Source::Automatic, recentreExpiry };
     }
 
 private:
@@ -223,20 +169,6 @@ private:
     static uint32_t latest(uint32_t a, uint32_t b)
     {
         return reached(a, b) ? a : b;
-    }
-
-    static uint32_t earliest(uint32_t a, uint32_t b)
-    {
-        return reached(a, b) ? b : a;
-    }
-
-    void switchTo(Mode mode, uint32_t nowMs)
-    {
-        if (mode != m_Mode) {
-            m_Mode = mode;
-            m_LastSwitchMs = nowMs;
-        }
-        m_Pending = false;
     }
 
     bool tightlyClipped() const
@@ -282,11 +214,7 @@ private:
     bool wantsRelative(uint32_t nowMs, uint32_t& recentreExpiry) const
     {
         recentreExpiry = 0;
-        if (!m_Visible) {
-            // A pointer hidden while typing counts once the mouse has moved.
-            return !m_TypingHide || m_TypingHideMoved;
-        }
-        if (tightlyClipped()) {
+        if (!m_Visible || tightlyClipped()) {
             return true;
         }
         return recentring(nowMs, recentreExpiry);
@@ -304,21 +232,12 @@ private:
     size_t m_NextReport = 0;
 
     bool m_ButtonsHeld = false;
-    bool m_Dragging = false;    // the mouse moved since the buttons went down
-
-    bool m_HasKey = false;
-    uint32_t m_LastKeyMs = 0;
-    bool m_TypingHide = false;
-    bool m_TypingHideMoved = false;
+    bool m_Moved = false;   // the mouse moved while the host wanted relative input
 
     bool m_Locked = false;
     Mode m_LockedMode = Mode::Absolute;
 
     Mode m_Mode = Mode::Fallback;
-    uint32_t m_LastSwitchMs = 0;
-    bool m_Pending = false;
-    Mode m_PendingMode = Mode::Fallback;
-    uint32_t m_PendingSinceMs = 0;
 };
 
 }

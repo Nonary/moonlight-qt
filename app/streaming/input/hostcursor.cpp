@@ -345,10 +345,9 @@ void SdlInputHandler::noteMouseButtons()
         return;
     }
 
-    // A drag switches to relative input at once if the game takes the mouse, and
-    // returns to absolute input only when every button is up, so an MMO camera drag
-    // starts and ends without a jump. Runs after the button event was sent, so the
-    // release reaches the host before any switch.
+    // A return to absolute input waits until every button is up, so an MMO camera
+    // drag ends as a drag rather than a jump. Runs after the button event was sent,
+    // so the release reaches the host before any switch.
     const bool held = SDL_GetMouseState(nullptr, nullptr) != 0;
     m_CursorPolicy.setMouseButtonsHeld(held);
     if (!held) {
@@ -545,7 +544,7 @@ void SdlInputHandler::handleHostCursorState(const LI_HOST_CURSOR_STATE* state)
     // The parser guarantees an ordered clip, not a small one: subtract in 64 bits.
     const int clipWidth = (int)std::clamp<int64_t>((int64_t)state->clipRight - state->clipLeft, 0, INT_MAX);
     const int clipHeight = (int)std::clamp<int64_t>((int64_t)state->clipBottom - state->clipTop, 0, INT_MAX);
-    m_CursorPolicy.setHostState(now, !(state->flags & LI_HOST_CURSOR_FALLBACK), visible,
+    m_CursorPolicy.setHostState(!(state->flags & LI_HOST_CURSOR_FALLBACK), visible,
                                 state->flags & LI_HOST_CURSOR_HAS_CLIP, clipWidth, clipHeight,
                                 state->referenceWidth, state->referenceHeight);
     if (visible && (state->flags & LI_HOST_CURSOR_HAS_POSITION) && !(state->flags & LI_HOST_CURSOR_RESYNC)) {

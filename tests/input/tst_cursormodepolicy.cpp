@@ -17,17 +17,28 @@ static void require(bool condition, const char* message)
 static constexpr int kWidth = 1920;
 static constexpr int kHeight = 1080;
 
-static void host(Policy& p, uint32_t now, bool visible, int clipW = -1, int clipH = -1)
+static void host(Policy& p, bool visible, int clipW = -1, int clipH = -1)
 {
-    p.setHostState(now, true, visible, clipW >= 0, clipW, clipH, kWidth, kHeight);
+    p.setHostState(true, visible, clipW >= 0, clipW, clipH, kWidth, kHeight);
 }
 
-// A policy that has seen the host's first state at `start` with the cursor visible.
-static Policy readyAbsolute(uint32_t start)
+// A policy that has seen the host's first state with the cursor visible.
+static Policy readyAbsolute()
 {
     Policy p;
-    host(p, start, true);
-    p.update(start);
+    host(p, true);
+    p.update(0);
+    return p;
+}
+
+// The host hides its cursor and the mouse moves: relative from that motion on.
+static Policy readyRelative()
+{
+    Policy p = readyAbsolute();
+    host(p, false);
+    p.update(0);
+    p.noteLocalMouseMotion(0);
+    p.update(0);
     return p;
 }
 
@@ -36,223 +47,83 @@ static void testFallbackUntilAvailable()
     Policy p;
     Decision d = p.update(0);
     require(d.mode == Mode::Fallback && d.source == Source::Fallback && d.nextUpdateMs == 0, "no host state is fallback");
+    require(!p.noteLocalMouseMotion(0), "motion in fallback needs no update");
 
-    p.setHostState(10, false, true, false, 0, 0, kWidth, kHeight);
+    p.setHostState(false, true, false, 0, 0, kWidth, kHeight);
     d = p.update(10);
     require(d.mode == Mode::Fallback, "host FALLBACK is fallback");
 
-    // The first usable state applies at once, without hysteresis.
-    host(p, 20, false);
+    // The first usable state applies at once, hidden included: there is no absolute
+    // input in progress to keep.
+    host(p, false);
     d = p.update(20);
     require(d.mode == Mode::Relative && d.source == Source::Automatic, "first state hidden -> relative now");
 
     Policy q;
-    host(q, 20, true);
+    host(q, true);
     require(q.update(20).mode == Mode::Absolute, "first state visible -> absolute now");
 }
 
-static void testEnterRelativeAfterHysteresis()
+static void testRelativeOnFirstMotion()
 {
-    Policy p = readyAbsolute(1000);
-    host(p, 2000, false);
-    Decision d = p.update(2000);
-    require(d.mode == Mode::Absolute, "hidden but not yet long enough");
-    require(d.nextUpdateMs == 2000 + kEnterRelativeMs, "timer due when the hide has lasted long enough");
-    require(p.update(2000 + kEnterRelativeMs - 1).mode == Mode::Absolute, "one ms early");
-    require(p.update(2000 + kEnterRelativeMs).mode == Mode::Relative, "relative once hidden for the delay");
-}
-
-static void testBriefHideNeverSwitches()
-{
-    Policy p = readyAbsolute(1000);
-    host(p, 2000, false);
-    p.update(2000);
-    host(p, 2000 + kEnterRelativeMs - 1, true);
-    Decision d = p.update(2000 + kEnterRelativeMs - 1);
-    require(d.mode == Mode::Absolute && d.nextUpdateMs == 0, "a short hide is forgotten");
-    require(p.update(5000).mode == Mode::Absolute, "and never switches later");
-}
-
-static void testExitRelativeAfterHysteresis()
-{
-    Policy p;
-    host(p, 0, false);
-    p.update(0);  // relative, last switch at 0
-    host(p, 1000, true);
+    Policy p = readyAbsolute();
+    host(p, false);
     Decision d = p.update(1000);
-    require(d.mode == Mode::Relative && d.nextUpdateMs == 1000 + kExitRelativeMs, "visible, waiting to return");
-    require(p.update(1000 + kExitRelativeMs - 1).mode == Mode::Relative, "one ms early");
-    require(p.update(1000 + kExitRelativeMs).mode == Mode::Absolute, "absolute once visible for the delay");
+    require(d.mode == Mode::Absolute && d.nextUpdateMs == 0, "hidden, mouse still: nothing to send yet");
+    require(p.update(9000).mode == Mode::Absolute, "however long the mouse stays still");
+
+    require(p.noteLocalMouseMotion(9000), "the first motion asks for an update");
+    require(p.update(9000).mode == Mode::Relative, "relative before that motion is sent");
+    require(!p.noteLocalMouseMotion(9001), "in relative mode motion needs no update");
+
+    // Motion before the host hid its cursor doesn't count.
+    Policy q = readyAbsolute();
+    require(!q.noteLocalMouseMotion(500), "visible cursor: motion needs no update");
+    host(q, false);
+    require(q.update(1000).mode == Mode::Absolute, "earlier motion doesn't switch");
+
+    // The cursor comes back before the mouse moves: nothing happened, nothing pending.
+    Policy r = readyAbsolute();
+    host(r, false);
+    r.update(1000);
+    host(r, true);
+    require(r.update(1010).mode == Mode::Absolute, "still absolute");
+    require(!r.noteLocalMouseMotion(1020), "and motion needs no update");
 }
 
-static void testMinimumDwell()
+static void testAbsoluteImmediately()
 {
-    Policy p = readyAbsolute(0);
-    host(p, 1000, false);
-    p.update(1000);
-    require(p.update(1000 + kEnterRelativeMs).mode == Mode::Relative, "switched to relative");
-    const uint32_t switched = 1000 + kEnterRelativeMs;
-
-    // Visible again straight away: the exit delay alone would allow a switch at
-    // switched + 100, but the minimum dwell holds it until switched + 150.
-    host(p, switched + 1, true);
-    Decision d = p.update(switched + 1);
-    const uint32_t due = switched + 1 + kExitRelativeMs > switched + kMinDwellMs ? switched + 1 + kExitRelativeMs : switched + kMinDwellMs;
-    require(d.nextUpdateMs == due, "dwell extends the due time");
-    require(p.update(due - 1).mode == Mode::Relative, "held by the dwell");
-    require(p.update(due).mode == Mode::Absolute, "switches once the dwell passes");
+    Policy p = readyRelative();
+    host(p, true);
+    Decision d = p.update(1000);
+    require(d.mode == Mode::Absolute && d.nextUpdateMs == 0, "visible again -> absolute now");
 }
 
-static void testFlappingHostDoesNotFlap()
+static void testFollowsEveryChange()
 {
-    // An ARPG/MMO hiding the cursor in 40 ms bursts: never long enough to switch.
-    Policy p = readyAbsolute(0);
+    // A cursor flashed for a single poll is followed both ways: there is no delay.
+    Policy p = readyRelative();
+    host(p, true);
+    require(p.update(1000).mode == Mode::Absolute, "flash shown");
+    host(p, false);
+    p.update(1005);
+    require(p.noteLocalMouseMotion(1006) && p.update(1006).mode == Mode::Relative, "flash hidden, next motion relative");
+
+    // Every hide with motion and every show switches once.
+    Policy q = readyAbsolute();
     int switches = 0;
     Mode last = Mode::Absolute;
-    for (uint32_t t = 100; t < 3000; t += 10) {
-        host(p, t, ((t / 40) % 2) == 0);
-        Mode m = p.update(t).mode;
-        switches += m != last;
-        last = m;
-    }
-    require(switches == 0, "40 ms hide/show bursts never switch");
-
-    // Long hides (camera drag) switch exactly once each way, and no faster than the dwell.
-    Policy q = readyAbsolute(0);
-    switches = 0;
-    last = Mode::Absolute;
     for (uint32_t t = 100; t < 5000; t += 5) {
-        host(q, t, ((t / 1000) % 2) == 1);
+        host(q, ((t / 1000) % 2) == 0);
+        q.update(t);
+        if (q.noteLocalMouseMotion(t)) {
+            q.update(t);
+        }
         Mode m = q.update(t).mode;
         switches += m != last;
         last = m;
     }
-    require(switches == 5, "1 s hides switch once per hide and once per show");
-
-    // A game in relative mode that flashes its cursor for a frame or two (a loading
-    // screen) stays relative: the return delay is longer than the flash.
-    Policy r;
-    host(r, 0, false);
-    r.update(0);
-    for (uint32_t t = 1000; t < 3000; t += 250) {
-        host(r, t, true);
-        r.update(t);
-        host(r, t + kExitRelativeMs - 20, false);
-        require(r.update(t + kExitRelativeMs - 20).mode == Mode::Relative, "a brief cursor flash stays relative");
-        require(r.update(t + 200).mode == Mode::Relative, "and stays relative after it");
-    }
-}
-
-static void testClips()
-{
-    // An RTS confining a visible cursor to its 800x600 window stays absolute.
-    Policy p = readyAbsolute(0);
-    host(p, 1000, true, 800, 600);
-    require(p.update(5000).mode == Mode::Absolute, "large clip stays absolute");
-
-    // A visible cursor clipped to a tiny rect is locked.
-    host(p, 6000, true, 40, 40);
-    p.update(6000);
-    require(p.update(6000 + kEnterRelativeMs).mode == Mode::Relative, "tiny clip -> relative");
-
-    // Narrow in one dimension only is not a lock.
-    Policy q = readyAbsolute(0);
-    host(q, 1000, true, 1920, 20);
-    require(q.update(5000).mode == Mode::Absolute, "a clip tiny in one dimension only stays absolute");
-
-    // A clip that misses the stream entirely (empty) is a lock.
-    Policy r = readyAbsolute(0);
-    host(r, 1000, true, 0, 0);
-    r.update(1000);
-    require(r.update(1000 + kEnterRelativeMs).mode == Mode::Relative, "empty clip -> relative");
-}
-
-static void testRecentring()
-{
-    Policy p = readyAbsolute(0);
-    host(p, 1000, true);
-    // The host keeps putting a visible cursor back at the centre.
-    p.noteHostPosition(1000, 960, 540);
-    p.noteHostPosition(1016, 961, 540);
-    require(p.update(1016).mode == Mode::Absolute && p.update(1016).nextUpdateMs == 0, "two returns are not recentring");
-    p.noteHostPosition(1033, 960, 541);
-    Decision d = p.update(1033);
-    require(d.mode == Mode::Absolute && d.nextUpdateMs == 1033 + kEnterRelativeMs, "three returns start the switch");
-    require(p.update(1033 + kEnterRelativeMs).mode == Mode::Relative, "recentred cursor -> relative");
-
-    // Recentring stops: the oldest of the three reports ages out at 1000 + window + 1,
-    // then the exit delay and dwell apply.
-    d = p.update(1100);
-    require(d.mode == Mode::Relative && d.nextUpdateMs == 1000 + kRecentreWindowMs + 1, "timer for the recentring to expire");
-    d = p.update(1000 + kRecentreWindowMs + 1);
-    require(d.mode == Mode::Relative && d.nextUpdateMs != 0, "expired, waiting to return");
-    require(p.update(1000 + kRecentreWindowMs + 1 + kExitRelativeMs).mode == Mode::Absolute, "free again -> absolute");
-
-    // Reports that wander (a cursor moving slowly) are not recentring.
-    Policy q = readyAbsolute(0);
-    host(q, 1000, true);
-    for (int i = 0; i < 10; i++) {
-        q.noteHostPosition(1000 + i * 20, 900 + i * 6, 500);
-    }
-    require(q.update(1200).mode == Mode::Absolute && q.update(1200).nextUpdateMs == 0, "slow movement is not recentring");
-}
-
-static void testLocks()
-{
-    Policy p = readyAbsolute(0);
-    p.lock(Mode::Relative);
-    Decision d = p.update(10);
-    require(d.mode == Mode::Relative && d.source == Source::Locked && d.nextUpdateMs == 0, "lock applies at once");
-    host(p, 20, true);
-    require(p.update(5000).mode == Mode::Relative, "lock ignores the host");
-
-    // The host losing cursor information still falls back; the lock resumes after.
-    p.setHostState(6000, false, true, false, 0, 0, kWidth, kHeight);
-    require(p.update(6000).mode == Mode::Fallback, "fallback overrides a lock");
-    host(p, 7000, true);
-    require(p.update(7000).mode == Mode::Relative, "lock resumes");
-
-    p.unlock();
-    d = p.update(7001);
-    require(d.mode == Mode::Relative && d.source == Source::Automatic && d.nextUpdateMs != 0, "unlocked, automatic again with hysteresis");
-    require(p.update(7001 + kMinDwellMs + kExitRelativeMs).mode == Mode::Absolute, "returns to the host's mode");
-}
-
-static void testHideWhileTyping()
-{
-    // "Hide pointer while typing": the cursor vanishes right after a key press.
-    Policy p = readyAbsolute(0);
-    p.noteLocalKey(1000);
-    host(p, 1010, false);
-    Decision d = p.update(1010);
-    require(d.mode == Mode::Absolute && d.nextUpdateMs == 0, "a hide while typing does not start a switch");
-    require(p.update(5000).mode == Mode::Absolute, "and typing on never switches");
-
-    // The first mouse move makes the host show the pointer again: still absolute.
-    require(p.noteLocalMouseMotion(5000), "motion settles a typing hide");
-    d = p.update(5000);
-    require(d.mode == Mode::Absolute && d.nextUpdateMs == 5000 + kTypingRevealMs, "the motion starts the reveal wait");
-    host(p, 5030, true);
-    require(p.update(5030).mode == Mode::Absolute && p.update(5030).nextUpdateMs == 0, "pointer back: no switch");
-    require(!p.noteLocalMouseMotion(5040), "visible cursor: motion needs no update");
-
-    // A game hiding the cursor after a key press (resuming with Enter) switches once
-    // the mouse moves and the cursor stays hidden.
-    Policy q = readyAbsolute(0);
-    q.noteLocalKey(1000);
-    host(q, 1100, false);
-    q.update(1100);
-    require(q.noteLocalMouseMotion(2000), "motion after a typing hide");
-    q.update(2000);
-    require(q.update(2000 + kTypingRevealMs - 1).mode == Mode::Absolute, "reveal wait");
-    require(q.update(2000 + kTypingRevealMs).mode == Mode::Relative, "still hidden after moving -> relative");
-
-    // A hide long after the last key press is an ordinary hide.
-    Policy r = readyAbsolute(0);
-    r.noteLocalKey(1000);
-    host(r, 1000 + kTypingHideWindowMs + 1, false);
-    r.update(1000 + kTypingHideWindowMs + 1);
-    require(r.update(1000 + kTypingHideWindowMs + 1 + kEnterRelativeMs).mode == Mode::Relative, "an ordinary hide switches");
+    require(switches == 4, "two hides and two shows, four switches");
 }
 
 static void testHeldButtonDefersReturnToAbsolute()
@@ -260,151 +131,126 @@ static void testHeldButtonDefersReturnToAbsolute()
     // An MMO camera drag: the game hides the cursor while the right button is held,
     // and may show it again before the button is released. Switching back to
     // absolute mid-drag would turn the rest of the drag into a jump.
-    Policy p;
-    host(p, 0, false);
-    p.update(0);  // relative
+    Policy p = readyRelative();
     p.setMouseButtonsHeld(true);
-    host(p, 1000, true);
-    p.update(1000);
-    Decision d = p.update(1000 + kExitRelativeMs);
+    host(p, true);
+    Decision d = p.update(1000);
     require(d.mode == Mode::Relative && d.nextUpdateMs == 0, "no return to absolute while a button is held");
     require(p.update(5000).mode == Mode::Relative, "however long it is held");
-
-    // Released after the cursor has long been visible: switch at once.
     p.setMouseButtonsHeld(false);
-    require(p.update(5001).mode == Mode::Absolute, "released: absolute immediately");
-
-    // Released before the return delay has run: the delay still applies.
-    Policy q;
-    host(q, 0, false);
-    q.update(0);
-    q.setMouseButtonsHeld(true);
-    host(q, 1000, true);
-    q.update(1000);
-    q.setMouseButtonsHeld(false);
-    d = q.update(1010);
-    require(d.mode == Mode::Relative && d.nextUpdateMs == 1000 + kExitRelativeMs, "release before the delay waits it out");
-    require(q.update(1000 + kExitRelativeMs).mode == Mode::Absolute, "then switches");
+    require(p.update(5001).mode == Mode::Absolute, "released: absolute at once");
 
     // Entering relative mid-drag is what makes camera drags work, so it is not held.
-    Policy r = readyAbsolute(0);
-    r.setMouseButtonsHeld(true);
-    host(r, 1000, false);
-    r.update(1000);
-    require(r.update(1000 + kEnterRelativeMs).mode == Mode::Relative, "relative while a button is held");
-}
-
-static void testDragSwitchesAtOnce()
-{
-    // An MMO camera drag starting: right button down, the mouse moves, and the game
-    // hides its cursor. Every absolute position sent until the switch turns the camera
-    // by the whole distance moved so far, so a drag skips the delay.
-    Policy p = readyAbsolute(0);
-    p.setMouseButtonsHeld(true);
-    require(p.noteLocalMouseMotion(1000), "the first motion with a button held starts a drag");
-    require(!p.noteLocalMouseMotion(1001), "later motion needs no update");
-    require(p.update(1001).mode == Mode::Absolute, "cursor still visible: no switch");
-    host(p, 1020, false);
-    require(p.update(1020).mode == Mode::Relative, "hidden during a drag: relative at once");
-
-    // The hide arrives before the mouse moves: the first motion switches, before it is sent.
-    Policy q = readyAbsolute(0);
+    Policy q = readyAbsolute();
     q.setMouseButtonsHeld(true);
-    host(q, 1000, false);
-    Decision d = q.update(1000);
-    require(d.mode == Mode::Absolute && d.nextUpdateMs == 1000 + kEnterRelativeMs, "a held click is not a drag yet");
-    require(q.noteLocalMouseMotion(1010), "motion makes it one");
-    require(q.update(1010).mode == Mode::Relative, "relative before the motion is sent");
-
-    // A click that doesn't move keeps the delay, so a short one never switches.
-    Policy r = readyAbsolute(0);
-    r.setMouseButtonsHeld(true);
-    host(r, 1000, false);
-    r.update(1000);
-    r.setMouseButtonsHeld(false);
-    host(r, 1030, true);
-    require(r.update(1030).mode == Mode::Absolute && r.update(5000).mode == Mode::Absolute, "a click never switches");
-
-    // Motion before the press doesn't make a drag.
-    Policy s = readyAbsolute(0);
-    require(!s.noteLocalMouseMotion(900), "motion without a button needs no update");
-    s.setMouseButtonsHeld(true);
-    host(s, 1000, false);
-    require(s.update(1000).mode == Mode::Absolute, "pressed but not moved since");
-
-    // Running with a key held, then steering with the right button: a hide that starts
-    // during a drag is not a typing hide.
-    Policy t = readyAbsolute(0);
-    t.noteLocalKey(1000);
-    t.setMouseButtonsHeld(true);
-    t.noteLocalMouseMotion(1100);
-    host(t, 1120, false);
-    require(t.update(1120).mode == Mode::Relative, "a drag right after a key press switches at once");
-
-    // A hide that started while typing still waits for the reveal, drag or not.
-    Policy u = readyAbsolute(0);
-    u.noteLocalKey(1000);
-    host(u, 1010, false);
-    u.update(1010);
-    u.setMouseButtonsHeld(true);
-    require(u.noteLocalMouseMotion(1500), "motion during a typing hide");
-    d = u.update(1500);
-    require(d.mode == Mode::Absolute && d.nextUpdateMs == 1500 + kTypingRevealMs, "the reveal wait still applies");
-
-    // Dragging again just after the last drag ended: the dwell doesn't hold it.
-    Policy v = readyAbsolute(0);
-    v.setMouseButtonsHeld(true);
-    v.noteLocalMouseMotion(1000);
-    host(v, 1000, false);
-    require(v.update(1000).mode == Mode::Relative, "first drag");
-    v.setMouseButtonsHeld(false);
-    host(v, 1200, true);
-    v.update(1200);
-    const uint32_t back = 1200 + kExitRelativeMs;
-    require(v.update(back).mode == Mode::Absolute, "released: absolute");
-    v.setMouseButtonsHeld(true);
-    v.noteLocalMouseMotion(back + 10);
-    host(v, back + 20, false);
-    require(v.update(back + 20).mode == Mode::Relative, "a second drag inside the dwell switches at once");
+    host(q, false);
+    q.update(1000);
+    require(q.noteLocalMouseMotion(1001) && q.update(1001).mode == Mode::Relative, "relative while a button is held");
 }
 
-static void testLongSessionsKeepSwitching()
+static void testClips()
 {
-    // More than 2^31 ms after the last switch the dwell must not look like the future.
-    Policy p = readyAbsolute(0);
-    const uint32_t later = 0x90000000u;
-    host(p, later, false);
-    Decision d = p.update(later);
-    require(d.nextUpdateMs == later + kEnterRelativeMs, "dwell long satisfied");
-    require(p.update(later + kEnterRelativeMs).mode == Mode::Relative, "switches after 24.8+ days");
+    // An RTS confining a visible cursor to its 800x600 window stays absolute.
+    Policy p = readyAbsolute();
+    host(p, true, 800, 600);
+    p.update(1000);
+    require(!p.noteLocalMouseMotion(1000) && p.update(5000).mode == Mode::Absolute, "large clip stays absolute");
+
+    // A visible cursor clipped to a tiny rect is locked.
+    host(p, true, 40, 40);
+    p.update(6000);
+    require(p.noteLocalMouseMotion(6001) && p.update(6001).mode == Mode::Relative, "tiny clip -> relative");
+
+    // Narrow in one dimension only is not a lock.
+    Policy q = readyAbsolute();
+    host(q, true, 1920, 20);
+    q.update(1000);
+    require(!q.noteLocalMouseMotion(1000) && q.update(5000).mode == Mode::Absolute, "a clip tiny in one dimension only stays absolute");
+
+    // A clip that misses the stream entirely (empty) is a lock.
+    Policy r = readyAbsolute();
+    host(r, true, 0, 0);
+    r.update(1000);
+    require(r.noteLocalMouseMotion(1001) && r.update(1001).mode == Mode::Relative, "empty clip -> relative");
+}
+
+static void testRecentring()
+{
+    Policy p = readyAbsolute();
+    // The host keeps putting a visible cursor back at the centre.
+    p.noteHostPosition(1000, 960, 540);
+    p.noteHostPosition(1016, 961, 540);
+    require(!p.noteLocalMouseMotion(1016) && p.update(1016).nextUpdateMs == 0, "two returns are not recentring");
+    p.noteHostPosition(1033, 960, 541);
+    Decision d = p.update(1033);
+    require(d.mode == Mode::Absolute && d.nextUpdateMs == 1000 + kRecentreWindowMs + 1, "three returns: recentring until the oldest ages out");
+    require(p.noteLocalMouseMotion(1040) && p.update(1040).mode == Mode::Relative, "recentred cursor -> relative on motion");
+
+    // Recentring stops when the oldest of the three reports ages out.
+    d = p.update(1100);
+    require(d.mode == Mode::Relative && d.nextUpdateMs == 1000 + kRecentreWindowMs + 1, "timer for the recentring to expire");
+    require(p.update(1000 + kRecentreWindowMs + 1).mode == Mode::Absolute, "free again -> absolute at once");
+
+    // Reports that wander (a cursor moving slowly) are not recentring.
+    Policy q = readyAbsolute();
+    for (int i = 0; i < 10; i++) {
+        q.noteHostPosition(1000 + i * 20, 900 + i * 6, 500);
+    }
+    require(!q.noteLocalMouseMotion(1200) && q.update(1200).nextUpdateMs == 0, "slow movement is not recentring");
+}
+
+static void testLocks()
+{
+    Policy p = readyAbsolute();
+    p.lock(Mode::Relative);
+    Decision d = p.update(10);
+    require(d.mode == Mode::Relative && d.source == Source::Locked && d.nextUpdateMs == 0, "lock applies at once");
+    host(p, true);
+    require(p.update(5000).mode == Mode::Relative, "lock ignores the host");
+
+    // The host losing cursor information still falls back; the lock resumes after.
+    p.setHostState(false, true, false, 0, 0, kWidth, kHeight);
+    require(p.update(6000).mode == Mode::Fallback, "fallback overrides a lock");
+    host(p, true);
+    require(p.update(7000).mode == Mode::Relative, "lock resumes");
+
+    p.unlock();
+    d = p.update(7001);
+    require(d.mode == Mode::Absolute && d.source == Source::Automatic, "unlocked: the host's mode at once");
+
+    // Locked absolute while the host hides its cursor: motion never switches.
+    Policy q = readyAbsolute();
+    q.lock(Mode::Absolute);
+    host(q, false);
+    q.update(1000);
+    require(!q.noteLocalMouseMotion(1001) && q.update(1001).mode == Mode::Absolute, "locked absolute ignores motion");
 }
 
 static void testTickWrap()
 {
+    // The recentring timer wraps with SDL_GetTicks().
     const uint32_t start = 0xFFFFFFF0u;
-    Policy p = readyAbsolute(start - 1000);
-    host(p, start + 5, false);
-    Decision d = p.update(start + 5);
-    require(d.nextUpdateMs == (uint32_t)(start + 5 + kEnterRelativeMs), "due time wraps");
-    require(p.update(start + 6).mode == Mode::Absolute, "not due across the wrap");
-    require(p.update((uint32_t)(start + 5 + kEnterRelativeMs)).mode == Mode::Relative, "due across the wrap");
+    Policy p = readyAbsolute();
+    p.noteHostPosition(start, 960, 540);
+    p.noteHostPosition(start + 8, 960, 540);
+    p.noteHostPosition(start + 16, 960, 540);
+    Decision d = p.update(start + 16);
+    require(d.nextUpdateMs == (uint32_t)(start + kRecentreWindowMs + 1), "expiry wraps");
+    require(p.noteLocalMouseMotion(start + 20) && p.update(start + 20).mode == Mode::Relative, "relative across the wrap");
+    require(p.update((uint32_t)(start + kRecentreWindowMs)).mode == Mode::Relative, "not expired across the wrap");
+    require(p.update((uint32_t)(start + kRecentreWindowMs + 1)).mode == Mode::Absolute, "expired across the wrap");
 }
 
 int main()
 {
     testFallbackUntilAvailable();
-    testEnterRelativeAfterHysteresis();
-    testBriefHideNeverSwitches();
-    testExitRelativeAfterHysteresis();
-    testMinimumDwell();
-    testFlappingHostDoesNotFlap();
+    testRelativeOnFirstMotion();
+    testAbsoluteImmediately();
+    testFollowsEveryChange();
+    testHeldButtonDefersReturnToAbsolute();
     testClips();
     testRecentring();
     testLocks();
-    testHideWhileTyping();
-    testHeldButtonDefersReturnToAbsolute();
-    testDragSwitchesAtOnce();
-    testLongSessionsKeepSwitching();
     testTickWrap();
     if (g_Failures == 0) {
         std::printf("PASS cursor mode policy\n");
