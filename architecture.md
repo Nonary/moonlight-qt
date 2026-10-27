@@ -5729,9 +5729,12 @@ extension with Vibeshine hosts; its design is Vibeshine's
 - **Policy.**
   - `app/streaming/input/cursormodepolicy.h` follows the host with no delays. A
     hide or lock switches to relative on the next mouse motion, before that motion
-    is sent; until then both modes send the same thing, and an app that only hides
-    the cursor doesn't grab the pointer. A visible, free cursor switches back at
-    once, except while a mouse button is held (an MMO camera drag).
+    is sent. Until then both modes send the same thing (clicks and the wheel reach
+    the game even with the local cursor in the letterbox), and an app that only
+    hides the cursor doesn't grab the pointer until the mouse moves over the
+    stream. The switch needs input focus, and host warps are not followed while it
+    is pending. A visible, free cursor switches back at once, except while a mouse
+    button is held (an MMO camera drag).
   - The return drops the mouse motion queued by leaving relative mode and syncs the
     host to the warp target.
   - Recentring expiry and the composite grace period are driven by an SDL timer
