@@ -102,9 +102,8 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
     // We should not reference the original event anymore
     event = nullptr;
 
-    // Mouse motion settles whether a pointer hidden while typing was a game capturing it,
-    // and turns a held button into a drag. Either may switch modes before this motion is
-    // sent, so a game that took the mouse gets it as relative motion.
+    // The first motion after the host hides or locks its cursor switches to relative
+    // input before it is sent, so the game gets it as relative motion.
     if (m_HostCursorSupported && m_CursorPolicy.noteLocalMouseMotion(SDL_GetTicks())) {
         evaluateCursorMode();
     }

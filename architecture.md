@@ -5727,16 +5727,15 @@ extension with Vibeshine hosts; its design is Vibeshine's
   - `Session::clHostCursorState`/`clHostCursorShape` copy them into
     `SDL_CODE_HOST_CURSOR_STATE`/`SHAPE` events for the main thread.
 - **Policy.**
-  - `app/streaming/input/cursormodepolicy.h` holds every tuning constant: enter
-    relative after 60 ms hidden or locked, return after 50 ms visible and free, and
-    at least 100 ms between switches. Once the mouse moves with a button held (an
-    MMO camera drag), a hide or lock switches to relative at once, before that
-    motion is sent; the return waits until every button is up, and drops the mouse
-    motion queued by leaving relative mode before syncing the host to the warp
-    target.
-  - A hide that starts within 1 s of a key press (the OS hiding the pointer while
-    typing) waits for mouse motion and then 120 ms of the cursor staying hidden.
-  - A pending switch is driven by an SDL timer that pushes `SDL_CODE_HOST_CURSOR_TICK`.
+  - `app/streaming/input/cursormodepolicy.h` follows the host with no delays. A
+    hide or lock switches to relative on the next mouse motion, before that motion
+    is sent; until then both modes send the same thing, and an app that only hides
+    the cursor doesn't grab the pointer. A visible, free cursor switches back at
+    once, except while a mouse button is held (an MMO camera drag).
+  - The return drops the mouse motion queued by leaving relative mode and syncs the
+    host to the warp target.
+  - Recentring expiry and the composite grace period are driven by an SDL timer
+    that pushes `SDL_CODE_HOST_CURSOR_TICK`.
   - `hostcursor.cpp` applies modes through the existing `setCaptureActive()` and
     `m_AbsoluteMouseMode`. A return to absolute warps the local cursor to the host
     position first.
