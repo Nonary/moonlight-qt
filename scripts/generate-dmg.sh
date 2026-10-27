@@ -1,4 +1,5 @@
-# This script requires create-dmg to be installed from https://github.com/sindresorhus/create-dmg
+# create-dmg from https://github.com/sindresorhus/create-dmg is used when installed.
+# Otherwise the DMG is staged and imaged natively with diskutil or hdiutil.
 BUILD_CONFIG=$1
 
 fail()
@@ -103,38 +104,67 @@ fi
 codesign --verify --deep --strict "$BUILD_FOLDER/app/Moonlight.app" || fail "App bundle signature verification failed!"
 
 echo Creating DMG
-DMG_CREATED=0
-if command -v create-dmg >/dev/null 2>&1; then
-  # Test if create-dmg is sindresorhus/create-dmg (accepts <app> <destination>)
-  if create-dmg --help 2>&1 | grep -q "<app>"; then
-    if [ "$SIGNING_IDENTITY" != "" ]; then
-      create-dmg "$BUILD_FOLDER/app/Moonlight.app" "$INSTALLER_FOLDER" --identity="$SIGNING_IDENTITY" --no-version-in-filename && DMG_CREATED=1
-    else
-      # Keep unsigned builds unverified even if this machine has a signing identity.
-      create-dmg "$BUILD_FOLDER/app/Moonlight.app" "$INSTALLER_FOLDER" --no-version-in-filename --no-code-sign
-      case $? in
-        0|2) DMG_CREATED=1 ;;
-        *) DMG_CREATED=0 ;;
-      esac
-    fi
-  fi
+DMG_PATH="$INSTALLER_FOLDER/Moonlight.dmg"
+DMG_STAGING="$BUILD_FOLDER/dmg-staging"
+
+# Packaging failures must not leave anything that looks like a usable image.
+fail_package()
+{
+  rm -rf "$DMG_STAGING" "$DMG_PATH"
+  fail "$1"
+}
+
+rm -rf "$DMG_STAGING" "$DMG_PATH" || fail "Could not clear previous DMG output!"
+
+# Only sindresorhus/create-dmg (create-dmg <app> [destination]) is supported.
+# Other tools named create-dmg, such as the Homebrew create-dmg/create-dmg
+# script, take different arguments and are treated as unavailable.
+USE_CREATE_DMG=0
+if command -v create-dmg >/dev/null 2>&1 && create-dmg --help 2>&1 | grep -q "<app>"; then
+  USE_CREATE_DMG=1
 fi
 
-if [ "$DMG_CREATED" -eq 0 ]; then
-  echo "Staging DMG contents with Applications symlink..."
-  DMG_STAGING="$BUILD_FOLDER/dmg-staging"
-  rm -rf "$DMG_STAGING" "$INSTALLER_FOLDER/Moonlight.dmg"
-  mkdir -p "$DMG_STAGING"
-  ditto "$BUILD_FOLDER/app/Moonlight.app" "$DMG_STAGING/Moonlight.app"
-  ln -s /Applications "$DMG_STAGING/Applications"
+if [ "$USE_CREATE_DMG" -eq 1 ]; then
+  # An available create-dmg is authoritative. Its failures are not retried
+  # with the native fallback, so a requested identity can never be dropped.
+  if [ "$SIGNING_IDENTITY" != "" ]; then
+    create-dmg "$BUILD_FOLDER/app/Moonlight.app" "$INSTALLER_FOLDER" --identity="$SIGNING_IDENTITY" --no-version-in-filename || fail_package "create-dmg failed!"
+  else
+    # Keep unsigned builds unverified even if this machine has a signing identity.
+    create-dmg "$BUILD_FOLDER/app/Moonlight.app" "$INSTALLER_FOLDER" --no-version-in-filename --no-code-sign
+    case $? in
+      0) ;;
+      2) ;;
+      *) fail_package "create-dmg failed!";;
+    esac
+  fi
+else
+  echo "create-dmg is unavailable; staging DMG contents with Applications symlink"
+  mkdir -p "$DMG_STAGING" || fail_package "Could not create DMG staging directory!"
+  ditto "$BUILD_FOLDER/app/Moonlight.app" "$DMG_STAGING/Moonlight.app" || fail_package "Could not copy Moonlight.app into DMG staging!"
+  ln -s /Applications "$DMG_STAGING/Applications" || fail_package "Could not create Applications link in DMG staging!"
+
+  # Validate what will actually be imaged, not just the source bundle.
+  codesign --verify --deep --strict "$DMG_STAGING/Moonlight.app" || fail_package "Staged app bundle signature verification failed!"
+  [ -L "$DMG_STAGING/Applications" ] && [ "$(readlink "$DMG_STAGING/Applications")" == "/Applications" ] || fail_package "Staged Applications link is invalid!"
 
   if command -v diskutil >/dev/null 2>&1 && diskutil help image create from >/dev/null 2>&1; then
-    diskutil image create from --format UDZO --volname "Moonlight" "$DMG_STAGING" "$INSTALLER_FOLDER/Moonlight.dmg" || fail "diskutil image create failed!"
+    diskutil image create from --format UDZO --volname "Moonlight" "$DMG_STAGING" "$DMG_PATH" || fail_package "diskutil image create failed!"
   else
-    hdiutil create -volname "Moonlight" -srcfolder "$DMG_STAGING" -ov -format UDZO "$INSTALLER_FOLDER/Moonlight.dmg" || fail "hdiutil create failed!"
+    hdiutil create -volname "Moonlight" -srcfolder "$DMG_STAGING" -ov -format UDZO "$DMG_PATH" || fail_package "hdiutil create failed!"
   fi
-  rm -rf "$DMG_STAGING"
+  rm -rf "$DMG_STAGING" || fail_package "Could not remove DMG staging directory!"
+
+  # create-dmg signs its image when an identity is requested; the native
+  # image must be signed explicitly or the package is rejected.
+  if [ "$SIGNING_IDENTITY" != "" ]; then
+    echo Signing DMG
+    codesign --force --timestamp --sign "$SIGNING_IDENTITY" "$DMG_PATH" || fail_package "DMG signing failed!"
+    codesign --verify --strict "$DMG_PATH" || fail_package "DMG signature verification failed!"
+  fi
 fi
+
+[ -s "$DMG_PATH" ] || fail_package "DMG was not created!"
 
 if [ "$NOTARY_KEYCHAIN_PROFILE" != "" ]; then
   echo Uploading to App Notary service
@@ -144,5 +174,5 @@ if [ "$NOTARY_KEYCHAIN_PROFILE" != "" ]; then
   xcrun stapler staple -v $INSTALLER_FOLDER/Moonlight.dmg || fail "Notary ticket stapling failed!"
 fi
 
-mv $INSTALLER_FOLDER/Moonlight.dmg $INSTALLER_FOLDER/Moonlight-$VERSION.dmg
+mv "$DMG_PATH" "$INSTALLER_FOLDER/Moonlight-$VERSION.dmg" || fail_package "Could not rename DMG!"
 echo Build successful
