@@ -1,3 +1,5 @@
+> Historical reference: the schema-1 replay configs and revision-specific policies described below have been retired. Use a fresh schema-6 trace with the current schema-2 configs in `tests/vrr/configs/`.
+
 # Source-offset recovery at lower frame rates
 
 ## Scope and evidence

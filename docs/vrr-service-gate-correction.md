@@ -1,5 +1,9 @@
 # Shared buffering service classification correction
 
+Historical investigation. Current schema-6 policy always uses the corrected
+serial-service accounting; the former revision selector has been removed.
+See [architecture.md](../architecture.md) for the active input-goal policy.
+
 This change follows the completed September 20 14:31:51 GPU diagnostic v3 run.
 The latest completed capture is the low-bitrate final session; its preceding
 connection is the separately identified high-bitrate session. Paths, sizes,

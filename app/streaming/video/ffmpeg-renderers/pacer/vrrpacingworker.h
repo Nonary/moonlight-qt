@@ -234,6 +234,8 @@ private:
     std::atomic_bool m_CalibrationInvalidated { false };
     QByteArray m_InitialPlayoutProfile;
     bool m_CalibrationLoaded = false;
+    // Frozen after loading the startup seed, before the writer thread starts.
+    VrrTimingParameters m_TraceParameters;
     QString startDelayPath() const;
     void noteSettledDelay(uint64_t nowUs, uint64_t delayUs);
     static constexpr uint64_t kSettledDelayWarmupUs = 30000000;

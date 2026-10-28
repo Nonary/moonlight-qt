@@ -38,8 +38,7 @@
 namespace {
 
 constexpr char kTraceMagic[] = "MLVRR1\n";
-constexpr char kReplayModel[] =
-    "recorded-world-controller-exact-spacing-recorded-coarse-wake-return-active-margin-absorbed-explicit-wait-path-coverage-scheduler-injection-measured-raster-probe-normalization-display-transition-faults-gpu-stage-timed-fence-bounded-post-present-query-timed-actual-swapchain-capability-explicit-display-epoch-causes-picosecond-circular-sync-phase-raster-envelope-displayconfig-complete-signal-d3dkmt-dynamic-scanline-scale-phase-validated-freshest-causal-anchor-free-running-refresh-2026-07";
+constexpr char kReplayModel[] = "current-policy-schema6-exact-worker-raster-2026-10-27";
 constexpr uint64_t kMinimumExactRasterValidationSamples = 100;
 constexpr uint64_t kSyncAnchorTranslationJitterToleranceUs = 50;
 constexpr uint64_t kRawQpcTranslationToleranceUs = 2;
@@ -321,7 +320,6 @@ TraceValueKind traceValueKind(const QByteArray& name)
         "queue_discontinuity",
         "decision_valid",
         "can_latch_present",
-        "additional_queued_frame",
         "session_allow_tearing",
         "render_scheduler_delay_valid",
         "render_deadline_already_elapsed",
@@ -543,7 +541,6 @@ struct Columns {
     int decisionUs = -1;
     int displayRefreshHz = -1;
     int streamRateHz = -1;
-    int additionalQueuedFrame = -1;
     int sessionAllowTearing = -1;
     int displayPeriodUs = -1;
     int canLatch = -1;
@@ -841,7 +838,6 @@ struct Columns {
         decisionUs = find("decision_us");
         displayRefreshHz = find("display_refresh_hz");
         streamRateHz = find("stream_rate_hz");
-        additionalQueuedFrame = find("additional_queued_frame");
         sessionAllowTearing = find("session_allow_tearing");
         displayPeriodUs = find("display_period_us");
         canLatch = find("can_latch_present");
@@ -1262,7 +1258,7 @@ struct Columns {
         };
         if (std::any_of(std::begin(required), std::end(required),
                         [](int column) { return column < 0; })) {
-            error = "trace schema is missing exact-simulation fields (schema 3, 4, or 5 required)";
+            error = "trace schema is missing exact-simulation fields (schema 6 required)";
             return false;
         }
         m_Maximum = header.size() - 1;
@@ -1274,19 +1270,6 @@ struct Columns {
 private:
     int m_Maximum = -1;
 };
-
-// Schema default for a controller parameter path, as text, or empty when the
-// path is not a controller parameter.
-QString vrrControllerParameterDefaultText(const QString& path)
-{
-#define VRR_REPLAY_PARAMETER_DEFAULT(type, jsonName, memberName, defaultValue) \
-    if (path == QStringLiteral("controller." #jsonName)) { \
-        return QString::number(static_cast<qulonglong>(defaultValue)); \
-    }
-    VRR_TIMING_PARAMETER_FIELDS(VRR_REPLAY_PARAMETER_DEFAULT)
-#undef VRR_REPLAY_PARAMETER_DEFAULT
-    return QString();
-}
 
 struct Distribution {
     static constexpr uint64_t kExactLimitUs = 100000;
@@ -1778,7 +1761,7 @@ struct Metrics {
     Vrr13::ReadinessWindow simulatedReadiness;
     uint64_t feedbackCapacityLimitedFrames = 0;
     VrrTimingDecision lastFeedbackDecision;
-    Vrr13::InputPercentileBuffer::Stats simulatedInputPercentile;
+    Vrr13::InputGoalBuffer::Stats simulatedInputPercentile;
     double simulatedInputBufferSumUs = 0;
     uint64_t simulatedInputBufferRows = 0;
 
@@ -1844,7 +1827,6 @@ struct Metrics {
     TraceFooter traceFooter;
     uint64_t displayRefreshMismatchRows = 0;
     uint64_t streamRateMismatchRows = 0;
-    uint64_t additionalQueuedFrameMismatchRows = 0;
     bool sessionAllowTearingTelemetryAvailable = false;
     uint64_t sessionAllowTearingMismatchRows = 0;
     uint64_t latchCapabilityMismatchRows = 0;
@@ -3411,10 +3393,8 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
                           const QString& decodedTraceSha256,
                           int capturedDisplayHz, int capturedStreamFps,
                           int simulatedDisplayHz, int simulatedStreamFps,
-                          bool additionalQueuedFrame,
                           bool sessionAllowTearing,
                           bool simulatedCanLatch,
-                          uint64_t capturedResponsiveBuffer,
                           const VrrReplayScenario& scenario)
 {
     const uint64_t captureDurationUs =
@@ -3514,7 +3494,6 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         "DXGI stores SyncQPCTime paired with latch_sync_refresh_seq; it is not generally the timestamp of latch_present_refresh_seq";
     capture["display_hz"] = capturedDisplayHz;
     capture["stream_fps"] = capturedStreamFps;
-    capture["additional_queued_frame"] = additionalQueuedFrame;
     capture["session_allow_tearing"] = sessionAllowTearing;
     capture["session_allow_tearing_field_available"] =
         metrics.sessionAllowTearingTelemetryAvailable;
@@ -3523,9 +3502,6 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         static_cast<qint64>(metrics.displayRefreshMismatchRows);
     sessionConfigIntegrity["stream_rate_mismatch_rows"] =
         static_cast<qint64>(metrics.streamRateMismatchRows);
-    sessionConfigIntegrity["additional_queued_frame_mismatch_rows"] =
-        static_cast<qint64>(
-            metrics.additionalQueuedFrameMismatchRows);
     sessionConfigIntegrity["allow_tearing_mismatch_rows"] =
         static_cast<qint64>(metrics.sessionAllowTearingMismatchRows);
     sessionConfigIntegrity["latch_capability_mismatch_rows"] =
@@ -3537,7 +3513,6 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     sessionConfigIntegrity["valid"] =
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
-        metrics.additionalQueuedFrameMismatchRows == 0 &&
         metrics.sessionAllowTearingMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
@@ -3892,7 +3867,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.referencePhaseDiscontinuityMismatches == 0 &&
         metrics.referenceRebasedMismatches == 0;
     const bool referenceControllerDiagnosticsExact =
-        metrics.traceSchema == 5 &&
+        metrics.traceSchema == 6 &&
         exactScheduledDistribution(metrics.referenceReadinessPhaseDrift) &&
         exactScheduledDistribution(metrics.referenceReadinessDemandDrift) &&
         exactScheduledDistribution(
@@ -5568,14 +5543,13 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     exactPresentRefresh["qualification"] =
         "PresentRefreshCount equals SyncRefreshCount, so SyncQPCTime timestamps the same refresh";
     exactPresentRefresh["evidence_scope"] =
-        "a positive active classification is the strongest schema-5 software evidence of an active-scanout transition, but it is not an optical tear sensor";
+        "a positive active classification is the strongest schema-6 software evidence of an active-scanout transition, but it is not an optical tear sensor";
     exactPresentRefresh["validation_scope"] =
         "pre_present_envelope_to_equality_anchored_classification for the same Present ID";
     observedTears["exact_present_refresh_timing"] = exactPresentRefresh;
 
-    const auto readinessObject = [](const Vrr13::ReadinessWindow& window,
-                                    uint64_t revision) {
-        const auto sample = window.snapshot(0, revision >= 4, revision >= 5);
+    const auto readinessObject = [](const Vrr13::ReadinessWindow& window) {
+        const auto sample = window.snapshot(0, true, true);
         QJsonObject result;
         result["window_us"] = qint64(30000000);
         result["samples"] = qint64(sample.samples);
@@ -5586,19 +5560,14 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         result["valid"] = sample.samples != 0;
         result["on_time_percent"] = sample.samples ?
             QJsonValue(100.0 * (sample.samples - sample.misses) / sample.samples) : QJsonValue();
-        if (revision >= 5) {
-            result["average_miss_us"] = Vrr13::ReadinessWindow::meanMissUs(sample);
-            result["mean_miss_smoothness_percent"] = Vrr13::ReadinessWindow::meanMissScore(sample);
-        }
-        result["scope"] = revision >= 5 ?
-            "V2 Queue: average measured lateness among late frames; smoothness score remains 100 through a 1 ms mean; 30-second reporting and one-second buffer control; drops counted separately" : revision >= 4 ?
-            "intended smoothed slot before recovery clamps; lateness through 1 ms is tolerated, 1-2 ms counts only above 50 percent prevalence, over 2 ms and client drops are misses; window/shutdown discards excluded" :
-            "intended smoothed slot before recovery clamps; any lateness and client drops are misses; window/shutdown discards excluded";
+        result["average_miss_us"] = Vrr13::ReadinessWindow::meanMissUs(sample);
+        result["mean_miss_smoothness_percent"] = Vrr13::ReadinessWindow::meanMissScore(sample);
+        result["scope"] = "readiness lateness diagnostics over 30 seconds; drops reported separately; input-goal adaptation uses its own eligible history";
         return result;
     };
     QJsonObject observed;
     observed["readiness"] = readinessObject(
-        metrics.observedReadiness, capturedResponsiveBuffer);
+        metrics.observedReadiness);
     observed["dispositions"] = countObject(metrics.dispositions);
     observed["drops"] = static_cast<qint64>(metrics.originalDrops);
     observed["latency_us"] = observedLatency;
@@ -5774,13 +5743,11 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     inputPercentile["final_window_coverage_percent"] = input.recentEligible ?
         QJsonValue(100.0 * double(input.recentEligible - std::min(input.recentEligible, input.recentMissed)) /
                    double(input.recentEligible)) : QJsonValue(QJsonValue::Null);
-    inputPercentile["scope"] = scenario.controller.playoutInputHitchMissesOnly ?
-        "session preventable input-hitch outcomes; a miss requires input beyond buffer plus tolerance and a same-frame readiness-attributed interval stretch; inputs beyond the permitted maximum are excluded, and compressed successors are not second misses" :
-        "candidate controller input-buffer coverage over the session; misses are frames whose readiness exceeded buffer plus tolerance and recovery credit";
+    inputPercentile["scope"] =
+        "Session preventable input-hitch outcomes; a miss requires input beyond buffer plus tolerance and a same-frame readiness-attributed interval stretch. Compressed successors are not second misses.";
     simulation["input_percentile"] = inputPercentile;
     simulation["display_hz"] = simulatedDisplayHz;
     simulation["stream_fps"] = simulatedStreamFps;
-    simulation["additional_queued_frame"] = additionalQueuedFrame;
     simulation["session_allow_tearing"] = sessionAllowTearing;
     simulation["native_presentation_permission_scope"] =
         "Retains the captured session's tearing permission. Controller spacing and raster classifications remain timing proxies; disabling permission does not establish optical tear absence or model changed native blocking.";
@@ -6154,8 +6121,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     simulation["overlay_playout_delay_us"] = distributionObject(
         metrics.simulatedOverlayPlayoutDelayUs);
     simulation["readiness"] = readinessObject(
-        metrics.simulatedReadiness,
-        scenario.controller.playoutResponsiveBuffer);
+        metrics.simulatedReadiness);
     simulation["on_time_target_percent"] = scenario.controller.playoutOnTimeTargetPerMillion / 10000.0;
     simulation["readiness_history_us"] = qint64(scenario.controller.playoutReadinessWindowUs);
     simulation["sender_cadence"] = senderCadenceObject(
@@ -6309,12 +6275,11 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
             metrics.exactPresentRefreshCorrelations;
     fidelity["invalid_execution_residuals"] = static_cast<qint64>(
         metrics.invalidExecutionResiduals);
-    fidelity["baseline_exact"] = metrics.traceSchema == 5 &&
+    fidelity["baseline_exact"] = metrics.traceSchema == 6 &&
         arrivalSequenceComplete &&
         semanticIntegrityReady &&
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
-        metrics.additionalQueuedFrameMismatchRows == 0 &&
         metrics.sessionAllowTearingMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
@@ -6546,7 +6511,6 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     const bool sessionConfigIntegrityReady =
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
-        metrics.additionalQueuedFrameMismatchRows == 0 &&
         metrics.sessionAllowTearingMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
@@ -6581,7 +6545,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
          metrics.postPresentQueryTimingRelationshipMismatchRows == 0) &&
         metrics.submissionTimestampRegressions == 0;
     const bool controllerReplayReady =
-        metrics.traceSchema == 5 &&
+        metrics.traceSchema == 6 &&
         arrivalSequenceComplete &&
         sessionConfigIntegrityReady &&
         timestampIntegrityReady &&
@@ -6695,7 +6659,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.counterfactualFreeRunningConversionFailures == 0;
 
     QJsonObject readinessGates;
-    readinessGates["schema_5"] = metrics.traceSchema == 5;
+    readinessGates["schema_6"] = metrics.traceSchema == 6;
     readinessGates["raster_simulation_mode_fixed"] =
         scenario.mode == "fixed";
     readinessGates["display_model_calibration_confirmed"] =
@@ -7124,7 +7088,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     summary["tear_semantics"] =
         "interval violations and raster exposure bounds are deterministic software models, not literal optical tear observations";
     summary["raster_model_scope"] =
-        "schema-5 integrity-checked DXGI SyncQPCTime/SyncRefreshCount history, stable QueryDisplayConfig physical-signal timing, and observation-only D3DKMT scan-position brackets anchor and audit modeled transitions across ideal VRR flip-following versus free-running fixed-refresh raster states; PresentRefreshCount is never treated as its timestamp";
+        "schema-6 integrity-checked DXGI SyncQPCTime/SyncRefreshCount history, stable QueryDisplayConfig physical-signal timing, and observation-only D3DKMT scan-position brackets anchor and audit modeled transitions across ideal VRR flip-following versus free-running fixed-refresh raster states; PresentRefreshCount is never treated as its timestamp";
 
     // Sender-spacing cadence headline numbers for sweep tables.
     {
@@ -8552,7 +8516,7 @@ int main(int argc, char* argv[])
             scenarioResults.append(result);
         }
         QJsonObject batch;
-        batch["config_schema"] = 1;
+        batch["config_schema"] = 2;
         batch["trace"] = QFileInfo(tracePath).fileName();
         batch["scenarios"] = scenarioResults;
         batch["passed"] = allPassed;
@@ -8666,6 +8630,27 @@ int main(int argc, char* argv[])
     const auto traceContains = [&traceColumn](const char* name) {
         return traceColumn(name) >= 0;
     };
+    // Schema 6 always emits these current-policy diagnostics. Exact replay
+    // must not silently skip an audit when a capture loses a column.
+    for (const char* name : {
+            "buffer_update_valid", "buffer_update_at_us", "buffer_update_frame",
+            "buffer_action", "buffer_attributed_frame", "buffer_request_before_us",
+            "buffer_request_after_us", "buffer_interval_error_us", "buffer_lateness_us",
+            "input_percentile_target_us", "input_percentile_current_us",
+            "input_percentile_samples", "input_percentile_window_us",
+            "input_percentile_probability_ppm", "input_percentile_eligible",
+            "input_percentile_ineligible", "input_percentile_absorbed", "input_percentile_missed",
+            "input_percentile_recent_eligible", "input_percentile_recent_absorbed",
+            "input_percentile_recent_missed", "input_percentile_release_samples",
+            "input_percentile_release_misses", "input_percentile_effective_fall_rate_us_per_second",
+            "input_percentile_last_input_required_us", "input_percentile_last_input_observation_us",
+            "input_percentile_growth_blocked", "trajectory_target_us", "trajectory_carry_us",
+            "trajectory_plans", "trajectory_resync_dropped", "trajectory_resync_deferred"}) {
+        if (!traceContains(name)) {
+            std::fprintf(stderr, "Schema 6 trace is missing current policy diagnostic: %s\n", name);
+            return 1;
+        }
+    }
     std::vector<TraceValueKind> traceValueKinds;
     traceValueKinds.reserve(static_cast<size_t>(traceHeader.size()));
     for (const QByteArray& name : traceHeader) {
@@ -9000,22 +8985,17 @@ int main(int argc, char* argv[])
         }
         const uint64_t traceSchema = unsignedField(fields,
                                                     columns.traceSchema);
-        if (traceSchema != 3 && traceSchema != 4 && traceSchema != 5) {
-            std::fprintf(stderr, "Unsupported trace schema on row %llu\n",
+        if (traceSchema != 6) {
+            std::fprintf(stderr, "Unsupported trace schema on row %llu; capture a fresh schema 6 trace\n",
                          static_cast<unsigned long long>(metrics.delivered + 2));
             return 1;
         }
-        if (traceSchema >= 4 && columns.spacingGuardFeedbackUs < 0) {
+        if (columns.spacingGuardFeedbackUs < 0) {
             std::fprintf(stderr,
-                         "Schema 4 trace is missing spacing_guard_feedback_us\n");
+                         "Schema 6 trace is missing spacing_guard_feedback_us\n");
             return 1;
         }
-        if (scenario.mode == "worker" && traceSchema < 5) {
-            std::fprintf(stderr,
-                         "Worker simulation requires a schema 5 trace\n");
-            return 2;
-        }
-        const int schema5StateColumns[] = {
+        const int controllerStateColumns[] = {
             columns.readinessPhaseUs,
             columns.readinessDemandUs,
             columns.appliedReadinessReserveUs,
@@ -9029,17 +9009,17 @@ int main(int argc, char* argv[])
             columns.phaseErrorFrames,
             columns.readinessModelValid,
         };
-        if (traceSchema >= 5 &&
+        if (traceSchema >= 6 &&
                 std::any_of(
-                    std::begin(schema5StateColumns),
-                    std::end(schema5StateColumns),
+                    std::begin(controllerStateColumns),
+                    std::end(controllerStateColumns),
                     [](int column) { return column < 0; })) {
             std::fprintf(
                 stderr,
-                "Schema 5 trace is missing captured controller diagnostic state\n");
+                "Schema 6 trace is missing captured controller diagnostic state\n");
             return 1;
         }
-        const int schema5TimingColumns[] = {
+        const int executionTimingColumns[] = {
             columns.queueDepthAfter,
             columns.queueDiscontinuity,
             columns.submissionIdValid,
@@ -9090,14 +9070,14 @@ int main(int argc, char* argv[])
             columns.completionQueueDepth,
             columns.terminalTimeUs,
         };
-        if (traceSchema >= 5 &&
+        if (traceSchema >= 6 &&
                 std::any_of(
-                    std::begin(schema5TimingColumns),
-                    std::end(schema5TimingColumns),
+                    std::begin(executionTimingColumns),
+                    std::end(executionTimingColumns),
                     [](int column) { return column < 0; })) {
             std::fprintf(
                 stderr,
-                "Schema 5 trace is missing captured lifecycle timing state\n");
+                "Schema 6 trace is missing captured lifecycle timing state\n");
             return 1;
         }
         if (metrics.traceSchema == 0) {
@@ -9360,9 +9340,7 @@ int main(int argc, char* argv[])
         const uint64_t gpuReadinessAppliedUs =
             optionalUnsignedField(
                 fields, columns.gpuReadinessAppliedUs);
-        const bool deferredGpuPolicy = optionalUnsignedField(
-            fields, columns.capturedParameterColumns.value(
-                QStringLiteral("controller.playout_serial_service_gate"), -1)) != 0;
+        constexpr bool deferredGpuPolicy = true;
         const bool nativeBackendDeclared =
             optionalUnsignedField(
                 fields, columns.nativeBackendValid) != 0;
@@ -11104,18 +11082,9 @@ int main(int argc, char* argv[])
                 pacerArrivalUs, dequeueUs, decisionUs,
                 optionalUnsignedField(fields, columns.decodeSyncWaitUs),
                 rowDecisionValid,
-                // The controller snapshot is initialized later on the first
-                // decision row. Audit that row with its recorded revision,
-                // too, rather than the default pre-revision-4 clock rule.
-                optionalUnsignedField(fields, columns.capturedParameterColumns.value(
-                    QStringLiteral("controller.playout_responsive_buffer"), -1)) >= 4,
-                optionalUnsignedField(fields, columns.capturedParameterColumns.value(
-                    QStringLiteral("controller.playout_source_mapping_decoder_output"), -1)) != 0 ||
-                // Serial-service revision 2 was introduced after the worker
-                // switched to actual post-wait clock readings. Source-map
-                // selection is independent of that timestamp contract.
-                optionalUnsignedField(fields, columns.capturedParameterColumns.value(
-                    QStringLiteral("controller.playout_serial_service_gate"), -1)) >= 2,
+                // Schema 6 always uses decode-anchored mapping and actual
+                // post-wait readiness observations, including its first row.
+                true, true,
                 optionalUnsignedField(fields, traceColumn("decode_readiness_observed")) != 0);
         const auto stageField = [&](const char* name) {
             return optionalUnsignedField(fields, traceColumn(name));
@@ -11931,8 +11900,6 @@ int main(int argc, char* argv[])
             static_cast<int>(rowStreamRateValue);
         const bool rowCanLatch =
             unsignedField(fields, columns.canLatch) != 0;
-        const bool rowAdditionalQueuedFrame = optionalUnsignedField(
-            fields, columns.additionalQueuedFrame) != 0;
         if (periodForRate(rowDisplayRefreshHz) == 0 ||
                 periodForRate(rowStreamRateHz) == 0) {
             std::fprintf(
@@ -11949,149 +11916,31 @@ int main(int argc, char* argv[])
         if (capturedConfig.displayRefreshHz == 0) {
             capturedConfig.displayRefreshHz = rowDisplayRefreshHz;
             capturedConfig.streamRateHz = rowStreamRateHz;
-            capturedConfig.allowAdditionalQueuedFrame =
-                rowAdditionalQueuedFrame;
             capturedConfig.allowTearing = rowAllowTearing;
             capturedCanLatch = rowCanLatch;
-            if (traceSchema < 5) {
-                // Schema-3/4 rows predate captured controller parameters.
-                // Reconstruct the absolute latch policy used to record them
-                // instead of inheriting current production defaults.
-                capturedParameters.latchedPresentationHeadroomUs = 1500;
-                capturedParameters.latchedPresentationExitHeadroomUs = 2000;
-                capturedParameters.
-                    latchedPresentationHeadroomPeriodNumerator = 0;
-                capturedParameters.
-                    latchedPresentationHeadroomPeriodDenominator = 1;
-                capturedParameters.
-                    latchedPresentationExitHeadroomPeriodNumerator = 0;
-                capturedParameters.
-                    latchedPresentationExitHeadroomPeriodDenominator = 1;
-                capturedParameters.latchedPresentationBaseGuardExit = 1;
+            QJsonObject capturedControllerSnapshot;
+            for (const QString& path : vrrReplayParameterNames()) {
+                if (!path.startsWith("controller.")) continue;
+                const auto column = columns.capturedParameterColumns.find(path);
+                if (column == columns.capturedParameterColumns.end()) {
+                    std::fprintf(stderr, "Schema 6 trace is missing captured controller parameter: %s\n", qPrintable(path));
+                    return 1;
+                }
+                const uint64_t capturedValue = unsignedField(fields, column.value());
+                capturedParameterValues.insert(column.value(), ownedField(fields[column.value()]));
+                if (capturedValue > 9007199254740991ULL) {
+                    std::fprintf(stderr, "Schema 6 trace has an inexact captured controller parameter: %s\n", qPrintable(path));
+                    return 1;
+                }
+                capturedControllerSnapshot.insert(path.section('.', 1, 1), static_cast<double>(capturedValue));
             }
-            else {
-                QJsonObject capturedControllerSnapshot;
-                int expectedParameterColumns = 0;
-                for (const QString& path : vrrReplayParameterNames()) {
-                    if (!path.startsWith("controller.")) continue;
-                    const auto column = columns.capturedParameterColumns.find(
-                        path);
-                    uint64_t capturedValue = 0;
-                    if (column == columns.capturedParameterColumns.end()) {
-                        // Preserve the policy semantics of schema-5 fields
-                        // added after the initial release. Older captures use
-                        // absolute latch thresholds, allow base-guard latch
-                        // exit, and predate render-tail pacing budgets; new
-                        // traces record all of these explicitly.
-                        QString legacyValue;
-                        if (path ==
-                                "controller.render_baseline_percentile") {
-                            legacyValue = "50";
-                        }
-                        else if (path ==
-                                 "controller.pacing_latency_budget_divisor") {
-                            legacyValue = "0";
-                        }
-                        else if (path.endsWith("_period_numerator")) {
-                            legacyValue = "0";
-                        }
-                        else if (path.endsWith("_period_denominator")) {
-                            legacyValue = "1";
-                        }
-                        else if (path ==
-                                 "controller.latch_base_guard_exit") {
-                            legacyValue = "1";
-                        }
-                        else if (path ==
-                                 "controller.cadence_stability_latch_frames") {
-                            // Captures made before cadence-instability
-                            // protection must retain their recorded adaptive
-                            // presentation decisions for exact replay.
-                            legacyValue = "0";
-                        }
-                        else if (path ==
-                                 "controller.source_playout_delay_us") {
-                            // Older schema-5 captures predate the explicit
-                            // source-clock playout reserve.
-                            legacyValue = "0";
-                        }
-                        else if (path ==
-                                 "controller.readiness_learning_window_us" ||
-                                 path ==
-                                 "controller.retain_readiness_on_phase_reset") {
-                            // Older schema-5 captures used a fixed sample
-                            // count and reacquired readiness after each phase
-                            // reset.
-                            legacyValue = "0";
-                        }
-                        else if (path ==
-                                 "controller.timestamp_playout_enabled") {
-                            // Older schema-5 captures predate timestamp
-                            // playout and always projected a source clock.
-                            legacyValue = "0";
-                        }
-                        else if (path ==
-                                 "controller.playout_offset_window_us") {
-                            legacyValue = "3000000";
-                        }
-                        else if (path ==
-                                 "controller.playout_offset_slew_us") {
-                            legacyValue = "20";
-                        }
-                        else if (path ==
-                                 "controller.playout_offset_warmup_samples") {
-                            legacyValue = "64";
-                        }
-                        else {
-                            // Any parameter added after a capture was made
-                            // takes its schema default: older captures ran
-                            // the controller exactly as if the parameter
-                            // did not exist, which is what the default
-                            // expresses.
-                            legacyValue =
-                                vrrControllerParameterDefaultText(path);
-                        }
-                        bool validLegacyValue = false;
-                        capturedValue = legacyValue.toULongLong(
-                            &validLegacyValue);
-                        if (legacyValue.isEmpty() || !validLegacyValue) {
-                            std::fprintf(stderr,
-                                         "Schema 5 trace is missing captured controller parameter: %s\n",
-                                         qPrintable(path));
-                            return 1;
-                        }
-                    }
-                    else {
-                        ++expectedParameterColumns;
-                        capturedValue = unsignedField(
-                            fields, column.value());
-                        capturedParameterValues.insert(
-                            column.value(), ownedField(fields[column.value()]));
-                    }
-                    if (capturedValue > 9007199254740991ULL) {
-                        std::fprintf(stderr,
-                                     "Schema 5 trace has an inexact captured controller parameter: %s\n",
-                                     qPrintable(path));
-                        return 1;
-                    }
-                    capturedControllerSnapshot.insert(
-                        path.section('.', 1, 1),
-                        static_cast<double>(capturedValue));
-                }
-                if (columns.capturedParameterColumns.size() !=
-                        expectedParameterColumns) {
-                    std::fprintf(stderr,
-                                 "Schema 5 trace is missing captured controller parameters\n");
-                    return 1;
-                }
-                if (!applyVrrReplayControllerSnapshot(
-                            capturedControllerSnapshot,
-                            capturedParameters, error)) {
-                    std::fprintf(stderr,
-                                 "Schema 5 trace has invalid captured parameters: %s\n",
-                                 qPrintable(error));
-                    return 1;
-                }
+            if (!applyVrrReplayControllerSnapshot(capturedControllerSnapshot, capturedParameters, error)) {
+                std::fprintf(stderr, "Schema 6 trace has invalid captured parameters: %s\n", qPrintable(error));
+                return 1;
+            }
+            if (!validateVrrCurrentPolicy(capturedParameters, error)) {
+                std::fprintf(stderr, "Schema 6 trace: %s\n", qPrintable(error));
+                return 1;
             }
             serializedStartSeedUs = capturedParameters.playoutDelayStartSeedUs;
             if (parser.isSet(restoredStartSeedOption)) {
@@ -12101,10 +11950,15 @@ int main(int argc, char* argv[])
                     (unsigned long long)serializedStartSeedUs,
                     (unsigned long long)restoredStartSeedUs);
             }
-            capturedConfig.latencyFix = capturedParameters.latencyFixEnabled != 0 &&
-                capturedParameters.latencyFixAllRates == 0;
-            capturedConfig.latencyMode = capturedParameters.latencyFixAllRates != 0 ?
-                (capturedParameters.latencyFixDelayPeriodPerMille == 0 ? 2 : 1) : 0;
+            const int latencyModeColumn = traceColumn("session_latency_mode");
+            if (latencyModeColumn < 0 || unsignedField(fields, latencyModeColumn) > 2) {
+                std::fprintf(stderr, "Schema 6 trace has no valid session latency mode\n");
+                return 1;
+            }
+            capturedConfig.latencyMode = int(unsignedField(fields, latencyModeColumn));
+            capturedConfig.smoothFrameTiming = capturedParameters.playoutSmoothingGainPerMille != 0;
+            capturedConfig.absorbMicrostutter =
+                capturedConfig.smoothFrameTiming && capturedParameters.smoothingMode == 7;
             if (capturedParameters.playoutIntervalToleranceUs != 0) {
                 // The explicit tolerance identifies customizable sessions. Replay
                 // their actual values rather than guessing the last preset name.
@@ -12115,10 +11969,7 @@ int main(int argc, char* argv[])
                     int(capturedParameters.playoutIntervalToleranceUs)
                 };
             }
-            simulatedConfig = capturedConfig;
-            // Current policy is shared across backends. Exact replay below
-            // still uses the captured parameters, including the retired Linux policy.
-            simulatedConfig.readinessHitchFeedback = false;
+            simulatedConfig = vrrProductionSessionConfig(capturedConfig);
             if (parser.isSet(displayOption)) {
                 simulatedConfig.displayRefreshHz = displayOverrideHz;
             }
@@ -12133,12 +11984,6 @@ int main(int argc, char* argv[])
                 scenario.controller = capturedParameters;
             }
             else if (!scenario.controllerCustomized || scenario.controllerFromSession) {
-                // Current preferences migrate the enabled legacy checkbox to
-                // Balanced Target; exact/reference replay retains the recorded policy.
-                if (simulatedConfig.latencyFix && simulatedConfig.latencyMode == 0) {
-                    simulatedConfig.latencyFix = false;
-                    simulatedConfig.latencyMode = 1;
-                }
                 scenario.controller = vrrTimingParametersForSession(
                     simulatedConfig, simulatedCanLatch &&
                         (capturedParameters.nativeSynchronizedPresentation != 0 ||
@@ -12158,6 +12003,10 @@ int main(int argc, char* argv[])
                         return 2;
                     }
                 }
+            }
+            if (!validateVrrCurrentPolicy(scenario.controller, error)) {
+                std::fprintf(stderr, "Replay scenario: %s\n", qPrintable(error));
+                return 2;
             }
             referenceController = std::make_unique<VrrTimingController>(
                 capturedConfig, capturedCanLatch, capturedParameters);
@@ -12191,9 +12040,6 @@ int main(int argc, char* argv[])
                 rowDisplayRefreshHz != capturedConfig.displayRefreshHz ? 1 : 0;
             metrics.streamRateMismatchRows +=
                 rowStreamRateHz != capturedConfig.streamRateHz ? 1 : 0;
-            metrics.additionalQueuedFrameMismatchRows +=
-                rowAdditionalQueuedFrame !=
-                    capturedConfig.allowAdditionalQueuedFrame ? 1 : 0;
             metrics.sessionAllowTearingMismatchRows +=
                 rowAllowTearing != capturedConfig.allowTearing ? 1 : 0;
             metrics.latchCapabilityMismatchRows +=
@@ -13183,7 +13029,7 @@ int main(int argc, char* argv[])
             optionalUnsignedField(fields, columns.spacingCorrected) != 0;
         const uint64_t recordedTerminalTimeUs = optionalUnsignedField(
             fields, columns.terminalTimeUs);
-        if (traceSchema >= 5) {
+        if (traceSchema >= 6) {
             const uint64_t recordedControllerCallUs = unsignedField(
                 fields, columns.controllerCallUs);
             const bool controllerCallOrderValid =
@@ -13589,7 +13435,7 @@ int main(int argc, char* argv[])
             }
         }
         metrics.lastFeedbackDecision = simulatedDecision;
-        // Optional schema-5 extension. Old captures retain their original gate;
+        // Optional schema-6 extension. Old captures retain their original gate;
         // when the extension is present every recorded reason/cost must match.
         const auto auditBufferField = [&](const char* name, uint64_t expected) {
             const int column = traceColumn(name);
@@ -13629,7 +13475,7 @@ int main(int argc, char* argv[])
         const auto auditBufferUpdate = [&]() {
             if (!traceContains("buffer_update_valid")) return;
             const auto& update = referenceController->intervalStats().update;
-            auditBufferField("buffer_update_valid", capturedParameters.playoutResponsiveBuffer >= 6 &&
+            auditBufferField("buffer_update_valid", 12 >= 6 &&
                 update.frame == uint64_t(frameNumber) && update.atUs != 0);
             auditBufferField("buffer_update_at_us", update.atUs);
             auditBufferField("buffer_update_frame", update.frame);
@@ -13643,16 +13489,6 @@ int main(int argc, char* argv[])
             auditBufferField("buffer_clipped_increase_us", update.clippedIncreaseUs);
             auditBufferField("buffer_hold_remaining_us", update.holdRemainingUs);
             auditBufferField("buffer_cooldown_remaining_us", update.cooldownRemainingUs);
-            if (traceContains("input_release_allowed")) {
-                const auto stats = referenceController->intervalStats();
-                auditBufferField("input_release_allowed", stats.inputReleaseAllowed);
-                auditBufferField("input_release_held", stats.inputReleaseHeld);
-                auditBufferField("input_release_unknown", stats.inputReleaseUnknown);
-                auditBufferField("input_evidence_us", stats.inputEvidenceUs);
-                auditBufferField("input_candidate_us", stats.inputCandidateUs);
-                auditBufferField("input_candidate_loss_per_million", uint64_t(stats.inputCandidateLoss * 1000000));
-                auditBufferField("input_current_loss_per_million", uint64_t(stats.inputCurrentLoss * 1000000));
-            }
             if (traceContains("input_percentile_target_us")) {
                 const auto stats = referenceController->intervalStats().inputPercentile;
                 auditBufferField("input_percentile_target_us", stats.targetUs);
@@ -13671,24 +13507,18 @@ int main(int argc, char* argv[])
                 auditBufferField("input_percentile_missed", stats.missed);
                 auditBufferField("input_percentile_raises", stats.raises);
                 auditBufferField("input_percentile_lowers", stats.lowers);
-                auditBufferField("input_percentile_unknown_release", stats.unknownRelease);
                 auditBufferField("input_percentile_epoch_resets", stats.epochResets);
                 if (traceContains("input_percentile_recent_eligible")) {
                     auditBufferField("input_percentile_recent_eligible", stats.recentEligible);
                     auditBufferField("input_percentile_recent_absorbed", stats.recentAbsorbed);
                     auditBufferField("input_percentile_recent_missed", stats.recentMissed);
                 }
-                if (traceContains("input_percentile_release_factor_ppm")) {
+                if (traceContains("input_percentile_release_samples")) {
                     auditBufferField("input_percentile_release_samples", stats.recentReleaseSamples);
                     auditBufferField("input_percentile_release_misses", stats.recentReleaseMisses);
-                    auditBufferField("input_percentile_release_factor_ppm", stats.releaseFactorPpm);
                     auditBufferField("input_percentile_effective_fall_rate_us_per_second", stats.effectiveFallRateUsPerSecond);
-                    auditBufferField("input_percentile_proposed_misses", stats.recentProposedMisses);
-                    auditBufferField("input_percentile_effective_fall_rate_milli_us_per_second", stats.effectiveFallRateMilliUsPerSecond);
                 }
-                if (traceContains("input_percentile_hold_until_us")) {
-                    auditBufferField("input_percentile_hold_until_us", stats.holdUntilUs);
-                    auditBufferField("input_percentile_hold_remaining_us", stats.holdRemainingUs);
+                if (traceContains("input_percentile_last_buffer_miss_us")) {
                     auditBufferField("input_percentile_last_buffer_miss_us", stats.lastBufferMissUs);
                     auditBufferField("input_percentile_last_network_miss_us", stats.lastNetworkMissUs);
                     auditBufferField("input_percentile_last_decoder_miss_us", stats.lastDecoderMissUs);
@@ -14014,7 +13844,7 @@ int main(int argc, char* argv[])
                 gpuReadyTimeUs >= gpuReadyWaitStartUs;
             const bool deferredGpuReady = gpuReadyCompleted &&
                 isVrrGpuReadyWaitDeferred(
-                    capturedParameters.playoutSerialServiceGate != 0,
+                    2 != 0,
                     gpuReadySignalSucceeded && gpuReadySetEventSucceeded,
                     gpuReadyWaitResultDeclared,
                     recordedPreparationEndUs,
@@ -14287,7 +14117,7 @@ int main(int argc, char* argv[])
         const bool correctionWaitPresent =
             recordedCorrectionWaitStartUs != 0 ||
             recordedCorrectionWaitEndUs != 0;
-        if (traceSchema >= 5) {
+        if (traceSchema >= 6) {
             if (targetWaitPresent &&
                     recordedTargetWaitEntryUs <
                         (nativeScheduledLifecycle && hasPresentOperation ?
@@ -14329,7 +14159,7 @@ int main(int argc, char* argv[])
         }
         const bool gpuReadyTimingValid = gpuReadyTimingDeclared;
         const bool deferredGpuReadyWait = isVrrGpuReadyWaitDeferred(
-            capturedParameters.playoutSerialServiceGate != 0,
+            2 != 0,
             gpuReadySignalSucceeded && gpuReadySetEventSucceeded,
             gpuReadyWaitResultDeclared,
             recordedPreparationEndUs,
@@ -14653,7 +14483,7 @@ int main(int argc, char* argv[])
                         nativePresentEndUs);
             }
         }
-        if (traceSchema >= 5) {
+        if (traceSchema >= 6) {
             const uint64_t terminalFloorUs = std::max({
                 recordedDecisionEndUs,
                 recordedStaleCheckUs,
@@ -15383,12 +15213,12 @@ int main(int argc, char* argv[])
             auditBufferUpdate();
             if (staleAfterRenderLifecycle) {
                 if (referenceController->latencyFixActive() ||
-                    referenceController->parameters().playoutMetronomeEnabled)
+                    false)
                     referenceController->noteSubmission(false, false, 0);
                 else
                     referenceController->rebase();
                 if (simulatedController->latencyFixActive() ||
-                    simulatedController->parameters().playoutMetronomeEnabled)
+                    false)
                     simulatedController->noteSubmission(false, false, 0);
                 else
                     simulatedController->rebase();
@@ -15520,8 +15350,7 @@ int main(int argc, char* argv[])
         QString::fromLatin1(decodedTraceHash.result().toHex()),
         capturedConfig.displayRefreshHz, capturedConfig.streamRateHz,
         simulatedConfig.displayRefreshHz, simulatedConfig.streamRateHz,
-        capturedConfig.allowAdditionalQueuedFrame,
-        capturedConfig.allowTearing, simulatedCanLatch, capturedParameters.playoutResponsiveBuffer,
+        capturedConfig.allowTearing, simulatedCanLatch,
         scenario);
     QJsonObject startupInput;
     startupInput["externally_reconstructed"] = parser.isSet(restoredStartSeedOption);

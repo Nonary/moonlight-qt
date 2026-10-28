@@ -1502,28 +1502,16 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 reason = "Holding - current frame timing is outside the target";
                 break;
             case Action::InputPercentileGrow:
-                reason = "Increasing - experimental input percentile needs headroom";
+                reason = "Increasing - input timing needs more buffer";
                 break;
             case Action::InputPercentileRelease:
-                reason = "Shrinking - experimental input percentile needs less headroom";
+                reason = "Shrinking - input timing needs less buffer";
                 break;
             case Action::InputPercentileHold:
                 reason = "Steady - learned input target met";
                 break;
-            case Action::InputPercentileBackoff:
-                reason = "Shrinking slowly - recent input misses exceed profile allowance";
-                break;
-            case Action::InputPercentileMissHold:
-                snprintf(recovery, sizeof(recovery),
-                         "Paused shrinking - network/decode buffer miss; %.1f s remaining",
-                         update.holdRemainingUs / 1000000.0);
-                reason = recovery;
-                break;
             case Action::InputPercentileUnknown:
                 reason = "Shrinking - obsolete input evidence expired (unknown workload)";
-                break;
-            case Action::AbsorbedJitterHold:
-                reason = "Holding - smaller buffer predicts input timing errors";
                 break;
             case Action::HistoryHold:
                 reason = "Holding - recent timing errors still affect the score";
@@ -1568,7 +1556,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                     "Adaptive input buffer | profile %.2f%% | target %.2f ms | %llu samples / %llu s%s%s\n"
                     "Window measured frames %llu | absorbed %llu | missed %llu | interval severity score distinct\n"
                     "Frame lateness %.2f ms | buffer target %.2f ms | tolerance %.2f ms | growth %s\n"
-                    "Release %.1f us/s | last-second inputs %llu / misses %llu | proposed misses %llu\n"
+                    "Release %.1f us/s | last-second inputs %llu / misses %llu\n"
                     "Network misses %llu | decode misses %llu (stage totals)\n",
                     input.probabilityPpm / 10000.0, input.targetUs / 1000.0,
                     static_cast<unsigned long long>(input.samples),
@@ -1581,10 +1569,9 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                     input.lastInputRequiredUs / 1000.0, input.headroomTargetUnclippedUs / 1000.0, input.toleranceUs / 1000.0,
                     input.growthBlocked ? "blocked: timing/capacity unqualified" :
                         input.lastInputEligible ? "measured frame" : "no measured frame",
-                    input.effectiveFallRateMilliUsPerSecond / 1000.0,
+                    double(input.effectiveFallRateUsPerSecond),
                     static_cast<unsigned long long>(input.recentReleaseSamples),
                     static_cast<unsigned long long>(input.recentReleaseMisses),
-                    static_cast<unsigned long long>(input.recentProposedMisses),
                     static_cast<unsigned long long>(input.cumulativeNetworkMisses),
                     static_cast<unsigned long long>(input.cumulativeDecoderMisses));
                 if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }

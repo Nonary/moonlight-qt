@@ -359,7 +359,7 @@ may continue if they remain useful.
 
 An unchanged controller must reproduce every target, submission timestamp,
 tear classification, and required diagnostic field exactly on the latest
-replay-supported capture, including schema 5 captures:
+replay-supported schema 6 capture:
 
 ```powershell
 $replay = (Resolve-Path .\build\tests-vrr\vrr\release\vrrreplay.exe).Path
@@ -535,7 +535,8 @@ are written locally under `%USERPROFILE%\vrr-traces` while gaming and copied to
 capture path to a UNC path: the tracer deliberately rejects UNC destinations
 to keep network I/O out of frame delivery.
 
-Both launchers enable schema-4 replay-grade `.vrrtrace` capture and deep diagnostics,
+Both launchers enable replay-grade `.vrrtrace` capture and deep diagnostics.
+The deployed worker determines the schema; current source emits schema 6. They
 retain at least the first 60 minutes, apply the 512 MiB cap only afterward, and
 run `vrrreplay.exe --require-exact-baseline` after capture to upload a JSON
 summary beside the trace. This exact check must continue to pass before a

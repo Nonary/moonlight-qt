@@ -250,9 +250,7 @@ void legacyRecoveryCannotSustainCarry() {
     VrrSessionConfig session;session.streamRateHz=116;session.displayRefreshHz=120;
     session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=1;session.experimentalBoundedCatchup=true;
     session.timingOptions.targetHundredths=9950;session.timingOptions.historySeconds=200;
-    for(bool hitchOnly:{false,true}) {
     auto policy=vrrTimingParametersForSession(session);
-    policy.playoutInputHitchMissesOnly=hitchOnly;
     policy.playoutDelayMinimumUs=1000;policy.playoutDelayStartSeedUs=1000;policy.playoutDelayMaximumUs=1000;
     VrrTimingController c(session,true,policy);
     const uint64_t period=1000000/116;
@@ -276,21 +274,14 @@ void legacyRecoveryCannotSustainCarry() {
     std::sort(carry.begin(),carry.end());std::sort(pushed.begin(),pushed.end());
     const auto median=[](const std::vector<uint64_t>& v){return v[v.size()/2];};
     const auto p90=[](const std::vector<uint64_t>& v){return v[v.size()*9/10];};
-    std::fprintf(stderr,"legacy recovery with bounded catch-up (%s): carry p50 %lluus p90 %lluus; target-plan p50 %lluus p90 %lluus\n",
-        hitchOnly?"preventable misses":"recorded input coverage",(unsigned long long)median(carry),(unsigned long long)p90(carry),(unsigned long long)median(pushed),(unsigned long long)p90(pushed));
+    std::fprintf(stderr,"bounded catch-up: carry p50 %lluus p90 %lluus; target-plan p50 %lluus p90 %lluus\n",
+        (unsigned long long)median(carry),(unsigned long long)p90(carry),(unsigned long long)median(pushed),(unsigned long long)p90(pushed));
     check(median(carry)==0 && median(pushed)==0,"between late frames the schedule returns to its plan");
-    if(!hitchOnly) check(p90(carry)<1000,
-        "recorded input coverage retains the original recovery regression bound");
-    else {
-        // A 6 ms input spike exceeds this session's permitted buffer. The
-        // new goal does not buy extra buffer for it; test actual catch-up
-        // convergence instead of relying on the old adaptive-buffer growth.
-        check(tailFrames>0 && tailStillPushed==0,
-            "unpreventable late frames still drain all carry before the next spike without re-imposing the hold");
-        check(p90(carry)<=policy.playoutCatchupCarryLimitUs,
-            "miss-only scoring retains the selected catch-up carry ceiling");
-    }
-    }
+    // A 6 ms spike exceeds the permitted buffer, so test actual convergence.
+    check(tailFrames>0 && tailStillPushed==0,
+        "late frames drain all carry before the next spike");
+    check(p90(carry)<=policy.playoutCatchupCarryLimitUs,
+        "catch-up retains the selected carry ceiling");
 }
 void actualCadenceChangeQualification() {
     VrrSessionConfig session;session.streamRateHz=120;session.displayRefreshHz=144;session.smoothFrameTiming=false;

@@ -60,6 +60,10 @@ preferences.file = $$PWD/preferences.pro
 SUBDIRS += preferences
 
 timingcontroller.file = $$PWD/timingcontroller.pro
+productionpolicybaseline.file = $$PWD/productionpolicybaseline.pro
+SUBDIRS += productionpolicybaseline
+intervalpolicybaseline.file = $$PWD/intervalpolicybaseline.pro
+SUBDIRS += intervalpolicybaseline
 sourcegapsmoothing.file = $$PWD/sourcegapsmoothing.pro
 SUBDIRS += sourcegapsmoothing
 framelimitercapabilities.file = $$PWD/framelimitercapabilities.pro
@@ -94,8 +98,8 @@ linux:packagesExist(wayland-client wayland-server) {
 
 phasetrajectory.file = $$PWD/phasetrajectory.pro
 SUBDIRS += phasetrajectory
-inputpercentileintegration.file = $$PWD/inputpercentileintegration.pro
-SUBDIRS += inputpercentileintegration
+inputgoalintegration.file = $$PWD/inputgoalintegration.pro
+SUBDIRS += inputgoalintegration
 
 performancestats.file = $$PWD/performancestats.pro
 SUBDIRS += performancestats

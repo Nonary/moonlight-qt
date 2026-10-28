@@ -1,5 +1,5 @@
 #pragma once
-#include "inputpercentilebuffer.h"
+#include "inputbuffer.h"
 #include <deque>
 
 namespace Vrr13 {
@@ -12,8 +12,8 @@ public:
         // erase history. The controller explicitly resets a new session.
         if (nowUs < m_LastUs) return;
         m_LastUs = nowUs;
-        windowUs = std::clamp(windowUs, InputPercentileBuffer::MinimumWindowUs,
-                             InputPercentileBuffer::MaximumWindowUs);
+        windowUs = std::clamp(windowUs, InputGoalBuffer::MinimumWindowUs,
+                             InputGoalBuffer::MaximumWindowUs);
         while (!m_Outcomes.empty() && nowUs - m_Outcomes.front().atUs >= windowUs)
             pop();
         m_ReportingWindowUs = std::min<uint64_t>(windowUs, 10000000);
@@ -26,12 +26,12 @@ public:
         if (!eligible) return;
         m_Outcomes.push_back({nowUs, absorbed, missed});
         m_Absorbed += absorbed; m_Missed += missed;
-        while (m_Outcomes.size() > InputPercentileBuffer::MaximumSamples) pop();
+        while (m_Outcomes.size() > InputGoalBuffer::MaximumSamples) pop();
         m_ReportingOutcomes.push_back({nowUs, absorbed, missed});
         m_ReportingAbsorbed += absorbed; m_ReportingMissed += missed;
-        while (m_ReportingOutcomes.size() > InputPercentileBuffer::MaximumSamples) popReporting();
+        while (m_ReportingOutcomes.size() > InputGoalBuffer::MaximumSamples) popReporting();
     }
-    void report(InputPercentileBuffer::Stats& stats, bool responsive = false) const {
+    void report(InputGoalBuffer::Stats& stats, bool responsive = false) const {
         stats.recentEligible = m_Outcomes.size();
         stats.recentAbsorbed = m_Absorbed;
         stats.recentMissed = m_Missed;

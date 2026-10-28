@@ -23,10 +23,10 @@ inline uint64_t staleHorizonUs(uint64_t periodUs, uint64_t periods,
                               uint64_t playoutDelayUs)
 {
     const uint64_t maximum = std::numeric_limits<uint64_t>::max();
-    const uint64_t legacy = periodUs > maximum / periods ? maximum : periodUs * periods;
+    const uint64_t cadenceHorizon = periodUs > maximum / periods ? maximum : periodUs * periods;
     const uint64_t protectedAge = playoutDelayUs > maximum - periodUs ?
         maximum : playoutDelayUs + periodUs;
-    return std::max(legacy, protectedAge);
+    return std::max(cadenceHorizon, protectedAge);
 }
 
 // Queue-only rejection, before calling a backend that may block for GPU
@@ -34,7 +34,7 @@ inline uint64_t staleHorizonUs(uint64_t periodUs, uint64_t periods,
 // slower source transition cannot be mistaken for stale queued work.
 inline bool beforeDecodeWait(const PacedFrame& frame, const PacedFrame& successor,
                              uint64_t arrivalUs, uint64_t nowUs,
-                             uint64_t sourcePeriodUs, bool metronome,
+                             uint64_t sourcePeriodUs,
                              uint64_t playoutDelayUs = 0)
 {
     if (!sourcePeriodUs || !arrivalUs || nowUs <= arrivalUs ||
@@ -47,12 +47,11 @@ inline bool beforeDecodeWait(const PacedFrame& frame, const PacedFrame& successo
     if (ticks == 0 || ticks > 90000) return false;
     const uint64_t nextIntervalUs = (uint64_t(ticks) * 1000000 + 89999) / 90000;
     const uint64_t periodUs = std::max(sourcePeriodUs, nextIntervalUs);
-    const uint64_t periods = metronome ? 4 : 2;
-    return nowUs - arrivalUs > staleHorizonUs(periodUs, periods, playoutDelayUs);
+    return nowUs - arrivalUs > staleHorizonUs(periodUs, 2, playoutDelayUs);
 }
 
-inline uint64_t maximumAgeUs(const VrrTimingDecision& decision, bool metronome,
-                             bool latencyFix, uint64_t playoutDelayUs = 0)
+inline uint64_t maximumAgeUs(const VrrTimingDecision& decision,
+                             uint64_t playoutDelayUs = 0)
 {
     // One source interval is normal occupancy for a single worker that waits
     // on the preceding frame's target. Using it as the stale threshold makes
@@ -60,13 +59,11 @@ inline uint64_t maximumAgeUs(const VrrTimingDecision& decision, bool metronome,
     // arrives. Lower-latency modes still measure age from admission, but they
     // must tolerate two intervals before replacing valid decoded work. New
     // sessions also protect the delay intentionally learned by the buffer.
-    (void) latencyFix;
-    const uint64_t periods = metronome ? 4 : 2;
-    return staleHorizonUs(decision.sourcePeriodUs, periods, playoutDelayUs);
+    return staleHorizonUs(decision.sourcePeriodUs, 2, playoutDelayUs);
 }
 
 inline bool beforeRender(const VrrTimingDecision& decision, uint64_t displayPeriodUs,
-                         uint64_t ageUs, bool metronome, bool latencyFix,
+                         uint64_t ageUs, bool latencyFix,
                          uint64_t playoutDelayUs = 0, bool lateRecovery = false)
 {
     const bool oversupply = displayPeriodUs != 0 && decision.sourcePeriodUs <= displayPeriodUs;
@@ -75,19 +72,18 @@ inline bool beforeRender(const VrrTimingDecision& decision, uint64_t displayPeri
     const bool floorBacklog = !lateRecovery && (oversupply || latencyFix) &&
         decision.presentationFloorPushUs > decision.sourcePeriodUs / 2;
     return decision.sourcePeriodUs != 0 &&
-        (ageUs > maximumAgeUs(decision, metronome, latencyFix, playoutDelayUs) ||
-         (metronome && decision.missedTicks != 0) || floorBacklog);
+        (ageUs > maximumAgeUs(decision, playoutDelayUs) || floorBacklog);
 }
 
 inline bool afterRenderWait(const VrrTimingDecision& decision, uint64_t ageOriginUs,
-                            uint64_t nowUs, bool metronome, bool latencyFix,
+                            uint64_t nowUs, bool latencyFix,
                             uint64_t decodeSyncWaitUs = 0,
                             uint64_t playoutDelayUs = 0)
 {
     const uint64_t originUs = latencyFix ? ageOriginUs : decision.targetUs;
     // The normal origin is already the delayed target. Only admission-age
     // mode needs the playout delay added to its stale horizon.
-    const uint64_t limitUs = maximumAgeUs(decision, metronome, latencyFix,
+    const uint64_t limitUs = maximumAgeUs(decision,
                                           latencyFix ? playoutDelayUs : 0);
     // A target-relative horizon already starts after decode synchronization.
     // Only admission-relative age includes the service we must exclude here.

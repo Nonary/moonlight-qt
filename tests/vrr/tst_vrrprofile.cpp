@@ -13,6 +13,15 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     QTemporaryDir dir;
     assert(dir.isValid());
+    const QByteArray policy = "\ninput_target=995000\ncarry=4000";
+    const auto key = Vrr13::calibrationKey("display-a", policy, true, true);
+    assert(!key.isEmpty());
+    assert(key == Vrr13::calibrationKey("display-a", policy, true, true));
+    assert(key != Vrr13::calibrationKey("display-b", policy, true, true));
+    assert(key != Vrr13::calibrationKey("display-a", policy + "0", true, true));
+    assert(key != Vrr13::calibrationKey("display-a", policy, false, true));
+    assert(key != Vrr13::calibrationKey("display-a", policy, true, false));
+    assert(Vrr13::calibrationKey("", policy, true, true).isEmpty());
     assert(Vrr13::jsonInteger(QJsonValue(4200)) == 4200);
     assert(Vrr13::jsonInteger(QJsonValue(1700000000.0)) == 1700000000);
     assert(Vrr13::jsonInteger(QJsonValue(-1)) == -1);

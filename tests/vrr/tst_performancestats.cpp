@@ -117,16 +117,16 @@ int main(int argc, char** argv)
         assert(cadence.stats().deviations == (error > 500 ? 1 : 0));
         assert(cadence.stats().uncertain == 0);
     }
-    // Producer-buffer sizing consumes the selected 500 us once and keeps
-    // Claude's free VRR room independent from the actual applied buffer.
+    // A qualified input hitch crosses B+T strictly; recovery credit does not
+    // erase an interval hitch that was actually observed.
     for (uint64_t room : {0, 760}) for (uint64_t error : {499, 500, 501}) {
-        Vrr13::InputPercentileBuffer input;
+        Vrr13::InputGoalBuffer input;
         input.reset(5000);
-        input.observe(1, 1000000, 1000000, int64_t(5000 + room + error), true,
-            0, 20000, 999500, 300000000, 1000, 250, 0, 500, room);
-        assert(input.stats().targetUs == 5000 + error - 500);
+        input.setGoalSolver(120000000, 700);
+        input.observe(1, 1000000, 1000000, int64_t(5000 + error), true,
+            0, 20000, 999500, 300000000, 4000, 1000, 0, 500, room, 0, error > 500);
+        assert(input.stats().targetUs == 5000); // One observation is not a qualified pair.
         assert(input.stats().recentMissed == (error > 500 ? 1 : 0));
-        assert(input.stats().rawRequiredQuantileUs == int64_t(5000 + room + error));
     }
     Vrr13::CadenceDetection cadence;
     cadence.observe({1, 10000, 1000000, 1100000, 1, true}, 500);

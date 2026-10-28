@@ -6,15 +6,14 @@
 #include <vector>
 
 #include "presenttiming.h"
-#include "absorbedjitter.h"
-#include "inputpercentilebuffer.h"
+#include "inputbuffer.h"
 #include "cadencedetection.h"
 
 namespace Vrr13 {
 // Client-added interval error, including zero-error intervals. Production
 // applies tolerance to each interval before averaging loss for both reporting
-// and control. Recorded revisions 7/8 average before tolerance; revision 10 uses a
-// separate mean-before-tolerance control history for exact historical replay.
+// and control. All observed adjacent intervals contribute to the long score;
+// capacity qualification gates adaptation rather than measurement.
 class IntervalBuffer {
 public:
     static constexpr uint64_t ToleranceUs = 500;
@@ -24,42 +23,14 @@ public:
         uint64_t frame = 0, intended = 0, submitted = 0, deadline = 0, ready = 0, buffer = 0;
         bool valid = false, absorbable = false;
         uint64_t serialService = 0, decoderQueue = 0;
-        uint64_t inputSlot = 0;
-        int64_t inputRequired = 0;
-        bool inputValid = false;
     };
     // Observation only. This explains the request made after an outcome;
     // the controller applies that request to subsequent frames. In particular,
     // rejected growth is not retained as debt or fed back into demand().
     enum class Action : uint8_t {
         Learning, SequenceBreak, Grow, Capped, CurrentPressure, HistoryHold,
-        RecoveryHold, Release, Minimum, NotAbsorbable, Cooldown, NoFreshMiss, LimitChange, AbsorbedJitterHold, InputPercentileGrow, InputPercentileRelease, InputPercentileHold, InputPercentileUnknown, InputPercentileMissHold, InputPercentileBackoff
+        RecoveryHold, Release, Minimum, NotAbsorbable, Cooldown, NoFreshMiss, LimitChange, InputPercentileGrow, InputPercentileRelease, InputPercentileHold, InputPercentileUnknown
     };
-    static const char* actionName(Action action) {
-        switch (action) {
-        case Action::InputPercentileBackoff: return "input misses slow release";
-        case Action::InputPercentileMissHold: return "input buffer miss release pause";
-        case Action::InputPercentileGrow: return "input percentile rise";
-        case Action::InputPercentileRelease: return "input percentile release";
-        case Action::InputPercentileHold: return "input percentile target";
-        case Action::InputPercentileUnknown: return "expired unknown input release";
-        case Action::AbsorbedJitterHold: return "absorbed input jitter hold";
-        case Action::Learning: return "learning";
-        case Action::SequenceBreak: return "sequence break";
-        case Action::Grow: return "late-work growth";
-        case Action::Capped: return "growth capped";
-        case Action::CurrentPressure: return "current error hold";
-        case Action::HistoryHold: return "history hold";
-        case Action::RecoveryHold: return "clean-time hold";
-        case Action::Release: return "releasing";
-        case Action::Minimum: return "minimum";
-        case Action::NotAbsorbable: return "work not absorbable";
-        case Action::Cooldown: return "growth cooldown";
-        case Action::NoFreshMiss: return "no fresh late work";
-        case Action::LimitChange: return "limit changed";
-        }
-        return "unknown";
-    }
     struct Update {
         uint64_t atUs = 0, frame = 0, attributedFrame = 0;
         uint64_t beforeUs = 0, requestedUs = 0, minimumUs = 0, maximumUs = 0;
@@ -82,11 +53,8 @@ public:
         bool serviceOverloaded = false; // Qualified one-second workload, diagnostic only.
         bool initialCalibrationComplete = false;
         uint64_t calibrationCoverageUs = 0, calibrationSamples = 0;
-        uint64_t inputReleaseAllowed = 0, inputReleaseHeld = 0, inputReleaseUnknown = 0;
-        uint64_t inputEvidenceUs = 0, inputCandidateUs = 0;
-        double inputCandidateLoss = 0, inputCurrentLoss = 0;
         bool inputPercentileEnabled = false;
-        InputPercentileBuffer::Stats inputPercentile;
+        InputGoalBuffer::Stats inputPercentile;
         Update update;
         uint64_t lastGrowthAtUs = 0, lastGrowthUs = 0;
         uint64_t lastClippedAtUs = 0, lastClippedUs = 0;
@@ -113,14 +81,7 @@ public:
                  uint64_t toleranceUs = 500,
                  uint64_t scoreWindowUs = 30000000,
                  uint64_t initialWarmupUs = 1000000,
-                 size_t initialMinimumSamples = 2,
-                 uint64_t recentPressureRelease = 0,
-                 uint64_t serialServiceGate = 0,
-                 uint64_t holdRenewBelowTarget = 0,
-                 bool perIntervalExcess = false,
-                 bool averageBufferControl = false,
-                 bool historyDriven = false,
-                 bool absorbedJitterRelease = false) {
+                 size_t initialMinimumSamples = 2) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -133,7 +94,7 @@ public:
         const bool adjacent = m_HavePrevious && s.valid && s.frame == previous.frame + 1 &&
             s.submitted > previous.submitted && s.intended > previous.intended &&
             s.submitted - previous.submitted < 1000000 && s.intended - previous.intended < 1000000;
-        if (recentPressureRelease >= 3 && s.submitted) {
+        if (s.submitted) {
             // Keep this clock independent of m_Previous: an invalid sample may
             // replace m_Previous with a zero timestamp before the next frame.
             const bool unobservedGap = m_LastObservedSubmittedUs &&
@@ -162,10 +123,6 @@ public:
         if (beforeUs != boundedUs) update.action = Action::LimitChange;
         update.minimumUs = minimum;
         update.maximumUs = maximum;
-        if (absorbedJitterRelease) {
-            m_Input.observe(s.frame, s.submitted, s.inputSlot, s.inputRequired,
-                s.valid && s.absorbable && s.inputValid);
-        }
         m_Previous = s;
         m_HavePrevious = s.valid && s.submitted && s.intended;
         if (!adjacent) {
@@ -207,44 +164,24 @@ public:
         m_Stats.calibrationCoverageUs = s.submitted - m_First;
         m_Stats.averageValid = samples >= 2 && m_SequenceSamples >= m_SequenceMinimumSamples &&
             m_Stats.calibrationCoverageUs >= m_SequenceWarmupUs;
-        if (!m_Stats.averageValid && !historyDriven) {
-            updateScore(s.submitted, scoreWindowUs);
-            return;
-        }
         if (m_Stats.averageValid) m_Stats.initialCalibrationComplete = true;
         m_Stats.serviceOverloaded = m_Stats.averageValid &&
             (service > intendedTime || decoderQueue > intendedTime);
         const bool pressure = total > samples * toleranceUs;
-        // Weight the score by evaluated time, not frame rate; gaps are unknown.
-        // Revision 9 applies tolerance before averaging so clean intervals
-        // cannot erase excess from isolated late/catch-up intervals.
         auto& score = m_Score[(s.submitted / 100000) % m_Score.size()];
         if (score.tick != s.submitted / 100000) score = ScoreBucket{s.submitted / 100000};
         score.evaluated += actual;
-        if (perIntervalExcess ? error > toleranceUs : pressure) score.failed += actual;
-        // Revision 7 measures severity rather than treating a tiny crossing as
-        // a completely failed interval. Keep sub-microsecond loss in double so
-        // Smooth's 99.99% target is not biased by per-frame rounding.
+        if (error > toleranceUs) score.failed += actual;
         const double excessUs = std::max(0.0,
-            (perIntervalExcess ? double(error) : m_Stats.averageErrorUs) - toleranceUs);
+            (double(error)) - toleranceUs);
         const double loss = std::min(1.0, excessUs / intended);
         if (severityWeighted) score.weightedLoss += actual * loss;
-        // Revision 10 keeps the accurate report above, but restores revision
-        // 7/8's averaging for every control decision, including history-based
-        // growth qualification and hold/release. Relaxing attack alone would
-        // still let isolated reported misses pin the buffer's release hold.
-        const double bufferExcessUs = averageBufferControl ?
-            std::max(0.0, m_Stats.averageErrorUs - toleranceUs) : excessUs;
-        const double bufferLoss = std::min(1.0, bufferExcessUs / intended);
-        if (averageBufferControl ? pressure : (perIntervalExcess ? error > toleranceUs : pressure))
-            score.bufferFailed += actual;
-        if (severityWeighted) score.bufferWeightedLoss += actual * bufferLoss;
+        const double bufferExcessUs = excessUs;
+        const double bufferLoss = loss;
+        if (error > toleranceUs) score.bufferFailed += actual;
+        if (severityWeighted) score.bufferWeightedLoss += actual * loss;
         updateScore(s.submitted, scoreWindowUs);
 
-        // Revision 12 retains every observed adjacent interval in the long
-        // history. Qualification guards buffer changes, not measurement:
-        // discarding a second after each break made a 2-minute score behave
-        // like a much shorter history in sessions with repeated frame gaps.
         if (!m_Stats.averageValid) return;
 
         const double allowedLoss = (1000000 - std::min<uint64_t>(targetPerMillion, 1000000)) / 1000000.0;
@@ -253,45 +190,26 @@ public:
         // Old score debt holds protection, but cannot authorize another attack
         // without current, attributable error outside the preset's allowance.
         const bool historicalPressure = severityWeighted && belowTarget;
-        const bool historyHolds = (!recentPressureRelease || historyDriven) && historicalPressure;
+        const bool historyHolds = historicalPressure;
         const auto& delayed = actual >= intended ? s : previous;
         const auto lateness = delayed.ready > delayed.deadline ? delayed.ready - delayed.deadline : 0;
         const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
         const bool windowAbsorbable = service <= intendedTime && decoderQueue <= intendedTime;
         const bool delayedAbsorbable = delayed.absorbable &&
-            (!serialServiceGate ||
-             (serialServiceGate >= 2 ? windowAbsorbable :
-              (delayed.serialService <= intended && delayed.decoderQueue <= intended)));
-        // Revision 2 applies growth's causal evidence to hold renewal too.
-        // Native presentation/scheduler jitter after readiness, or sustained
-        // service overload, cannot be repaired by retaining standing delay.
-        // Keep the normal hold between attributable misses; do not change the
-        // long quality score, attack qualification, or gradual release rate.
-        // Revision 2 permits continued recovery while the long score meets
-        // the preset target, even when recent pressure moves that score.
-        // Revision 1 only suppressed hold renewal and still paused release.
-        const bool targetAllowsHold = holdRenewBelowTarget < 2 ||
-            !severityWeighted || belowTarget;
+            (windowAbsorbable);
+        const bool targetAllowsHold = !severityWeighted || belowTarget;
         const bool pressureHolds = targetAllowsHold && currentPressure &&
-            (recentPressureRelease < 2 || (freshError && delayedAbsorbable && lateness));
+            (freshError && delayedAbsorbable && lateness);
         const bool holdProtection = pressureHolds ||
             (targetAllowsHold && historyHolds);
-        // Preserve revision 1's above-target pause for historical captures.
         const bool renewsHold = holdProtection &&
-            (!holdRenewBelowTarget || !severityWeighted || belowTarget);
+            (!severityWeighted || belowTarget);
         if (renewsHold) {
             m_LastPressure = s.submitted;
             if (severityWeighted) m_ReleaseFraction = 0;
         }
-        // Revision 3 earns release time only from qualified, absorbable
-        // adjacent observations. The qualification window still restarts on
-        // every break, while earned recovery survives short gaps. This avoids
-        // keeping a raised delay forever when a frame is missed every few
-        // seconds, without counting the unknown gap as clean playback.
-        if (recentPressureRelease >= 3) {
-            // A capacity dip pauses qualified recovery, but revision 3
-            // must not erase it while the long score meets the target.
-            if (renewsHold || ((holdRenewBelowTarget < 3 || targetAllowsHold) &&
+        {
+            if (renewsHold || ((targetAllowsHold) &&
                                (!s.absorbable || !windowAbsorbable))) {
                 m_CleanEvidenceUs = 0;
                 m_LastCleanEvidenceUs = 0;
@@ -308,20 +226,13 @@ public:
             return elapsed < duration ? duration - elapsed : 0;
         };
         update.holdRemainingUs = std::max(
-            recentPressureRelease >= 3 ? remaining(m_CleanEvidenceUs, hold) :
-                remaining(s.submitted - m_First, hold),
+            remaining(m_CleanEvidenceUs, hold),
             m_LastPressure ? remaining(s.submitted - m_LastPressure, hold) : 0);
         update.cooldownRemainingUs = m_LastAttack ?
             remaining(s.submitted - m_LastAttack, 250000) : 0;
         update.action = pressureHolds ? Action::CurrentPressure :
             (targetAllowsHold && historyHolds) ? Action::HistoryHold : Action::RecoveryHold;
         const bool grow = currentPressure && (!severityWeighted || belowTarget);
-        // Revision 1 mistook every slow frame for sustained overload. A
-        // jitter buffer can cover a transient dependency stall when subsequent
-        // frames recover. Judge capacity over the same qualified one-second
-        // window as interval pressure, not the single late/catch-up pair.
-        // Sequence breaks discard this evidence, preventing stale headroom
-        // from authorizing growth across missing frames or source epochs.
         if (grow && freshError && delayedAbsorbable && lateness &&
                 (!m_LastAttack || s.submitted - m_LastAttack >= 250000)) {
             const auto excess = severityWeighted ?
@@ -348,33 +259,14 @@ public:
             m_ReleaseFraction = 0;
         }
         else if (!holdProtection && s.absorbable &&
-                (recentPressureRelease >= 3 ?
-                    (windowAbsorbable && m_CleanEvidenceUs >= hold) :
-                    s.submitted - m_First >= hold) &&
+                (windowAbsorbable && m_CleanEvidenceUs >= hold) &&
                 (!m_LastPressure || s.submitted - m_LastPressure >= hold)) {
             m_ReleaseFraction += std::min<uint64_t>(actual, 100000) * releaseRate;
             const auto release = m_ReleaseFraction / 1000000;
             m_ReleaseFraction %= 1000000;
             const auto candidate = m_Target - std::min(m_Target - minimum, release);
-            bool allowed = true;
-            if (absorbedJitterRelease && candidate < m_Target) {
-                m_Stats.inputCandidateUs = candidate;
-                m_Stats.inputEvidenceUs = m_Input.coverage();
-                if (m_Input.qualified(s.submitted)) {
-                    m_Stats.inputCurrentLoss = m_Input.loss(m_Target, toleranceUs);
-                    m_Stats.inputCandidateLoss = m_Input.loss(candidate, toleranceUs);
-                    // Existing loss is not new shrink risk. This permits equal-
-                    // risk release through a flat/constant-lateness region.
-                    allowed = m_Stats.inputCandidateLoss <=
-                        std::max(allowedLoss, m_Stats.inputCurrentLoss) + 1e-12;
-                    if (allowed) ++m_Stats.inputReleaseAllowed;
-                    else ++m_Stats.inputReleaseHeld;
-                } else ++m_Stats.inputReleaseUnknown;
-            }
-            if (allowed) m_Target = candidate;
-            // Do not bank rejected release into a later large downward step.
-            update.action = !allowed ? Action::AbsorbedJitterHold :
-                m_Target == minimum ? Action::Minimum : Action::Release;
+            m_Target = candidate;
+            update.action = m_Target == minimum ? Action::Minimum : Action::Release;
         }
         else if (grow) {
             update.action = !delayedAbsorbable ? Action::NotAbsorbable :
@@ -382,9 +274,7 @@ public:
         }
         else if (!holdProtection &&
                  !(s.absorbable &&
-                   (!serialServiceGate || (serialServiceGate >= 2 ? windowAbsorbable :
-                    (s.serialService <= intended &&
-                     s.decoderQueue <= intended))))) {
+                   (windowAbsorbable))) {
             update.action = Action::NotAbsorbable;
         }
         if (beforeUs != boundedUs) update.action = Action::LimitChange;
@@ -401,7 +291,6 @@ public:
     }
     Stats stats() const { return m_Stats; }
     void breakSequence() {
-        m_Input.reset();
         m_Window = {}; m_First = m_ReleaseFraction = m_SequenceSamples = 0; m_HavePrevious = false;
         m_Stats.averageErrorUs = 0; m_Stats.averageValid = false;
         m_Stats.calibrationCoverageUs = m_Stats.calibrationSamples = 0;
@@ -442,7 +331,6 @@ private:
     // Keep the long score history off the controller's stack. The controller
     // is instantiated in several independent workers and test fixtures.
     std::vector<ScoreBucket> m_Score = std::vector<ScoreBucket>(MaximumScoreBuckets);
-    AbsorbedJitter m_Input;
     Sample m_Previous;
     Stats m_Stats;
     uint64_t m_Target = 0, m_First = 0, m_LastAttack = 0, m_LastPressure = 0, m_ReleaseFraction = 0;

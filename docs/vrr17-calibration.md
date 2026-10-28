@@ -1,3 +1,5 @@
+> Historical reference: the schema-1 replay configs and revision-specific policies described below have been retired. Use a fresh schema-6 trace with the current schema-2 configs in `tests/vrr/configs/`.
+
 # VRR17 follow-up: stable learning and vrr14-style protection
 
 Source: `1ccefb6e` (vrr17.1), plus the buffer-accounting review, the

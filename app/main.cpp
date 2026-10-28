@@ -928,7 +928,7 @@ int main(int argc, char *argv[])
             "Effective VRR profile: mode=%d target_basis_points=%d smoothness=%.2f%% input_percentile_ppm=%llu history_seconds=%d adaptive=%d; session snapshot, changes apply to next stream",
             preferences->vrrLatencyMode, options.targetHundredths, options.targetHundredths / 100.0,
             static_cast<unsigned long long>(uint64_t(options.targetHundredths) * 100), options.historySeconds,
-            qEnvironmentVariable("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER") != "0");
+            1);
         return 0;
     }
 

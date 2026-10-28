@@ -95,7 +95,7 @@ bool loadCapture(const QString& path, Capture& capture, QString& error)
     const QList<QByteArray> required {
         "arrival_sequence", "frame", "rtp_timestamp", "rtp_valid",
         "decode_complete_us", "pacer_arrival_us", "display_refresh_hz",
-        "stream_rate_hz", "additional_queued_frame", "prepare_us",
+        "stream_rate_hz", "session_latency_mode", "prepare_us",
         "present_call_us", "controller_call_us"
     };
     for (const QByteArray& name : required) {
@@ -130,13 +130,11 @@ bool loadCapture(const QString& path, Capture& capture, QString& error)
                 value(fields, columns, "display_refresh_hz"));
             capture.session.streamRateHz = static_cast<int>(
                 value(fields, columns, "stream_rate_hz"));
-            capture.session.allowAdditionalQueuedFrame =
-                value(fields, columns, "additional_queued_frame") != 0;
-            const bool allRates = value(fields, columns, "param_latency_fix_all_rates") != 0;
-            capture.session.latencyFix = value(fields, columns, "param_latency_fix_enabled") != 0 && !allRates;
-            capture.session.latencyMode = allRates ?
-                (value(fields, columns, "param_latency_fix_delay_period_per_mille") == 0 ? 2 : 1) : 0;
-            capture.session.readinessHitchFeedback = false; // Shared current policy.
+            capture.session.latencyMode = int(value(fields, columns, "session_latency_mode"));
+            if (capture.session.latencyMode < 0 || capture.session.latencyMode > 2) {
+                error = "capture has invalid session latency mode";
+                return false;
+            }
 
         }
         const uint64_t preparation = value(fields, columns, "prepare_us");
@@ -202,12 +200,6 @@ QJsonObject simulate(const Capture& capture, VrrReplayScenario scenario,
 {
     VrrSessionConfig simulatedSession = capture.session;
     if (!scenario.controllerCustomized) {
-        // Match the UI migration from the enabled legacy checkbox to Balanced Target
-        // when resolving current session policy, leaving explicit snapshots alone.
-        if (simulatedSession.latencyFix && simulatedSession.latencyMode == 0) {
-            simulatedSession.latencyFix = false;
-            simulatedSession.latencyMode = 1;
-        }
         scenario.controller = vrrTimingParametersForSession(simulatedSession);
     }
     VrrTimingController controller(simulatedSession, capture.canLatchPresentation, scenario.controller);
@@ -312,7 +304,6 @@ QJsonObject simulate(const Capture& capture, VrrReplayScenario scenario,
         const VrrTimingDecision decision = controller.schedule(frame, decisionUs);
         const uint64_t decisionEndUs = addSaturated(decisionUs, capture.decisionCallUs);
         admitThrough(decisionEndUs);
-        const bool metronome = scenario.controller.playoutMetronomeEnabled != 0;
         const bool active = controller.latencyFixActive();
         activeDecisions += active;
         if (scheduled > 1 && active != priorActive) ++activeTransitions;
@@ -324,7 +315,7 @@ QJsonObject simulate(const Capture& capture, VrrReplayScenario scenario,
         scheduledAge.values.push_back(ageUs);
         appliedDelay.values.push_back(decision.playoutDelayUs);
         if (!queue.empty() && VrrFrameDropPolicy::beforeRender(decision,
-                controller.displayPeriodUs(), ageUs, metronome, active,
+                controller.displayPeriodUs(), ageUs, active,
                 scenario.controller.playoutLateRecovery ? decision.playoutDelayUs : 0,
                 scenario.controller.playoutLateRecovery != 0)) {
             ++staleDrops;
@@ -343,11 +334,11 @@ QJsonObject simulate(const Capture& capture, VrrReplayScenario scenario,
             std::max(decisionEndUs, decision.renderStartUs), renderWakeDelay);
         admitThrough(renderStartUs);
         if (!queue.empty() && VrrFrameDropPolicy::afterRenderWait(decision,
-                ageOrigin, renderStartUs, metronome, active, 0,
+                ageOrigin, renderStartUs, active, 0,
                 scenario.controller.playoutLateRecovery ? decision.playoutDelayUs : 0)) {
             ++staleDrops;
             dropped[inputIndex] = true;
-            if (metronome || active) controller.noteSubmission(false, false, 0);
+            if (active) controller.noteSubmission(false, false, 0);
             else controller.rebase();
             nowUs = renderStartUs;
             continue;

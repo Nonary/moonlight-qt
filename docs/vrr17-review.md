@@ -1,3 +1,5 @@
+> Historical reference: the schema-1 replay configs and revision-specific policies described below have been retired. Use a fresh schema-6 trace with the current schema-2 configs in `tests/vrr/configs/`.
+
 # VRR17 smoothness and buffer accounting review
 
 Reviewed release tags `v6.1.0-vrr14` and `v6.1.0-vrr17` (`704a89f9`),

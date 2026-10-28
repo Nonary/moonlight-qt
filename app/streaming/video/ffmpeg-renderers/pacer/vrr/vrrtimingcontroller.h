@@ -7,10 +7,8 @@
 #include "reserve.h"
 #include "workload.h"
 #include "prediction.h"
-#include "readinessfeedback.h"
-#include "meanmissbuffer.h"
 #include "intervalbuffer.h"
-#include "inputpercentilebuffer.h"
+#include "inputbuffer.h"
 #include "phasetrajectory.h"
 
 #include <cstddef>
@@ -34,37 +32,22 @@
     X(uint64_t, latency_fix_delay_period_per_mille, latencyFixDelayPeriodPerMille, 500) \
     X(uint64_t, playout_delay_cap_source_period_per_mille, playoutDelayCapSourcePeriodPerMille, 0) \
     X(uint64_t, playout_delay_cap_uses_observed_period, playoutDelayCapUsesObservedPeriod, 0) \
-    X(uint64_t, playout_absorbed_jitter_release, playoutAbsorbedJitterRelease, 0) \
     X(uint64_t, bounded_catchup_enabled, boundedCatchupEnabled, 0) \
     X(uint64_t, normalized_source_mapping, normalizedSourceMapping, 0) \
-    /* Zero preserves historical capture accounting. */ \
-    /* 1 = raw applied offset; 2 = minus median per-second drift; */ \
-    /* 3 = minus least-squares drift over the trailing 120 s. */ \
-    X(uint64_t, playout_input_clock_relative_history, playoutInputClockRelativeHistory, 0) \
     /* Bounded catch-up carry ceiling: nonzero caps it at this many us and, */ \
     /* with the share, at that share of the source period. Zero: one period. */ \
     X(uint64_t, playout_catchup_carry_limit_us, playoutCatchupCarryLimitUs, 0) \
     X(uint64_t, playout_catchup_carry_limit_period_per_mille, playoutCatchupCarryLimitPeriodPerMille, 0) \
-    X(uint64_t, playout_input_bounded_recovery_credit, playoutInputBoundedRecoveryCredit, 0) \
     /* Unbounded credit: nonzero scales the physical VRR room by this share. */ \
     X(uint64_t, playout_input_recovery_credit_room_per_mille, playoutInputRecoveryCreditRoomPerMille, 0) \
-    X(uint64_t, playout_input_rate_drop_snap, playoutInputRateDropSnap, 0) \
     /* Nonzero: a never-seen rate layer is seeded from the previous layer only */ \
     /* when that layer's period is at most this many per mille of the new one. */ \
     X(uint64_t, playout_input_layer_seed_ratio_per_mille, playoutInputLayerSeedRatioPerMille, 0) \
     /* Input-buffer learning ignores the largest `trim` requirements until the */ \
     /* profile tail is supported. */ \
-    X(uint64_t, playout_input_learning_trim, playoutInputLearningTrim, 0) \
     X(uint64_t, playout_input_percentile_enabled, playoutInputPercentileEnabled, 0) \
     /* Only preventable input misses that caused an interval hitch score/grow. */ \
-    X(uint64_t, playout_input_hitch_misses_only, playoutInputHitchMissesOnly, 0) \
     /* Stable target adaptation is independent of miss eligibility. */ \
-    X(uint64_t, playout_input_stable_adaptation, playoutInputStableAdaptation, 0) \
-    /* Nonzero: client-timing goal solver; thousandths of a percentage point */ \
-    /* of score each further millisecond must recover when the goal is unreachable. */ \
-    X(uint64_t, playout_input_goal_lambda, playoutInputGoalLambda, 0) \
-    /* Ignore the historical latency price when choosing an unreachable goal. */ \
-    X(uint64_t, playout_input_goal_unpriced, playoutInputGoalUnpriced, 0) \
     X(uint64_t, playout_input_goal_window_us, playoutInputGoalWindowUs, 0) \
     /* Share of the goal's allowed loss the solver aims for; 0 aims at the goal. */ \
     X(uint64_t, playout_input_goal_tail_per_mille, playoutInputGoalTailPerMille, 0) \
@@ -85,26 +68,18 @@
     X(uint64_t, playout_gpu_readiness_release_us_per_second, playoutGpuReadinessReleaseUsPerSecond, 250) \
     X(uint64_t, playout_gpu_readiness_maximum_us, playoutGpuReadinessMaximumUs, 12000) \
     X(uint64_t, playout_prediction_only, playoutPredictionOnly, 0) \
-    X(uint64_t, playout_responsive_buffer, playoutResponsiveBuffer, 0) \
     /* Production source mapping is anchored before worker/backend waits. */ \
     X(uint64_t, playout_source_mapping_decoder_output, playoutSourceMappingDecoderOutput, 0) \
-    /* Gate buffer growth on the complete serial service path. */ \
-    X(uint64_t, playout_serial_service_gate, playoutSerialServiceGate, 0) \
-    /* Long quality history remains diagnostic while recent pressure owns release. */ \
-    X(uint64_t, playout_recent_pressure_release, playoutRecentPressureRelease, 0) \
-    /* Zero preserves historical burst recovery. Production starts at 2 percent. */ \
+    /* Bounded per-frame recovery allowance. */ \
     X(uint64_t, playout_catchup_per_mille, playoutCatchupPerMille, 0) \
     /* Rescue bounded late frames and recover from actual submission lateness. */ \
     X(uint64_t, playout_late_recovery, playoutLateRecovery, 0) \
     X(uint64_t, playout_interval_tolerance_us, playoutIntervalToleranceUs, 0) \
-    /* Historical captures retain the one-second/two-interval warmup. */ \
+    /* Qualification requires both elapsed time and consecutive samples. */ \
     X(uint64_t, playout_interval_initial_warmup_us, playoutIntervalInitialWarmupUs, 1000000) \
     X(size_t, playout_interval_initial_minimum_samples, playoutIntervalInitialMinimumSamples, 2) \
     X(uint64_t, playout_mean_miss_hold_us, playoutMeanMissHoldUs, 4000000) \
     X(uint64_t, playout_mean_miss_release_us_per_second, playoutMeanMissReleaseUsPerSecond, 200) \
-    /* Nonzero restarts the clean-time hold only while the quality score is */ \
-    /* below target; above it, current pressure only pauses release. */ \
-    X(uint64_t, playout_hold_renew_below_target, playoutHoldRenewBelowTarget, 0) \
     /* Nonzero floors the adaptive playout delay at this per-mille percentile */ \
     /* of recent timestamp-playout ready offsets (decode completion after the */ \
     /* mapped source slot), so release cannot drain below what current frames */ \
@@ -113,7 +88,6 @@
     X(uint64_t, playout_readiness_floor_window_us, playoutReadinessFloorWindowUs, 10000000) \
     X(uint64_t, playout_on_time_target_per_million, playoutOnTimeTargetPerMillion, 990000) \
     X(uint64_t, playout_readiness_window_us, playoutReadinessWindowUs, 3000000) \
-    X(uint64_t, playout_readiness_hitch_threshold_us, playoutReadinessHitchThresholdUs, 0) \
     X(uint64_t, playout_require_display_events, playoutRequireDisplayEvents, 0) \
     X(uint64_t, playout_submission_estimate_fallback, playoutSubmissionEstimateFallback, 0) \
     X(uint64_t, playout_native_hitch_adaptation, playoutNativeHitchAdaptation, 0) \
@@ -122,7 +96,7 @@
     X(uint64_t, render_start_preserve_learned_lead, renderStartPreserveLearnedLead, 0) \
     X(uint64_t, playout_smoothness_feedback_enabled, playoutSmoothnessFeedbackEnabled, 0) \
     X(uint64_t, playout_prediction_enabled, playoutPredictionEnabled, 0) \
-    /* 0: historical cadence latch; 1: slot only; 2: slot plus safety headroom. */ \
+    /* Slot latching with optional diagnostic safety headroom. */ \
     X(uint64_t, playout_per_frame_latch, playoutPerFrameLatch, 0) \
     /* Constant native synchronization is a presenter capability, not a latch choice. */ \
     X(uint64_t, native_synchronized_presentation, nativeSynchronizedPresentation, 0) \
@@ -131,19 +105,17 @@
     X(uint64_t, playout_history_enabled, playoutHistoryEnabled, 0) \
     X(uint64_t, maximum_forward_movement_us, maximumForwardMovementUs, 1000000) \
     X(uint64_t, render_lead_floor_us, renderLeadFloorUs, 1000) \
-    X(uint64_t, render_lead_ceiling_us, renderLeadCeilingUs, 0) \
     X(uint64_t, render_lead_slack_us, renderLeadSlackUs, 0) \
     X(unsigned int, render_baseline_percentile, renderBaselinePercentile, 50) \
     X(uint64_t, pacing_latency_budget_divisor, pacingLatencyBudgetDivisor, 2) \
     X(uint64_t, pacing_latency_extra_period_numerator, pacingLatencyExtraPeriodNumerator, 0) \
     X(uint64_t, pacing_latency_extra_period_denominator, pacingLatencyExtraPeriodDenominator, 1) \
-    X(uint64_t, pacing_latency_queue_mode_extra, pacingLatencyQueueModeExtra, 1) \
     X(uint64_t, presentation_safety_us, presentationSafetyUs, 0) \
     X(uint64_t, source_playout_delay_us, sourcePlayoutDelayUs, 0) \
     X(uint64_t, timestamp_playout_enabled, timestampPlayoutEnabled, 0) \
     X(uint64_t, playout_offset_window_us, playoutOffsetWindowUs, 3000000) \
     X(uint64_t, playout_offset_slew_us, playoutOffsetSlewUs, 20) \
-    /* Zero defaults retain the per-frame, unfiltered historical mapping. */ \
+    /* Source-clock mapping eligibility and bounded slew. */ \
     X(uint64_t, playout_offset_cadence_gate, playoutOffsetCadenceGate, 0) \
     X(uint64_t, playout_offset_slew_us_per_second, playoutOffsetSlewUsPerSecond, 0) \
     X(uint64_t, playout_offset_source_clock, playoutOffsetSourceClock, 0) \
@@ -169,10 +141,7 @@
     X(uint64_t, playout_smoothing_period_alpha_per_mille, playoutSmoothingPeriodAlphaPerMille, 50) \
     X(uint64_t, playout_smoothing_max_lag_us, playoutSmoothingMaxLagUs, 8000) \
     X(uint64_t, playout_smoothing_snap_per_mille, playoutSmoothingSnapPerMille, 1000) \
-    /* 0: pair gate; 1: window; 2: compensated bursts; 3: clipped gap excess; 4: source-only gap phase; */ \
-    /* 5: whole gap excess within max-lag, recentred within T; 6: phase-locked */ \
-    /* smoothing with uniform local source-cadence qualification and reseeding. */ \
-    X(uint64_t, playout_smoothing_windowed_cadence, playoutSmoothingWindowedCadence, 0) \
+    X(uint64_t, smoothing_mode, smoothingMode, VrrSmoothingOff) \
     X(uint64_t, playout_smoothing_recovery_us, playoutSmoothingRecoveryUs, 200000) \
     /* Zero maximum disables the learned smoothed-cadence readiness reserve. */ \
     X(uint64_t, playout_smoothing_reserve_max_us, playoutSmoothingReserveMaxUs, 0) \
@@ -184,51 +153,23 @@
     /* Zero drops the retiming to the raw slot at a cadence reset; nonzero */ \
     /* eases it there by at most this many microseconds per frame. */ \
     X(uint64_t, playout_smoothing_reset_slew_us, playoutSmoothingResetSlewUs, 0) \
-    /* Revision 5: per-frame share of the retained phase returned toward zero */ \
-    /* within the tolerance the interval has left. */ \
-    X(uint64_t, playout_smoothing_recenter_per_mille, playoutSmoothingRecenterPerMille, 0) \
-    /* Absorb microstutter: a standing presentation reserve that revision 5 */ \
-    /* may spend on late source frames. A nonzero share scales it by the */ \
-    /* fitted source period, capped at the reserve. */ \
+    /* Absorb keeps a fixed presentation reserve. */ \
     X(uint64_t, playout_smoothing_absorb_reserve_us, playoutSmoothingAbsorbReserveUs, 0) \
-    X(uint64_t, playout_smoothing_absorb_reserve_period_per_mille, playoutSmoothingAbsorbReservePeriodPerMille, 0) \
-    /* Revision 5: the retained phase limit is at least this share of the */ \
-    /* fitted source period. Zero keeps the fixed limit alone. */ \
-    X(uint64_t, playout_smoothing_max_lag_period_per_mille, playoutSmoothingMaxLagPeriodPerMille, 0) \
-    /* Revision 5: nonzero raises the band's lower edge to the display period, */ \
-    /* at most the source period, so corrected gaps stay presentable. */ \
-    X(uint64_t, playout_smoothing_presentable_floor, playoutSmoothingPresentableFloor, 0) \
-    /* Revision 5 presentable floor: extra room above the display period. */ \
-    X(uint64_t, playout_smoothing_floor_margin_us, playoutSmoothingFloorMarginUs, 0) \
-    X(uint64_t, playout_metronome_enabled, playoutMetronomeEnabled, 0) \
     X(uint64_t, playout_delay_start_period_per_mille, playoutDelayStartPeriodPerMille, 0) \
     X(uint64_t, playout_delay_maximum_period_per_mille, playoutDelayMaximumPeriodPerMille, 0) \
-    X(uint64_t, playout_phase_step_minimum_us, playoutPhaseStepMinimumUs, 30) \
-    X(uint64_t, playout_phase_step_divisor, playoutPhaseStepDivisor, 64) \
-    X(uint64_t, playout_phase_step_period_per_mille, playoutPhaseStepPeriodPerMille, 20) \
-    X(uint64_t, playout_phase_residual_window_frames, playoutPhaseResidualWindowFrames, 256) \
-    X(uint64_t, playout_phase_deadband_us, playoutPhaseDeadbandUs, 100) \
-    X(uint64_t, playout_metronome_period_window_frames, playoutMetronomePeriodWindowFrames, 128) \
     X(uint64_t, playout_offset_reseed_frames, playoutOffsetReseedFrames, 1) \
-    X(uint64_t, playout_motion_deadband_enabled, playoutMotionDeadbandEnabled, 0) \
-    X(uint64_t, playout_motion_floor_us, playoutMotionFloorUs, 1000) \
-    X(uint64_t, playout_motion_ceiling_period_per_mille, playoutMotionCeilingPeriodPerMille, 750) \
-    X(uint64_t, playout_motion_gain_per_mille, playoutMotionGainPerMille, 1500) \
-    X(unsigned int, playout_motion_percentile, playoutMotionPercentile, 90) \
-    X(size_t, playout_motion_window_frames, playoutMotionWindowFrames, 128) \
-    X(size_t, playout_motion_minimum_samples, playoutMotionMinimumSamples, 16) \
     X(uint64_t, playout_delay_slew_across_bands, playoutDelaySlewAcrossBands, 0) \
     X(uint64_t, playout_prepare_on_arrival, playoutPrepareOnArrival, 0) \
     X(uint64_t, render_start_after_submission_us, renderStartAfterSubmissionUs, 0) \
     X(uint64_t, render_start_minimum_lead_us, renderStartMinimumLeadUs, 1500) \
     X(uint64_t, playout_stall_burst_exclusion, playoutStallBurstExclusion, 0) \
-    /* Revisions 2/3 cap/remove the duplicate queued CPU ownership floor. */ \
+    /* Native and queued presenters have different spacing ownership. */ \
     X(uint64_t, latched_floor_disabled, latchedFloorDisabled, 0) \
     /* Zero anchors display spacing at every Present call; one anchors a */ \
     /* latched present at its predicted flip (prior anchor + display period). */ \
     X(uint64_t, latched_flip_anchor, latchedFlipAnchor, 0) \
     /* Waiting-frame capacity for admission and the delay budget; 0 keeps */ \
-    /* the historical three (VrrMaximumQueuedFrames). */ \
+    /* the conservative three-frame fallback (VrrMaximumQueuedFrames). */ \
     X(uint64_t, playout_queue_frames, playoutQueueFrames, 0) \
     /* Nonzero latches the first present at a gap this long, so */ \
     /* it cannot tear against a driver-managed LFC repeat after a long gap. */ \
@@ -250,7 +191,6 @@
     X(uint64_t, minimum_guard_us, minimumGuardUs, 100) \
     X(uint64_t, latch_enter_headroom_us, latchedPresentationHeadroomUs, 225) \
     X(uint64_t, latch_exit_headroom_us, latchedPresentationExitHeadroomUs, 400) \
-    X(uint64_t, latch_base_guard_exit, latchedPresentationBaseGuardExit, 0) \
     X(size_t, cadence_stability_latch_frames, cadenceStabilityLatchFrames, 64) \
     X(uint64_t, latch_enter_headroom_period_numerator, latchedPresentationHeadroomPeriodNumerator, 0) \
     X(uint64_t, latch_enter_headroom_period_denominator, latchedPresentationHeadroomPeriodDenominator, 1) \
@@ -304,6 +244,14 @@
     /* Producer-clock GPU service is learned only from prompt collection. */ \
     X(uint64_t, normalized_source_intrinsic_decode_gpu, normalizedSourceIntrinsicDecodeGpu, 0)
 
+// Current smoothing modes. Numeric values are serialized, not revision selectors.
+enum VrrSmoothingMode : uint64_t {
+    VrrSmoothingOff = 0,
+    VrrSmoothingWorkerPhaseLocked = 2,
+    VrrSmoothingNativeToleranceBounded = 4,
+    VrrSmoothingAbsorb = 7,
+};
+
 // Every value that changes VRR policy remains replaceable by replay without
 // rebuilding the controller. Production callers use these defaults.
 struct VrrTimingParameters {
@@ -312,6 +260,9 @@ struct VrrTimingParameters {
     VRR_TIMING_PARAMETER_FIELDS(VRR_DECLARE_TIMING_PARAMETER)
 #undef VRR_DECLARE_TIMING_PARAMETER
 };
+
+// Stable serialization of the effective policy for calibration identity.
+std::string vrrCalibrationPolicy(const VrrTimingParameters& parameters);
 
 // Resolve mode-dependent production policy once for both the live worker and
 // the replay baseline. Candidate replay configs may still override any field.
@@ -385,11 +336,6 @@ struct VrrTimingDecision {
     uint64_t playoutQueueLimitUs = 0;
     uint64_t playoutPresetCapUs = 0;
     int64_t playoutOffsetUs = 0;
-    // Cadence smoothing: how far this target was moved from its raw mapped
-    // slot (positive = later) to keep presented intervals even. Under the
-    // metronome this is the schedule's lag behind the mapped sender clock;
-    // a lag of a full source period or more means this frame missed its tick
-    // and is occupying a later one.
     int64_t cadenceSmoothingUs = 0;
     // Net phase requested by smoothing/display/recovery. Do not subtract a
     // different amount of already-incurred input lateness on each frame.
@@ -402,10 +348,6 @@ struct VrrTimingDecision {
         const uint64_t earlyUs = uint64_t(-(cadenceSmoothingUs + 1)) + 1;
         return phaseUs - std::min(phaseUs, earlyUs);
     }
-    // Metronome: the frame arrived this many whole source periods after its
-    // tick. Non-zero means a fresher successor, if one is already queued,
-    // should be shown instead.
-    uint64_t missedTicks = 0;
 
     uint64_t renderStartUs = 0;
     uint64_t targetUs = 0;
@@ -495,7 +437,7 @@ public:
     // line for diagnostics. Release feedback uses corrected causal observations.
     void noteInputBufferMiss(uint64_t atUs, bool networkMiss, bool decoderMiss) {
         if (m_Parameters.playoutInputPercentileEnabled)
-            m_InputPercentileBuffer.noteBufferMiss(atUs, networkMiss, decoderMiss);
+            m_InputBuffer.noteBufferMiss(atUs, networkMiss, decoderMiss);
     }
     void noteTrajectoryResyncDrop() { m_PhaseTrajectory.noteResyncDrop(); }
     void noteTrajectoryDeferred() { m_PhaseTrajectory.noteDeferred(); }
@@ -510,26 +452,22 @@ public:
         auto stats = m_IntervalBuffer.stats();
         stats.inputPercentileEnabled = m_Parameters.playoutInputPercentileEnabled != 0;
         if (stats.inputPercentileEnabled) {
-            stats.inputPercentile = m_InputPercentileBuffer.stats();
-            // Policy 8 reports the session's trailing actual outcomes across
+            stats.inputPercentile = m_InputBuffer.stats();
+            // Report the session's trailing actual outcomes across
             // all rates. Adaptation continues to use the active layer's own
             // stats internally; switching layers cannot erase playback history.
-            if (m_Parameters.playoutInputHitchMissesOnly >= 8)
-                m_InputCoverageHistory.report(stats.inputPercentile, m_Parameters.playoutInputHitchMissesOnly >= 10);
+            m_InputCoverageHistory.report(stats.inputPercentile, true);
             stats.update.beforeUs = m_InputPercentileBeforeUs;
             stats.update.requestedUs = stats.inputPercentile.currentUs;
             stats.update.minimumUs = stats.inputPercentile.minimumUs;
             stats.update.maximumUs = stats.inputPercentile.maximumUs;
-            stats.update.holdRemainingUs = stats.inputPercentile.holdRemainingUs;
+            stats.update.holdRemainingUs = 0;
             stats.update.cooldownRemainingUs = 0;
             stats.update.attemptedIncreaseUs = stats.inputPercentile.currentUs > m_InputPercentileBeforeUs ?
                 stats.inputPercentile.currentUs - m_InputPercentileBeforeUs : 0;
             stats.update.clippedIncreaseUs = 0;
             using Action = Vrr13::IntervalBuffer::Action;
-            const bool releaseBackoff = stats.inputPercentile.releaseFactorPpm < 1000000 &&
-                stats.inputPercentile.targetUs < stats.inputPercentile.currentUs;
-            stats.update.action = releaseBackoff ? Action::InputPercentileBackoff :
-                stats.inputPercentile.growthBlocked ? Action::NotAbsorbable :
+            stats.update.action = stats.inputPercentile.growthBlocked ? Action::NotAbsorbable :
                 stats.inputPercentile.clipped ? Action::Capped :
                 stats.inputPercentile.expiredUnknown ? Action::InputPercentileUnknown :
                 !stats.inputPercentile.evidenceValid ? Action::NotAbsorbable :
@@ -583,12 +521,11 @@ public:
     uint64_t playoutDelayUs() const;
     // Learned Reduce judder readiness reserve; already included in each
     // decision's cadenceSmoothingUs, never in playoutDelayUs.
-    uint64_t smoothingReserveUs() const { return m_Parameters.playoutSmoothingWindowedCadence == 7 ?
+    uint64_t smoothingReserveUs() const { return m_Parameters.smoothingMode == 7 ?
         absorbReserveUs() : m_SmoothingReserveUs; }
     // Absorb microstutter reserve at the current source period; included in
-    // each revision-5 decision's cadenceSmoothingUs, never in playoutDelayUs.
+    // each decision's cadenceSmoothingUs, never in playoutDelayUs.
     uint64_t absorbReserveUs() const;
-    // Revision 5 retained phase limit at the current source period.
     uint64_t smoothingPhaseLimitUs() const;
     unsigned int playoutBandIndex() const;
     uint64_t playoutBandSamples() const;
@@ -617,7 +554,6 @@ private:
     uint64_t playoutDelayCapUs() const;
     uint64_t gpuReadinessCeilingUs() const;
     bool m_LatencyFixActive = false;
-    Vrr13::RecentReadiness m_RecentReadiness;
     uint64_t m_CadenceStableSinceUs = 0;
     uint64_t m_PreviousSmoothingIntervalUs = 0;
     int64_t m_SourceGapSmoothingUs = 0;
@@ -649,15 +585,6 @@ private:
         bool inputValid = false;
         bool intervalValid = false;
         bool trajectoryValid = false;
-        // Metronome: the slot this frame occupies, committed as the schedule
-        // basis only if the frame is actually presented so a dropped frame
-        // frees its tick for the successor.
-        bool hasSmoothedBasis = false;
-        uint64_t smoothedBasisUsQ16 = 0;
-        uint64_t smoothedBasisOrdinal = 0;
-        int64_t phaseDebtUs = 0;
-        int64_t phaseResidualEmaUs = 0;
-        int64_t basisMappingUs = 0;
     };
 
     struct CadenceObservation {
@@ -716,24 +643,9 @@ private:
     // moves the smoothed schedule later by the recent shortfall that exceeds
     // the tolerated lateness; it is zero unless its parameters enable it.
     bool smoothingReserveEnabled() const;
-    // Revision 5 buffers only the part of an early retiming that no standing
-    // reserve covers; earlier revisions buffer the whole retiming.
     int64_t bufferedSmoothingUs(int64_t smoothingUs) const;
     void observeSmoothingReserve(bool engaged, int64_t shortfallUs,
                                  uint64_t nowUs);
-    // Metronome: the schedule advances from the last presented slot by the
-    // fitted source period and corrects phase toward the raw slot by a
-    // bounded step per frame. Returns the lag of that tick behind the raw
-    // slot; a frame that arrived after its tick reports the whole periods
-    // of shortfall in missedTicks and the caller slips it to "now".
-    int64_t metronomeAdjustUs(const CadenceObservation& cadence,
-                              bool rebased, uint64_t rawBasisUs,
-                              uint64_t playoutDelayUs,
-                              uint64_t earliestBasisUs,
-                              uint64_t& missedTicks,
-                              int64_t& remainingDebtUs);
-    bool metronomeEnabled() const;
-    uint64_t motionThresholdUs(uint64_t periodUs) const;
     void resetCadenceSmoothing();
     uint64_t playoutDelayStartUs() const;
     uint64_t playoutDelayMinimumUs() const;
@@ -769,7 +681,6 @@ private:
     void clampReadinessReserveToPolicy();
 
     uint64_t pacingLatencyBudgetUs() const;
-    bool pacingLatencyPolicyEnabled() const;
     uint64_t minimumReadinessReserveUs() const;
     uint64_t renderInsuranceCeilingUs() const;
     uint64_t renderInsuranceUs() const;
@@ -875,11 +786,6 @@ private:
     int64_t m_InputClockCoordinateUs = 0;
     int64_t m_InputClockRawUs = 0;
     int64_t m_InputClockDriftRemainder = 0;
-    uint64_t m_InputDriftAnchorUs = 0;
-    int64_t m_InputDriftAnchorRawUs = 0;
-    std::array<int64_t, 61> m_InputDriftSlopesPpb{};
-    size_t m_InputDriftSlopeCount = 0;
-    size_t m_InputDriftSlopeIndex = 0;
     struct InputDriftPoint { uint64_t atUs; int64_t rawUs; };
     std::deque<InputDriftPoint> m_InputDriftPoints;
     uint64_t m_InputDriftLastFitUs = 0;
@@ -888,20 +794,18 @@ private:
     Vrr13::Reserve m_PlayoutHistory;
     Vrr13::WorkloadEpisode m_WorkloadEpisode;
     Vrr13::ReadinessPrediction m_ReadinessPrediction;
-    Vrr13::ReadinessFeedback m_ReadinessFeedback;
-    Vrr13::MeanMissBuffer m_MeanMissBuffer;
     Vrr13::IntervalBuffer m_IntervalBuffer;
-    Vrr13::InputPercentileBuffer m_InputPercentileBuffer;
+    Vrr13::InputGoalBuffer m_InputBuffer;
     // VRR headroom last applied to the input buffer; rescaled on rate change.
     uint64_t m_InputHeadroomUs = 0;
     // Layered input buffers, one per source-rate range. Lateness depends on
     // the rate (2026-10-10 22:55: median 2.9 ms at 110 FPS, -0.35 ms at
     // 30 FPS), so each layer keeps its own evidence, protection and coverage.
-    // The active layer lives in m_InputPercentileBuffer, anchored at
+    // The active layer lives in m_InputBuffer, anchored at
     // m_InputLayerPeriodUs; stored layers wait for their rate to return.
     struct InputLayer {
         uint64_t periodUs = 0;
-        Vrr13::InputPercentileBuffer buffer;
+        Vrr13::InputGoalBuffer buffer;
     };
     enum class InputLayerChange { None, Restored, Created };
     std::vector<InputLayer> m_InputLayers;
@@ -910,7 +814,6 @@ private:
     Vrr13::InputLayerCadence m_InputLayerCadence;
     Vrr13::InputCoverageHistory m_InputCoverageHistory;
     InputLayerChange updateInputLayer(uint64_t nowUs, const CadenceObservation& cadence);
-    uint64_t inputHitchPolicy(uint64_t nowUs) const;
     // Exact GPU decode durations (decoder output -> completion) from frames
     // the worker blocked on; their median estimates unobserved completions.
     std::array<uint64_t, 64> m_DecodeGpuSamples {};
@@ -955,26 +858,6 @@ private:
     // from (target minus lead and safety) and the tracked source period.
     bool m_HaveSmoothedBasis = false;
     uint64_t m_LastSmoothedBasisUs = 0;
-    uint64_t m_LastSmoothedBasisUsQ16 = 0;
-    uint64_t m_LastSmoothedBasisOrdinal = 0;
-    // Metronome phase state. The debt is how far the grid sits from where
-    // it should be: positive after a late frame presented when ready or a
-    // floor wait, negative when the clock mapping moved later underneath it.
-    // It is paid back at the bounded step. The residual is the slow filtered
-    // difference that remains once the debt is excluded, which tracks clock
-    // drift and fit error without chasing per-frame stamp wobble.
-    int64_t m_PhaseDebtUs = 0;
-    int64_t m_PhaseResidualEmaUs = 0;
-    // The clock mapping (applied offset plus playout delay) the committed
-    // basis was placed against. Known movement of that mapping since then is
-    // owed to the schedule exactly, so neither delay slew nor offset
-    // tracking has to be rediscovered through the residual filter.
-    int64_t m_LastBasisMappingUs = 0;
-    // The metronome's tick period: the cumulative endpoint fit filtered over
-    // many frames before the negotiated-rate floor is applied. Clamping each
-    // noisy fit first biases the mean above the true period, and a tick that
-    // runs a dozen microseconds slow per frame drifts visibly.
-    uint64_t m_MetronomePeriodUsQ16 = 0;
     uint64_t m_SmoothedPeriodUs = 0;
     int64_t m_SmoothedPeriodRemainder = 0;
     int64_t m_SmoothedPeriodFeedbackRemainder = 0;
@@ -991,13 +874,6 @@ private:
     std::array<int64_t, 128> m_SmoothingShortfalls{};
     size_t m_SmoothingShortfallCount = 0;
     size_t m_SmoothingShortfallIndex = 0;
-    // Recent magnitudes of the stamp's deviation from the metronome grid
-    // once known debt is excluded. Their upper percentile is the capture
-    // jitter the grid absorbs; a deviation beyond it is motion timing the
-    // stamp is reporting, and the frame presents on its stamp instead.
-    std::deque<uint64_t> m_MotionResiduals;
-    // Consecutive frames whose mapped source time sat more than a period in
-    // the future; the offset is re-seeded only once enough agree.
     unsigned int m_FutureProjectionFrames = 0;
     // Frames still to exclude from the lateness reservoir after an arrival
     // stall: the backlog that the stall held up, not the link's jitter.

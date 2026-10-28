@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h"
+#include "ffmpeg-renderers/pacer/vrr/inputbuffer.h"
 #include "ffmpeg-renderers/pacer/vrr/presenttiming.h"
 #include <algorithm>
 #include <cstdio>
@@ -21,7 +21,7 @@ struct Snapshot {
     uint64_t smoothingUs = 0;
     uint64_t targetPpm = 0, toleranceUs = 0;
     uint64_t nowUs = 0;
-    Vrr13::InputPercentileBuffer::Stats input;
+    Vrr13::InputGoalBuffer::Stats input;
     // Interval-policy CPU submission score, independent of input coverage.
     bool clientTimingValid = false;
     double clientTimingPercent = 0;
