@@ -30,7 +30,7 @@ constexpr char kTraceHeader[] =
     "trace_schema,arrival_sequence,frame,rtp_timestamp,rtp_valid,decode_complete_us,"
     "frame_receive_us,frame_reassembled_us,decode_submit_us,pacer_arrival_us,"
     "arrival_queue_depth_before,arrival_queue_depth_after,queue_accepted,dequeue_us,queue_discontinuity,decision_valid,decision_us,"
-    "display_refresh_hz,stream_rate_hz,additional_queued_frame,display_period_us,can_latch_present,sender_interval_us,source_rate_hz,source_period_us,"
+    "display_refresh_hz,stream_rate_hz,display_period_us,can_latch_present,sender_interval_us,source_rate_hz,source_period_us,"
     "source_time_us,ready_offset_us,readiness_budget_us,timing_budget_us,render_lead_us,gpu_readiness_lead_us,"
     "render_wake_lead_us,target_wake_lead_us,guard_us,headroom_us,render_start_us,render_wait_final_us,render_wait_overshoot_us,"
     "render_scheduler_delay_us,render_scheduler_delay_valid,render_deadline_already_elapsed,"
@@ -58,11 +58,11 @@ constexpr char kTraceHeader[] =
     "native_raster_after_query_result_valid,native_raster_after_query_result,native_raster_after_query_start_us,native_raster_after_query_end_us,native_raster_after_in_vertical_blank,native_raster_after_scanline,"
     "submission_id_query_result_valid,submission_id_query_result,submission_id_query_start_us,submission_id_query_end_us,frame_stats_query_result_valid,frame_stats_query_result,frame_stats_query_start_us,frame_stats_query_end_us,latch_raw_sync_qpc_valid,latch_raw_sync_qpc_ticks,latch_raw_sync_qpc_frequency_hz,"
     "latch_qpc_correlation_valid,latch_qpc_correlation_reference_ticks,latch_qpc_correlation_reference_time_us,latch_qpc_correlation_span_ticks,"
-    "readiness_phase_us,readiness_demand_us,applied_readiness_reserve_us,render_baseline_us,render_insurance_us,gpu_readiness_applied_us,pacing_latency_budget_us,cadence_sample_count,rate_candidate_sample_count,readiness_sample_count,preparation_sample_count,render_scheduler_sample_count,target_scheduler_sample_count,clean_spacing_frames,phase_error_frames,readiness_model_valid,playout_delay_us,cadence_smoothing_us,missed_ticks,"
+    "readiness_phase_us,readiness_demand_us,applied_readiness_reserve_us,render_baseline_us,render_insurance_us,gpu_readiness_applied_us,pacing_latency_budget_us,cadence_sample_count,rate_candidate_sample_count,readiness_sample_count,preparation_sample_count,render_scheduler_sample_count,target_scheduler_sample_count,clean_spacing_frames,phase_error_frames,readiness_model_valid,playout_delay_us,cadence_smoothing_us,"
     "decode_sync_wait_us,prepare_timing_valid,prepare_decode_sync_us,prepare_acquire_us,prepare_render_us,prepare_flush_us,"
     "gap_fills_before,gap_fill_last_us,original_target_us,playout_initial_profile,original_scanout_us,predicted_scanout_us,compositor_lead_us,recovery_headroom_us,smoothness_protection_us,requested_playout_delay_us,submission_smoothness_samples,submission_smoothness_misses,native_smoothness_samples,native_smoothness_misses,playout_capacity_limited,presentation_uncertainty_us"
     VRR_TIMING_PARAMETER_FIELDS(VRR_TRACE_PARAMETER_HEADER)
-    ",decoder_output_us,session_latency_mode,session_readiness_hitch_feedback,calibration_loaded,initial_cached_samples,history_version,history_state_valid,history_samples,history_misses,history_duration_us,history_can_release"
+    ",decoder_output_us,session_latency_mode,calibration_loaded,initial_cached_samples,history_version,history_state_valid,history_samples,history_misses,history_duration_us,history_can_release"
     ",session_latency_oscillation,latency_test_phase,session_allow_tearing"
     ",buffer_cap_us,buffer_queue_limit_us,buffer_preset_cap_us,playout_offset_us,presentation_floor_push_us"
     ",buffer_update_valid,buffer_update_at_us,buffer_update_frame,buffer_action,buffer_attributed_frame"
@@ -77,16 +77,8 @@ constexpr char kTraceHeader[] =
     ",native_target_100ns,native_target_reference_100ns,native_target_clock_before_us,native_target_clock_after_us,native_target_uncertainty_us"
     ",native_outstanding_presents,native_retiring_present_id,native_skipped_frames,native_canceled_frames,native_displayed_duration_100ns,native_status_id,native_status,native_dropped_status_frames"
     ",lost_packets"
-    ",input_release_allowed,input_release_held,input_release_unknown,input_evidence_us,input_candidate_us,input_candidate_loss_per_million,input_current_loss_per_million"
-    ",input_percentile_target_us,input_percentile_current_us,input_percentile_samples,input_percentile_window_us,input_percentile_probability_ppm,input_percentile_tail_uncertain,input_percentile_evidence_valid,input_percentile_clipped,input_percentile_expired_unknown,input_percentile_history_truncated,input_percentile_eligible,input_percentile_ineligible,input_percentile_absorbed,input_percentile_missed,input_percentile_raises,input_percentile_lowers,input_percentile_unknown_release,input_percentile_epoch_resets,input_percentile_recent_eligible,input_percentile_recent_absorbed,input_percentile_recent_missed,input_percentile_last_input_eligible,input_percentile_last_input_required_us,input_percentile_last_input_observation_us,input_percentile_growth_blocked,input_network_buffer_miss,input_decode_buffer_miss,input_buffer_miss_observation_us,input_percentile_hold_until_us,input_percentile_hold_remaining_us,input_percentile_last_buffer_miss_us,input_percentile_last_network_miss_us,input_percentile_last_decoder_miss_us,input_percentile_network_misses,input_percentile_decoder_misses,input_percentile_release_samples,input_percentile_release_misses,input_percentile_release_factor_ppm,input_percentile_effective_fall_rate_us_per_second,input_percentile_proposed_misses,input_percentile_effective_fall_rate_milli_us_per_second"
+    ",input_percentile_target_us,input_percentile_current_us,input_percentile_samples,input_percentile_window_us,input_percentile_probability_ppm,input_percentile_tail_uncertain,input_percentile_evidence_valid,input_percentile_clipped,input_percentile_expired_unknown,input_percentile_history_truncated,input_percentile_eligible,input_percentile_ineligible,input_percentile_absorbed,input_percentile_missed,input_percentile_raises,input_percentile_lowers,input_percentile_epoch_resets,input_percentile_recent_eligible,input_percentile_recent_absorbed,input_percentile_recent_missed,input_percentile_last_input_eligible,input_percentile_last_input_required_us,input_percentile_last_input_observation_us,input_percentile_growth_blocked,input_network_buffer_miss,input_decode_buffer_miss,input_buffer_miss_observation_us,input_percentile_last_buffer_miss_us,input_percentile_last_network_miss_us,input_percentile_last_decoder_miss_us,input_percentile_network_misses,input_percentile_decoder_misses,input_percentile_release_samples,input_percentile_release_misses,input_percentile_effective_fall_rate_us_per_second"
     ",trajectory_nominal_us,trajectory_existing_us,trajectory_target_us,trajectory_added_us,trajectory_carry_us,trajectory_minimum_interval_us,trajectory_physical_period_us,trajectory_allowance_us,trajectory_intended_interval_us,trajectory_plans,trajectory_limited,trajectory_resets,trajectory_resync_drops,trajectory_deferred,trajectory_continuity,trajectory_no_headroom,trajectory_resync_recommended,trajectory_resync_dropped,trajectory_resync_deferred,trajectory_successor_frame,trajectory_successor_proof"
-    ",trace_model_kind,buffer_audit_revision"
-#define VRR_BUFFER_BEFORE_HEADER(type, name, member) ",buffer_before_" #name
-    VRR_BUFFER_AUDIT_FIELDS(VRR_BUFFER_BEFORE_HEADER)
-#undef VRR_BUFFER_BEFORE_HEADER
-#define VRR_BUFFER_AFTER_HEADER(type, name, member) ",buffer_after_" #name
-    VRR_BUFFER_AUDIT_FIELDS(VRR_BUFFER_AFTER_HEADER)
-#undef VRR_BUFFER_AFTER_HEADER
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
 
@@ -96,7 +88,6 @@ bool isUncPath(const QString& path)
     return path.startsWith(QStringLiteral("\\\\")) || path.startsWith(QStringLiteral("//"));
 }
 #endif
-
 
 } // namespace
 
@@ -110,9 +101,6 @@ int VrrPacingWorker::traceRun()
     TraceRow row;
     while (true) {
         if (m_TraceQueue->pop(row)) {
-#ifdef VRR_WORKER_REPLAY
-            replayTraceConsumed.fetch_add(1, std::memory_order_relaxed);
-#endif
             if (m_TraceAcceptingRows.load() ||
                     (m_TraceStopping.load() && !m_TraceWriteFailed && !m_TraceSizeCapped))
                 writeTraceRow(row);
@@ -142,11 +130,8 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
                                       row.input.arrivalUs);
     const VrrTimingDecision& decision = row.decision;
     const VrrTimingDiagnostics& diagnostics = row.diagnostics;
-    // The writer must never read mutable controller parameters. Reconstruct
-    // this row's policy from immutable session settings and its captured mode.
+    // The policy and startup seed were frozen before the writer thread began.
     const VrrTimingParameters& parameters = m_TraceParameters;
-    // Loaded before either worker starts; retain the actual startup input
-    // without reading mutable controller state on the trace writer thread.
     const VrrPresentFeedback& feedback = row.feedback;
     const FrameTelemetry& telemetry = row.telemetry;
     const uint64_t nativePresentDurationUs =
@@ -201,7 +186,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
         line.append(value);
     };
 
-    addUnsigned(5);
+    addUnsigned(6);
     addUnsigned(row.input.arrivalSequence);
     addSigned(row.frameNumber);
     addUnsigned(row.rtpTimestamp);
@@ -220,7 +205,6 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(telemetry.decisionTimeUs);
     addSigned(m_Config.displayRefreshHz);
     addSigned(m_Config.streamRateHz);
-    addBool(m_Config.allowAdditionalQueuedFrame);
     addUnsigned(displayPeriodUs);
     addBool(m_CanLatchPresentation);
     addUnsigned(decision.sourceIntervalUs);
@@ -485,7 +469,6 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addBool(diagnostics.readinessModelValid);
     addUnsigned(decision.playoutDelayUs);
     addSigned(decision.cadenceSmoothingUs);
-    addUnsigned(decision.missedTicks);
     addUnsigned(telemetry.decodeSyncWaitUs);
     addBool(telemetry.prepareTimingValid);
     addUnsigned(telemetry.prepareDecodeSyncUs);
@@ -516,7 +499,6 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
 #undef VRR_ADD_TRACE_PARAMETER
     addUnsigned(row.decoderOutputUs);
     addSigned(row.latencyMode);
-    addUnsigned(m_Config.readinessHitchFeedback);
     addUnsigned(m_CalibrationLoaded);
     addUnsigned(m_InitialCachedSamples);
     addSigned(m_HistoryVersion);
@@ -536,7 +518,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     const auto& update = row.bufferStats.update;
     // Stale/failed rows may precede the observer call. Never attribute the
     // preceding frame's update to them, nor inspect worker state on producers.
-    addUnsigned(row.decisionValid && parameters.playoutResponsiveBuffer >= 6 &&
+    addUnsigned(row.decisionValid && 12 >= 6 &&
                 update.frame == static_cast<uint64_t>(row.frameNumber) && update.atUs != 0);
     addUnsigned(update.atUs);
     addUnsigned(update.frame);
@@ -586,13 +568,6 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(row.feedback.nativeStatus);
     addUnsigned(row.feedback.nativeDroppedStatusFrames);
     addUnsigned(row.lostPackets);
-    addUnsigned(row.bufferStats.inputReleaseAllowed);
-    addUnsigned(row.bufferStats.inputReleaseHeld);
-    addUnsigned(row.bufferStats.inputReleaseUnknown);
-    addUnsigned(row.bufferStats.inputEvidenceUs);
-    addUnsigned(row.bufferStats.inputCandidateUs);
-    addUnsigned(uint64_t(row.bufferStats.inputCandidateLoss * 1000000));
-    addUnsigned(uint64_t(row.bufferStats.inputCurrentLoss * 1000000));
     addUnsigned(row.bufferStats.inputPercentile.targetUs);
     addUnsigned(row.bufferStats.inputPercentile.currentUs);
     addUnsigned(row.bufferStats.inputPercentile.samples);
@@ -609,7 +584,6 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(row.bufferStats.inputPercentile.missed);
     addUnsigned(row.bufferStats.inputPercentile.raises);
     addUnsigned(row.bufferStats.inputPercentile.lowers);
-    addUnsigned(row.bufferStats.inputPercentile.unknownRelease);
     addUnsigned(row.bufferStats.inputPercentile.epochResets);
     addUnsigned(row.bufferStats.inputPercentile.recentEligible);
     addUnsigned(row.bufferStats.inputPercentile.recentAbsorbed);
@@ -621,8 +595,6 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(row.telemetry.inputNetworkBufferMiss);
     addUnsigned(row.telemetry.inputDecodeBufferMiss);
     addUnsigned(row.telemetry.inputBufferMissObservationUs);
-    addUnsigned(row.bufferStats.inputPercentile.holdUntilUs);
-    addUnsigned(row.bufferStats.inputPercentile.holdRemainingUs);
     addUnsigned(row.bufferStats.inputPercentile.lastBufferMissUs);
     addUnsigned(row.bufferStats.inputPercentile.lastNetworkMissUs);
     addUnsigned(row.bufferStats.inputPercentile.lastDecoderMissUs);
@@ -630,10 +602,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(row.bufferStats.inputPercentile.cumulativeDecoderMisses);
     addUnsigned(row.bufferStats.inputPercentile.recentReleaseSamples);
     addUnsigned(row.bufferStats.inputPercentile.recentReleaseMisses);
-    addUnsigned(row.bufferStats.inputPercentile.releaseFactorPpm);
     addUnsigned(row.bufferStats.inputPercentile.effectiveFallRateUsPerSecond);
-    addUnsigned(row.bufferStats.inputPercentile.recentProposedMisses);
-    addUnsigned(row.bufferStats.inputPercentile.effectiveFallRateMilliUsPerSecond);
     addUnsigned(row.decision.trajectory.nominalUs);
     addUnsigned(row.decision.trajectory.existingUs);
     addUnsigned(row.decision.trajectory.targetUs);
@@ -655,21 +624,6 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(row.telemetry.trajectoryResyncDeferred);
     addSigned(row.telemetry.trajectorySuccessorFrame);
     addUnsigned(row.telemetry.trajectorySuccessorProof);
-#ifdef VRR_WORKER_REPLAY
-    addUnsigned(2); // Virtual production-worker closed loop, never a live capture.
-#else
-    addUnsigned(0);
-#endif
-    addUnsigned(row.telemetry.bufferAuditValid ? 1 : 0);
-    const auto addAudit = [&](const VrrBufferAuditSnapshot& audit) {
-#define VRR_WRITE_BUFFER_AUDIT(type, name, member) \
-        if constexpr (std::is_signed<type>::value) addSigned(audit.member); \
-        else addUnsigned(audit.member);
-        VRR_BUFFER_AUDIT_FIELDS(VRR_WRITE_BUFFER_AUDIT)
-#undef VRR_WRITE_BUFFER_AUDIT
-    };
-    addAudit(row.telemetry.bufferBefore);
-    addAudit(row.bufferAfter);
     line.append('\n');
 
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {
@@ -941,11 +895,6 @@ void VrrPacingWorker::closeTrace()
         m_TraceRowsEnqueued.exchange(0, std::memory_order_relaxed);
     const uint64_t arrivalsAllocated =
         m_TraceArrivalSequence.load(std::memory_order_relaxed);
-#ifdef VRR_WORKER_REPLAY
-    const bool replayHadTrace = m_TraceFile != nullptr;
-    const bool replayWasCapped = m_TraceSizeCapped;
-    bool replayCloseFailed = false;
-#endif
     if (m_TraceFile != nullptr) {
         if (m_TraceFormat == TraceFormat::Csv &&
                 std::fflush(m_TraceFile) != 0) {
@@ -1001,21 +950,11 @@ void VrrPacingWorker::closeTrace()
 
     if (m_TraceFile != nullptr) {
         if (std::fclose(m_TraceFile) != 0) {
-#ifdef VRR_WORKER_REPLAY
-            replayCloseFailed = true;
-#endif
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "VRR trace close reported a write failure");
         }
         m_TraceFile = nullptr;
     }
-#ifdef VRR_WORKER_REPLAY
-    if (replayTraceResult) {
-        *replayTraceResult = replayHadTrace && !replayWasCapped &&
-            !m_TraceWriteFailed && !replayCloseFailed && droppedRows == 0 &&
-            arrivalsAllocated > 0 && rowsEnqueued == arrivalsAllocated;
-    }
-#endif
     m_TraceChunk.clear();
     m_TraceWriteFailed = false;
 }

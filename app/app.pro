@@ -329,17 +329,12 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h \
         streaming/video/ffmpeg-renderers/ivrrframepresenter.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/absorbedjitter.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/inputbufferestimate.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/bufferaudit.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/rollingquantile.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/inputbuffer.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/inputgoalbuffer.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/phasetrajectory.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/recentreadiness.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/readinesswindow.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/readinessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/inputlayercadence.h \

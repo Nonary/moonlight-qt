@@ -16,38 +16,27 @@ extern "C" {
 }
 
 #include <algorithm>
-#include <chrono>
 #include <limits>
 #include <thread>
 #include <utility>
 
 namespace {
 
-// The production session always uses bounded catch-up and corrected input
-// accounting. Historical parameter values remain available to offline replay.
-VrrSessionConfig experimentalInputConfig(VrrSessionConfig config, bool logConfiguration = true)
+VrrSessionConfig prepareProductionConfig(VrrSessionConfig config)
 {
-    config.correctInputAccounting = true;
-    config.experimentalBoundedCatchup = true;
-    if (logConfiguration) {
-        for (const char* name : {"MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER",
-                                 "MOONLIGHT_VRR_BOUNDED_CATCHUP",
-                                 "MOONLIGHT_VRR_INPUT_ACCOUNTING"}) {
-            if (qEnvironmentVariableIsSet(name))
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Retired VRR switch %s is ignored", name);
-        }
+    config = vrrProductionSessionConfig(config);
+    for (const char* name : {"MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER",
+                             "MOONLIGHT_VRR_BOUNDED_CATCHUP",
+                             "MOONLIGHT_VRR_INPUT_ACCOUNTING"}) {
+        if (qEnvironmentVariableIsSet(name))
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Retired VRR switch %s is ignored", name);
     }
-    // Preferences already resolved preset/custom precedence at session creation.
-    // The profile supplies the target; there is no second target.
-    config.experimentalInputPercentilePpm =
-        uint64_t(config.timingOptions.resolved(config.latencyMode).targetHundredths) * 100;
-    config.experimentalInputPercentileWindowUs =
-        uint64_t(config.timingOptions.resolved(config.latencyMode).historySeconds) * 1000000;
-    if (logConfiguration) SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Adaptive buffer: profile %.2f%% selects actual preventable-hitch coverage; history %llu s, rise %llu us/s, selected-window mean protection plus one tolerance reserve sizes demand: breakthrough hitches while coverage fails, all absorbed and missed disturbances while it is met, releasing in proportion to unused miss budget even when that demand is not lower; coverage can refuse growth; proportional convergence in both directions without jump restores or per-frame layer drain lost-cause seconds (misses over 4x the allowance, at least 10%%) retained 10 s and not scored; target the smallest buffer whose predicted window hitches (breakthroughs scaled by hitches per breakthrough) fit the allowance less half its deviation, approached proportionally (stable revision 13); layers at least 30 FPS apart; fixed 2T Absorb pad (input policy 11); display-ceiling phase replacement on every presentation path, keeping late-input phase up to a refresh, expiring 5 s after the last late frame at tolerance per frame, trajectory repaying up to tolerance per frame (ceiling policy 3); interval severity score remains distinct",
-        config.experimentalInputPercentilePpm / 10000.0,
-        static_cast<unsigned long long>(config.experimentalInputPercentileWindowUs / 1000000),
-        static_cast<unsigned long long>(std::clamp<uint64_t>(config.experimentalInputPercentileRiseUsPerSecond, 250, 1000)));
+    const auto target = config.experimentalInputPercentilePpm;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+        "Adaptive buffer: client-timing goal %.2f%% (network and decode jitter only); least buffer meeting it over the last %llu s, aiming at 70%% of the allowed loss; beyond reach maximize timing quality within the buffer cap; rise 4 ms/s, fall 1 ms/s; history %llu s",
+        target / 10000.0,
+        static_cast<unsigned long long>(target >= 999000 ? 120 : target >= 995000 ? 60 : 20),
+        static_cast<unsigned long long>(config.timingOptions.resolved(config.latencyMode).historySeconds));
     return config;
 }
 
@@ -117,17 +106,12 @@ uint64_t submissionBoundaryUs(const VrrPresentFeedback& feedback,
 
 } // namespace
 
-VrrSessionConfig VrrPacingWorker::resolvedInputConfig(VrrSessionConfig config)
-{
-    return experimentalInputConfig(std::move(config), false);
-}
-
 VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
                                  const VrrSessionConfig& config,
                                  PacerTelemetry* telemetry) :
     m_Presenter(presenter),
     m_Telemetry(telemetry),
-    m_Config(experimentalInputConfig(config)),
+    m_Config(prepareProductionConfig(config)),
     m_CanLatchPresentation(presenter != nullptr &&
                            presenter->canLatchAdaptivePresent()),
     m_NativeSynchronizedPresentation(m_CanLatchPresentation &&
@@ -139,10 +123,15 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
         vrrTimingParametersForSession(m_Config, m_NativeSynchronizedPresentation,
                                      m_NativeScheduledPresentation)))
 {
+    if (!m_Config.calibrationKey.empty()) {
+        m_Config.calibrationKey = Vrr13::calibrationKey(
+            QString::fromStdString(m_Config.calibrationKey),
+            QByteArray::fromStdString(vrrCalibrationPolicy(m_TimingController->parameters())),
+            m_CanLatchPresentation, m_Config.allowTearing).toStdString();
+    }
     // Settings enables tracing after SDL initialization. SDL2-compat may cache
     // its environment, so read the current process value just like the path.
     m_DeepTraceEnabled = qEnvironmentVariable("MOONLIGHT_VRR_DEEP_TRACE").startsWith(QLatin1Char('1'));
-    m_BufferAuditEnabled = qEnvironmentVariable("MOONLIGHT_VRR_BUFFER_AUDIT") == QLatin1String("1");
     m_QueueCapacity = m_TimingController->queuedFrameCapacity();
 
     VrrTargetWaiterHooks hooks;
@@ -216,19 +205,18 @@ bool VrrPacingWorker::start()
         m_TimingController->seedPlayoutDelayStart(m_StartDelaySeedUs);
     }
     m_InitialPlayoutProfile = encodeVrrPlayoutProfile(m_TimingController->playoutHistory());
+    m_TraceParameters = m_TimingController->parameters();
     m_InitialCachedSamples = m_TimingController->playoutHistory().cachedEvidence();
     m_HistoryVersion = m_TimingController->playoutHistory().version();
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "VRR capture policy: latency_mode=%d readiness_hitch_feedback=%d history_version=%d calibration_loaded=%d cached_samples=%llu start_delay_seed_us=%llu",
-                m_Config.latencyMode, int(m_Config.readinessHitchFeedback),
+                "VRR capture policy: latency_mode=%d history_version=%d calibration_loaded=%d cached_samples=%llu start_delay_seed_us=%llu",
+                m_Config.latencyMode,
                 m_HistoryVersion, int(m_CalibrationLoaded),
                 static_cast<unsigned long long>(m_InitialCachedSamples),
                 static_cast<unsigned long long>(m_StartDelaySeedUs));
 
     // Enable capture before the producer can submit its first frame. Opening
     // from run() left a small startup race that made session replay incomplete.
-    m_TraceParameters = m_TimingController->parameters();
-    m_TraceParameters.playoutDelayStartSeedUs = m_StartDelaySeedUs;
     openTraceIfRequested();
 
     m_WorkerThread = SDL_CreateThread(VrrPacingWorker::threadProc,
@@ -244,9 +232,6 @@ bool VrrPacingWorker::start()
     if (m_Telemetry != nullptr) {
         m_Telemetry->beginVrrSession();
     }
-#ifdef VRR_WORKER_REPLAY
-    replayStartReady.store(true);
-#endif
 
     return true;
 }
@@ -345,16 +330,11 @@ int VrrPacingWorker::threadProc(void* context)
 
 int VrrPacingWorker::run()
 {
-#if !defined(VRR_WORKER_REPLAY) && !defined(VRR_OFFLINE_TEST)
     const VideoThreadPriority priority("VRRPacer", VideoThreadPriority::Role::Deadline);
-#endif
 
     QueuedFrame reservedFrame;
     bool reservedDiscontinuity = false;
     while (!isStopping()) {
-#ifdef VRR_WORKER_REPLAY
-        if (replayBeforeDequeue) replayBeforeDequeue(replayContext, bool(reservedFrame));
-#endif
         consumeWindowStateNotifications();
 
         QueuedFrame queuedFrame;
@@ -464,10 +444,6 @@ int VrrPacingWorker::run()
         publishReceiveDeadline(frame, decision);
         noteSettledDelay(decisionTimeUs, decision.playoutDelayUs);
         FrameTelemetry telemetry;
-        if (m_BufferAuditEnabled && m_TraceAcceptingRows.load(std::memory_order_relaxed)) {
-            telemetry.bufferAuditValid = true;
-            telemetry.bufferBefore = m_TimingController->bufferAudit(decisionTimeUs, decision.playoutDelayUs);
-        }
         telemetry.preparedAhead = preparedAhead;
         if (preparedAhead) telemetry.preparationStage = queuedFrame.preparation->timing;
         telemetry.decodeSyncWaitUs = decodeSyncWaitUs;
@@ -508,9 +484,8 @@ int VrrPacingWorker::run()
         }
 
         if (decision.trajectory.resyncRecommended) {
-            const auto& policy = m_TimingController->parameters();
             const uint64_t waitUs = decision.replacementWaitUs != 0 ? decision.replacementWaitUs :
-                policy.playoutSmoothingWindowedCadence >= 8 || policy.playoutCeilingPhaseReplacement != 0 ?
+                m_TimingController->parameters().playoutCeilingPhaseReplacement != 0 ?
                     std::min<uint64_t>(20000, decision.sourcePeriodUs * 2) : 0;
             const unsigned replacementWaitMs = unsigned((waitUs + 999) / 1000);
             if (reserveReadySuccessor(preparedAhead, reservedFrame, reservedDiscontinuity, replacementWaitMs)) {
@@ -551,8 +526,6 @@ int VrrPacingWorker::run()
         const uint64_t scheduleAgeUs = scheduleNowUs >= ageBoundaryUs ?
             scheduleNowUs - ageBoundaryUs : 0;
         telemetry.staleAgeUs = scheduleAgeUs;
-        const bool metronome =
-            m_TimingController->parameters().playoutMetronomeEnabled != 0;
         const bool latencyFix = m_TimingController->latencyFixActive();
         // The playout delay is intentional queue residence, not staleness.
         // So is bounded trajectory carry (at most one source period): it
@@ -577,7 +550,7 @@ int VrrPacingWorker::run()
         // here can freeze video indefinitely under sustained GPU load. Keep
         // queue admission/expiry bounded, but present the active ready image.
         if (!preparedAhead && hasQueuedFrame() && VrrFrameDropPolicy::beforeRender(
-                decision, m_TimingController->displayPeriodUs(), ageUs, metronome,
+                decision, m_TimingController->displayPeriodUs(), ageUs,
                 latencyFix, protectedDelayUs,
                 m_TimingController->parameters().playoutLateRecovery != 0)) {
             recordFrameCompletion(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
@@ -636,12 +609,12 @@ int VrrPacingWorker::run()
         // fresh rather than rendering an avoidably old image.
         uint64_t nowUs = LiGetMicroseconds();
         if (!preparedAhead && hasQueuedFrame() && VrrFrameDropPolicy::afterRenderWait(
-                decision, ageOriginUs, nowUs, metronome, latencyFix,
+                decision, ageOriginUs, nowUs, latencyFix,
                 decodeSyncWaitUs, protectedDelayUs)) {
             recordFrameCompletion(queuedFrame, decision, VrrPresentFeedback {}, telemetry,
                        TraceDisposition::Stale);
             noteDrop();
-            if (metronome || latencyFix) {
+            if (latencyFix) {
                 // The tick is freed for the successor; the clock mapping is
                 // still valid and a rebase would only restart its warm-up.
                 m_TimingController->noteSubmission(false, false, 0);
@@ -1091,8 +1064,7 @@ int VrrPacingWorker::run()
             sample.bufferCapUs = decision.playoutDelayMaximumUs;
             sample.gpuReadinessLeadUs = decision.gpuReadinessLeadUs;
             const uint64_t readinessDeadlineUs =
-                m_TimingController->parameters().playoutResponsiveBuffer >= 3 ?
-                decision.originalTargetUs : decision.targetUs;
+                decision.originalTargetUs;
             sample.prepareLate = telemetry.preparationEndUs > readinessDeadlineUs;
             sample.cadenceIntervals = m_TimingController->nativeCadenceIntervals();
             sample.cadenceHitches = m_TimingController->nativeCadenceHitches();
@@ -1167,7 +1139,6 @@ bool VrrPacingWorker::dequeueFrame(QueuedFrame& frame,
                 m_FrameQueue[0].frame, m_FrameQueue[1].frame,
                 m_FrameQueue[0].trace.arrivalUs, nowUs,
                 m_TimingController->sourcePeriodUs(),
-                m_TimingController->parameters().playoutMetronomeEnabled != 0,
                 protectedDelayUs)) {
         expiredFrames.push_back(std::move(m_FrameQueue.front()));
         m_FrameQueue.pop_front();
@@ -1545,20 +1516,20 @@ void VrrPacingWorker::recordFrameCompletion(const QueuedFrame& queuedFrame,
         disposition == TraceDisposition::PreparationFailed;
     if (m_Telemetry && playbackOutcome) {
         const auto& parameters = m_TimingController->parameters();
-        const uint64_t deadlineUs = parameters.playoutResponsiveBuffer >= 3 ?
+        const uint64_t deadlineUs = 12 >= 3 ?
             decision.originalTargetUs : decision.targetUs;
         const bool dropped = disposition != TraceDisposition::Presented;
         // Controller state belongs to the worker. Producer-side drop rows
         // preserve the last published interval result instead of reading it.
-        const bool intervalValid = decisionValid && parameters.playoutResponsiveBuffer >= 6;
+        const bool intervalValid = decisionValid && 12 >= 6;
         const auto intervalStats = intervalValid ? m_TimingController->intervalStats() : Vrr13::IntervalBuffer::Stats{};
         m_Telemetry->recordVrrReadiness(LiGetMicroseconds(),
             decisionValid ? positiveDifference(telemetry.preparationEndUs, deadlineUs) : 0,
             dropped, parameters.playoutOnTimeTargetPerMillion,
             decision.playoutCapacityLimited, decisionValid,
-            parameters.playoutResponsiveBuffer >= 4,
-            parameters.playoutResponsiveBuffer >= 5,
-            parameters.playoutResponsiveBuffer >= 6, intervalValid ? &intervalStats : nullptr);
+            12 >= 4,
+            12 >= 5,
+            12 >= 6, intervalValid ? &intervalStats : nullptr);
     }
     if (queuedFrame.trace.arrivalSequence == 0) {
         return;
@@ -1604,8 +1575,6 @@ void VrrPacingWorker::recordFrameCompletion(const QueuedFrame& queuedFrame,
         row.historyDurationUs = static_cast<uint64_t>(history.duration() / 1000);
         row.historyCanRelease = history.canRelease();
         row.bufferStats = m_TimingController->intervalStats();
-        if (telemetry.bufferAuditValid)
-            row.bufferAfter = m_TimingController->bufferAudit(LiGetMicroseconds(), decision.playoutDelayUs);
     }
     row.feedback = feedback;
     row.telemetry = telemetry;

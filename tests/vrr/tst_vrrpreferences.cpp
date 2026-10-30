@@ -100,7 +100,7 @@ private slots:
             QCOMPARE(prefs->vrrHistorySeconds(), expected.historySeconds);
             QCOMPARE(prefs->vrrToleranceUs(), expected.toleranceUs);
             QCOMPARE(QSettings().value("vrrtargethundredths").toInt(), expected.targetHundredths);
-            QCOMPARE(QSettings().value("vrrtimingpresetrevision").toInt(), 3);
+            QCOMPARE(QSettings().value("vrrtimingpresetrevision").toInt(), 4);
 
             // Explicitly choosing the former target after migration is custom.
             prefs->setVrrTargetHundredths(oldPreset.targetHundredths);

@@ -1,0 +1,44 @@
+{
+  "config_schema": 2,
+  "scenarios": [
+    {
+      "name": "session-policy",
+      "base": "session",
+      "mode": "fixed",
+      "assertions": [
+        {"metric": "simulation.tear.modelled_interval_violations", "operator": "==", "value": 0},
+        {"metric": "simulation.latency_us.decode_to_submission.p99", "operator": "<=", "value": 100000}
+      ]
+    },
+    {
+      "name": "periodic-decision",
+      "base": "session",
+      "mode": "fixed",
+      "parameters": {"execution": {"periodic_stall_every_frames": 37, "periodic_stall_us": 3000}},
+      "assertions": [
+        {"metric": "simulation.tear.modelled_interval_violations", "operator": "==", "value": 0},
+        {"metric": "simulation.latency_us.decode_to_submission.p99", "operator": "<=", "value": 100000}
+      ]
+    },
+    {
+      "name": "periodic-preparation-and-submission",
+      "base": "session",
+      "mode": "fixed",
+      "parameters": {"execution": {"periodic_stall_every_frames": 47, "periodic_preparation_stall_us": 2000, "periodic_submission_stall_us": 1000}},
+      "assertions": [
+        {"metric": "simulation.tear.modelled_interval_violations", "operator": "==", "value": 0},
+        {"metric": "simulation.latency_us.decode_to_submission.p99", "operator": "<=", "value": 100000}
+      ]
+    },
+    {
+      "name": "scheduler-burst",
+      "base": "session",
+      "mode": "fixed",
+      "parameters": {"execution": {"periodic_stall_every_frames": 30, "periodic_stall_burst_frames": 4, "periodic_stall_us": 3000}},
+      "assertions": [
+        {"metric": "simulation.tear.modelled_interval_violations", "operator": "==", "value": 0},
+        {"metric": "simulation.latency_us.decode_to_submission.p99", "operator": "<=", "value": 150000}
+      ]
+    }
+  ]
+}

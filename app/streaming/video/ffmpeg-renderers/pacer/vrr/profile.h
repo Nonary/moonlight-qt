@@ -1,8 +1,12 @@
 #pragma once
 #include "reserve.h"
+#include <QByteArray>
 #include <QString>
 
 namespace Vrr13 {
+// Identity follows the effective controller and presenter, not revision labels.
+QString calibrationKey(const QString& context, const QByteArray& policy,
+                       bool canLatch, bool allowTearing);
 // Bounded, versioned model cache. No phase, native timestamps, or temporary
 // boost survives a session. Empty profile key disables disk access (the lab/tests).
 bool loadProfile(const QString& path, const QString& key, Reserve& reserve);

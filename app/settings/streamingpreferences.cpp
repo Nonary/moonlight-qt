@@ -84,7 +84,7 @@
 #define SER_RENDERER "renderer"
 
 #define CURRENT_DEFAULT_VER 2
-#define CURRENT_VRR_TIMING_PRESET_REVISION 3
+#define CURRENT_VRR_TIMING_PRESET_REVISION 4
 
 static StreamingPreferences* s_GlobalPrefs;
 
@@ -193,7 +193,11 @@ void StreamingPreferences::reload()
         // Saved presets had no separate preset/custom marker. Migrate only
         // the complete old tuple for the explicitly saved mode; any edited
         // value makes it custom and must survive the new preset defaults.
-        const VrrTimingOptions previousPreset = savedPresetRevision == 2 ?
+        const VrrTimingOptions previousPreset = savedPresetRevision == 3 ?
+            (vrrLatencyMode == VLM_LOW_LATENCY ? VrrTimingOptions{500, 9900, 60, 500} :
+             vrrLatencyMode == VLM_SMOOTH ? VrrTimingOptions{4000, 9995, 300, 500} :
+                                          VrrTimingOptions{1000, 9950, 120, 500}) :
+            savedPresetRevision == 2 ?
             (vrrLatencyMode == VLM_LOW_LATENCY ? VrrTimingOptions{500, 9900, 60, 500} :
              vrrLatencyMode == VLM_SMOOTH ? VrrTimingOptions{4000, 9995, 300, 250} :
                                           VrrTimingOptions{1000, 9950, 120, 500}) :

@@ -9,8 +9,24 @@
 #include <QJsonObject>
 #include <QLockFile>
 #include <QSaveFile>
+#include <QCryptographicHash>
 
 namespace Vrr13 {
+
+QString calibrationKey(const QString& context, const QByteArray& policy,
+                       bool canLatch, bool allowTearing)
+{
+    if (context.isEmpty()) return {};
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    hash.addData(QByteArrayLiteral("vrr-calibration-v3\n"));
+    hash.addData(context.toUtf8());
+    hash.addData(QByteArrayLiteral("\ncan-latch="));
+    hash.addData(QByteArray::number(canLatch));
+    hash.addData(QByteArrayLiteral("\nallow-tearing="));
+    hash.addData(QByteArray::number(allowTearing));
+    hash.addData(policy);
+    return QString::fromLatin1(hash.result().toHex());
+}
 static QJsonObject read(const QString& path)
 {
     QFile file(path);

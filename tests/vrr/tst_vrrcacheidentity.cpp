@@ -3,51 +3,52 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profile.h"
 #include <QCoreApplication>
 #include <QTemporaryDir>
-#include <QCryptographicHash>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+
 extern "C" uint64_t LiGetMicroseconds(void) {
     return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
-static QString key(const VrrTimingParameters& p) {
-    QString context="same-device-codec-settings";
-    if(p.playoutInputClockRelativeHistory>=4)
-      context+=QStringLiteral("|input-receive-drift-clock=%1").arg(p.playoutInputClockRelativeHistory);
-    return QCryptographicHash::hash(context.toUtf8(),QCryptographicHash::Sha256).toHex();
-}
-int main(int argc,char**argv) {
-    QCoreApplication app(argc,argv);
-    qunsetenv("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER");
-    qunsetenv("MOONLIGHT_VRR_INPUT_ACCOUNTING");
-    qunsetenv("MOONLIGHT_VRR_BOUNDED_CATCHUP");
-    VrrSessionConfig raw;raw.streamRateHz=116;raw.displayRefreshHz=120;raw.latencyMode=1;
-    raw.timingOptions={1000,9950,120,500};
-    auto before=vrrTimingParametersForSession(raw,false,false);
-    auto effective=VrrPacingWorker::resolvedInputConfig(raw);
-    auto after=vrrTimingParametersForSession(effective,false,false);
-    assert(before.playoutInputClockRelativeHistory==0&&after.playoutInputClockRelativeHistory==4);
-    assert(after.playoutInputPercentileTargetPerMillion==995000);
-    assert(after.playoutInputPercentileWindowUs==120000000);
-    assert(after.playoutInputPercentileToleranceUs==500);
-    QTemporaryDir dir;assert(dir.isValid());const QString path=dir.path()+"/seed.json";
-    assert(Vrr13::saveStartDelay(path,key(before),8378));
-    const auto incorrectlyShared=Vrr13::loadStartDelay(path,key(before));
-    const auto separated=Vrr13::loadStartDelay(path,key(after));
-    assert(incorrectlyShared==8378&&separated==0);
-    const char* switches[] = {"MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER", "MOONLIGHT_VRR_INPUT_ACCOUNTING", "MOONLIGHT_VRR_BOUNDED_CATCHUP"};
+
+int main(int argc, char** argv) {
+    QCoreApplication app(argc, argv);
+    VrrSessionConfig raw;
+    raw.streamRateHz = 116;
+    raw.displayRefreshHz = 120;
+    raw.latencyMode = 1;
+    raw.timingOptions = {1000, 9950, 120, 500};
+    const auto resolved = vrrProductionSessionConfig(raw);
+    const auto policy = vrrTimingParametersForSession(resolved, false, false);
+    assert(policy.playoutInputPercentileTargetPerMillion == 995000);
+    assert(policy.playoutInputPercentileWindowUs == 120000000);
+    const auto identity = [](const VrrTimingParameters& p, bool canLatch) {
+        return Vrr13::calibrationKey("same-device-codec-settings",
+            QByteArray::fromStdString(vrrCalibrationPolicy(p)), canLatch, true);
+    };
+    const auto key = identity(policy, false);
+    QTemporaryDir dir;
+    assert(dir.isValid());
+    const auto path = dir.filePath("seed.json");
+    assert(Vrr13::saveStartDelay(path, key, 8378));
+    assert(Vrr13::loadStartDelay(path, key) == 8378);
+    assert(Vrr13::loadStartDelay(path, identity(policy, true)) == 0);
+    auto changed = policy;
+    changed.playoutInputPercentileTargetPerMillion = 990000;
+    assert(Vrr13::loadStartDelay(path, identity(changed, false)) == 0);
+    const char* switches[] = {"MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER",
+                              "MOONLIGHT_VRR_INPUT_ACCOUNTING", "MOONLIGHT_VRR_BOUNDED_CATCHUP"};
     for (unsigned mask = 0; mask < 8; ++mask) {
         for (unsigned i = 0; i < 3; ++i) {
             if (mask & (1U << i)) qputenv(switches[i], "0");
             else qunsetenv(switches[i]);
         }
-        const auto retired=vrrTimingParametersForSession(VrrPacingWorker::resolvedInputConfig(raw),false,false);
-#define VRR_ASSERT_SAME_PARAMETER(type, jsonName, memberName, defaultValue) assert(retired.memberName == after.memberName);
+        const auto candidate = vrrTimingParametersForSession(vrrProductionSessionConfig(raw), false, false);
+#define VRR_ASSERT_SAME_PARAMETER(type, jsonName, memberName, defaultValue) assert(candidate.memberName == policy.memberName);
         VRR_TIMING_PARAMETER_FIELDS(VRR_ASSERT_SAME_PARAMETER)
 #undef VRR_ASSERT_SAME_PARAMETER
+        assert(identity(candidate, false) == key);
     }
-    std::printf("raw_cache_clock=%llu live_clock=%llu old_namespace_seed=%llu corrected_namespace_seed=%llu; target=995000 window=120000000 tolerance=500; retired overrides ignored\n",
-     (unsigned long long)before.playoutInputClockRelativeHistory,(unsigned long long)after.playoutInputClockRelativeHistory,
-     (unsigned long long)incorrectlyShared,(unsigned long long)separated);
+    std::puts("Effective policy and presenter capabilities isolate calibration; retired switches ignored");
 }

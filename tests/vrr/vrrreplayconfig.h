@@ -99,7 +99,7 @@ struct VrrReplayScenario {
     bool controllerCustomized = false;
     // "base": "session" layers controllerOverrides on the session policy the
     // replay resolves for the capture instead of on historical defaults.
-    bool controllerFromSession = false;
+    bool controllerFromSession = true;
     QJsonObject controllerOverrides;
     VrrReplayWorkerParameters worker;
     VrrReplayDisplayParameters display;
@@ -116,6 +116,9 @@ struct VrrReplayConfiguration {
     VrrReplayExecutionParameters commonExecution;
     QList<VrrReplayScenario> scenarios;
 };
+
+// Schema 6 only supports the production family of controller policies.
+bool validateVrrCurrentPolicy(const VrrTimingParameters& value, QString& error);
 
 QJsonObject vrrTimingParametersToJson(const VrrTimingParameters& value);
 QJsonObject vrrWorkerParametersToJson(const VrrReplayWorkerParameters& value);

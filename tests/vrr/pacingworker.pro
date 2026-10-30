@@ -54,10 +54,9 @@ HEADERS += \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
-    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/recentreadiness.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h
 
-HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/absorbedjitter.h \
-           $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/intervalbuffer.h
+HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/intervalbuffer.h
 
-HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h
+HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputbuffer.h
+HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputgoalbuffer.h

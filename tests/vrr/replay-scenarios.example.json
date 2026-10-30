@@ -1,5 +1,5 @@
 {
-  "config_schema": 1,
+  "config_schema": 2,
   "parameters": {
     "controller": {},
     "worker": {
@@ -50,7 +50,8 @@
           "operator": "<=",
           "value": 0
         }
-      ]
+      ],
+      "base": "session"
     },
     {
       "name": "larger-guard-step",
@@ -59,7 +60,8 @@
         "controller": {
           "guard_step_us": 100
         }
-      }
+      },
+      "base": "session"
     },
     {
       "name": "alignment-probe-overhead-normalized",
@@ -75,7 +77,8 @@
           "operator": "<=",
           "value": 0
         }
-      ]
+      ],
+      "base": "session"
     },
     {
       "name": "periodic-decision-stall",
@@ -85,7 +88,8 @@
           "periodic_stall_every_frames": 60,
           "periodic_stall_us": 2000
         }
-      }
+      },
+      "base": "session"
     },
     {
       "name": "periodic-render-and-submit-stalls",
@@ -96,7 +100,8 @@
           "periodic_preparation_stall_us": 1500,
           "periodic_submission_stall_us": 1000
         }
-      }
+      },
+      "base": "session"
     },
     {
       "name": "scheduler-and-spacing-anomaly-burst",
@@ -110,7 +115,8 @@
           "periodic_target_wake_delay_us": 1000,
           "periodic_spacing_guard_feedback_us": 250
         }
-      }
+      },
+      "base": "session"
     },
     {
       "name": "periodic-early-present-fault",
@@ -120,7 +126,8 @@
           "periodic_stall_every_frames": 60,
           "periodic_submission_advance_us": 6000
         }
-      }
+      },
+      "base": "session"
     },
     {
       "name": "periodic-display-transition-delay",
@@ -130,7 +137,8 @@
           "periodic_stall_every_frames": 60,
           "periodic_display_transition_delay_us": 6000
         }
-      }
+      },
+      "base": "session"
     },
     {
       "name": "wide-worker-queue",
@@ -156,7 +164,8 @@
           "operator": "<=",
           "value": 0
         }
-      ]
+      ],
+      "base": "session"
     }
   ]
 }

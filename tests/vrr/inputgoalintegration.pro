@@ -1,5 +1,5 @@
 TEMPLATE = app
-TARGET = tst_inputpercentileintegration
+TARGET = tst_inputgoalintegration
 DEFINES += INPUT_PERCENTILE_CONTROLLER_TEST
 
 QT -= gui
@@ -7,7 +7,7 @@ CONFIG += console c++17
 CONFIG -= app_bundle
 
 SOURCES += \
-    $$PWD/tst_inputpercentileintegration.cpp \
+    $$PWD/tst_inputgoalintegration.cpp \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.cpp \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.cpp
 
@@ -47,13 +47,9 @@ HEADERS += \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/cadencedetection.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
-    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/recentreadiness.h \
-    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/readinessfeedback.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h
 
-HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/absorbedjitter.h \
-           $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/intervalbuffer.h
+HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/intervalbuffer.h
 
-HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h
-
-HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputbufferestimate.h
+HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputbuffer.h
+HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputgoalbuffer.h

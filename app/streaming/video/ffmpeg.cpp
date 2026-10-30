@@ -656,7 +656,8 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     m_OriginalVideoHeight = params->height;
     m_StreamFps = params->frameRate;
     m_VideoFormat = params->videoFormat;
-    m_VrrUsesMaximumBuffer = params->vrrTimingOptions.resolved(params->vrrLatencyMode).bufferPerMille >= 4000;
+    m_VrrUsesMaximumBuffer = params->vrrTimingOptions.resolved(params->vrrLatencyMode).bufferPerMille >=
+        VrrTimingOptions::preset(0).bufferPerMille;
     m_CurrentTestMode = testMode;
 
     // Don't bother initializing Pacer if we're not actually going to render
@@ -1510,33 +1511,16 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 reason = "Holding - current frame timing is outside the target";
                 break;
             case Action::InputPercentileGrow:
-                reason = interval.inputPercentile.adaptationRevision >= 7 ?
-                    "Converging upward - average hitch protection plus tolerance reserve" :
-                    "Increasing - experimental input percentile needs headroom";
+                reason = "Increasing - input timing needs more buffer";
                 break;
             case Action::InputPercentileRelease:
-                reason = interval.inputPercentile.adaptationRevision >= 7 ?
-                    "Converging downward - average hitch protection plus tolerance reserve" :
-                    "Shrinking - experimental input percentile needs less headroom";
+                reason = "Shrinking - input timing needs less buffer";
                 break;
             case Action::InputPercentileHold:
-                reason = interval.inputPercentile.adaptationRevision >= 7 ?
-                    "Steady - no additional buffer requested" : "Steady - profile input percentile met";
-                break;
-            case Action::InputPercentileBackoff:
-                reason = "Shrinking slowly - recent input misses exceed profile allowance";
-                break;
-            case Action::InputPercentileMissHold:
-                snprintf(recovery, sizeof(recovery),
-                         "Paused shrinking - network/decode buffer miss; %.1f s remaining",
-                         update.holdRemainingUs / 1000000.0);
-                reason = recovery;
+                reason = "Steady - learned input target met";
                 break;
             case Action::InputPercentileUnknown:
                 reason = "Shrinking - obsolete input evidence expired (unknown workload)";
-                break;
-            case Action::AbsorbedJitterHold:
-                reason = "Holding - smaller buffer predicts input timing errors";
                 break;
             case Action::HistoryHold:
                 reason = "Holding - recent timing errors still affect the score";
@@ -1578,14 +1562,12 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             if (interval.inputPercentileEnabled) {
                 const auto& input = interval.inputPercentile;
                 ret = snprintf(&output[offset], length - offset,
-                    "Adaptive buffer | profile %.2f%% %s | target %.2f ms | %llu samples / %llu s%s%s\n"
+                    "Adaptive input buffer | profile %.2f%% | target %.2f ms | %llu samples / %llu s%s%s\n"
                     "Window measured frames %llu | absorbed %llu | missed %llu | interval severity score distinct\n"
                     "Frame lateness %.2f ms | buffer target %.2f ms | tolerance %.2f ms | growth %s\n"
-                    "Release %.1f us/s | last-second inputs %llu / misses %llu | proposed misses %llu\n"
+                    "Release %.1f us/s | last-second inputs %llu / misses %llu\n"
                     "Network misses %llu | decode misses %llu (stage totals)\n",
-                    input.probabilityPpm / 10000.0,
-                    input.adaptationRevision >= 7 ? "hitch-coverage goal; mean + reserve sizing" : "frame-coverage percentile",
-                    input.targetUs / 1000.0,
+                    input.probabilityPpm / 10000.0, input.targetUs / 1000.0,
                     static_cast<unsigned long long>(input.samples),
                     static_cast<unsigned long long>(input.windowUs / 1000000),
                     input.tailUncertain ? " | tail uncertain" : "",
@@ -1596,34 +1578,13 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                     input.lastInputRequiredUs / 1000.0, input.headroomTargetUnclippedUs / 1000.0, input.toleranceUs / 1000.0,
                     input.growthBlocked ? "blocked: timing/capacity unqualified" :
                         input.lastInputEligible ? "measured frame" : "no measured frame",
-                    input.effectiveFallRateMilliUsPerSecond / 1000.0,
+                    double(input.effectiveFallRateUsPerSecond),
                     static_cast<unsigned long long>(input.recentReleaseSamples),
                     static_cast<unsigned long long>(input.recentReleaseMisses),
-                    static_cast<unsigned long long>(input.recentProposedMisses),
                     static_cast<unsigned long long>(input.cumulativeNetworkMisses),
                     static_cast<unsigned long long>(input.cumulativeDecoderMisses));
                 if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
                 offset += ret;
-                if (input.adaptationRevision >= 13) {
-                    ret = snprintf(&output[offset], length - offset,
-                        "Hitch budget: buffer %.2f ms keeps predicted hitches within the allowance | %llu frames / %llu s\n",
-                        input.hitchRequirementMeanUs / 1000.0,
-                        static_cast<unsigned long long>(input.hitchRequirementSamples),
-                        static_cast<unsigned long long>(input.windowUs / 1000000));
-                    if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
-                    offset += ret;
-                }
-                else if (input.adaptationRevision >= 7) {
-                    ret = snprintf(&output[offset], length - offset,
-                        "Hitch estimate: average required protection %.2f ms + tolerance reserve %.2f ms | %llu %s / %llu s\n",
-                        input.hitchRequirementMeanUs / 1000.0, input.toleranceUs / 1000.0,
-                        static_cast<unsigned long long>(input.hitchRequirementSamples),
-                        input.adaptationRevision >= 8 && !input.hitchRequirementFromMisses ?
-                            "disturbances" : "hitches",
-                        static_cast<unsigned long long>(input.windowUs / 1000000));
-                    if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
-                    offset += ret;
-                }
             }
         }
         if (stats.vrrReadiness.samples == 0) {
@@ -1677,7 +1638,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 else snprintf(presentTiming, sizeof(presentTiming), "unavailable");
                 if (advancedStats) {
                     ret = snprintf(&output[offset], length - offset,
-                        "Client timing: %s (target %.2f%%)\n"
+                        "Client timing (CPU submissions): %s (target %.2f%%)\n"
                         "Scored time: %.1fs / %s history (gaps excluded)\n"
                         "Timing error (1s avg): %s | Allowed: %.2f ms | Drops (30s): %llu\n"
                         "Present timing issues (30s): %s\n",
@@ -1690,7 +1651,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 }
                 else {
                     ret = snprintf(&output[offset], length - offset,
-                        "VRR pacing: %s | Client timing: %s / %.2f%% target%s\n"
+                        "VRR pacing: %s | Client timing (CPU submissions): %s / %.2f%% target%s\n"
                         "Scored time: %.1fs / %s history (gaps excluded)\n"
                         "Client interval error (1s): %s | Tolerance: %.2f ms | Dropped (30s): %llu\n"
                         "Present timing issues (30s): %s\n",

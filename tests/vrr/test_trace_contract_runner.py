@@ -91,7 +91,9 @@ class TraceContractRunnerTests(unittest.TestCase):
         bin_dir.mkdir()
         suffix = ".exe" if os.name == "nt" else ""
         for name in runner.REQUIRED_TESTS | {"vrrreplay"}:
-            (bin_dir / (name + suffix)).touch()
+            executable = bin_dir / (name + suffix)
+            executable.touch()
+            executable.chmod(0o755)
         return bin_dir
 
     def _successful_fake_run(self, command, log, env, timeout, *, expected_exit=0, result="valid",

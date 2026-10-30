@@ -25,7 +25,7 @@ run_suite vrr/timingcontroller tst_vrrtimingcontroller
 run_suite vrr/pacingworker tst_vrrpacingworker
 run_suite vrr/vrrcacheidentity tst_vrrcacheidentity
 run_suite vrr/phasetrajectory tst_phasetrajectory
-run_suite vrr/inputpercentileintegration tst_inputpercentileintegration
+run_suite vrr/inputgoalintegration tst_inputgoalintegration
 run_suite vrr/performancestats tst_performancestats
 run_suite vrr/overlay tst_overlay
 run_suite input/tolerance tst_toleranceinput

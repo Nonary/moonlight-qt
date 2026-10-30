@@ -47,9 +47,9 @@ at least one whole frame worse on screen than they were submitted, and
 **Worst** is the largest such delay in the window. A few large stalls are very
 visible but barely change the percentage.
 
-Hitches that start at the host (the game or host capture stalling) are not
-present timing issues: in the frametime graph they spike the Planned, Client and
-Display lanes together.
+A source cadence change can appear in the Planned, Client and Display lanes
+together. Check frame identities, source timestamps and workload before
+attributing a long interval to a host or client fault.
 
 Below about 50 fps the panel is under its adaptive-refresh range and the GPU
 driver repeats frames on its own schedule, so the line reads **paused below VRR
@@ -136,8 +136,9 @@ environment/file APIs for Unicode paths. Export uses a per-capture lock and
 refuses the latest recording while it is active instead of exporting an older
 run. An atomic latest-capture pointer avoids timestamp ties. Interrupted
 recordings remain exportable after their process exits, without gaining a
-clean-close claim. Trace completeness and replay fidelity still require a fresh
-exact replay gate; export does not certify replay or smoothness.
+clean-close claim. Current recordings use schema 6; older raw traces can still
+be decoded but require recapture for replay. Trace completeness and replay
+fidelity still require a fresh exact replay gate; export does not certify replay or smoothness.
 
 ## Validation contracts
 
@@ -154,8 +155,9 @@ actually succeed before the Windows package is described as updated.
 
 Local verification (2026-09-18): the Linux app build, QML syntax check, all nine
 C++ suites, 35 Python tests, independent ZIP reader, cold/warm exact replays and
-five stress scenarios pass. The supplied historical capture also retains exact
-replay. The worker test enables diagnostics after SDL initialization through the
+five stress scenarios pass. Historical captures from that run are not supported
+by the current schema-6 replay contract. The worker test enables diagnostics
+after SDL initialization through the
 same process environment used by the checkbox and confirms deep observations
 without changing presentation mode. An isolated offscreen GUI remains running
 until the smoke test stops it. Artifacts are under `build/vrr-checkbox-f36FtU`.

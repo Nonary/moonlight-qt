@@ -1,3 +1,5 @@
+> Historical reference: the schema-1 replay configs and revision-specific policies described below have been retired. Use a fresh schema-6 trace with the current schema-2 configs in `tests/vrr/configs/`.
+
 # VRR14 integration with measured smoothness feedback
 
 Production keeps the restored VRR14 predictor, source-clock smoothing, native

@@ -1,7 +1,6 @@
 #include "pacer.h"
 #include "../../videothreadpriority.h"
 #include "path.h"
-#include <QCryptographicHash>
 #include "vrrpacingworker.h"
 #include "../ivrrframepresenter.h"
 #include "streaming/streamutils.h"
@@ -305,98 +304,24 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
     // rejection continues through the original fixed path below.
     if (enableVrr) {
         VrrSessionConfig config;
-        // The production queue policy is shared across native backends.
-        config.readinessHitchFeedback = false;
         config.latencyMode = vrrLatencyMode >= 0 && vrrLatencyMode <= 2 ? vrrLatencyMode : 1;
         config.timingOptions = vrrTimingOptions.resolved(config.latencyMode);
         config.streamRateHz = maxVideoFps;
         config.displayRefreshHz = vrrDisplayRefreshHz;
         config.smoothFrameTiming = smoothVrrFrameTiming;
         config.absorbMicrostutter = smoothVrrFrameTiming && absorbVrrMicrostutter;
+        config = vrrProductionSessionConfig(config);
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         if (!calibrationKey.isEmpty()) {
             const QString display = QString::fromUtf8(SDL_GetDisplayName(SDL_GetWindowDisplayIndex(window)));
-            auto context = calibrationKey + QString("|%1|%2|%3|%4")
-                .arg(display).arg(maxVideoFps).arg(vrrDisplayRefreshHz)
-                .arg(smoothVrrFrameTiming);
-#ifdef Q_OS_LINUX
-            // Do not seed the shared policy with retired Linux hitch-policy history.
-            context += QStringLiteral("|shared-readiness-policy-v18");
-#endif
-            // Cache by effective values, never by the last selected preset.
-            context += QStringLiteral("|custom-timing-v1=%1-%2-%3-%4")
-                .arg(config.timingOptions.bufferPerMille)
-                .arg(config.timingOptions.targetHundredths)
-                .arg(config.timingOptions.historySeconds)
-                .arg(config.timingOptions.toleranceUs);
-            // Preserve the historical V2 calibration identity now that its
-            // queue policy is unconditional rather than a live preference.
-            context += QStringLiteral("|mean-miss-queue-v2");
-            const auto cacheConfig = VrrPacingWorker::resolvedInputConfig(config);
-            const auto recoveryPolicy = vrrTimingParametersForSession(cacheConfig);
-            if (recoveryPolicy.playoutInputClockRelativeHistory >= 4)
-                context += QStringLiteral("|input-receive-drift-clock=%1").arg(recoveryPolicy.playoutInputClockRelativeHistory);
-            if (recoveryPolicy.playoutInputHitchMissesOnly)
-                context += QStringLiteral("|input-hitch-misses=%1").arg(recoveryPolicy.playoutInputHitchMissesOnly);
-            if (recoveryPolicy.normalizedSourceIntrinsicDecodeGpu)
-                context += QStringLiteral("|intrinsic-producer-clock=%1").arg(recoveryPolicy.normalizedSourceIntrinsicDecodeGpu);
-            if (recoveryPolicy.playoutInputStableAdaptation)
-                context += QStringLiteral("|stable-input-adaptation=%1").arg(recoveryPolicy.playoutInputStableAdaptation);
-            context += QStringLiteral("|late-recovery=%1|buffer-ratio=%2")
-                .arg(recoveryPolicy.playoutLateRecovery)
-                .arg(recoveryPolicy.playoutDelayMaximumPeriodPerMille);
-            if (recoveryPolicy.playoutInputLayerSeedRatioPerMille != 0 ||
-                    recoveryPolicy.playoutCatchupCarryLimitUs != 0) {
-                context += QStringLiteral("|input-learning=%1-%2-%3-%6|carry-limit=%4-%5")
-                    .arg(recoveryPolicy.playoutInputBoundedRecoveryCredit)
-                    .arg(recoveryPolicy.playoutInputLayerSeedRatioPerMille)
-                    .arg(recoveryPolicy.playoutInputLearningTrim)
-                    .arg(recoveryPolicy.playoutCatchupCarryLimitUs)
-                    .arg(recoveryPolicy.playoutCatchupCarryLimitPeriodPerMille)
-                    .arg(recoveryPolicy.playoutInputRecoveryCreditRoomPerMille);
-            }
-            if (smoothVrrFrameTiming) {
-                // The saved flag previously selected timestamp-following
-                // playout too. Do not cross-seed its readiness calibration.
-                const auto policy = vrrTimingParametersForSession(cacheConfig);
-                context += QStringLiteral("|frame-smoothing=%1-%2-%3|cadence=%4-%5")
-                    .arg(policy.playoutSmoothingGainPerMille)
-                    .arg(policy.playoutSmoothingPeriodAlphaPerMille)
-                    .arg(policy.playoutSmoothingMaxLagUs)
-                    .arg(policy.playoutSmoothingWindowedCadence)
-                    .arg(policy.playoutSmoothingRecoveryUs);
-                context += QStringLiteral("|catchup=%1").arg(policy.playoutCatchupPerMille);
-                if (policy.playoutSmoothingRecenterPerMille != 0) {
-                    context += QStringLiteral("|recenter=%1").arg(policy.playoutSmoothingRecenterPerMille);
-                }
-                if (policy.playoutSmoothingMaxLagPeriodPerMille != 0) {
-                    context += QStringLiteral("|lag-period=%1").arg(policy.playoutSmoothingMaxLagPeriodPerMille);
-                }
-                if (policy.playoutSmoothingAbsorbReserveUs != 0) {
-                    context += QStringLiteral("|absorb-microstutter=%1-%2")
-                        .arg(policy.playoutSmoothingAbsorbReserveUs)
-                        .arg(policy.playoutSmoothingAbsorbReservePeriodPerMille);
-                }
-                if (policy.playoutSmoothingReadinessBound != 0) {
-                    context += QStringLiteral("|smoothing-readiness-bound=%1")
-                        .arg(policy.playoutSmoothingReadinessBound);
-                }
-                if (policy.playoutSmoothingReserveMaxUs != 0 ||
-                        policy.playoutSmoothingPeriodFeedbackPerMillion != 0) {
-                    context += QStringLiteral("|smoothing-reserve=%1-%2-%3-%4|period-feedback=%5")
-                        .arg(policy.playoutSmoothingReserveMaxUs)
-                        .arg(policy.playoutSmoothingReserveToleranceUs)
-                        .arg(policy.playoutSmoothingReservePercentilePerMille)
-                        .arg(policy.playoutSmoothingReserveReleaseUsPerSecond)
-                        .arg(policy.playoutSmoothingPeriodFeedbackPerMillion);
-                }
-            }
-            config.calibrationKey = QCryptographicHash::hash(context.toUtf8(), QCryptographicHash::Sha256).toHex().toStdString();
+            // The worker hashes this device context with its resolved policy and
+            // presenter capabilities after the presenter has been selected.
+            config.calibrationKey = (calibrationKey + QStringLiteral("|display=%1|stream=%2|refresh=%3")
+                .arg(display).arg(maxVideoFps).arg(vrrDisplayRefreshHz)).toStdString();
             config.calibrationPath = Path::getCacheFileInfo("vrr13-calibration.json").absoluteFilePath().toStdString();
         }
         // The retired extra-queue flag remains only for historical replay;
         // the timing profile controls delay and stale-frame replacement.
-        config.allowAdditionalQueuedFrame = false;
 
         if (!enableVsync) {
             fallbackReason = VrrFallbackReason::IneffectiveVsync;
