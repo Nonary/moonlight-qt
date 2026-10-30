@@ -6,8 +6,10 @@
 #include "../../app/streaming/input/rumbleroute.h"
 #include "../../app/streaming/input/steamcontroller/steamcontrollerlink.h"
 #include "../../app/streaming/input/steamcontroller/steamcontrollerhost.h"
+#include "support/SDL_compat.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -22,6 +24,11 @@ using namespace SteamController;
 struct HostState { short number, mask; int flags; uint8_t lt, rt; short lsX, lsY, rsX, rsY; };
 struct HostTouch { uint8_t number, event, pad; uint32_t pointer; };
 static std::vector<HostState> g_HostStates;
+static int g_QuitEvents = 0;
+void recordSdlEvent(const SDL_Event& event)
+{
+    if (event.type == SDL_QUIT) g_QuitEvents++;
+}
 static std::vector<HostTouch> g_HostTouches;
 struct HostMotion { uint8_t number, type; float x, y, z; };
 static std::vector<HostMotion> g_HostMotionLog;
@@ -993,6 +1000,93 @@ static void testHostFocusPolicy()
     link->stop(g_Now);
 }
 
+static void setNoGamepadQuit(const char* value)
+{
+#ifdef _WIN32
+    _putenv_s("NO_GAMEPAD_QUIT", value ? value : "");
+#else
+    if (value) setenv("NO_GAMEPAD_QUIT", value, 1);
+    else unsetenv("NO_GAMEPAD_QUIT");
+#endif
+}
+
+// The direct HID host bridge consumes the quit combo once per press, including extra
+// controller bits, and does not leak a held combo to the host or across focus changes.
+static void testHostQuitCombo()
+{
+    const char* original = std::getenv("NO_GAMEPAD_QUIT");
+    const bool hadOriginal = original != nullptr;
+    const std::string saved = hadOriginal ? original : "";
+    setNoGamepadQuit(nullptr);
+
+    SteamControllerHost host;
+    SteamControllerHost::setActiveGamepadMask(1);
+    auto device = std::make_shared<FakeState>();
+    SteamHidDeviceInfo info;
+    info.productId = PRODUCT_PUCK;
+    info.interfaceNumber = 2;
+    auto link = std::make_shared<SteamControllerLink>(1004, info,
+        std::unique_ptr<SteamHidDevice>(new FakeDevice(device)), SteamControllerConfig{}, 500, &host);
+    host.announce(0, link, link->generation());
+    g_HostStates.clear();
+    g_QuitEvents = 0;
+    auto send = [&](int flags) {
+        host.linkState(*link, link->generation(), flags, 4, 5, 6, 7, 8, 9);
+    };
+    auto neutral = [](const HostState& s) {
+        return s.number == 0 && s.mask == 1 && s.flags == 0 && s.lt == 0 && s.rt == 0
+            && s.lsX == 0 && s.lsY == 0 && s.rsX == 0 && s.rsY == 0;
+    };
+    const int combo = PLAY_FLAG | BACK_FLAG | LB_FLAG | RB_FLAG;
+
+    send(combo & ~RB_FLAG);
+    check(g_QuitEvents == 0 && g_HostStates.size() == 1 && g_HostStates[0].flags == (combo & ~RB_FLAG),
+          "incomplete quit combination forwards normally");
+    g_HostStates.clear();
+    send(combo | PADDLE1_FLAG | LEFT_GRIP_TOUCH_FLAG);
+    check(g_QuitEvents == 1 && g_HostStates.size() == 1 && neutral(g_HostStates[0]),
+          "quit combination with extra buttons posts one quit and releases the host state");
+    g_HostStates.clear();
+    send(combo | PADDLE1_FLAG | LEFT_GRIP_TOUCH_FLAG);
+    check(g_QuitEvents == 1 && g_HostStates.empty(), "held quit combination is consumed without repeating the event");
+    send(combo & ~RB_FLAG);
+    check(g_HostStates.size() == 1 && g_HostStates[0].flags == (combo & ~RB_FLAG),
+          "releasing one combo button resumes ordinary forwarding");
+    g_HostStates.clear();
+    send(combo);
+    check(g_QuitEvents == 2 && g_HostStates.size() == 1 && neutral(g_HostStates[0]),
+          "pressing the quit combination again posts another quit event");
+
+    send(0);
+    g_HostStates.clear();
+    setNoGamepadQuit("1");
+    send(combo);
+    check(g_QuitEvents == 2 && g_HostStates.size() == 1 && g_HostStates[0].flags == combo,
+          "NO_GAMEPAD_QUIT=1 forwards the combination without quitting");
+    setNoGamepadQuit(nullptr);
+    send(0);
+    SteamControllerHost::notifyWindowFocus(false, false);
+    g_HostStates.clear();
+    send(combo);
+    check(g_QuitEvents == 2 && g_HostStates.empty(), "suppressed input cannot trigger the quit shortcut");
+    SteamControllerHost::notifyWindowFocus(true, false);
+    check(g_HostStates.empty(), "focus regain does not replay a held quit combination");
+    send(combo);
+    check(g_QuitEvents == 2 && g_HostStates.empty(), "held combo after focus regain remains consumed");
+    send(0);
+    g_HostStates.clear();
+    send(combo);
+    check(g_QuitEvents == 3 && g_HostStates.size() == 1 && neutral(g_HostStates[0]),
+          "release and repress after focus regain triggers the shortcut");
+    g_HostStates.clear();
+    host.linkState(*link, link->generation() + 1, combo, 0, 0, 0, 0, 0, 0);
+    check(g_QuitEvents == 3 && g_HostStates.empty(), "stale link generation cannot trigger quit");
+
+    host.shutdown();
+    link->stop(g_Now);
+    setNoGamepadQuit(hadOriginal ? saved.c_str() : nullptr);
+}
+
 // Focus transitions and the pads/IMU: a finger held across the change (or set down while
 // unfocused) gets a fresh DOWN on regain rather than a MOVE the host would reject after
 // CANCEL_ALL; the gyro is zeroed on loss and the current sample is resent on regain even when
@@ -1531,6 +1625,7 @@ int main()
         testHostFeedbackGeneration();
         testRumbleRoute();
         testHostFocusPolicy();
+        testHostQuitCombo();
         testHostFocusTouchAndMotion();
         testBle();
         testBleHapticKnobs();
