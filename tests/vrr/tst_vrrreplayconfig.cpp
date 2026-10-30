@@ -305,17 +305,19 @@ void VrrReplayConfigTest::intrinsicProducerClockRoundTrip()
     VrrSessionConfig session;
     session.experimentalBoundedCatchup = true;
     const auto production = vrrTimingParametersForSession(session);
-    QCOMPARE(production.normalizedSourceIntrinsicDecodeGpu, uint64_t(1));
+    QCOMPARE(production.normalizedSourceIntrinsicDecodeGpu, uint64_t(2));
     auto snapshot = vrrTimingParametersToJson(production);
     VrrTimingParameters restored;
     QString error;
     QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error), qPrintable(error));
+    QCOMPARE(restored.normalizedSourceIntrinsicDecodeGpu, uint64_t(2));
+    QVERIFY2(applyVrrReplayControllerSnapshot({{"normalized_source_intrinsic_decode_gpu", 1}}, restored, error), qPrintable(error));
     QCOMPARE(restored.normalizedSourceIntrinsicDecodeGpu, uint64_t(1));
     snapshot.remove("normalized_source_intrinsic_decode_gpu");
     restored = VrrTimingParameters{};
     QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error), qPrintable(error));
     QCOMPARE(restored.normalizedSourceIntrinsicDecodeGpu, uint64_t(0));
-    QVERIFY(!applyVrrReplayControllerSnapshot({{"normalized_source_intrinsic_decode_gpu", 2}}, restored, error));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"normalized_source_intrinsic_decode_gpu", 3}}, restored, error));
     QCOMPARE(restored.normalizedSourceIntrinsicDecodeGpu, uint64_t(0));
 }
 

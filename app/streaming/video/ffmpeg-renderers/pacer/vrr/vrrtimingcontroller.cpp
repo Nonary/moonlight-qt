@@ -232,7 +232,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutInputLayerLifecycle = parameters.playoutInputPercentileEnabled ? 2 : 0;
     parameters.boundedCatchupEnabled = config.experimentalBoundedCatchup;
     parameters.normalizedSourceMapping = config.experimentalBoundedCatchup;
-    parameters.normalizedSourceIntrinsicDecodeGpu = config.experimentalBoundedCatchup;
+    parameters.normalizedSourceIntrinsicDecodeGpu = config.experimentalBoundedCatchup ? 2 : 0;
     // At the display ceiling no presenter can repay inherited phase by showing
     // frames faster. Released input buffer otherwise became standing ownership
     // phase on DXGI (5 ms for minutes in the 2026-10-20 capture at 120/120).
@@ -751,6 +751,22 @@ void VrrTimingController::initializeTimeline(const PacedFrame& frame)
 
 uint64_t VrrTimingController::estimatedDecodeCompleteUs(const PacedFrame& frame) const
 {
+    if (m_Parameters.normalizedSourceIntrinsicDecodeGpu >= 2) {
+        const uint64_t output = frame.decoderOutputUs();
+        const uint64_t observed = frame.decodeCompleteUs();
+        const uint64_t wait = frame.decodeSyncWaitUs();
+        const uint64_t collected = observed - std::min(observed, wait);
+        // A late poll measures readiness after our own pacing queue. Even a
+        // blocking poll cannot turn the whole output-to-poll interval into
+        // independent producer work. Preserve prompt observations of genuine
+        // GPU stalls; otherwise use only independently learned service time.
+        // The worker still waits for actual readiness before scheduling.
+        if (wait >= PreciseCompletionWaitUs &&
+                (collected <= output || collected - output <= PromptCollectionUs))
+            return std::max(output, observed);
+        return std::min(std::max(output, observed),
+                        saturatingAdd(output, m_DecodeIntrinsicUs));
+    }
     return estimateDecodeCompleteUs(frame.decoderOutputUs(), frame.decodeCompleteUs(),
                                     frame.decodeSyncWaitUs(), m_DecodeGpuTypicalUs);
 }
@@ -760,6 +776,12 @@ void VrrTimingController::learnDecodeGpu(const PacedFrame& frame)
     const uint64_t output = frame.decoderOutputUs();
     const uint64_t complete = frame.decodeCompleteUs();
     if (!output || complete <= output || frame.decodeSyncWaitUs() < PreciseCompletionWaitUs) return;
+    const uint64_t collectedUs = complete - std::min(complete, frame.decodeSyncWaitUs());
+    const bool prompt = collectedUs <= output || collectedUs - output <= PromptCollectionUs;
+    // Revision 1 retained late observations in the generic estimator and
+    // rejected them only from the source-clock estimator. Input buffering
+    // then learned its own queue residence through that generic estimator.
+    if (m_Parameters.normalizedSourceIntrinsicDecodeGpu >= 2 && !prompt) return;
     m_DecodeGpuSamples[m_DecodeGpuNext] = complete - output;
     m_DecodeGpuNext = (m_DecodeGpuNext + 1) % m_DecodeGpuSamples.size();
     m_DecodeGpuCount = std::min(m_DecodeGpuCount + 1, m_DecodeGpuSamples.size());
@@ -769,8 +791,7 @@ void VrrTimingController::learnDecodeGpu(const PacedFrame& frame)
     m_DecodeGpuTypicalUs = *middle;
     // A late collection includes intentional pacing-queue residence even
     // when the final API wait blocks. Only prompt collection measures service.
-    const uint64_t collectedUs = complete - std::min(complete, frame.decodeSyncWaitUs());
-    if (collectedUs > output && collectedUs - output > PromptCollectionUs) return;
+    if (!prompt) return;
     m_DecodeIntrinsicSamples[m_DecodeIntrinsicNext] = complete - output;
     m_DecodeIntrinsicNext = (m_DecodeIntrinsicNext + 1) % m_DecodeIntrinsicSamples.size();
     m_DecodeIntrinsicCount = std::min(m_DecodeIntrinsicCount + 1, m_DecodeIntrinsicSamples.size());

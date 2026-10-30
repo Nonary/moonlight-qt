@@ -615,8 +615,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutSmoothingResetSlewUs > 100000) {
         return fail("playout_smoothing_reset_slew_us must be in 0..100000");
     }
-    if (value.normalizedSourceIntrinsicDecodeGpu > 1) {
-        return fail("normalized_source_intrinsic_decode_gpu must be 0 or 1");
+    if (value.normalizedSourceIntrinsicDecodeGpu > 2) {
+        return fail("normalized_source_intrinsic_decode_gpu must be 0..2");
     }
     if (value.playoutSmoothingReadinessBound > 1) {
         return fail("playout_smoothing_readiness_bound must be 0 or 1");

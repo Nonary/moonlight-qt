@@ -252,6 +252,84 @@ void asyncDecodeCompletionPlanning() {
     std::fprintf(stderr,"async decode planning: early=%llu/%llu mean plan after completion=%lluus typicalGpu=%lluus\n",
         (unsigned long long)early,(unsigned long long)planned,(unsigned long long)(planned?lead/planned:0),(unsigned long long)c.typicalDecodeGpuUs());
 }
+
+// Reproduce a standing pacing queue followed by a late fence poll. The poll
+// still gates this frame, but its age must not become producer jitter for all
+// subsequent frames that were already ready when checked.
+void queuedDecodeCompletionDoesNotTrainInputDelay() {
+    uint64_t peakInput[2] = {}, finalTarget[2] = {}, typical[2] = {};
+    for (int revision : {1, 2}) {
+        VrrSessionConfig session;
+        session.streamRateHz=116; session.displayRefreshHz=120;
+        session.smoothFrameTiming=false;
+        session.experimentalInputPercentilePpm=1;
+        session.experimentalBoundedCatchup=true;
+        session.timingOptions.targetHundredths=9995;
+        session.timingOptions.historySeconds=300;
+        session.timingOptions.bufferPerMille=4000;
+        auto policy=vrrTimingParametersForSession(session);
+        policy.normalizedSourceIntrinsicDecodeGpu=revision;
+        policy.playoutDelayStartSeedUs=22000;
+        VrrTimingController controller(session,true,policy);
+        for (int i=0;i<1200;++i) {
+            const uint64_t source=1000000+uint64_t(i)*1000000/116;
+            const uint64_t output=source+500;
+            const bool prompt=i<64;
+            const uint64_t wait=prompt?2000:(i%30==0?500:0);
+            const uint64_t observed=output+(prompt?2000:20000+wait);
+            PacedFrame f(nullptr,i,uint32_t(uint64_t(i)*90000/116),true,output);
+            f.setDeliveryTimeline(source-200,source,source+100);
+            f.noteGpuReadyUs(observed); f.noteDecodeSyncWaitUs(wait);
+            const auto d=controller.schedule(f,observed);
+            const auto ready=std::max(observed,d.renderStartUs)+500;
+            const auto submitted=std::max(ready,d.targetUs);
+            check(d.targetUs>=observed,"queue-neutral input accounting never plans before actual decode readiness");
+            controller.notePreparationDuration(500,0,ready);
+            controller.noteSchedulerDelays(0,0,true);
+            controller.noteSubmission(true,false,submitted,submitted);
+            const auto input=controller.intervalStats().inputPercentile;
+            if(i>=256 && input.lastInputEligible)
+                peakInput[revision-1]=std::max(peakInput[revision-1],
+                    uint64_t(std::max<int64_t>(0,input.lastInputRequiredUs)));
+        }
+        finalTarget[revision-1]=controller.intervalStats().inputPercentile.targetUs;
+        typical[revision-1]=controller.typicalDecodeGpuUs();
+    }
+    check(peakInput[0]>15000 && finalTarget[0]>15000,
+          "historical policy reproduces queue residence becoming standing input protection");
+    check(peakInput[1]<1000 && finalTarget[1]==1000 && typical[1]==2000,
+          "late collection cannot contaminate GPU service or retain input protection");
+    std::fprintf(stderr,"queued decode input: peak %llu -> %llu us, target %llu -> %llu us, GPU estimate %llu -> %llu us\n",
+        (unsigned long long)peakInput[0],(unsigned long long)peakInput[1],
+        (unsigned long long)finalTarget[0],(unsigned long long)finalTarget[1],
+        (unsigned long long)typical[0],(unsigned long long)typical[1]);
+
+    VrrSessionConfig session;
+    session.streamRateHz=60;session.displayRefreshHz=120;
+    session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=1;
+    session.experimentalBoundedCatchup=true;
+    VrrTimingController controller(session,true,vrrTimingParametersForSession(session));
+    bool sawRealStall=false;
+    for(int i=0;i<180;++i) {
+        const uint64_t source=1000000+uint64_t(i)*1000000/60,output=source+500;
+        const uint64_t wait=i==120?6500:2000,observed=output+wait;
+        PacedFrame f(nullptr,i,uint32_t(uint64_t(i)*1500),true,output);
+        f.setDeliveryTimeline(source-200,source,source+100);
+        f.noteGpuReadyUs(observed);f.noteDecodeSyncWaitUs(wait);
+        const auto d=controller.schedule(f,observed);
+        const auto ready=std::max(observed,d.renderStartUs)+500;
+        const auto submitted=std::max(ready,d.targetUs);
+        controller.notePreparationDuration(500,0,ready);
+        controller.noteSchedulerDelays(0,0,true);
+        controller.noteSubmission(true,false,submitted,submitted);
+        if(i==120) {
+            const auto input=controller.intervalStats().inputPercentile;
+            sawRealStall=input.lastInputEligible && input.lastInputRequiredUs>=4000;
+            check(d.targetUs>=observed,"a real promptly observed GPU stall cannot be planned early");
+        }
+    }
+    check(sawRealStall,"promptly observed GPU stalls remain eligible input-lateness evidence");
+}
 // Bounded catch-up owns recovery. The VRR17 late-recovery floor re-armed on
 // every submission later than the original plan, i.e. on every carried frame,
 // and spaced each frame from the previous actual submission: at 116 FPS on a
@@ -368,4 +446,4 @@ void actualControllerAndInputIsolation() {
     late.reset();check(late.trajectoryStats().plans==0,"controller full reset clears trajectory model");
 }
 }
-int main() {extraDelayDoesNotChaseCurrentReadiness();bufferReleaseDoesNotCreateCarry();carryRepaymentKnobs();decodeCompletionEstimate();legacyRecoveryCannotSustainCarry();asyncDecodeCompletionPlanning();compressionAndAcceptance();resyncAndLifecycle();preparedSuccessorProof();sourceMappingFactorial();actualCadenceChangeQualification();actualControllerAndInputIsolation();std::fprintf(stderr,"phase trajectory integration: %s (%d failures)\n",failures?"FAIL":"PASS",failures);return failures?1:0;}
+int main() {extraDelayDoesNotChaseCurrentReadiness();bufferReleaseDoesNotCreateCarry();carryRepaymentKnobs();decodeCompletionEstimate();legacyRecoveryCannotSustainCarry();asyncDecodeCompletionPlanning();queuedDecodeCompletionDoesNotTrainInputDelay();compressionAndAcceptance();resyncAndLifecycle();preparedSuccessorProof();sourceMappingFactorial();actualCadenceChangeQualification();actualControllerAndInputIsolation();std::fprintf(stderr,"phase trajectory integration: %s (%d failures)\n",failures?"FAIL":"PASS",failures);return failures?1:0;}

@@ -1,3 +1,15 @@
+GPU readiness accounting (2026-10-30, `normalized_source_intrinsic_decode_gpu=2`):
+production learns GPU service only when collection starts within 1 ms of decoder
+output. A completion sampled after pacing-queue residence is an upper bound, even
+if its final poll blocks. Input requirements then use the prompt-service estimate
+(or decoder output until such evidence exists), bounded by observed completion.
+Promptly observed real stalls retain their measured completion. Actual worker/GPU
+readiness and preparation gates are unchanged. This prevents standing input delay
+from training itself through the generic GPU-duration estimator. Revisions 0/1
+retain their recorded behavior for exact replay. Delayed observations cannot prove
+the true unqueued GPU completion, so replay comparisons remain conditional on the
+recorded workload and must not be described as measured physical latency savings.
+
 Input lifecycle and requirement coordinates (2026-10-25,
 `playout_input_stable_adaptation=14`): revision 13 held seeded protection when
 no hitch-budget estimate existed, even after history expiry. Revision 14 keeps

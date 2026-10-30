@@ -1,3 +1,27 @@
+Queued GPU readiness (2026-10-30): production uses
+`normalized_source_intrinsic_decode_gpu=2`. `tst_phasetrajectory` reproduces
+a 20 ms pacing queue with occasional residual GPU waits. Revision 1 learns
+20.5 ms GPU service and an 18.111 ms input target; revision 2 retains the
+independently observed 2 ms GPU service and a 1 ms target. A separate prompt
+6.5 ms GPU stall remains eligible lateness, and neither case plans before
+observed physical readiness. Revisions 0/1 retain exact replay compatibility.
+
+The supplied daily.193 capture (20.846 s, 2,431 rows, SHA-256
+`f59259ed48daabc97f483605ebe903173db9c7e6717a2b7eb72a2bc8fcc59faf`)
+passes the rebuilt exact baseline and complete-sequence gates. With every
+captured parameter including its 21.862 ms startup seed preserved, changing
+only the readiness revision lowers the last presented frame's learned target
+21.988 -> 5.046 ms and applied buffer 22.008 -> 16.896 ms. The ordinary 250 us/s
+release limit still applies. Mean modeled decoder-output-to-submission time
+falls 28.128 -> 25.946 ms; p99 presented jerk stays 1.432 ms and the share over
+2 ms stays 0.7%. Nominal, periodic decision/preparation/submission stalls, and
+scheduler bursts pass 30 assertions for mean/p99 latency, buffer, cadence and
+zero modeled interval violations, with no reported worker saturation.
+The fresh-profile simulation is saturated and is excluded from performance
+claims. These are captured-workload controller comparisons, not measured GPU
+completion or physical-display improvements. Local results and exact configs:
+`build/buffer-investigation-20261030`.
+
 Validation (2026-10-17): nine new frame-rate/goal combinations fail under
 revision 2 and pass under revision 3, each releasing 1000 us over four qualified
 seconds. Seven controller/lifecycle/trace/config/render suites pass. The worker
