@@ -4,9 +4,14 @@
 #include "SDL_compat.h"
 #include "streaming/streamutils.h"
 
+#include <QScopeGuard>
+
 void SdlInputHandler::handleMouseButtonEvent(SDL_MouseButtonEvent* event)
 {
     int button;
+
+    // Automatic mouse mode sees the new button state once this event is handled
+    auto noteButtons = qScopeGuard([this] { noteMouseButtons(); });
 
     if (event->which == SDL_TOUCH_MOUSEID) {
         // Ignore synthetic mouse events
@@ -26,8 +31,10 @@ void SdlInputHandler::handleMouseButtonEvent(SDL_MouseButtonEvent* event)
         // Not capturing
         return;
     }
-    else if (m_AbsoluteMouseMode && !isMouseInVideoRegion(event->x, event->y) && event->state == SDL_PRESSED) {
-        // Ignore button presses outside the video region, but allow button releases
+    else if (m_AbsoluteMouseMode && !isMouseInVideoRegion(event->x, event->y) && event->state == SDL_PRESSED &&
+             !isAwaitingRelativeMouse()) {
+        // Ignore button presses outside the video region, but allow button releases.
+        // A game holding a hidden or locked cursor gets them wherever ours rests.
         return;
     }
 
@@ -97,6 +104,17 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
     // We should not reference the original event anymore
     event = nullptr;
 
+    // The first motion after the host hides or locks its cursor switches to relative
+    // input before it is sent, so the game gets it as relative motion. Not in an
+    // unfocused window, where relative input would wait for a click.
+    if (m_HostCursorSupported && (SDL_GetWindowFlags(m_Window) & SDL_WINDOW_INPUT_FOCUS) &&
+            m_CursorPolicy.noteLocalMouseMotion(SDL_GetTicks())) {
+        evaluateCursorMode();
+        if (!isCaptureActive()) {
+            return;
+        }
+    }
+
     if (m_AbsoluteMouseMode) {
         int windowWidth, windowHeight;
         SDL_GetWindowSize(m_Window, &windowWidth, &windowHeight);
@@ -139,7 +157,13 @@ void SdlInputHandler::handleMouseMotionEvent(SDL_MouseMotionEvent* event)
 
         // Adjust the cursor visibility if applicable
         if (mouseInVideoRegion ^ m_MouseWasInVideoRegion) {
-            SDL_ShowCursor((mouseInVideoRegion && m_MouseCursorCapturedVisibilityState == SDL_DISABLE) ? SDL_DISABLE : SDL_ENABLE);
+            if (m_HostCursorSupported) {
+                // The host's cursor inside the video, the normal cursor outside it
+                updateLocalCursor(mouseInVideoRegion);
+            }
+            else {
+                SDL_ShowCursor((mouseInVideoRegion && m_MouseCursorCapturedVisibilityState == SDL_DISABLE) ? SDL_DISABLE : SDL_ENABLE);
+            }
             if (!mouseInVideoRegion && buttonState != 0) {
                 // If we still have a button pressed on leave, wait for that to come up
                 // before we stop sending mouse position events.
@@ -165,7 +189,7 @@ void SdlInputHandler::handleMouseWheelEvent(SDL_MouseWheelEvent* event)
         return;
     }
 
-    if (m_AbsoluteMouseMode) {
+    if (m_AbsoluteMouseMode && !isAwaitingRelativeMouse()) {
         int mouseX, mouseY;
         SDL_GetMouseState(&mouseX, &mouseY);
         if (!isMouseInVideoRegion(mouseX, mouseY)) {
@@ -275,6 +299,17 @@ void SdlInputHandler::updatePointerRegionLock()
                                     (fullscreenFlags != 0 && SDL_GetNumVideoDisplays() == 1);
     }
 
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    // A host application confining its visible cursor (an RTS keeping it inside its
+    // window) confines ours to the same part of the video.
+    SDL_Rect hostClip;
+    if (isCaptureActive() && getHostCursorClipRect(&hostClip)) {
+        SDL_SetWindowMouseRect(m_Window, &hostClip);
+        updateLocalCursor();
+        return;
+    }
+#endif
+
     // If region lock is enabled, grab the cursor so it can't accidentally leave our window.
     if (isCaptureActive() && m_PointerRegionLockActive) {
 #if SDL_VERSION_ATLEAST(2, 0, 18)
@@ -309,4 +344,7 @@ void SdlInputHandler::updatePointerRegionLock()
         SDL_SetWindowGrab(m_Window, SDL_FALSE);
 #endif
     }
+
+    // The video region may have changed size, and the local cursor's size with it
+    updateLocalCursor();
 }

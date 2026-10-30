@@ -7,7 +7,14 @@
 #include "dualsensetriggers.h"
 #include "steamcontroller/steamcontrollersdl.h"
 
+#include <Limelight.h>
+#include "cursormodepolicy.h"
+
+#include <QHash>
+#include <QList>
+
 #include <memory>
+#include <vector>
 
 class SteamControllerHost;
 class SteamControllerLink;
@@ -63,6 +70,11 @@ struct GamepadState {
 
 #define GAMEPAD_HAPTIC_SIMPLE_HIFREQ_MOTOR_WEIGHT 0.33
 #define GAMEPAD_HAPTIC_SIMPLE_LOWFREQ_MOTOR_WEIGHT 0.8
+
+// SDL_USEREVENT codes for the client-side cursor (106 is SDL_CODE_STEAM_CONTROLLER_LINK)
+#define SDL_CODE_HOST_CURSOR_STATE 107
+#define SDL_CODE_HOST_CURSOR_SHAPE 108
+#define SDL_CODE_HOST_CURSOR_TICK 109
 
 class SdlInputHandler
 {
@@ -144,6 +156,21 @@ public:
 
     void updatePointerRegionLock();
 
+    // Client-side cursor (hostcursor.cpp), on the main thread. startHostCursor()
+    // subscribes when the host supports it; until then the handlers do nothing.
+    void startHostCursor();
+
+    void handleHostCursorState(const LI_HOST_CURSOR_STATE* state);
+
+    void handleHostCursorShape(const LI_HOST_CURSOR_SHAPE* shape);
+
+    // SDL_CODE_HOST_CURSOR_TICK: recentring expired or the composite grace period ended.
+    void handleHostCursorTick();
+
+    // Automatic mouse mode, for the stats overlay; safe to call from any thread.
+    static
+    QString getMouseModeStatus();
+
     static
     QString getUnmappedGamepads();
 
@@ -161,6 +188,7 @@ private:
         KeyComboQuitAndExit,
         KeyComboToggleKeyboardGrab,
         KeyComboToggleTimingGraph,
+        KeyComboToggleMouseModeLock,
         KeyComboMax
     };
 
@@ -192,6 +220,55 @@ private:
     void handleRelativeFingerEvent(SDL_TouchFingerEvent* event);
 
     void performSpecialKeyCombo(KeyCombo combo);
+
+    struct HostCursorShape {
+        int width;
+        int height;
+        int hotspotX;
+        int hotspotY;
+        std::vector<uint8_t> pixels;
+    };
+
+    SDL_Rect getVideoRegion();
+
+    bool isHostCursorDrawingWanted();
+
+    bool isHostCursorDrawnLocally();
+
+    void updateLocalCursor(int mouseInVideoRegion = -1);
+
+    void updateHostCursorControl();
+
+    void warpToHostCursor(bool modeSwitch = false);
+
+    bool isAutomaticMouseModeActive();
+
+    void publishMouseModeStatus();
+
+    static
+    void clearMouseModeStatus();
+
+    void evaluateCursorMode();
+
+    void scheduleCursorModeTimer();
+
+    void noteMouseButtons();
+
+    // Absolute mode while automatic mode waits for motion to switch to relative
+    bool isAwaitingRelativeMouse();
+
+    void applyCursorMode(CursorModePolicy::Mode mode, CursorModePolicy::Mode previous);
+
+    bool getHostCursorClipRect(SDL_Rect* rect);
+
+    static
+    Uint32 cursorModeTimerCallback(Uint32 interval, void* param);
+
+    SDL_Cursor* getHostSdlCursor();
+
+    void freeHostSdlCursor(uint32_t shapeId);
+
+    void freeHostSdlCursors();
 
     static
     Uint32 longPressTimerCallback(Uint32 interval, void* param);
@@ -262,6 +339,32 @@ private:
     SDL_TimerID m_DragTimer;
     char m_DragButton;
     int m_NumFingersDown;
+
+    bool m_HostCursorSupported;
+    bool m_HostCursorReady;
+    LI_HOST_CURSOR_STATE m_HostCursorState;
+    bool m_HostCursorHasPosition;
+    int32_t m_HostCursorX;
+    int32_t m_HostCursorY;
+    int m_HostCursorControlSent;
+    uint32_t m_HostCursorResendId;
+    Uint32 m_HostCursorResendTime;
+    QHash<uint32_t, HostCursorShape> m_HostCursorShapes;
+    QList<uint32_t> m_HostCursorShapeOrder;
+    QHash<uint32_t, SDL_Cursor*> m_HostSdlCursors;
+    double m_HostSdlCursorScale;
+
+    bool m_AutomaticMouseMode;
+    bool m_FallbackAbsoluteMouseMode;
+    bool m_AutomaticCaptureDone;
+    CursorModePolicy::Policy m_CursorPolicy;
+    CursorModePolicy::Decision m_CursorDecision;
+    SDL_TimerID m_CursorModeTimer;
+    uint32_t m_CursorModeTimerDue;
+    bool m_ClientDrawsGraceActive;
+    uint32_t m_ClientDrawsSinceMs;
+    bool m_HasAbsoluteSyncPoint;
+    SDL_Point m_AbsoluteSyncPoint;
 
     static const int k_ButtonMap[];
 };

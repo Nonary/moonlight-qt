@@ -1462,6 +1462,19 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         offset += ret;
     }
 
+    // Automatic mouse mode: which mode is active and why (absent with the setting off).
+    {
+        const QByteArray mouseMode = SdlInputHandler::getMouseModeStatus().toUtf8();
+        if (!mouseMode.isEmpty()) {
+            ret = snprintf(&output[offset], length - offset, "%s\n", mouseMode.constData());
+            if (ret < 0 || ret >= length - offset) {
+                SDL_assert(false);
+                return;
+            }
+            offset += ret;
+        }
+    }
+
     if (stats.vrrTelemetryActive || stats.vrrEligibleFrames != 0 ||
             stats.vrrPacingDroppedFrames != 0 ||
             stats.vrrPresentFailedFrames != 0 ||

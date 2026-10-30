@@ -5704,6 +5704,55 @@ queued audio latency. Muting can suppress audio processing without retiming VRR.
 
 Input goes from SDL handlers to common-library input APIs and a separate sender.
 
+Automatic mouse mode (client-side cursor, added 2026-10-25) is a coordinated
+extension with Vibeshine hosts; its design is Vibeshine's
+`docs/client-cursor-design.md`. The pieces:
+
+- **Negotiation.**
+  - A host that sets `LI_FF_HOST_CURSOR` (0x00010000) in `x-ss-general.featureFlags`
+    is a candidate.
+  - When `automaticMouseMode` is on (the default), the input handler subscribes with
+    `LiSendHostCursorControl()` once the window exists.
+  - The client stays in fallback (the user's `absoluteMouseMode`) until the host's
+    first `RESYNC` state.
+  - With the setting off, or on any other host, no callback is registered, nothing
+    is sent, and the mouse code paths are the pre-existing ones.
+- **Delivery.**
+  - Common-c validates `CURSOR_STATE`/`CURSOR_SHAPE` on the control receive thread.
+    It reassembles chunked shapes into at most 256x256 BGRA.
+  - `Session::clHostCursorState`/`clHostCursorShape` copy them into
+    `SDL_CODE_HOST_CURSOR_STATE`/`SHAPE` events for the main thread.
+- **Policy.**
+  - `app/streaming/input/cursormodepolicy.h` follows the host with no delays. A
+    hide or lock switches to relative on the next mouse motion, before that motion
+    is sent. Until then both modes send the same thing (clicks and the wheel reach
+    the game even with the local cursor in the letterbox), and an app that only
+    hides the cursor doesn't grab the pointer until the mouse moves over the
+    stream. The switch needs input focus, and host warps are not followed while it
+    is pending. A visible, free cursor switches back at once, except while a mouse
+    button is held (an MMO camera drag).
+  - The return drops the mouse motion queued by leaving relative mode and syncs the
+    host to the warp target.
+  - Recentring expiry and the composite grace period are driven by an SDL timer
+    that pushes `SDL_CODE_HOST_CURSOR_TICK`.
+  - `hostcursor.cpp` applies modes through the existing `setCaptureActive()` and
+    `m_AbsoluteMouseMode`. A return to absolute warps the local cursor to the host
+    position first.
+- **Rendering.**
+  - In absolute mode the host shape is an SDL colour cursor, scaled by
+    `scaleQ16 × video width / reference width`.
+  - The host stops compositing (`CLIENT_DRAWS`) unless another session still needs
+    it (`COMPOSITED`). The local cursor shows as soon as `CLIENT_DRAWS` is sent; if
+    the host still reports `COMPOSITED` 300 ms later it is hidden again.
+  - A large host clip confines the local cursor through `SDL_SetWindowMouseRect`.
+- **Overrides.** Ctrl+Alt+Shift+M locks the other mode; Ctrl+Alt+Shift+A locks or
+  unlocks the current one.
+- **Diagnostics.** The stats overlay shows a `Mouse mode:` line.
+- **Tests.** `tests/input/hostcursor.pro`, `cursormodepolicy.pro` and
+  `automousepreferences.pro` cover the mapping and scaling, the state machine, and
+  the settings default and migration. Real cursors and games are covered by
+  Vibeshine's `docs/client-cursor-test-checklist.md`.
+
 Steam Controller (2026) USB/puck/Bluetooth LE input also has a direct HID path
 (`app/streaming/input/steamcontroller`, reviewed against `88b21736`). The three
 transports (cable `28de:1302`, puck `28de:1304` interfaces 2..5, Bluetooth LE

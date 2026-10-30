@@ -282,6 +282,64 @@ void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlag
     if (SDL_PushEvent(&setControllerLEDEvent) <= 0) SDL_free(state);
 }
 
+void Session::clHostCursorState(const LI_HOST_CURSOR_STATE* state)
+{
+    // Called on the control receive thread. Log transitions, not every position update.
+    static uint8_t lastFlags = 0xFF;
+    static uint32_t lastShapeId;
+    const uint8_t flags = state->flags & ~(LI_HOST_CURSOR_HAS_POSITION | LI_HOST_CURSOR_RESYNC);
+    if ((state->flags & LI_HOST_CURSOR_RESYNC) || flags != lastFlags || state->shapeId != lastShapeId) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Host cursor state %u: flags 0x%02x, shape %u, position %d,%d, reference %ux%u, scale %.3f, clip %d,%d-%d,%d",
+                    state->sequence, state->flags, state->shapeId, state->x, state->y,
+                    state->referenceWidth, state->referenceHeight, state->scaleQ16 / 65536.0,
+                    state->clipLeft, state->clipTop, state->clipRight, state->clipBottom);
+        lastFlags = flags;
+        lastShapeId = state->shapeId;
+    }
+
+    // The main thread owns the cursor and the input handler; it frees the copy.
+    LI_HOST_CURSOR_STATE* copy = (LI_HOST_CURSOR_STATE*)SDL_malloc(sizeof(*copy));
+    if (copy == nullptr) {
+        return;
+    }
+    *copy = *state;
+
+    SDL_Event event = {};
+    event.type = SDL_USEREVENT;
+    event.user.code = SDL_CODE_HOST_CURSOR_STATE;
+    event.user.data1 = copy;
+    if (SDL_PushEvent(&event) <= 0) {
+        SDL_free(copy);
+    }
+}
+
+void Session::clHostCursorShape(const LI_HOST_CURSOR_SHAPE* shape)
+{
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Host cursor shape %u: %ux%u, hotspot %u,%u",
+                shape->shapeId, shape->width, shape->height, shape->hotspotX, shape->hotspotY);
+
+    // One allocation: the shape header followed by its pixels, freed by the main thread.
+    size_t pixelBytes = (size_t)shape->width * shape->height * 4;
+    LI_HOST_CURSOR_SHAPE* copy = (LI_HOST_CURSOR_SHAPE*)SDL_malloc(sizeof(*copy) + pixelBytes);
+    if (copy == nullptr) {
+        return;
+    }
+    *copy = *shape;
+    uint8_t* pixels = (uint8_t*)(copy + 1);
+    SDL_memcpy(pixels, shape->pixels, pixelBytes);
+    copy->pixels = pixels;
+
+    SDL_Event event = {};
+    event.type = SDL_USEREVENT;
+    event.user.code = SDL_CODE_HOST_CURSOR_SHAPE;
+    event.user.data1 = copy;
+    if (SDL_PushEvent(&event) <= 0) {
+        SDL_free(copy);
+    }
+}
+
 bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             StreamingPreferences::RendererSelection renderer,
                             SDL_Window* window, int videoFormat, int width, int height,
@@ -1478,6 +1536,25 @@ bool Session::validateLaunch(SDL_Window* testWindow)
 }
 
 
+// Host cursor events pushed after the event loop stopped would otherwise leak their
+// payloads or reach the next session; SDL_FilterEvents() drops them under SDL's lock.
+static int dropHostCursorEvents(void*, SDL_Event* event)
+{
+    if (event->type != SDL_USEREVENT) {
+        return 1;
+    }
+    switch (event->user.code) {
+    case SDL_CODE_HOST_CURSOR_STATE:
+    case SDL_CODE_HOST_CURSOR_SHAPE:
+        SDL_free(event->user.data1);
+        return 0;
+    case SDL_CODE_HOST_CURSOR_TICK:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
 class DeferredSessionCleanupTask : public QRunnable
 {
 public:
@@ -1517,6 +1594,9 @@ private:
 
         // Finish cleanup of the connection state
         LiStopConnection();
+
+        // No more host cursor callbacks can run now
+        SDL_FilterEvents(dropHostCursorEvents, nullptr);
 
         // Perform a best-effort app quit
         if (shouldQuit) {
@@ -1975,6 +2055,16 @@ bool Session::startConnectionAsync()
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave pacing hints: link %d Mbps, calibrated pace %d Mbps",
                     m_StreamConfig.pyrowaveLinkMbps, m_StreamConfig.pyrowavePaceMbps);
     }
+    // Host cursor state and shapes for automatic mouse mode (Vibeshine extension).
+    // Nothing arrives until the input handler subscribes; with the setting off we
+    // never subscribe and register nothing.
+    if (m_Preferences->automaticMouseMode) {
+        LiSetHostCursorCallbacks(clHostCursorState, clHostCursorShape);
+    }
+    else {
+        LiSetHostCursorCallbacks(nullptr, nullptr);
+    }
+
     // The Steam Controller (2026) haptic and settings relays are registered here rather than in
     // k_ConnCallbacks, which keeps its V1 layout. They are delivered straight to the driver's
     // registry (not through the SDL event queue: haptics are latency sensitive and the driver
@@ -2195,6 +2285,9 @@ void Session::exec()
 
     m_InputHandler->setWindow(m_Window);
 
+    // The connection is up: subscribe to the host cursor if the host offers it
+    m_InputHandler->startHostCursor();
+
     QSvgRenderer svgIconRenderer(QString(":/res/moonlight.svg"));
     QImage svgImage(ICON_SIZE, ICON_SIZE, QImage::Format_RGBA8888);
     svgImage.fill(0);
@@ -2402,6 +2495,17 @@ void Session::exec()
                 break;
             case SDL_CODE_STEAM_CONTROLLER_LINK:
                 m_InputHandler->handleSteamControllerEvent(&event.user);
+                break;
+            case SDL_CODE_HOST_CURSOR_STATE:
+                m_InputHandler->handleHostCursorState((const LI_HOST_CURSOR_STATE*)event.user.data1);
+                SDL_free(event.user.data1);
+                break;
+            case SDL_CODE_HOST_CURSOR_SHAPE:
+                m_InputHandler->handleHostCursorShape((const LI_HOST_CURSOR_SHAPE*)event.user.data1);
+                SDL_free(event.user.data1);
+                break;
+            case SDL_CODE_HOST_CURSOR_TICK:
+                m_InputHandler->handleHostCursorTick();
                 break;
             default:
                 SDL_assert(false);
