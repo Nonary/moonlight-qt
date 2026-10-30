@@ -23,9 +23,18 @@ on:
 jobs:
   build:
     timeout-minutes: 90
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
     env:
       CI_VERSION: ${{ inputs.ci_version }}
+      ARCH: ${{ matrix.arch }}
       CCACHE_DIR: ${{ github.workspace }}/.flatpak-builder/ccache
     steps:
       - uses: actions/checkout@v5
@@ -75,6 +84,7 @@ jobs:
           sdl = next(m for m in manifest['modules'] if m['name'] == 'SDL3')
           sdl['build-options']['config-opts'].append('-DSDL_WAYLAND=ON')
           module['sources'][0]['commit'] = os.environ['SOURCE_SHA']
+          module['sources'][0]['url'] = 'https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '.git'
           import re
           assert re.fullmatch(r'6\.[12]\.0-daily\.[1-9][0-9]*', os.environ['CI_VERSION'])
           module['post-install'] = [
@@ -95,11 +105,11 @@ jobs:
           PY
       - name: Build Flatpak
         run: |
-          dbus-run-session -- flatpak run --env=CCACHE_DIR="$CCACHE_DIR" --env=CCACHE_MAXSIZE=512M org.flatpak.Builder --user --force-clean --sandbox --ccache --jobs="$BUILD_JOBS" --rebuild-on-sdk-change \
+          dbus-run-session -- flatpak run --env=CCACHE_DIR="$CCACHE_DIR" --env=CCACHE_MAXSIZE=512M org.flatpak.Builder --user --force-clean --sandbox --ccache --jobs="$BUILD_JOBS" --rebuild-on-sdk-change --arch="${ARCH}" \
             --install-deps-from=flathub --repo=flatpak-repo flatpak-build \
             packaging/flatpak/com.moonlight_stream.Moonlight.json
           flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
-            flatpak-repo "Moonlight-$CI_VERSION-x86_64.flatpak" \
+            flatpak-repo "Moonlight-$CI_VERSION-$ARCH.flatpak" \
             com.moonlight_stream.Moonlight master
       - name: Verify exported source and Gamescope patch
         run: |
@@ -118,9 +128,9 @@ jobs:
           export FLATPAK_USER_DIR="$RUNNER_TEMP/nightly-flatpak-user"
           dbus-run-session -- flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
           dbus-run-session -- flatpak install --user -y flathub org.kde.Platform//6.10
-          dbus-run-session -- flatpak install --user --noninteractive -y "./Moonlight-$CI_VERSION-x86_64.flatpak"
-          flatpak info --user --show-ref com.moonlight_stream.Moonlight//master | grep -Fx app/com.moonlight_stream.Moonlight/x86_64/master
-          flatpak info --user --show-runtime com.moonlight_stream.Moonlight//master | grep -Fx org.kde.Platform/x86_64/6.10
+          dbus-run-session -- flatpak install --user --noninteractive -y "./Moonlight-$CI_VERSION-$ARCH.flatpak"
+          flatpak info --user --show-ref com.moonlight_stream.Moonlight//master | grep -Fx "app/com.moonlight_stream.Moonlight/${ARCH}/master"
+          flatpak info --user --show-runtime com.moonlight_stream.Moonlight//master | grep -Fx "org.kde.Platform/${ARCH}/6.10"
           installed=$(flatpak info --user --show-location com.moonlight_stream.Moonlight//master)
           export INSTALLED_PATH="$installed"
           python3 - <<'PY'
@@ -136,11 +146,11 @@ jobs:
           grep -Fx "Moonlight $CI_VERSION" installed-version.txt
           bash scripts/smoke-linux-wayland.sh flatpak run --user --env=QT_QPA_PLATFORM=wayland com.moonlight_stream.Moonlight//master --version > installed-wayland-version.txt
           grep -Fx "Moonlight $CI_VERSION" installed-wayland-version.txt
-          echo 'Installed exported x86_64 bundle, source/version, runtime and sandboxed launch verified.'
+          echo "Installed exported ${ARCH} bundle, source/version, runtime and sandboxed launch verified."
       - uses: actions/upload-artifact@v6
         with:
-          name: Moonlight-Flatpak-${{ env.CI_VERSION }}
-          path: Moonlight-${{ env.CI_VERSION }}-x86_64.flatpak
+          name: Moonlight-Flatpak-${{ env.CI_VERSION }}-${{ matrix.arch }}
+          path: Moonlight-${{ env.CI_VERSION }}-${{ matrix.arch }}.flatpak
           compression-level: 0
           if-no-files-found: error
       - name: Save verified Flatpak compiler cache
