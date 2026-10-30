@@ -3909,15 +3909,11 @@ migration described above. Reduce judder defaults on, preserves the saved
 Legacy frame pacing defaults off. The default requested stream is 720p60.
 These are defaults, not evidence of the user's current saved settings.
 
-The FPS picker is advisory. Fixed 30 and 60 FPS remain available. When V-sync
-and VRR are requested, usable display refresh rates contribute VRR choices at
-`floor(refresh - refresh^2 / 3600)` and Low-latency VRR choices at
-`floor(refresh / 6) * 5`, restoring the original dropdown calculations
-(116 and 100 FPS at 120 Hz; 138 and 120 FPS at 144 Hz). Native rates remain
-available as ordinary choices with VRR enabled or disabled. Native choices take
-precedence when another display's calculated recommendation matches them, and
-a saved maximum-refresh selection stays selected when VRR is toggled.
-A saved custom FPS remains selectable. Toggling VRR does not rewrite saved FPS;
+The FPS picker is advisory and independent of the VRR setting. It offers fixed
+30 and 60 FPS, usable native display rates, and a plain below-refresh choice at
+`floor(refresh - refresh^2 / 3600)` (116 FPS at 120 Hz and 138 at 144 Hz).
+Duplicate rates are collapsed and a saved custom FPS remains selectable.
+Toggling VRR does not rewrite saved FPS;
 `m_StreamConfig.fps` receives the requested preference.
 
 `snapshotPresentationSettings()` resolves that request for the session:

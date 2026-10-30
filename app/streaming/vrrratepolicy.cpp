@@ -35,15 +35,6 @@ int VrrRatePolicy::vrrRateForRefresh(int refreshHz)
     return protectedRateForRefresh(refreshHz);
 }
 
-int VrrRatePolicy::lowLatencyRateForRefresh(int refreshHz)
-{
-    if (!isUsableRefreshRate(refreshHz)) {
-        return 0;
-    }
-
-    return (refreshHz / 6) * 5;
-}
-
 bool VrrRatePolicy::hasAdaptiveHeadroom(int streamRateHz, int displayRefreshHz)
 {
     if (streamRateHz <= 0 || displayRefreshHz <= 0) {
@@ -54,8 +45,7 @@ bool VrrRatePolicy::hasAdaptiveHeadroom(int streamRateHz, int displayRefreshHz)
 }
 
 std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& refreshRates,
-                                                       int savedFps,
-                                                       bool vrrEnabled)
+                                                       int savedFps)
 {
     std::map<int, VrrFpsChoiceKind> choices;
 
@@ -77,10 +67,7 @@ std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& re
             continue;
         }
 
-        if (vrrEnabled) {
-            addChoice(choices, vrrRateForRefresh(refreshHz), VrrFpsChoiceKind::Vrr);
-            addChoice(choices, lowLatencyRateForRefresh(refreshHz), VrrFpsChoiceKind::LowLatencyVrr);
-        }
+        addChoice(choices, vrrRateForRefresh(refreshHz), VrrFpsChoiceKind::Fixed);
     }
 
     // Preserve manually saved values outside the built-in choices.

@@ -553,7 +553,7 @@ QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRate
     }
 
     const std::vector<VrrFpsChoice> choices = VrrRatePolicy::buildChoices(
-        rates, fps, enableVsync && enableVrr);
+        rates, fps);
     QVariantList result;
     for (const VrrFpsChoice& choice : choices) {
         QVariantMap item;
@@ -563,12 +563,6 @@ QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRate
         switch (choice.kind) {
         case VrrFpsChoiceKind::Fixed:
             item.insert("kind", "fixed");
-            break;
-        case VrrFpsChoiceKind::Vrr:
-            item.insert("kind", "vrr");
-            break;
-        case VrrFpsChoiceKind::LowLatencyVrr:
-            item.insert("kind", "low-latency-vrr");
             break;
         case VrrFpsChoiceKind::Custom:
             item.insert("kind", "custom");

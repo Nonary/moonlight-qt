@@ -7,8 +7,6 @@
 // renderer, so the arithmetic can be tested independently.
 enum class VrrFpsChoiceKind {
     Fixed,
-    Vrr,
-    LowLatencyVrr,
     Custom,
 };
 
@@ -23,10 +21,7 @@ public:
     // Below-refresh recommendation: floor(refresh - refresh^2 / 3600).
     static int vrrRateForRefresh(int refreshHz);
 
-    // Lower-rate option: floor((refresh * 5 / 6) / 5) * 5.
-    static int lowLatencyRateForRefresh(int refreshHz);
-
-    // Shared recommendation and native-presentation protection cutoff.
+    // Below-refresh choice and native-presentation protection cutoff.
     // Keep floor(r - r*r/3600), including its rounding.
     static constexpr int protectedRateForRefresh(int refreshHz)
     {
@@ -40,9 +35,8 @@ public:
     // scanout safety; session admission no longer reserves a fixed FPS margin.
     static bool hasAdaptiveHeadroom(int streamRateHz, int displayRefreshHz);
 
-    // Build baseline, recommended VRR, low-latency, and saved custom choices.
+    // Build baseline, below-refresh, native, and saved custom choices.
     static std::vector<VrrFpsChoice> buildChoices(const std::vector<int>& refreshRates,
-                                                   int savedFps,
-                                                   bool vrrEnabled);
+                                                   int savedFps);
 
 };

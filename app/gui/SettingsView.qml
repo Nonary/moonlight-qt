@@ -584,10 +584,6 @@ Flickable {
 
                         function choiceText(choice) {
                             switch (choice.kind) {
-                            case "vrr":
-                                return qsTr("VRR (%1 FPS)").arg(choice.video_fps)
-                            case "low-latency-vrr":
-                                return qsTr("Low-latency VRR (%1 FPS)").arg(choice.video_fps)
                             case "custom":
                                 return qsTr("Custom (%1 FPS)").arg(choice.video_fps)
                             default:
@@ -645,8 +641,6 @@ Flickable {
                         Component.onCompleted: {
                             reinitialize()
                             languageChanged.connect(reinitialize)
-                            StreamingPreferences.enableVsyncChanged.connect(reinitialize)
-                            StreamingPreferences.enableVrrChanged.connect(reinitialize)
                         }
 
                         model: ListModel {
