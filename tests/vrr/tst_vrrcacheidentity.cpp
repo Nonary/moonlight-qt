@@ -36,10 +36,18 @@ int main(int argc,char**argv) {
     const auto incorrectlyShared=Vrr13::loadStartDelay(path,key(before));
     const auto separated=Vrr13::loadStartDelay(path,key(after));
     assert(incorrectlyShared==8378&&separated==0);
-    qputenv("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER","0");
-    const auto legacy=vrrTimingParametersForSession(VrrPacingWorker::resolvedInputConfig(raw),false,false);
-    assert(legacy.playoutInputClockRelativeHistory==0&&legacy.playoutInputPercentileEnabled==0);
-    std::printf("raw_cache_clock=%llu live_clock=%llu old_namespace_seed=%llu corrected_namespace_seed=%llu; target=995000 window=120000000 tolerance=500; legacy diagnostic preserved\n",
+    const char* switches[] = {"MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER", "MOONLIGHT_VRR_INPUT_ACCOUNTING", "MOONLIGHT_VRR_BOUNDED_CATCHUP"};
+    for (unsigned mask = 0; mask < 8; ++mask) {
+        for (unsigned i = 0; i < 3; ++i) {
+            if (mask & (1U << i)) qputenv(switches[i], "0");
+            else qunsetenv(switches[i]);
+        }
+        const auto retired=vrrTimingParametersForSession(VrrPacingWorker::resolvedInputConfig(raw),false,false);
+#define VRR_ASSERT_SAME_PARAMETER(type, jsonName, memberName, defaultValue) assert(retired.memberName == after.memberName);
+        VRR_TIMING_PARAMETER_FIELDS(VRR_ASSERT_SAME_PARAMETER)
+#undef VRR_ASSERT_SAME_PARAMETER
+    }
+    std::printf("raw_cache_clock=%llu live_clock=%llu old_namespace_seed=%llu corrected_namespace_seed=%llu; target=995000 window=120000000 tolerance=500; retired overrides ignored\n",
      (unsigned long long)before.playoutInputClockRelativeHistory,(unsigned long long)after.playoutInputClockRelativeHistory,
      (unsigned long long)incorrectlyShared,(unsigned long long)separated);
 }

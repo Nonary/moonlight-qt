@@ -10,6 +10,7 @@ DEFINES += SDL_MAIN_HANDLED
 SOURCES += \
     $$PWD/tst_vrrpacingworker.cpp \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.cpp \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrrpacingtrace.cpp \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.cpp \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.cpp
 

@@ -1,3 +1,9 @@
+VRR session cleanup (2026-10-29): current live sessions always use the
+existing adaptive buffer, corrected input accounting and bounded catch-up.
+The three former environment switches are ignored with a warning; historical
+controller parameters remain available for replay. The trace writer is housed
+in `vrrpacingtrace.cpp`. The production hitch-budget policy is unchanged.
+
 Input lifecycle and requirement coordinates (2026-10-25,
 `playout_input_stable_adaptation=14`): revision 13 held seeded protection when
 no hitch-budget estimate existed, even after history expiry. Revision 14 keeps
@@ -1220,9 +1226,9 @@ bounded by the configured interval allowance as well as physical VRR room;
 PhaseTrajectory still uses physical room and its existing gradual repayment.
 Profile target/history/tolerance, producer clock estimator, conditional decode
 hold, rate layers and 250us/s release remain. Legacy unbounded catch-up retains
-its original accounting. Diagnostic
-`MOONLIGHT_VRR_INPUT_ACCOUNTING=0` selects the historical control in the same
-binary. Tests and frozen capture guards establish software behavior; live
+its original accounting. The former `MOONLIGHT_VRR_INPUT_ACCOUNTING` diagnostic
+switch is retired; historical controls remain available in recorded replay
+parameters. Tests and frozen capture guards establish software behavior; live
 GPU/compositor behavior requires a coordinated comparison.
 
 Absorb microstutter recovery (2026-10-14, superseded 2026-10-16): the recovered source-gap smoother
@@ -3879,7 +3885,7 @@ directory contains the common library.
 | Renderer abstraction | [renderer.h](app/streaming/video/ffmpeg-renderers/renderer.h): `IFFmpegRenderer` |
 | Pacer mode selection | [pacer.cpp](app/streaming/video/ffmpeg-renderers/pacer/pacer.cpp) |
 | Frame and presenter contracts | [vrrtypes.h](app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h), [ivrrframepresenter.h](app/streaming/video/ffmpeg-renderers/ivrrframepresenter.h) |
-| VRR execution and tracing | [vrrpacingworker.cpp](app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.cpp) |
+| VRR execution and tracing | [vrrpacingworker.cpp](app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.cpp) and [vrrpacingtrace.cpp](app/streaming/video/ffmpeg-renderers/pacer/vrrpacingtrace.cpp) |
 | Deadline waiting | [vrrtargetwaiter.cpp](app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.cpp) |
 | Timing policy | [vrrtimingcontroller.cpp](app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.cpp), [vrrtimingcontroller.h](app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h) |
 | Active learning models | [prediction.h](app/streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h), [reserve.h](app/streaming/video/ffmpeg-renderers/pacer/vrr/reserve.h), [smoothnessfeedback.h](app/streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h) |
@@ -6813,11 +6819,10 @@ its old image until the next normal launch.
 ### Adaptive input buffer, bounded catch-up and completion clock (production default, 2026-10-10)
 
 The adaptive input buffer, bounded catch-up (`PhaseTrajectory`) and normalized
-producer clock are the default for every VRR session. For diagnosis only,
-`MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER=0` restores the revision-12 buffer and
-`MOONLIGHT_VRR_BOUNDED_CATCHUP=0` disables catch-up and the normalized clock while
-keeping the adaptive buffer. Traces serialize the active parameters, so captures
-replay with their own policy; a strict replay of a 2026-10-10 VRR17 capture (its
+producer clock are active for every VRR session. The former
+`MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER`, `MOONLIGHT_VRR_BOUNDED_CATCHUP`,
+and `MOONLIGHT_VRR_INPUT_ACCOUNTING` switches are ignored with a warning. Traces
+serialize the active parameters, so captures replay with their own policy; a strict replay of a 2026-10-10 VRR17 capture (its
 start-delay seed restored) still reproduces every decision.
 
 **Buffer.** The current preventable-hitch goal is described at the top of this

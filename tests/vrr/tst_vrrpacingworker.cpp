@@ -3864,10 +3864,13 @@ void testExperimentalInputPercentileActivationTrace()
     }, &logs);
     struct Case { int mode, target, history; };
     const Case cases[] = {{0,0,0},{1,0,0},{2,0,0},{1,9900,10},{1,9950,200},{1,9999,300},{1,-1,1},{1,10000,999}};
-    // Production default: enabled unless MOONLIGHT_VRR_BOUNDED_CATCHUP=0.
-    const bool expectedBoundedCatchup = qEnvironmentVariable("MOONLIGHT_VRR_BOUNDED_CATCHUP")!="0";
+    // Retired environment switches cannot change production policy.
+    const bool expectedBoundedCatchup = true;
     for (size_t caseIndex=0;caseIndex<std::size(cases);++caseIndex) {
         resetFakeClock();
+        // Leave room for an unambiguously early receive timestamp in the
+        // decode-only case, independent of real-thread scheduling delays.
+        if (caseIndex == 4) g_TestClockOffsetUs.fetch_add(300000);
         QTemporaryDir directory;
         expect(directory.isValid(), "adaptive activation trace needs a temporary directory");
         const QString tracePath = directory.filePath("experimental-worker.vrrtrace");
@@ -3893,7 +3896,7 @@ void testExperimentalInputPercentileActivationTrace()
                 auto input = frame(i + 1, lifetime[i]);
                 input.setDeliveryTimeline(input.decoderOutputUs()-800,input.decoderOutputUs()-600,input.decoderOutputUs()-500);
                 if(caseIndex==4 && i==1) input.setDeliveryTimeline(input.decoderOutputUs()-1000,input.decoderOutputUs()-500,input.decoderOutputUs()-200);
-                if(caseIndex==4 && i==2) input.setDeliveryTimeline(input.decoderOutputUs()-70000,input.decoderOutputUs()-69000,input.decoderOutputUs()-200);
+                if(caseIndex==4 && i==2) input.setDeliveryTimeline(input.decoderOutputUs()-200000,input.decoderOutputUs()-199000,input.decoderOutputUs()-200);
                 worker.submit(std::move(input));
                 expect(backend.waitForPresentCount(size_t(i + 1)),
                        "adaptive activation fixture must present each input");
@@ -3925,7 +3928,7 @@ void testExperimentalInputPercentileActivationTrace()
                    "worker trace must serialize adaptive probability and history from the effective profile");
             expect(columns.indexOf("param_bounded_catchup_enabled")>=0 &&
                        fields.value(columns.indexOf("param_bounded_catchup_enabled")).toULongLong()==uint64_t(expectedBoundedCatchup),
-                   "worker trace captures bounded catchup (default on, =0 opts out) as an independent parameter");
+                   "worker trace captures bounded catchup as an independent parameter");
             expect(columns.indexOf("trajectory_target_us")>=0 && columns.indexOf("trajectory_resync_dropped")>=0 &&
                        columns.indexOf("trajectory_resync_deferred")>=0 &&
                        (!expectedBoundedCatchup || fields.value(columns.indexOf("trajectory_plans")).toULongLong()>0),

@@ -14,6 +14,7 @@ SOURCES += \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/macdisplaytiming.mm \
     $$PWD/../../app/streaming/streamutils.cpp \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.cpp \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrrpacingtrace.cpp \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.cpp \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.cpp \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profile.cpp

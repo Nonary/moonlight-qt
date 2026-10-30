@@ -18,15 +18,12 @@ run_suite() {
         else
             "./$target"
         fi
-        if [[ "$target" == tst_vrrpacingworker ]]; then
-            MOONLIGHT_VRR_BOUNDED_CATCHUP=0 "./$target"
-            MOONLIGHT_VRR_BOUNDED_CATCHUP=1 "./$target"
-        fi
     )
 }
 run_suite vrr/preferences tst_vrrpreferences
 run_suite vrr/timingcontroller tst_vrrtimingcontroller
 run_suite vrr/pacingworker tst_vrrpacingworker
+run_suite vrr/vrrcacheidentity tst_vrrcacheidentity
 run_suite vrr/phasetrajectory tst_phasetrajectory
 run_suite vrr/inputpercentileintegration tst_inputpercentileintegration
 run_suite vrr/performancestats tst_performancestats
