@@ -1266,6 +1266,11 @@ backpressure. Audio startup intentionally discards an initial backlog of about
 queued audio latency. Muting can suppress audio processing without retiming VRR.
 
 Input goes from SDL handlers to common-library input APIs and a separate sender.
+The direct Steam Controller (2026) path bypasses SDL's gamepad button handler.
+Its host bridge detects Start+View+LB+RB with a bitmask, queues one SDL quit event
+per press unless `NO_GAMEPAD_QUIT=1`, sends a neutral host state, and holds the
+combination back until release. Focus suppression neither triggers the shortcut
+nor replays a held combination to the host.
 
 Windows/Linux DualSense waveform feedback (updated 2026-10-05) runs separately
 from video and ordinary stream audio. A Bluetooth Sony DualSense/Edge with an
