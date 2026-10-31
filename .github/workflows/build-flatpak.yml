@@ -71,6 +71,13 @@ jobs:
           from pathlib import Path
           path = Path('packaging/flatpak/com.moonlight_stream.Moonlight.json')
           manifest = json.loads(path.read_text())
+          for dependency in manifest['modules']:
+              for source in dependency.get('sources', []):
+                  if source.get('type') == 'patch':
+                      original = (path.parent / source['path']).resolve()
+                      staged = path.parent / original.name
+                      staged.write_bytes(original.read_bytes())
+                      source['path'] = staged.name
           module = next(m for m in manifest['modules'] if m['name'] == 'moonlight')
           sdl = next(m for m in manifest['modules'] if m['name'] == 'SDL3')
           sdl['build-options']['config-opts'].append('-DSDL_WAYLAND=ON')

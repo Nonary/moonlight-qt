@@ -85,6 +85,13 @@ jobs:
           from pathlib import Path
           path = Path('packaging/flatpak/com.moonlight_stream.Moonlight.json')
           manifest = json.loads(path.read_text())
+          for dependency in manifest['modules']:
+              for source in dependency.get('sources', []):
+                  if source.get('type') == 'patch':
+                      original = (path.parent / source['path']).resolve()
+                      staged = path.parent / original.name
+                      staged.write_bytes(original.read_bytes())
+                      source['path'] = staged.name
           module = next(m for m in manifest['modules'] if m['name'] == 'moonlight')
           module['sources'][0]['commit'] = os.environ['GITHUB_SHA']
           module['sources'][1]['commands'] = ['echo ' + os.environ['CI_VERSION'] + ' > app/version.txt']
