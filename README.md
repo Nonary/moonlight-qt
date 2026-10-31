@@ -69,7 +69,7 @@ Hosting for Moonlight's Debian and L4T package repositories is graciously provid
     * Base Requirements: `openssl-devel SDL2-devel SDL2_ttf-devel ffmpeg-devel libva-devel libvdpau-devel opus-devel pulseaudio-libs-devel alsa-lib-devel libdrm-devel`
     * Qt 6 (Recommended): `qt6-qtsvg-devel qt6-qtdeclarative-devel`
     * Qt 5: `qt5-qtsvg-devel qt5-qtquickcontrols2-devel`
-* Building the Vulkan renderer requires a `libplacebo-dev`/`libplacebo-devel` version of at least v7.349.0 and FFmpeg 6.1 or later.
+* Building the Vulkan renderer requires Vulkan development headers (for example, `vulkan-headers` on Arch Linux), a `libplacebo-dev`/`libplacebo-devel` version of at least v7.349.0, and FFmpeg 6.1 or later.
 
 ### Steam Link Build Requirements
 * [Steam Link SDK](https://github.com/ValveSoftware/steamlink-sdk) cloned on your build system
@@ -100,8 +100,8 @@ for different architectures, which handle building deps and extra linking for yo
         * For Windows builds, use `scripts\build-arch.bat` and `scripts\generate-bundle.bat`. Execute these scripts from the root of the repository within a Qt command prompt. Ensure  7-Zip binary directory is on your `%PATH%`.
         * For macOS builds, use `scripts/generate-dmg.sh`. Execute this script from the root of the repository and ensure Qt's `bin` folder is in your `$PATH`.
         * For Steam Link builds, run `scripts/build-steamlink-app.sh` from the root of the repository.
-    * To build from the command line for development use on macOS or Linux, run `qmake6 moonlight-qt.pro` then `make debug` or `make release`.
-        * The final binary will be placed in `app/moonlight`.
+    * For a local Linux development build, run `scripts/build-linux.sh` (release) or `scripts/build-linux.sh debug`. The script reuses `build/local-linux-release` or `build/local-linux-debug`, sets a safe parallel job count, and places the binary at `app/moonlight` within that build directory. Set `BUILD_JOBS` to override the job count.
+    * For a macOS development build, or to build manually on Linux, run `qmake6 moonlight-qt.pro` then `make debug` or `make release`. The in-tree binary will be placed in `app/moonlight`.
     * To create an embedded build for a single-purpose device, use `qmake6 "CONFIG+=embedded" moonlight-qt.pro` and build normally.
         * This build will lack windowed mode, Discord/Help links, and other features that don't make sense on an embedded device.
         * For platforms with poor GPU performance, add `"CONFIG+=gpuslow"` to prefer direct KMSDRM rendering over GL/Vulkan renderers. Direct KMSDRM rendering can use dedicated YUV/RGB conversion and scaling hardware rather than slower GPU shaders for these operations.
