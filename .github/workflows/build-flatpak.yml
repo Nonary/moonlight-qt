@@ -88,6 +88,8 @@ jobs:
                       staged.write_bytes(original.read_bytes())
                       source['path'] = staged.name
           module = next(m for m in manifest['modules'] if m['name'] == 'moonlight')
+          # Build the repository running this workflow (Nonary or a fork), not a hard-coded remote.
+          module['sources'][0]['url'] = 'https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '.git'
           sdl = next(m for m in manifest['modules'] if m['name'] == 'SDL3')
           sdl['build-options']['config-opts'].append('-DSDL_WAYLAND=ON')
           module['sources'][0]['commit'] = os.environ['SOURCE_SHA']

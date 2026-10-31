@@ -196,6 +196,14 @@ jobs:
           cmake --build build --parallel "$BUILD_JOBS"
           DESTDIR="$DEP_STAGE" cmake --install build
           sudo cp -a "$DEP_STAGE/usr/local/." /usr/local/
+          # sdl2-compat installs only sdl2-compat.pc, while Moonlight and SDL_ttf ask pkg-config
+          # for sdl2. The x86_64 runner image happens to satisfy that from a system package; on
+          # aarch64 nothing does, so alias the pkg-config name to sdl2-compat (staged for the cache).
+          if ! pkg-config --exists sdl2; then
+            ln -s sdl2-compat.pc "$DEP_STAGE/usr/local/lib/pkgconfig/sdl2.pc"
+            sudo ln -s sdl2-compat.pc /usr/local/lib/pkgconfig/sdl2.pc
+            pkg-config --modversion sdl2
+          fi
 
       - name: Checkout SDL_ttf
         uses: actions/checkout@v5

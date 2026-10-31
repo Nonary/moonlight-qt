@@ -102,6 +102,8 @@ jobs:
                       staged.write_bytes(original.read_bytes())
                       source['path'] = staged.name
           module = next(m for m in manifest['modules'] if m['name'] == 'moonlight')
+          # Build the repository running this workflow (Nonary or a fork), not a hard-coded remote.
+          module['sources'][0]['url'] = 'https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '.git'
           module['sources'][0]['commit'] = os.environ['GITHUB_SHA']
           module['sources'][1]['commands'] = ['echo ' + os.environ['CI_VERSION'] + ' > app/version.txt']
           path.write_text(json.dumps(manifest, indent=4) + '\n')
