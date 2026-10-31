@@ -661,7 +661,7 @@ void VrrTimingController::learnDecodeGpu(const PacedFrame& frame)
 {
     const uint64_t output = frame.decoderOutputUs();
     const uint64_t complete = frame.decodeCompleteUs();
-    if (!output || complete <= output || frame.decodeSyncWaitUs() < PreciseCompletionWaitUs) return;
+    if (!promptDecodeCompletion(output, complete, frame.decodeSyncWaitUs())) return;
     m_DecodeGpuSamples[m_DecodeGpuNext] = complete - output;
     m_DecodeGpuNext = (m_DecodeGpuNext + 1) % m_DecodeGpuSamples.size();
     m_DecodeGpuCount = std::min(m_DecodeGpuCount + 1, m_DecodeGpuSamples.size());
@@ -669,15 +669,6 @@ void VrrTimingController::learnDecodeGpu(const PacedFrame& frame)
     const auto middle = sorted.begin() + m_DecodeGpuCount / 2;
     std::nth_element(sorted.begin(), middle, sorted.begin() + m_DecodeGpuCount);
     m_DecodeGpuTypicalUs = *middle;
-    const uint64_t collectedUs = complete - std::min(complete, frame.decodeSyncWaitUs());
-    if (collectedUs > output + PromptCollectionUs) return;
-    m_DecodeIntrinsicSamples[m_DecodeIntrinsicNext] = complete - output;
-    m_DecodeIntrinsicNext = (m_DecodeIntrinsicNext + 1) % m_DecodeIntrinsicSamples.size();
-    m_DecodeIntrinsicCount = std::min(m_DecodeIntrinsicCount + 1, m_DecodeIntrinsicSamples.size());
-    auto intrinsic = m_DecodeIntrinsicSamples;
-    const auto intrinsicMiddle = intrinsic.begin() + m_DecodeIntrinsicCount / 2;
-    std::nth_element(intrinsic.begin(), intrinsicMiddle, intrinsic.begin() + m_DecodeIntrinsicCount);
-    m_DecodeIntrinsicUs = *intrinsicMiddle;
 }
 
 uint64_t VrrTimingController::sendSpanCorrectionUs(const PacedFrame& frame)
@@ -729,8 +720,8 @@ uint64_t VrrTimingController::sourceMappingUs(const PacedFrame& frame) const
             // Without a qualified sample, anchor at immutable decoder output;
             // the scheduling readiness floor still waits for real completion.
             completionUs = frame.decoderOutputUs();
-            if (m_DecodeIntrinsicUs) completionUs = std::min(frame.decodeCompleteUs(),
-                saturatingAdd(frame.decoderOutputUs(), m_DecodeIntrinsicUs));
+            if (m_DecodeGpuTypicalUs) completionUs = std::min(frame.decodeCompleteUs(),
+                saturatingAdd(frame.decoderOutputUs(), m_DecodeGpuTypicalUs));
         }
         return saturatingAdd(frame.reassembledUs(),
             completionUs - std::min(completionUs, frame.decodeSubmitUs()));
@@ -1564,12 +1555,10 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     // buffer must cover. Completions observed after a queue wait are bounded
     // by output + typical GPU time so our own queueing is not counted.
     const auto inputBacklog = saturatingAdd(frame.decoderQueueUs(), frame.decodeHoldUs());
-    auto decodeReadyUs = estimatedDecodeCompleteUs(frame);
-    // A decode observed only after the worker collected the frame finished
-    // behind our own queue, not its network or decode cost.
-    if (m_Parameters.playoutInputIntrinsicDecodeGpu && m_DecodeIntrinsicUs && frame.decoderOutputUs())
-        decodeReadyUs = std::max(frame.reassembledUs(),
-            std::min(decodeReadyUs, saturatingAdd(frame.decoderOutputUs(), m_DecodeIntrinsicUs)));
+    // Prompt blocking observations preserve real GPU jitter. Late collection
+    // uses the shared service estimate and cannot feed queue residence back
+    // into the input buffer, even before the first qualified service sample.
+    const auto decodeReadyUs = estimatedDecodeCompleteUs(frame);
     const auto inputReadyUs = decodeReadyUs - std::min(decodeReadyUs, inputBacklog);
     m_Pending.inputRequiredUs = signedDifference(inputReadyUs, m_Pending.inputSlotUs);
     m_Pending.inputValid = frame.reassembledUs() != 0 &&

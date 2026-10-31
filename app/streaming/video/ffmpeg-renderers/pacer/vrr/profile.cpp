@@ -19,6 +19,9 @@ QString calibrationKey(const QString& context, const QByteArray& policy,
     if (context.isEmpty()) return {};
     QCryptographicHash hash(QCryptographicHash::Sha256);
     hash.addData(QByteArrayLiteral("vrr-calibration-v3\n"));
+    // Discard learned delay from the queue-contaminated estimator while keeping
+    // the same production policy and settings. Existing cache files stay intact.
+    hash.addData(QByteArrayLiteral("prompt-decode-accounting\n"));
     hash.addData(context.toUtf8());
     hash.addData(QByteArrayLiteral("\ncan-latch="));
     hash.addData(QByteArray::number(canLatch));

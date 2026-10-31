@@ -376,20 +376,25 @@ struct VrrTimingDecision {
 
 class VrrTimingController {
 public:
-    // Decode completion for the producer clock. The worker's completion time
-    // is exact only when it blocked on the decode (syncWait >= this); a frame
-    // that finished while queued is observed late, so its completion is
-    // estimated as decoder output + the learned typical GPU decode time,
-    // never later than the observation. Without a learned typical time the
-    // observation is used.
+    // A blocking wait measures producer work only when collection started
+    // promptly after decoder output. A late poll includes our own queue time.
     static constexpr uint64_t PreciseCompletionWaitUs = 200;
+    static constexpr uint64_t PromptCollectionUs = 1000;
+    static bool promptDecodeCompletion(uint64_t outputUs, uint64_t observedUs, uint64_t waitUs)
+    {
+        if (!outputUs || observedUs <= outputUs || waitUs < PreciseCompletionWaitUs) return false;
+        const uint64_t collectedUs = observedUs - std::min(observedUs, waitUs);
+        return collectedUs <= outputUs || collectedUs - outputUs <= PromptCollectionUs;
+    }
+    // Late observations use only independently learned service, bounded by
+    // observed completion. Without a sample, output is the accounting origin;
+    // actual readiness still gates scheduling and presentation separately.
     static uint64_t estimateDecodeCompleteUs(uint64_t decoderOutputUs, uint64_t observedCompleteUs,
                                              uint64_t syncWaitUs, uint64_t typicalGpuUs)
     {
         if (observedCompleteUs <= decoderOutputUs) return decoderOutputUs;
-        if (syncWaitUs >= PreciseCompletionWaitUs || typicalGpuUs == 0) return observedCompleteUs;
-        const uint64_t estimate = decoderOutputUs + typicalGpuUs;
-        return estimate < observedCompleteUs ? estimate : observedCompleteUs;
+        if (promptDecodeCompletion(decoderOutputUs, observedCompleteUs, syncWaitUs)) return observedCompleteUs;
+        return decoderOutputUs + std::min(typicalGpuUs, observedCompleteUs - decoderOutputUs);
     }
     uint64_t typicalDecodeGpuUs() const { return m_DecodeGpuTypicalUs; }
     explicit VrrTimingController(const VrrSessionConfig& config,
@@ -836,18 +841,11 @@ private:
     Vrr13::InputLayerCadence m_InputLayerCadence;
     Vrr13::InputCoverageHistory m_InputCoverageHistory;
     InputLayerChange updateInputLayer(uint64_t nowUs, const CadenceObservation& cadence);
-    // Exact GPU decode durations (decoder output -> completion) from frames
-    // the worker blocked on; their median estimates unobserved completions.
+    // Promptly collected blocking completions only. One shared service estimate
+    // keeps source mapping and input accounting independent of our own queue.
     std::array<uint64_t, 64> m_DecodeGpuSamples {};
     size_t m_DecodeGpuNext = 0, m_DecodeGpuCount = 0;
     uint64_t m_DecodeGpuTypicalUs = 0;
-    // The same durations restricted to frames the worker collected within
-    // PromptCollectionUs of decoder output: their decode was not held back
-    // behind earlier queued frames.
-    static constexpr uint64_t PromptCollectionUs = 1000;
-    std::array<uint64_t, 64> m_DecodeIntrinsicSamples {};
-    size_t m_DecodeIntrinsicNext = 0, m_DecodeIntrinsicCount = 0;
-    uint64_t m_DecodeIntrinsicUs = 0;
     std::array<uint32_t, 512> m_SendSpanSamples {};
     size_t m_SendSpanNext = 0, m_SendSpanCount = 0;
     uint64_t m_SendSpanTypicalUs = 0;

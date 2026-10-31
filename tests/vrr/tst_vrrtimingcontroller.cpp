@@ -2904,8 +2904,8 @@ void testProducerClockExcludesLateGpuCollection()
     std::fprintf(stderr, "late GPU collection clock skew: %llu -> %llu us\n",
                  static_cast<unsigned long long>(worstClockSkew[0]),
                  static_cast<unsigned long long>(worstClockSkew[1]));
-    expect(worstClockSkew[0] > 8000 && worstClockSkew[1] < 2000,
-           "late collection must not move the producer clock forward by our own queue residence");
+    expect(worstClockSkew[0] < 2000 && worstClockSkew[1] < 2000,
+           "both source-mapping paths must exclude our own queue residence from GPU service");
 
     auto session = config(120, 120);
     session.smoothFrameTiming = false;

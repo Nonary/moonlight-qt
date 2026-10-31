@@ -138,8 +138,89 @@ void decodeCompletionEstimate() {
     check(C::estimateDecodeCompleteUs(1000,5000,3000,3800)==5000,"worker blocked on decode: its completion time is exact");
     check(C::estimateDecodeCompleteUs(1000,9000,20,3800)==4800,"finished while queued: output plus typical GPU decode, not the late observation");
     check(C::estimateDecodeCompleteUs(1000,3000,20,3800)==3000,"estimate never exceeds the observed completion bound");
-    check(C::estimateDecodeCompleteUs(1000,9000,20,0)==9000,"without a learned GPU time the observation is used");
+    check(C::estimateDecodeCompleteUs(1000,9000,20,0)==1000,"without a prompt GPU sample queued observation cannot create producer work");
+    check(C::estimateDecodeCompleteUs(1000,21000,500,2000)==3000,"a blocking late poll still contains queue residence");
+    check(C::estimateDecodeCompleteUs(1000,21000,500,0)==1000,"a blocking late poll cannot seed its own queue delay");
+    check(C::estimateDecodeCompleteUs(UINT64_MAX-5000,UINT64_MAX-100,20,6000)==UINT64_MAX-100,
+          "GPU completion estimate saturates at its observed bound without wrapping");
     check(C::estimateDecodeCompleteUs(1000,0,0,3800)==1000,"unknown completion falls back to decoder output");
+}
+// The normal production policy must never learn intentional queue residence as
+// GPU service, including a session with no prompt completion samples at all.
+void queuedDecodeCompletionDoesNotTrainInputDelay() {
+    for (const bool warm : {false, true}) {
+        VrrSessionConfig session;
+        session.streamRateHz=116; session.displayRefreshHz=120;
+        session.smoothFrameTiming=false;
+        session.experimentalInputPercentilePpm=1;
+        session.experimentalBoundedCatchup=true;
+        session.timingOptions={4000,9995,300,500};
+        auto policy=vrrTimingParametersForSession(session);
+        check(policy.normalizedSourceIntrinsicDecodeGpu==1,
+              "queue feedback regression exercises the existing production policy");
+        policy.playoutDelayStartSeedUs=22000;
+        VrrTimingController controller(session,true,policy);
+        uint64_t peakInput=0;
+        for (int i=0;i<1200;++i) {
+            const uint64_t source=1000000+uint64_t(i)*1000000/116;
+            const uint64_t output=source+500;
+            const bool prompt=warm && i<64;
+            const uint64_t wait=prompt?2000:500;
+            // Alternate queue residence by 5 ms without changing source or
+            // GPU service. The decrease is smaller than one source period,
+            // so observation time stays monotonic on every frame.
+            const uint64_t queue=(i/15)%2?15000:10000;
+            const uint64_t observed=output+(prompt?2000:queue+wait);
+            PacedFrame frame(nullptr,i,uint32_t(uint64_t(i)*90000/116),true,output);
+            frame.setDeliveryTimeline(source-200,source,source+100);
+            frame.noteGpuReadyUs(observed); frame.noteDecodeSyncWaitUs(wait);
+            const auto decision=controller.schedule(frame,observed);
+            check(decision.targetUs>=observed,
+                  "queue-neutral accounting still respects actual GPU readiness");
+            const auto ready=std::max(observed,decision.renderStartUs)+500;
+            controller.notePreparationDuration(500,0,ready);
+            controller.noteSchedulerDelays(0,0,true);
+            const auto submitted=std::max(ready,decision.targetUs);
+            controller.noteSubmission(true,false,submitted,submitted);
+            const auto input=controller.intervalStats().inputPercentile;
+            if(i>=256 && input.lastInputEligible)
+                peakInput=std::max(peakInput,uint64_t(std::max<int64_t>(0,input.lastInputRequiredUs)));
+        }
+        const auto target=controller.intervalStats().inputPercentile.targetUs;
+        check(peakInput<1000 && target<=1000,
+              "queued completion cannot become standing input protection");
+        check(controller.typicalDecodeGpuUs()==(warm?2000U:0U),
+              "only promptly collected completions train GPU service");
+        std::fprintf(stderr,"queued decode (%s): peak input %llu us, target %llu us, GPU estimate %llu us\n",
+            warm?"warm":"cold",(unsigned long long)peakInput,(unsigned long long)target,
+            (unsigned long long)controller.typicalDecodeGpuUs());
+    }
+
+    VrrSessionConfig session;
+    session.streamRateHz=60; session.displayRefreshHz=120;
+    session.smoothFrameTiming=false; session.experimentalInputPercentilePpm=1;
+    session.experimentalBoundedCatchup=true;
+    VrrTimingController controller(session,true,vrrTimingParametersForSession(session));
+    bool sawRealStall=false;
+    for(int i=0;i<180;++i) {
+        const uint64_t source=1000000+uint64_t(i)*1000000/60,output=source+500;
+        const uint64_t wait=i==120?6500:2000,observed=output+wait;
+        PacedFrame frame(nullptr,i,uint32_t(i*1500),true,output);
+        frame.setDeliveryTimeline(source-200,source,source+100);
+        frame.noteGpuReadyUs(observed); frame.noteDecodeSyncWaitUs(wait);
+        const auto decision=controller.schedule(frame,observed);
+        const auto ready=std::max(observed,decision.renderStartUs)+500;
+        controller.notePreparationDuration(500,0,ready);
+        controller.noteSchedulerDelays(0,0,true);
+        const auto submitted=std::max(ready,decision.targetUs);
+        controller.noteSubmission(true,false,submitted,submitted);
+        if(i==120) {
+            const auto input=controller.intervalStats().inputPercentile;
+            sawRealStall=input.lastInputEligible && input.lastInputRequiredUs>=4000;
+            check(decision.targetUs>=observed,"a promptly observed GPU stall still gates presentation");
+        }
+    }
+    check(sawRealStall,"prompt GPU stalls remain eligible input-lateness evidence");
 }
 void resyncAndLifecycle() {
     Vrr13::PhaseTrajectory p;p.commit(1,100000,106690,106690,true,false,true);
@@ -359,4 +440,4 @@ void actualControllerAndInputIsolation() {
     late.reset();check(late.trajectoryStats().plans==0,"controller full reset clears trajectory model");
 }
 }
-int main() {extraDelayDoesNotChaseCurrentReadiness();bufferReleaseDoesNotCreateCarry();carryRepaymentKnobs();decodeCompletionEstimate();legacyRecoveryCannotSustainCarry();asyncDecodeCompletionPlanning();compressionAndAcceptance();resyncAndLifecycle();preparedSuccessorProof();sourceMappingFactorial();actualCadenceChangeQualification();actualControllerAndInputIsolation();std::fprintf(stderr,"phase trajectory integration: %s (%d failures)\n",failures?"FAIL":"PASS",failures);return failures?1:0;}
+int main() {extraDelayDoesNotChaseCurrentReadiness();bufferReleaseDoesNotCreateCarry();carryRepaymentKnobs();decodeCompletionEstimate();queuedDecodeCompletionDoesNotTrainInputDelay();legacyRecoveryCannotSustainCarry();asyncDecodeCompletionPlanning();compressionAndAcceptance();resyncAndLifecycle();preparedSuccessorProof();sourceMappingFactorial();actualCadenceChangeQualification();actualControllerAndInputIsolation();std::fprintf(stderr,"phase trajectory integration: %s (%d failures)\n",failures?"FAIL":"PASS",failures);return failures?1:0;}

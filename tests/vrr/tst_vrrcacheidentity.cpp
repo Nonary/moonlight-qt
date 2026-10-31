@@ -2,6 +2,7 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profile.h"
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QTemporaryDir>
 #include <cassert>
 #include <chrono>
@@ -28,9 +29,18 @@ int main(int argc, char** argv) {
             QByteArray::fromStdString(vrrCalibrationPolicy(p)), canLatch, true);
     };
     const auto key = identity(policy, false);
+    QCryptographicHash previous(QCryptographicHash::Sha256);
+    previous.addData(QByteArrayLiteral("vrr-calibration-v3\n"));
+    previous.addData(QByteArrayLiteral("same-device-codec-settings"));
+    previous.addData(QByteArrayLiteral("\ncan-latch=0\nallow-tearing=1"));
+    previous.addData(QByteArray::fromStdString(vrrCalibrationPolicy(policy)));
+    const auto previousKey = QString::fromLatin1(previous.result().toHex());
+    assert(key != previousKey);
     QTemporaryDir dir;
     assert(dir.isValid());
     const auto path = dir.filePath("seed.json");
+    assert(Vrr13::saveStartDelay(path, previousKey, 14492));
+    assert(Vrr13::loadStartDelay(path, key) == 0);
     assert(Vrr13::saveStartDelay(path, key, 8378));
     assert(Vrr13::loadStartDelay(path, key) == 8378);
     assert(Vrr13::loadStartDelay(path, identity(policy, true)) == 0);

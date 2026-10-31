@@ -29,6 +29,12 @@ python3 ../../tests/vrr/check_fresh_trace_schema.py ./vrrreplay fresh.vrrtrace
 Use the actual paths to the worker and replay binaries in your build tree.
 The fixture is synthetic and does not establish live smoothness or scanout.
 
+`tst_phasetrajectory` covers the policy-1 decode-buffer feedback regression:
+late blocking/nonblocking completion checks, cold and warm GPU estimates,
+retained startup protection, prompt real GPU stalls, actual readiness floors,
+and completion arithmetic near the timestamp limit. `tst_vrrcacheidentity`
+checks that the corrected estimator cannot load a prior saved startup delay.
+
 ## Capture and exact replay
 
 The worker writes schema-6 captures as compressed `.vrrtrace` files or CSV.
@@ -49,6 +55,14 @@ scanout or proof that a changed policy would cause the same host, network, GPU,
 or display events. Use a fresh matching capture and preserve its baseline
 separately from candidate results. Re-enumerate captures before each analysis
 as described in `AGENTS.md`.
+
+The 2026-10-30 correction changes the existing policy-1 accounting in place.
+Captures recorded before that correction can be rejected for divergent
+diagnostics or original deadlines despite retaining the same policy fields.
+Preserve an exact baseline from the matching old executable and use fresh
+worker captures for the corrected controller's replay and stress gates.
+Never waive an exact mismatch or introduce a second production policy merely
+to reproduce the old bug.
 
 ## Current-policy scenarios
 

@@ -1,6 +1,6 @@
 # Streaming and VRR architecture
 
-Source baseline: cleanup policy merged with master on 2026-10-29. The production worker
+Source baseline: master plus the decode-buffer accounting correction on 2026-10-30. The production worker
 resolves one adaptive input policy, bounded catch-up and corrected input
 accounting. The calibration key includes effective policy and presenter
 capabilities; existing keys are not reused. Schema-6 capture and schema-2
@@ -634,12 +634,26 @@ interval quality, network and decoder stage attribution are separate metrics.
 Packet loss, discontinuities and invalid observations have explicit eligibility
 rules; downstream preparation or submission delay is not input lateness.
 
+The existing `normalized_source_intrinsic_decode_gpu=1` path admits a GPU
+service sample only when a blocking completion check began within 1 ms of
+decoder output. A late check can include our own queue residence even when
+the final wait blocks. Source mapping and input accounting share one median
+of those prompt samples. Late observations use output plus that median,
+bounded by observed completion; without a qualified sample they use output.
+This is an accounting estimate: the worker still waits for actual readiness
+before presentation. Promptly observed GPU stalls retain their full duration
+for input feedback instead of being clipped to the median. No second policy
+or additional user setting is introduced.
+
 `profile.cpp` stores calibration under the cache path. The worker constructs
 the key from device/session context, effective controller policy and presenter
 capabilities before loading. The new key deliberately cold-starts rather than
 borrowing an old policy's cached evidence. Cached history is not proof of live
 coverage or physical presentation, and phase rebases and complete resets have
 different lifecycle effects.
+The `prompt-decode-accounting` cache marker additionally isolates both saved
+startup delay and reserve history from the former queue-contaminated estimator.
+Existing cache files are preserved, but their prior keys are not loaded.
 
 ## 10. Windows D3D11 mechanics and native synchronization
 
