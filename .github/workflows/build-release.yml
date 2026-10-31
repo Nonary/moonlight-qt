@@ -48,7 +48,16 @@ jobs:
 
   flatpak:
     needs: setup
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    name: flatpak (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     env:
       CI_VERSION: ${{ needs.setup.outputs.ci_version }}
       CCACHE_DIR: ${{ github.workspace }}/.flatpak-builder/ccache
@@ -103,7 +112,7 @@ jobs:
             --install-deps-from=flathub --repo=flatpak-repo flatpak-build \
             packaging/flatpak/com.moonlight_stream.Moonlight.json
           flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
-            flatpak-repo "Moonlight-VRR-$CI_VERSION-linux-x86_64.flatpak" \
+            flatpak-repo "Moonlight-VRR-$CI_VERSION-linux-${{ matrix.arch }}.flatpak" \
             com.moonlight_stream.Moonlight master
       - name: Verify exported source and Gamescope patch
         run: |
@@ -117,8 +126,8 @@ jobs:
           PY
       - uses: actions/upload-artifact@v6
         with:
-          name: Moonlight-Flatpak-${{ env.CI_VERSION }}
-          path: Moonlight-VRR-${{ env.CI_VERSION }}-linux-x86_64.flatpak
+          name: Moonlight-Flatpak-${{ matrix.arch }}-${{ env.CI_VERSION }}
+          path: Moonlight-VRR-${{ env.CI_VERSION }}-linux-${{ matrix.arch }}.flatpak
           compression-level: 0
           if-no-files-found: error
       - name: Save verified Flatpak compiler cache

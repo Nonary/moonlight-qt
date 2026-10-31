@@ -158,6 +158,15 @@ private slots:
                      .value("tag_name").toString(), QString("v6.1.0-daily.182"));
         QVERIFY(AutoUpdateChecker::findUpdate({nightly}, installed, "appimage", "arm64").isEmpty());
         QVERIFY(AutoUpdateChecker::findUpdate({nightly}, installed, "appimage", "x86_64", false).isEmpty());
+        auto aarch64 = assets;
+        aarch64.append(QJsonObject{{"name", "Moonlight-6.1.0-daily.182-aarch64.AppImage"}, {"state", "uploaded"}, {"size", 100}});
+        auto multiarch = nightly;
+        multiarch["assets"] = aarch64;
+        embedIdentity(multiarch);
+        QCOMPARE(AutoUpdateChecker::findUpdate({multiarch}, installed, "appimage", "arm64")
+                     .value("tag_name").toString(), QString("v6.1.0-daily.182"));
+        QCOMPARE(AutoUpdateChecker::findUpdate({multiarch}, installed, "appimage", "x86_64")
+                     .value("tag_name").toString(), QString("v6.1.0-daily.182"));
         QVERIFY(AutoUpdateChecker::findUpdate({nightly}, version("6.1.0-daily.182", false), "appimage", "x86_64").isEmpty());
         auto incomplete = assets[0].toObject();
         incomplete["state"] = "new";
