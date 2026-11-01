@@ -7,10 +7,18 @@
 
 #include <algorithm>
 
+#ifdef HAVE_FFMPEG
 extern "C" {
 #include <libavcodec/version.h>
 #include <libavutil/version.h>
 }
+#define PROBE_CACHE_LAVC_VERSION LIBAVCODEC_VERSION_INT
+#define PROBE_CACHE_LAVU_VERSION LIBAVUTIL_VERSION_INT
+#else
+// Builds without FFmpeg (e.g. Steam Link) have no decoder versions to key on
+#define PROBE_CACHE_LAVC_VERSION 0
+#define PROBE_CACHE_LAVU_VERSION 0
+#endif
 
 #ifdef HAVE_LIBPLACEBO_VULKAN
 #include <SDL_vulkan.h>
@@ -121,8 +129,8 @@ QString DecoderProbeCache::environmentKey()
             .arg(PROBE_CACHE_SCHEMA)
             .arg(VERSION_STR)
             .arg(videoDriver ? videoDriver : "none")
-            .arg(LIBAVCODEC_VERSION_INT)
-            .arg(LIBAVUTIL_VERSION_INT)
+            .arg(PROBE_CACHE_LAVC_VERSION)
+            .arg(PROBE_CACHE_LAVU_VERSION)
             .arg(gpuIdentity())
             .arg(overrides.join(','));
     return key;
