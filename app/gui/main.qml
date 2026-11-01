@@ -1,5 +1,5 @@
 import QtQuick 2.9
-import QtQuick.Controls 2.2
+import QtQuick.Controls 2.5
 import QtQuick.Layouts 1.3
 import QtQuick.Window 2.2
 import QtQuick.Controls.Material 2.2
@@ -9,6 +9,7 @@ import AutoUpdateChecker 1.0
 import StreamingPreferences 1.0
 import SystemProperties 1.0
 import SdlGamepadKeyNavigation 1.0
+import "PopupFocus.js" as PopupFocus
 
 ApplicationWindow {
     property bool pollingActive: false
@@ -108,6 +109,7 @@ ApplicationWindow {
 
     StackView {
         id: stackView
+        property bool focusViewAfterDialog: false
         anchors.fill: parent
         focus: true
 
@@ -120,10 +122,10 @@ ApplicationWindow {
 
         onCurrentItemChanged: {
             // Ensure focus travels to the next view when going back
-            if (currentItem) {
-                currentItem.forceActiveFocus()
-            }
+            PopupFocus.focusCurrentView(stackView)
         }
+
+        Window.onActiveFocusItemChanged: PopupFocus.keepModalFocus(Overlay.overlay)
 
         Keys.onEscapePressed: {
             if (depth > 1) {
