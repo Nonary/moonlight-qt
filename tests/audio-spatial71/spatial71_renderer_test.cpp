@@ -11,6 +11,7 @@
 #include "../../app/streaming/audio/renderers/spatialaudioqueue.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -19,7 +20,7 @@
 namespace {
 using Clock = std::chrono::steady_clock;
 constexpr int FramesPerPacket = 240;
-constexpr int PacketBytes = FramesPerPacket * 8 * static_cast<int>(sizeof(float));
+int packetBytes(int channels) { return FramesPerPacket * channels * static_cast<int>(sizeof(float)); }
 
 void json(const QJsonObject& object)
 {
@@ -34,13 +35,15 @@ void help()
               "  --help                         Does not open any audio device\n"
               "  --list-endpoints               Read-only HDMI/DisplayPort endpoint inventory\n"
               "  --invalid-endpoint-test        Tests rejected configuration/device ID only\n"
+              "  --pcm-test                     Tests 6/8-channel tone generation offline\n"
               "  --endpoint-id ID --silence|--tones [--seconds 60] [--cycles 1]\n"
               "  --default-endpoint --silence|--tones [--seconds 60] [--cycles 1]\n"
-              "      [--gap-at-ms 10000 --gap-ms 500]\n"
+              "      [--channels 6|8] [--gap-at-ms 10000 --gap-ms 500]\n"
               "Native tests require an explicit endpoint ID or --default-endpoint. The latter\n"
               "uses the current default only if it is HDMI/DisplayPort; it never guesses another\n"
               "device. No Windows default or system setting is changed. Try silence first. Tones\n"
-              "are one channel/second: FL FR FC LFE BL BR SL SR, peak -30 dBFS.\n"
+              "are one channel/second: FL FR FC LFE BL BR, then SL SR for 8 channels;\n"
+              "peak -30 dBFS. The default is 8 channels; 6 channels has no side objects.\n"
               "stdout contains producer JSON; stderr contains actual renderer diagnostics.\n"
               "A PASS proves API execution, not audibility, Dolby/MAT, physical latency or A/V sync.");
 }
@@ -58,11 +61,11 @@ int listEndpoints()
     return error.isEmpty() ? 0 : 1;
 }
 
-OPUS_MULTISTREAM_CONFIGURATION configuration()
+OPUS_MULTISTREAM_CONFIGURATION configuration(int channels = 8)
 {
     OPUS_MULTISTREAM_CONFIGURATION result{};
     result.sampleRate = 48000;
-    result.channelCount = 8;
+    result.channelCount = channels;
     result.samplesPerFrame = FramesPerPacket;
     // The harness supplies already-decoded PCM, exactly like the IAudioRenderer
     // boundary. No Opus decoder, network stack, Session or video path is simulated.
@@ -73,22 +76,26 @@ int invalidEndpointTest()
 {
     const QString invalidId = QStringLiteral("Spatial71-test-invalid-endpoint-not-a-device");
     auto config = configuration();
-    constexpr int caseCount = 7;
+    constexpr int caseCount = 11;
     for (int test = 0; test < caseCount; ++test) {
         auto candidate = config;
         if (test == 1) candidate.channelCount = 2;
-        if (test == 2) candidate.channelCount = 6;
+        if (test == 2) candidate.channelCount = 7;
         if (test == 3) candidate.sampleRate = 44100;
         if (test == 4) candidate.samplesPerFrame = 0;
         if (test == 5) candidate.samplesPerFrame = static_cast<int>(Spatial71::MaxDecodeFrames + 1);
+        if (test == 7 || test == 8) candidate.channelCount = 6;
+        if (test == 8) candidate.sampleRate = 44100;
+        if (test == 9) candidate.channelCount = 0;
+        if (test == 10) candidate.channelCount = -1;
         // Unsupported configurations must be rejected before resolving a
         // default device. The valid-format case uses an impossible device ID.
-        SpatialAudioRenderer renderer(test == 0 ? invalidId : QString{});
+        SpatialAudioRenderer renderer(test == 0 || test == 7 ? invalidId : QString{});
         if (renderer.prepareForPlayback(test == 6 ? nullptr : &candidate)) {
             json({{"event", "invalid_endpoint_test"}, {"result", "FAIL"}, {"case", test}});
             return 1;
         }
-        int bytes = PacketBytes;
+        int bytes = packetBytes(candidate.channelCount == 6 ? 6 : 8);
         if (renderer.getAudioBuffer(&bytes) == nullptr || renderer.submitAudio(0)) {
             json({{"event", "failure_propagation_test"}, {"result", "FAIL"}, {"case", test}});
             return 1;
@@ -134,11 +141,13 @@ struct Options {
     int cycles = 1;
     int gapAtMs = 0;
     int gapMs = 0;
+    int channels = 8;
 };
 
 bool parse(const QStringList& args, Options& options)
 {
     bool modeSet = false;
+    bool channelsSet = false;
     for (int index = 1; index < args.size(); ++index) {
         const auto option = args[index];
         if (option == "--silence" || option == "--tones") {
@@ -164,6 +173,10 @@ bool parse(const QStringList& args, Options& options)
             else if (option == "--cycles" && value >= 1 && value <= 20) options.cycles = value;
             else if (option == "--gap-at-ms" && value >= 1 && value <= 3599999) options.gapAtMs = value;
             else if (option == "--gap-ms" && value >= 1 && value <= 30000) options.gapMs = value;
+            else if (option == "--channels" && (value == 6 || value == 8) && !channelsSet) {
+                options.channels = value;
+                channelsSet = true;
+            }
             else return false;
         }
     }
@@ -172,20 +185,55 @@ bool parse(const QStringList& args, Options& options)
              (options.gapAtMs > 0 && options.gapMs > 0 && options.gapAtMs + options.gapMs < options.seconds * 1000));
 }
 
-void fill(float* destination, std::uint64_t firstFrame, bool tones)
+void fill(float* destination, std::uint64_t firstFrame, bool tones, int channels)
 {
-    std::fill_n(destination, FramesPerPacket * 8, 0.0f);
+    std::fill_n(destination, FramesPerPacket * channels, 0.0f);
     if (!tones) return;
     constexpr double pi = 3.14159265358979323846;
     constexpr double gain = 0.03162277660168379; // -30 dBFS peak
     for (std::uint64_t frame = 0; frame < FramesPerPacket; ++frame) {
         const auto absolute = firstFrame + frame;
-        const auto channel = (absolute / 48000) % 8;
+        const auto channel = (absolute / 48000) % static_cast<std::uint64_t>(channels);
         const auto phaseFrame = absolute % 48000;
         const double fade = (std::min)(1.0, static_cast<double>((std::min)(phaseFrame, 47999 - phaseFrame)) / 480.0);
         const double frequency = channel == 3 ? 60.0 : 440.0;
-        destination[frame * 8 + channel] = static_cast<float>(gain * fade * std::sin(2.0 * pi * frequency * static_cast<double>(phaseFrame) / 48000.0));
+        destination[frame * static_cast<std::uint64_t>(channels) + channel] = static_cast<float>(gain * fade * std::sin(2.0 * pi * frequency * static_cast<double>(phaseFrame) / 48000.0));
     }
+}
+
+int pcmTest()
+{
+    int cases = 0;
+    for (int channels : {6, 8}) {
+        const auto sampleCount = static_cast<std::size_t>(FramesPerPacket * channels);
+        std::array<float, FramesPerPacket * 8 + 2> storage{};
+        storage.fill(-9.0f);
+        fill(storage.data() + 1, 0, false, channels);
+        if (storage.front() != -9.0f || storage[sampleCount + 1] != -9.0f) return 1;
+        for (std::size_t sample = 1; sample <= sampleCount; ++sample) {
+            if (storage[sample] != 0.0f) return 1;
+        }
+        ++cases;
+        for (int active = 0; active < channels; ++active) {
+            storage.fill(-9.0f);
+            fill(storage.data() + 1, static_cast<std::uint64_t>(active) * 48000 + 1000, true, channels);
+            if (storage.front() != -9.0f || storage[sampleCount + 1] != -9.0f) return 1;
+            bool audible = false;
+            for (int frame = 0; frame < FramesPerPacket; ++frame) {
+                for (int channel = 0; channel < channels; ++channel) {
+                    const auto value = storage[1 + static_cast<std::size_t>(frame * channels + channel)];
+                    if (!std::isfinite(value) || std::abs(value) > 0.031623f) return 1;
+                    if (channel != active && value != 0.0f) return 1;
+                    if (channel == active && std::abs(value) > 0.01f) audible = true;
+                }
+            }
+            if (!audible) return 1;
+            ++cases;
+        }
+    }
+    json({{"event", "producer_pcm_test"}, {"result", "PASS"}, {"cases", cases},
+          {"active_endpoint_opened", false}, {"limitation", "Generated PCM only; no audible channel or native stream test"}});
+    return 0;
 }
 
 int run(const Options& options)
@@ -195,7 +243,8 @@ int run(const Options& options)
         DeadlineTimer timer;
         if (!timer.valid()) return 1;
         auto renderer = std::make_unique<SpatialAudioRenderer>(options.endpoint);
-        auto config = configuration();
+        auto config = configuration(options.channels);
+        const int bytesPerPacket = packetBytes(options.channels);
         if (!renderer->prepareForPlayback(&config)) {
             json({{"event", "renderer_start"}, {"result", "FAIL"}, {"cycle", cycle}, {"endpoint", selection}});
             return 1;
@@ -203,7 +252,8 @@ int run(const Options& options)
         if (renderer->getAudioBufferFormat() != IAudioRenderer::AudioFormat::Float32NE) return 1;
         json({{"event", "renderer_start"}, {"result", "PASS"}, {"cycle", cycle},
               {"endpoint", selection}, {"mode", options.tones ? "tones" : "silence"},
-              {"packet_frames", FramesPerPacket}, {"high_resolution_producer_timer", timer.highResolution()}});
+              {"channels", options.channels}, {"packet_frames", FramesPerPacket},
+              {"packet_bytes", bytesPerPacket}, {"high_resolution_producer_timer", timer.highResolution()}});
         const auto start = Clock::now();
         auto next = start;
         const auto end = start + std::chrono::seconds(options.seconds);
@@ -228,11 +278,11 @@ int run(const Options& options)
             const double lateMs = std::chrono::duration<double, std::milli>(now - next).count();
             maximumLateMs = (std::max)(maximumLateMs, lateMs);
             if (lateMs >= 5.0) { ++latePeriods; next = now; } // no accumulated catch-up bursts
-            int size = PacketBytes;
+            int size = bytesPerPacket;
             auto* buffer = static_cast<float*>(renderer->getAudioBuffer(&size));
-            if (!buffer || size < PacketBytes) { success = false; break; }
-            fill(buffer, sentFrames, options.tones);
-            if (!renderer->submitAudio(PacketBytes)) { success = false; break; }
+            if (!buffer || size < bytesPerPacket) { success = false; break; }
+            fill(buffer, sentFrames, options.tones, options.channels);
+            if (!renderer->submitAudio(bytesPerPacket)) { success = false; break; }
             sentFrames += FramesPerPacket;
             ++packets;
             next += std::chrono::milliseconds(5);
@@ -245,6 +295,7 @@ int run(const Options& options)
         renderer.reset();
         const double stopMs = std::chrono::duration<double, std::milli>(Clock::now() - stopStart).count();
         json({{"event", "producer_run"}, {"result", success ? "PASS" : "FAIL"}, {"cycle", cycle},
+              {"channels", options.channels},
               {"frames_submitted", static_cast<qint64>(sentFrames)}, {"packets_submitted", static_cast<qint64>(packets)},
               {"duration_ms", durationMs}, {"max_producer_lateness_ms", maximumLateMs},
               {"late_producer_periods", static_cast<qint64>(latePeriods)}, {"stop_join_ms", stopMs},
@@ -263,6 +314,7 @@ int main(int argc, char** argv)
     if (args.size() == 1 || (args.size() == 2 && args[1] == "--help")) { help(); return 0; }
     if (args.size() == 2 && args[1] == "--list-endpoints") return listEndpoints();
     if (args.size() == 2 && args[1] == "--invalid-endpoint-test") return invalidEndpointTest();
+    if (args.size() == 2 && args[1] == "--pcm-test") return pcmTest();
     Options options;
     if (!parse(args, options)) { help(); std::fputs("Invalid arguments; no audio device opened.\n", stderr); return 2; }
     return run(options);

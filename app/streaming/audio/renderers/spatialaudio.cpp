@@ -1,4 +1,4 @@
-// Windows Spatial Audio integration for Moonlight's decoded 7.1 PCM.
+// Windows Spatial Audio integration for Moonlight's decoded 5.1/7.1 PCM.
 // API contract: https://learn.microsoft.com/windows/win32/coreaudio/render-spatial-sound-using-spatial-audio-objects
 // All rendering COM interfaces are created, used, and released on the worker.
 #ifndef NOMINMAX
@@ -37,7 +37,12 @@ static_assert(Spatial71::StaticObjectTypes[0] == AudioObjectType_FrontLeft &&
               Spatial71::StaticObjectTypes[5] == AudioObjectType_BackRight &&
               Spatial71::StaticObjectTypes[6] == AudioObjectType_SideLeft &&
               Spatial71::StaticObjectTypes[7] == AudioObjectType_SideRight,
-              "7.1 PCM channel order must match the native static object types");
+              "Surround PCM channel order must match the native static object types");
+static_assert(Spatial71::staticObjectMask(6) ==
+              static_cast<std::uint32_t>(AudioObjectType_FrontLeft | AudioObjectType_FrontRight |
+                  AudioObjectType_FrontCenter | AudioObjectType_LowFrequency |
+                  AudioObjectType_BackLeft | AudioObjectType_BackRight),
+              "Moonlight 5.1 uses the back pair from its 0x3F Windows channel mask");
 
 struct SpatialFailure {
     const char* operation;
@@ -131,14 +136,14 @@ struct SpatialStream {
             const HRESULT hr = stream->Stop();
             if (FAILED(hr)) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "Spatial 7.1: Stop during cleanup failed: 0x%08lX", static_cast<unsigned long>(hr));
+                            "Spatial Audio: Stop during cleanup failed: 0x%08lX", static_cast<unsigned long>(hr));
             }
         }
         for (auto& object : objects) object.Reset();
         const HRESULT hr = stream->Reset();
         if (FAILED(hr)) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Spatial 7.1: Reset during cleanup failed: 0x%08lX", static_cast<unsigned long>(hr));
+                        "Spatial Audio: Reset during cleanup failed: 0x%08lX", static_cast<unsigned long>(hr));
         }
     }
 };
@@ -176,10 +181,10 @@ struct SpatialAudioRenderer::Impl
             const auto stats = queue.statistics();
             const double tickMs = frequency ? 1000.0 / static_cast<double>(frequency) : 0;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Spatial 7.1 stats: submitted=%llu consumed=%llu dropped=%llu underrun_frames=%llu "
+                "Spatial Audio stats: channels=%zu submitted=%llu consumed=%llu dropped=%llu underrun_frames=%llu "
                 "queue_peak=%zu/1440 frames quanta=%llu quantum_max=%u startup_silence_frames=%llu "
                 "max_event_interval_ms=%.3f max_fill_ms=%.3f failed=%d (not acoustic latency)",
-                static_cast<unsigned long long>(stats.submittedFrames),
+                channelCount, static_cast<unsigned long long>(stats.submittedFrames),
                 static_cast<unsigned long long>(stats.consumedFrames),
                 static_cast<unsigned long long>(stats.droppedFrames),
                 static_cast<unsigned long long>(underrunFrames), stats.highWaterFrames,
@@ -202,8 +207,8 @@ struct SpatialAudioRenderer::Impl
     {
         if (!failed.exchange(true)) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "Spatial 7.1: %s failed: 0x%08lX; renderer recovery required",
-                         operation, static_cast<unsigned long>(hr));
+                         "Spatial Audio (%zu channels): %s failed: 0x%08lX; renderer recovery required",
+                         channelCount, operation, static_cast<unsigned long>(hr));
         }
         if (stopEvent) SetEvent(stopEvent->handle);
     }
@@ -273,8 +278,9 @@ struct SpatialAudioRenderer::Impl
                                   reinterpret_cast<void**>(client.GetAddressOf())), "Activate ISpatialAudioClient");
         AudioObjectType nativeMask = AudioObjectType_None;
         require(client->GetNativeStaticObjectTypeMask(&nativeMask), "Read native static object mask");
-        if ((static_cast<UINT32>(nativeMask) & Spatial71::StaticObjectMask) != Spatial71::StaticObjectMask) {
-            throw SpatialFailure{"Endpoint lacks eight native 7.1 objects", AUDCLNT_E_UNSUPPORTED_FORMAT};
+        const auto requestedMask = Spatial71::staticObjectMask(channelCount);
+        if ((static_cast<UINT32>(nativeMask) & requestedMask) != requestedMask) {
+            throw SpatialFailure{"Endpoint lacks the requested native surround objects", AUDCLNT_E_UNSUPPORTED_FORMAT};
         }
 
         WAVEFORMATEX format{};
@@ -296,12 +302,12 @@ struct SpatialAudioRenderer::Impl
         }
         // All allocations are complete before playback. COM buffers are never
         // retained beyond their update; this scratch buffer owns interleaved PCM.
-        std::vector<float> scratch(static_cast<std::size_t>(maximumFrames) * Spatial71::ChannelCount);
+        std::vector<float> scratch(static_cast<std::size_t>(maximumFrames) * channelCount);
         Event renderEvent(false);
         SpatialStream output;
         SpatialAudioObjectRenderStreamActivationParams parameters{};
         parameters.ObjectFormat = &format;
-        parameters.StaticObjectTypeMask = static_cast<AudioObjectType>(Spatial71::StaticObjectMask);
+        parameters.StaticObjectTypeMask = static_cast<AudioObjectType>(requestedMask);
         parameters.MinDynamicObjectCount = 0;
         parameters.MaxDynamicObjectCount = 0;
         parameters.Category = AudioCategory_GameMedia;
@@ -312,7 +318,7 @@ struct SpatialAudioRenderer::Impl
         activation.blob.pBlobData = reinterpret_cast<BYTE*>(&parameters);
         // activation refers to stack storage; it must not be PropVariantClear'd.
         require(client->ActivateSpatialAudioStream(&activation, __uuidof(ISpatialAudioObjectRenderStream),
-            reinterpret_cast<void**>(output.stream.GetAddressOf())), "Activate 7.1 spatial stream");
+            reinterpret_cast<void**>(output.stream.GetAddressOf())), "Activate surround spatial stream");
         LARGE_INTEGER counterFrequency{};
         if (!QueryPerformanceFrequency(&counterFrequency) || counterFrequency.QuadPart <= 0) {
             throw SpatialFailure{"QueryPerformanceFrequency", E_UNEXPECTED};
@@ -321,7 +327,7 @@ struct SpatialAudioRenderer::Impl
         Mmcss mmcss;
         if (mmcss.error != ERROR_SUCCESS) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Spatial 7.1: MMCSS Pro Audio unavailable: %lu", mmcss.error);
+                        "Spatial Audio: MMCSS Pro Audio unavailable: %lu", mmcss.error);
         }
         require(output.stream->Start(), "Start spatial stream");
         output.started = true;
@@ -369,19 +375,19 @@ struct SpatialAudioRenderer::Impl
                     }
                 }
                 else {
-                    std::fill_n(scratch.data(), static_cast<std::size_t>(frames) * Spatial71::ChannelCount, 0.0f);
+                    std::fill_n(scratch.data(), static_cast<std::size_t>(frames) * channelCount, 0.0f);
                     if (everPlayed) underrunFrames += frames;
                     else startupSilenceFrames += frames;
                 }
             }
 
-            // All eight objects are updated, including silent or muted periods.
+            // All requested objects are updated, including silent or muted periods.
             // Omitting GetBuffer can terminate a static object implicitly.
-            for (std::size_t channel = 0; channel < Spatial71::ChannelCount; ++channel) {
+            for (std::size_t channel = 0; channel < channelCount; ++channel) {
                 if (!output.objects[channel]) {
                     require(output.stream->ActivateSpatialAudioObject(
                         static_cast<AudioObjectType>(Spatial71::StaticObjectTypes[channel]),
-                        &output.objects[channel]), "Activate static 7.1 object");
+                        &output.objects[channel]), "Activate static surround object");
                 }
                 BYTE* bytes = nullptr;
                 UINT32 length = 0;
@@ -391,7 +397,7 @@ struct SpatialAudioRenderer::Impl
                     throw SpatialFailure{"Unexpected static object buffer extent", E_UNEXPECTED};
                 }
                 if (length) std::memset(bytes, 0, length);
-                if (!Spatial71::deinterleave(scratch.data(), frames, channel, reinterpret_cast<float*>(bytes))) {
+                if (!Spatial71::deinterleave(scratch.data(), frames, channel, reinterpret_cast<float*>(bytes), channelCount)) {
                     throw SpatialFailure{"Invalid channel buffer", E_UNEXPECTED};
                 }
             }
@@ -402,10 +408,12 @@ struct SpatialAudioRenderer::Impl
             if (!activated && frames) {
                 activated = true;
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Spatial 7.1 active: 48000 Hz float32, FL FR FC LFE BL BR SL SR, "
-                    "8 static objects, native_mask=0x%08X, maximum_frames=%u, queue_limit=1440 (30 ms), "
+                    "Spatial Audio active: channels=%zu, 48000 Hz float32, %s, "
+                    "%zu static objects, requested_mask=0x%08X, native_mask=0x%08X, "
+                    "maximum_frames=%u, queue_limit=1440 (30 ms), "
                     "startup_target=480 frames/10 ms (event-quantized), selection=%s; provider/physical Atmos not verified",
-                    static_cast<unsigned int>(nativeMask), maximumFrames,
+                    channelCount, channelCount == 6 ? "FL FR FC LFE BL BR" : "FL FR FC LFE BL BR SL SR",
+                    channelCount, static_cast<unsigned int>(requestedMask), static_cast<unsigned int>(nativeMask), maximumFrames,
                     endpointId.empty() ? "default console render at initialization" : "explicit endpoint ID");
                 completeInitialization(true);
             }
@@ -415,6 +423,7 @@ struct SpatialAudioRenderer::Impl
     const std::wstring endpointId;
     std::array<float, Spatial71::MaxDecodeFrames * Spatial71::ChannelCount> staging{};
     std::size_t decodeCapacityFrames = 0;
+    std::size_t channelCount = Spatial71::ChannelCount;
     std::unique_ptr<Event> stopEvent;
     std::thread worker;
     bool workerCreated = false;
@@ -481,7 +490,7 @@ QList<SpatialAudioRenderer::EndpointInfo> SpatialAudioRenderer::enumerateEndpoin
         return result;
     }
     catch (const SpatialFailure& failure) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Spatial 7.1 endpoint enumeration: %s failed: 0x%08lX",
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Spatial Audio endpoint enumeration: %s failed: 0x%08lX",
                      failure.operation, static_cast<unsigned long>(failure.result));
         if (error) *error = QStringLiteral("Endpoint enumeration failed; see the diagnostic log for the HRESULT.");
     }
@@ -503,13 +512,19 @@ SpatialAudioRenderer::~SpatialAudioRenderer() = default;
 
 bool SpatialAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION* config)
 {
-    if (m_Impl->workerCreated || !config || config->channelCount != static_cast<int>(Spatial71::ChannelCount) ||
+    if (m_Impl->workerCreated || !config ||
+        !Spatial71::supportedChannelCount(static_cast<std::size_t>(config->channelCount)) ||
         config->sampleRate != static_cast<int>(Spatial71::SampleRate) || config->samplesPerFrame <= 0 ||
         static_cast<std::size_t>(config->samplesPerFrame) > Spatial71::MaxDecodeFrames ||
         m_Impl->endpointId.size() > 4096 ||
         m_Impl->endpointId.find(L'\0') != std::wstring::npos) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "Spatial 7.1 requires eight channels at 48000 Hz and a valid optional endpoint ID");
+                    "Spatial Audio requires six or eight channels at 48000 Hz and a valid optional endpoint ID");
+        return false;
+    }
+    m_Impl->channelCount = static_cast<std::size_t>(config->channelCount);
+    if (!m_Impl->queue.setChannelCount(m_Impl->channelCount)) {
+        m_Impl->fail("Invalid queue channel count", E_INVALIDARG);
         return false;
     }
     m_Impl->decodeCapacityFrames = static_cast<std::size_t>(config->samplesPerFrame);
@@ -550,7 +565,7 @@ bool SpatialAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATI
 void* SpatialAudioRenderer::getAudioBuffer(int* size)
 {
     std::size_t frames = 0;
-    if (!size || !Spatial71::bytesToFrames(size ? *size : -1, m_Impl->decodeCapacityFrames, frames)) {
+    if (!size || !Spatial71::bytesToFrames(size ? *size : -1, m_Impl->decodeCapacityFrames, frames, m_Impl->channelCount)) {
         m_Impl->fail("Invalid decoder buffer size", E_INVALIDARG);
         if (size) *size = 0;
     }
@@ -564,7 +579,7 @@ bool SpatialAudioRenderer::submitAudio(int bytesWritten)
     // Check failure BEFORE bytesWritten==0, including decode errors/missing data.
     if (m_Impl->failed.load() || !m_Impl->workerCreated) return false;
     std::size_t frames = 0;
-    if (!Spatial71::bytesToFrames(bytesWritten, m_Impl->decodeCapacityFrames, frames)) {
+    if (!Spatial71::bytesToFrames(bytesWritten, m_Impl->decodeCapacityFrames, frames, m_Impl->channelCount)) {
         m_Impl->fail("Invalid decoded packet size", E_INVALIDARG);
         return false;
     }

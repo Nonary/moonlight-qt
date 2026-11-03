@@ -1265,18 +1265,21 @@ backpressure. Audio startup intentionally discards an initial backlog of about
 500 ms; renderer reinitialization similarly prevents downtime becoming permanent
 queued audio latency. Muting can suppress audio processing without retiming VRR.
 
-Windows desktop also has an opt-in [Spatial Audio 7.1 renderer](docs/windows-spatial-audio.md).
-`MOONLIGHT_SPATIAL_AUDIO=1` enables it only for eight channels at 48 kHz;
-`MOONLIGHT_SPATIAL_AUDIO_ENDPOINT` optionally pins an endpoint ID. Otherwise it
-resolves the current default console render endpoint. The output must be an
-active HDMI/DisplayPort endpoint supporting all eight static objects and mono
+Windows desktop also has an opt-in [Spatial Audio 5.1/7.1 renderer](docs/windows-spatial-audio.md).
+The Windows-only Audio Settings checkbox persists `spatialaudio` (default false)
+and enables it only for six or eight channels at 48 kHz. The checkbox is available
+with 5.1 or 7.1 selected; switching to stereo retains the preference without using
+the renderer. The GUI renderer resolves the current default console render
+endpoint and ignores the prototype's endpoint environment override. The output must be an
+active HDMI/DisplayPort endpoint supporting the requested static objects and mono
 float32/48 kHz. No Windows setting is changed. Explicit `ML_AUDIO=sdl` retains
 precedence, and initialization failure continues through normal SDL selection.
-Stereo, 5.1 and non-opted-in sessions retain their existing paths.
+Stereo and non-opted-in sessions retain their existing paths.
 
 One MTA worker owns the spatial COM objects, event-driven output and teardown.
-The decoded FL/FR/FC/LFE/BL/BR/SL/SR order maps directly to eight static objects,
-without changing Opus mappings or adding heights. A 1,440-frame FIFO bounds
+The decoded FL/FR/FC/LFE/BL/BR order maps directly to six static objects for 5.1;
+7.1 adds SL/SR for eight objects. This preserves the protocol's 5.1 back-channel
+mask without changing Opus mappings or adding heights. A 1,440-frame FIFO bounds
 queued PCM to 30 ms; overflow drops oldest complete frames and underflow fills
 zeros. All channels share one queue cursor, and every object is updated even
 when input is muted. Worker faults reach `submitAudio(false)` and existing

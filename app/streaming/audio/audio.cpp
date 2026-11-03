@@ -47,13 +47,13 @@ IAudioRenderer* Session::createAudioRenderer(const POPUS_MULTISTREAM_CONFIGURATI
     // -------------- Automatic backend selection below this line ---------------
 
 #if defined(Q_OS_WIN) && !defined(Q_OS_WINRT)
-    if (qgetenv("MOONLIGHT_SPATIAL_AUDIO") == "1") {
-        if (opusConfig->channelCount == 8 && opusConfig->sampleRate == 48000) {
+    if (m_Preferences->spatialAudio) {
+        if ((opusConfig->channelCount == 6 || opusConfig->channelCount == 8) && opusConfig->sampleRate == 48000) {
             try {
-                // Empty selects the current default render endpoint, provided
-                // it is a compatible HDMI/DisplayPort output. No default is set.
-                auto renderer = std::make_unique<SpatialAudioRenderer>(
-                    QString::fromUtf8(qgetenv("MOONLIGHT_SPATIAL_AUDIO_ENDPOINT")));
+                // The GUI option uses the current default render endpoint.
+                // Ignore legacy prototype endpoint overrides after HDMI changes.
+                // No Windows default is set; the output must support Spatial Audio.
+                auto renderer = std::make_unique<SpatialAudioRenderer>(QString());
                 if (renderer->prepareForPlayback(opusConfig)) {
                     return renderer.release();
                 }
@@ -62,11 +62,11 @@ IAudioRenderer* Session::createAudioRenderer(const POPUS_MULTISTREAM_CONFIGURATI
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Unable to allocate Spatial Audio renderer");
             }
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Spatial 7.1 unavailable; falling back to the regular audio renderer");
+                        "Spatial Audio unavailable; falling back to the regular audio renderer");
         }
         else {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Spatial 7.1 requires eight channels at 48000 Hz; using regular audio");
+                        "Spatial Audio requires six or eight channels at 48000 Hz; using regular audio");
         }
     }
 #endif

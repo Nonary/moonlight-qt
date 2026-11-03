@@ -9,6 +9,9 @@ on:
     paths:
       - .github/workflows/spatial-audio.yml
       - app/streaming/audio/**
+      - app/settings/**
+      - app/gui/SettingsView.qml
+      - app/gui/AutoResizingComboBox.qml
       - app/SDL_compat.h
       - app/app.pro
       - tests/audio-spatial71/**
@@ -17,6 +20,9 @@ on:
     paths:
       - .github/workflows/spatial-audio.yml
       - app/streaming/audio/**
+      - app/settings/**
+      - app/gui/SettingsView.qml
+      - app/gui/AutoResizingComboBox.qml
       - app/SDL_compat.h
       - app/app.pro
       - tests/audio-spatial71/**
@@ -71,7 +77,7 @@ jobs:
           set-env: false
           add-tools-to-path: false
           aqtsource: 'git+https://github.com/miurahr/aqtinstall.git@073e34d7c2ab4ae6961ed7cca690b3abd5ba5a7e'
-      - name: Build actual renderer and queue with static analysis
+      - name: Build renderer and queue with static analysis, and settings tests
         shell: cmd
         run: |
           for /f "usebackq delims=" %%i in (`scripts\vswhere.exe -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvarsall.bat" x64
@@ -90,6 +96,13 @@ jobs:
           if errorlevel 1 exit /b 1
           nmake
           if errorlevel 1 exit /b 1
+          cd ..\..
+          mkdir build\spatial-settings
+          cd build\spatial-settings
+          qmake ..\..\tests\audio-spatial71\spatial71-settings.pro
+          if errorlevel 1 exit /b 1
+          nmake
+          if errorlevel 1 exit /b 1
       - name: Run hardware-free tests and read-only endpoint enumeration
         shell: pwsh
         run: |
@@ -98,3 +111,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Queue tests failed' }
           python tests/audio-spatial71/test_harness_offline.py --binary build/spatial-renderer/Spatial71RendererTest.exe --allow-unavailable-discovery
           if ($LASTEXITCODE -ne 0) { throw 'Native offline tests failed' }
+      - name: Test preferences and actual audio controls without audio playback
+        shell: pwsh
+        run: |
+          $env:Path = "$env:QT_BIN;$env:Path"
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          $env:QT_QUICK_BACKEND = 'software'
+          $env:QT_QPA_FONTDIR = Join-Path $env:WINDIR 'Fonts'
+          $env:QT_PLUGIN_PATH = Join-Path $env:QT_BIN '..\plugins'
+          $env:QML_IMPORT_PATH = Join-Path $env:QT_BIN '..\qml'
+          $env:QML2_IMPORT_PATH = $env:QML_IMPORT_PATH
+          & ./build/spatial-settings/Spatial71SettingsTests.exe -o 'spatial-settings-results.txt,txt'
+          $settingsExitCode = $LASTEXITCODE
+          Get-Content -LiteralPath spatial-settings-results.txt
+          if ($settingsExitCode -ne 0) { throw 'Settings and UI tests failed' }

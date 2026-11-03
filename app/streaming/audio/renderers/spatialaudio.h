@@ -6,7 +6,7 @@
 #include <QString>
 #include <memory>
 
-// Opt-in Windows output for decoded 7.1 PCM. An empty ID selects the current
+// Opt-in Windows output for decoded 5.1 or 7.1 PCM. An empty ID selects the current
 // default console render endpoint at initialization; a nonempty ID pins that
 // endpoint. Both paths require HDMI/DisplayPort and never change audio policy.
 class SpatialAudioRenderer : public IAudioRenderer

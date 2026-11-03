@@ -1,61 +1,58 @@
-# Optional Windows Spatial Audio 7.1 output
+# Optional Windows Spatial Audio 5.1/7.1 output
 
-This Windows desktop renderer sends already-decoded 7.1 PCM to eight static
+This Windows desktop renderer sends already-decoded 5.1 or 7.1 PCM to six or eight static
 `ISpatialAudioObject`s through `ISpatialAudioClient`. It is disabled by default.
 The normal SDL renderer, Opus decoder and channel negotiation are unchanged.
 There are no host, driver, video, HDR, VRR or PyroWave changes.
 
 ## Enable and select an output
 
-Select **7.1 surround sound** in Moonlight. Configure the desired spatial sound
-provider on a compatible HDMI/DisplayPort output in Windows beforehand.
+In Moonlight, open **Settings > Audio Settings**, select **5.1 surround sound**
+or **7.1 surround sound**, and check **Use Windows Spatial Audio**. The checkbox
+is shown only on Windows and is available with either surround layout. It is off by default and saved
+with Moonlight's other preferences, so normal use needs no launch arguments or
+environment variables. Launching `Moonlight.exe` directly works; no command
+script or test utility is required. Changes apply when the next streaming session starts.
+Switching to stereo keeps the saved checkbox value but uses regular audio.
+
+Configure the desired spatial sound provider on a compatible HDMI/DisplayPort
+output in Windows beforehand.
 Moonlight neither enables a provider nor installs drivers or changes defaults.
-The endpoint must support all eight static objects and mono float32 at 48 kHz.
+The endpoint must support the requested six or eight static objects and mono
+float32 at 48 kHz.
 
-Start Moonlight with the opt-in set for that process, for example in PowerShell:
-
-```powershell
-$env:MOONLIGHT_SPATIAL_AUDIO = '1'
-.\Moonlight.exe
-```
-
-If `MOONLIGHT_SPATIAL_AUDIO_ENDPOINT` is unset or empty, the renderer resolves
-the **current default render endpoint (console role)** when it initializes. It
+The GUI renderer resolves the **current default render endpoint (console role)**
+when it initializes. It
 requires an active digital-display output; it never picks an arbitrary monitor
 or changes the default. A default-device change does not move an already working
-stream; the default is resolved again at the next initialization. To pin a
-specific output instead:
-
-```powershell
-$env:MOONLIGHT_SPATIAL_AUDIO = '1'
-$env:MOONLIGHT_SPATIAL_AUDIO_ENDPOINT = '<endpoint ID>'
-.\Moonlight.exe
-```
+stream; the default is resolved again at the next initialization. The application
+does not use the prototype's `MOONLIGHT_SPATIAL_AUDIO_ENDPOINT` override, so an old
+device selection cannot pin it to a disconnected output after an HDMI cable change.
+The standalone test utility still supports explicit endpoint IDs for diagnostics.
 
 Use the optional test utility's `--list-endpoints` command to list active
 digital-display outputs, their names/IDs and the current default. Listing is
 read-only and does not start a stream. See [test instructions](../tests/audio-spatial71/README.md).
 Endpoint names are not used as identifiers. No manufacturer or model is assumed.
 
-Only the exact opt-in value `1` enables this backend. Explicit `ML_AUDIO=sdl`
-continues to take precedence. Unsupported formats (including stereo and 5.1),
+The saved checkbox is the activation control; the prototype's
+`MOONLIGHT_SPATIAL_AUDIO` toggle is no longer used. Explicit `ML_AUDIO=sdl`
+continues to take precedence. Unsupported formats (including stereo),
 unavailable devices or spatial initialization failures use the existing renderer
-selection path. SDL fallback can use its regular default output; it does not
-necessarily address the pinned spatial endpoint.
+selection path. SDL fallback uses its regular output selection.
 
-To disable the opt-in in the current PowerShell session:
-
-```powershell
-Remove-Item Env:MOONLIGHT_SPATIAL_AUDIO -ErrorAction SilentlyContinue
-Remove-Item Env:MOONLIGHT_SPATIAL_AUDIO_ENDPOINT -ErrorAction SilentlyContinue
-```
+To disable spatial output, uncheck **Use Windows Spatial Audio** before
+starting the next stream.
 
 ## Output and recovery
 
-Decoded channel order is **FL, FR, FC, LFE, BL, BR, SL, SR**. Each channel maps to
-its corresponding static object. There is no additional Opus remapping, gain,
+Decoded channel order is **FL, FR, FC, LFE, BL, BR** for 5.1, with **SL, SR**
+added for 7.1. Each channel maps to its corresponding static object. The 5.1
+back-channel positions follow Moonlight's negotiated WAVE mask `0x3F`; they are
+not silently relabeled as side channels. There is no additional Opus remapping, gain,
 clipping, height synthesis or dynamic-object metadata. The spatial object mask
-`0x1FE` is distinct from the WAVE speaker mask `0x63F`.
+is `0x19E` for 5.1 and `0x1FE` for 7.1, distinct from their WAVE speaker masks
+`0x3F` and `0x63F`.
 
 A dedicated MTA worker owns all COM interfaces, event updates and cleanup. A
 preallocated interleaved queue holds at most 1,440 complete frames (30 ms at
@@ -74,7 +71,7 @@ forcibly cancelled safely, so initialization/cleanup has no hard wall-time bound
 
 ## Diagnostics and validation limits
 
-`Spatial 7.1 active` confirms successful activation and an actual eight-object
+`Spatial Audio active` confirms successful activation and an actual six- or eight-object
 update. Moonlight also opens the renderer during its audio preflight, which has
 zero submitted PCM frames. A streaming result must include nonzero submitted
 and consumed counters from the actual session.
@@ -95,10 +92,15 @@ renderer initialization, not total audible interruption). An eight-second
 standalone channel-tone run had no missing-frame or overflow events. The stream
 had no queue overflows, but accumulated missing-frame silence whose cause was not
 localized; uninterrupted long-duration playback is still a validation item.
-The generalized default-endpoint selection is additional to that explicit-ID
-hardware test. Automated tests do not substitute for hardware/provider testing.
 
-The application supplies ordinary **7.1 audio**, not native Atmos passthrough,
+The subsequent GUI/default-endpoint build was also tested on a Windows client
+connected through a Samsung TV and eARC soundbar. The tester confirmed working
+playback with **both 5.1 and 7.1 selected** and reported very good sound quality.
+This is a user-reported listening test, not an instrumented speaker-routing or
+latency measurement.
+Automated tests do not substitute for hardware/provider testing.
+
+The application supplies ordinary **5.1 or 7.1 audio**, not native Atmos passthrough,
 7.1.4 content, MAT capture or bit-identical HDMI transport. The selected Windows
 provider decides how to render/encode it. An Atmos indicator is an observed
 output-mode result, not verification of source Atmos metadata or speaker routing.
