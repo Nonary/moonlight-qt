@@ -107,6 +107,5 @@ output-mode result, not verification of source Atmos metadata or speaker routing
 Queue/fill timings do not measure acoustic latency or A/V synchronization. Audio
 continues to follow the device clock independently of video presentation.
 
-The implementation uses documented Microsoft Spatial Audio APIs. Development
-was informed by SpatialAudioLab experiments, but no SpatialAudioLab source or
-dependency is included. New source follows this repository's existing license.
+The implementation uses documented Microsoft Spatial Audio APIs and follows
+this repository's existing license.
