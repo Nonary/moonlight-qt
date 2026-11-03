@@ -1265,6 +1265,25 @@ backpressure. Audio startup intentionally discards an initial backlog of about
 500 ms; renderer reinitialization similarly prevents downtime becoming permanent
 queued audio latency. Muting can suppress audio processing without retiming VRR.
 
+Windows desktop also has an opt-in [Spatial Audio 7.1 renderer](docs/windows-spatial-audio.md).
+`MOONLIGHT_SPATIAL_AUDIO=1` enables it only for eight channels at 48 kHz;
+`MOONLIGHT_SPATIAL_AUDIO_ENDPOINT` optionally pins an endpoint ID. Otherwise it
+resolves the current default console render endpoint. The output must be an
+active HDMI/DisplayPort endpoint supporting all eight static objects and mono
+float32/48 kHz. No Windows setting is changed. Explicit `ML_AUDIO=sdl` retains
+precedence, and initialization failure continues through normal SDL selection.
+Stereo, 5.1 and non-opted-in sessions retain their existing paths.
+
+One MTA worker owns the spatial COM objects, event-driven output and teardown.
+The decoded FL/FR/FC/LFE/BL/BR/SL/SR order maps directly to eight static objects,
+without changing Opus mappings or adding heights. A 1,440-frame FIFO bounds
+queued PCM to 30 ms; overflow drops oldest complete frames and underflow fills
+zeros. All channels share one queue cursor, and every object is updated even
+when input is muted. Worker faults reach `submitAudio(false)` and existing
+Session reinitialization, including its downtime-drop window. After a working
+SDL fallback, spatial output is retried on the next session. Software queue,
+event and fill statistics do not establish acoustic latency or Dolby/MAT output.
+
 Input goes from SDL handlers to common-library input APIs and a separate sender.
 
 Windows/Linux DualSense waveform feedback (updated 2026-10-05) runs separately

@@ -1,0 +1,100 @@
+name: Spatial audio tests
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - .github/workflows/spatial-audio.yml
+      - app/streaming/audio/**
+      - app/SDL_compat.h
+      - app/app.pro
+      - tests/audio-spatial71/**
+      - moonlight-common-c/**
+  push:
+    paths:
+      - .github/workflows/spatial-audio.yml
+      - app/streaming/audio/**
+      - app/SDL_compat.h
+      - app/app.pro
+      - tests/audio-spatial71/**
+      - moonlight-common-c/**
+  workflow_dispatch:
+
+concurrency:
+  group: spatial-audio-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  queue-sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and test the portable production queue
+        run: |
+          mkdir -p build/spatial-queue
+          g++ -std=c++17 -O1 -g -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            tests/audio-spatial71/tst_spatial71queue.cpp \
+            -o build/spatial-queue/Spatial71QueueTests
+          build/spatial-queue/Spatial71QueueTests
+
+  native-windows:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      QT_BIN: ${{ github.workspace }}\..\Qt\6.11.1\msvc2022_64\bin
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Download the repository's pinned x64 dependencies
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build, libs/windows | Out-Null
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'build/windows-x64-v8.zip'
+          Invoke-WebRequest 'https://github.com/moonlight-stream/moonlight-qt-deps/releases/download/v8/windows-x64.zip' -OutFile $archive
+          $expected = '9f906c7e4c10ce41bda3c9b499f74c5a4b07f37ddea84e5d871e1c681267a3a0'
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) {
+            throw 'Dependency archive SHA-256 mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath libs/windows
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.11.1'
+          arch: win64_msvc2022_64
+          cache: true
+          set-env: false
+          add-tools-to-path: false
+          aqtsource: 'git+https://github.com/miurahr/aqtinstall.git@073e34d7c2ab4ae6961ed7cca690b3abd5ba5a7e'
+      - name: Build actual renderer and queue with static analysis
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`scripts\vswhere.exe -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+          set "PATH=%QT_BIN%;%PATH%"
+          mkdir build\spatial-queue
+          cd build\spatial-queue
+          qmake ..\..\tests\audio-spatial71\spatial71-queue.pro CONFIG+=spatial_analyze
+          if errorlevel 1 exit /b 1
+          nmake
+          if errorlevel 1 exit /b 1
+          cd ..\..
+          mkdir build\spatial-renderer
+          cd build\spatial-renderer
+          qmake ..\..\tests\audio-spatial71\spatial71-renderer.pro CONFIG+=spatial_analyze
+          if errorlevel 1 exit /b 1
+          nmake
+          if errorlevel 1 exit /b 1
+      - name: Run hardware-free tests and read-only endpoint enumeration
+        shell: pwsh
+        run: |
+          $env:Path = "$env:QT_BIN;$env:GITHUB_WORKSPACE\libs\windows\lib\x64;$env:Path"
+          & ./build/spatial-queue/Spatial71QueueTests.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Queue tests failed' }
+          python tests/audio-spatial71/test_harness_offline.py --binary build/spatial-renderer/Spatial71RendererTest.exe --allow-unavailable-discovery
+          if ($LASTEXITCODE -ne 0) { throw 'Native offline tests failed' }

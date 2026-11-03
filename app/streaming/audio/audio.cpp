@@ -7,6 +7,12 @@
 
 #include "renderers/sdl.h"
 
+#if defined(Q_OS_WIN) && !defined(Q_OS_WINRT)
+#include "renderers/spatialaudio.h"
+#include <memory>
+#include <new>
+#endif
+
 #include <Limelight.h>
 
 #define TRY_INIT_RENDERER(renderer, opusConfig)        \
@@ -39,6 +45,31 @@ IAudioRenderer* Session::createAudioRenderer(const POPUS_MULTISTREAM_CONFIGURATI
     }
 
     // -------------- Automatic backend selection below this line ---------------
+
+#if defined(Q_OS_WIN) && !defined(Q_OS_WINRT)
+    if (qgetenv("MOONLIGHT_SPATIAL_AUDIO") == "1") {
+        if (opusConfig->channelCount == 8 && opusConfig->sampleRate == 48000) {
+            try {
+                // Empty selects the current default render endpoint, provided
+                // it is a compatible HDMI/DisplayPort output. No default is set.
+                auto renderer = std::make_unique<SpatialAudioRenderer>(
+                    QString::fromUtf8(qgetenv("MOONLIGHT_SPATIAL_AUDIO_ENDPOINT")));
+                if (renderer->prepareForPlayback(opusConfig)) {
+                    return renderer.release();
+                }
+            }
+            catch (const std::bad_alloc&) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Unable to allocate Spatial Audio renderer");
+            }
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Spatial 7.1 unavailable; falling back to the regular audio renderer");
+        }
+        else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Spatial 7.1 requires eight channels at 48000 Hz; using regular audio");
+        }
+    }
+#endif
 
 #if defined(HAVE_SLAUDIO)
     // Steam Link should always have SLAudio
