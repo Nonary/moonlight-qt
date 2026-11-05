@@ -440,4 +440,42 @@ void actualControllerAndInputIsolation() {
     late.reset();check(late.trajectoryStats().plans==0,"controller full reset clears trajectory model");
 }
 }
-int main() {extraDelayDoesNotChaseCurrentReadiness();bufferReleaseDoesNotCreateCarry();carryRepaymentKnobs();decodeCompletionEstimate();queuedDecodeCompletionDoesNotTrainInputDelay();legacyRecoveryCannotSustainCarry();asyncDecodeCompletionPlanning();compressionAndAcceptance();resyncAndLifecycle();preparedSuccessorProof();sourceMappingFactorial();actualCadenceChangeQualification();actualControllerAndInputIsolation();std::fprintf(stderr,"phase trajectory integration: %s (%d failures)\n",failures?"FAIL":"PASS",failures);return failures?1:0;}
+// A D3D11 fence the worker blocked on is real completion, and render work follows
+// it, so both are evidence. Shaped like the 2026-11-03 Radeon 780M capture, where
+// decode alone took most of a 144 FPS frame. Other collection stays queue-neutral.
+void blockedDecodeFenceTrainsInputBuffer() {
+    const auto targetUs=[](bool asynchronousOutput,bool blocked) {
+        VrrSessionConfig session;
+        session.streamRateHz=144; session.displayRefreshHz=144;
+        session.smoothFrameTiming=false;
+        session.experimentalInputPercentilePpm=1;
+        session.experimentalBoundedCatchup=true;
+        session.timingOptions={2000,9995,300,500};
+        VrrTimingController controller(session,true,vrrTimingParametersForSession(session));
+        for(int i=0;i<2880;++i) {
+            const uint64_t source=1000000+uint64_t(i)*1000000/144,output=source+500;
+            const uint64_t complete=output+((i/8)%2?7500:5000);
+            const uint64_t collected=blocked?output+3000:output+((i/15)%2?15000:10000);
+            const uint64_t observed=blocked?complete:collected;
+            PacedFrame frame(nullptr,i,uint32_t(uint64_t(i)*90000/144),true,output);
+            frame.setDeliveryTimeline(source-200,source,source+100);
+            frame.setDecoderOutputComplete(!asynchronousOutput);
+            frame.noteGpuReadyUs(observed);
+            frame.noteDecodeSyncWaitUs(observed-collected);
+            const auto decision=controller.schedule(frame,observed);
+            const auto ready=std::max(observed,decision.renderStartUs)+2000;
+            controller.notePreparationDuration(2000,0,ready);
+            controller.noteSchedulerDelays(0,0,true);
+            const auto submitted=std::max(ready,decision.targetUs);
+            controller.noteSubmission(true,false,submitted,submitted);
+        }
+        return controller.intervalStats().inputPercentile.targetUs;
+    };
+    const auto blockedFence=targetUs(true,true);
+    std::fprintf(stderr,"blocked D3D11 fence target %llu us\n",(unsigned long long)blockedFence);
+    check(blockedFence>=8500 && blockedFence<=9750,
+          "blocked fence completion and render work set the buffer");
+    check(targetUs(true,false)<=1000,"an unblocked late collection stays queue-neutral on D3D11");
+    check(targetUs(false,true)<=1000,"other backends keep their decode estimate");
+}
+int main() {blockedDecodeFenceTrainsInputBuffer();extraDelayDoesNotChaseCurrentReadiness();bufferReleaseDoesNotCreateCarry();carryRepaymentKnobs();decodeCompletionEstimate();queuedDecodeCompletionDoesNotTrainInputDelay();legacyRecoveryCannotSustainCarry();asyncDecodeCompletionPlanning();compressionAndAcceptance();resyncAndLifecycle();preparedSuccessorProof();sourceMappingFactorial();actualCadenceChangeQualification();actualControllerAndInputIsolation();std::fprintf(stderr,"phase trajectory integration: %s (%d failures)\n",failures?"FAIL":"PASS",failures);return failures?1:0;}

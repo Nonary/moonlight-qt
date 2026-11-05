@@ -607,6 +607,7 @@ private:
         uint64_t inputObservationUs = 0;
         int64_t inputReadinessBudgetUs = 0;
         int64_t inputRequiredUs = 0;
+        uint64_t blockedDecodeReadyUs = 0;
         int64_t inputClockOffsetUs = 0;
         bool inputValid = false;
         bool intervalValid = false;

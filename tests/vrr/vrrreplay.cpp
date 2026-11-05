@@ -12913,6 +12913,12 @@ int main(int argc, char* argv[])
         frame.setLostPackets(uint32_t(lostPackets));
         frame.noteDecodeSyncWaitUs(
             optionalUnsignedField(fields, columns.decodeSyncWaitUs));
+        // Match the worker: D3D11 decoder output is only a GPU submission.
+        {
+            const uint64_t backend = optionalUnsignedField(fields, traceColumn("native_backend"));
+            constexpr uint64_t kDxgi = 1, kComposition = 3;
+            frame.setDecoderOutputComplete(backend != kDxgi && backend != kComposition);
+        }
         frame.setDeliveryTimeline(
             optionalUnsignedField(fields, traceColumn("frame_receive_us")),
             optionalUnsignedField(fields, traceColumn("frame_reassembled_us")),

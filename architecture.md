@@ -1,6 +1,7 @@
 # Streaming and VRR architecture
 
-Source baseline: master plus the decode-buffer accounting correction on 2026-10-30. The production worker
+Source baseline: master plus the decode-buffer accounting correction on 2026-10-30
+and the buffer evidence corrections on 2026-11-04. The production worker
 resolves one adaptive input policy, bounded catch-up and corrected input
 accounting. The calibration key includes effective policy and presenter
 capabilities; existing keys are not reused. Schema-6 capture and schema-2
@@ -635,7 +636,8 @@ controller maintains rate-specific evidence layers and credits available VRR
 headroom according to the profile. Eligible outcomes, actual input coverage,
 interval quality, network and decoder stage attribution are separate metrics.
 Packet loss, discontinuities and invalid observations have explicit eligibility
-rules; downstream preparation or submission delay is not input lateness.
+rules. Submission delay is not input lateness, and preparation counts only after
+a blocked D3D11 decode, as described below.
 
 The existing `normalized_source_intrinsic_decode_gpu=1` path admits a GPU
 service sample only when a blocking completion check began within 1 ms of
@@ -648,6 +650,22 @@ before presentation. Promptly observed GPU stalls retain their full duration
 for input feedback instead of being clipped to the median. No second policy
 or additional user setting is introduced.
 
+On D3D11, decoder output is only a GPU submission, and the decoder thread signals
+the decode fence. A wait of at least `PreciseCompletionWaitUs` therefore ends at
+real GPU completion however long the frame sat in the worker queue. Such a frame
+reports at least that completion plus its preparation service relative to the
+input slot, because the readiness budget is zero and nothing else reserves time
+for render work. This uses the fence time and measured durations from the fixed
+slot, so it does not move with the applied buffer. Frames that did not block stay
+queue-neutral. Once the buffer exceeds most completions only the slowest frames
+still block, and those are the frames the goal is sized from. Source mapping
+keeps prompt samples only, and other presenters keep the estimate until their
+wait semantics are verified. On a 2026-11-03 Radeon 780M capture at 4K144, the
+former input predicted 99.77% at a 2.75 ms buffer against 91.97% actual, while
+actual timing reached 99.95% at 9 ms. Three captures on that client showed no
+growth of GPU completion with buffer size. That is software timing evidence
+from one device, not optical proof.
+
 `profile.cpp` stores calibration under the cache path. The worker constructs
 the key from device/session context, effective controller policy and presenter
 capabilities before loading. The new key deliberately cold-starts rather than
@@ -656,7 +674,9 @@ coverage or physical presentation, and phase rebases and complete resets have
 different lifecycle effects.
 The `prompt-decode-accounting` cache marker additionally isolates both saved
 startup delay and reserve history from the former queue-contaminated estimator.
-Existing cache files are preserved, but their prior keys are not loaded.
+Existing cache files are preserved, but their prior keys are not loaded. The
+`measured-readiness` marker likewise isolates delay learned before stalls beyond
+the cap stopped pinning the buffer and before blocked decode evidence counted.
 
 ## 10. Windows D3D11 mechanics and native synchronization
 

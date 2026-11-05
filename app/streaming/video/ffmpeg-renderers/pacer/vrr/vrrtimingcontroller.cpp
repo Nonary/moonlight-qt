@@ -1562,6 +1562,11 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     const auto decodeReadyUs = estimatedDecodeCompleteUs(frame);
     const auto inputReadyUs = decodeReadyUs - std::min(decodeReadyUs, inputBacklog);
     m_Pending.inputRequiredUs = signedDifference(inputReadyUs, m_Pending.inputSlotUs);
+    // The decoder thread signals a D3D11 decode fence, so a wait that blocked
+    // ended at real GPU completion however long the frame sat in our queue.
+    m_Pending.blockedDecodeReadyUs = !frame.decoderOutputComplete() &&
+        frame.decodeSyncWaitUs() >= PreciseCompletionWaitUs ?
+        frame.decodeCompleteUs() - std::min(frame.decodeCompleteUs(), inputBacklog) : 0;
     m_Pending.inputValid = frame.reassembledUs() != 0 &&
         frame.decodeSubmitUs() >= frame.reassembledUs() &&
         frame.decoderOutputUs() >= frame.decodeSubmitUs() &&
@@ -2497,9 +2502,20 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                     outcome.intervalErrorUs > toleranceUs && outcome.latenessUs > toleranceUs;
                 m_InputPercentileBeforeUs = p.applied;
                 const auto inputBefore = m_InputBuffer.stats();
+                // A frame blocked on decode cannot start rendering until the
+                // fence completes, and nothing else reserves time for that
+                // render work. Measured durations from the fixed slot keep this
+                // independent of the applied buffer, so it cannot feed itself.
+                int64_t inputRequiredUs = m_Pending.inputRequiredUs;
+                if (m_Pending.blockedDecodeReadyUs) {
+                    inputRequiredUs = std::max(inputRequiredUs, signedDifference(
+                        saturatingAdd(m_Pending.blockedDecodeReadyUs,
+                            saturatingAdd(preparationServiceUs, m_Pending.deferredGpuWaitUs)),
+                        m_Pending.inputSlotUs));
+                }
                 m_InputBuffer.observe(m_Pending.smoothness.frame,
                     enqueueUs ? enqueueUs : m_Pending.inputObservationUs,
-                    m_Pending.intervalIntendedUs, m_Pending.inputRequiredUs, validInput,
+                    m_Pending.intervalIntendedUs, inputRequiredUs, validInput,
                     playoutDelayMinimumUs(), playoutDelayMaximumUs(),
                     m_Parameters.playoutInputPercentileTargetPerMillion,
                     m_Parameters.playoutInputPercentileWindowUs,

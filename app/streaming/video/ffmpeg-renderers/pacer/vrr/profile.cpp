@@ -22,6 +22,9 @@ QString calibrationKey(const QString& context, const QByteArray& policy,
     // Discard learned delay from the queue-contaminated estimator while keeping
     // the same production policy and settings. Existing cache files stay intact.
     hash.addData(QByteArrayLiteral("prompt-decode-accounting\n"));
+    // Also discard delay learned before stalls beyond the cap stopped pinning
+    // the buffer and before blocked decode and render work counted as evidence.
+    hash.addData(QByteArrayLiteral("measured-readiness\n"));
     hash.addData(context.toUtf8());
     hash.addData(QByteArrayLiteral("\ncan-latch="));
     hash.addData(QByteArray::number(canLatch));

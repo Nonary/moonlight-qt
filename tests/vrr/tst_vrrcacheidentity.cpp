@@ -41,6 +41,14 @@ int main(int argc, char** argv) {
     const auto path = dir.filePath("seed.json");
     assert(Vrr13::saveStartDelay(path, previousKey, 14492));
     assert(Vrr13::loadStartDelay(path, key) == 0);
+    QCryptographicHash promptOnly(QCryptographicHash::Sha256);
+    promptOnly.addData(QByteArrayLiteral("vrr-calibration-v3\n"));
+    promptOnly.addData(QByteArrayLiteral("prompt-decode-accounting\n"));
+    promptOnly.addData(QByteArrayLiteral("same-device-codec-settings"));
+    promptOnly.addData(QByteArrayLiteral("\ncan-latch=0\nallow-tearing=1"));
+    promptOnly.addData(QByteArray::fromStdString(vrrCalibrationPolicy(policy)));
+    assert(Vrr13::saveStartDelay(path, QString::fromLatin1(promptOnly.result().toHex()), 13889));
+    assert(Vrr13::loadStartDelay(path, key) == 0);
     assert(Vrr13::saveStartDelay(path, key, 8378));
     assert(Vrr13::loadStartDelay(path, key) == 8378);
     assert(Vrr13::loadStartDelay(path, identity(policy, true)) == 0);
