@@ -54,9 +54,9 @@ public:
         m_Stats.currentUs = m_Stats.targetUs = current;
         m_Stats.initialized = true;
     }
-    // Select the smallest buffer that meets the goal over the requested window,
-    // or the smallest buffer with the best achievable score. Aim inside the
-    // allowed loss so that reacting to a dip can still meet the profile goal.
+    // Select the smallest buffer within the allowed loss of the best the cap
+    // can do over the requested window. Aim inside the allowed loss so that
+    // reacting to a dip can still meet the profile goal.
     void setGoalSolver(uint64_t windowUs, uint64_t tailPerMille = 1000) {
         m_GoalWindowUs = windowUs; m_GoalTailPerMille = std::clamp<uint64_t>(tailPerMille, 1, 1000);
     }
@@ -400,7 +400,9 @@ private:
         const auto solution = m_GoalSolver.solve(aimPpm, m_Stats.toleranceUs,
             m_Stats.minimumUs, m_Stats.maximumUs, GoalStepUs);
         m_Stats.headroomTargetUnclippedUs = solution.bufferUs;
-        m_Stats.clipped = !solution.goalReachable;
+        // Capped means the cap is what limits us, not merely that a stall no
+        // permitted buffer could absorb is still inside the window.
+        m_Stats.clipped = !solution.goalReachable && solution.bufferUs >= m_Stats.maximumUs;
         m_Stats.targetUs = std::clamp(solution.bufferUs, m_Stats.minimumUs, m_Stats.maximumUs);
     }
     void move(uint64_t elapsed, bool growthAllowed) {

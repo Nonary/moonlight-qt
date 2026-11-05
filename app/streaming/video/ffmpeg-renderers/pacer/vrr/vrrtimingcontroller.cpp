@@ -203,8 +203,9 @@ VrrTimingParameters vrrTimingParametersForSession(
             uint64_t(options.historySeconds) * 1000000, 10000000, 300000000);
         // Meet the profile's client-timing goal with the least buffer over a
         // recent span, aiming at 70% of its allowed loss because growth
-        // follows a dip. If the goal is unreachable, maximize timing quality
-        // within the existing cap without a latency-price penalty.
+        // follows a dip. Loss the cap cannot absorb spends no buffer: a stall
+        // beyond the cap must not hold every later frame at the cap for the
+        // length of the window.
         const auto target = parameters.playoutInputPercentileTargetPerMillion;
         parameters.playoutInputGoalWindowUs = target >= 999000 ? 120000000 :
             target >= 995000 ? 60000000 : 20000000;

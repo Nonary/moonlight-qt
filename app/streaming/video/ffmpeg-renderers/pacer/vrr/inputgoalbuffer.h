@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
-#include <limits>
 #include <vector>
 
 namespace Vrr13 {
@@ -12,8 +11,11 @@ namespace Vrr13 {
 // min(1, (|error| - tolerance) / intended) of its duration. Lateness is input
 // (network and decode) readiness relative to the unbuffered slot.
 //
-// When no buffer meets the goal, choose the smallest buffer with the best
-// achievable score.
+// Loss that remains even at the cap cannot be bought back by any permitted
+// buffer, such as a 30 ms delivery stall under a 14 ms cap. It must not spend
+// buffer, so the goal applies above that floor: choose the smallest buffer
+// within the allowed loss of the best the cap can do. Sustained jitter beyond
+// the cap still reaches the cap, because every step below it loses more.
 class InputGoalSolver {
 public:
     void clear() { m_Pairs.clear(); m_IntendedUs = 0; }
@@ -47,16 +49,11 @@ public:
                    uint64_t minimumUs, uint64_t maximumUs, uint64_t stepUs) const {
         const double allowed = double(1000000 - std::min<uint64_t>(probabilityPpm, 1000000)) / 1e6;
         stepUs = std::max<uint64_t>(stepUs, 1);
-        Solution best{minimumUs, false};
-        double bestValue = -std::numeric_limits<double>::infinity();
+        const double unabsorbable = loss(maximumUs, toleranceUs);
+        const bool reachable = unabsorbable <= allowed;
         for (uint64_t b = minimumUs;; b = std::min(maximumUs, b + stepUs)) {
-            const double lost = loss(b, toleranceUs);
-            if (lost <= allowed) return {b, true};
-            const double value = -100.0 * lost;
-            if (value > bestValue) { bestValue = value; best.bufferUs = b; }
-            if (b >= maximumUs) break;
+            if (b >= maximumUs || loss(b, toleranceUs) <= allowed + unabsorbable) return {b, reachable};
         }
-        return best;
     }
 private:
     static constexpr int64_t kLimitUs = 10000000;

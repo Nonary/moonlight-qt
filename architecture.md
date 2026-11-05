@@ -626,8 +626,11 @@ planned extra delay, queue capacity and retained phase are distinct quantities.
 `InputGoalBuffer` observes eligible input readiness against the unbuffered
 source slot. The goal solver selects the smallest buffer meeting the selected
 severity-weighted client timing goal over its configured window, aiming at a
-fraction of the allowed loss. If the goal is unreachable within the cap, it
-selects the best attainable score. Rise and release are rate limited; the
+fraction of the allowed loss. Loss that remains even at the cap cannot be bought
+back, so the goal applies above that floor: the solver selects the smallest
+buffer within the allowed loss of the best the cap attains. A stall beyond the
+cap therefore spends no buffer, while sustained jitter beyond it still reaches
+the cap. Rise and release are rate limited; the
 controller maintains rate-specific evidence layers and credits available VRR
 headroom according to the profile. Eligible outcomes, actual input coverage,
 interval quality, network and decoder stage attribution are separate metrics.

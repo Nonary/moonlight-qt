@@ -361,6 +361,26 @@ static void testGoalSolverUnreachableGoals() {
     check(!plateau.goalReachable && plateau.bufferUs==1000,
           "equal timing scores prefer the smallest buffer");
 }
+static void testGoalSolverIgnoresStallsBeyondTheCap() {
+    // 120 s at 144 FPS with 3 ms of ordinary jitter and two delivery stalls beyond
+    // the 13.89 ms cap, shaped like the 2026-11-03 daily.196 capture that pinned
+    // its buffer at the cap for two minutes.
+    const auto build=[](bool stalls){
+        Vrr13::InputGoalSolver solver; int64_t previous=0;
+        for(int i=1;i<=17280;++i){
+            int64_t late=i%10==0?3000:0;
+            if(stalls&&i==7000)late=27000;
+            if(stalls&&i==7700)late=34000;
+            solver.add(previous,late,6944,500);previous=late;
+        }
+        return solver;
+    };
+    const auto calm=build(false).solve(999650,500,1000,13889,250);
+    check(calm.goalReachable && calm.bufferUs==2500,"ordinary jitter sets the buffer");
+    const auto stalled=build(true).solve(999650,500,1000,13889,250);
+    check(!stalled.goalReachable,"stalls beyond the cap still report an unreachable goal");
+    check(stalled.bufferUs==calm.bufferUs,"stalls beyond the cap spend no buffer");
+}
 static void testGoalBufferFollowsRecentJitter() {
     Vrr13::InputGoalBuffer buffer; buffer.setGoalSolver(20000000,1000);
     uint64_t t=1000000,frame=0,slot=1000000;
@@ -433,7 +453,7 @@ static void testProductionUsesGoalSolver() {
 int main() {
     testFastLayerCadence();testConfirmedLayerCadence();testContinuousCoverage();testResponsiveCoverageReporting();
     testSharedExtraBufferAllowance();
-    testGoalSolverMeetsGoalWithLeastBuffer();testGoalSolverUnreachableGoals();testGoalBufferFollowsRecentJitter();testGoalBufferLifecycle();
+    testGoalSolverMeetsGoalWithLeastBuffer();testGoalSolverUnreachableGoals();testGoalSolverIgnoresStallsBeyondTheCap();testGoalBufferFollowsRecentJitter();testGoalBufferLifecycle();
 #ifdef INPUT_PERCENTILE_CONTROLLER_TEST
     testProductionUsesGoalSolver();
     testFactoryProfileOwnsAdaptiveTarget();

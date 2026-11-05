@@ -34,6 +34,8 @@ late blocking/nonblocking completion checks, cold and warm GPU estimates,
 retained startup protection, prompt real GPU stalls, actual readiness floors,
 and completion arithmetic near the timestamp limit. `tst_vrrcacheidentity`
 checks that the corrected estimator cannot load a prior saved startup delay.
+`tst_inputgoalintegration` pins that a stall beyond the cap spends no buffer,
+while sustained jitter beyond the cap still reaches it.
 
 ## Capture and exact replay
 
