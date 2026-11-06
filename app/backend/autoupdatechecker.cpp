@@ -264,7 +264,9 @@ QJsonObject AutoUpdateChecker::findUpdate(const QJsonArray& releases, const QVec
                 assetName = QStringLiteral("MoonlightSetup-%1.exe").arg(versionString);
         }
         else if (platform == "appimage") {
-            assetName = QStringLiteral("Moonlight-%1-%2.AppImage").arg(versionString, architecture);
+            // linuxdeploy names the image after uname -m, so Qt's arm64 is aarch64 there.
+            const QString arch = architecture == "arm64" ? QStringLiteral("aarch64") : architecture;
+            assetName = QStringLiteral("Moonlight-%1-%2.AppImage").arg(versionString, arch);
         }
         else if (platform == "osx") {
             assetName = QStringLiteral("Moonlight-%1.dmg").arg(versionString);

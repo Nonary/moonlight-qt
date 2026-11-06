@@ -121,7 +121,7 @@ def moonlight_notes(repo, tag, version, previous, commits, compare, ancestor):
         notes += ['', 'Windows, Mac and AppImage users of 6.1.0-daily.182 or earlier must download this update manually once; automatic nightly update notifications work after upgrading.']
     notes += ['', f'[SHA256 checksums](https://github.com/{repo}/releases/download/{tag}/SHA256SUMS)',
               '', '### Linux installation', '',
-              'Download either Linux x86_64 package below. For Flatpak, install Flatpak through your distribution\'s software manager first, then run:',
+              'Linux packages are provided for x86_64 and aarch64 (64-bit Arm: Raspberry Pi 4/5, Snapdragon X, NVIDIA N1X, Apple silicon under Asahi); pick the AppImage or Flatpak for your CPU, replacing `x86_64` with `aarch64` below on Arm. For Flatpak, install Flatpak through your distribution\'s software manager first, then run:',
               '', '```sh',
               'flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo',
               f'flatpak install --user --reinstall ./Moonlight-{version}-x86_64.flatpak',

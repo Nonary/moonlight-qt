@@ -23,7 +23,16 @@ on:
 jobs:
   build:
     timeout-minutes: 90
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     env:
       CI_VERSION: ${{ inputs.ci_version }}
       CCACHE_DIR: ${{ github.workspace }}/.flatpak-builder/ccache
@@ -79,6 +88,8 @@ jobs:
                       staged.write_bytes(original.read_bytes())
                       source['path'] = staged.name
           module = next(m for m in manifest['modules'] if m['name'] == 'moonlight')
+          # Build the repository running this workflow (Nonary or a fork), not a hard-coded remote.
+          module['sources'][0]['url'] = 'https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '.git'
           sdl = next(m for m in manifest['modules'] if m['name'] == 'SDL3')
           sdl['build-options']['config-opts'].append('-DSDL_WAYLAND=ON')
           module['sources'][0]['commit'] = os.environ['SOURCE_SHA']
@@ -106,7 +117,7 @@ jobs:
             --install-deps-from=flathub --repo=flatpak-repo flatpak-build \
             packaging/flatpak/com.moonlight_stream.Moonlight.json
           flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
-            flatpak-repo "Moonlight-$CI_VERSION-x86_64.flatpak" \
+            flatpak-repo "Moonlight-$CI_VERSION-${{ matrix.arch }}.flatpak" \
             com.moonlight_stream.Moonlight master
       - name: Verify exported source and Gamescope patch
         run: |
@@ -125,9 +136,9 @@ jobs:
           export FLATPAK_USER_DIR="$RUNNER_TEMP/nightly-flatpak-user"
           dbus-run-session -- flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
           dbus-run-session -- flatpak install --user -y flathub org.kde.Platform//6.10
-          dbus-run-session -- flatpak install --user --noninteractive -y "./Moonlight-$CI_VERSION-x86_64.flatpak"
-          flatpak info --user --show-ref com.moonlight_stream.Moonlight//master | grep -Fx app/com.moonlight_stream.Moonlight/x86_64/master
-          flatpak info --user --show-runtime com.moonlight_stream.Moonlight//master | grep -Fx org.kde.Platform/x86_64/6.10
+          dbus-run-session -- flatpak install --user --noninteractive -y "./Moonlight-$CI_VERSION-${{ matrix.arch }}.flatpak"
+          flatpak info --user --show-ref com.moonlight_stream.Moonlight//master | grep -Fx app/com.moonlight_stream.Moonlight/${{ matrix.arch }}/master
+          flatpak info --user --show-runtime com.moonlight_stream.Moonlight//master | grep -Fx org.kde.Platform/${{ matrix.arch }}/6.10
           installed=$(flatpak info --user --show-location com.moonlight_stream.Moonlight//master)
           export INSTALLED_PATH="$installed"
           python3 - <<'PY'
@@ -143,11 +154,11 @@ jobs:
           grep -Fx "Moonlight $CI_VERSION" installed-version.txt
           bash scripts/smoke-linux-wayland.sh flatpak run --user --env=QT_QPA_PLATFORM=wayland com.moonlight_stream.Moonlight//master --version > installed-wayland-version.txt
           grep -Fx "Moonlight $CI_VERSION" installed-wayland-version.txt
-          echo 'Installed exported x86_64 bundle, source/version, runtime and sandboxed launch verified.'
+          echo 'Installed exported ${{ matrix.arch }} bundle, source/version, runtime and sandboxed launch verified.'
       - uses: actions/upload-artifact@v6
         with:
-          name: Moonlight-Flatpak-${{ env.CI_VERSION }}
-          path: Moonlight-${{ env.CI_VERSION }}-x86_64.flatpak
+          name: Moonlight-Flatpak-${{ matrix.arch }}-${{ env.CI_VERSION }}
+          path: Moonlight-${{ env.CI_VERSION }}-${{ matrix.arch }}.flatpak
           compression-level: 0
           if-no-files-found: error
       - name: Save verified Flatpak compiler cache

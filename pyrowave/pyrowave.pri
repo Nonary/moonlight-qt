@@ -41,6 +41,8 @@ linux:contains(QT_ARCH, x86_64) {
     # supports it; without this flag the vendored source hits "Implement me".
     QMAKE_CXXFLAGS += -msse4.1
 }
+# linux arm64: Granite picks its NEON backend from __ARM_NEON, which GCC and
+# Clang define unconditionally on AArch64, so no extra flags are needed.
 macx {
     # Granite's x86 backend uses SSE4.1; arm64 uses its native SIMD backend.
     QMAKE_CXXFLAGS += -Xarch_x86_64 -msse4.1

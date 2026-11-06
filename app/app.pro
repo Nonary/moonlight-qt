@@ -593,7 +593,7 @@ win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
     message(PyroWave decoder enabled)
     CONFIG += pyrowave
 }
-linux:contains(QT_ARCH, x86_64):!disable-pyrowave:contains(CONFIG, libplacebo) {
+linux:if(contains(QT_ARCH, x86_64)|contains(QT_ARCH, arm64)):!disable-pyrowave:contains(CONFIG, libplacebo) {
     message(PyroWave decoder enabled)
     CONFIG += pyrowave
 }
