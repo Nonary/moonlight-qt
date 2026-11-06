@@ -1841,7 +1841,7 @@ bool Session::startConnectionAsync()
     }
 
     QString rtspSessionUrl;
-    LaunchWarning::Code launchWarning = LaunchWarning::Code::None;
+    LaunchWarning::Warning launchWarning;
 
     try {
         NvHTTP http(m_Computer);
