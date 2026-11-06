@@ -2439,10 +2439,31 @@ Flickable {
                 spacing: 5
 
                 CheckBox {
+                    id: automaticMouseCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    text: qsTr("Automatic mouse mode on supported hosts")
+                    font.pointSize:  12
+                    checked: StreamingPreferences.automaticMouseMode
+                    onCheckedChanged: {
+                        StreamingPreferences.automaticMouseMode = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("On hosts that support it, the mouse feels local: the host's cursor is drawn by this PC on the desktop, and the mouse switches to game mode by itself while a game captures it.") + " " +
+                                  qsTr("While streaming, Ctrl+Alt+Shift+A keeps the current mode and Ctrl+Alt+Shift+M switches to the other one.") + "\n\n" +
+                                  qsTr("Other hosts use the mouse option below.")
+                }
+
+                CheckBox {
                     id: absoluteMouseCheck
                     hoverEnabled: true
                     width: parent.width
-                    text: qsTr("Optimize mouse for remote desktop instead of games")
+                    text: automaticMouseCheck.checked ?
+                              qsTr("Optimize mouse for remote desktop on hosts without automatic mode") :
+                              qsTr("Optimize mouse for remote desktop instead of games")
                     font.pointSize:  12
                     checked: StreamingPreferences.absoluteMouseMode
                     onCheckedChanged: {
@@ -2452,7 +2473,9 @@ Flickable {
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
                     ToolTip.visible: hovered
-                    ToolTip.text: qsTr("This enables seamless mouse control without capturing the client's mouse cursor. It is ideal for remote desktop usage but will not work in most games.") + " " +
+                    ToolTip.text: (automaticMouseCheck.checked ?
+                                       qsTr("Applies when automatic mouse mode is not available, such as on hosts that do not support it.") + "\n\n" : "") +
+                                  qsTr("This enables seamless mouse control without capturing the client's mouse cursor. It is ideal for remote desktop usage but will not work in most games.") + " " +
                                   qsTr("You can toggle this while streaming using Ctrl+Alt+Shift+M.") + "\n\n" +
                                   qsTr("NOTE: Due to a bug in GeForce Experience, this option may not work properly if your host PC has multiple monitors.")
                 }

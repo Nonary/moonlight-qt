@@ -35,8 +35,28 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
       m_RightButtonReleaseTimer(0),
       m_DragTimer(0),
       m_DragButton(0),
-      m_NumFingersDown(0)
+      m_NumFingersDown(0),
+      m_HostCursorSupported(false),
+      m_HostCursorReady(false),
+      m_HostCursorHasPosition(false),
+      m_HostCursorX(0),
+      m_HostCursorY(0),
+      m_HostCursorControlSent(-1),
+      m_HostCursorResendId(0),
+      m_HostCursorResendTime(0),
+      m_HostSdlCursorScale(0),
+      m_AutomaticMouseMode(prefs.automaticMouseMode),
+      m_FallbackAbsoluteMouseMode(prefs.absoluteMouseMode),
+      m_AutomaticCaptureDone(false),
+      m_CursorDecision { CursorModePolicy::Mode::Fallback, CursorModePolicy::Source::Fallback, 0 },
+      m_CursorModeTimer(0),
+      m_CursorModeTimerDue(0),
+      m_ClientDrawsGraceActive(false),
+      m_ClientDrawsSinceMs(0),
+      m_HasAbsoluteSyncPoint(false),
+      m_AbsoluteSyncPoint { 0, 0 }
 {
+    SDL_zero(m_HostCursorState);
     DualSenseHaptics::resetSpeakerGenerationFloor();
 
     // System keys are always captured when running without a DE
@@ -136,6 +156,13 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     m_SpecialKeyCombos[KeyComboToggleTimingGraph].keyCode = SDLK_f;
     m_SpecialKeyCombos[KeyComboToggleTimingGraph].scanCode = SDL_SCANCODE_F;
     m_SpecialKeyCombos[KeyComboToggleTimingGraph].enabled = true;
+
+    m_SpecialKeyCombos[KeyComboToggleMouseModeLock].keyCombo = KeyComboToggleMouseModeLock;
+    m_SpecialKeyCombos[KeyComboToggleMouseModeLock].keyCode = SDLK_a;
+    m_SpecialKeyCombos[KeyComboToggleMouseModeLock].scanCode = SDL_SCANCODE_A;
+    // Enabled by startHostCursor() only when automatic mode is available, so on
+    // other hosts (or with the setting off) the combo still reaches the host.
+    m_SpecialKeyCombos[KeyComboToggleMouseModeLock].enabled = false;
 
     m_OldIgnoreDevices = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES);
     m_OldIgnoreDevicesExcept = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT);
@@ -299,6 +326,11 @@ SdlInputHandler::~SdlInputHandler()
     SDL_RemoveTimer(m_LeftButtonReleaseTimer);
     SDL_RemoveTimer(m_RightButtonReleaseTimer);
     SDL_RemoveTimer(m_DragTimer);
+    SDL_RemoveTimer(m_CursorModeTimer);
+
+    // Host cursor shapes live only as long as the session.
+    freeHostSdlCursors();
+    clearMouseModeStatus();
 
 #if !SDL_VERSION_ATLEAST(2, 0, 9)
     SDL_QuitSubSystem(SDL_INIT_HAPTIC);
@@ -481,14 +513,22 @@ void SdlInputHandler::setCaptureActive(bool active)
             int mouseX, mouseY;
             int windowX, windowY;
 
-            // We have to use SDL_GetGlobalMouseState() because macOS may not reflect
-            // the new position of the mouse when outside the window.
-            SDL_GetGlobalMouseState(&mouseX, &mouseY);
+            if (m_HasAbsoluteSyncPoint) {
+                // Automatic mouse mode just warped the cursor to the host's position
+                mouseX = m_AbsoluteSyncPoint.x;
+                mouseY = m_AbsoluteSyncPoint.y;
+                m_HasAbsoluteSyncPoint = false;
+            }
+            else {
+                // We have to use SDL_GetGlobalMouseState() because macOS may not reflect
+                // the new position of the mouse when outside the window.
+                SDL_GetGlobalMouseState(&mouseX, &mouseY);
 
-            // Convert global mouse state to window-relative
-            SDL_GetWindowPosition(m_Window, &windowX, &windowY);
-            mouseX -= windowX;
-            mouseY -= windowY;
+                // Convert global mouse state to window-relative
+                SDL_GetWindowPosition(m_Window, &windowX, &windowY);
+                mouseX -= windowX;
+                mouseY -= windowY;
+            }
 
             if (isMouseInVideoRegion(mouseX, mouseY)) {
                 // Synthesize a mouse event to synchronize the cursor
@@ -511,7 +551,16 @@ void SdlInputHandler::setCaptureActive(bool active)
         else {
             SDL_SetRelativeMouseMode(SDL_FALSE);
         }
+
+        // Uncaptured, the window shows the normal cursor and the video shows the host's
+        if (m_HostCursorSupported) {
+            SDL_SetCursor(SDL_GetDefaultCursor());
+        }
     }
+
+    // Tell the host whether we draw the cursor now
+    updateHostCursorControl();
+    publishMouseModeStatus();
 
     // Update mouse pointer region constraints
     updatePointerRegionLock();
