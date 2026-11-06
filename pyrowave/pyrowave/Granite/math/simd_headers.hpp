@@ -45,4 +45,16 @@
 #include <xmmintrin.h>
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+// MSVC targeting ARM64 defines _M_ARM64 but neither __ARM_NEON nor __aarch64__,
+// which the NEON paths in simd.hpp and muglm.cpp test for. Its arm64_neon.h
+// provides the standard intrinsic names, so take the NEON paths there too.
+// (clang-cl defines both macros itself and is handled above.)
+#include <arm64_neon.h>
+#ifndef __ARM_NEON
+#define __ARM_NEON 1
+#endif
+#ifndef __aarch64__
+#define __aarch64__ 1
+#endif
 #endif

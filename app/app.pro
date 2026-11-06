@@ -586,10 +586,10 @@ linux:!disable-kwin-scanout-guard:packagesExist(wayland-client) {
     DEFINES += HAVE_H264BITSTREAM
 }
 
-# PyroWave decoding runs on Vulkan. Windows shares D3D11 surfaces; Linux
-# presents the decoded planes through libplacebo. macOS exports MoltenVK images
+# PyroWave decoding runs on Vulkan. Windows (x64 and ARM64) shares D3D11
+# surfaces; Linux presents the decoded planes through libplacebo. macOS exports MoltenVK images
 # as Metal textures so decoding and presentation share the same GPU planes.
-win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
+win32:!winrt:if(contains(QT_ARCH, x86_64)|contains(QT_ARCH, arm64)):!disable-pyrowave {
     message(PyroWave decoder enabled)
     CONFIG += pyrowave
 }
