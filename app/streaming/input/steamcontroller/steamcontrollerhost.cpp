@@ -18,6 +18,7 @@ struct Entry {
     uint8_t number = 0;
     // The last state the link reported under this announcement, replayed when input resumes.
     bool haveState = false;
+    bool quitComboPressed = false;
     int buttonFlags = 0;
     uint8_t lt = 0, rt = 0;
     short lsX = 0, lsY = 0, rsX = 0, rsY = 0;
@@ -239,7 +240,7 @@ void SteamControllerHost::notifyWindowFocus(bool focused, bool backgroundGamepad
             }
         }
         else {
-            if (e.haveState) {
+            if (e.haveState && !e.quitComboPressed) {
                 // The controller may have moved while nothing was forwarded: resume from its last state.
                 LiSendMultiControllerEvent((short)e.number, (short)r.mask, e.buttonFlags, e.lt, e.rt, e.lsX, e.lsY, e.rsX, e.rsY);
             }
@@ -278,11 +279,31 @@ void SteamControllerHost::linkState(SteamControllerLink& link, int generation, i
     std::lock_guard<std::mutex> lock(r.mutex);
     Entry* e = r.alive ? r.find(link, generation) : nullptr;
     if (e == nullptr) return;
-    // Remembered even while held back, so a focus regain resumes from the current state.
+    const int quitCombo = PLAY_FLAG | BACK_FLAG | LB_FLAG | RB_FLAG;
+    const char* noGamepadQuit = SDL_getenv("NO_GAMEPAD_QUIT");
+    const bool quitPressed = (buttonFlags & quitCombo) == quitCombo &&
+                             (noGamepadQuit == nullptr || SDL_strcmp(noGamepadQuit, "1") != 0);
+    const bool wasQuitPressed = e->quitComboPressed;
+    // Remember the current state while suppressed; focus regain replays it unless
+    // it contains the quit combination.
     e->haveState = true;
+    e->quitComboPressed = quitPressed;
     e->buttonFlags = buttonFlags; e->lt = lt; e->rt = rt;
     e->lsX = lsX; e->lsY = lsY; e->rsX = rsX; e->rsY = rsY;
     if (r.suppressed) return;
+    if (quitPressed) {
+        // Consume the held combination, including extra grip/touch flags, so the
+        // host never sees it after the neutral state or on a focus regain.
+        if (!wasQuitPressed) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Detected quit gamepad button combo");
+            LiSendMultiControllerEvent((short)e->number, (short)r.mask, 0, 0, 0, 0, 0, 0, 0);
+            SDL_Event event = {};
+            event.type = SDL_QUIT;
+            event.quit.timestamp = SDL_GetTicks();
+            SDL_PushEvent(&event);
+        }
+        return;
+    }
     LiSendMultiControllerEvent((short)e->number, (short)r.mask, buttonFlags, lt, rt, lsX, lsY, rsX, rsY);
 }
 
