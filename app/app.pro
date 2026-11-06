@@ -485,6 +485,11 @@ win32 {
 win32:!winrt {
     message(DXVA2 and D3D11VA renderers selected)
 
+    SOURCES += streaming/audio/renderers/spatialaudio.cpp
+    HEADERS += streaming/audio/renderers/spatialaudio.h \
+               streaming/audio/renderers/spatialaudioqueue.h
+    LIBS += avrt.lib
+
     SOURCES += \
         streaming/video/ffmpeg-renderers/dxva2.cpp \
         streaming/video/ffmpeg-renderers/d3d11va.cpp \
