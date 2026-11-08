@@ -128,6 +128,9 @@ ApplicationWindow {
         Window.onActiveFocusItemChanged: PopupFocus.keepModalFocus(Overlay.overlay)
 
         Keys.onEscapePressed: {
+            if (PopupFocus.rejectTopModal()) {
+                return
+            }
             if (depth > 1) {
                 goBack()
             }
@@ -137,6 +140,9 @@ ApplicationWindow {
         }
 
         Keys.onBackPressed: {
+            if (PopupFocus.rejectTopModal()) {
+                return
+            }
             if (depth > 1) {
                 goBack()
             }

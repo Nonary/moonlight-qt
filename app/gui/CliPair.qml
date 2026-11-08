@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import QtQuick.Controls 2.2
+import "PopupFocus.js" as PopupFocus
 
 import ComputerManager 1.0
 
@@ -25,13 +26,13 @@ Item {
 
     // Allow user to back out of pairing
     Keys.onEscapePressed: {
-        Qt.quit()
+        if (!PopupFocus.rejectTopModal()) Qt.quit()
     }
     Keys.onBackPressed: {
-        Qt.quit()
+        if (!PopupFocus.rejectTopModal()) Qt.quit()
     }
     Keys.onCancelPressed: {
-        Qt.quit()
+        if (!PopupFocus.rejectTopModal()) Qt.quit()
     }
 
     StackView.onActivated: {

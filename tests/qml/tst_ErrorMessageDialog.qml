@@ -23,6 +23,13 @@ TestCase {
         initialItem: view
         onCurrentItemChanged: PopupFocus.focusCurrentView(stackView)
         Window.onActiveFocusItemChanged: PopupFocus.keepModalFocus(Overlay.overlay)
+        property int backCount: 0
+        Keys.onEscapePressed: {
+            if (!PopupFocus.rejectTopModal()) backCount++
+        }
+        Keys.onBackPressed: {
+            if (!PopupFocus.rejectTopModal()) backCount++
+        }
     }
     Component {
         id: view
@@ -49,6 +56,8 @@ TestCase {
         text: "Pairing"
         imageSrc: ""
         standardButtons: Dialog.Cancel
+        property int rejectedCount: 0
+        onRejected: rejectedCount++
     }
 
     NavigableMessageDialog {
@@ -67,7 +76,9 @@ TestCase {
     NavigableDialog {
         id: formDialog
         property int menuActivated: 0
+        property int rejectedCount: 0
         standardButtons: Dialog.Close
+        onRejected: rejectedCount++
         onOpened: formField.forceActiveFocus()
         Column {
             TextField { id: formField }
@@ -113,8 +124,11 @@ TestCase {
         SystemProperties.hasBrowser = true
         errorDialog.acceptedCount = 0
         errorDialog.closedCount = 0
+        pairingDialog.rejectedCount = 0
+        stackView.backCount = 0
         confirmationDialog.navigateOnAccept = false
         formDialog.menuActivated = 0
+        formDialog.rejectedCount = 0
         formField.text = ""
         stackView.forceActiveFocus()
     }
@@ -159,6 +173,60 @@ TestCase {
         keyClick(Qt.Key_Escape) // Controller B.
         tryCompare(errorDialog, "visible", false)
         compare(errorDialog.closedCount, 1)
+    }
+
+    function test_back_rejects_top_dialog_before_navigation() {
+        pairingDialog.open()
+        tryCompare(pairingDialog, "opened", true)
+        errorDialog.open()
+        tryCompare(errorDialog, "opened", true)
+        // Exercise the same dialog-first path used by the navigation handler.
+        verify(PopupFocus.rejectTopModal())
+        tryCompare(errorDialog, "visible", false)
+        verify(pairingDialog.visible)
+        compare(stackView.backCount, 0)
+        verify(PopupFocus.rejectTopModal())
+        tryCompare(pairingDialog, "visible", false)
+        compare(pairingDialog.rejectedCount, 1)
+        compare(stackView.backCount, 0)
+        verify(!PopupFocus.rejectTopModal())
+    }
+
+    function test_circle_dismisses_dialog_before_back_navigation() {
+        stackView.push(view, StackView.Immediate)
+        pairingDialog.open()
+        tryCompare(pairingDialog, "opened", true)
+        keyClick(Qt.Key_Escape)
+        tryCompare(pairingDialog, "visible", false)
+        compare(pairingDialog.rejectedCount, 1)
+        compare(stackView.depth, 2)
+        compare(stackView.backCount, 0)
+        keyClick(Qt.Key_Escape)
+        compare(stackView.backCount, 1)
+    }
+
+    function test_circle_cancels_a_focused_form() {
+        formDialog.open()
+        tryCompare(formDialog, "opened", true)
+        verify(formField.activeFocus)
+        keyClick(Qt.Key_Escape)
+        tryCompare(formDialog, "visible", false)
+        compare(formDialog.rejectedCount, 1)
+        compare(stackView.backCount, 0)
+    }
+
+    function test_circle_closes_nested_menu_before_dialog() {
+        formDialog.open()
+        tryCompare(formDialog, "opened", true)
+        formMenu.open()
+        tryCompare(formMenu, "opened", true)
+        keyClick(Qt.Key_Escape)
+        tryCompare(formMenu, "visible", false)
+        verify(formDialog.visible)
+        keyClick(Qt.Key_Escape)
+        tryCompare(formDialog, "visible", false)
+        compare(formDialog.rejectedCount, 1)
+        compare(stackView.backCount, 0)
     }
 
     function test_confirmation_dialog_keeps_its_default_focus() {

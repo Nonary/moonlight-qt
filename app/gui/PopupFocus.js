@@ -22,6 +22,19 @@ function hasVisibleModal() {
     return false
 }
 
+// Back navigation must dismiss the most recently opened dialog before it
+// changes the underlying view. Reject it so dialog-specific cancellation runs.
+function rejectTopModal() {
+    for (var i = visibleDialogs.length - 1; i >= 0; i--) {
+        var dialog = visibleDialogs[i]
+        if (dialog && dialog.visible && dialog.modal) {
+            dialog.reject()
+            return true
+        }
+    }
+    return false
+}
+
 function keepModalFocus(overlay) {
     if (restoringModalFocus || !overlay) return
 
