@@ -266,6 +266,13 @@ private:
     uint64_t m_VrrPriorFrameStatsTimeUs;
     uint64_t m_VrrPriorFrameStatsPresentRefreshSequence;
     uint64_t m_VrrPriorFrameStatsRefreshSequence;
+    // Present() returns a non-display status such as DXGI_STATUS_OCCLUDED for
+    // every frame while the display is off or covered. These summarize a run of
+    // them so the log gets a few lines instead of one per frame.
+    HRESULT m_VrrNonDisplayStatus = S_OK;
+    uint64_t m_VrrNonDisplayFrames = 0;
+    uint64_t m_VrrNonDisplaySinceUs = 0;
+    uint64_t m_VrrNonDisplayLastLogUs = 0;
 
     std::array<Microsoft::WRL::ComPtr<ID3D11PixelShader>, PixelShaders::_COUNT> m_VideoPixelShaders;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_VideoVertexBuffer;
