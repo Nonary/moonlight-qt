@@ -25,6 +25,9 @@ QString calibrationKey(const QString& context, const QByteArray& policy,
     // Also discard delay learned before stalls beyond the cap stopped pinning
     // the buffer and before blocked decode and render work counted as evidence.
     hash.addData(QByteArrayLiteral("measured-readiness\n"));
+    // Also discard delay learned while a stall beyond the cap, or one late
+    // frame in a window that had only begun to fill, still raised the buffer.
+    hash.addData(QByteArrayLiteral("absorbable-loss\n"));
     hash.addData(context.toUtf8());
     hash.addData(QByteArrayLiteral("\ncan-latch="));
     hash.addData(QByteArray::number(canLatch));

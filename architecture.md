@@ -1,7 +1,8 @@
 # Streaming and VRR architecture
 
-Source baseline: master plus the decode-buffer accounting correction on 2026-10-30
-and the buffer evidence corrections on 2026-11-04. The production worker
+Source baseline: master plus the decode-buffer accounting correction on 2026-10-30,
+the buffer evidence corrections on 2026-11-04, and the absorbable-loss solver
+and release hold on 2026-11-09. The production worker
 resolves one adaptive input policy, bounded catch-up and corrected input
 accounting. The calibration key includes effective policy and presenter
 capabilities; existing keys are not reused. Schema-6 capture and schema-2
@@ -627,11 +628,28 @@ planned extra delay, queue capacity and retained phase are distinct quantities.
 `InputGoalBuffer` observes eligible input readiness against the unbuffered
 source slot. The goal solver selects the smallest buffer meeting the selected
 severity-weighted client timing goal over its configured window, aiming at a
-fraction of the allowed loss. Loss that remains even at the cap cannot be bought
-back, so the goal applies above that floor: the solver selects the smallest
-buffer within the allowed loss of the best the cap attains. A stall beyond the
-cap therefore spends no buffer, while sustained jitter beyond it still reaches
-the cap. Rise and release are rate limited; the
+fraction of the allowed loss. Three rules keep it from buying latency that
+removes no hitch:
+
+- An interval loses at most itself. The reported client-timing score weights
+  loss by presented duration, so a freeze counts for its whole length; sizing
+  from that let every millisecond of buffer shorten a freeze it could not
+  remove. A wholly lost interval is lost at every buffer and asks for nothing.
+- Loss that remains at the cap cannot be bought back. The goal applies to the
+  loss the cap would remove, so a stall beyond the cap spends no buffer however
+  many the window holds, while sustained jitter beyond it still reaches the cap.
+- A loss rate needs several late frames. While fewer than eight intervals lose
+  at a candidate buffer (four late frames, each a stretched and a compressed
+  interval) and less than a quarter of the goal window has been observed, the
+  allowance is that quarter's, scaled by the eligible share of the elapsed
+  time. A session start, a source epoch and a new rate layer all begin such a
+  window. Sustained lateness is held to its rate from the first second.
+
+Rise is rate limited and never delayed. Release is rate limited and held: it
+goes no lower than the highest target solved within `playoutMeanMissHoldUs`
+(8 s), because the solved target steps between neighbouring 250 us values as
+single late frames enter and leave the window. A layer transition and a
+headroom credit clear the held targets so their drain is not delayed. The
 controller maintains rate-specific evidence layers and credits available VRR
 headroom according to the profile. Eligible outcomes, actual input coverage,
 interval quality, network and decoder stage attribution are separate metrics.
@@ -677,6 +695,9 @@ startup delay and reserve history from the former queue-contaminated estimator.
 Existing cache files are preserved, but their prior keys are not loaded. The
 `measured-readiness` marker likewise isolates delay learned before stalls beyond
 the cap stopped pinning the buffer and before blocked decode evidence counted.
+The `absorbable-loss` marker isolates delay learned while a stall beyond the
+cap, or one late frame in a window that had only begun to fill, still raised
+the buffer.
 
 ## 10. Windows D3D11 mechanics and native synchronization
 

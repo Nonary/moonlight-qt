@@ -36,8 +36,11 @@ and completion arithmetic near the timestamp limit. `tst_vrrcacheidentity`
 checks that the corrected estimator cannot load a prior saved startup delay.
 It also pins that a blocked D3D11 decode fence and its render work set the buffer,
 while unblocked collection stays queue-neutral and other backends keep their
-estimate. `tst_inputgoalintegration` pins that a stall beyond the cap spends no buffer,
-while sustained jitter beyond the cap still reaches it.
+estimate. `tst_inputgoalintegration` pins that a stall beyond the cap spends no buffer
+however many the window holds, that an interval loses at most itself, that one
+late frame in a window that has only begun to fill buys nothing while sustained
+lateness is held to its rate, that release waits out its hold, and that
+sustained jitter beyond the cap still reaches it.
 
 ## Capture and exact replay
 

@@ -49,6 +49,16 @@ int main(int argc, char** argv) {
     promptOnly.addData(QByteArray::fromStdString(vrrCalibrationPolicy(policy)));
     assert(Vrr13::saveStartDelay(path, QString::fromLatin1(promptOnly.result().toHex()), 13889));
     assert(Vrr13::loadStartDelay(path, key) == 0);
+    // Delay learned while a stall beyond the cap still raised the buffer.
+    QCryptographicHash measured(QCryptographicHash::Sha256);
+    measured.addData(QByteArrayLiteral("vrr-calibration-v3\n"));
+    measured.addData(QByteArrayLiteral("prompt-decode-accounting\n"));
+    measured.addData(QByteArrayLiteral("measured-readiness\n"));
+    measured.addData(QByteArrayLiteral("same-device-codec-settings"));
+    measured.addData(QByteArrayLiteral("\ncan-latch=0\nallow-tearing=1"));
+    measured.addData(QByteArray::fromStdString(vrrCalibrationPolicy(policy)));
+    assert(Vrr13::saveStartDelay(path, QString::fromLatin1(measured.result().toHex()), 10750));
+    assert(Vrr13::loadStartDelay(path, key) == 0);
     assert(Vrr13::saveStartDelay(path, key, 8378));
     assert(Vrr13::loadStartDelay(path, key) == 8378);
     assert(Vrr13::loadStartDelay(path, identity(policy, true)) == 0);

@@ -3887,7 +3887,8 @@ void VrrTimingController::updatePlayoutHistory(
                 }
                 m_InputHeadroomUs = vrrHeadroomUs;
                 m_InputBuffer.setGoalSolver(m_Parameters.playoutInputGoalWindowUs,
-                    m_Parameters.playoutInputGoalTailPerMille ? m_Parameters.playoutInputGoalTailPerMille : 1000);
+                    m_Parameters.playoutInputGoalTailPerMille ? m_Parameters.playoutInputGoalTailPerMille : 1000,
+                    m_Parameters.playoutMeanMissHoldUs);
                 m_InputBuffer.advance(nowUs, playoutDelayMinimumUs(),
                     playoutDelayMaximumUs(), m_Parameters.playoutInputPercentileTargetPerMillion,
                     m_Parameters.playoutInputPercentileWindowUs,
