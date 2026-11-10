@@ -26,7 +26,8 @@ QString calibrationKey(const QString& context, const QByteArray& policy,
     // the buffer and before blocked decode and render work counted as evidence.
     hash.addData(QByteArrayLiteral("measured-readiness\n"));
     // Also discard delay learned while a stall beyond the cap, or one late
-    // frame in a window that had only begun to fill, still raised the buffer.
+    // frame in a window that had only begun to fill, still raised the buffer,
+    // and while blocked decode evidence counted preparation the target allows.
     hash.addData(QByteArrayLiteral("absorbable-loss\n"));
     hash.addData(context.toUtf8());
     hash.addData(QByteArrayLiteral("\ncan-latch="));

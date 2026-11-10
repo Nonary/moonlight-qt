@@ -1,8 +1,8 @@
 # Streaming and VRR architecture
 
 Source baseline: master plus the decode-buffer accounting correction on 2026-10-30,
-the buffer evidence corrections on 2026-11-04, and the absorbable-loss solver
-and release hold on 2026-11-09. The production worker
+the buffer evidence corrections on 2026-11-04, and the absorbable-loss solver,
+release hold and blocked-evidence correction on 2026-11-09. The production worker
 resolves one adaptive input policy, bounded catch-up and corrected input
 accounting. The calibration key includes effective policy and presenter
 capabilities; existing keys are not reused. Schema-6 capture and schema-2
@@ -671,18 +671,37 @@ or additional user setting is introduced.
 On D3D11, decoder output is only a GPU submission, and the decoder thread signals
 the decode fence. A wait of at least `PreciseCompletionWaitUs` therefore ends at
 real GPU completion however long the frame sat in the worker queue. Such a frame
-reports at least that completion plus its preparation service relative to the
-input slot, because the readiness budget is zero and nothing else reserves time
-for render work. This uses the fence time and measured durations from the fixed
-slot, so it does not move with the applied buffer. Frames that did not block stay
-queue-neutral. Once the buffer exceeds most completions only the slowest frames
-still block, and those are the frames the goal is sized from. Source mapping
-keeps prompt samples only, and other presenters keep the estimate until their
-wait semantics are verified. On a 2026-11-03 Radeon 780M capture at 4K144, the
-former input predicted 99.77% at a 2.75 ms buffer against 91.97% actual, while
-actual timing reached 99.95% at 9 ms. Three captures on that client showed no
-growth of GPU completion with buffer size. That is software timing evidence
-from one device, not optical proof.
+reports at least that completion plus the render work that follows it, less the
+render time its target already allows: the target sits the typical preparation
+after slot plus buffer, so only work beyond that needs buffer. GPU render time
+after preparation is known only when its fence was still pending at the target,
+and then exactly (completion less the end of preparation); a fence that had
+already completed adds nothing, because when it completed is not known. These
+are durations from the fixed slot, whenever preparation actually began. Frames
+that did not block stay queue-neutral. Source mapping keeps prompt samples
+only, and other presenters keep the estimate until their wait semantics are
+verified.
+
+This evidence is censored, and it does move with the applied buffer: a frame
+that was on time reports a lower bound, and a frame that missed reports what it
+needed. Release therefore probes one 250 us step, and the misses it causes
+restore the buffer within seconds. Until 2026-11-09 the requirement counted
+preparation from the slot although the target allows for it, and used only the
+residual wait at the target as GPU render time. On the blocked-fence fixture
+(2 ms preparation, 141 FPS) every frame needed 2.6 ms and the buffer held
+4.0 ms; with a 2 ms preparation and a decode tail it held 7.4 ms where a
+pinned 5.5 ms reached 99.97%, and now holds 5.9 ms. Where preparation ended before the target, a late frame read
+as absorbed, and a tail-free stream settled at 99.89% under a 99.95% goal; it
+now reaches 99.98% at 3.5 ms. The requirement still excludes decoder backlog,
+including the steady 0.1 ms handoff, so it can land one grid step short at a
+tolerance edge.
+
+On a 2026-11-03 Radeon 780M capture at 4K144, the input before 2026-11-04
+predicted 99.77% at a 2.75 ms buffer against 91.97% actual, while actual timing
+reached 99.95% at 9 ms. Three captures on that client showed no growth of GPU
+completion with buffer size. That is software timing evidence from one device,
+not optical proof. The 2026-11-09 correction has not been replayed against
+those captures.
 
 `profile.cpp` stores calibration under the cache path. The worker constructs
 the key from device/session context, effective controller policy and presenter
@@ -697,7 +716,33 @@ Existing cache files are preserved, but their prior keys are not loaded. The
 the cap stopped pinning the buffer and before blocked decode evidence counted.
 The `absorbable-loss` marker isolates delay learned while a stall beyond the
 cap, or one late frame in a window that had only begun to fill, still raised
-the buffer.
+the buffer, and while blocked decode evidence counted preparation the target
+already allows.
+
+The 2026-11-09 rules were measured on synthetic input through the production
+controller, against the same input through the v6.1.0-vrr18 controller. At
+116 FPS on 120 Hz, a 30 ms stall every 45 s took Smooth from its 1 ms floor to
+as much as 10.75 ms and back, twelve times in five minutes, for the same seven
+hitches vrr18 showed at about 1 ms; it now stays at 1 ms. One 6 ms frame 8 s
+into a session took Smooth to 4.25 ms and now moves nothing. On a modelled
+GPU-bound 141 FPS stream Smooth turned its buffer around 113 times in 240 s
+(vrr18: 4) and now does so 18 times, each a single 250 us probe, at 7.0 ms
+either way. The hold keeps the buffer at the top of the target's steps: across
+the scenarios mean latency rose by at most 0.5 ms (the GPU-bound Smooth cases)
+and fell by 1.8 ms in the stall case.
+
+The solver still holds more buffer than vrr18 wherever that reaches the
+profile goal. vrr18 grew by at most 250 us per observed miss and did not
+buffer GPU-bound lateness. On the modelled GPU-bound stream it held
+2.4/2.5/3.4 ms (Low Latency/Balanced/Smooth) for 99.33/99.35/99.65% client
+timing, where the solver holds 3.0/4.3/7.1 ms for 99.46/99.77/99.99%. With the
+buffer pinned on that stream, timing is 99.67% at 3.5 ms, 99.74% at 4.0 ms and
+99.95% at 6.5 ms: half the frames need 2.3 ms and 99.5% need 4.4 ms, but the
+slowest 0.5% need up to 9.6 ms, and Smooth's goal lies inside that tail. The
+last 0.2% of timing costs 2.5 ms there; the same model without the tail
+reaches 99.98% at 3.5 ms. How far a real client's buffer sits above vrr18's is
+set by its own tail. None of this is a live or optical measurement, and no
+capture from the reporting client was available to replay.
 
 ## 10. Windows D3D11 mechanics and native synchronization
 

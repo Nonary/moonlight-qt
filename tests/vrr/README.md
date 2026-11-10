@@ -34,7 +34,8 @@ late blocking/nonblocking completion checks, cold and warm GPU estimates,
 retained startup protection, prompt real GPU stalls, actual readiness floors,
 and completion arithmetic near the timestamp limit. `tst_vrrcacheidentity`
 checks that the corrected estimator cannot load a prior saved startup delay.
-It also pins that a blocked D3D11 decode fence and its render work set the buffer,
+It also pins that a blocked D3D11 decode fence and the render work beyond the
+target's own allowance set the buffer,
 while unblocked collection stays queue-neutral and other backends keep their
 estimate. `tst_inputgoalintegration` pins that a stall beyond the cap spends no buffer
 however many the window holds, that an interval loses at most itself, that one
