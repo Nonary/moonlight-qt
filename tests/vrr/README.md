@@ -43,6 +43,13 @@ late frame in a window that has only begun to fill buys nothing while sustained
 lateness is held to its rate, that release waits out its hold, and that
 sustained jitter beyond the cap still reaches it.
 
+`tst_vrrbufferregressions` is the adaptive-buffer gate described in
+`AGENTS.md`. It was dropped from `vrr.pro` and stopped compiling when the
+goal-buffer policy was merged on 2026-10-29, and was restored on 2026-11-09.
+The contracts that merge broke are listed in its `g_Known` table with their
+evidence; each is a decision still to make. Its `unabsorbable-loss` scenario
+pins the three solver rules above through a production session.
+
 ## Capture and exact replay
 
 The worker writes schema-6 captures as compressed `.vrrtrace` files or CSV.

@@ -48,12 +48,10 @@ HEADERS += \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/cadencedetection.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
-    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/recentreadiness.h \
-    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/readinessfeedback.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h \
-    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/absorbedjitter.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/intervalbuffer.h \
-    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputbuffer.h \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputgoalbuffer.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputbufferestimate.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputcoveragehistory.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/inputlayercadence.h \
