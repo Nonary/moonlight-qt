@@ -10,7 +10,7 @@ TARGET = moonlight-common-c
 TEMPLATE = lib
 
 # Build a static library
-CONFIG += staticlib
+CONFIG += staticlib c11
 
 # Include global qmake defs
 include(../globaldefs.pri)
@@ -88,10 +88,6 @@ CONFIG(debug, debug|release) {
     DEFINES += LC_DEBUG
 }
 
-# Older GCC versions defaulted to GNU89
-*-g++ {
-    QMAKE_CFLAGS += -std=gnu99
-}
 
 # Disable unused parameter warnings on GCC and Clang
 *-g++|*-clang* {

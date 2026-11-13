@@ -33,6 +33,7 @@ static unsigned fecPercent;
 static unsigned dataPackets = DATA_PACKETS;
 
 uint64_t PltGetMicroseconds(void) { return ++fakeNowUs; }
+bool isReferenceFrameInvalidationEnabled(void) { return true; }
 void connectionSawFrame(uint32_t frame) { (void)frame; }
 void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS status) { (void)status; }
 void notifyFrameLost(unsigned frame, bool speculative) {
