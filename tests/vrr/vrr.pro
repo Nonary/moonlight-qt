@@ -107,6 +107,10 @@ phasetrajectory.file = $$PWD/phasetrajectory.pro
 SUBDIRS += phasetrajectory
 inputgoalintegration.file = $$PWD/inputgoalintegration.pro
 SUBDIRS += inputgoalintegration
+# The adaptive-buffer regression gate. It was left out of this list, and stopped
+# compiling, when the goal-buffer policy was merged on 2026-10-29.
+bufferregressions.file = $$PWD/bufferregressions.pro
+SUBDIRS += bufferregressions
 
 performancestats.file = $$PWD/performancestats.pro
 SUBDIRS += performancestats

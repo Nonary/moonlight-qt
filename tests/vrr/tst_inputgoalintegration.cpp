@@ -362,24 +362,58 @@ static void testGoalSolverUnreachableGoals() {
           "equal timing scores prefer the smallest buffer");
 }
 static void testGoalSolverIgnoresStallsBeyondTheCap() {
-    // 120 s at 144 FPS with 3 ms of ordinary jitter and two delivery stalls beyond
-    // the 13.89 ms cap, shaped like the 2026-11-03 daily.196 capture that pinned
-    // its buffer at the cap for two minutes.
-    const auto build=[](bool stalls){
+    // 120 s at 144 FPS with 3 ms of ordinary jitter and delivery stalls beyond the
+    // 13.89 ms cap, shaped like the 2026-11-03 daily.196 capture that pinned its
+    // buffer at the cap for two minutes. Three stalls fitted inside the allowance
+    // once the cap's own loss was set aside; a fourth did not, and the buffer rose
+    // (3.5 ms for four, 8.75 ms for eight) to shorten freezes it could not remove.
+    const auto build=[](int stalls){
         Vrr13::InputGoalSolver solver; int64_t previous=0;
         for(int i=1;i<=17280;++i){
             int64_t late=i%10==0?3000:0;
-            if(stalls&&i==7000)late=27000;
-            if(stalls&&i==7700)late=34000;
+            for(int stall=0;stall<stalls;++stall) if(i==2000+stall*1900) late=stall%2?34000:27000;
             solver.add(previous,late,6944,500);previous=late;
         }
         return solver;
     };
-    const auto calm=build(false).solve(999650,500,1000,13889,250);
+    const auto calm=build(0).solve(999650,500,1000,13889,250);
     check(calm.goalReachable && calm.bufferUs==2500,"ordinary jitter sets the buffer");
-    const auto stalled=build(true).solve(999650,500,1000,13889,250);
-    check(!stalled.goalReachable,"stalls beyond the cap still report an unreachable goal");
-    check(stalled.bufferUs==calm.bufferUs,"stalls beyond the cap spend no buffer");
+    for(int stalls:{2,4,8}) check(build(stalls).solve(999650,500,1000,13889,250).bufferUs==calm.bufferUs,
+        "stalls beyond the cap spend no buffer, however many the window holds");
+    check(!build(8).solve(999650,500,1000,13889,250).goalReachable,
+          "enough stalls beyond the cap still report an unreachable goal");
+    // A wholly lost interval is lost at every buffer: the freeze's length is not jitter.
+    Vrr13::InputGoalSolver freeze; freeze.add(0,30000,8620,500); freeze.add(30000,0,8620,500);
+    check(freeze.lostUs(1000,500)==freeze.lostUs(17240,500) && freeze.lostUs(1000,500)==2*8620,
+          "an interval loses at most itself");
+}
+static void testGoalSolverNeedsARateBeforeItRaises() {
+    // Eight seconds of a 120 s Smooth window at 116 FPS: the evidence allows 2.8 ms
+    // of loss and a quarter of the window allows 10.5 ms.
+    const uint64_t intended=8620,quarter=30000000;
+    const auto build=[&](int spikeEvery,int64_t spikeUs){
+        Vrr13::InputGoalSolver solver; int64_t previous=0;
+        for(int i=1;i<=928;++i){
+            const int64_t late=(spikeEvery?i%spikeEvery==0:i==500)?spikeUs:0;
+            solver.add(previous,late,intended,500);previous=late;
+        }
+        return solver;
+    };
+    const auto one=build(0,6000);
+    check(one.solve(999650,500,1000,17240,250,quarter).bufferUs==1000,
+          "one late frame in a window that has only begun to fill buys no buffer");
+    check(one.solve(999650,500,1000,17240,250).bufferUs>=4000,
+          "the same frame exceeds the allowance of the evidence alone");
+    const auto sustained=build(20,3000);
+    check(sustained.solve(999650,500,1000,17240,250,quarter).bufferUs==
+          sustained.solve(999650,500,1000,17240,250).bufferUs &&
+          sustained.solve(999650,500,1000,17240,250,quarter).bufferUs>=2500,
+          "sustained lateness is held to its rate however little of the window is filled");
+    // Two 12 ms frames lose more than a quarter of the window allows.
+    Vrr13::InputGoalSolver two; int64_t previous=0;
+    for(int i=1;i<=928;++i){const int64_t late=i==300||i==700?12000:0;two.add(previous,late,intended,500);previous=late;}
+    check(two.solve(999650,500,1000,17240,250,quarter).bufferUs>1000,
+          "late frames beyond the window's own share still raise the buffer");
 }
 static void testGoalBufferFollowsRecentJitter() {
     Vrr13::InputGoalBuffer buffer; buffer.setGoalSolver(20000000,1000);
@@ -393,6 +427,83 @@ static void testGoalBufferFollowsRecentJitter() {
     check(grown>=3500 && grown<=5000,"recurring 5 ms spikes above the goal's tail grow the buffer to cover them");
     feed(60,0);
     check(buffer.stats().currentUs==0,"clean input releases the buffer once the spikes leave the solver window");
+}
+
+static void testGoalBufferHoldsReleaseAgainstTargetSteps() {
+    // 120 FPS, 20 s solver window, 8 s release hold.
+    Vrr13::InputGoalBuffer buffer; buffer.setGoalSolver(20000000,1000,8000000);
+    uint64_t t=1000000,frame=0,slot=1000000;
+    auto feed=[&](double seconds,int spikeEvery){for(int i=0;i<int(seconds*120);++i){t+=8333;slot+=8333;++frame;
+        const int64_t late=spikeEvery&&frame%spikeEvery==0?5000:0;
+        buffer.advance(t,0,8620,995000,60000000,4000,1000,0,500,0,0);
+        buffer.observe(frame,t,slot,late,true,0,8620,995000,60000000,4000,1000,0,500,0,0,late>500);}};
+    feed(30,50);
+    const uint64_t grown=buffer.stats().currentUs;
+    check(grown>=3500 && grown<=5000,"a release hold does not delay the rise");
+    int waited=0;
+    while(buffer.stats().targetUs>=grown && waited++<400) feed(0.1,0);
+    check(buffer.stats().targetUs<grown,"the solved target falls once spikes leave the window");
+    feed(6,0);
+    check(buffer.stats().currentUs==grown,"release waits while a higher target is inside the hold");
+    feed(30,0);
+    check(buffer.stats().currentUs==0,"release resumes once every held target has aged out");
+    // A layer transition drains the previous layer's excess at once.
+    feed(30,50);
+    const uint64_t again=buffer.stats().currentUs;
+    buffer.transitionFrom(again+3000);
+    feed(1,50);
+    check(buffer.stats().currentUs<again+3000,"a layer transition is not held");
+}
+static void testGoalBufferSpendsNothingOnStallsBeyondTheCap() {
+    // 116 FPS Smooth with its 17.24 ms cap and a 30 ms delivery stall every 45 s.
+    Vrr13::InputGoalBuffer buffer; buffer.setGoalSolver(120000000,700,8000000);
+    uint64_t t=1000000,frame=0,slot=1000000,peak=0;
+    for(int i=0;i<300*116;++i){t+=8620;slot+=8620;++frame;
+        const int64_t late=frame%(45*116)==2000?30000:int64_t(frame*2654435761u%400);
+        buffer.advance(t,1000,17240,999500,300000000,4000,1000,0,500,0,0);
+        buffer.observe(frame,t,slot,late,true,1000,17240,999500,300000000,4000,1000,0,500,0,0,late>500);
+        peak=std::max(peak,buffer.stats().currentUs);}
+    check(peak==1000,"a stall beyond the cap never raises the applied buffer");
+}
+
+static void testGoalBufferMarginCostIsCapped() {
+    // 138 FPS Smooth: 99.95%, aiming at 70% of the allowed loss over 120 s.
+    // One 8 ms frame every 2 s, and one 15.15 ms frame every 36 s that the
+    // 14.49 ms cap cannot absorb. Three of the big frames in the window leave
+    // the aim at 7.5 ms and a fourth takes it past 9 ms, although 7.5 ms meets
+    // the goal either way.
+    constexpr uint64_t period=7246,cap=14490;
+    const auto lateness=[](uint64_t frame){return int64_t(frame%(36*138)==100?15150:frame%(2*138)==50?8000:0);};
+    Vrr13::InputGoalSolver solver; int64_t previous=0;
+    for(int i=1;i<=int(120*138);++i){const int64_t late=lateness(uint64_t(i));
+        solver.add(previous,late,period,500);previous=late;}
+    const auto both=solver.solve(999650,500,1000,cap,250,0,999500);
+    check(both.bufferUs==solver.solve(999650,500,1000,cap,250).bufferUs,
+          "a separate goal does not change the buffer the aim asks for");
+    check(both.requiredUs==solver.solve(999500,500,1000,cap,250).bufferUs && both.requiredUs+1000<=both.bufferUs,
+          "the goal itself needs a millisecond less here than the aim inside it");
+    check(solver.solve(999650,500,1000,cap,250).requiredUs==both.bufferUs,
+          "without a separate goal the aim is the requirement");
+
+    Vrr13::InputGoalBuffer buffer; buffer.setGoalSolver(120000000,700,8000000);
+    uint64_t t=1000000,frame=0,slot=1000000;
+    uint64_t lowest=UINT64_MAX,highest=0,unprotected=0,overpaid=0;
+    const auto feed=[&](int frames,const auto& late){for(int i=0;i<frames;++i){t+=period;slot+=period;++frame;
+        buffer.advance(t,1000,cap,999500,300000000,4000,1000,0,500,0,0);
+        buffer.observe(frame,t,slot,late(frame),true,1000,cap,999500,300000000,4000,1000,0,500,0,0,late(frame)>500);}};
+    feed(240*138,lateness);
+    for(int i=0;i<240*138;++i){feed(1,lateness);
+        const auto s=buffer.stats();
+        lowest=std::min(lowest,s.currentUs);highest=std::max(highest,s.currentUs);
+        unprotected+=s.currentUs<s.requiredUs;overpaid+=s.targetUs>s.requiredUs+500;}
+    check(highest-lowest<=500 && lowest>=7250 && highest<=8000,
+          "the applied buffer stays within the margin's cost of what the goal needs while the aim moves a millisecond");
+    check(unprotected==0,"the applied buffer never sits below what the goal needs");
+    check(overpaid==0,"the target never asks more than the margin's cost beyond what the goal needs");
+
+    // Lateness the goal does not allow still raises the buffer at once.
+    feed(20*138,[](uint64_t f){return int64_t(f%20==0?11000:0);});
+    check(buffer.stats().currentUs>=10000,"a missed goal still raises the buffer");
 }
 
 static void testGoalBufferLifecycle() {
@@ -453,7 +564,7 @@ static void testProductionUsesGoalSolver() {
 int main() {
     testFastLayerCadence();testConfirmedLayerCadence();testContinuousCoverage();testResponsiveCoverageReporting();
     testSharedExtraBufferAllowance();
-    testGoalSolverMeetsGoalWithLeastBuffer();testGoalSolverUnreachableGoals();testGoalSolverIgnoresStallsBeyondTheCap();testGoalBufferFollowsRecentJitter();testGoalBufferLifecycle();
+    testGoalSolverMeetsGoalWithLeastBuffer();testGoalSolverUnreachableGoals();testGoalSolverIgnoresStallsBeyondTheCap();testGoalSolverNeedsARateBeforeItRaises();testGoalBufferFollowsRecentJitter();testGoalBufferHoldsReleaseAgainstTargetSteps();testGoalBufferSpendsNothingOnStallsBeyondTheCap();testGoalBufferMarginCostIsCapped();testGoalBufferLifecycle();
 #ifdef INPUT_PERCENTILE_CONTROLLER_TEST
     testProductionUsesGoalSolver();
     testFactoryProfileOwnsAdaptiveTarget();

@@ -18,12 +18,7 @@
 // MOONLIGHT_VRR_* environment overrides.
 inline VrrSessionConfig vrrProductionInputConfig(VrrSessionConfig config)
 {
-    config.correctInputAccounting = true;
-    config.experimentalBoundedCatchup = true;
-    const auto options = config.timingOptions.resolved(config.latencyMode);
-    config.experimentalInputPercentilePpm = uint64_t(options.targetHundredths) * 100;
-    config.experimentalInputPercentileWindowUs = uint64_t(options.historySeconds) * 1000000;
-    return config;
+    return vrrProductionSessionConfig(std::move(config));
 }
 
 // Mirrors Pacer::initialize() for a preset (latencyMode 0 Smooth, 1 Balanced,
@@ -34,7 +29,6 @@ inline VrrSessionConfig vrrProductionSession(int latencyMode, int streamRateHz,
                                              bool absorbMicrostutter = false)
 {
     VrrSessionConfig config;
-    config.readinessHitchFeedback = false;
     config.latencyMode = latencyMode >= 0 && latencyMode <= 2 ? latencyMode : 1;
     config.timingOptions = VrrTimingOptions{}.resolved(config.latencyMode);
     config.streamRateHz = streamRateHz;

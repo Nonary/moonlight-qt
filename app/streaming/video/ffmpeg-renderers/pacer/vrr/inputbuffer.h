@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <utility>
 
 namespace Vrr13 {
 // Learns an input buffer from source-relative readiness and the selected CPU
@@ -21,6 +22,7 @@ public:
     static constexpr uint64_t MinimumWindowUs = 10000000;
     static constexpr uint64_t MaximumWindowUs = 300000000;
     static constexpr size_t MaximumSamples = 262144;
+    static constexpr uint64_t MaximumReleaseHoldUs = 60000000;
     struct Stats {
         uint64_t targetUs = 0, currentUs = 0, samples = 0, minimumUs = 0, maximumUs = 0;
         // Session totals; retained names preserve existing trace/test callers.
@@ -42,6 +44,8 @@ public:
         uint64_t probabilityPpm = 0, windowUs = 0, toleranceUs = 0, vrrHeadroomUs = 0;
         int64_t readinessBudgetUs = 0, clockOffsetUs = 0;
         uint64_t headroomTargetUnclippedUs = 0;
+        // Smallest buffer that meets the goal itself; targetUs aims inside it.
+        uint64_t requiredUs = 0;
         bool tailUncertain = true, evidenceValid = false;
         bool historyTruncated = false, expiredUnknown = false, clipped = false;
         bool initialized = false, lastInputEligible = false, growthBlocked = false;
@@ -57,8 +61,17 @@ public:
     // Select the smallest buffer within the allowed loss of the best the cap
     // can do over the requested window. Aim inside the allowed loss so that
     // reacting to a dip can still meet the profile goal.
-    void setGoalSolver(uint64_t windowUs, uint64_t tailPerMille = 1000) {
+    //
+    // The solved target steps between neighbouring grid values as single late
+    // frames enter and leave the window, and following each step down turned
+    // the buffer around within a second of raising it (113 reversals of 250 us
+    // or more in 240 s on a modelled GPU-bound 141 FPS stream, where vrr18's
+    // hold made 4). Release therefore goes no lower than the highest target
+    // solved within releaseHoldUs; a rise is never delayed. Zero follows the
+    // target at once.
+    void setGoalSolver(uint64_t windowUs, uint64_t tailPerMille = 1000, uint64_t releaseHoldUs = 0) {
         m_GoalWindowUs = windowUs; m_GoalTailPerMille = std::clamp<uint64_t>(tailPerMille, 1, 1000);
+        m_ReleaseHoldUs = std::min<uint64_t>(releaseHoldUs, MaximumReleaseHoldUs);
     }
     bool layerTransitionActive() const { return m_LayerTransitionActive; }
     bool fastLayerDrain() const { return m_LayerTransitionActive && m_LayerFastDrain; }
@@ -78,6 +91,7 @@ public:
         m_PreviousValid = false;
         m_Direction = 0;
         m_LayerTransitionActive = false;
+        m_HeldTargets.clear();
         ++m_Epoch;
         // Keep elapsed/last-eligible clocks and diagnostics: recurring phase
         // breaks must not rearm the unknown-evidence retention window forever.
@@ -101,6 +115,7 @@ public:
             sample.seed = true;
             sample.absorbed = sample.missed = false;
         }
+        m_HeldTargets.clear();
     }
     // Session totals and stage diagnostics continue across rate-band layers;
     // evidence, protection and coverage outcomes stay with each band.
@@ -126,6 +141,8 @@ public:
         m_Stats.currentUs = reduce(m_Stats.currentUs);
         m_Stats.targetUs = reduce(m_Stats.targetUs);
         m_ReleaseFraction = 0;
+        // Targets solved before the credit describe the old rate's need.
+        m_HeldTargets.clear();
     }
     // Source-rate change that lost VRR headroom: the retained evidence already
     // sets the target at the new rate (call after advance()), so step to it at
@@ -148,6 +165,9 @@ public:
         const uint64_t learnedUs = m_Stats.currentUs;
         previousUs = std::max(previousUs, m_Stats.minimumUs);
         m_LayerTransitionActive = false;
+        // A transition drains the previous layer's excess; an earlier visit's
+        // held targets must not stand in its way.
+        m_HeldTargets.clear();
         if (learnedUs == previousUs ||
             (learnedUs > previousUs && learnedUs - previousUs > m_Stats.toleranceUs)) return;
         m_LayerTransitionTargetUs = learnedUs;
@@ -382,8 +402,10 @@ private:
         };
         m_GoalSolver.clear();
         const Sample* previous = nullptr;
+        uint64_t oldestUs = 0;
         for (const auto& sample : m_Samples) {
             if (sample.seed || atUs - sample.at >= spanUs) { previous = nullptr; continue; }
+            if (!oldestUs) oldestUs = sample.at;
             if (previous && sample.epoch == previous->epoch && sample.slot > previous->slot &&
                     sample.slot - previous->slot < 1000000)
                 m_GoalSolver.add(lateness(*previous), lateness(sample), sample.slot - previous->slot,
@@ -396,18 +418,52 @@ private:
             m_Stats.targetUs = m_Stats.currentUs;
             return;
         }
+        // A window that has only begun to fill has almost no allowance. Until
+        // a quarter of it is observed, the few late frames that cannot yet
+        // establish a rate are budgeted against that quarter, at the
+        // evidence's own eligible share of the elapsed time.
+        const uint64_t elapsedUs = std::max<uint64_t>(oldestUs ? atUs - oldestUs : 0, GoalMinimumCoverageUs);
+        const uint64_t budgetUs = elapsedUs < spanUs / GoalBudgetWindowDivisor ?
+            uint64_t(double(m_GoalSolver.intendedUs()) * double(spanUs / GoalBudgetWindowDivisor) / double(elapsedUs)) : 0;
         const uint64_t aimPpm = 1000000 - (1000000 - m_Stats.probabilityPpm) * m_GoalTailPerMille / 1000;
         const auto solution = m_GoalSolver.solve(aimPpm, m_Stats.toleranceUs,
-            m_Stats.minimumUs, m_Stats.maximumUs, GoalStepUs);
-        m_Stats.headroomTargetUnclippedUs = solution.bufferUs;
+            m_Stats.minimumUs, m_Stats.maximumUs, GoalStepUs, budgetUs, m_Stats.probabilityPpm);
+        // Aiming inside the allowed loss is a margin, and where the loss curve
+        // is flat the margin is all the aim buys. On a recorded 138 FPS session
+        // whose remaining loss was one 15 ms frame every 36 s, 8.25 ms met
+        // 99.95% and the aim stepped between 8.25 and 9.0 ms as the fourth such
+        // frame entered and left the window: 0.75 ms of latency for a hundredth
+        // of a percent. The margin may cost GoalMarginCostUs beyond what the
+        // goal itself needs.
+        const uint64_t aimUs = std::min(solution.bufferUs,
+            solution.requiredUs > m_Stats.maximumUs - std::min(m_Stats.maximumUs, GoalMarginCostUs) ?
+                m_Stats.maximumUs : solution.requiredUs + GoalMarginCostUs);
+        m_Stats.headroomTargetUnclippedUs = aimUs;
         // Capped means the cap is what limits us, not merely that a stall no
         // permitted buffer could absorb is still inside the window.
-        m_Stats.clipped = !solution.goalReachable && solution.bufferUs >= m_Stats.maximumUs;
-        m_Stats.targetUs = std::clamp(solution.bufferUs, m_Stats.minimumUs, m_Stats.maximumUs);
+        m_Stats.clipped = !solution.goalReachable && aimUs >= m_Stats.maximumUs;
+        m_Stats.targetUs = std::clamp(aimUs, m_Stats.minimumUs, m_Stats.maximumUs);
+        m_Stats.requiredUs = std::clamp(solution.requiredUs, m_Stats.minimumUs, m_Stats.targetUs);
+        if (m_ReleaseHoldUs) {
+            // Monotonic deque: the front is the highest target still held.
+            while (!m_HeldTargets.empty() && m_HeldTargets.back().second <= m_Stats.targetUs) m_HeldTargets.pop_back();
+            m_HeldTargets.emplace_back(atUs, m_Stats.targetUs);
+        }
+    }
+    // Where release may go at this time: the solved target, or the highest
+    // target solved within the hold when that is above it.
+    uint64_t releaseFloorUs(uint64_t atUs) {
+        while (!m_HeldTargets.empty() && atUs - m_HeldTargets.front().first >= m_ReleaseHoldUs) m_HeldTargets.pop_front();
+        return m_HeldTargets.empty() || m_LayerTransitionActive ? m_Stats.targetUs :
+            std::clamp(m_HeldTargets.front().second, m_Stats.targetUs, m_Stats.maximumUs);
     }
     void move(uint64_t elapsed, bool growthAllowed) {
-        const int direction = m_Stats.targetUs > m_Stats.currentUs ? 1 :
-            m_Stats.targetUs < m_Stats.currentUs ? -1 : 0;
+        // Only release is held: a destination above the applied buffer is the
+        // solved target itself.
+        const uint64_t destinationUs = m_Stats.targetUs < m_Stats.currentUs ?
+            std::min(m_Stats.currentUs, releaseFloorUs(m_LastClockUs)) : m_Stats.targetUs;
+        const int direction = destinationUs > m_Stats.currentUs ? 1 :
+            destinationUs < m_Stats.currentUs ? -1 : 0;
         if (direction != m_Direction) m_ReleaseFraction = 0;
         m_Direction = direction;
         m_Stats.growthBlocked = direction > 0 && !growthAllowed;
@@ -415,8 +471,8 @@ private:
         m_ReleaseFraction += elapsed * (direction > 0 ? m_RiseRate : m_FallRate);
         const uint64_t step = m_ReleaseFraction / 1000000;
         m_ReleaseFraction %= 1000000;
-        const uint64_t distance = direction > 0 ? m_Stats.targetUs - m_Stats.currentUs :
-            m_Stats.currentUs - m_Stats.targetUs;
+        const uint64_t distance = direction > 0 ? destinationUs - m_Stats.currentUs :
+            m_Stats.currentUs - destinationUs;
         const uint64_t movement = std::min(step, distance);
         if (direction > 0) { m_Stats.currentUs += movement; if (movement) ++m_Stats.raises; }
         else { m_Stats.currentUs -= movement; if (movement) ++m_Stats.lowers; }
@@ -429,7 +485,10 @@ private:
     static constexpr uint64_t GoalEvaluationIntervalUs = 500000;
     static constexpr uint64_t GoalMinimumCoverageUs = 1000000;
     static constexpr uint64_t GoalStepUs = 250;
-    uint64_t m_GoalWindowUs = 0, m_GoalTailPerMille = 1000;
+    static constexpr uint64_t GoalMarginCostUs = 500;
+    static constexpr uint64_t GoalBudgetWindowDivisor = 4;
+    uint64_t m_GoalWindowUs = 0, m_GoalTailPerMille = 1000, m_ReleaseHoldUs = 0;
+    std::deque<std::pair<uint64_t, uint64_t>> m_HeldTargets; // (solved at, target)
     InputGoalSolver m_GoalSolver;
     Stats m_Stats;
     uint64_t m_FirstObservationUs = 0, m_LastObservationUs = 0, m_LastEligibleUs = 0;

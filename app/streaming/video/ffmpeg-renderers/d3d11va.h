@@ -3,6 +3,7 @@
 #include "dxgipresent.h"
 #include "dxgiwaitable.h"
 #include "d3d11composition.h"
+#include "d3d11decodecompletion.h"
 #include "d3d11pyrowave.h"
 #include "d3d11presentpolicy.h"
 #include "ivrrframepresenter.h"
@@ -13,6 +14,7 @@
 #include <dxgi1_6.h>
 
 #include <memory>
+#include <thread>
 
 extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
@@ -237,6 +239,14 @@ private:
     UINT64 m_VrrPresentReadyFenceValue;
     HANDLE m_VrrPresentReadyFenceEvent;
     HANDLE m_VrrDecodeReadyEvent;
+    // Timestamps every decode-to-render fence completion as it happens, for
+    // frames the pacing worker collects after their decode has finished.
+    void startDecodeCompletionWatch();
+    void stopDecodeCompletionWatch();
+    D3D11DecodeCompletion::Log m_DecodeCompletionLog;
+    std::thread m_DecodeCompletionThread;
+    HANDLE m_DecodeCompletionEvent = nullptr;
+    HANDLE m_DecodeCompletionStopEvent = nullptr;
     bool m_VrrPresentReadyAvailable;
     bool m_VrrGpuReadyAttempted;
     bool m_VrrGpuReadySignalResultValid;

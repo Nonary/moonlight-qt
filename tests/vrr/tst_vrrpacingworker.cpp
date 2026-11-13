@@ -1278,6 +1278,8 @@ void testShortAndAlreadyCompleteDecodeReadiness()
                        value("decode_sync_wait_us") == waitUs &&
                        value("decode_readiness_observed") == uint64_t(observed),
                    "readiness evidence must preserve immutable output and actual CPU wait");
+            expect(columns.contains("decode_completion_exact") && value("decode_completion_exact") == 0,
+                   "a completion the backend did not timestamp must be recorded as a collection-time bound");
             const auto graph = telemetry.timingGraphSnapshot().points;
             if (observed) {
                 expect(value("decode_complete_us") >= value("dequeue_us") + waitUs &&
@@ -1301,6 +1303,64 @@ void testShortAndAlreadyCompleteDecodeReadiness()
             qputenv("MOONLIGHT_VRR_TRACE", "");
         }
     }
+}
+
+void testTimestampedDecodeCompletion()
+{
+    // The decode finished 2.5 ms after decoder output while the frame spent
+    // 5.8 ms in the pacing queue. A backend that timestamped the completion
+    // reports that time, not the time the worker collected the frame.
+    class TimestampedPresenter : public FakeVrrFramePresenter {
+    public:
+        uint64_t completedUs = 0;
+        VrrDecodeReadiness observeDecodeReadiness(AVFrame*, uint64_t) override
+        {
+            return {0, true, true, completedUs};
+        }
+    };
+    resetFakeClock();
+    QTemporaryDir directory;
+    const QString path = directory.filePath("timestamped-decode.vrrtrace");
+    qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(path).constData());
+    TimestampedPresenter backend;
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime;
+    uint64_t outputUs = 0;
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "timestamped decode completion worker must start");
+        FrozenTestClock clock;
+        auto input = frame(1, lifetime);
+        outputUs = input.decoderOutputUs();
+        backend.completedUs = outputUs + 2500;
+        clock.advance(5803);
+        worker.submit(std::move(input));
+        expect(backend.waitForPrepareCount(1), "timestamped completion must reach preparation");
+        clock.resume();
+        expect(backend.waitForPresentCount(1), "timestamped completion frame must present");
+    }
+    const auto lines = readExpandedTrace(path).split('\n');
+    const auto columns = lines.value(0).split(',');
+    const auto fields = lines.value(1).split(',');
+    const auto value = [&](const char* name) {
+        return fields.value(columns.indexOf(name)).toULongLong();
+    };
+    expect(value("decode_complete_us") == outputUs + 2500 && value("decode_completion_exact") == 1 &&
+               value("decode_readiness_observed") == 1 && value("decode_sync_wait_us") == 0,
+           "a timestamped completion must reach the trace unchanged by the later collection time");
+    expect(value("decode_complete_us") < value("dequeue_us") &&
+               value("source_time_us") == value("decode_complete_us"),
+           "a timestamped completion earlier than the dequeue must anchor the source mapping");
+    const auto graph = telemetry.timingGraphSnapshot().points;
+    expect(graph.size() == 1 && graph[0].decoderReadyUs == value("decode_complete_us"),
+           "the graph must show the same timestamped completion as scheduling");
+    const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_TIMESTAMPED_DECODE_TRACE");
+    if (exportPath && exportPath[0]) {
+        QFile::remove(QString::fromLocal8Bit(exportPath));
+        expect(QFile::copy(path, QString::fromLocal8Bit(exportPath)),
+               "timestamped-completion fixture must export for exact replay");
+    }
+    qputenv("MOONLIGHT_VRR_TRACE", "");
 }
 
 class NativeScheduledPresenter : public FakeVrrFramePresenter {
@@ -4429,6 +4489,7 @@ int main()
     runNamed("testRepeatedDecodeContentionKeepsPresenting()", [&] { testRepeatedDecodeContentionKeepsPresenting(); });
     runNamed("testFirstFrameDecodeReadinessTrace()", [&] { testFirstFrameDecodeReadinessTrace(); });
     runNamed("testShortAndAlreadyCompleteDecodeReadiness()", [&] { testShortAndAlreadyCompleteDecodeReadiness(); });
+    runNamed("testTimestampedDecodeCompletion()", [&] { testTimestampedDecodeCompletion(); });
     runNamed("testNativeScheduledEnqueueCadenceAndLifecycle()", [&] { testNativeScheduledEnqueueCadenceAndLifecycle(); });
     runNamed("testTelemetrySnapshotsRemainCumulative()", [&] { testTelemetrySnapshotsRemainCumulative(); });
     runNamed("testSuspendDiscardAndFreshFrame()", [&] { testSuspendDiscardAndFreshFrame(); });

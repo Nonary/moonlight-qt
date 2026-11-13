@@ -34,10 +34,31 @@ late blocking/nonblocking completion checks, cold and warm GPU estimates,
 retained startup protection, prompt real GPU stalls, actual readiness floors,
 and completion arithmetic near the timestamp limit. `tst_vrrcacheidentity`
 checks that the corrected estimator cannot load a prior saved startup delay.
-It also pins that a blocked D3D11 decode fence and its render work set the buffer,
+It also pins that a blocked D3D11 decode fence and the render work beyond the
+target's own allowance set the buffer,
 while unblocked collection stays queue-neutral and other backends keep their
-estimate. `tst_inputgoalintegration` pins that a stall beyond the cap spends no buffer,
-while sustained jitter beyond the cap still reaches it.
+estimate. `tst_inputgoalintegration` pins that a stall beyond the cap spends no buffer
+however many the window holds, that an interval loses at most itself, that one
+late frame in a window that has only begun to fill buys nothing while sustained
+lateness is held to its rate, that release waits out its hold, that
+sustained jitter beyond the cap still reaches it, and that the aim's margin
+costs at most 500 us beyond what the goal itself needs.
+
+`tst_vrrbufferregressions` is the adaptive-buffer gate described in
+`AGENTS.md`. It was dropped from `vrr.pro` and stopped compiling when the
+goal-buffer policy was merged on 2026-10-29, and was restored on 2026-11-09.
+The contracts that merge broke are listed in its `g_Known` table with their
+evidence; each is a decision still to make. Its `unabsorbable-loss` scenario
+pins the three solver rules above through a production session. Its
+`slow-gpu-decode` scenario replays a recorded Radeon 780M span
+(`slowdecodespan.h`, decode close to the 138 FPS source interval) through a
+serial decoder and worker, and requires a settled buffer and source mapping
+when the presenter timestamps decode completion; it prints the result with
+collection times only beside it. `tst_dxgipresent` covers the watcher that
+takes those timestamps, `tst_vrrtimingcontroller` that a timestamped
+completion maps and sizes the same however late the worker collects the
+frame, and `tst_vrrpacingworker` that it reaches the controller and the
+`decode_completion_exact` trace column.
 
 ## Capture and exact replay
 

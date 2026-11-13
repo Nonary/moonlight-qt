@@ -61,6 +61,7 @@ public:
         uint64_t sequence=0, arrival=0, output=0, ready=0, receive=0, reassembled=0, decodeSubmit=0;
         uint64_t prepare=0, present=0, loss=0;
         int frame=0; uint32_t rtp=0; bool rtpValid=true, cancelled=false, completion=false;
+        bool completionExact=false; // ready is the backend's own completion timestamp
         bool assumedPrepare=false, assumedPresent=false;
     };
     struct Presenter : IVrrFramePresenter {
@@ -70,7 +71,7 @@ public:
         VrrDecodeReadiness observeDecodeReadiness(AVFrame* f,uint64_t) override {
             auto& i=h->inputs[size_t(f->pts)]; const auto start=LiGetMicroseconds();
             if (i.completion) h->advance(std::max(start,i.ready));
-            return {LiGetMicroseconds()-start,i.completion,!i.completion};
+            return {LiGetMicroseconds()-start,i.completion,!i.completion,i.completion&&i.completionExact?i.ready:0};
         }
         VrrPrepareResult prepareFrame(AVFrame* f,uint64_t) override {
             active=&h->inputs[size_t(f->pts)];
@@ -170,7 +171,7 @@ public:
                 if(!number(key,std::numeric_limits<int>::max()))return false;
             for(const auto* key:{"rtp_timestamp","lost_packets","trace_schema","trace_model_kind"})
                 if(!number(key,std::numeric_limits<uint32_t>::max()))return false;
-            for(const auto* key:{"rtp_valid","cancelled","decode_readiness_observed","model_decode_observed",
+            for(const auto* key:{"rtp_valid","cancelled","decode_readiness_observed","model_decode_observed","decode_completion_exact",
                     "prepared_ahead","can_latch_present","additional_queued_frame"})
                 if(!number(key,1))return false;
 #define VRR_PARSE_PARAMETER(type,name,member,defaultValue) \
@@ -188,6 +189,7 @@ public:
             i.receive=value("frame_receive_us");i.reassembled=value("frame_reassembled_us");i.decodeSubmit=value("decode_submit_us");
             i.prepare=value("prepare_us");i.present=value("present_call_us");i.cancelled=value("cancelled");i.loss=value("lost_packets");
             i.completion=value("decode_readiness_observed")||value("model_decode_observed");
+            i.completionExact=value("decode_completion_exact");
             observedPreparedAhead+=value("prepared_ahead")!=0;
             const auto costKnown=[&](const char* duration,const char* start,const char* end) {
                 if(!columns.contains(duration))return false;

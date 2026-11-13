@@ -654,6 +654,7 @@ void VrrTimingController::initializeTimeline(const PacedFrame& frame)
 
 uint64_t VrrTimingController::estimatedDecodeCompleteUs(const PacedFrame& frame) const
 {
+    if (frame.decodeCompletionExact()) return frame.decodeCompleteUs();
     return estimateDecodeCompleteUs(frame.decoderOutputUs(), frame.decodeCompleteUs(),
                                     frame.decodeSyncWaitUs(), m_DecodeGpuTypicalUs);
 }
@@ -662,7 +663,8 @@ void VrrTimingController::learnDecodeGpu(const PacedFrame& frame)
 {
     const uint64_t output = frame.decoderOutputUs();
     const uint64_t complete = frame.decodeCompleteUs();
-    if (!promptDecodeCompletion(output, complete, frame.decodeSyncWaitUs())) return;
+    if (frame.decodeCompletionExact() ? complete <= output :
+            !promptDecodeCompletion(output, complete, frame.decodeSyncWaitUs())) return;
     m_DecodeGpuSamples[m_DecodeGpuNext] = complete - output;
     m_DecodeGpuNext = (m_DecodeGpuNext + 1) % m_DecodeGpuSamples.size();
     m_DecodeGpuCount = std::min(m_DecodeGpuCount + 1, m_DecodeGpuSamples.size());
@@ -1565,8 +1567,9 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     // The decoder thread signals a D3D11 decode fence, so a wait that blocked
     // ended at real GPU completion however long the frame sat in our queue.
     m_Pending.blockedDecodeReadyUs = !frame.decoderOutputComplete() &&
-        frame.decodeSyncWaitUs() >= PreciseCompletionWaitUs ?
+        (frame.decodeCompletionExact() || frame.decodeSyncWaitUs() >= PreciseCompletionWaitUs) ?
         frame.decodeCompleteUs() - std::min(frame.decodeCompleteUs(), inputBacklog) : 0;
+    m_Pending.inputRenderReserveUs = saturatingAdd(renderOffsetUs, m_Parameters.presentationSafetyUs);
     m_Pending.inputValid = frame.reassembledUs() != 0 &&
         frame.decodeSubmitUs() >= frame.reassembledUs() &&
         frame.decoderOutputUs() >= frame.decodeSubmitUs() &&
@@ -2503,15 +2506,29 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_InputPercentileBeforeUs = p.applied;
                 const auto inputBefore = m_InputBuffer.stats();
                 // A frame blocked on decode cannot start rendering until the
-                // fence completes, and nothing else reserves time for that
-                // render work. Measured durations from the fixed slot keep this
-                // independent of the applied buffer, so it cannot feed itself.
+                // fence completes. Its requirement is the render work that
+                // then follows, less what the target already allows for it:
+                // the target sits the typical preparation after slot + buffer,
+                // and counting preparation from the slot again held 4.0 ms
+                // where every frame needed 2.6 (2 ms preparation, 141 FPS).
+                //
+                // GPU render time is known only when its fence was still
+                // pending at the target, and then exactly: completion less the
+                // end of preparation. The residual wait alone understated a
+                // frame whose preparation ended before the target by that idle
+                // time, so a late frame could read as absorbed. A fence that
+                // had already completed adds nothing: when is not known.
+                // These are durations from the fixed slot, whenever
+                // preparation actually began.
                 int64_t inputRequiredUs = m_Pending.inputRequiredUs;
                 if (m_Pending.blockedDecodeReadyUs) {
+                    const uint64_t gpuRenderUs = m_Pending.deferredGpuReadyUs > m_Pending.preparationCompleteUs &&
+                            m_Pending.preparationCompleteUs ?
+                        m_Pending.deferredGpuReadyUs - m_Pending.preparationCompleteUs : m_Pending.deferredGpuWaitUs;
                     inputRequiredUs = std::max(inputRequiredUs, signedDifference(
                         saturatingAdd(m_Pending.blockedDecodeReadyUs,
-                            saturatingAdd(preparationServiceUs, m_Pending.deferredGpuWaitUs)),
-                        m_Pending.inputSlotUs));
+                            saturatingAdd(preparationServiceUs, gpuRenderUs)),
+                        saturatingAdd(m_Pending.inputSlotUs, m_Pending.inputRenderReserveUs)));
                 }
                 m_InputBuffer.observe(m_Pending.smoothness.frame,
                     enqueueUs ? enqueueUs : m_Pending.inputObservationUs,
@@ -3887,7 +3904,8 @@ void VrrTimingController::updatePlayoutHistory(
                 }
                 m_InputHeadroomUs = vrrHeadroomUs;
                 m_InputBuffer.setGoalSolver(m_Parameters.playoutInputGoalWindowUs,
-                    m_Parameters.playoutInputGoalTailPerMille ? m_Parameters.playoutInputGoalTailPerMille : 1000);
+                    m_Parameters.playoutInputGoalTailPerMille ? m_Parameters.playoutInputGoalTailPerMille : 1000,
+                    m_Parameters.playoutMeanMissHoldUs);
                 m_InputBuffer.advance(nowUs, playoutDelayMinimumUs(),
                     playoutDelayMaximumUs(), m_Parameters.playoutInputPercentileTargetPerMillion,
                     m_Parameters.playoutInputPercentileWindowUs,

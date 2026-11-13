@@ -608,6 +608,8 @@ private:
         int64_t inputReadinessBudgetUs = 0;
         int64_t inputRequiredUs = 0;
         uint64_t blockedDecodeReadyUs = 0;
+        // Render time this frame's target already allows after its slot.
+        uint64_t inputRenderReserveUs = 0;
         int64_t inputClockOffsetUs = 0;
         bool inputValid = false;
         bool intervalValid = false;

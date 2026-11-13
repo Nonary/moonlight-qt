@@ -443,6 +443,11 @@ void actualControllerAndInputIsolation() {
 // A D3D11 fence the worker blocked on is real completion, and render work follows
 // it, so both are evidence. Shaped like the 2026-11-03 Radeon 780M capture, where
 // decode alone took most of a 144 FPS frame. Other collection stays queue-neutral.
+//
+// The target already sits the typical preparation (2 ms here) after slot + buffer,
+// so only render work beyond that needs buffer. With the buffer pinned, every
+// interval is inside tolerance from 7.25 ms and exact at 7.6 ms; counting the
+// preparation from the slot again asked for 9.0 ms.
 void blockedDecodeFenceTrainsInputBuffer() {
     const auto targetUs=[](bool asynchronousOutput,bool blocked) {
         VrrSessionConfig session;
@@ -473,8 +478,8 @@ void blockedDecodeFenceTrainsInputBuffer() {
     };
     const auto blockedFence=targetUs(true,true);
     std::fprintf(stderr,"blocked D3D11 fence target %llu us\n",(unsigned long long)blockedFence);
-    check(blockedFence>=8500 && blockedFence<=9750,
-          "blocked fence completion and render work set the buffer");
+    check(blockedFence>=6750 && blockedFence<=7750,
+          "blocked fence completion and render work beyond the target's allowance set the buffer");
     check(targetUs(true,false)<=1000,"an unblocked late collection stays queue-neutral on D3D11");
     check(targetUs(false,true)<=1000,"other backends keep their decode estimate");
 }

@@ -422,6 +422,11 @@ int VrrPacingWorker::run()
         if (preparedAhead) {
             frame.noteGpuReadyUs(queuedFrame.preparation->timing.decodeReadyUs);
         }
+        if (decodeReadiness.completedUs) {
+            // The backend timestamped the completion when it happened, so it
+            // does not depend on how long this frame waited for the worker.
+            frame.noteDecodeCompletedUs(decodeReadiness.completedUs);
+        }
         if (decodeReadiness.completionObserved) {
             // This is an upper bound on completion, sampled after the native
             // wait. Adding the wait duration to decoder output is wrong when
@@ -1551,6 +1556,7 @@ void VrrPacingWorker::recordFrameCompletion(const QueuedFrame& queuedFrame,
     row.lostPackets = frame.lostPackets();
     row.timestampValid = frame.timestampValid();
     row.decodeCompleteUs = frame.decodeCompleteUs();
+    row.decodeCompletionExact = frame.decodeCompletionExact();
     row.decoderOutputUs = frame.decoderOutputUs();
     row.latencyMode = m_Config.latencyMode;
     row.receiveUs = frame.receiveUs();
