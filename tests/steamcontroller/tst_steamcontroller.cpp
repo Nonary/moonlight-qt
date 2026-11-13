@@ -19,7 +19,7 @@ using namespace SteamController;
 
 // Network boundary only: execute the real registry and link bodies without a stream. What the
 // host bridge sends is recorded so the focus policy can be checked.
-struct HostState { short number, mask; int flags; uint8_t lt, rt; short lsX, lsY, rsX, rsY; };
+struct HostState { uint8_t number; uint16_t mask; int flags; uint8_t lt, rt; short lsX, lsY, rsX, rsY; };
 struct HostTouch { uint8_t number, event, pad; uint32_t pointer; };
 static std::vector<HostState> g_HostStates;
 static std::vector<HostTouch> g_HostTouches;
@@ -28,7 +28,7 @@ static std::vector<HostMotion> g_HostMotionLog;
 static int g_HostMotions;
 extern "C" {
 int LiSendControllerArrivalEvent(uint8_t, uint16_t, uint8_t, uint32_t, uint16_t) { return 0; }
-int LiSendMultiControllerEvent(short number, short mask, int flags, unsigned char lt, unsigned char rt, short lsX, short lsY, short rsX, short rsY)
+int LiSendMultiControllerEvent(uint8_t number, uint16_t mask, int flags, unsigned char lt, unsigned char rt, short lsX, short lsY, short rsX, short rsY)
 {
     g_HostStates.push_back({number, mask, flags, lt, rt, lsX, lsY, rsX, rsY});
     return 0;
