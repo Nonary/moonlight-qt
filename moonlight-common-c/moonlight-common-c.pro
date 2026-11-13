@@ -88,6 +88,10 @@ CONFIG(debug, debug|release) {
     DEFINES += LC_DEBUG
 }
 
+# Enable support for C11 atomics on MSVC
+*-msvc {
+    QMAKE_CFLAGS += -std:c11 -experimental:c11atomics
+}
 
 # Disable unused parameter warnings on GCC and Clang
 *-g++|*-clang* {
