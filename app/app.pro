@@ -502,6 +502,7 @@ win32:!winrt {
         streaming/video/ffmpeg-renderers/presentationclock.h \
         streaming/video/ffmpeg-renderers/dxgipresent.h \
         streaming/video/ffmpeg-renderers/dxgiwaitable.h \
+        streaming/video/ffmpeg-renderers/d3d11decodecompletion.h \
         streaming/video/ffmpeg-renderers/d3d11fencewait.h \
         streaming/video/ffmpeg-renderers/d3d11presentpolicy.h \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.h

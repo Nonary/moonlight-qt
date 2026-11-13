@@ -20,6 +20,7 @@
 //   tst_vrrbufferregressions start-release rate-round-trip
 
 #include "capturespans.h"
+#include "slowdecodespan.h"
 #include "vrrproductionsession.h"
 
 #include <algorithm>
@@ -1626,6 +1627,100 @@ void testSmoothingStaysInsideItsBudget()
     }
 }
 
+// 13. A client whose GPU decode runs close to the source interval must hold
+// a steady buffer and a steady source clock once it has settled, including
+// above one source interval of buffer. Regression: found 2026-11-13 on a
+// recorded 4K 138 FPS HEVC stream on a Radeon 780M (slowdecodespan.h). Above
+// 7.25 ms of buffer the worker reached each fast frame after its decode had
+// finished and could report only its own arrival time, so the source mapping
+// rose 2 ms while the solved buffer fell 2 ms and both swung back every 10 to
+// 15 s; and Smooth's aim inside its allowance stepped the buffer between 8.25
+// and 9.0 ms as single 15 ms frames entered and left the window, although
+// 8.25 ms met the goal. vrr18 held 6.4 to 6.65 ms on the same input. The
+// decoder is one serial queue and the worker one serial thread, as live; the
+// D3D11 presenter now timestamps each decode completion itself.
+void testSlowGpuDecodeHoldsASteadyBuffer()
+{
+    struct Run { uint64_t bufferLow, bufferHigh; int64_t mappingLow, mappingHigh; size_t late, frames; };
+    const auto run = [&](const VrrSessionConfig& session, bool timestamped) {
+        VrrTimingController controller(session, t_CanLatch, vrrTimingParametersForSession(session));
+        controller.seedPlayoutDelayStart(1000);
+        constexpr size_t kLoops = 14; // 8.75 minutes
+        const size_t span = sizeof(kSlowDecodeSpan) / sizeof(kSlowDecodeSpan[0]), total = span * kLoops;
+        const uint64_t tolerance = uint64_t(session.timingOptions.toleranceUs);
+        uint64_t ticks = 0, lastSubmittedUs = 0, decoderFreeUs = 0;
+        Run result{UINT64_MAX, 0, INT64_MAX, INT64_MIN, 0, 0};
+        int64_t secondSum = 0;
+        size_t secondCount = 0;
+        for (size_t i = 0; i < total; ++i) {
+            const auto& in = kSlowDecodeSpan[i % span];
+            ticks += in.ticks;
+            const uint64_t sourceUs = kOriginUs + ticks * 1000000 / 90000;
+            const uint64_t outputUs = sourceUs + kBaseLatencyUs + in.lateUs + 100;
+            PacedFrame frame(nullptr, int(i), uint32_t(ticks + 0xFFF00000u), true, outputUs);
+            const uint64_t submitUs = outputUs - 600;
+            frame.setDeliveryTimeline(submitUs - 300, submitUs - 100, submitUs);
+            frame.setDecoderOutputComplete(false);
+            const uint64_t completedUs = std::max(outputUs, decoderFreeUs) + in.decodeUs;
+            decoderFreeUs = completedUs;
+            // The worker collects a frame once the previous present returned,
+            // and then waits for its decode if that is still running.
+            const uint64_t dequeueUs = std::max(outputUs, lastSubmittedUs);
+            const uint64_t now = std::max(dequeueUs, completedUs);
+            frame.noteDecodeSyncWaitUs(now - dequeueUs);
+            if (timestamped) frame.noteDecodeCompletedUs(completedUs);
+            frame.noteGpuReadyUs(now);
+            const auto d = controller.schedule(frame, now);
+            if (d.trajectory.resyncRecommended) controller.noteTrajectoryDeferred();
+            const uint64_t prepareStartUs = std::max(now, d.renderStartUs);
+            const uint64_t preparedUs = prepareStartUs + in.prepareUs;
+            controller.notePreparationDuration(in.prepareUs, 0, preparedUs);
+            const uint64_t targetReachedUs = std::max(preparedUs, d.targetUs);
+            const uint64_t renderedUs = std::max(preparedUs + in.renderUs, targetReachedUs);
+            controller.noteDeferredGpuReady(renderedUs - targetReachedUs, true, renderedUs,
+                renderedUs - prepareStartUs, renderedUs != targetReachedUs);
+            controller.noteSchedulerDelays(0, 0, true);
+            controller.noteSubmission(true, false, renderedUs, renderedUs);
+            lastSubmittedUs = renderedUs;
+            if (i < total / 2) continue;
+            ++result.frames;
+            result.bufferLow = std::min(result.bufferLow, d.playoutDelayUs);
+            result.bufferHigh = std::max(result.bufferHigh, d.playoutDelayUs);
+            result.late += renderedUs > d.targetUs + tolerance;
+            // The mapping as one-second means: it is a slewed clock offset.
+            secondSum += int64_t(d.sourceTimeUs) - int64_t(sourceUs);
+            if (++secondCount == 138) {
+                result.mappingLow = std::min(result.mappingLow, secondSum / 138);
+                result.mappingHigh = std::max(result.mappingHigh, secondSum / 138);
+                secondSum = 0; secondCount = 0;
+            }
+        }
+        return result;
+    };
+    for (const auto& preset : kPresets) {
+        const auto& smoothing = kSmoothing[1];
+        const std::string name = label("slow-gpu-decode", preset, smoothing);
+        const auto session = vrrProductionSession(preset.mode, 144, 144, smoothing.smooth, smoothing.absorb);
+        const Run timestamped = run(session, true), collected = run(session, false);
+        report("%-52s buffer %5" PRIu64 "-%5" PRIu64 " mapping moved %4" PRId64 " late %4zu of %zu | collection time only: buffer %5" PRIu64 "-%5" PRIu64 " mapping moved %4" PRId64 " late %4zu\n",
+            name.c_str(), timestamped.bufferLow, timestamped.bufferHigh, timestamped.mappingHigh - timestamped.mappingLow,
+            timestamped.late, timestamped.frames, collected.bufferLow, collected.bufferHigh,
+            collected.mappingHigh - collected.mappingLow, collected.late);
+        // The target lies within the margin's cost (500 us) of what the goal
+        // needs and moves on a 250 us grid.
+        check(timestamped.bufferHigh - timestamped.bufferLow <= 750, name,
+            "a settled buffer stays within the solver's margin on a steady slow-decode workload",
+            "applied buffer moved between %" PRIu64 " and %" PRIu64 " us over the last half",
+            timestamped.bufferLow, timestamped.bufferHigh);
+        // The span's own fastest decode moves 0.7 ms between its light and
+        // heavy passages, and the mapping follows it (vrr18: 0.6 ms).
+        check(timestamped.mappingHigh - timestamped.mappingLow <= 1000, name,
+            "the source clock does not move with the buffer on a steady slow-decode workload",
+            "one-second mean mapping moved %" PRId64 " us over the last half",
+            timestamped.mappingHigh - timestamped.mappingLow);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1649,6 +1744,7 @@ int main(int argc, char** argv)
         {"catch-up-carry", testCatchUpCarryDrainsBetweenLateFrames},
         {"invalid-expiry", testExpiryThroughInvalidEvidence},
         {"smoothing-budget", testSmoothingStaysInsideItsBudget},
+        {"slow-gpu-decode", testSlowGpuDecodeHoldsASteadyBuffer},
     };
     std::vector<const char*> selection;
     for (int i = 1; i < argc; ++i) {

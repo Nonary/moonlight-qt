@@ -2571,6 +2571,20 @@ void VrrReplayConfigTest::decodeReadinessOrder()
         1000, 6888, 1020, 6803, 6890, 90, true, true, true, true));
     QVERIFY(!vrrDecodeReadinessOrderValid(
         1000, 1000, 1020, 0, 0, 0, false, true, true, true));
+    // A completion the backend timestamped itself may precede the dequeue,
+    // but not decoder output, and a worker that waited saw it complete.
+    QVERIFY(vrrDecodeReadinessOrderValid(
+        1000, 3400, 1020, 6803, 6805, 0, true, true, true, true, true, true));
+    QVERIFY(vrrDecodeReadinessOrderValid(
+        1000, 6885, 1020, 6803, 6890, 83, true, true, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 3400, 1020, 6803, 6890, 83, true, true, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 900, 1020, 6803, 6805, 0, true, true, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 6900, 1020, 6803, 6890, 0, true, true, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 3400, 1020, 6803, 6805, 0, true, true, true, false, true, true));
 }
 
 void VrrReplayConfigTest::recordedWorkerQueueCapacity()

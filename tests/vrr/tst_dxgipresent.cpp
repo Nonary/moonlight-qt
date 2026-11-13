@@ -1,8 +1,11 @@
 #include "../../app/streaming/video/ffmpeg-renderers/dxgipresent.h"
+#include "../../app/streaming/video/ffmpeg-renderers/d3d11decodecompletion.h"
 #include "../../app/streaming/video/ffmpeg-renderers/d3d11fencewait.h"
 #include "../../app/streaming/video/ffmpeg-renderers/d3d11presentpolicy.h"
 
 #include <cstdio>
+#include <limits>
+#include <vector>
 #include "../../app/streaming/video/ffmpeg-renderers/dxgiwaitable.h"
 
 namespace {
@@ -326,5 +329,97 @@ int main()
     submit(DxgiPresentParameters::adaptive(true, allowTearing), 1, 0);
     swapChain.result = 1;
     submit(DxgiPresentParameters::adaptive(false, allowTearing), 0, allowTearing);
+
+    // Decode completion watcher. A scripted fence: boundary k completes at
+    // completesAt[k]; each wait() advances the clock to the next wake.
+    {
+        struct Fence {
+            std::vector<uint64_t> completesAt; // index = boundary
+            uint64_t now = 0, armed = 0;
+            std::vector<uint64_t> wakes;       // scripted wake times, then stop
+            size_t nextWake = 0;
+            uint64_t completed() const {
+                uint64_t value = 0;
+                for (size_t k = 1; k < completesAt.size() && completesAt[k] <= now; ++k) value = k;
+                return value;
+            }
+        };
+        const auto run = [](Fence& fence, D3D11DecodeCompletion::Log& log, bool armFails = false) {
+            D3D11DecodeCompletion::watch(log, [&] { return fence.now; }, [&] { return fence.completed(); },
+                [&](uint64_t value) { fence.armed = value; return !armFails; },
+                [&] {
+                    if (fence.nextWake >= fence.wakes.size()) return false;
+                    fence.now = fence.wakes[fence.nextWake++];
+                    return true;
+                });
+        };
+        {
+            // Boundaries 1 and 2 finished before the watcher started.
+            Fence fence{{0, 100, 200, 5000, 9000, 9040, 30000}, 1000, 0, {5030, 9060, 9061}};
+            D3D11DecodeCompletion::Log log;
+            run(fence, log);
+            check(log.completedUs(1) == 0 && log.completedUs(2) == 0,
+                  "a boundary that finished before the watcher started has no known completion time");
+            check(log.completedUs(3) == 5030,
+                  "a boundary is timestamped at the wake that follows its completion");
+            check(log.completedUs(4) == 9060 && log.completedUs(5) == 9060,
+                  "boundaries found complete at one wake share its time");
+            check(log.completedUs(6) == 0 && fence.armed == 6,
+                  "an unfinished boundary stays armed and unrecorded");
+        }
+        {
+            // A wake left over from an earlier boundary must not be recorded.
+            Fence fence{{0, 5000}, 1000, 0, {2000, 3000, 5040}};
+            D3D11DecodeCompletion::Log log;
+            run(fence, log);
+            check(log.completedUs(1) == 5040, "a stale wake must not timestamp an unfinished decode");
+        }
+        {
+            Fence fence{{0, 5000}, 1000, 0, {5040}};
+            D3D11DecodeCompletion::Log log;
+            run(fence, log, true);
+            check(log.completedUs(1) == 0, "a failed completion request must stop the watcher");
+        }
+        {
+            D3D11DecodeCompletion::Log log;
+            unsigned polls = 0;
+            D3D11DecodeCompletion::watch(log, [] { return 7ULL; },
+                [&] { return polls++ ? (std::numeric_limits<uint64_t>::max)() : 4ULL; },
+                [](uint64_t) { return true; }, [] { return true; });
+            check(log.completedUs(5) == 0, "the device-removed sentinel must never count as a completed decode");
+        }
+        {
+            // After a long gap only what a reader could still ask for is kept.
+            Fence fence{std::vector<uint64_t>(1001, 5000), 1000, 0, {5040}};
+            fence.completesAt[0] = 0;
+            D3D11DecodeCompletion::Log log;
+            run(fence, log);
+            check(log.completedUs(1000) == 5040 &&
+                  log.completedUs(1000 - (D3D11DecodeCompletion::Log::Capacity - 1)) == 5040 &&
+                  log.completedUs(1000 - D3D11DecodeCompletion::Log::Capacity) == 0,
+                  "a burst of completions must stay inside the log");
+        }
+        {
+            D3D11DecodeCompletion::Log log;
+            for (uint64_t boundary = 1; boundary <= D3D11DecodeCompletion::Log::Capacity + 1; ++boundary)
+                log.record(boundary, 1000 + boundary);
+            check(log.completedUs(1) == 0 && log.completedUs(2) == 1002 &&
+                  log.completedUs(D3D11DecodeCompletion::Log::Capacity + 1) == 1001 + D3D11DecodeCompletion::Log::Capacity,
+                  "the log must retain the newest completions and forget the oldest");
+            check(log.completedUs(0) == 0, "boundary zero means no boundary was captured");
+            log.clear();
+            check(log.completedUs(2) == 0, "a cleared log must not answer for an earlier device");
+        }
+        check(D3D11DecodeCompletion::resolve(4000, false, 9000) == 4000,
+              "a frame that finished before the worker asked must use the watcher's time");
+        check(D3D11DecodeCompletion::resolve(0, false, 9000) == 0,
+              "a frame that had already finished is unknown without the watcher");
+        check(D3D11DecodeCompletion::resolve(0, true, 9000) == 9000,
+              "a frame the worker waited for on the fence event finished at that wake");
+        check(D3D11DecodeCompletion::resolve(8990, true, 9000) == 8990,
+              "the earlier of the watcher's and the worker's wake is the completion");
+        check(D3D11DecodeCompletion::resolve(9500, false, 9000) == 0,
+              "a completion later than the present cannot be the frame's completion");
+    }
     return failures == 0 ? 0 : 1;
 }

@@ -2920,6 +2920,69 @@ void testProducerClockExcludesLateGpuCollection()
            "promptly observed genuine long GPU service must remain in the producer clock");
 }
 
+void testDecodeCompletionTimestampIsIndependentOfCollection()
+{
+    // 138 FPS with GPU decode in runs of 2.5 ms and 6.5 ms. One worker collects
+    // every frame the moment its decode finishes. The other is still holding
+    // the previous frame and reaches each one 4.5 ms after decoder output, as
+    // it does once the playout buffer exceeds a source interval, so it waits
+    // only for the slow frames. The decode itself is identical in both.
+    struct Outcome { int64_t mappingUs = 0; uint64_t bufferUs = 0; };
+    const auto run = [](bool lateCollection, bool timestamped) {
+        auto session = config(144, 144);
+        session.smoothFrameTiming = true;
+        VrrTimingController controller(session, true, vrrTimingParametersForSession(session));
+        int64_t mappingSum = 0, mappings = 0;
+        Outcome outcome;
+        for (int i = 0; i < 138 * 60; ++i) {
+            const uint64_t output = 1000000 + uint64_t(i) * 652 * 1000000 / 90000;
+            const uint64_t completed = output + ((i / 20) % 2 ? 6500 : 2500);
+            const uint64_t waitStart = lateCollection ? output + 4500 : output;
+            const uint64_t collected = std::max(completed, waitStart);
+            auto input = frame(i + 1, uint32_t(i) * 652, true, output);
+            input.setDeliveryTimeline(output - 900, output - 800, output - 500);
+            input.setDecoderOutputComplete(false);
+            if (timestamped) input.noteDecodeCompletedUs(completed);
+            input.noteGpuReadyUs(collected);
+            input.noteDecodeSyncWaitUs(collected - waitStart);
+            const auto d = controller.schedule(input, collected);
+            const uint64_t prepared = std::max(collected, d.renderStartUs) + 1000;
+            controller.notePreparationDuration(1000, 0, prepared);
+            controller.noteSchedulerDelays(0, 0, true);
+            const uint64_t submitted = std::max(d.targetUs, prepared);
+            controller.noteSubmission(true, false, submitted, submitted);
+            if (i >= 138 * 30) {
+                mappingSum += int64_t(d.sourceTimeUs) - int64_t(output);
+                ++mappings;
+                outcome.bufferUs = d.playoutDelayUs;
+            }
+        }
+        outcome.mappingUs = mappingSum / std::max<int64_t>(1, mappings);
+        return outcome;
+    };
+    const auto prompt = run(false, true), late = run(true, true), bound = run(true, false);
+    std::fprintf(stderr, "decode completion vs collection: mapping %lld / %lld / %lld us, buffer %llu / %llu / %llu us "
+                 "(prompt / collected late with timestamp / collected late without)\n",
+                 static_cast<long long>(prompt.mappingUs), static_cast<long long>(late.mappingUs),
+                 static_cast<long long>(bound.mappingUs), static_cast<unsigned long long>(prompt.bufferUs),
+                 static_cast<unsigned long long>(late.bufferUs), static_cast<unsigned long long>(bound.bufferUs));
+    expect(std::llabs(late.mappingUs - prompt.mappingUs) <= 100,
+           "a timestamped decode completion must map the source clock the same however late the worker collects the frame");
+    expect(std::llabs(int64_t(late.bufferUs) - int64_t(prompt.bufferUs)) <= 250,
+           "a timestamped decode completion must size the input buffer the same however late the worker collects the frame");
+
+    // The collection time must not replace or move a timestamped completion.
+    auto input = frame(1, 652, true, 1000000);
+    input.noteDecodeCompletedUs(1002500);
+    input.noteGpuReadyUs(1009000);
+    expect(input.decodeCompletionExact() && input.decodeCompleteUs() == 1002500,
+           "a later collection time must not overwrite a timestamped completion");
+    auto early = frame(2, 1304, true, 1000000);
+    early.noteDecodeCompletedUs(999000);
+    expect(early.decodeCompleteUs() == 1000000,
+           "a decode cannot complete before the decoder returned the frame");
+}
+
 void testProductionWorkerSmoothingOwnsMovement()
 {
     // Alternating 11/15 ms source intervals require sub-millisecond retiming
@@ -4378,6 +4441,7 @@ int main()
     testHistoricalSourceGapSmoothFrameTiming();
     testProductionWorkerSmoothingOwnsMovement();
     testProducerClockExcludesLateGpuCollection();
+    testDecodeCompletionTimestampIsIndependentOfCollection();
     testQueuedCeilingRecoveryCannotRatchet();
     testSmoothQueueReachesItsCeilingNearRefresh();
     testPreparationKeepsLearnedLead();

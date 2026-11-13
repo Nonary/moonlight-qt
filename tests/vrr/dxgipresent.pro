@@ -6,4 +6,5 @@ SOURCES += $$PWD/tst_dxgipresent.cpp
 HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/dxgipresent.h
 HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/dxgiwaitable.h
 HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/d3d11fencewait.h
+HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/d3d11decodecompletion.h
 HEADERS += $$PWD/../../app/streaming/video/ffmpeg-renderers/d3d11presentpolicy.h

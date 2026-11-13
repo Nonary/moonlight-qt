@@ -1,8 +1,11 @@
 # Streaming and VRR architecture
 
 Source baseline: master plus the decode-buffer accounting correction on 2026-10-30,
-the buffer evidence corrections on 2026-11-04, and the absorbable-loss solver,
-release hold and blocked-evidence correction on 2026-11-09. The production worker
+the buffer evidence corrections on 2026-11-04, the absorbable-loss solver,
+release hold and blocked-evidence correction on 2026-11-09, and timestamped
+D3D11 decode completion with the capped solver margin on 2026-11-13 (the D3D11
+presenter part had not been run on Windows when this was written). The
+production worker
 resolves one adaptive input policy, bounded catch-up and corrected input
 accounting. The calibration key includes effective policy and presenter
 capabilities; existing keys are not reused. Schema-6 capture and schema-2
@@ -687,6 +690,24 @@ that did not block stay queue-neutral. Source mapping keeps prompt samples
 only, and other presenters keep the estimate until their wait semantics are
 verified.
 
+A completion the worker observes depends on when the worker collects the
+frame, and the worker is free only after the previous present. Once the buffer
+exceeds one source interval it reaches every fast frame after that frame's
+decode finished and can report only its own arrival time, so the measurement
+moves with the buffer it sizes. On the recorded Radeon 780M span
+(`tests/vrr/slowdecodespan.h`, decode 3 to 8.5 ms a frame at 138 FPS) the share
+of frames still blocked fell from 95% to 63% above 7.25 ms, the source mapping
+rose 2 ms while the solved buffer fell 2 ms, and both swung back every 10 to
+15 s. The D3D11 presenter therefore timestamps every decode-to-render fence
+completion on a watcher thread (`d3d11decodecompletion.h`) and returns it in
+`VrrDecodeReadiness::completedUs`. `PacedFrame::noteDecodeCompletedUs()` marks
+that time exact: source mapping, the GPU service median and input evidence use
+it whenever the frame was collected, and a later collection time cannot replace
+it. The trace records the flag as `decode_completion_exact`, and replay restores
+it. PyroWave's decode fence, Vulkan and VAAPI are unchanged and keep the
+collection-time estimate; the regression gate's `slow-gpu-decode` scenario
+prints what that costs beside the timestamped result.
+
 This evidence is censored, and it does move with the applied buffer: a frame
 that was on time reports a lower bound, and a frame that missed reports what it
 needed. Release therefore probes one 250 us step, and the misses it causes
@@ -777,8 +798,10 @@ wait duration and completion evidence, taking no context lock and using its own
 event with the 50 ms / fence-value-verified wait described below. The worker
 records its post-observation upper bound as `decodeCompleteUs` even for short
 waits and already-ready fences; the former 200 us threshold cannot determine
-timestamp correctness. Unknown asynchronous readiness stays unknown in the
-input graph. Production source mapping uses the observed completion boundary. Between
+timestamp correctness. When the completion watcher saw the boundary finish, or
+the worker's own wait ended on the fence event, the reported `completedUs`
+replaces that bound with the completion itself (section 9). Unknown
+asynchronous readiness stays unknown in the input graph. Production source mapping uses the observed completion boundary. Between
 `78b99f1c` and 2026-09-22 this check was nonblocking, which left Windows mapped
 from decoder output while Linux mapped from completion. Non-monitored fences and
 shared devices remain nonblocking; there, a zero CPU decode-wait measurement

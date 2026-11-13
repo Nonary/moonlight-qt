@@ -305,6 +305,9 @@ D3D11VARenderer::~D3D11VARenderer()
     m_OverlayBlendState.Reset();
     m_VideoBlendState.Reset();
 
+    // The watcher holds its own reference to the decode fence.
+    stopDecodeCompletionWatch();
+
     m_DecodeD2RFence.Reset();
     m_DecodeR2DFence.Reset();
     m_RenderD2RFence.Reset();
@@ -1310,7 +1313,9 @@ VrrDecodeReadiness D3D11VARenderer::observeDecodeReadiness(AVFrame* frame, uint6
         return {0, false, true};
     }
     if (completed >= decodeBoundary) {
-        return {0, true, true};
+        // Already finished: only the watcher knows when.
+        return {0, true, true, D3D11DecodeCompletion::resolve(
+            m_DecodeCompletionLog.completedUs(decodeBoundary), false, LiGetMicroseconds())};
     }
 
     // renderVideo() still queues an ID3D11DeviceContext4::Wait for this
@@ -1358,7 +1363,62 @@ VrrDecodeReadiness D3D11VARenderer::observeDecodeReadiness(AVFrame* frame, uint6
         queueRenderDeviceReset();
         return {0, false, true}; // Failure must never advertise GPU readiness.
     }
-    return {LiGetMicroseconds() - startUs, true, true};
+    // The decode finished during this wait. A wake on the fence's event is
+    // the completion; the 1 ms polling fallback is not.
+    const uint64_t nowUs = LiGetMicroseconds();
+    return {nowUs - startUs, true, true, D3D11DecodeCompletion::resolve(
+        m_DecodeCompletionLog.completedUs(decodeBoundary),
+        SUCCEEDED(eventResult) && lastEventResult == WAIT_OBJECT_0, nowUs)};
+}
+
+void D3D11VARenderer::startDecodeCompletionWatch()
+{
+    if (m_DecodeCompletionThread.joinable() || m_DecodeD2RFence == nullptr ||
+            m_FenceType != SupportedFenceType::Monitored) {
+        return;
+    }
+
+    m_DecodeCompletionEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    m_DecodeCompletionStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (m_DecodeCompletionEvent == nullptr || m_DecodeCompletionStopEvent == nullptr) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11 VRR could not create the decode-completion watch events: %lu",
+                    GetLastError());
+        stopDecodeCompletionWatch();
+        return;
+    }
+
+    // The thread owns a fence reference and copies of the handles, so it
+    // touches no renderer state other than the log.
+    m_DecodeCompletionThread = std::thread(
+        [fence = m_DecodeD2RFence, completion = m_DecodeCompletionEvent,
+         stop = m_DecodeCompletionStopEvent, log = &m_DecodeCompletionLog] {
+            // It runs for microseconds per frame, and its wake latency is the
+            // error of every timestamp it takes.
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            const HANDLE handles[] = { stop, completion };
+            D3D11DecodeCompletion::watch(*log, LiGetMicroseconds,
+                [&] { return static_cast<uint64_t>(fence->GetCompletedValue()); },
+                [&](uint64_t value) { return SUCCEEDED(fence->SetEventOnCompletion(value, completion)); },
+                [&] { return WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0 + 1; });
+        });
+}
+
+void D3D11VARenderer::stopDecodeCompletionWatch()
+{
+    if (m_DecodeCompletionThread.joinable()) {
+        SetEvent(m_DecodeCompletionStopEvent);
+        m_DecodeCompletionThread.join();
+    }
+    if (m_DecodeCompletionEvent != nullptr) {
+        CloseHandle(m_DecodeCompletionEvent);
+        m_DecodeCompletionEvent = nullptr;
+    }
+    if (m_DecodeCompletionStopEvent != nullptr) {
+        CloseHandle(m_DecodeCompletionStopEvent);
+        m_DecodeCompletionStopEvent = nullptr;
+    }
+    m_DecodeCompletionLog.clear();
 }
 
 bool D3D11VARenderer::renderPyroWaveVideo(AVFrame* frame, PyroWaveFrameRef* ref)
@@ -2588,6 +2648,7 @@ bool D3D11VARenderer::initializeVrrPresentReadyFence()
                         GetLastError());
         }
     }
+    startDecodeCompletionWatch();
 
     HRESULT hr = m_RenderDevice->CreateFence(
         0, D3D11_FENCE_FLAG_NONE,

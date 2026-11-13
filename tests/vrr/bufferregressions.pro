@@ -45,6 +45,7 @@ unix:!macx {
 HEADERS += \
     $$PWD/vrrproductionsession.h \
     $$PWD/capturespans.h \
+    $$PWD/slowdecodespan.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/cadencedetection.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \

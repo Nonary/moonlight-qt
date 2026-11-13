@@ -311,6 +311,7 @@ TraceValueKind traceValueKind(const QByteArray& name)
     static const QSet<QByteArray> booleanColumns {
         "native_scheduled_presentation",
         "decode_readiness_observed",
+        "decode_completion_exact",
         "prepared_ahead",
         "flip_protection_checked",
         "flip_protection_pending",
@@ -11094,7 +11095,8 @@ int main(int argc, char* argv[])
                 // post-wait readiness observations, including its first row.
                 true, true,
                 optionalUnsignedField(fields, traceColumn("decode_readiness_observed")) != 0,
-                traceColumn("decode_readiness_observed") >= 0);
+                traceColumn("decode_readiness_observed") >= 0,
+                optionalUnsignedField(fields, traceColumn("decode_completion_exact")) != 0);
         const auto stageField = [&](const char* name) {
             return optionalUnsignedField(fields, traceColumn(name));
         };
@@ -12904,7 +12906,11 @@ int main(int argc, char* argv[])
                          rtpTimestamp,
                          unsignedField(fields, columns.rtpValid) != 0,
                          decoderOutputUs);
-        frame.noteGpuReadyUs(decodeCompleteUs);
+        // A completion the backend timestamped is the completion itself;
+        // otherwise the column is the time the worker collected the frame.
+        if (optionalUnsignedField(fields, traceColumn("decode_completion_exact")) != 0)
+            frame.noteDecodeCompletedUs(decodeCompleteUs);
+        else frame.noteGpuReadyUs(decodeCompleteUs);
         const uint64_t lostPackets = optionalUnsignedField(fields, traceColumn("lost_packets"));
         if (lostPackets > UINT32_MAX) {
             std::fprintf(stderr, "Packet loss input exceeds uint32 on frame %d\n", frameNumber);

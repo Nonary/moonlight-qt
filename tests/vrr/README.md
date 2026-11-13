@@ -49,7 +49,16 @@ costs at most 500 us beyond what the goal itself needs.
 goal-buffer policy was merged on 2026-10-29, and was restored on 2026-11-09.
 The contracts that merge broke are listed in its `g_Known` table with their
 evidence; each is a decision still to make. Its `unabsorbable-loss` scenario
-pins the three solver rules above through a production session.
+pins the three solver rules above through a production session. Its
+`slow-gpu-decode` scenario replays a recorded Radeon 780M span
+(`slowdecodespan.h`, decode close to the 138 FPS source interval) through a
+serial decoder and worker, and requires a settled buffer and source mapping
+when the presenter timestamps decode completion; it prints the result with
+collection times only beside it. `tst_dxgipresent` covers the watcher that
+takes those timestamps, `tst_vrrtimingcontroller` that a timestamped
+completion maps and sizes the same however late the worker collects the
+frame, and `tst_vrrpacingworker` that it reaches the controller and the
+`decode_completion_exact` trace column.
 
 ## Capture and exact replay
 

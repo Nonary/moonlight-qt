@@ -654,6 +654,7 @@ void VrrTimingController::initializeTimeline(const PacedFrame& frame)
 
 uint64_t VrrTimingController::estimatedDecodeCompleteUs(const PacedFrame& frame) const
 {
+    if (frame.decodeCompletionExact()) return frame.decodeCompleteUs();
     return estimateDecodeCompleteUs(frame.decoderOutputUs(), frame.decodeCompleteUs(),
                                     frame.decodeSyncWaitUs(), m_DecodeGpuTypicalUs);
 }
@@ -662,7 +663,8 @@ void VrrTimingController::learnDecodeGpu(const PacedFrame& frame)
 {
     const uint64_t output = frame.decoderOutputUs();
     const uint64_t complete = frame.decodeCompleteUs();
-    if (!promptDecodeCompletion(output, complete, frame.decodeSyncWaitUs())) return;
+    if (frame.decodeCompletionExact() ? complete <= output :
+            !promptDecodeCompletion(output, complete, frame.decodeSyncWaitUs())) return;
     m_DecodeGpuSamples[m_DecodeGpuNext] = complete - output;
     m_DecodeGpuNext = (m_DecodeGpuNext + 1) % m_DecodeGpuSamples.size();
     m_DecodeGpuCount = std::min(m_DecodeGpuCount + 1, m_DecodeGpuSamples.size());
@@ -1565,7 +1567,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     // The decoder thread signals a D3D11 decode fence, so a wait that blocked
     // ended at real GPU completion however long the frame sat in our queue.
     m_Pending.blockedDecodeReadyUs = !frame.decoderOutputComplete() &&
-        frame.decodeSyncWaitUs() >= PreciseCompletionWaitUs ?
+        (frame.decodeCompletionExact() || frame.decodeSyncWaitUs() >= PreciseCompletionWaitUs) ?
         frame.decodeCompleteUs() - std::min(frame.decodeCompleteUs(), inputBacklog) : 0;
     m_Pending.inputRenderReserveUs = saturatingAdd(renderOffsetUs, m_Parameters.presentationSafetyUs);
     m_Pending.inputValid = frame.reassembledUs() != 0 &&
