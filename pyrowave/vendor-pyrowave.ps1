@@ -142,6 +142,11 @@ Local patch 0011-macos-portability.patch uses monotonic nanosleep waits on Darwi
 and permits MoltenVK's native subgroup width for the vendored SPIR-V 1.3
 programs. It does not request unsupported required-subgroup-size stages and
 retains the ordinary native-size contract by omitting the varying-size flag.
+
+Local patch 0012-msvc-arm64-neon.patch makes MSVC ARM64 builds take the NEON
+math paths: MSVC defines _M_ARM64 but not __ARM_NEON or __aarch64__, so without
+it simd.hpp stops at "Implement me." It includes arm64_neon.h and defines those
+two macros for the vendored math code only; clang-cl and GCC are unaffected.
 "@ | Set-Content -Encoding utf8 (Join-Path (Split-Path $Destination) "VENDOR.txt")
 
 Write-Host "PyroWave vendored into $Destination"
