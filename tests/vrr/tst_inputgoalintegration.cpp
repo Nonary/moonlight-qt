@@ -466,6 +466,46 @@ static void testGoalBufferSpendsNothingOnStallsBeyondTheCap() {
     check(peak==1000,"a stall beyond the cap never raises the applied buffer");
 }
 
+static void testGoalBufferMarginCostIsCapped() {
+    // 138 FPS Smooth: 99.95%, aiming at 70% of the allowed loss over 120 s.
+    // One 8 ms frame every 2 s, and one 15.15 ms frame every 36 s that the
+    // 14.49 ms cap cannot absorb. Three of the big frames in the window leave
+    // the aim at 7.5 ms and a fourth takes it past 9 ms, although 7.5 ms meets
+    // the goal either way.
+    constexpr uint64_t period=7246,cap=14490;
+    const auto lateness=[](uint64_t frame){return int64_t(frame%(36*138)==100?15150:frame%(2*138)==50?8000:0);};
+    Vrr13::InputGoalSolver solver; int64_t previous=0;
+    for(int i=1;i<=int(120*138);++i){const int64_t late=lateness(uint64_t(i));
+        solver.add(previous,late,period,500);previous=late;}
+    const auto both=solver.solve(999650,500,1000,cap,250,0,999500);
+    check(both.bufferUs==solver.solve(999650,500,1000,cap,250).bufferUs,
+          "a separate goal does not change the buffer the aim asks for");
+    check(both.requiredUs==solver.solve(999500,500,1000,cap,250).bufferUs && both.requiredUs+1000<=both.bufferUs,
+          "the goal itself needs a millisecond less here than the aim inside it");
+    check(solver.solve(999650,500,1000,cap,250).requiredUs==both.bufferUs,
+          "without a separate goal the aim is the requirement");
+
+    Vrr13::InputGoalBuffer buffer; buffer.setGoalSolver(120000000,700,8000000);
+    uint64_t t=1000000,frame=0,slot=1000000;
+    uint64_t lowest=UINT64_MAX,highest=0,unprotected=0,overpaid=0;
+    const auto feed=[&](int frames,const auto& late){for(int i=0;i<frames;++i){t+=period;slot+=period;++frame;
+        buffer.advance(t,1000,cap,999500,300000000,4000,1000,0,500,0,0);
+        buffer.observe(frame,t,slot,late(frame),true,1000,cap,999500,300000000,4000,1000,0,500,0,0,late(frame)>500);}};
+    feed(240*138,lateness);
+    for(int i=0;i<240*138;++i){feed(1,lateness);
+        const auto s=buffer.stats();
+        lowest=std::min(lowest,s.currentUs);highest=std::max(highest,s.currentUs);
+        unprotected+=s.currentUs<s.requiredUs;overpaid+=s.targetUs>s.requiredUs+500;}
+    check(highest-lowest<=500 && lowest>=7250 && highest<=8000,
+          "the applied buffer stays within the margin's cost of what the goal needs while the aim moves a millisecond");
+    check(unprotected==0,"the applied buffer never sits below what the goal needs");
+    check(overpaid==0,"the target never asks more than the margin's cost beyond what the goal needs");
+
+    // Lateness the goal does not allow still raises the buffer at once.
+    feed(20*138,[](uint64_t f){return int64_t(f%20==0?11000:0);});
+    check(buffer.stats().currentUs>=10000,"a missed goal still raises the buffer");
+}
+
 static void testGoalBufferLifecycle() {
     Vrr13::InputGoalBuffer buffer;
 
@@ -524,7 +564,7 @@ static void testProductionUsesGoalSolver() {
 int main() {
     testFastLayerCadence();testConfirmedLayerCadence();testContinuousCoverage();testResponsiveCoverageReporting();
     testSharedExtraBufferAllowance();
-    testGoalSolverMeetsGoalWithLeastBuffer();testGoalSolverUnreachableGoals();testGoalSolverIgnoresStallsBeyondTheCap();testGoalSolverNeedsARateBeforeItRaises();testGoalBufferFollowsRecentJitter();testGoalBufferHoldsReleaseAgainstTargetSteps();testGoalBufferSpendsNothingOnStallsBeyondTheCap();testGoalBufferLifecycle();
+    testGoalSolverMeetsGoalWithLeastBuffer();testGoalSolverUnreachableGoals();testGoalSolverIgnoresStallsBeyondTheCap();testGoalSolverNeedsARateBeforeItRaises();testGoalBufferFollowsRecentJitter();testGoalBufferHoldsReleaseAgainstTargetSteps();testGoalBufferSpendsNothingOnStallsBeyondTheCap();testGoalBufferMarginCostIsCapped();testGoalBufferLifecycle();
 #ifdef INPUT_PERCENTILE_CONTROLLER_TEST
     testProductionUsesGoalSolver();
     testFactoryProfileOwnsAdaptiveTarget();

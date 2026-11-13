@@ -628,8 +628,13 @@ planned extra delay, queue capacity and retained phase are distinct quantities.
 `InputGoalBuffer` observes eligible input readiness against the unbuffered
 source slot. The goal solver selects the smallest buffer meeting the selected
 severity-weighted client timing goal over its configured window, aiming at a
-fraction of the allowed loss. Three rules keep it from buying latency that
-removes no hitch:
+fraction of the allowed loss. That aim is a margin and may cost at most
+`GoalMarginCostUs` (500 us) beyond the smallest buffer that meets the goal
+itself (`requiredUs`): where the loss curve is flat the margin is all the aim
+buys. On a recorded 138 FPS session whose remaining loss was one 15 ms frame
+every 36 s, 8.25 ms met Smooth's 99.95% and the uncapped aim stepped between
+8.25 and 9.0 ms as the fourth such frame entered and left the 120 s window.
+Three rules keep it from buying latency that removes no hitch:
 
 - An interval loses at most itself. The reported client-timing score weights
   loss by presented duration, so a freeze counts for its whole length; sizing

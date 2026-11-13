@@ -44,6 +44,8 @@ public:
         uint64_t probabilityPpm = 0, windowUs = 0, toleranceUs = 0, vrrHeadroomUs = 0;
         int64_t readinessBudgetUs = 0, clockOffsetUs = 0;
         uint64_t headroomTargetUnclippedUs = 0;
+        // Smallest buffer that meets the goal itself; targetUs aims inside it.
+        uint64_t requiredUs = 0;
         bool tailUncertain = true, evidenceValid = false;
         bool historyTruncated = false, expiredUnknown = false, clipped = false;
         bool initialized = false, lastInputEligible = false, growthBlocked = false;
@@ -425,12 +427,23 @@ private:
             uint64_t(double(m_GoalSolver.intendedUs()) * double(spanUs / GoalBudgetWindowDivisor) / double(elapsedUs)) : 0;
         const uint64_t aimPpm = 1000000 - (1000000 - m_Stats.probabilityPpm) * m_GoalTailPerMille / 1000;
         const auto solution = m_GoalSolver.solve(aimPpm, m_Stats.toleranceUs,
-            m_Stats.minimumUs, m_Stats.maximumUs, GoalStepUs, budgetUs);
-        m_Stats.headroomTargetUnclippedUs = solution.bufferUs;
+            m_Stats.minimumUs, m_Stats.maximumUs, GoalStepUs, budgetUs, m_Stats.probabilityPpm);
+        // Aiming inside the allowed loss is a margin, and where the loss curve
+        // is flat the margin is all the aim buys. On a recorded 138 FPS session
+        // whose remaining loss was one 15 ms frame every 36 s, 8.25 ms met
+        // 99.95% and the aim stepped between 8.25 and 9.0 ms as the fourth such
+        // frame entered and left the window: 0.75 ms of latency for a hundredth
+        // of a percent. The margin may cost GoalMarginCostUs beyond what the
+        // goal itself needs.
+        const uint64_t aimUs = std::min(solution.bufferUs,
+            solution.requiredUs > m_Stats.maximumUs - std::min(m_Stats.maximumUs, GoalMarginCostUs) ?
+                m_Stats.maximumUs : solution.requiredUs + GoalMarginCostUs);
+        m_Stats.headroomTargetUnclippedUs = aimUs;
         // Capped means the cap is what limits us, not merely that a stall no
         // permitted buffer could absorb is still inside the window.
-        m_Stats.clipped = !solution.goalReachable && solution.bufferUs >= m_Stats.maximumUs;
-        m_Stats.targetUs = std::clamp(solution.bufferUs, m_Stats.minimumUs, m_Stats.maximumUs);
+        m_Stats.clipped = !solution.goalReachable && aimUs >= m_Stats.maximumUs;
+        m_Stats.targetUs = std::clamp(aimUs, m_Stats.minimumUs, m_Stats.maximumUs);
+        m_Stats.requiredUs = std::clamp(solution.requiredUs, m_Stats.minimumUs, m_Stats.targetUs);
         if (m_ReleaseHoldUs) {
             // Monotonic deque: the front is the highest target still held.
             while (!m_HeldTargets.empty() && m_HeldTargets.back().second <= m_Stats.targetUs) m_HeldTargets.pop_back();
@@ -472,6 +485,7 @@ private:
     static constexpr uint64_t GoalEvaluationIntervalUs = 500000;
     static constexpr uint64_t GoalMinimumCoverageUs = 1000000;
     static constexpr uint64_t GoalStepUs = 250;
+    static constexpr uint64_t GoalMarginCostUs = 500;
     static constexpr uint64_t GoalBudgetWindowDivisor = 4;
     uint64_t m_GoalWindowUs = 0, m_GoalTailPerMille = 1000, m_ReleaseHoldUs = 0;
     std::deque<std::pair<uint64_t, uint64_t>> m_HeldTargets; // (solved at, target)

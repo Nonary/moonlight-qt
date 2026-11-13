@@ -59,16 +59,23 @@ public:
     double loss(uint64_t bufferUs, uint64_t toleranceUs) const {
         return m_IntendedUs ? std::min(1.0, lostUs(bufferUs, toleranceUs) / double(m_IntendedUs)) : 0;
     }
-    struct Solution { uint64_t bufferUs = 0; bool goalReachable = true; };
+    // bufferUs meets probabilityPpm. requiredUs is the smallest buffer that
+    // meets goalProbabilityPpm, a goal no stricter than that; it is bufferUs
+    // when no separate goal is given.
+    struct Solution { uint64_t bufferUs = 0; bool goalReachable = true; uint64_t requiredUs = 0; };
     // budgetUs is the scored time the allowance covers while too few intervals
     // lose to establish a rate. Zero, or less than the evidence, uses the
     // evidence as it stands.
     Solution solve(uint64_t probabilityPpm, uint64_t toleranceUs,
                    uint64_t minimumUs, uint64_t maximumUs, uint64_t stepUs,
-                   uint64_t budgetUs = 0) const {
+                   uint64_t budgetUs = 0, uint64_t goalProbabilityPpm = 0) const {
         const double fraction = double(1000000 - std::min<uint64_t>(probabilityPpm, 1000000)) / 1e6;
         const double rateAllowed = fraction * double(m_IntendedUs);
         const double budgetAllowed = fraction * double(std::max(budgetUs, m_IntendedUs));
+        const double goalScale = goalProbabilityPpm && fraction > 0 ? std::max(1.0,
+            double(1000000 - std::min<uint64_t>(goalProbabilityPpm, 1000000)) / 1e6 / fraction) : 1.0;
+        bool haveRequired = false;
+        uint64_t requiredUs = 0;
         stepUs = std::max<uint64_t>(stepUs, 1);
         const int64_t cap = int64_t(std::min<uint64_t>(maximumUs, kLimitUs));
         m_AtCap.resize(m_Pairs.size());
@@ -79,7 +86,7 @@ public:
         }
         const bool reachable = unabsorbable <= rateAllowed;
         for (uint64_t b = minimumUs;; b = std::min(maximumUs, b + stepUs)) {
-            if (b >= maximumUs) return {b, reachable};
+            if (b >= maximumUs) return {b, reachable, haveRequired ? requiredUs : b};
             const int64_t buffer = int64_t(std::min<uint64_t>(b, kLimitUs));
             // Loss the cap would remove, and the intervals it comes from.
             double absorbable = 0;
@@ -88,7 +95,9 @@ public:
                 const uint64_t here = lostUs(m_Pairs[i], buffer, toleranceUs);
                 if (here > m_AtCap[i]) { absorbable += double(here - m_AtCap[i]); ++pairs; }
             }
-            if (absorbable <= (pairs >= RatePairs ? rateAllowed : budgetAllowed)) return {b, reachable};
+            const double allowed = pairs >= RatePairs ? rateAllowed : budgetAllowed;
+            if (!haveRequired && absorbable <= allowed * goalScale) { requiredUs = b; haveRequired = true; }
+            if (absorbable <= allowed) return {b, reachable, requiredUs};
         }
     }
 private:

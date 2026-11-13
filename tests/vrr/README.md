@@ -40,8 +40,9 @@ while unblocked collection stays queue-neutral and other backends keep their
 estimate. `tst_inputgoalintegration` pins that a stall beyond the cap spends no buffer
 however many the window holds, that an interval loses at most itself, that one
 late frame in a window that has only begun to fill buys nothing while sustained
-lateness is held to its rate, that release waits out its hold, and that
-sustained jitter beyond the cap still reaches it.
+lateness is held to its rate, that release waits out its hold, that
+sustained jitter beyond the cap still reaches it, and that the aim's margin
+costs at most 500 us beyond what the goal itself needs.
 
 `tst_vrrbufferregressions` is the adaptive-buffer gate described in
 `AGENTS.md`. It was dropped from `vrr.pro` and stopped compiling when the
