@@ -2031,6 +2031,26 @@ Flickable {
                     }
                 }
 
+                CheckBox {
+                    id: spatialAudioCheck
+                    width: parent.width
+                    text: qsTr("Use Windows Spatial Audio")
+                    font.pointSize: 12
+                    visible: Qt.platform.os === "windows"
+                    enabled: StreamingPreferences.audioConfig === StreamingPreferences.AC_51_SURROUND ||
+                             StreamingPreferences.audioConfig === StreamingPreferences.AC_71_SURROUND
+                    // Retain the preference when another channel layout is selected.
+                    checked: StreamingPreferences.spatialAudio
+                    onToggled: StreamingPreferences.spatialAudio = checked
+                    hoverEnabled: true
+
+                    Accessible.description: ToolTip.text
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered || activeFocus
+                    ToolTip.text: qsTr("For 5.1 and 7.1 surround sound. Requires Spatial Sound to be enabled in Windows for a compatible HDMI/DisplayPort output.") + " " +
+                                  qsTr("Applies to the next stream. Uses regular audio automatically if unavailable.")
+                }
 
                 CheckBox {
                     id: audioPcCheck
