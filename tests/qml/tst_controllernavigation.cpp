@@ -5,6 +5,7 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
+#include <QQmlIncubator>
 #include <QQuickWindow>
 #include <QQuickItem>
 #include <QDir>
@@ -75,6 +76,21 @@ class ControllerNavigationTest : public QObject {
         for (auto* child : item->childItems())
             if (auto* result = visualItem(child, name)) return result;
         return nullptr;
+    }
+    static void polishItems(QQuickItem* item) {
+        for (auto* child : item->childItems()) polishItems(child);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 3, 0)
+        item->ensurePolished();
+#endif
+    }
+    static void settleLayout(QQmlApplicationEngine& engine, QQuickWindow* root) {
+        // Synthetic keys can outrun asynchronous Loader creation and Column
+        // polish. Finish those before checking the visible navigation order.
+        if (auto* controller = engine.incubationController()) controller->incubateFor(50);
+        QCoreApplication::processEvents();
+        polishItems(root->contentItem());
+        QCoreApplication::processEvents();
+        polishItems(root->contentItem());
     }
     void button(Uint32 type, Uint8 button, Sint32 controller = 1) {
         SDL_Event event {};
@@ -830,7 +846,7 @@ private slots:
         QTRY_COMPARE(QGuiApplication::focusWindow(),root);
         navigation->notifyWindowFocus(true);
         QMetaObject::invokeMethod(navigation.get(),"onPollingTimerFired");
-        const auto press=[&](Uint8 code) { button(SDL_CONTROLLERBUTTONDOWN,code); button(SDL_CONTROLLERBUTTONUP,code); };
+        const auto press=[&](Uint8 code) { button(SDL_CONTROLLERBUTTONDOWN,code); button(SDL_CONTROLLERBUTTONUP,code); settleLayout(engine, root); };
         const auto savedUiMode=prefs->uiDisplayMode;
         prefs->uiDisplayMode=StreamingPreferences::UI_FULLSCREEN;
         press(SDL_CONTROLLER_BUTTON_START);
@@ -972,9 +988,9 @@ private slots:
         // Visit every category using real controller events. Check visible
         // movement and exact reversal rather than reusing production's ordering.
         for(const auto size : {QSize(1280,720),QSize(800,500)}) {
-        root->resize(size); QTest::qWait(30);
+        root->resize(size); settleLayout(engine, root);
         for(int category=0;category<8;++category) {
-            rail->forceActiveFocus(); page->setProperty("category",category); QTest::qWait(30);
+            rail->forceActiveFocus(); page->setProperty("category",category); settleLayout(engine, root);
             press(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
             for(int limit=0;limit<100;++limit) {
                 auto* previous=root->activeFocusItem(); press(SDL_CONTROLLER_BUTTON_DPAD_UP);
@@ -1167,6 +1183,8 @@ private slots:
         auto* root=qobject_cast<QQuickWindow*>(engine.rootObjects().first()); QVERIFY(root);
         root->requestActivate(); QTRY_COMPARE(QGuiApplication::focusWindow(),root);
         navigation->notifyWindowFocus(true);
+        // Complete the intentional stale-input flush before injecting a new press.
+        QVERIFY(QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired"));
         const auto press=[&](Uint8 code) { button(SDL_CONTROLLERBUTTONDOWN,code); button(SDL_CONTROLLERBUTTONUP,code); };
         press(SDL_CONTROLLER_BUTTON_START);
         auto* rail=root->findChild<QQuickItem*>("settingsCategories"); QTRY_VERIFY(rail && rail->isVisible());
