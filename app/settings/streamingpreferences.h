@@ -216,6 +216,9 @@ public:
     Q_PROPERTY(UIDisplayMode uiDisplayMode MEMBER uiDisplayMode NOTIFY uiDisplayModeChanged)
     Q_PROPERTY(bool swapMouseButtons MEMBER swapMouseButtons NOTIFY mouseButtonsChanged)
     Q_PROPERTY(bool muteOnFocusLoss MEMBER muteOnFocusLoss NOTIFY muteOnFocusLossChanged)
+    Q_PROPERTY(bool clipboardSyncToHost MEMBER clipboardSyncToHost NOTIFY clipboardSyncToHostChanged)
+    Q_PROPERTY(bool clipboardSyncFromHost MEMBER clipboardSyncFromHost NOTIFY clipboardSyncFromHostChanged)
+    Q_PROPERTY(int clipboardSyncMaxSizeMB MEMBER clipboardSyncMaxSizeMB NOTIFY clipboardSyncMaxSizeMBChanged)
     Q_PROPERTY(bool backgroundGamepad MEMBER backgroundGamepad NOTIFY backgroundGamepadChanged)
     Q_PROPERTY(bool reverseScrollDirection MEMBER reverseScrollDirection NOTIFY reverseScrollDirectionChanged)
     Q_PROPERTY(bool swapFaceButtons MEMBER swapFaceButtons NOTIFY swapFaceButtonsChanged)
@@ -278,6 +281,9 @@ public:
     bool showFrametimeGraph;
     bool swapMouseButtons;
     bool muteOnFocusLoss;
+    bool clipboardSyncToHost;
+    bool clipboardSyncFromHost;
+    int clipboardSyncMaxSizeMB;
     bool backgroundGamepad;
     bool reverseScrollDirection;
     bool swapFaceButtons;
@@ -356,6 +362,9 @@ signals:
     void showFrametimeGraphChanged();
     void mouseButtonsChanged();
     void muteOnFocusLossChanged();
+    void clipboardSyncToHostChanged();
+    void clipboardSyncFromHostChanged();
+    void clipboardSyncMaxSizeMBChanged();
     void backgroundGamepadChanged();
     void reverseScrollDirectionChanged();
     void swapFaceButtonsChanged();

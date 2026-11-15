@@ -175,6 +175,13 @@ public:
     // Call only after explicit user confirmation. Exactly one GET and one POST; no retries.
     void requestHostSleep();
 
+    // Text clipboard sync via Apollo's /actions/clipboard endpoint. The host
+    // only accepts these while this client has an active stream, and only if
+    // it granted this client the clipboard read/set permissions. Throw on
+    // failure, like the other requests.
+    QString getClipboardText(int timeoutMs);
+    void setClipboardText(const QByteArray& utf8Text, int timeoutMs);
+
     void
     quitApp();
 
@@ -217,7 +224,9 @@ private:
                    const std::function<QString(QNetworkReply*)>& receiveHeaders = {},
                    bool powerAction = false,
                    QNetworkAccessManager::Operation operation = QNetworkAccessManager::GetOperation,
-                   QSslCertificate pairedServerCert = QSslCertificate());
+                   QSslCertificate pairedServerCert = QSslCertificate(),
+                   const QByteArray& postBody = QByteArray(),
+                   const QByteArray& postContentType = QByteArray());
 
     NvAddress m_Address;
     QNetworkAccessManager* m_Nam;

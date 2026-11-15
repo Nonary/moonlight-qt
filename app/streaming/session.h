@@ -12,6 +12,7 @@
 #include "video/overlaymanager.h"
 #include "video/clientpacingwarning.h"
 #include "diagnostics/diagnosticcapture.h"
+#include "clipboardsync.h"
 #ifdef HAVE_KWIN_SCANOUT_GUARD
 #include "streaming/kwinscanoutguard.h"
 #endif
@@ -128,6 +129,21 @@ public:
     Overlay::OverlayManager& getOverlayManager()
     {
         return m_OverlayManager;
+    }
+
+    // Manual clipboard sync (keyboard shortcuts); SDL main thread only
+    void sendClipboardToHost()
+    {
+        if (m_ClipboardSync) {
+            m_ClipboardSync->sendToHostNow();
+        }
+    }
+
+    void receiveClipboardFromHost()
+    {
+        if (m_ClipboardSync) {
+            m_ClipboardSync->receiveFromHostNow();
+        }
     }
 
     bool clientPacingWarningsEnabled() const { return m_Preferences->connectionWarnings && !m_Preferences->hideVrrBufferWarnings; }
@@ -311,6 +327,7 @@ private:
     QQuickWindow* m_QtWindow;
     bool m_UnexpectedTermination;
     SdlInputHandler* m_InputHandler;
+    std::unique_ptr<ClipboardSync> m_ClipboardSync;
     int m_MouseEmulationRefCount;
     int m_FlushingWindowEventsRef;
     QStringList m_LaunchWarnings;

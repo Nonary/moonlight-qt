@@ -2288,6 +2288,14 @@ void Session::exec()
 
     m_InputHandler->initializeControllers();
 
+    // The host only accepts clipboard requests once our stream is live, which
+    // it is by now. Created on this (SDL main) thread, which owns it.
+    m_ClipboardSync.reset(new ClipboardSync(m_Computer,
+                                            m_Preferences->clipboardSyncToHost,
+                                            m_Preferences->clipboardSyncFromHost,
+                                            m_Preferences->clipboardSyncMaxSizeMB));
+    m_ClipboardSync->onStreamStarted();
+
     // Hijack this thread to be the SDL main thread. We have to do this
     // because we want to suspend all Qt processing until the stream is over.
     SDL_Event event;
@@ -2403,6 +2411,11 @@ void Session::exec()
             case SDL_CODE_STEAM_CONTROLLER_LINK:
                 m_InputHandler->handleSteamControllerEvent(&event.user);
                 break;
+            case SDL_CODE_CLIPBOARD_RESULT:
+                if (m_ClipboardSync) {
+                    m_ClipboardSync->processResults();
+                }
+                break;
             default:
                 SDL_assert(false);
             }
@@ -2432,12 +2445,18 @@ void Session::exec()
                     m_AudioMuted = true;
                 }
                 m_InputHandler->notifyFocusLost();
+                if (m_ClipboardSync) {
+                    m_ClipboardSync->onFocusLost();
+                }
                 break;
             case SDL_WINDOWEVENT_FOCUS_GAINED:
                 if (m_Preferences->muteOnFocusLoss) {
                     m_AudioMuted = false;
                 }
                 m_InputHandler->notifyFocusGained();
+                if (m_ClipboardSync) {
+                    m_ClipboardSync->onFocusGained();
+                }
                 break;
             case SDL_WINDOWEVENT_LEAVE:
                 m_InputHandler->notifyMouseLeave();
@@ -2740,6 +2759,10 @@ DispatchDeferredCleanup:
     if (QGuiApplication::platformName() == "eglfs") {
         QGuiApplication::restoreOverrideCursor();
     }
+
+    // Stop clipboard sync before the connection goes away. Any request still
+    // in flight finishes in the background and its result is discarded.
+    m_ClipboardSync.reset();
 
     // Raise any keys that are still down
     m_InputHandler->raiseAllKeys();

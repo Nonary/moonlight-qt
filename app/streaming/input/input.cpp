@@ -137,6 +137,16 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     m_SpecialKeyCombos[KeyComboToggleTimingGraph].scanCode = SDL_SCANCODE_F;
     m_SpecialKeyCombos[KeyComboToggleTimingGraph].enabled = true;
 
+    m_SpecialKeyCombos[KeyComboSendClipboard].keyCombo = KeyComboSendClipboard;
+    m_SpecialKeyCombos[KeyComboSendClipboard].keyCode = SDLK_u;
+    m_SpecialKeyCombos[KeyComboSendClipboard].scanCode = SDL_SCANCODE_U;
+    m_SpecialKeyCombos[KeyComboSendClipboard].enabled = true;
+
+    m_SpecialKeyCombos[KeyComboReceiveClipboard].keyCombo = KeyComboReceiveClipboard;
+    m_SpecialKeyCombos[KeyComboReceiveClipboard].keyCode = SDLK_g;
+    m_SpecialKeyCombos[KeyComboReceiveClipboard].scanCode = SDL_SCANCODE_G;
+    m_SpecialKeyCombos[KeyComboReceiveClipboard].enabled = true;
+
     m_OldIgnoreDevices = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES);
     m_OldIgnoreDevicesExcept = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT);
 
