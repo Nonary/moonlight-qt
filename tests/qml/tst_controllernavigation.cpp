@@ -124,6 +124,10 @@ private slots:
         SDL_SetHint("SDL_JOYSTICK_DINPUT", "0");
         SDL_SetHint("SDL_JOYSTICK_WGI", "0");
         SDL_SetHint("SDL_XINPUT_ENABLED", "0");
+        // sdl2-compat also uses SDL3's gamepad filter; allow only the
+        // zero-VID/PID virtual fixtures in this isolated test process.
+        SDL_SetHint("SDL_GAMEPAD_IGNORE_DEVICES_EXCEPT", "0x0000/0x0000");
+        SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT, "0x0000/0x0000");
 #endif
         navigation = std::make_unique<SdlGamepadKeyNavigation>(prefs);
         qmlRegisterSingletonType<StreamingPreferences>("StreamingPreferences", 1, 0, "StreamingPreferences",
@@ -155,6 +159,8 @@ private slots:
         QTRY_COMPARE(QGuiApplication::focusWindow(), &window);
     }
     void init() {
+        window.show(); window.requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), &window);
         navigation->notifyWindowFocus(false);
         QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired");
         prefs->swapFaceButtons = false;
@@ -163,6 +169,76 @@ private slots:
         prefs->uiControllerFullscreen = false;
         window.keys.clear();
         window.onPress = {};
+    }
+    void controllerFamiliesAndPrompts() {
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+        QQmlApplicationEngine engine;
+        engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
+        engine.rootContext()->setContextProperty("initialView", QString("qrc:/gui/PcView.qml"));
+        engine.rootContext()->setContextProperty("runConfigChecks", false);
+        engine.load(QUrl("qrc:/gui/main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* root=qobject_cast<QQuickWindow*>(engine.rootObjects().first()); QVERIFY(root);
+        navigation->notifyWindowFocus(false);
+        auto label=[root](const char* action) {
+            QVariant result;
+            QMetaObject::invokeMethod(root,"controllerLabel",Q_RETURN_ARG(QVariant,result),
+                Q_ARG(QVariant,QVariant(QString::fromLatin1(action))));
+            return result.toString();
+        };
+        // SDL virtual pads always report VIRTUAL in sdl2-compat; inject only
+        // the detected type into the same classifier used by noteController.
+        // Real SDL event discovery/switching is checked separately below.
+        const auto select=[this](int type) {
+            navigation->m_InputMethod="controller";
+            navigation->m_ControllerFamily=navigation->familyForControllerType(type);
+            emit navigation->navigationStateChanged();
+        };
+        for (int type:{int(SDL_CONTROLLER_TYPE_XBOX360),int(SDL_CONTROLLER_TYPE_XBOXONE),
+                      int(SDL_CONTROLLER_TYPE_UNKNOWN),int(SDL_CONTROLLER_TYPE_VIRTUAL)}) {
+            select(type); QCOMPARE(navigation->controllerFamily(),QString("xbox"));
+            for(bool swapped:{false,true}) {
+                prefs->swapFaceButtons=swapped;
+                QCOMPARE(label("confirm"),QString(swapped ? "B" : "A"));
+                QCOMPARE(label("back"),QString(swapped ? "A" : "B"));
+                QCOMPARE(label("options"),QString(swapped ? "Y" : "X"));
+                QCOMPARE(label("done"),QString(swapped ? "X" : "Y"));
+                QCOMPARE(label("sections"),QString("LB / RB"));
+            }
+        }
+        for(int type:{int(SDL_CONTROLLER_TYPE_PS3),int(SDL_CONTROLLER_TYPE_PS4),int(SDL_CONTROLLER_TYPE_PS5)}) {
+            select(type); QCOMPARE(navigation->controllerFamily(),QString("playstation"));
+            for(bool swapped:{false,true}) {
+                prefs->swapFaceButtons=swapped;
+                QCOMPARE(label("confirm"),QString::fromUtf8(swapped ? "○" : "×"));
+                QCOMPARE(label("back"),QString::fromUtf8(swapped ? "×" : "○"));
+                QCOMPARE(label("options"),QString::fromUtf8(swapped ? "△" : "□"));
+                QCOMPARE(label("done"),QString::fromUtf8(swapped ? "□" : "△"));
+                QCOMPARE(label("sections"),QString("L1 / R1"));
+            }
+        }
+        select(SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO);
+        QCOMPARE(label("sections"),QString("L / R"));
+        prefs->swapFaceButtons=false;
+        QCOMPARE(label("confirm"),QString("B"));
+        select(SDL_CONTROLLER_TYPE_PS5);
+        // Actual SDL input from an unknown/virtual pad replaces the PS family.
+        button(SDL_CONTROLLERBUTTONDOWN,SDL_CONTROLLER_BUTTON_LEFTSTICK,1);
+        button(SDL_CONTROLLERBUTTONUP,SDL_CONTROLLER_BUTTON_LEFTSTICK,1);
+        QCOMPARE(navigation->controllerFamily(),QString("xbox"));
+        QCOMPARE(label("confirm"),QString("A"));
+        select(SDL_CONTROLLER_TYPE_PS5);
+        const int index=SDL_JoystickAttachVirtual(SDL_JOYSTICK_TYPE_GAMECONTROLLER,
+            SDL_CONTROLLER_AXIS_MAX,SDL_CONTROLLER_BUTTON_MAX,0);
+        QVERIFY(index>=0);
+        QMetaObject::invokeMethod(navigation.get(),"onPollingTimerFired");
+        QCOMPARE(navigation->controllerFamily(),QString("xbox"));
+        QCOMPARE(label("confirm"),QString("A"));
+        QCOMPARE(SDL_JoystickDetachVirtual(index),0);
+        QMetaObject::invokeMethod(navigation.get(),"onPollingTimerFired");
+#else
+        QSKIP("Controller family lifecycle test requires SDL 2.0.14 virtual devices");
+#endif
     }
     void modeChangeDuringPress_data() {
         QTest::addColumn<int>("buttonCode");
@@ -1271,6 +1347,22 @@ private slots:
         virtualControllers.clear();
         QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired");
         QCOMPARE(navigation->connectedGamepads(), 0);
+        QCOMPARE(navigation->inputMethod(), QString("keyboard"));
+        QCOMPARE(navigation->controllerFamily(), QString("xbox"));
+        // Reproduce a controller disconnect while the stream owns SDL.
+        const int psIndex = SDL_JoystickAttachVirtual(SDL_JOYSTICK_TYPE_GAMECONTROLLER,
+            SDL_CONTROLLER_AXIS_MAX, SDL_CONTROLLER_BUTTON_MAX, 0);
+        QVERIFY(psIndex >= 0);
+        auto* ps = SDL_JoystickOpen(psIndex); QVERIFY(ps);
+        QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired");
+        navigation->m_ControllerFamily="playstation";
+        navigation->m_InputMethod="controller";
+        navigation->disable();
+        QCOMPARE(SDL_JoystickDetachVirtual(psIndex), 0); SDL_JoystickClose(ps);
+        navigation->enable();
+        QCOMPARE(navigation->connectedGamepads(), 0);
+        QCOMPARE(navigation->inputMethod(), QString("keyboard"));
+        QCOMPARE(navigation->controllerFamily(), QString("xbox"));
         prefs->uiControllerFullscreen = true;
         prefs->uiDisplayMode = StreamingPreferences::UI_WINDOWED;
         prefs->uiLastHostUuid.clear();

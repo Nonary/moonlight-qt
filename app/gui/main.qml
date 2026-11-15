@@ -148,7 +148,7 @@ ApplicationWindow {
         if (!controllerInput) return action === "confirm" ? "Enter" : action === "back" ? "Esc" : action === "options" ? "Menu" : action === "done" ? "Enter" : "PgUp / PgDn"
         var family = SdlGamepadKeyNavigation.controllerFamily
         var swapped = StreamingPreferences.swapFaceButtons
-        if (action === "sections") return family === "xbox" ? "LB / RB" : "L1 / R1"
+        if (action === "sections") return family === "playstation" ? "L1 / R1" : family === "nintendo" ? "L / R" : "LB / RB"
         var labels = family === "playstation" ? ["×", "○", "□", "△"] : family === "nintendo" ? ["B", "A", "Y", "X"] : ["A", "B", "X", "Y"]
         return action === "done" ? labels[swapped ? 2 : 3] : action === "confirm" ? labels[swapped ? 1 : 0] : action === "back" ? labels[swapped ? 0 : 1] : labels[swapped ? 3 : 2]
     }

@@ -72,6 +72,7 @@ void SdlGamepadKeyNavigation::enable()
     }
 
     if (!m_Gamepads.isEmpty()) noteController(m_Gamepads.first());
+    else { m_InputMethod = "keyboard"; m_ControllerFamily = "xbox"; }
     emit navigationStateChanged();
     m_Enabled = true;
 
@@ -249,6 +250,7 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
                 }
             }
             if (!m_Gamepads.isEmpty()) noteController(m_Gamepads.first());
+            else { m_InputMethod = "keyboard"; m_ControllerFamily = "xbox"; }
             emit navigationStateChanged();
             break;
         case SDL_CONTROLLERDEVICEADDED:
@@ -260,6 +262,7 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
                 // before we've processed the add event.
                 if (!m_Gamepads.contains(gc)) {
                     m_Gamepads.append(gc);
+                    noteController(gc);
                     emit navigationStateChanged();
                 }
                 else {
@@ -403,13 +406,12 @@ int SdlGamepadKeyNavigation::getConnectedGamepads()
     return count;
 }
 
-void SdlGamepadKeyNavigation::noteController(SDL_GameController* controller)
+QString SdlGamepadKeyNavigation::familyForControllerType(int type)
 {
-    QString family = m_ControllerFamily;
+    QString family = "xbox"; // Unknown and older SDL devices use ABXY prompts.
 #if SDL_VERSION_ATLEAST(2, 0, 12)
-    if (controller) {
-        const auto type = SDL_GameControllerGetType(controller);
-        family = "xbox";
+    {
+
         if (type == SDL_CONTROLLER_TYPE_PS3 || type == SDL_CONTROLLER_TYPE_PS4
 #if SDL_VERSION_ATLEAST(2, 0, 14)
             || type == SDL_CONTROLLER_TYPE_PS5
@@ -424,6 +426,19 @@ void SdlGamepadKeyNavigation::noteController(SDL_GameController* controller)
         ) family = "nintendo";
     }
 #endif
+    return family;
+}
+
+void SdlGamepadKeyNavigation::noteController(SDL_GameController* controller)
+{
+    if (!controller) return;
+    const QString family = familyForControllerType(
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+        SDL_GameControllerGetType(controller)
+#else
+        0
+#endif
+    );
     if (m_InputMethod != "controller" || m_ControllerFamily != family) {
         m_InputMethod = "controller";
         m_ControllerFamily = family;

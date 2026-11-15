@@ -46,6 +46,8 @@ protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
+    friend class ControllerNavigationTest;
+    static QString familyForControllerType(int type);
     void noteController(SDL_GameController* controller);
     QString m_InputMethod = "keyboard";
     QString m_ControllerFamily = "xbox";
