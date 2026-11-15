@@ -504,7 +504,9 @@ void OverlayManager::updateOverlayText(OverlayType type, const char* text, Timin
         if (type == OverlayDebug && m_TimingGraphEnabled) m_TimingGraph = snapshot;
         SDL_utf8strlcpy(overlay.text, text, sizeof(overlay.text));
         ++overlay.revision;
-        overlay.dirty = overlay.dirty || overlay.enabled;
+        // Every revision change needs a replacement job. A hidden update can
+        // supersede an already-consumed hide before its null surface publishes.
+        overlay.dirty = true;
         overlay.queued = std::chrono::steady_clock::now();
     }
     m_WorkReady.notify_one();

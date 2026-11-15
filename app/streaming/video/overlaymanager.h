@@ -79,6 +79,7 @@ public:
     void setOverlayRenderer(IOverlayRenderer* renderer);
 
 private:
+    friend struct OverlayManagerTestAccess;
     void run();
     SDL_Surface* RenderTextOutlinedWrapped(TTF_Font* font, const char* text, SDL_Color textColor, SDL_Color outlineColor, int outlineWidth, int wrapWidth);
 
