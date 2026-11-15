@@ -706,7 +706,17 @@ int StreamingPreferences::selectedUiApp(const QString& hostUuid) const
 QVariantList StreamingPreferences::recentUiApps(const QString& hostUuid) const
 {
     if (hostUuid.isEmpty()) return {};
-    return QSettings().value("ui/recentApps/" + hostUuid).toList();
+    // INI settings can deserialize integer list entries as strings. Return a
+    // canonical list so history identity and deduplication survive a restart.
+    QVariantList history;
+    const auto stored = QSettings().value("ui/recentApps/" + hostUuid).toList();
+    for (const auto& value : stored) {
+        bool ok = false;
+        const int id = value.toInt(&ok);
+        if (ok && id > 0 && !history.contains(id)) history.append(id);
+        if (history.size() == 20) break;
+    }
+    return history;
 }
 
 void StreamingPreferences::recordUiPlay(const QString& hostUuid, int appId)

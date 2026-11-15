@@ -6,6 +6,7 @@ import "ConsoleStyle.js" as Style
 
 NavigableDialog {
     id: dialog
+    tabNavigation: false
 
     property alias text: dialogLabel.dialogText
     property alias showSpinner: dialogSpinner.visible

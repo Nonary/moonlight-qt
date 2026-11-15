@@ -63,6 +63,20 @@ TestCase {
         tryCompare(keyboard, "visible", false)
         compare(numeric.value, 123)
     }
+    function test_symbolRowAndCursorRemainReachable() {
+        field.openKeyboard()
+        var keyboard = findChild(field.Window.window, "consoleKeyboard")
+        tryCompare(keyboard, "opened", true)
+        var draft = findChild(keyboard, "keyboardDraft")
+        verify(draft.cursorVisible)
+        keyboard.symbols = true
+        compare(keyboard.keyGrid.count, 42)
+        keyboard.keyGrid.currentIndex = 39
+        keyboard.keyGrid.move(0, 1)
+        compare(keyboard.keyGrid.currentIndex, 41)
+        keyboard.reject()
+        tryCompare(keyboard, "visible", false)
+    }
     function test_physicalKeyboardStillTypes() {
         SdlGamepadKeyNavigation.inputMethod = "keyboard"
         keyClick(Qt.Key_A)

@@ -36,6 +36,8 @@ ComboBox {
         background: Rectangle { color: parent.highlighted ? Style.control : Style.raised; radius: Style.px(6, control.Window.window); ConsoleFocus { focused: control.highlightedIndex === index; radius: parent.radius } }
     }
     property int textWidth
+    property int popupTextWidth
+    readonly property int desiredPopupWidth: leftPadding + popupTextWidth + rightPadding
     property int desiredWidth : leftPadding + textWidth + indicator.width + rightPadding
     property int maximumWidth : parent.width
 
@@ -48,6 +50,10 @@ ComboBox {
         radius: Style.px(10, control.Window.window)
         border.color: Style.outline
     }
+    popup.width: Math.min(Math.max(control.width, control.desiredPopupWidth), control.Window.window ? control.Window.window.width - Style.px(32, control.Window.window) : control.desiredWidth)
+    popup.leftMargin: Style.px(16, control.Window.window)
+    popup.rightMargin: Style.px(16, control.Window.window)
+    popup.x: settingsRowHost ? control.width - popup.width : 0
     popup.enter: Transition { }
     popup.exit: Transition { }
 
@@ -61,13 +67,14 @@ ComboBox {
 
     function recalculateWidth() {
         textMetrics.font = font
-        popupMetrics.font = popup.font
+        popupMetrics.font = font
         textWidth = 0
+        popupTextWidth = 0
         for (var i = 0; i < count; i++){
             textMetrics.text = textAt(i)
-            popupMetrics.text = textAt(i)
+            popupMetrics.text = "\u2713  " + textAt(i)
             textWidth = Math.max(textMetrics.width, textWidth)
-            textWidth = Math.max(popupMetrics.width, textWidth)
+            popupTextWidth = Math.max(popupMetrics.width, popupTextWidth)
         }
     }
 
@@ -76,6 +83,7 @@ ComboBox {
     onActivated: recalculateWidth()
 
     popup.onAboutToShow: {
+        recalculateWidth()
         previousNavigationMode = SdlGamepadKeyNavigation.currentUiNavMode()
         // Switch to normal navigation for combo boxes
         SdlGamepadKeyNavigation.setUiNavMode(false)

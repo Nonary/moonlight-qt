@@ -20,19 +20,27 @@ FocusScope {
     readonly property int currentIndex: activeShelf.currentIndex
     readonly property var currentItem: activeShelf.currentItem
     property bool ready: false
+    // A view can defer countChanged while its model changes during navigation.
+    // Availability and layout follow the source notifications instead.
+    property int libraryCount: 0
+    property int recentCount: 0
+    function refreshLibraryCount() { libraryCount = appModel.rowCount() }
+    function refreshRecentCount() { recentCount = recentModel.rowCount() }
     readonly property real shelfHeight: Math.max(Style.px(100, Window.window), Math.min(Style.px(196, Window.window),
         Math.floor((shelfScroll.height - recentHeading.height - libraryHeading.height - shelfRows.spacing -
-                    recentRow.spacing - libraryRow.spacing - (recentShelf.count ? 0 : recentEmpty.height + recentRow.spacing)) /
-                   (recentShelf.count ? 2 : 1))))
+                    recentRow.spacing - libraryRow.spacing - (appPage.recentCount ? 0 : recentEmpty.height + recentRow.spacing)) /
+                   (appPage.recentCount ? 2 : 1))))
     property bool recentRowActive: false
     readonly property var activeShelf: recentRowActive ? recentShelf : shelf
-    readonly property bool hasGames: shelf.count > 0
-    readonly property bool hasMultipleShelves: recentShelf.count > 0 && hasGames
+    readonly property bool hasGames: appPage.libraryCount > 0
+    readonly property bool hasMultipleShelves: appPage.recentCount > 0 && hasGames
     property var selectedApp: ({})
     property AppModel appModel: AppModel { includeHostActions: false }
     property RecentAppsModel recentModel: RecentAppsModel { sourceModel: appPage.appModel }
     readonly property real uiScale: Style.windowScale(Window.window)
-    readonly property int selectedIndex: selectedApp.appid ? appModel.indexOfApp(selectedApp.appid) : -1
+    // Invokable lookups have no model-change notification for a QML binding.
+    // Catalogue rows can move independently of the selected Recent shelf item.
+    function selectedAppIndex() { return selectedApp.appid ? appModel.indexOfApp(selectedApp.appid) : -1 }
     focus: true
 
     function restoreSelection() {
@@ -48,7 +56,7 @@ FocusScope {
     }
     function focusShelf(recent) {
         if (!hasGames) { choosePcButton.forceActiveFocus(); return }
-        recentRowActive = recent && recentShelf.count > 0
+        recentRowActive = recent && appPage.recentCount > 0
         activeShelf.forceActiveFocus()
         updateSelection()
         Qt.callLater(revealShelf)
@@ -68,7 +76,7 @@ FocusScope {
     }
     function collapseDetails() { detailsExpanded = false; focusShelf(recentRowActive) }
     function launchSelected() {
-        var row = selectedIndex
+        var row = selectedAppIndex()
         if (row < 0) return
         var runningId = appModel.getRunningAppId()
         if (runningId !== 0 && runningId !== selectedApp.appid) {
@@ -94,11 +102,13 @@ FocusScope {
     }
     Component.onCompleted: {
         appModel.initialize(ComputerManager, computerIndex, showHiddenGames)
+        refreshLibraryCount()
         recentModel.appIds = StreamingPreferences.recentUiApps(hostUuid)
+        refreshRecentCount()
         var wanted = StreamingPreferences.selectedUiApp(hostUuid)
         shelf.restoreSelection(wanted)
         recentShelf.restoreSelection(wanted)
-        recentRowActive = recentShelf.count > 0 && (!wanted || recentModel.indexOfApp(wanted) >= 0)
+        recentRowActive = appPage.recentCount > 0 && (!wanted || recentModel.indexOfApp(wanted) >= 0)
         ready = true
         updateSelection()
         Qt.callLater(function() { if (appPage.activeFocus && !appPage.detailsExpanded) appPage.focusShelf(appPage.recentRowActive) })
@@ -121,6 +131,9 @@ FocusScope {
     }
     Connections {
         target: appPage.appModel
+        function onRowsInserted() { appPage.refreshLibraryCount() }
+        function onRowsRemoved() { appPage.refreshLibraryCount() }
+        function onModelReset() { appPage.refreshLibraryCount() }
         function onComputerLost() { if (appPage.activated) stackView.pop(null) }
         function onHostSleepCompleted(error) {
             appPage.sleepPending = false
@@ -135,8 +148,20 @@ FocusScope {
             if (uuid === appPage.hostUuid) appPage.recentModel.appIds = StreamingPreferences.recentUiApps(uuid)
         }
     }
-    readonly property string primaryVerb: !hasGames ? qsTr("Choose PC") : selectedApp.running ? qsTr("Resume") : qsTr("Play")
-    function primaryAction() { if (hasGames) launchSelected(); else stackView.pop(null) }
+    Connections {
+        target: appPage.recentModel
+        function onRowsInserted() { appPage.refreshRecentCount() }
+        function onRowsRemoved() { appPage.refreshRecentCount() }
+        function onModelReset() { appPage.refreshRecentCount() }
+    }
+    onRecentCountChanged: {
+        if (!ready || recentCount > 0 || !recentRowActive) return
+        recentRowActive = false
+        if (!detailsExpanded && visible && activeFocus) shelf.forceActiveFocus()
+        updateSelection()
+    }
+    readonly property string primaryVerb: !hasGames ? (emptySleepButton.activeFocus ? qsTr("Sleep PC") : qsTr("Choose PC")) : selectedApp.running ? qsTr("Resume") : qsTr("Play")
+    function primaryAction() { if (hasGames) launchSelected(); else if (emptySleepButton.activeFocus && emptySleepButton.enabled) sleepDialog.open(); else stackView.pop(null) }
     Keys.onMenuPressed: { if (detailsExpanded) collapseDetails(); else if (hasGames) expandDetails() }
     onHasGamesChanged: {
         if (!ready) return
@@ -187,32 +212,27 @@ FocusScope {
                         x: Style.px(64, appPage.Window.window)
                         spacing: Style.px(16, appPage.Window.window)
                         ConsoleText { role: "heading"; text: qsTr("Recently played") }
-                        ConsoleText { role: "caption"; text: qsTr("Latest first"); visible: recentShelf.count > 0; anchors.verticalCenter: parent.verticalCenter }
+                        ConsoleText { role: "caption"; text: qsTr("Latest first"); visible: appPage.recentCount > 0; anchors.verticalCenter: parent.verticalCenter }
                     }
                     ConsoleText {
                         id: recentEmpty
                         x: Style.px(64, appPage.Window.window)
                         width: parent.width - 2 * x
                         role: "secondary"; text: qsTr("Games you play will appear here.")
-                        visible: recentShelf.count === 0
+                        visible: appPage.recentCount === 0
                     }
                     GameShelf {
                         id: recentShelf; objectName: "recentGameShelf"
-                        width: parent.width; height: visible ? appPage.shelfHeight : 0
-                        visible: count > 0
+                        showCurrent: appPage.recentRowActive
+                        width: parent.width; height: appPage.recentCount > 0 ? appPage.shelfHeight : 0
+                        visible: appPage.recentCount > 0
                         model: appPage.recentModel
                         onSelectionChanged: {
                             if (activeFocus) appPage.recentRowActive = true
                             if (appPage.recentRowActive) appPage.updateSelection()
                         }
                         onActiveFocusChanged: { if (activeFocus) Qt.callLater(appPage.revealShelf) }
-                        onCountChanged: {
-                            if (appPage.ready && count === 0 && appPage.recentRowActive) {
-                                appPage.recentRowActive = false
-                                if (!appPage.detailsExpanded) shelf.forceActiveFocus()
-                                appPage.updateSelection()
-                            }
-                        }
+
                         onMoveUp: { if (typeof window !== "undefined") window.focusNavigation() }
                         onMoveDown: appPage.focusShelf(false)
                         onPlayRequested: appPage.launchSelected()
@@ -225,10 +245,11 @@ FocusScope {
                     spacing: Style.px(4, appPage.Window.window)
                     ConsoleText {
                         x: Style.px(64, appPage.Window.window)
-                        id: libraryHeading; role: "heading"; text: qsTr("All games · %1").arg(shelf.count)
+                        id: libraryHeading; role: "heading"; text: qsTr("All games · %1").arg(appPage.libraryCount)
                     }
                     GameShelf {
                         id: shelf; objectName: "gameShelf"
+                        showCurrent: !appPage.recentRowActive
                         width: parent.width; height: appPage.shelfHeight
                         model: appPage.appModel
                         focus: true
@@ -238,7 +259,7 @@ FocusScope {
                         }
                         onActiveFocusChanged: { if (activeFocus) Qt.callLater(appPage.revealShelf) }
                         onMoveUp: {
-                            if (recentShelf.count > 0) appPage.focusShelf(true)
+                            if (appPage.recentCount > 0) appPage.focusShelf(true)
                             else if (typeof window !== "undefined") window.focusNavigation()
                         }
                         onMoveDown: { }
@@ -307,17 +328,24 @@ FocusScope {
             ConsoleListRow {
                 id: directButton; width: parent.width
                 text: qsTr("Direct launch") + (appPage.selectedApp.directLaunch ? qsTr(" · On") : qsTr(" · Off"))
-                enabled: appPage.selectedIndex >= 0 && !appPage.selectedApp.hidden
+                enabled: !!appPage.selectedApp.appid && !appPage.selectedApp.hidden
                 textOnly: true; textAlignment: Text.AlignLeft
-                onClicked: appPage.appModel.setAppDirectLaunch(appPage.selectedIndex, !appPage.selectedApp.directLaunch)
+                onClicked: {
+                    var row = appPage.selectedAppIndex()
+                    if (row >= 0) appPage.appModel.setAppDirectLaunch(row, !appPage.selectedApp.directLaunch)
+                }
                 KeyNavigation.up: quitGame.visible ? quitGame : playButton; KeyNavigation.down: hideButton
             }
             ConsoleListRow {
-                id: hideButton; width: parent.width
+                id: hideButton; objectName: "hideGameButton"; width: parent.width
                 text: appPage.selectedApp.hidden ? qsTr("Show in library") : qsTr("Hide from library")
-                enabled: appPage.selectedIndex >= 0 && (appPage.selectedApp.hidden || (!appPage.selectedApp.running && !appPage.selectedApp.directLaunch))
+                enabled: !!appPage.selectedApp.appid && (appPage.selectedApp.hidden || (!appPage.selectedApp.running && !appPage.selectedApp.directLaunch))
                 textOnly: true; textAlignment: Text.AlignLeft
-                onClicked: { appPage.appModel.setAppHidden(appPage.selectedIndex, !appPage.selectedApp.hidden); appPage.collapseDetails() }
+                onClicked: {
+                    var row = appPage.selectedAppIndex()
+                    if (row >= 0) appPage.appModel.setAppHidden(row, !appPage.selectedApp.hidden)
+                    appPage.collapseDetails()
+                }
                 KeyNavigation.up: directButton; KeyNavigation.down: streamSettingsButton
             }
             ConsoleListRow {

@@ -34,6 +34,7 @@ ApplicationWindow {
     Material.primary: Style.surface
     Material.background: Style.background
     Material.foreground: Style.text
+    readonly property bool toolbarFocused: homeButton.activeFocus || pcsButton.activeFocus || settingsButton.activeFocus || uiFullscreenButton.activeFocus
     readonly property bool controllerInput: SdlGamepadKeyNavigation.inputMethod === "controller"
     property bool uiDisplayReady: false
     property bool controllerFullscreenRequested: false
@@ -106,7 +107,7 @@ ApplicationWindow {
         }
     }
     function activatePrimary() {
-        if (window.popupHasFocus()) { activateFocused(); return }
+        if (window.popupHasFocus() || toolbarFocused) { activateFocused(); return }
         var page = stackView.currentItem
         if (page instanceof AppView && page.detailsExpanded) activateFocused()
         else if (page && typeof page.primaryAction === "function") page.primaryAction()
@@ -383,6 +384,7 @@ ApplicationWindow {
 
     header: ToolBar {
         id: toolBar
+        Keys.forwardTo: [stackView]
         height: Style.px(72, window)
         background: Rectangle { color: Style.background }
         RowLayout {
@@ -434,7 +436,7 @@ ApplicationWindow {
                     id: hint
                     readonly property string action: modelData
                     objectName: "footerHint_" + action
-                    visible: action === "confirm" || action === "back" || action === "options" && ((stackView.currentItem instanceof PcView || stackView.currentItem instanceof SettingsView) && stackView.currentItem.optionsAvailable || stackView.currentItem instanceof AppView && stackView.currentItem.hasGames && !stackView.currentItem.detailsExpanded) || action === "shelves" && stackView.currentItem instanceof AppView && stackView.currentItem.hasMultipleShelves && !stackView.currentItem.detailsExpanded
+                    visible: action === "confirm" || action === "back" || !window.toolbarFocused && (action === "options" && ((stackView.currentItem instanceof PcView || stackView.currentItem instanceof SettingsView) && stackView.currentItem.optionsAvailable || stackView.currentItem instanceof AppView && stackView.currentItem.hasGames && !stackView.currentItem.detailsExpanded) || action === "shelves" && stackView.currentItem instanceof AppView && stackView.currentItem.hasMultipleShelves && !stackView.currentItem.detailsExpanded)
                     implicitWidth: hintRow.implicitWidth; implicitHeight: hintRow.implicitHeight
                     Row {
                         id: hintRow; spacing: Style.px(8, window)
@@ -442,7 +444,7 @@ ApplicationWindow {
                         ConsoleText {
                             role: "secondary"
                             text: hint.action === "back" ? qsTr("Back") : hint.action === "options" ? stackView.currentItem instanceof AppView ? qsTr("Details") : stackView.currentItem instanceof SettingsView ? qsTr("Help") : qsTr("Options") : hint.action === "shelves" ? qsTr("Rows") :
-                                stackView.currentItem && stackView.currentItem.primaryVerb && !stackView.currentItem.detailsExpanded ? stackView.currentItem.primaryVerb : qsTr("Select")
+                                window.toolbarFocused ? qsTr("Select") : stackView.currentItem && stackView.currentItem.primaryVerb && !stackView.currentItem.detailsExpanded ? stackView.currentItem.primaryVerb : qsTr("Select")
                         }
                     }
                     MouseArea {
@@ -457,7 +459,7 @@ ApplicationWindow {
                 }
             }
             Item { Layout.fillWidth: true }
-              ConsoleText { role: "caption"; text: qsTr("◀  Categories"); visible: stackView.currentItem instanceof SettingsView && !stackView.currentItem.categoryMenuFocused && !window.popupHasFocus() }
+              ConsoleText { role: "caption"; text: qsTr("◀  Categories"); visible: stackView.currentItem instanceof SettingsView && !stackView.currentItem.categoryMenuFocused && !window.toolbarFocused && !window.popupHasFocus() }
             ConsoleText { role: "caption"; text: window.controllerLabel("sections") + "  " + qsTr("Sections"); visible: window.width >= 1100 }
         }
     }

@@ -71,8 +71,21 @@ FocusScope {
             for (var i = 0; i < item.children.length; ++i) collect(item.children[i])
         }
         collect(settingsPage.contentItem)
+        // All proxies are direct siblings of the Columns. Keep even those
+        // excluded from navigation aligned so they cannot intercept stale areas.
+        var siblings = settingsPage.contentItem.children
+        for (var i = 0; i < siblings.length; ++i) {
+            if (siblings[i].disabledSettingProxy === true && siblings[i].visible) siblings[i].syncGeometry()
+        }
         categoryRows = items
         return items
+    }
+    // A proxy is outside the settings Columns, so resynchronize it after
+    // wrapping, conditional rows, and viewport changes settle.
+    function reflowRows() { if (visible) settingsFocusItems() }
+    function reflowAndReveal() {
+        reflowRows()
+        if (activeRow && (activeRow.activeFocus || activeRow.rowFocused === true)) ensureRowVisible(activeRow)
     }
     function rowFocused(row) {
         activeRow = row
@@ -94,8 +107,19 @@ FocusScope {
     function primaryAction() { if (categoryMenuFocused) focusContent(); else if (activeRow) activateRow(activeRow) }
     function backAction() { focusCategories() }
     function activateRow(row) {
+        if (!row) return
+        var items = settingsFocusItems()
+        var index = items.indexOf(row)
+        // Availability can change while a popup or asynchronous action owns
+        // focus. Recover to its live row instead of invoking a stale editor.
+        if (index < 0) {
+            var live = row.disabledSettingProxy === true ? row.target : row.disabledSettingsProxy
+            if (live && items.indexOf(live) >= 0) focusRow(live)
+            else if (items.length) focusRow(items[0])
+            else focusCategories()
+            return
+        }
         rowFocused(row)
-        var index = settingsFocusItems().indexOf(row)
         if (row.disabledSettingProxy === true) { optionsAction(); return }
         row.activateSetting()
         // Actions such as Use Default can remove their own row. Keep focus
@@ -130,7 +154,8 @@ FocusScope {
         if (index < 0) {
             // A busy/hidden action may have relinquished focus since the last
             // frame. Recover inside the list; popup keys are contained by editors.
-            var remembered = items.indexOf(activeRow)
+            var live = activeRow && (activeRow.disabledSettingProxy === true ? activeRow.target : activeRow.disabledSettingsProxy)
+            var remembered = Math.max(items.indexOf(activeRow), items.indexOf(live))
             if (items.length) focusRow(items[Math.max(0, remembered)])
             else focusCategories()
             return true
@@ -158,10 +183,12 @@ FocusScope {
             readonly property string settingsLabel: target ? target.settingsLabel : ""
             readonly property string settingsHelp: qsTr("Unavailable with the current settings or device.") +
                 (target && target.settingsHelp ? "\n" + target.settingsHelp : "")
-            visible: !!target && target.visible && (!target.enabled || !!target.editor && !target.editor.enabled)
+            visible: !!target && target.visible && (!target.editor || target.editor.visible) && (!target.enabled || !!target.editor && !target.editor.enabled)
             activeFocusOnTab: visible
+            onVisibleChanged: if (visible && target) Qt.callLater(syncGeometry)
             z: 2
             function syncGeometry() {
+                if (!target) return
                 var point = target.mapToItem(parent, 0, 0)
                 x = point.x; y = point.y; width = target.width; height = target.height
             }
@@ -221,6 +248,9 @@ FocusScope {
     }
     Flickable {
     id: settingsPage
+    onWidthChanged: Qt.callLater(settingsShell.reflowAndReveal)
+    onHeightChanged: Qt.callLater(settingsShell.reflowAndReveal)
+    onContentHeightChanged: Qt.callLater(settingsShell.reflowRows)
     anchors.left: categoryList.right; anchors.leftMargin: Style.px(40, settingsShell.Window.window)
     width: Math.min(Style.px(760, settingsShell.Window.window), settingsShell.width - x - Style.px(64, settingsShell.Window.window))
     anchors.top: parent.top; anchors.topMargin: Style.px(24, settingsShell.Window.window)

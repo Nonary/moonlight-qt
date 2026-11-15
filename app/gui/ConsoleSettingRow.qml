@@ -31,7 +31,7 @@ Item {
     Keys.onPressed: function(event) { event.accepted = settingsNavigation ? settingsNavigation.handleRowKey(row, event) : false }
     Rectangle { anchors.fill: parent; color: row.rowFocused ? Style.control : "transparent"; radius: Style.px(6, row.Window.window) }
     Item { id: labelHolder; x: Style.px(16, row.Window.window); y: (row.height - (row.labelItem ? row.labelItem.implicitHeight : 0)) / 2; width: editorHolder.x - x - Style.px(24, row.Window.window); height: row.labelItem ? row.labelItem.implicitHeight : 0; opacity: !row.editor || row.editor.enabled ? 1 : 0.5 }
-    Item { id: editorHolder; width: Math.min(Style.px(280, row.Window.window), row.width * 0.43); x: row.width - width - Style.px(16, row.Window.window); y: (row.height - (row.editor ? row.editor.implicitHeight : 0)) / 2; height: row.editor ? row.editor.implicitHeight : 0 }
+    Item { id: editorHolder; width: Math.min(Style.px(280, row.Window.window), Math.round(row.width * 0.43)); x: row.width - width - Style.px(16, row.Window.window); y: (row.height - (row.editor ? row.editor.implicitHeight : 0)) / 2; height: row.editor ? row.editor.implicitHeight : 0 }
     MouseArea { width: editorHolder.x; height: parent.height; enabled: !row.editor || row.editor.enabled; onClicked: { row.forceActiveFocus(); row.activateSetting() } }
     Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Style.outline }
     ConsoleFocus { focused: row.rowFocused; radius: Style.px(6, row.Window.window) }

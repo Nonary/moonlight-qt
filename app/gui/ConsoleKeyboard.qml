@@ -79,6 +79,9 @@ NavigableDialog {
             font.family: "Inter"
             font.pixelSize: Style.typeSize("heading", keyboard.hostWindow)
             selectByMouse: true
+            cursorVisible: keyboard.opened
+            selectionColor: Style.text
+            selectedTextColor: Style.surface
             maximumLength: keyboard.targetField ? keyboard.targetField.maximumLength : 32767
             validator: keyboard.targetField ? keyboard.targetField.validator : null
             Keys.onDownPressed: keyGrid.forceActiveFocus()
@@ -94,9 +97,9 @@ NavigableDialog {
             cellWidth: width / columns
             cellHeight: Style.px(56, keyboard.hostWindow)
             interactive: false
-            property var rowLengths: keyboard.numeric ? [6,6] : keyboard.symbols ? [10,10,10,10] : [10,9,7]
-            model: keyboard.numeric ? (keyboard.addressMode ? "1234567890.:" : "1234567890.,").split("") : keyboard.symbols ?
-                "1234567890!@#$%&*()_-+=[]{}:/\\.,?;\"'<>|~`".split("") :
+            property var rowLengths: keyboard.numeric ? (keyboard.allowText || keyboard.addressMode ? [6,6] : [6,4]) : keyboard.symbols ? [10,10,10,10,2] : [10,9,7]
+            model: keyboard.numeric ? (keyboard.addressMode ? "1234567890.:" : keyboard.allowText ? "1234567890.," : "1234567890").split("") : keyboard.symbols ?
+                "1234567890!@#$%^&*()_-+=[]{}:/\\.,?;\"'<>|~`".split("") :
                 (keyboard.upperCase ? "QWERTYUIOPASDFGHJKL ZXCVBNM   " : "qwertyuiopasdfghjkl zxcvbnm   ").split("")
             function move(dx, dy) {
                 var row = Math.floor(currentIndex / columns), col = currentIndex % columns
@@ -110,6 +113,8 @@ NavigableDialog {
                 width: keyGrid.cellWidth - Style.px(8, keyboard.hostWindow)
                 height: keyGrid.cellHeight - Style.px(8, keyboard.hostWindow)
                 text: modelData
+                activeFocusOnTab: false
+                onActiveFocusChanged: if (activeFocus) keyGrid.currentIndex = index
                 focus: GridView.isCurrentItem
                 visible: modelData !== " "
                 enabled: visible
@@ -132,23 +137,23 @@ NavigableDialog {
             spacing: Style.px(12, keyboard.hostWindow)
             Layout.fillWidth: true
             ConsoleButton { text: keyboard.numeric || keyboard.symbols ? qsTr("ABC") : qsTr("123 / #"); visible: keyboard.allowText; onClicked: { if (keyboard.numeric) keyboard.numeric = false; else keyboard.symbols = !keyboard.symbols; keyGrid.currentIndex = 0 } }
-            ConsoleButton { text: qsTr("Shift"); visible: !keyboard.numeric; onClicked: keyboard.upperCase = !keyboard.upperCase }
+            ConsoleButton { text: qsTr("Shift"); selected: keyboard.upperCase; visible: !keyboard.numeric; onClicked: keyboard.upperCase = !keyboard.upperCase }
             ConsoleButton { text: qsTr("Space"); visible: !keyboard.numeric; Layout.fillWidth: true; onClicked: keyboard.enterKey(" ") }
             ConsoleButton {
                 id: backspace
-                text: qsTr("Delete")
+                text: qsTr("Backspace")
                 onClicked: keyboard.erase()
             }
             Keys.onUpPressed: keyGrid.forceActiveFocus()
-            Keys.onDownPressed: doneButton.forceActiveFocus()
+            Keys.onDownPressed: (doneButton.enabled ? doneButton : cancelButton).forceActiveFocus()
             Keys.onLeftPressed: keyboard.focusPrevious()
             Keys.onRightPressed: keyboard.focusNext()
         }
         RowLayout {
             spacing: Style.px(12, keyboard.hostWindow)
-            ConsoleText { role: "caption"; text: keyboard.commandLabel("options") + " " + qsTr("Delete") + " · " + keyboard.commandLabel("done") + " " + qsTr("Done") + " · " + keyboard.commandLabel("sections") + " " + qsTr("Cursor"); visible: SdlGamepadKeyNavigation.inputMethod === "controller" }
+            ConsoleText { role: "caption"; text: keyboard.commandLabel("options") + " " + qsTr("Backspace") + " · " + keyboard.commandLabel("done") + " " + qsTr("Done") + " · " + keyboard.commandLabel("sections") + " " + qsTr("Cursor"); visible: SdlGamepadKeyNavigation.inputMethod === "controller" }
             Item { Layout.fillWidth: true }
-            ConsoleButton { text: qsTr("Cancel"); onClicked: keyboard.reject() }
+            ConsoleButton { id: cancelButton; text: qsTr("Cancel"); onClicked: keyboard.reject() }
             ConsoleButton { id: doneButton; text: qsTr("Done"); enabled: draft.acceptableInput; onClicked: keyboard.commit() }
             Layout.fillWidth: true
             Keys.onUpPressed: backspace.forceActiveFocus()
@@ -160,6 +165,6 @@ NavigableDialog {
         return hostWindow && typeof hostWindow.controllerLabel === "function" ? hostWindow.controllerLabel(action) : action === "options" ? "X" : action === "done" ? "Y" : "LB / RB"
     }
     function erase() { if (draft.cursorPosition > 0) draft.remove(draft.cursorPosition - 1, draft.cursorPosition) }
-    function focusNext() { var item = keyGrid.Window.activeFocusItem; if (item) item.nextItemInFocusChain(true).forceActiveFocus() }
-    function focusPrevious() { var item = keyGrid.Window.activeFocusItem; if (item) item.nextItemInFocusChain(false).forceActiveFocus() }
+    function focusNext() { var item = keyGrid.Window.activeFocusItem; if (item) { var next = item.nextItemInFocusChain(true); if (next.parent === item.parent) next.forceActiveFocus() } }
+    function focusPrevious() { var item = keyGrid.Window.activeFocusItem; if (item) { var next = item.nextItemInFocusChain(false); if (next.parent === item.parent) next.forceActiveFocus() } }
 }

@@ -8,8 +8,14 @@ RecentAppsModel::RecentAppsModel(QObject* parent) : QSortFilterProxyModel(parent
 
 void RecentAppsModel::setAppIds(const QVariantList& ids)
 {
-    if (ids == m_AppIds) return;
-    m_AppIds = ids;
+    QVariantList normalized;
+    for (const auto& value : ids) {
+        bool ok = false;
+        const int id = value.toInt(&ok);
+        if (ok && id > 0 && !normalized.contains(id)) normalized.append(id);
+    }
+    if (normalized == m_AppIds) return;
+    m_AppIds = normalized;
     invalidate();
     emit appIdsChanged();
 }
@@ -38,7 +44,7 @@ bool RecentAppsModel::filterAcceptsRow(int row, const QModelIndex& parent) const
 
 bool RecentAppsModel::lessThan(const QModelIndex& left, const QModelIndex& right) const
 {
-    return m_AppIds.indexOf(left.data(m_AppIdRole)) < m_AppIds.indexOf(right.data(m_AppIdRole));
+    return m_AppIds.indexOf(left.data(m_AppIdRole).toInt()) < m_AppIds.indexOf(right.data(m_AppIdRole).toInt());
 }
 
 QVariantMap RecentAppsModel::get(int row) const

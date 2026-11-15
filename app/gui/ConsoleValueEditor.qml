@@ -46,21 +46,24 @@ NavigableDialog {
         if (!rangeEditor && !numberInput.readOnly && SdlGamepadKeyNavigation.inputMethod !== "controller") {
             numberInput.forceActiveFocus()
             numberInput.selectAll()
-        } else editorFocus.forceActiveFocus()
+        } else focusSink.forceActiveFocus()
     }
-    function step(direction) {
+    function step(direction, multiplier) {
         if (!readNumber()) return
-        pendingValue = Math.max(target.from, Math.min(target.to, pendingValue + direction * target.stepSize))
+        pendingValue = Math.max(target.from, Math.min(target.to, pendingValue + direction * target.stepSize * (multiplier || 1)))
         refreshNumber()
     }
     contentItem: FocusScope {
         id: editorFocus
         focus: true
         implicitHeight: editorColumn.implicitHeight
+        Item { id: focusSink; focus: true }
         Keys.onPressed: function(event) {
             event.accepted = true
             if (event.key === Qt.Key_Left) dialog.step(-1)
             else if (event.key === Qt.Key_Right) dialog.step(1)
+            else if (event.key === Qt.Key_PageUp) dialog.step(-1, 10)
+            else if (event.key === Qt.Key_PageDown) dialog.step(1, 10)
             else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) dialog.finish()
             else if (event.key === Qt.Key_Escape || event.key === Qt.Key_Back) dialog.reject()
             else if (event.key !== Qt.Key_Up && event.key !== Qt.Key_Down && event.key !== Qt.Key_PageUp && event.key !== Qt.Key_PageDown) event.accepted = false
@@ -80,11 +83,12 @@ NavigableDialog {
                 width: parent.width; visible: !dialog.rangeEditor
                 font.family: "Inter"; font.pixelSize: Style.typeSize("display", dialog.hostWindow)
                 horizontalAlignment: Text.AlignHCenter; selectByMouse: true
+                selectionColor: Style.text; selectedTextColor: Style.surface
                 readOnly: !!dialog.target && dialog.target.editable === false
                 validator: !dialog.rangeEditor && dialog.target && typeof dialog.target.validator !== "undefined" ? dialog.target.validator : null
                 onTextEdited: edited = true
-                Keys.onLeftPressed: dialog.step(-1)
-                Keys.onRightPressed: dialog.step(1)
+                Keys.onLeftPressed: function(event) { if (readOnly) dialog.step(-1); else event.accepted = false }
+                Keys.onRightPressed: function(event) { if (readOnly) dialog.step(1); else event.accepted = false }
                 Keys.onReturnPressed: dialog.finish()
                 Keys.onEnterPressed: dialog.finish()
             }

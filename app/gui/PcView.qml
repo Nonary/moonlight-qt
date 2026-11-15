@@ -15,7 +15,8 @@ CenteredGridView {
     property ComputerModel computerModel : createModel()
 
     property bool startupRestorePending: true
-    property string rememberedStatus: ""
+    readonly property string rememberedStatus: selectedHost.uuid === StreamingPreferences.uiLastHostUuid && !selectedHost.online ?
+        qsTr("%1 is unavailable. Use Options to wake it, or choose another PC.").arg(selectedHost.name) : ""
     function openHost(row, allApps, automatic) {
         var host = computerModel.get(row)
         if (!host.online || !host.paired || !host.serverSupported) return false
@@ -32,8 +33,6 @@ CenteredGridView {
         var row = computerModel.indexOfUuid(StreamingPreferences.uiLastHostUuid)
         if (row < 0) return false
         currentIndex = row
-        var host = computerModel.get(row)
-        rememberedStatus = host.online ? qsTr("Choose a PC to start playing") : qsTr("%1 is unavailable. Use Options to wake it, or choose another PC.").arg(host.name)
         return openHost(row, false, true)
     }
     function tryStartupRestore() {
@@ -48,8 +47,10 @@ CenteredGridView {
     Connections {
         target: pcGrid.computerModel
         function onDataChanged() { pcGrid.refreshHost(); Qt.callLater(pcGrid.tryStartupRestore) }
-        function onRowsInserted() { Qt.callLater(pcGrid.tryStartupRestore) }
-        function onModelReset() { Qt.callLater(pcGrid.tryStartupRestore) }
+        function onRowsInserted() { Qt.callLater(pcGrid.refreshAfterModelChange) }
+        function onRowsRemoved() { Qt.callLater(pcGrid.refreshAfterModelChange) }
+        function onModelReset() { Qt.callLater(pcGrid.refreshAfterModelChange) }
+        function onLayoutChanged() { Qt.callLater(pcGrid.refreshAfterModelChange) }
     }
     Timer { interval: 200; running: true; onTriggered: pcGrid.tryStartupRestore() }
     ConsoleBackdrop { parent: pcGrid; anchors.fill: parent; z: -1 }
@@ -62,13 +63,23 @@ CenteredGridView {
         if (count === 0 && footerItem) footerItem.button.forceActiveFocus()
         else if (currentItem) currentItem.forceActiveFocus()
     }
-    onCountChanged: Qt.callLater(focusContent)
+    onCountChanged: Qt.callLater(function() {
+        // Discovery continues while another page or the navigation rail owns focus.
+        if (pcGrid.StackView.status !== StackView.Active || !pcGrid.visible || !pcGrid.activeFocus) return
+        if (typeof window !== "undefined" && window.popupHasFocus()) return
+        pcGrid.focusContent()
+    })
     function primaryAction() {
         if (count === 0 || addingPc) addPcDialog.open()
         else if (currentItem) currentItem.activateHost()
     }
     function optionsAction() { if (currentItem) currentItem.pcContextMenu.open() }
     function refreshHost() { selectedHost = computerModel.get(currentIndex) }
+    function refreshAfterModelChange() {
+        // A reset or reorder can replace the host at an unchanged row number.
+        refreshHost()
+        tryStartupRestore()
+    }
     onCurrentIndexChanged: refreshHost()
     Column {
         parent: pcGrid
@@ -128,7 +139,11 @@ CenteredGridView {
     // also be done in CliStartStreamSegue.qml, since this code does not run
     // for command-line initiated streams.
     StackView.onActivated: {
-        Qt.callLater(pcGrid.focusContent)
+        Qt.callLater(function() {
+            if (pcGrid.StackView.status !== StackView.Active || !pcGrid.visible) return
+            if (typeof window !== "undefined" && window.popupHasFocus()) return
+            pcGrid.focusContent()
+        })
         // Setup signals on CM
         ComputerManager.computerAddCompleted.connect(addComplete)
 

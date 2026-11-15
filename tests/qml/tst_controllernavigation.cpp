@@ -40,6 +40,29 @@ public:
     }
 };
 
+class MutableConsoleHostModel : public ConsoleHostModel {
+    Q_OBJECT
+public:
+    using ConsoleHostModel::ConsoleHostModel;
+    bool reversed = false;
+    Q_INVOKABLE QVariantMap get(int row) const {
+        return ConsoleHostModel::get(reversed && row >= 0 && row < hostCount ? hostCount - row - 1 : row);
+    }
+    QVariant data(const QModelIndex& index, int role) const override {
+        return get(index.row()).value(QString::fromUtf8(roleNames().value(role)));
+    }
+    void reverseHosts() {
+        beginResetModel();
+        reversed = !reversed;
+        endResetModel();
+    }
+    void resetHostCount(int count) {
+        beginResetModel();
+        hostCount = count;
+        endResetModel();
+    }
+};
+
 class ControllerNavigationTest : public QObject {
     Q_OBJECT
     QTemporaryDir config;
@@ -47,6 +70,12 @@ class ControllerNavigationTest : public QObject {
     StreamingPreferences* prefs = nullptr;
     std::unique_ptr<SdlGamepadKeyNavigation> navigation;
     QList<SDL_Joystick*> virtualControllers;
+    static QQuickItem* visualItem(QQuickItem* item, const QString& name) {
+        if (item->objectName() == name) return item;
+        for (auto* child : item->childItems())
+            if (auto* result = visualItem(child, name)) return result;
+        return nullptr;
+    }
     void button(Uint32 type, Uint8 button, Sint32 controller = 1) {
         SDL_Event event {};
         event.type = type;
@@ -61,7 +90,7 @@ private slots:
     void initTestCase() {
         QFontDatabase::addApplicationFont(":/fonts/Inter.ttf");
         QGuiApplication::setFont(QFont("Inter"));
-        qmlRegisterType<ConsoleHostModel>("ComputerModel",1,0,"ComputerModel");
+        qmlRegisterType<MutableConsoleHostModel>("ComputerModel",1,0,"ComputerModel");
         qmlRegisterType<ConsoleAppModel>("AppModel",1,0,"AppModel");
         qmlRegisterType<RecentAppsModel>("AppModel",1,0,"RecentAppsModel");
         QVERIFY(config.isValid());
@@ -265,6 +294,96 @@ private slots:
         QCOMPARE(capped.first().toInt(), 30);
         QCOMPARE(capped.last().toInt(), 11);
         QSettings().remove("ui/recentApps");
+    }
+    void persistedHistoryNormalizesStringIdsAndDeduplicates() {
+        const QString key = "ui/recentApps/restarted-history";
+        // INI-loaded variants may be strings even when originally saved as ints.
+        QSettings().setValue(key, QVariantList({"4", "2", "4", "bad", "0", "-1"}));
+        QCOMPARE(prefs->recentUiApps("restarted-history"), QVariantList({4, 2}));
+        prefs->recordUiPlay("restarted-history", 2);
+        QCOMPARE(prefs->recentUiApps("restarted-history"), QVariantList({2, 4}));
+        QCOMPARE(QSettings().value(key).toList(), QVariantList({2, 4}));
+        ConsoleAppModel catalogue;
+        RecentAppsModel recent;
+        recent.setSourceModel(&catalogue);
+        recent.setAppIds({"4", "2", "4", "bad", "0", "-1"});
+        QCOMPARE(recent.rowCount(), 2);
+        QCOMPARE(recent.get(0).value("appid").toInt(), 4);
+        QCOMPARE(recent.get(1).value("appid").toInt(), 2);
+        QSettings().remove(key);
+    }
+    void hostDiscoveryPreservesSettingsFocusAndStatusTracksSelection() {
+        prefs->uiLastHostUuid = "host-two";
+        QQmlApplicationEngine engine;
+        engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
+        engine.rootContext()->setContextProperty("initialView", QString("qrc:/gui/PcView.qml"));
+        engine.rootContext()->setContextProperty("runConfigChecks", false);
+        engine.load(QUrl("qrc:/gui/main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* root = qobject_cast<QQuickWindow*>(engine.rootObjects().first()); QVERIFY(root);
+        root->requestActivate(); QTRY_COMPARE(QGuiApplication::focusWindow(), root);
+        auto* grid = root->findChild<QQuickItem*>("Computers"); QVERIFY(grid);
+        QTRY_VERIFY(!grid->property("startupRestorePending").toBool());
+        QVERIFY(grid->property("rememberedStatus").toString().contains("Living Room PC"));
+        grid->setProperty("currentIndex", 0);
+        QTRY_VERIFY(grid->property("rememberedStatus").toString().isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(root, "openSettings", Q_ARG(QVariant, QVariant(0))));
+        auto* rail = root->findChild<QQuickItem*>("settingsCategories");
+        QTRY_VERIFY(rail && rail->isVisible());
+        rail->forceActiveFocus();
+        auto* model = qobject_cast<MutableConsoleHostModel*>(grid->property("computerModel").value<QObject*>()); QVERIFY(model);
+        model->resetHostCount(1);
+        QTest::qWait(60);
+        QVERIFY(rail->hasActiveFocus());
+        model->resetHostCount(2);
+        QTest::qWait(60);
+        QVERIFY(rail->hasActiveFocus());
+        model->reverseHosts();
+        QTRY_COMPARE(grid->property("selectedHost").toMap().value("name").toString(), QString("Living Room PC"));
+        QVERIFY(rail->hasActiveFocus());
+        model->reverseHosts();
+        QTRY_COMPARE(grid->property("selectedHost").toMap().value("name").toString(), QString("Gaming PC"));
+        prefs->uiLastHostUuid.clear();
+    }
+    void recentGameActionsFollowIdentityAfterCatalogueRowsMove() {
+        QSettings().remove("ui/selectedApps/host-one");
+        QSettings().remove("ui/recentApps/host-one");
+        prefs->recordUiPlay("host-one", 4);
+        QCOMPARE(prefs->recentUiApps("host-one"), QVariantList({QVariant(4)}));
+        prefs->uiLastHostUuid.clear();
+        QQmlApplicationEngine engine;
+        engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
+        engine.rootContext()->setContextProperty("initialView", QString("qrc:/gui/PcView.qml"));
+        engine.rootContext()->setContextProperty("runConfigChecks", false);
+        engine.load(QUrl("qrc:/gui/main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* root = qobject_cast<QQuickWindow*>(engine.rootObjects().first()); QVERIFY(root);
+        root->requestActivate(); QTRY_COMPARE(QGuiApplication::focusWindow(), root);
+        auto* add = root->findChild<QQuickItem*>("addPcTile"); QVERIFY(add);
+        add->forceActiveFocus();
+        QTest::keyClick(root, Qt::Key_Left);
+        QTest::keyClick(root, Qt::Key_Return);
+        QQuickItem* recent = nullptr;
+        QTRY_VERIFY((recent = root->findChild<QQuickItem*>("recentGameShelf")));
+        auto* page = recent->parentItem();
+        while (page && !page->property("appModel").isValid()) page = page->parentItem();
+        QVERIFY(page);
+        auto* model = qobject_cast<ConsoleAppModel*>(page->property("appModel").value<QObject*>()); QVERIFY(model);
+        QVERIFY(QMetaObject::invokeMethod(page, "focusShelf", Q_ARG(QVariant, QVariant(true))));
+        QTRY_COMPARE(page->property("selectedApp").toMap().value("appid").toInt(), 4);
+        // Removing an app absent from Recents shifts the source row without a
+        // Recent selection change, so a bound invokable row lookup goes stale.
+        model->removeApp(1);
+        QTest::qWait(40);
+        QCOMPARE(page->property("selectedApp").toMap().value("appid").toInt(), 4);
+        QTest::keyClick(root, Qt::Key_Menu);
+        auto* hide = root->findChild<QQuickItem*>("hideGameButton"); QVERIFY(hide);
+        QTRY_VERIFY(hide->isVisible());
+        QVERIFY(QMetaObject::invokeMethod(hide, "clicked"));
+        QTRY_VERIFY(model->hiddenIds.contains(4));
+        QVERIFY(!model->hiddenIds.contains(5));
+        QSettings().remove("ui/recentApps/host-one");
+        prefs->uiLastHostUuid.clear();
     }
     void controllerFullscreenPreferenceDefaultsOnAndPersists() {
         QSettings().remove("ui/controllerFullscreen");
@@ -478,6 +597,18 @@ private slots:
         }
         QTest::keyClick(root, Qt::Key_Up);
         QVERIFY(!recent->hasActiveFocus());
+        QVERIFY(root->property("toolbarFocused").toBool());
+        auto* footerConfirm = visualItem(root->contentItem(), "footerHint_confirm"); QVERIFY(footerConfirm);
+        bool selectHint = false;
+        for (auto* item : footerConfirm->findChildren<QQuickItem*>())
+            if (item->property("text").toString() == "Select") selectHint = true;
+        QVERIFY(selectHint);
+        if (!capture.isEmpty()) QVERIFY(root->grabWindow().save(capture + "/toolbar-library.png"));
+        const int toolbarSelection = selectedId();
+        QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier,
+            footerConfirm->mapToScene(QPointF(footerConfirm->width()/2, footerConfirm->height()/2)).toPoint());
+        QTRY_VERIFY(recent->hasActiveFocus());
+        QCOMPARE(selectedId(), toolbarSelection);
         // Emptying Recents skips that row and leaves the complete catalogue usable.
         model->setAppHidden(model->indexOfApp(1), true);
         model->setAppHidden(model->indexOfApp(2), true);
@@ -927,7 +1058,13 @@ private slots:
         auto* resetRow=root->findChild<QQuickItem*>("resetBitrateRow"); QVERIFY(resetRow && resetRow->isVisible());
         resetRow->forceActiveFocus(); press(SDL_CONTROLLER_BUTTON_A);
         QTRY_VERIFY(!resetRow->isVisible());
-        QTRY_COMPARE(root->activeFocusItem()->property("settingsLabel").toString(),QString("V-Sync"));
+        QTRY_VERIFY(root->activeFocusItem() && root->activeFocusItem()->isVisible() && root->activeFocusItem()->isEnabled());
+        QVERIFY(!root->activeFocusItem()->property("settingsLabel").toString().isEmpty());
+        QQuickItem* vsyncSetting = nullptr;
+        for (auto* item : root->findChildren<QQuickItem*>())
+            if (item->isVisible() && item->property("settingsLabel").toString() == "V-Sync") { vsyncSetting = item; break; }
+        QVERIFY(vsyncSetting);
+        vsyncSetting->forceActiveFocus();
         auto* vsyncRow=root->activeFocusItem();
         press(SDL_CONTROLLER_BUTTON_A); QVERIFY(!prefs->enableVsync);
         auto* disabledPacing=root->findChild<QQuickItem*>("framePacingRow"); QVERIFY(disabledPacing);
@@ -937,7 +1074,19 @@ private slots:
         QVERIFY(root->activeFocusItem()->isEnabled());
         QCOMPARE(root->activeFocusItem()->property("settingsLabel").toString(), QString("Frame pacing"));
         QVERIFY(root->activeFocusItem()->property("disabledSettingProxy").toBool());
+        auto* disabledProxy = root->activeFocusItem();
         const auto disabledSnapshot = snapshot();
+        for (const QSize size : {QSize(800,500), QSize(1280,720)}) {
+            root->resize(size);
+            QTRY_VERIFY(QLineF(disabledProxy->mapToScene(QPointF()), disabledPacing->mapToScene(QPointF())).length() < 1);
+            QTRY_VERIFY(qAbs(disabledProxy->width() - disabledPacing->width()) < 1);
+            QTRY_VERIFY(qAbs(disabledProxy->height() - disabledPacing->height()) < 1);
+            QTRY_COMPARE(root->activeFocusItem(), disabledProxy);
+            QTRY_VERIFY(disabledProxy->mapToItem(pane, QPointF()).y() >= -1 &&
+                disabledProxy->mapToItem(pane, QPointF()).y() + disabledProxy->height() <= pane->height() + 1);
+            QCOMPARE(snapshot(), disabledSnapshot);
+            captureState(QString("disabled-row-%1").arg(size.width()));
+        }
         press(SDL_CONTROLLER_BUTTON_A);
         auto* disabledHelp = root->findChild<QObject*>("settingsHelpDialog"); QVERIFY(disabledHelp);
         QTRY_VERIFY(disabledHelp->property("visible").toBool());
@@ -1048,6 +1197,7 @@ private slots:
         auto* root=qobject_cast<QQuickWindow*>(engine.rootObjects().first()); QVERIFY(root);
         root->requestActivate(); QTRY_COMPARE(QGuiApplication::focusWindow(),root);
         navigation->notifyWindowFocus(true);
+        QVERIFY(QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired"));
         const auto press=[&](Uint8 code) { button(SDL_CONTROLLERBUTTONDOWN,code); button(SDL_CONTROLLERBUTTONUP,code); };
         auto* add=root->findChild<QQuickItem*>("addPcTile"); QVERIFY(add); add->forceActiveFocus();
         press(SDL_CONTROLLER_BUTTON_DPAD_LEFT); press(SDL_CONTROLLER_BUTTON_A);
@@ -1056,9 +1206,22 @@ private slots:
         auto* model=qobject_cast<ConsoleAppModel*>(page->property("appModel").value<QObject*>()); QVERIFY(model);
         model->setProperty("appListLoading",true);
         for(int id : QList<int>(model->ids)) model->removeApp(id);
+        QTRY_VERIFY(!page->property("hasGames").toBool());
         auto* choose=root->findChild<QQuickItem*>("emptyLibraryChoosePc"); QVERIFY(choose);
         QTRY_VERIFY(choose->hasActiveFocus());
         QCOMPARE(page->property("primaryVerb").toString(),QString("Choose PC"));
+        auto* emptySleep = root->findChild<QQuickItem*>("emptyHostSleepAction"); QVERIFY(emptySleep);
+        // Expose the optional host capability without performing a power action.
+        emptySleep->setProperty("visible", true);
+        emptySleep->forceActiveFocus();
+        QTRY_COMPARE(page->property("primaryVerb").toString(), QString("Sleep PC"));
+        QVERIFY(QMetaObject::invokeMethod(page, "primaryAction"));
+        auto* sleepConfirmation = root->findChild<QObject*>("hostSleepConfirmation"); QVERIFY(sleepConfirmation);
+        QTRY_VERIFY(sleepConfirmation->property("visible").toBool());
+        QTest::keyClick(root, Qt::Key_Escape);
+        QTRY_VERIFY(!sleepConfirmation->property("visible").toBool());
+        emptySleep->setProperty("visible", false);
+        choose->forceActiveFocus();
         auto* title=root->findChild<QObject*>("emptyLibraryTitle"); QVERIFY(title);
         QTRY_COMPARE(title->property("text").toString(),QString::fromUtf8("Loading games…"));
         const QString capture=qEnvironmentVariable("CONSOLE_UI_CAPTURE_DIR");

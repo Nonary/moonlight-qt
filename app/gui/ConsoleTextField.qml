@@ -8,6 +8,8 @@ import "ConsoleStyle.js" as Style
 TextField {
     id: field
     selectByMouse: true
+    selectionColor: Style.text
+    selectedTextColor: Style.surface
     property bool addressInput: false
     font.family: "Inter"
     font.pixelSize: Style.typeSize("body", Window.window)

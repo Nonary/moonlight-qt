@@ -8,6 +8,8 @@ ListView {
     id: shelf
     property int selectedAppId: 0
     property bool modelChanging: false
+    // Keep the selected cover identifiable when focus moves to navigation.
+    property bool showCurrent: activeFocus
     signal selectionChanged()
     signal moveUp()
     signal moveDown()
@@ -66,7 +68,10 @@ ListView {
         height: shelf.height
         Rectangle {
             id: cover
-            readonly property bool selected: shelf.currentIndex === index && shelf.activeFocus
+            readonly property bool current: shelf.currentIndex === index && shelf.showCurrent
+            readonly property bool selected: current && shelf.activeFocus
+            readonly property bool appRunning: !!model.running
+            readonly property bool appHidden: !!model.hidden
             x: 0; y: Style.px(6, shelf.Window.window)
             height: parent.height - 2 * y
             width: height * 0.72
@@ -90,7 +95,27 @@ ListView {
                 role: "secondary"; text: model.name
                 wrapMode: Text.Wrap; maximumLineCount: 3; elide: Text.ElideRight
             }
-            Rectangle { anchors.fill: parent; color: "black"; opacity: cover.selected ? 0 : 0.28 }
+            Rectangle { anchors.fill: parent; color: "black"; opacity: cover.current ? 0 : 0.28 }
+            Column {
+                anchors.right: parent.right; anchors.top: parent.top
+                anchors.margins: Style.px(8, shelf.Window.window)
+                spacing: Style.px(4, shelf.Window.window)
+                Repeater {
+                    model: [qsTr("Running"), qsTr("Hidden")]
+                    delegate: Rectangle {
+                        visible: index === 0 ? cover.appRunning : cover.appHidden
+                        width: Math.min(cover.width - Style.px(16, shelf.Window.window), stateLabel.implicitWidth + Style.px(16, shelf.Window.window))
+                        height: visible ? stateLabel.implicitHeight + Style.px(8, shelf.Window.window) : 0
+                        radius: Style.px(4, shelf.Window.window)
+                        color: Style.background
+                        ConsoleText {
+                            id: stateLabel; anchors.centerIn: parent; role: "caption"
+                            width: parent.width - Style.px(16, shelf.Window.window); elide: Text.ElideRight
+                            text: modelData; color: index === 0 ? Style.ok : Style.muted
+                        }
+                    }
+                }
+            }
             ConsoleFocus { focused: cover.selected }
             MouseArea {
                 anchors.fill: parent; acceptedButtons: Qt.LeftButton | Qt.RightButton

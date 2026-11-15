@@ -43,7 +43,7 @@ T.Button {
     }
     background: Rectangle {
         radius: Style.px(6, control.Window.window)
-        color: control.focusVisible || control.down || control.hovered ? Style.control : control.selected ? Style.raised : control.textOnly ? "transparent" : Style.control
+        color: control.down ? Qt.lighter(Style.control, 1.65) : control.hovered || control.focusVisible ? Qt.lighter(Style.control, 1.3) : control.selected ? Style.raised : control.textOnly ? "transparent" : Style.control
         ConsoleFocus { focused: control.activeFocus; radius: parent.radius }
         Rectangle {
             visible: control.selected && !control.focusVisible
