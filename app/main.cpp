@@ -10,6 +10,7 @@
 #include <QNetworkProxyFactory>
 #include <QPalette>
 #include <QFont>
+#include <QFontDatabase>
 #include <QCursor>
 #include <QElapsedTimer>
 #include <QTemporaryFile>
@@ -50,6 +51,7 @@
 #include "diagnostics/diagnosticcapture.h"
 #include "gui/computermodel.h"
 #include "gui/appmodel.h"
+#include "gui/recentappsmodel.h"
 #include "backend/autoupdatechecker.h"
 #include "backend/computermanager.h"
 #include "backend/systemproperties.h"
@@ -996,6 +998,11 @@ int main(int argc, char *argv[])
 #ifndef Q_OS_DARWIN
     // Set the window icon except on macOS where we want to keep the
     // modified macOS 11 style rounded corner icon.
+    QFontDatabase::addApplicationFont(":/fonts/Inter.ttf");
+    QFont uiFont;
+    uiFont.setFamilies({"Inter", "Segoe UI Variable Text", "Segoe UI", "Noto Sans"});
+    uiFont.setPixelSize(20);
+    app.setFont(uiFont);
     app.setWindowIcon(QIcon(":/res/moonlight.svg"));
 #endif
 
@@ -1007,6 +1014,7 @@ int main(int argc, char *argv[])
     // Register our C++ types for QML
     qmlRegisterType<ComputerModel>("ComputerModel", 1, 0, "ComputerModel");
     qmlRegisterType<AppModel>("AppModel", 1, 0, "AppModel");
+    qmlRegisterType<RecentAppsModel>("AppModel", 1, 0, "RecentAppsModel");
     qmlRegisterUncreatableType<Session>("Session", 1, 0, "Session", "Session cannot be created from QML");
     qmlRegisterSingletonType<ComputerManager>("ComputerManager", 1, 0,
                                               "ComputerManager",

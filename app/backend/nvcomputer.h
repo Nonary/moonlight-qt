@@ -122,6 +122,8 @@ public:
     QString uuid;
     QSslCertificate serverCert;
     QVector<NvApp> appList;
+    bool appListFetchCompleted = false;
+    bool appListFetchFailed = false;
     bool isNvidiaServerSoftware;
     // Remember to update isEqualSerialized() when adding fields here!
 

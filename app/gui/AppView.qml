@@ -1,382 +1,377 @@
 import QtQuick 2.9
-import QtQuick.Controls 2.2
-import QtQuick.Controls.Material 2.2
-
+import QtQuick.Controls 2.5
+import QtQuick.Layouts 1.3
+import QtQuick.Window 2.2
 import StreamingPreferences 1.0
 import AppModel 1.0
 import ComputerManager 1.0
 import SdlGamepadKeyNavigation 1.0
+import "ConsoleStyle.js" as Style
 
-CenteredGridView {
+FocusScope {
+    id: appPage
     property int computerIndex
-    property AppModel appModel : createModel()
-    property bool activated
-    property bool showHiddenGames
-    property bool showGames
+    property string hostUuid: ""
+    property bool showHiddenGames: false
+    property bool showGames: false
+    property bool activated: false
     property bool sleepPending: false
+    property bool detailsExpanded: false
+    readonly property int currentIndex: activeShelf.currentIndex
+    readonly property var currentItem: activeShelf.currentItem
+    property bool ready: false
+    readonly property real shelfHeight: Math.max(Style.px(100, Window.window), Math.min(Style.px(196, Window.window),
+        Math.floor((shelfScroll.height - recentHeading.height - libraryHeading.height - shelfRows.spacing -
+                    recentRow.spacing - libraryRow.spacing - (recentShelf.count ? 0 : recentEmpty.height + recentRow.spacing)) /
+                   (recentShelf.count ? 2 : 1))))
+    property bool recentRowActive: false
+    readonly property var activeShelf: recentRowActive ? recentShelf : shelf
+    readonly property bool hasGames: shelf.count > 0
+    readonly property bool hasMultipleShelves: recentShelf.count > 0 && hasGames
+    property var selectedApp: ({})
+    property AppModel appModel: AppModel { includeHostActions: false }
+    property RecentAppsModel recentModel: RecentAppsModel { sourceModel: appPage.appModel }
+    readonly property real uiScale: Style.windowScale(Window.window)
+    readonly property int selectedIndex: selectedApp.appid ? appModel.indexOfApp(selectedApp.appid) : -1
+    focus: true
+
+    function restoreSelection() {
+        shelf.restoreSelection()
+        recentShelf.restoreSelection()
+        updateSelection()
+    }
+    function updateSelection() {
+        if (!ready || activeShelf.modelChanging) return
+        selectedApp = activeShelf.currentApp()
+        if (selectedApp.appid) StreamingPreferences.rememberUiSelection(hostUuid, selectedApp.appid)
+        else if (detailsExpanded) collapseDetails()
+    }
+    function focusShelf(recent) {
+        if (!hasGames) { choosePcButton.forceActiveFocus(); return }
+        recentRowActive = recent && recentShelf.count > 0
+        activeShelf.forceActiveFocus()
+        updateSelection()
+        Qt.callLater(revealShelf)
+    }
+    function revealShelf() {
+        if (detailsExpanded) return
+        var row = recentRowActive ? recentRow : libraryRow
+        if (row.y < shelfScroll.contentY) shelfScroll.contentY = row.y
+        else if (row.y + row.height > shelfScroll.contentY + shelfScroll.height)
+            shelfScroll.contentY = row.y + row.height - shelfScroll.height
+    }
+    function expandDetails() {
+        if (!selectedApp.appid) return
+        detailsExpanded = true
+        playButton.forceActiveFocus()
+        Qt.callLater(function() { if (appPage.detailsExpanded) playButton.forceActiveFocus() })
+    }
+    function collapseDetails() { detailsExpanded = false; focusShelf(recentRowActive) }
+    function launchSelected() {
+        var row = selectedIndex
+        if (row < 0) return
+        var runningId = appModel.getRunningAppId()
+        if (runningId !== 0 && runningId !== selectedApp.appid) {
+            quitAppDialog.appName = appModel.getRunningAppName()
+            quitAppDialog.segueToStream = true
+            quitAppDialog.nextAppName = selectedApp.name
+            quitAppDialog.nextAppId = selectedApp.appid
+            quitAppDialog.open()
+            return
+        }
+        var session = appModel.createSessionForApp(row)
+        if (!session) return
+        var component = Qt.createComponent("StreamSegue.qml")
+        stackView.push(component.createObject(stackView, {
+            "appName": selectedApp.name, "artwork": selectedApp.boxart,
+            "session": session, "isResume": runningId === selectedApp.appid
+        }))
+    }
+    function quitSelected() {
+        quitAppDialog.appName = appModel.getRunningAppName()
+        quitAppDialog.segueToStream = false
+        quitAppDialog.open()
+    }
+    Component.onCompleted: {
+        appModel.initialize(ComputerManager, computerIndex, showHiddenGames)
+        recentModel.appIds = StreamingPreferences.recentUiApps(hostUuid)
+        var wanted = StreamingPreferences.selectedUiApp(hostUuid)
+        shelf.restoreSelection(wanted)
+        recentShelf.restoreSelection(wanted)
+        recentRowActive = recentShelf.count > 0 && (!wanted || recentModel.indexOfApp(wanted) >= 0)
+        ready = true
+        updateSelection()
+        Qt.callLater(function() { if (appPage.activeFocus && !appPage.detailsExpanded) appPage.focusShelf(appPage.recentRowActive) })
+    }
+    StackView.onActivated: {
+        activated = true
+        SdlGamepadKeyNavigation.setUiNavMode(false)
+        restoreSelection()
+        if (!showGames && !showHiddenGames) {
+            showGames = true
+            var direct = appModel.getDirectLaunchAppIndex()
+            if (direct >= 0 && appModel.getRunningAppId() === 0) {
+                recentRowActive = false; shelf.currentIndex = direct; updateSelection(); launchSelected()
+            }
+        }
+    }
+    StackView.onDeactivating: activated = false
+    onActiveFocusChanged: {
+        if (activeFocus && !activeShelf.activeFocus && !detailsExpanded) focusShelf(recentRowActive)
+    }
     Connections {
-        target: appModel
+        target: appPage.appModel
+        function onComputerLost() { if (appPage.activated) stackView.pop(null) }
         function onHostSleepCompleted(error) {
-            appGrid.sleepPending = false
+            appPage.sleepPending = false
             sleepResult.imageSrc = error.length ? "qrc:/res/baseline-error_outline-24px.svg" : "qrc:/res/baseline-check_circle_outline-24px.svg"
             sleepResult.text = error.length ? error : qsTr("The host accepted the sleep request. Sleep completion depends on the host. No stream was started.")
             sleepResult.open()
         }
     }
-
-    id: appGrid
-    focus: true
-    activeFocusOnTab: true
-    topMargin: 20
-    bottomMargin: 5
-    cellWidth: 230; cellHeight: 297;
-
-    function computerLost()
-    {
-        // Go back to the PC view on PC loss
-        stackView.pop()
-    }
-
-    Component.onCompleted: {
-        // Don't show any highlighted item until interacting with them.
-        // We do this here instead of onActivated to avoid losing the user's
-        // selection when backing out of a different page of the app.
-        currentIndex = -1
-    }
-
-    StackView.onActivated: {
-        appModel.computerLost.connect(computerLost)
-        activated = true
-
-        // Highlight the first item if a gamepad is connected
-        if (currentIndex === -1 && SdlGamepadKeyNavigation.getConnectedGamepads() > 0) {
-            currentIndex = 0
+    Connections {
+        target: StreamingPreferences
+        function onRecentUiAppsChanged(uuid) {
+            if (uuid === appPage.hostUuid) appPage.recentModel.appIds = StreamingPreferences.recentUiApps(uuid)
         }
-
-        if (!showGames && !showHiddenGames) {
-            // Check if there's a direct launch app
-            var directLaunchAppIndex = model.getDirectLaunchAppIndex();
-            if (directLaunchAppIndex >= 0) {
-                // Start the direct launch app if nothing else is running
-                currentIndex = directLaunchAppIndex
-                currentItem.launchOrResumeSelectedApp(false)
-
-                // Set showGames so we will not loop when the stream ends
-                showGames = true
+    }
+    readonly property string primaryVerb: !hasGames ? qsTr("Choose PC") : selectedApp.running ? qsTr("Resume") : qsTr("Play")
+    function primaryAction() { if (hasGames) launchSelected(); else stackView.pop(null) }
+    Keys.onMenuPressed: { if (detailsExpanded) collapseDetails(); else if (hasGames) expandDetails() }
+    onHasGamesChanged: {
+        if (!ready) return
+        Qt.callLater(function() {
+            if (!appPage.visible || !appPage.activeFocus) return
+            if (!appPage.hasGames) appPage.collapseDetails()
+            else appPage.focusShelf(appPage.recentRowActive)
+        })
+    }
+    function optionsAction() { expandDetails() }
+    function detailsAction() { expandDetails() }
+    ConsoleBackdrop { anchors.fill: parent; artwork: appPage.selectedApp.boxart || "" }
+    Item {
+        id: libraryBrowser
+        anchors.fill: parent
+        visible: !appPage.detailsExpanded && appPage.hasGames
+        Column {
+            id: selectionSummary
+            x: Style.px(64, appPage.Window.window); y: Style.px(12, appPage.Window.window)
+            width: parent.width - 2 * x
+            spacing: Style.px(4, appPage.Window.window)
+            ConsoleText { width: parent.width; role: "title"; text: appPage.selectedApp.name || ""; elide: Text.ElideRight }
+            ConsoleText {
+                width: parent.width; role: "secondary"; elide: Text.ElideRight
+                text: appPage.selectedApp.running ? qsTr("Running on %1").arg(appPage.objectName) :
+                    appPage.objectName
             }
         }
+        Flickable {
+            id: shelfScroll
+            objectName: "gameShelfScroll"
+            y: selectionSummary.y + selectionSummary.height + Style.px(20, appPage.Window.window)
+            width: parent.width; height: parent.height - y
+            contentHeight: shelfRows.height
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            onHeightChanged: Qt.callLater(appPage.revealShelf)
+            Column {
+                id: shelfRows
+                width: shelfScroll.width
+                spacing: Style.px(16, appPage.Window.window)
+                Column {
+                    id: recentRow
+                    width: parent.width
+                    spacing: Style.px(4, appPage.Window.window)
+                    Row {
+                        id: recentHeading
+                        x: Style.px(64, appPage.Window.window)
+                        spacing: Style.px(16, appPage.Window.window)
+                        ConsoleText { role: "heading"; text: qsTr("Recently played") }
+                        ConsoleText { role: "caption"; text: qsTr("Latest first"); visible: recentShelf.count > 0; anchors.verticalCenter: parent.verticalCenter }
+                    }
+                    ConsoleText {
+                        id: recentEmpty
+                        x: Style.px(64, appPage.Window.window)
+                        width: parent.width - 2 * x
+                        role: "secondary"; text: qsTr("Games you play will appear here.")
+                        visible: recentShelf.count === 0
+                    }
+                    GameShelf {
+                        id: recentShelf; objectName: "recentGameShelf"
+                        width: parent.width; height: visible ? appPage.shelfHeight : 0
+                        visible: count > 0
+                        model: appPage.recentModel
+                        onSelectionChanged: {
+                            if (activeFocus) appPage.recentRowActive = true
+                            if (appPage.recentRowActive) appPage.updateSelection()
+                        }
+                        onActiveFocusChanged: { if (activeFocus) Qt.callLater(appPage.revealShelf) }
+                        onCountChanged: {
+                            if (appPage.ready && count === 0 && appPage.recentRowActive) {
+                                appPage.recentRowActive = false
+                                if (!appPage.detailsExpanded) shelf.forceActiveFocus()
+                                appPage.updateSelection()
+                            }
+                        }
+                        onMoveUp: { if (typeof window !== "undefined") window.focusNavigation() }
+                        onMoveDown: appPage.focusShelf(false)
+                        onPlayRequested: appPage.launchSelected()
+                        onDetailsRequested: appPage.expandDetails()
+                    }
+                }
+                Column {
+                    id: libraryRow
+                    width: parent.width
+                    spacing: Style.px(4, appPage.Window.window)
+                    ConsoleText {
+                        x: Style.px(64, appPage.Window.window)
+                        id: libraryHeading; role: "heading"; text: qsTr("All games · %1").arg(shelf.count)
+                    }
+                    GameShelf {
+                        id: shelf; objectName: "gameShelf"
+                        width: parent.width; height: appPage.shelfHeight
+                        model: appPage.appModel
+                        focus: true
+                        onSelectionChanged: {
+                            if (activeFocus) appPage.recentRowActive = false
+                            if (!appPage.recentRowActive) appPage.updateSelection()
+                        }
+                        onActiveFocusChanged: { if (activeFocus) Qt.callLater(appPage.revealShelf) }
+                        onMoveUp: {
+                            if (recentShelf.count > 0) appPage.focusShelf(true)
+                            else if (typeof window !== "undefined") window.focusNavigation()
+                        }
+                        onMoveDown: { }
+                        onPlayRequested: appPage.launchSelected()
+                        onDetailsRequested: appPage.expandDetails()
+                    }
+                }
+            }
+            ScrollBar.vertical: ScrollBar { }
+        }
     }
-
-    StackView.onDeactivating: {
-        appModel.computerLost.disconnect(computerLost)
-        activated = false
-    }
-
-    function createModel()
-    {
-        var model = Qt.createQmlObject('import StreamingPreferences 1.0
-import AppModel 1.0; AppModel {}', parent, '')
-        model.initialize(ComputerManager, computerIndex, showHiddenGames)
-        return model
-    }
-
-    model: appModel
-
-    delegate: NavigableItemDelegate {
-        width: 220; height: 287;
-        objectName: model.sleepAction ? "hostSleepTile" : ""
-        grid: appGrid
-
-        property alias appContextMenu: appContextMenuLoader.item
-        property alias appNameText: appNameTextLoader.item
-
-        // Dim the app if it's hidden
-        opacity: model.hidden ? 0.4 : 1.0
-
+    Rectangle {
+        visible: appPage.detailsExpanded
+        x: Style.px(64, appPage.Window.window); y: Style.px(32, appPage.Window.window)
+        height: Math.min(Style.px(338, appPage.Window.window), appPage.height * 0.7)
+        width: height * 0.72
+        color: Style.surface
+        border.width: 1; border.color: Style.outline
         Image {
-            property bool isPlaceholder: false
-
-            id: appIcon
-            anchors.horizontalCenter: parent.horizontalCenter
-            y: 10
-            source: model.boxart
-
-            onSourceSizeChanged: {
-                // Nearly all of Nvidia's official box art does not match the dimensions of placeholder
-                // images, however the one known exception is Overcooked. Therefore, we only execute
-                // the image size checks if this is not an app collector game. We know the officially
-                // supported games all have box art, so this check is not required.
-                if (!model.isAppCollectorGame &&
-                    ((sourceSize.width === 130 && sourceSize.height === 180) || // GFE 2.0 placeholder image
-                     (sourceSize.width === 628 && sourceSize.height === 888) || // GFE 3.0 placeholder image
-                     (sourceSize.width === 200 && sourceSize.height === 266)))  // Our no_app_image.png
-                {
-                    isPlaceholder = true
-                }
-                else
-                {
-                    isPlaceholder = false
-                }
-
-                width = 200
-                height = 267
-            }
-
-            // Display a tooltip with the full name if it's truncated
-            ToolTip.text: model.name
-            ToolTip.delay: 1000
-            ToolTip.timeout: 5000
-            ToolTip.visible: (parent.hovered || parent.highlighted) && (!appNameText || appNameText.truncated)
-        }
-
-        Loader {
-            active: model.running
-            asynchronous: true
-            anchors.fill: appIcon
-
-            sourceComponent: Item {
-                RoundButton {
-                    // Don't steal focus from the toolbar buttons
-                    focusPolicy: Qt.NoFocus
-
-                    anchors.horizontalCenterOffset: appIcon.isPlaceholder ? -47 : 0
-                    anchors.verticalCenterOffset: appIcon.isPlaceholder ? -75 : -60
-                    anchors.centerIn: parent
-                    implicitWidth: 85
-                    implicitHeight: 85
-
-                    icon.source: "qrc:/res/play_arrow_FILL1_wght700_GRAD200_opsz48.svg"
-                    icon.width: 75
-                    icon.height: 75
-
-                    onClicked: {
-                        launchOrResumeSelectedApp(true)
-                    }
-
-                    ToolTip.text: qsTr("Resume Game")
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 3000
-                    ToolTip.visible: hovered
-
-                    Material.background: "#D0808080"
-                }
-
-                RoundButton {
-                    // Don't steal focus from the toolbar buttons
-                    focusPolicy: Qt.NoFocus
-
-                    anchors.horizontalCenterOffset: appIcon.isPlaceholder ? 47 : 0
-                    anchors.verticalCenterOffset: appIcon.isPlaceholder ? -75 : 60
-                    anchors.centerIn: parent
-                    implicitWidth: 85
-                    implicitHeight: 85
-
-                    icon.source: "qrc:/res/stop_FILL1_wght700_GRAD200_opsz48.svg"
-                    icon.width: 75
-                    icon.height: 75
-
-                    onClicked: {
-                        doQuitGame()
-                    }
-
-                    ToolTip.text: qsTr("Quit Game")
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 3000
-                    ToolTip.visible: hovered
-
-                    Material.background: "#D0808080"
-                }
-            }
-        }
-
-        Loader {
-            id: appNameTextLoader
-            active: appIcon.isPlaceholder
-
-            // This loader is not asynchronous to avoid noticeable differences
-            // in the time in which the text loads for each game.
-
-            width: appIcon.width
-            height: model.running ? 175 : appIcon.height
-
-            anchors.left: appIcon.left
-            anchors.right: appIcon.right
-            anchors.bottom: appIcon.bottom
-
-            sourceComponent: Label {
-                id: appNameText
-                text: model.name
-                font.pointSize: 22
-                leftPadding: 20
-                rightPadding: 20
-                verticalAlignment: Text.AlignVCenter
-                horizontalAlignment: Text.AlignHCenter
-                wrapMode: Text.Wrap
-                elide: Text.ElideRight
-            }
-        }
-
-        function launchOrResumeSelectedApp(quitExistingApp)
-        {
-            if (model.sleepAction) {
-                if (!appGrid.sleepPending) sleepDialog.open()
-                return
-            }
-            var runningId = appModel.getRunningAppId()
-            if (runningId !== 0 && runningId !== model.appid) {
-                if (quitExistingApp) {
-                    quitAppDialog.appName = appModel.getRunningAppName()
-                    quitAppDialog.segueToStream = true
-                    quitAppDialog.nextAppName = model.name
-                    quitAppDialog.nextAppIndex = index
-                    quitAppDialog.open()
-                }
-
-                return
-            }
-
-            var component = Qt.createComponent("StreamSegue.qml")
-            var segue = component.createObject(stackView, {
-                                                   "appName": model.name,
-                                                   "session": appModel.createSessionForApp(index),
-                                                   "isResume": runningId === model.appid
-                                               })
-            stackView.push(segue)
-        }
-
-        onClicked: {
-            // Only allow clicking on the box art for non-running games.
-            // For running games, buttons will appear to resume or quit which
-            // will handle starting the game and clicks on the box art will
-            // be ignored.
-            if (!model.running) {
-                launchOrResumeSelectedApp(true)
-            }
-        }
-
-        onPressAndHold: {
-            // popup() ensures the menu appears under the mouse cursor
-            if (model.sleepAction) {
-                if (!appGrid.sleepPending) sleepDialog.open()
-                return
-            }
-            if (appContextMenu.popup) {
-                appContextMenu.popup()
-            }
-            else {
-                // Qt 5.9 doesn't have popup()
-                appContextMenu.open()
-            }
-        }
-
-        MouseArea {
             anchors.fill: parent
-            acceptedButtons: Qt.RightButton;
-            onClicked: {
-                parent.pressAndHold()
-            }
+            source: Style.placeholder(appPage.selectedApp.boxart) ? "" : appPage.selectedApp.boxart
+            fillMode: Image.PreserveAspectCrop; asynchronous: true
         }
-
-        Keys.onReturnPressed: {
-            // Open the app context menu if activated via the gamepad or keyboard
-            // for running games. If the game isn't running, the above onClicked
-            // method will handle the launch.
-            if (model.running) {
-                // This will be keyboard/gamepad driven so use
-                // open() instead of popup()
-                appContextMenu.open()
-            }
-        }
-
-        Keys.onEnterPressed: {
-            // Open the app context menu if activated via the gamepad or keyboard
-            // for running games. If the game isn't running, the above onClicked
-            // method will handle the launch.
-            if (model.running) {
-                // This will be keyboard/gamepad driven so use
-                // open() instead of popup()
-                appContextMenu.open()
-            }
-        }
-
-        Keys.onMenuPressed: {
-            // This will be keyboard/gamepad driven so use open() instead of popup()
-            if (model.sleepAction) {
-                if (!appGrid.sleepPending) sleepDialog.open()
-            } else appContextMenu.open()
-        }
-
-        function doQuitGame() {
-            quitAppDialog.appName = appModel.getRunningAppName()
-            quitAppDialog.segueToStream = false
-            quitAppDialog.open()
-        }
-
-        Loader {
-            id: appContextMenuLoader
-            asynchronous: true
-            active: !model.sleepAction
-            sourceComponent: NavigableMenu {
-                id: appContextMenu
-                initiator: appContextMenuLoader.parent
-                NavigableMenuItem {
-                    text: model.running ? qsTr("Resume Game") : qsTr("Launch Game")
-                    onTriggered: launchOrResumeSelectedApp(true)
-                }
-                NavigableMenuItem {
-                    text: qsTr("Quit Game")
-                    onTriggered: doQuitGame()
-                    visible: model.running
-                }
-                NavigableMenuItem {
-                    checkable: true
-                    checked: model.directLaunch
-                    text: qsTr("Direct Launch")
-                    onTriggered: appModel.setAppDirectLaunch(model.index, !model.directLaunch)
-                    enabled: !model.hidden
-
-                    ToolTip.text: qsTr("Launch this app immediately when the host is selected, bypassing the app selection grid.")
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 3000
-                    ToolTip.visible: hovered
-                }
-                NavigableMenuItem {
-                    checkable: true
-                    checked: model.hidden
-                    text: qsTr("Hide Game")
-                    onTriggered: appModel.setAppHidden(model.index, !model.hidden)
-                    enabled: model.hidden || (!model.running && !model.directLaunch)
-
-                    ToolTip.text: qsTr("Hide this game from the app grid. To access hidden games, right-click on the host and choose %1.").arg(qsTr("View All Apps"))
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                }
-            }
+        ConsoleText {
+            visible: Style.placeholder(appPage.selectedApp.boxart)
+            anchors.fill: parent; anchors.margins: Style.px(16, appPage.Window.window)
+            role: "heading"; text: appPage.selectedApp.name || ""
+            wrapMode: Text.Wrap; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter
         }
     }
-
-    Row {
-        anchors.centerIn: parent
-        spacing: 5
-        visible: appGrid.count === 0
-
-        Label {
-            text: qsTr("This computer doesn't seem to have any applications or some applications are hidden")
-            font.pointSize: 20
-            verticalAlignment: Text.AlignVCenter
-            wrapMode: Text.Wrap
+    Flickable {
+        id: detailScroll
+        objectName: "gameDetails"
+        visible: appPage.detailsExpanded
+        x: Style.px(340, appPage.Window.window); y: Style.px(24, appPage.Window.window)
+        width: Math.min(Style.px(520, appPage.Window.window), appPage.width - x - Style.px(64, appPage.Window.window))
+        height: appPage.height - y - Style.px(16, appPage.Window.window)
+        contentHeight: detailColumn.height
+        clip: true
+        function reveal(item) {
+            var pos = item.mapToItem(contentItem, 0, 0)
+            if (pos.y < contentY) contentY = pos.y
+            else if (pos.y + item.height > contentY + height) contentY = pos.y + item.height - height
         }
+        Window.onActiveFocusItemChanged: {
+            var item = Window.activeFocusItem
+            if (item && item.parent === detailColumn) reveal(item)
+        }
+        Column {
+            id: detailColumn; width: parent.width; spacing: Style.px(8, appPage.Window.window)
+            ConsoleText { role: "title"; text: appPage.selectedApp.name || ""; width: parent.width; maximumLineCount: 2; wrapMode: Text.Wrap; elide: Text.ElideRight }
+            ConsoleText { role: "secondary"; text: appPage.objectName; bottomPadding: Style.px(16, appPage.Window.window) }
+            ConsoleListRow {
+                id: playButton; objectName: "gamePlayButton"
+                width: parent.width; text: appPage.primaryVerb; textOnly: true; textAlignment: Text.AlignLeft
+                onClicked: appPage.launchSelected()
+                KeyNavigation.down: quitGame.visible ? quitGame : directButton
+                Keys.onUpPressed: appPage.collapseDetails()
+            }
+            ConsoleListRow {
+                id: quitGame; width: parent.width; visible: !!appPage.selectedApp.running
+                text: qsTr("Quit game"); textOnly: true; textAlignment: Text.AlignLeft
+                onClicked: appPage.quitSelected()
+                KeyNavigation.up: playButton; KeyNavigation.down: directButton
+            }
+            ConsoleListRow {
+                id: directButton; width: parent.width
+                text: qsTr("Direct launch") + (appPage.selectedApp.directLaunch ? qsTr(" · On") : qsTr(" · Off"))
+                enabled: appPage.selectedIndex >= 0 && !appPage.selectedApp.hidden
+                textOnly: true; textAlignment: Text.AlignLeft
+                onClicked: appPage.appModel.setAppDirectLaunch(appPage.selectedIndex, !appPage.selectedApp.directLaunch)
+                KeyNavigation.up: quitGame.visible ? quitGame : playButton; KeyNavigation.down: hideButton
+            }
+            ConsoleListRow {
+                id: hideButton; width: parent.width
+                text: appPage.selectedApp.hidden ? qsTr("Show in library") : qsTr("Hide from library")
+                enabled: appPage.selectedIndex >= 0 && (appPage.selectedApp.hidden || (!appPage.selectedApp.running && !appPage.selectedApp.directLaunch))
+                textOnly: true; textAlignment: Text.AlignLeft
+                onClicked: { appPage.appModel.setAppHidden(appPage.selectedIndex, !appPage.selectedApp.hidden); appPage.collapseDetails() }
+                KeyNavigation.up: directButton; KeyNavigation.down: streamSettingsButton
+            }
+            ConsoleListRow {
+                id: streamSettingsButton; width: parent.width; text: qsTr("Stream settings"); textOnly: true; textAlignment: Text.AlignLeft
+                onClicked: { if (typeof window !== "undefined") window.openSettings(0) }
+                KeyNavigation.up: hideButton
+                Keys.onDownPressed: { if (sleepButton.visible) sleepButton.forceActiveFocus() }
+            }
+            ConsoleListRow {
+                id: sleepButton; objectName: "hostSleepAction"; width: parent.width
+                visible: appPage.appModel.hostSleepAvailable; enabled: !appPage.sleepPending
+                text: qsTr("Sleep PC"); textOnly: true; textAlignment: Text.AlignLeft
+                onClicked: sleepDialog.open()
+                KeyNavigation.up: streamSettingsButton
+                Keys.onDownPressed: { }
+            }
+            Rectangle { width: parent.width; height: 1; color: Style.outline }
+            GridLayout {
+                columns: 2; columnSpacing: Style.px(24, appPage.Window.window); rowSpacing: Style.px(8, appPage.Window.window)
+                ConsoleText { role: "secondary"; text: qsTr("Resolution") }
+                ConsoleText { role: "secondary"; text: qsTr("%1 × %2").arg(StreamingPreferences.width).arg(StreamingPreferences.height) }
+                ConsoleText { role: "secondary"; text: qsTr("Frame rate") }
+                ConsoleText { role: "secondary"; text: qsTr("%1 FPS").arg(StreamingPreferences.fps) }
+                ConsoleText { role: "secondary"; text: qsTr("Bitrate") }
+                ConsoleText { role: "secondary"; text: qsTr("%1 Mbps").arg((StreamingPreferences.bitrateKbps / 1000).toFixed(1)) }
+            }
+            ConsoleText { role: "caption"; text: qsTr("Requested settings. The negotiated stream mode may differ."); width: parent.width; wrapMode: Text.Wrap }
+        }
+        ScrollBar.vertical: ScrollBar { }
     }
-
+    Column {
+        x: Style.px(64, appPage.Window.window); y: Style.px(100, appPage.Window.window)
+        width: parent.width - 2 * x; spacing: Style.px(24, appPage.Window.window); visible: !appPage.hasGames
+        ConsoleText { objectName: "emptyLibraryTitle"; width: parent.width; text: appPage.appModel.appListLoading ? qsTr("Loading games…") : appPage.appModel.appListUnavailable ? qsTr("Games unavailable") : qsTr("No games available"); role: "display"; wrapMode: Text.Wrap }
+        ConsoleText { width: parent.width; text: appPage.appModel.appListLoading ? qsTr("Waiting for the game list from %1.").arg(appPage.objectName) : appPage.appModel.appListUnavailable ? qsTr("Could not load games from this PC. Check the host and connection, or choose another PC.") : qsTr("Add apps on your host, or choose View all apps from its options."); role: "secondary"; wrapMode: Text.Wrap }
+        ConsoleButton {
+            id: choosePcButton; objectName: "emptyLibraryChoosePc"; text: qsTr("Choose PC"); onClicked: stackView.pop(null)
+            Keys.onUpPressed: { if (typeof window !== "undefined") window.focusNavigation() }
+            Keys.onDownPressed: { if (emptySleepButton.visible && emptySleepButton.enabled) emptySleepButton.forceActiveFocus() }
+        }
+        ConsoleButton { id: emptySleepButton; KeyNavigation.up: choosePcButton; Keys.onDownPressed: { }
+            objectName: "emptyHostSleepAction"; visible: appPage.appModel.hostSleepAvailable; text: qsTr("Sleep PC"); enabled: !appPage.sleepPending; onClicked: sleepDialog.open() }
+    }
     NavigableMessageDialog {
         id: quitAppDialog
+        acceptText: qsTr("Quit game")
+        rejectText: qsTr("Keep playing")
         property string appName : ""
         property bool segueToStream : false
         property string nextAppName: ""
-        property int nextAppIndex: 0
+        property int nextAppId: 0
         text:qsTr("Are you sure you want to quit %1? Any unsaved progress will be lost.").arg(appName)
         standardButtons: Dialog.Yes | Dialog.No
+        initialFocusButton: Dialog.No
 
         function quitApp() {
             var component = Qt.createComponent("QuitSegue.qml")
@@ -385,7 +380,9 @@ import AppModel 1.0; AppModel {}', parent, '')
                 // Store the session and app name if we're going to stream after
                 // successfully quitting the old app.
                 params.nextAppName = nextAppName
-                params.nextSession = appModel.createSessionForApp(nextAppIndex)
+                var nextIndex = appModel.indexOfApp(nextAppId)
+                if (nextIndex < 0) return
+                params.nextSession = appModel.createSessionForApp(nextIndex)
             }
             else {
                 params.nextAppName = null
@@ -400,13 +397,16 @@ import AppModel 1.0; AppModel {}', parent, '')
 
     NavigableMessageDialog {
         id: sleepDialog
+        acceptText: qsTr("Sleep PC")
+        rejectText: qsTr("Cancel")
         objectName: "hostSleepConfirmation"
         title: qsTr("Put PC to Sleep")
         text: qsTr("Put this host PC to sleep? All host applications and streaming sessions must be closed first. You will need a way to wake the PC again.")
         standardButtons: Dialog.Yes | Dialog.No
+        initialFocusButton: Dialog.No
         onAccepted: {
-            if (!appGrid.sleepPending) {
-                appGrid.sleepPending = true
+            if (!appPage.sleepPending) {
+                appPage.sleepPending = true
                 appModel.requestHostSleep()
             }
         }
@@ -419,5 +419,5 @@ import AppModel 1.0; AppModel {}', parent, '')
         standardButtons: Dialog.Ok
     }
 
-    ScrollBar.vertical: ScrollBar {}
+
 }

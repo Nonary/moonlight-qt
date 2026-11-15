@@ -1,10 +1,13 @@
 import QtQuick 2.0
+import "ConsoleStyle.js" as Style
 import QtQuick.Controls 2.2
+import QtQuick.Window 2.2
 
 import ComputerManager 1.0
 import Session 1.0
 
 Item {
+    ConsoleBackdrop { anchors.fill: parent }
     property string appName
     property var quitRunningAppFn
     property Session nextSession : null
@@ -67,7 +70,7 @@ Item {
             id: stageLabel
             height: stageSpinner.height
             text: stageText
-            font.pointSize: 20
+            font.pixelSize: Style.typeSize("body", Window.window)
             verticalAlignment: Text.AlignVCenter
 
             wrapMode: Text.Wrap

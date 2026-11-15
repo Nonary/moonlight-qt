@@ -60,15 +60,22 @@ private:
 
         try {
             appList = http.getAppList();
-            if (appList.isEmpty()) {
-                return false;
-            }
         } catch (...) {
+            QWriteLocker lock(&m_Computer->lock);
+            changed = !m_Computer->appListFetchCompleted || !m_Computer->appListFetchFailed;
+            m_Computer->appListFetchCompleted = true;
+            m_Computer->appListFetchFailed = true;
             return false;
         }
 
         QWriteLocker lock(&m_Computer->lock);
-        changed = m_Computer->updateAppList(appList);
+        changed = !m_Computer->appListFetchCompleted || m_Computer->appListFetchFailed;
+        m_Computer->appListFetchCompleted = true;
+        m_Computer->appListFetchFailed = false;
+        // Preserve the existing cached-list policy for empty host responses.
+        // Request completion still distinguishes an empty host from loading.
+        if (appList.isEmpty()) return false;
+        changed = m_Computer->updateAppList(appList) || changed;
         return true;
     }
 

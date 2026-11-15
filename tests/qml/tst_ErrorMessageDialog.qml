@@ -229,12 +229,12 @@ TestCase {
         compare(stackView.backCount, 0)
     }
 
-    function test_confirmation_dialog_keeps_its_default_focus() {
+    function test_confirmation_dialog_focuses_safe_action() {
         confirmationDialog.acceptedCount = 0
         confirmationDialog.open()
         tryCompare(confirmationDialog, "opened", true)
         var buttons = confirmationDialog.footer
-        verify(buttons.itemAt(buttons.count - 1).activeFocus)
+        verify(buttons.standardButton(Dialog.No).activeFocus)
         keyClick(Qt.Key_Escape)
         tryCompare(confirmationDialog, "visible", false)
         compare(confirmationDialog.acceptedCount, 0)

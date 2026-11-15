@@ -131,13 +131,13 @@ Item {
         }
         function test_controller_focus_order() {
             var names = ["vrrPreset", "vrrBuffer", "vrrTarget", "vrrHistory", "vrrTolerance"]
-            control(names[0]).forceActiveFocus()
+            control(names[0]).settingsRowHost.forceActiveFocus()
             for (var i = 1; i < names.length; i++) {
                 keyClick(Qt.Key_Tab) // Controller down in UI-navigation mode.
-                verify(control(names[i]).activeFocus, names[i] + " should receive focus")
+                verify(control(names[i]).settingsRowHost.activeFocus, names[i] + " row should receive focus")
             }
             keyClick(Qt.Key_Backtab)
-            verify(control("vrrHistory").activeFocus)
+            verify(control("vrrHistory").settingsRowHost.activeFocus)
         }
     }
 }

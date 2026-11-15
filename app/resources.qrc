@@ -1,5 +1,7 @@
 <RCC>
     <qresource prefix="/">
+        <file alias="fonts/Inter.ttf">res/fonts/Inter.ttf</file>
+        <file alias="licenses/Inter-OFL.txt">res/fonts/Inter-OFL.txt</file>
         <file alias="licenses/LZ4.txt">../third-party/lz4/LICENSE</file>
         <file alias="haptics/PROVENANCE.md">../third-party/saxense/PROVENANCE.md</file>
         <file alias="haptics/LICENSE-MPL-2.0">../third-party/saxense/LICENSE</file>

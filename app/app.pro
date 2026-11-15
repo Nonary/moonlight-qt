@@ -215,6 +215,7 @@ SOURCES += \
     streaming/audio/renderers/sdlaud.cpp \
     gui/computermodel.cpp \
     gui/appmodel.cpp \
+    gui/recentappsmodel.cpp \
     streaming/bandwidth.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
@@ -286,6 +287,7 @@ HEADERS += \
     gui/computermodel.h \
     gui/onlinecomputerentries.h \
     gui/appmodel.h \
+    gui/recentappsmodel.h \
     streaming/video/decoder.h \
     streaming/vrrratepolicy.h \
     streaming/bandwidth.h \

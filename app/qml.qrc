@@ -1,8 +1,25 @@
 <RCC>
     <qresource prefix="/">
+        <file>gui/ConsoleStyle.js</file>
+        <file>gui/ConsoleText.qml</file>
+        <file>gui/ConsoleFocus.qml</file>
+        <file>gui/ConsoleGlyph.qml</file>
+        <file>gui/ConsoleSettingsSection.qml</file>
+        <file>gui/ConsoleSettingRow.qml</file>
+        <file>gui/ConsoleListRow.qml</file>
+        <file>gui/ConsoleValueEditor.qml</file>
+        <file>gui/ConsoleCheckBox.qml</file>
+        <file>gui/ConsoleSlider.qml</file>
+        <file>gui/ConsoleButton.qml</file>
+        <file>gui/ConsoleBackdrop.qml</file>
+        <file>gui/ConsoleKeyboard.qml</file>
+        <file>gui/ConsoleKeyboardService.js</file>
+        <file>gui/ConsoleTextField.qml</file>
+        <file>gui/ConsoleSpinBox.qml</file>
         <file>gui/main.qml</file>
         <file>gui/PcView.qml</file>
         <file>gui/AppView.qml</file>
+        <file>gui/GameShelf.qml</file>
         <file>gui/SettingsView.qml</file>
         <file>gui/CalibrationButton.qml</file>
         <file>gui/CalibrationHostSelection.qml</file>

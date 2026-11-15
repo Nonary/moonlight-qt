@@ -1,0 +1,2 @@
+module PyroWaveCalibrator
+singleton PyroWaveCalibrator 1.0 PyroWaveCalibrator.qml

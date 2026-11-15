@@ -261,3 +261,22 @@ void ComputerModel::handleComputerStateChanged(NvComputer* computer)
 }
 
 #include "computermodel.moc"
+
+QVariantMap ComputerModel::get(int computerIndex) const
+{
+    QVariantMap result;
+    if (computerIndex < 0 || computerIndex >= m_Computers.size()) return result;
+    const auto roles = roleNames();
+    for (auto it = roles.cbegin(); it != roles.cend(); ++it)
+        result.insert(QString::fromUtf8(it.value()), data(index(computerIndex), it.key()));
+    result.insert("uuid", uuidAt(computerIndex));
+    return result;
+}
+
+int ComputerModel::indexOfUuid(const QString& uuid) const
+{
+    if (uuid.isEmpty()) return -1;
+    for (int i = 0; i < m_Computers.size(); ++i)
+        if (uuidAt(i) == uuid) return i;
+    return -1;
+}
