@@ -252,6 +252,12 @@ private:
     void clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right);
 
     static
+    void clHostCursorState(const LI_HOST_CURSOR_STATE* state);
+
+    static
+    void clHostCursorShape(const LI_HOST_CURSOR_SHAPE* shape);
+
+    static
     int arInit(int audioConfiguration,
                const POPUS_MULTISTREAM_CONFIGURATION opusConfig,
                void* arContext, int arFlags);

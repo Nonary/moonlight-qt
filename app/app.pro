@@ -204,6 +204,7 @@ SOURCES += \
     streaming/input/steamcontroller/steamcontrollerlink.cpp \
     streaming/input/steamcontroller/steamcontrollerhost.cpp \
     streaming/input/steamcontroller/steamcontrollersdl.cpp \
+    streaming/input/hostcursor.cpp \
     streaming/input/input.cpp \
     streaming/input/keyboard.cpp \
     streaming/input/mouse.cpp \
@@ -272,6 +273,8 @@ HEADERS += \
     diagnostics/gputrace.h \
     diagnostics/diagnosticzip.h \
     streaming/input/dualsensehaptics.h \
+    streaming/input/cursormodepolicy.h \
+    streaming/input/hostcursormath.h \
     streaming/input/input.h \
     streaming/session.h \
     streaming/gpuperformancehold.h \
