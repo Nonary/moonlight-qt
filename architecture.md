@@ -214,6 +214,9 @@ colorspace/range, encryption, codec capabilities, and other connection choices.
 `x-nv-video[0].clientRefreshRateX100`. RTSP negotiation determines the actual
 codec/profile using host SDP and server codec flags, with AV1/HEVC/H.264 paths.
 Renderer setup receives that negotiated format before video streaming starts.
+For Amaterasu, the launch-scoped DESCRIBE must offer a compatible PyroWave
+bitstream even when the host advertises PyroWave in `/serverinfo`. A missing
+or incompatible offer leaves the standard codec negotiation available.
 
 Packet size is aligned down to a 16-byte multiple for FEC. Connection setup
 also applies route-dependent packet-size limits. These are transport decisions,
