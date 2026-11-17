@@ -2,6 +2,7 @@
 
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QQmlComponent>
 #include <QQmlEngine>
 #include <QQuickItem>
@@ -12,6 +13,8 @@
 #include <QTemporaryDir>
 #include <QtTest>
 #include <memory>
+
+#include "settings-test-path.h"
 
 // The real preferences need these queries, but this test must not inspect GPUs.
 namespace WMUtils {
@@ -94,8 +97,8 @@ private slots:
         const auto audioId = qml.indexOf("id: audioSettingsGroupBox");
         const auto hostId = qml.indexOf("id: hostSettingsGroupBox", audioId);
         QVERIFY(audioId >= 0 && hostId > audioId);
-        const auto audioStart = qml.lastIndexOf("GroupBox {", audioId);
-        const auto audioEnd = qml.lastIndexOf("GroupBox {", hostId);
+        const auto audioStart = qml.lastIndexOf("ConsoleSettingsSection {", audioId);
+        const auto audioEnd = qml.lastIndexOf("ConsoleSettingsSection {", hostId);
         QVERIFY(audioStart >= 0 && audioEnd > audioStart);
         const auto saveStart = qml.indexOf("Component.onDestruction: {");
         const auto saveEnd = qml.indexOf('}', saveStart);
@@ -103,13 +106,14 @@ private slots:
 
         // Execute the production audio group and page-close handler verbatim.
         // Unrelated discovery/calibration/video controls are not instantiated.
-        audioPage = "import QtQuick 2.9\nimport QtQuick.Controls 2.2\n"
+        audioPage = "import QtQuick 2.9\nimport QtQuick.Controls 2.2\nimport QtQuick.Window 2.2\n"
+                    "import \"ConsoleStyle.js\" as Style\n"
                     "import StreamingPreferences 1.0\nimport SystemProperties 1.0\n"
-                    "Item { width: 760; height: 340\n"
+                    "Item { id: settingsShell; width: 760; height: 340; property int category: 1\n"
                     "property alias selector: audioComboBox\n"
                     "property alias spatialControl: spatialAudioCheck\n";
         audioPage += qml.mid(saveStart, saveEnd - saveStart + 1);
-        audioPage += "\nColumn { width: parent.width; padding: 10\n";
+        audioPage += "\nColumn { width: parent.width; padding: 10; property real leftPadding: 10; property real rightPadding: 10\n";
         audioPage += qml.mid(audioStart, audioEnd - audioStart);
         audioPage += "\n}\n}\n";
     }
@@ -249,6 +253,40 @@ private slots:
         QCOMPARE(prefs->audioConfig, StreamingPreferences::AC_71_SURROUND);
         QVERIFY(prefs->playAudioOnHost);
         QVERIFY(prefs->muteOnFocusLoss);
+    }
+
+    void native714RequiresSpatialAndPersists()
+    {
+#ifndef Q_OS_WIN
+        QSKIP("Native 7.1.4 output requires the Windows renderer");
+#else
+        auto* prefs = StreamingPreferences::get();
+        prefs->audioConfig = StreamingPreferences::AC_714_SURROUND;
+        prefs->spatialAudio = false;
+        prefs->save();
+        prefs->reload();
+        QCOMPARE(prefs->audioConfig, StreamingPreferences::AC_714_SURROUND);
+        QVERIFY(prefs->spatialAudio);
+        QQuickWindow window;
+        auto page = createPage(window);
+        QVERIFY(page);
+        auto* checkbox = control(page.get(), "spatialControl");
+        auto* selector = control(page.get(), "selector");
+        QVERIFY(checkbox && selector);
+        QCOMPARE(selector->property("count").toInt(), 4);
+        QCOMPARE(selector->property("currentIndex").toInt(), 3);
+        QVERIFY(checkbox->property("checked").toBool());
+        QVERIFY(!checkbox->isEnabled());
+#endif
+    }
+
+    void invalidSavedLayoutIsRejected()
+    {
+        for (int invalid : {-1, 4, 2147483647}) {
+            QSettings().setValue("audiocfg", invalid);
+            StreamingPreferences::get()->reload();
+            QCOMPARE(StreamingPreferences::get()->audioConfig, StreamingPreferences::AC_STEREO);
+        }
     }
 };
 

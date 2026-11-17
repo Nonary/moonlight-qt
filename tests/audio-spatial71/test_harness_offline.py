@@ -58,8 +58,8 @@ def execute(binary, label, arguments, expected, event=None, allow_unavailable_di
             raise AssertionError(f"{label}: no-stream contract missing")
         if event == "invalid_endpoint_test" and record.get("cases") != 11:
             raise AssertionError(f"{label}: incomplete rejected-configuration coverage")
-        if event == "producer_pcm_test" and record.get("cases") != 16:
-            raise AssertionError(f"{label}: incomplete 6/8-channel producer coverage")
+        if event == "producer_pcm_test" and record.get("cases") != 29:
+            raise AssertionError(f"{label}: incomplete 6/8/12-channel producer coverage")
         if event == "endpoint_inventory":
             for endpoint in record["endpoints"]:
                 if not isinstance(endpoint.get("id"), str) or not endpoint["id"]:
@@ -83,7 +83,7 @@ def main():
     execute(binary, "no-arguments", [], 0)
     execute(binary, "rejected-configurations", ["--invalid-endpoint-test"], 0, "invalid_endpoint_test")
     execute(binary, "6-and-8-channel-generated-pcm", ["--pcm-test"], 0, "producer_pcm_test")
-    for channels in (6, 8):
+    for channels in (6, 8, 12):
         execute(binary, f"valid-{channels}-channel-args-invalid-device",
                 ["--endpoint-id", "Spatial71-test-invalid-endpoint-not-a-device", "--silence",
                  "--channels", str(channels)], 1, "renderer_start")
@@ -115,7 +115,7 @@ def main():
         ("stereo-channels", [*prefix, "--channels", "2"]),
         ("zero-channels", [*prefix, "--channels", "0"]),
         ("seven-channels", [*prefix, "--channels", "7"]),
-        ("height-channels", [*prefix, "--channels", "12"]),
+        ("unsupported-channel-count", [*prefix, "--channels", "13"]),
         ("noninteger-channels", [*prefix, "--channels", "6.5"]),
         ("missing-channels", [*prefix, "--channels"]),
         ("duplicate-channels", [*prefix, "--channels", "6", "--channels", "8"]),

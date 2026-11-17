@@ -36,7 +36,11 @@ static_assert(Spatial71::StaticObjectTypes[0] == AudioObjectType_FrontLeft &&
               Spatial71::StaticObjectTypes[4] == AudioObjectType_BackLeft &&
               Spatial71::StaticObjectTypes[5] == AudioObjectType_BackRight &&
               Spatial71::StaticObjectTypes[6] == AudioObjectType_SideLeft &&
-              Spatial71::StaticObjectTypes[7] == AudioObjectType_SideRight,
+              Spatial71::StaticObjectTypes[7] == AudioObjectType_SideRight &&
+              Spatial71::StaticObjectTypes[8] == AudioObjectType_TopFrontLeft &&
+              Spatial71::StaticObjectTypes[9] == AudioObjectType_TopFrontRight &&
+              Spatial71::StaticObjectTypes[10] == AudioObjectType_TopBackLeft &&
+              Spatial71::StaticObjectTypes[11] == AudioObjectType_TopBackRight,
               "Surround PCM channel order must match the native static object types");
 static_assert(Spatial71::staticObjectMask(6) ==
               static_cast<std::uint32_t>(AudioObjectType_FrontLeft | AudioObjectType_FrontRight |
@@ -127,7 +131,7 @@ bool isDigitalDisplay(IPropertyStore* properties)
 
 struct SpatialStream {
     ComPtr<ISpatialAudioObjectRenderStream> stream;
-    std::array<ComPtr<ISpatialAudioObject>, Spatial71::ChannelCount> objects;
+    std::array<ComPtr<ISpatialAudioObject>, Spatial71::MaxChannelCount> objects;
     bool started = false;
     ~SpatialStream()
     {
@@ -412,7 +416,7 @@ struct SpatialAudioRenderer::Impl
                     "%zu static objects, requested_mask=0x%08X, native_mask=0x%08X, "
                     "maximum_frames=%u, queue_limit=1440 (30 ms), "
                     "startup_target=480 frames/10 ms (event-quantized), selection=%s; provider/physical Atmos not verified",
-                    channelCount, channelCount == 6 ? "FL FR FC LFE BL BR" : "FL FR FC LFE BL BR SL SR",
+                    channelCount, channelCount == 6 ? "FL FR FC LFE BL BR" : channelCount == 8 ? "FL FR FC LFE BL BR SL SR" : "FL FR FC LFE BL BR SL SR TFL TFR TBL TBR",
                     channelCount, static_cast<unsigned int>(requestedMask), static_cast<unsigned int>(nativeMask), maximumFrames,
                     endpointId.empty() ? "default console render at initialization" : "explicit endpoint ID");
                 completeInitialization(true);
@@ -421,7 +425,7 @@ struct SpatialAudioRenderer::Impl
     }
 
     const std::wstring endpointId;
-    std::array<float, Spatial71::MaxDecodeFrames * Spatial71::ChannelCount> staging{};
+    std::array<float, Spatial71::MaxDecodeFrames * Spatial71::MaxChannelCount> staging{};
     std::size_t decodeCapacityFrames = 0;
     std::size_t channelCount = Spatial71::ChannelCount;
     std::unique_ptr<Event> stopEvent;
@@ -519,7 +523,7 @@ bool SpatialAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATI
         m_Impl->endpointId.size() > 4096 ||
         m_Impl->endpointId.find(L'\0') != std::wstring::npos) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "Spatial Audio requires six or eight channels at 48000 Hz and a valid optional endpoint ID");
+                    "Spatial Audio requires six, eight or twelve channels at 48000 Hz and a valid optional endpoint ID");
         return false;
     }
     m_Impl->channelCount = static_cast<std::size_t>(config->channelCount);

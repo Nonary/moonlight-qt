@@ -38,7 +38,7 @@ void help()
               "  --pcm-test                     Tests 6/8-channel tone generation offline\n"
               "  --endpoint-id ID --silence|--tones [--seconds 60] [--cycles 1]\n"
               "  --default-endpoint --silence|--tones [--seconds 60] [--cycles 1]\n"
-              "      [--channels 6|8] [--gap-at-ms 10000 --gap-ms 500]\n"
+              "      [--channels 6|8|12] [--gap-at-ms 10000 --gap-ms 500]\n"
               "Native tests require an explicit endpoint ID or --default-endpoint. The latter\n"
               "uses the current default only if it is HDMI/DisplayPort; it never guesses another\n"
               "device. No Windows default or system setting is changed. Try silence first. Tones\n"
@@ -173,7 +173,7 @@ bool parse(const QStringList& args, Options& options)
             else if (option == "--cycles" && value >= 1 && value <= 20) options.cycles = value;
             else if (option == "--gap-at-ms" && value >= 1 && value <= 3599999) options.gapAtMs = value;
             else if (option == "--gap-ms" && value >= 1 && value <= 30000) options.gapMs = value;
-            else if (option == "--channels" && (value == 6 || value == 8) && !channelsSet) {
+            else if (option == "--channels" && (value == 6 || value == 8 || value == 12) && !channelsSet) {
                 options.channels = value;
                 channelsSet = true;
             }
@@ -204,9 +204,9 @@ void fill(float* destination, std::uint64_t firstFrame, bool tones, int channels
 int pcmTest()
 {
     int cases = 0;
-    for (int channels : {6, 8}) {
+    for (int channels : {6, 8, 12}) {
         const auto sampleCount = static_cast<std::size_t>(FramesPerPacket * channels);
-        std::array<float, FramesPerPacket * 8 + 2> storage{};
+        std::array<float, FramesPerPacket * 12 + 2> storage{};
         storage.fill(-9.0f);
         fill(storage.data() + 1, 0, false, channels);
         if (storage.front() != -9.0f || storage[sampleCount + 1] != -9.0f) return 1;

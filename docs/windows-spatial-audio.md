@@ -1,9 +1,32 @@
-# Optional Windows Spatial Audio 5.1/7.1 output
+# Windows Spatial Audio: 5.1, 7.1 and native 7.1.4
 
-This Windows desktop renderer sends already-decoded 5.1 or 7.1 PCM to six or eight static
-`ISpatialAudioObject`s through `ISpatialAudioClient`. It is disabled by default.
-The normal SDL renderer, Opus decoder and channel negotiation are unchanged.
+This Windows desktop renderer sends already-decoded 5.1, 7.1 or native 7.1.4 PCM to six, eight or twelve static
+`ISpatialAudioObject`s through `ISpatialAudioClient`. It is opt-in for 5.1/7.1 and required when 7.1.4 is selected.
+Stereo/5.1/7.1 retain their existing SDL fallback. Native 7.1.4 uses the explicit twelve-channel Common extension.
 There are no host, driver, video, HDR, VRR or PyroWave changes.
+
+
+## Native 7.1.4
+
+Select **7.1.4 surround sound**. Moonlight automatically selects the required
+Windows Spatial renderer for this mode; the static mask is `0x1FFE`, with
+FL FR FC LFE BL BR SL SR TFL TFR TBL TBR in that order. Dynamic object count is
+zero. There is no upmix, scene estimator, synthetic height or Dolby codec.
+The host and Common must explicitly negotiate twelve channels. The wire layout
+identifier `0xF63F` is not the Windows speaker mask (`0x2D63F`).
+
+A compatible active default HDMI/DisplayPort endpoint must already have its
+Windows spatial provider enabled. The client does not install/activate a
+proprietary provider or change system defaults. A missing static-height capability
+or failed native12 initialization rejects the stream with an actionable error;
+it does not claim twelve-channel playback through an eight-channel output.
+Switch layouts at the next session boundary. The bounded queue has the same
+1440-frame capacity and 480-frame startup threshold as the original PR.
+
+Depends on [Common PR #4](https://github.com/Nonary/moonlight-common-c/pull/4).
+Applications must rebuild against its expanded mapping array. Existing PR #40
+history is retained. New upstream binaries need separate hardware acceptance;
+private RC1 listening results are historical evidence only.
 
 ## Enable and select an output
 
@@ -36,8 +59,7 @@ read-only and does not start a stream. See [test instructions](../tests/audio-sp
 Endpoint names are not used as identifiers. No manufacturer or model is assumed.
 
 The saved checkbox is the activation control; the prototype's
-`MOONLIGHT_SPATIAL_AUDIO` toggle is no longer used. Explicit `ML_AUDIO=sdl`
-continues to take precedence. Unsupported formats (including stereo),
+`MOONLIGHT_SPATIAL_AUDIO` toggle is no longer used. For 5.1/7.1, explicit `ML_AUDIO=sdl` continues to take precedence. Native 7.1.4 rejects explicit backend overrides and never silently downmixes to SDL. For the legacy layouts, unsupported formats (including stereo),
 unavailable devices or spatial initialization failures use the existing renderer
 selection path. SDL fallback uses its regular output selection.
 

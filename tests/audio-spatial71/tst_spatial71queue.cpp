@@ -35,7 +35,7 @@ std::vector<float> frames(std::size_t start, std::size_t count, std::size_t chan
 
 void formatAndRouting(std::size_t channels)
 {
-    constexpr std::array<std::uint32_t, 8> expected = {2, 4, 8, 16, 128, 256, 32, 64};
+    constexpr std::array<std::uint32_t, 12> expected = {2, 4, 8, 16, 128, 256, 32, 64, 512, 1024, 2048, 4096};
     static_assert(Spatial71::SampleRate == 48000, "Timing tests require 48 kHz");
     static_assert(Spatial71::QueueCapacityFrames == 1440, "Maximum PCM backlog is 30 ms");
     CHECK(Spatial71::StaticObjectTypes == expected);
@@ -44,9 +44,9 @@ void formatAndRouting(std::size_t channels)
         CHECK((mask & type) == 0);
         mask |= type;
     }
-    CHECK(mask == 0x1FE && mask == Spatial71::StaticObjectMask);
+    CHECK(mask == 0x1FFE && mask == Spatial71::StaticObjectMask714);
     CHECK(Spatial71::supportedChannelCount(channels));
-    CHECK(Spatial71::staticObjectMask(channels) == (channels == 6 ? 0x19EU : 0x1FEU));
+    CHECK(Spatial71::staticObjectMask(channels) == (channels == 6 ? 0x19EU : channels == 8 ? 0x1FEU : 0x1FFEU));
     const auto source = frames(0, 23, channels);
     for (std::size_t channel = 0; channel < channels; ++channel) {
         std::array<float, 25> destination{};
@@ -132,9 +132,9 @@ void exactFloatPreservation(std::size_t channels)
 {
     // Storage/routing is not a DSP transform. Verify bitwise preservation of
     // ordinary amplitudes, signed zero, denormals and IEEE diagnostic values.
-    constexpr std::array<std::uint32_t, 8> bits = {0U, 0x80000000U, 0x3D000000U, 0xBD000000U, 1U, 0x7FC00001U, 0x7F800000U, 0xFF800000U};
+    constexpr std::array<std::uint32_t, 12> bits = {0U, 0x80000000U, 0x3D000000U, 0xBD000000U, 1U, 0x7FC00001U, 0x7F800000U, 0xFF800000U, 0x3F000000U, 0xBF000000U, 0x00800000U, 0x80800000U};
     static_assert(sizeof(float) == sizeof(std::uint32_t), "32-bit PCM");
-    std::array<float, 8> input{}, output{};
+    std::array<float, 12> input{}, output{};
     std::memcpy(input.data(), bits.data(), sizeof(bits));
     const auto storage = std::make_unique<Spatial71::FrameQueue>();
     auto& queue = *storage;
@@ -157,7 +157,7 @@ void modelStress(std::size_t channels)
     const auto storage = std::make_unique<Spatial71::FrameQueue>();
     auto& queue = *storage;
     CHECK(queue.setChannelCount(channels));
-    std::deque<std::array<float, 8>> model;
+    std::deque<std::array<float, 12>> model;
     std::uint32_t random = 0x7151U;
     std::size_t nextFrame = 0;
     std::uint64_t submitted = 0, consumed = 0, dropped = 0, missing = 0;
@@ -172,7 +172,7 @@ void modelStress(std::size_t channels)
             submitted += count;
             const auto beforeDropped = dropped;
             for (std::size_t f = 0; f < count; ++f) {
-                std::array<float, 8> frame{};
+                std::array<float, 12> frame{};
                 std::copy_n(input.data() + f * channels, channels, frame.data());
                 model.push_back(frame);
                 if (model.size() > 1440) { model.pop_front(); ++dropped; }
@@ -212,7 +212,7 @@ void layoutTransitions()
     const auto storage = std::make_unique<Spatial71::FrameQueue>();
     auto& queue = *storage;
     CHECK(queue.channelCount() == 8);
-    for (const std::size_t channels : {6U, 8U, 6U, 8U}) {
+    for (const std::size_t channels : {6U, 8U, 12U, 6U, 12U, 8U}) {
         CHECK(queue.setChannelCount(channels));
         CHECK(queue.channelCount() == channels && queue.size() == 0);
         const auto reset = queue.statistics();
@@ -243,13 +243,13 @@ void layoutTransitions()
         // samples or statistics may survive that new stream epoch.
         CHECK(queue.push(input.data(), 3) == 0);
     }
-    std::puts("PASS 6/8-channel transitions, reset isolation, invalid-layout rejection without mutation");
+    std::puts("PASS 6/8/12-channel transitions, reset isolation, invalid-layout rejection without mutation");
 }
 } // namespace
 
 int main()
 {
-    for (const std::size_t channels : {6U, 8U}) {
+    for (const std::size_t channels : {6U, 8U, 12U}) {
         std::printf("Testing %zu-channel PCM\n", channels);
         formatAndRouting(channels);
         silenceWrapAndOverflow(channels);

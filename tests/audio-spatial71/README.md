@@ -1,7 +1,7 @@
-# Windows Spatial 5.1/7.1 tests
+# Windows static Spatial 5.1/7.1/7.1.4 tests
 
-These opt-in tests cover the renderer for existing 48 kHz, six/eight-channel decoded
-PCM. They do not change Opus negotiation or the video pipeline. The application
+These opt-in tests cover the renderer for existing 48 kHz, six/eight/twelve-channel decoded
+PCM. Native12 negotiation is covered separately by Common PR #4; these tests exercise the static renderer and its queue. The video pipeline is unchanged. The application
 feature and its endpoint selection are documented in
 [`docs/windows-spatial-audio.md`](../../docs/windows-spatial-audio.md).
 For normal streaming, start `Moonlight.exe` directly and enable **Use Windows
