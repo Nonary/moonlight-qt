@@ -1,4 +1,5 @@
 #include "../../app/streaming/audio/renderers/spatialaudioqueue.h"
+#include "../../app/streaming/audio/renderers/spatialaudioplayout.h"
 
 #include <array>
 #include <climits>
@@ -257,6 +258,35 @@ int main()
         modelStress(channels);
     }
     layoutTransitions();
+    for (const std::size_t channels : {6U, 8U, 12U}) {
+        auto owner = std::make_unique<Spatial71::FrameQueue>();
+        auto& queue = *owner;
+        CHECK(queue.setChannelCount(channels));
+        Spatial71::PlayoutState state;
+        auto input = frames(0, 480, channels);
+        std::vector<float> output(input.size(), -1.0f);
+        state.queued(queue.size(), 1);
+        queue.push(input.data(), 480);
+        state.render(queue, output.data(), 480, 2, 10000000);
+        CHECK(state.primed && queue.size() == 0 && state.underrunFrames == 0);
+        CHECK(std::memcmp(input.data(), output.data(), input.size()*sizeof(float)) == 0);
+        state.queued(queue.size(), 100);
+        queue.push(input.data(), 240);
+        state.render(queue, output.data(), 240, 101, 10000000);
+        CHECK(state.primed && queue.size() == 0 && state.underrunFrames == 0);
+        state.render(queue, output.data(), 240, 102, 10000000);
+        CHECK(!state.primed && state.underrunFrames == 240 && state.firstQueued == 0);
+        for (std::size_t i=0; i<240*channels; ++i) CHECK(output[i] == 0.0f);
+        state.queued(queue.size(), 103);
+        queue.push(input.data(), 240);
+        state.render(queue, output.data(), 240, 104, 10000000);
+        CHECK(!state.primed && queue.size() == 240);
+        state.render(queue, output.data(), 240, 100103, 10000000);
+        CHECK(state.primed && queue.size() == 0);
+        state = {};
+        CHECK(!state.primed && !state.everPlayed && !state.underrunFrames);
+    }
+    std::puts("PASS production renderer priming/exact-empty/on-time successor/underrun/restart");
     std::printf("PASS all offline Spatial71 queue tests (%zu checks); no audio device was opened\n", checks);
     return 0;
 }

@@ -4,7 +4,8 @@ QT -= core gui
 CONFIG += console c++17 release
 CONFIG -= app_bundle debug debug_and_release
 SOURCES += tst_spatial71queue.cpp
-HEADERS += ../../app/streaming/audio/renderers/spatialaudioqueue.h
+HEADERS += ../../app/streaming/audio/renderers/spatialaudioqueue.h \
+           ../../app/streaming/audio/renderers/spatialaudioplayout.h
 win32-msvc {
     QMAKE_CXXFLAGS_WARN_ON = /W4
     QMAKE_CXXFLAGS += /WX

@@ -14,6 +14,7 @@
 
 #include "spatialaudio.h"
 #include "spatialaudioqueue.h"
+#include "spatialaudioplayout.h"
 #include "SDL_compat.h"
 
 #include <atomic>
@@ -191,9 +192,9 @@ struct SpatialAudioRenderer::Impl
                 channelCount, static_cast<unsigned long long>(stats.submittedFrames),
                 static_cast<unsigned long long>(stats.consumedFrames),
                 static_cast<unsigned long long>(stats.droppedFrames),
-                static_cast<unsigned long long>(underrunFrames), stats.highWaterFrames,
+                static_cast<unsigned long long>(playout.underrunFrames), stats.highWaterFrames,
                 static_cast<unsigned long long>(quanta), maxQuantum,
-                static_cast<unsigned long long>(startupSilenceFrames),
+                static_cast<unsigned long long>(playout.startupSilenceFrames),
                 static_cast<double>(maxEventInterval) * tickMs,
                 static_cast<double>(maxFill) * tickMs, failed.load() ? 1 : 0);
         }
@@ -364,25 +365,7 @@ struct SpatialAudioRenderer::Impl
                 // Only memory copies and counters run under this lock. No COM
                 // call or wait can block the Opus callback while holding it.
                 std::lock_guard<std::mutex> lock(queueMutex);
-                if (!primed && queue.size() &&
-                    (queue.size() >= Spatial71::StartupFrames ||
-                     (firstQueued && ready - firstQueued >= frequency / 100))) {
-                    primed = true;
-                }
-                if (primed) {
-                    const auto copied = queue.pop(scratch.data(), frames);
-                    everPlayed = everPlayed || copied != 0;
-                    underrunFrames += frames - copied;
-                    if (copied < frames || queue.size() == 0) {
-                        primed = false;
-                        firstQueued = 0;
-                    }
-                }
-                else {
-                    std::fill_n(scratch.data(), static_cast<std::size_t>(frames) * channelCount, 0.0f);
-                    if (everPlayed) underrunFrames += frames;
-                    else startupSilenceFrames += frames;
-                }
+                playout.render(queue, scratch.data(), frames, ready, frequency);
             }
 
             // All requested objects are updated, including silent or muted periods.
@@ -438,15 +421,11 @@ struct SpatialAudioRenderer::Impl
     bool initSuccess = false;
     std::mutex queueMutex;
     Spatial71::FrameQueue queue;
-    bool primed = false;
-    bool everPlayed = false;
-    LONGLONG firstQueued = 0;
+    Spatial71::PlayoutState playout;
     LONGLONG frequency = 0;
     LONGLONG maxEventInterval = 0;
     LONGLONG maxFill = 0;
     std::uint64_t quanta = 0;
-    std::uint64_t startupSilenceFrames = 0;
-    std::uint64_t underrunFrames = 0;
     UINT32 maxQuantum = 0;
 };
 
@@ -589,7 +568,7 @@ bool SpatialAudioRenderer::submitAudio(int bytesWritten)
     }
     if (frames) {
         std::lock_guard<std::mutex> lock(m_Impl->queueMutex);
-        if (!m_Impl->primed && !m_Impl->queue.size()) m_Impl->firstQueued = qpc();
+        m_Impl->playout.queued(m_Impl->queue.size(), qpc());
         m_Impl->queue.push(m_Impl->staging.data(), frames);
     }
     return !m_Impl->failed.load();
