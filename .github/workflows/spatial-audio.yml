@@ -8,6 +8,8 @@ on:
     branches: [master]
     paths:
       - .github/workflows/spatial-audio.yml
+      - architecture.md
+      - docs/windows-spatial-audio.md
       - app/streaming/audio/**
       - app/settings/**
       - app/gui/SettingsView.qml
@@ -19,6 +21,8 @@ on:
   push:
     paths:
       - .github/workflows/spatial-audio.yml
+      - architecture.md
+      - docs/windows-spatial-audio.md
       - app/streaming/audio/**
       - app/settings/**
       - app/gui/SettingsView.qml
