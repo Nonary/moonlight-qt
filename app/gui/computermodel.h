@@ -44,6 +44,8 @@ public:
 
     Q_INVOKABLE void renameComputer(int computerIndex, QString name);
 
+    Q_INVOKABLE QVariantMap get(int computerIndex) const;
+    Q_INVOKABLE int indexOfUuid(const QString& uuid) const;
     Q_INVOKABLE QString uuidAt(int computerIndex) const;
 
     QVariantList onlineHosts() const;

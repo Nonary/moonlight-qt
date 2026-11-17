@@ -20,12 +20,14 @@
 //   tst_vrrbufferregressions start-release rate-round-trip
 
 #include "capturespans.h"
+#include "slowdecodespan.h"
 #include "vrrproductionsession.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -93,6 +95,18 @@ struct KnownRegression {
     const char* evidence;
     size_t failed, passed;
 };
+// The goal solver sizes for severity-weighted time lost, not for the number of
+// intervals beyond tolerance that these contracts count.
+const char* const kGoalSeverity =
+    "The goal solver stops at the smallest buffer whose severity-weighted loss meets the profile goal, which leaves "
+    "a late frame a fraction of a millisecond beyond tolerance. Against 3 ms spikes on every 20th frame it reaches "
+    "at most 2250/2500/3000 us (Low Latency/Balanced/Smooth) and 290/290/144 of 5799 frames still count as hitches where "
+    "the allowance is 60/31/5; the hitch-budget buffer held about 3 ms for 40/27/0.";
+// The solver looks back 20/60/120 s, not the profile's 60/120/300 s history.
+const char* const kGoalWindow =
+    "The goal solver sizes from its own 20/60/120 s window (Low Latency/Balanced/Smooth) rather than the profile's "
+    "60/120/300 s history, so protection is released, after the 8 s hold, about 20/55/125 s after its evidence "
+    "ends: within half the selected history. The hitch-budget buffer held it for 55/117/317 s.";
 std::vector<KnownRegression> g_Known = {
     {"display-ceiling@no-latch/",
      {"a released starting delay actually lowers latency at the ceiling",
@@ -121,6 +135,51 @@ std::vector<KnownRegression> g_Known = {
      "In the lossy 04:20 span (61-364 lost packets per frame, 20-46 ms late) Balanced shows about 54 visible events "
      "where fixed refresh's deeper queue shows 28, at 5.5 ms more latency. Ceiling policy 1 shows 56: the adaptive "
      "buffer's rise, not ceiling replacement, decides that trade, and it does not rise fast enough for chaos.", 0, 0},
+    // The entries below all date from c822745f (2026-10-29), which replaced the
+    // hitch-budget input buffer these contracts were written against with the
+    // client-timing goal solver. This gate did not compile from that merge until
+    // 2026-11-09, so none of them was seen. Each is a decision still to make:
+    // change the solver, or retire the contract.
+    {"earn-protection/",
+     {"earned protection keeps presented hitches inside the profile allowance", nullptr},
+     kGoalSeverity, 0, 0},
+    {"ordinary-variation/balanced/",
+     {"a larger need during rate variation scales protection like a steady rate", nullptr},
+     kGoalSeverity, 0, 0},
+    {"rate-round-trip/",
+     {"the return is covered without relearning through hitches", nullptr},
+     kGoalSeverity, 0, 0},
+    {"plateau-history/low-latency/smoothing-off",
+     {"protection holds while its evidence is inside the selected history", nullptr}, kGoalWindow, 0, 0},
+    {"plateau-history/low-latency/reduce-judder",
+     {"protection holds while its evidence is inside the selected history", nullptr}, kGoalWindow, 0, 0},
+    {"plateau-history/balanced/smoothing-off",
+     {"protection holds while its evidence is inside the selected history", nullptr}, kGoalWindow, 0, 0},
+    {"plateau-history/balanced/reduce-judder",
+     {"protection holds while its evidence is inside the selected history", nullptr}, kGoalWindow, 0, 0},
+    {"plateau-history/smooth/",
+     {"protection holds while its evidence is inside the selected history", nullptr}, kGoalWindow, 0, 0},
+    {"rate-round-trip/low-latency/smoothing-off",
+     {"a returning rate keeps its evidence for the rest of its history", nullptr}, kGoalWindow, 0, 0},
+    {"rate-round-trip/low-latency/reduce-judder",
+     {"a returning rate keeps its evidence for the rest of its history", nullptr}, kGoalWindow, 0, 0},
+    {"rate-round-trip/balanced/absorb",
+     {"returning to a rate seen before restores its protection at once", nullptr},
+     "Balanced with Absorb is back at its 1000 us floor ten frames after returning to a rate that had learned "
+     "1500 us; the other eight preset and smoothing combinations restore their learned buffer.", 0, 0},
+    {"rate-drop/smooth/",
+     {"a rate drop gives back the moved mapping promptly", nullptr},
+     "After 116 -> 30 FPS, Smooth drains its 8 ms of protection at the 1 ms/s release law: decode-to-present "
+     "averages 2.76 ms over the next 15 s where a fresh 30 FPS session settles at 1.10 ms. Nothing remains after "
+     "10 s, and Low Latency and Balanced stay inside the bound.", 0, 0},
+    {"versus-fixed-refresh-captures/0358-sustained-120",
+     {"no more visible stutter than fixed refresh on a recorded capture span", nullptr},
+     "On the recorded 03:58 sustained 120 FPS span Balanced shows 11 visible events (2 replacements) where fixed "
+     "refresh shows 6.1, at 4.1 ms less latency. Ceiling policy 1 also shows 11.", 0, 0},
+    {"versus-fixed-refresh@no-latch/smooth/reduce-judder/",
+     {"less latency than fixed refresh at the display ceiling", nullptr},
+     "Smooth with Reduce judder on a presenter that cannot latch averages 13.58 ms where fixed refresh's "
+     "common-budget queue averages 13.51 ms, in the late-4ms and frequent-2ms scenarios.", 0, 0},
 };
 
 KnownRegression* knownRegression(const std::string& scenario, const char* contract)
@@ -256,6 +315,11 @@ public:
         frame.setLostPackets(input.lostPackets);
         const uint64_t now = std::max(f.decodedUs, m_LastSubmittedUs);
         const auto d = m_Controller.schedule(frame, now);
+        // The controller no longer exports its audit counters; a change of the
+        // active layer's anchor period is a switch.
+        const uint64_t layerPeriodUs = m_Controller.inputLayerPeriodUs();
+        if (m_LayerPeriodUs && layerPeriodUs && layerPeriodUs != m_LayerPeriodUs) ++m_LayerSwitches;
+        if (layerPeriodUs) m_LayerPeriodUs = layerPeriodUs;
         f.targetUs = d.targetUs;
         f.appliedUs = d.playoutDelayUs;
         f.recoveryUs = d.recoveryAddedUs;
@@ -303,12 +367,13 @@ public:
     // replacement requests that found none and cost the worker its wait.
     size_t replacements() const { return m_Replacements; }
     size_t deferrals() const { return m_Deferrals; }
+    uint64_t layerSwitches() const { return m_LayerSwitches; }
 
     void rebase() { m_Controller.rebase(); }
     const std::vector<Frame>& frames() const { return m_Frames; }
     size_t size() const { return m_Frames.size(); }
     const VrrTimingController& controller() const { return m_Controller; }
-    Vrr13::InputPercentileBuffer::Stats input() const { return m_Controller.intervalStats().inputPercentile; }
+    Vrr13::InputGoalBuffer::Stats input() const { return m_Controller.intervalStats().inputPercentile; }
     uint64_t toleranceUs() const { return uint64_t(m_Session.timingOptions.toleranceUs); }
     uint64_t windowUs() const { return uint64_t(m_Session.timingOptions.historySeconds) * 1000000; }
     // Profile allowance: the share of frames the selected smoothness may miss.
@@ -328,6 +393,7 @@ private:
     uint64_t m_Ticks = 0, m_LastSubmittedUs = 0, m_LastShownUs = 0;
     int m_FrameNumber = 0;
     size_t m_Replacements = 0, m_Deferrals = 0;
+    uint64_t m_LayerPeriodUs = 0, m_LayerSwitches = 0;
     std::vector<Frame> m_Frames;
 };
 
@@ -510,6 +576,76 @@ void testMissesWithinAllowanceBuyNoDelay()
     }
 }
 
+// 2b. Loss no permitted buffer can remove, and a late frame that cannot yet
+// establish a rate, must not buy latency either; and a release must wait out
+// its hold. Regression: the goal solver merged in c822745f. It weighted a lost
+// interval by its presented length, so buffer shortened a freeze it could not
+// remove: after each 30 ms stall Smooth rose from its floor to as much as
+// 10.75 ms for the same hitches (cb7dcec7 covered only stalls that fitted the
+// allowance). It applied the allowance to however little of the window was
+// filled, so one 6 ms frame 8 s into a session took Smooth to 4.25 ms. And it
+// followed every step of the solved target down, turning the buffer around
+// within a second of raising it.
+void testUnabsorbableLossBuysNoDelay()
+{
+    for (const auto& preset : kPresets) for (const auto& smoothing : kSmoothing) {
+        const std::string name = label("unabsorbable-loss", preset, smoothing);
+        const auto session = vrrProductionSession(preset.mode, 116, 120, smoothing.smooth, smoothing.absorb);
+        {
+            // A 30 ms delivery stall every 45 s: beyond every profile's cap.
+            Stream s(session, 1000);
+            Rng rng(131 + uint64_t(preset.mode));
+            const size_t total = frames116(300), every = frames116(45);
+            for (size_t i = 0; i < total; ++i) s.step(k116Ticks, {i % every == every / 2 ? 30000 : rng.below(400)});
+            const uint64_t floor = s.input().minimumUs, peak = maximum(s.frames(), frames116(1), total, applied);
+            report("%-52s stalls: peak %5" PRIu64 " floor %5" PRIu64 "\n", name.c_str(), peak, floor);
+            check(peak <= floor + 250, name, "a stall beyond the cap never buys latency",
+                "buffer reached %" PRIu64 " us (floor %" PRIu64 ") for a 30 ms stall every 45 s", peak, floor);
+        }
+        {
+            // One 6 ms frame 8 s into the session, then clean input.
+            Stream s(session, 1000);
+            Rng rng(137 + uint64_t(preset.mode));
+            const size_t total = frames116(90), late = frames116(8);
+            for (size_t i = 0; i < total; ++i) s.step(k116Ticks, {i == late ? 6000 : rng.below(400)});
+            const uint64_t floor = s.input().minimumUs, peak = maximum(s.frames(), late, total, applied);
+            report("%-52s one late frame: peak %5" PRIu64 " floor %5" PRIu64 "\n", name.c_str(), peak, floor);
+            check(peak <= floor + 250, name, "one late frame in a window that has only begun to fill never buys latency",
+                "buffer reached %" PRIu64 " us (floor %" PRIu64 ") for one 6 ms frame 8 s into the session", peak, floor);
+        }
+        {
+            // Heavy-tailed lateness (exponential, mean 0.6 ms): the solved
+            // target steps between neighbouring values every few seconds.
+            Stream s(session, 1000);
+            Rng rng(139 + uint64_t(preset.mode));
+            const size_t total = frames116(180);
+            for (size_t i = 0; i < total; ++i) {
+                const double unit = double(rng.below(1000000) + 1) / 1000001.0;
+                s.step(k116Ticks, {uint64_t(-600.0 * std::log(unit))});
+            }
+            const auto& f = s.frames();
+            const uint64_t holdUs = s.controller().parameters().playoutMeanMissHoldUs;
+            // A fall sooner after a rise than the hold, less one evaluation.
+            uint64_t lastRiseUs = 0, soonestUs = UINT64_MAX;
+            size_t early = 0;
+            for (size_t i = frames116(10); i < total; ++i) {
+                if (f[i].appliedUs > f[i - 1].appliedUs) lastRiseUs = f[i].sourceUs;
+                else if (f[i].appliedUs < f[i - 1].appliedUs && lastRiseUs) {
+                    const uint64_t sinceUs = f[i].sourceUs - lastRiseUs;
+                    soonestUs = std::min(soonestUs, sinceUs);
+                    early += sinceUs + 1000000 < holdUs;
+                }
+            }
+            report("%-52s target steps: reversals %3zu soonest release %5.1f s after a rise (hold %.0f s)\n", name.c_str(),
+                reversals(f, frames116(10), total, 200), soonestUs == UINT64_MAX ? -1.0 : double(soonestUs) / 1e6,
+                double(holdUs) / 1e6);
+            check(early == 0, name, "a release waits out the hold after a rise",
+                "%zu releases began within %.1f s of a rise; the hold is %.0f s", early,
+                soonestUs == UINT64_MAX ? 0.0 : double(soonestUs) / 1e6, double(holdUs) / 1e6);
+        }
+    }
+}
+
 // 3. Late input beyond the allowance must earn protection at the rise rate
 // and then keep presented hitches inside the allowance, without buying more
 // than the measured lateness. Regression: 5b062c4b (slow relearning missed
@@ -682,9 +818,7 @@ void testOrdinaryVariationKeepsOneLayer()
             const auto jittered = [&](double fps) {
                 return varying ? uint32_t(int64_t(ticksForRate(fps)) + int64_t(rateRng.below(55)) - 27) : k116Ticks;
             };
-            const auto switches = [&] {
-                return s.controller().bufferAudit(s.frames().back().submittedUs, s.frames().back().appliedUs).layerSwitches;
-            };
+            const auto switches = [&] { return s.layerSwitches(); };
             while (elapsedTicks < 20 * 90000) step(k116Ticks);
             const uint64_t switchesBefore = switches();
             const uint64_t learned = s.frames().back().appliedUs;
@@ -1493,6 +1627,100 @@ void testSmoothingStaysInsideItsBudget()
     }
 }
 
+// 13. A client whose GPU decode runs close to the source interval must hold
+// a steady buffer and a steady source clock once it has settled, including
+// above one source interval of buffer. Regression: found 2026-11-13 on a
+// recorded 4K 138 FPS HEVC stream on a Radeon 780M (slowdecodespan.h). Above
+// 7.25 ms of buffer the worker reached each fast frame after its decode had
+// finished and could report only its own arrival time, so the source mapping
+// rose 2 ms while the solved buffer fell 2 ms and both swung back every 10 to
+// 15 s; and Smooth's aim inside its allowance stepped the buffer between 8.25
+// and 9.0 ms as single 15 ms frames entered and left the window, although
+// 8.25 ms met the goal. vrr18 held 6.4 to 6.65 ms on the same input. The
+// decoder is one serial queue and the worker one serial thread, as live; the
+// D3D11 presenter now timestamps each decode completion itself.
+void testSlowGpuDecodeHoldsASteadyBuffer()
+{
+    struct Run { uint64_t bufferLow, bufferHigh; int64_t mappingLow, mappingHigh; size_t late, frames; };
+    const auto run = [&](const VrrSessionConfig& session, bool timestamped) {
+        VrrTimingController controller(session, t_CanLatch, vrrTimingParametersForSession(session));
+        controller.seedPlayoutDelayStart(1000);
+        constexpr size_t kLoops = 14; // 8.75 minutes
+        const size_t span = sizeof(kSlowDecodeSpan) / sizeof(kSlowDecodeSpan[0]), total = span * kLoops;
+        const uint64_t tolerance = uint64_t(session.timingOptions.toleranceUs);
+        uint64_t ticks = 0, lastSubmittedUs = 0, decoderFreeUs = 0;
+        Run result{UINT64_MAX, 0, INT64_MAX, INT64_MIN, 0, 0};
+        int64_t secondSum = 0;
+        size_t secondCount = 0;
+        for (size_t i = 0; i < total; ++i) {
+            const auto& in = kSlowDecodeSpan[i % span];
+            ticks += in.ticks;
+            const uint64_t sourceUs = kOriginUs + ticks * 1000000 / 90000;
+            const uint64_t outputUs = sourceUs + kBaseLatencyUs + in.lateUs + 100;
+            PacedFrame frame(nullptr, int(i), uint32_t(ticks + 0xFFF00000u), true, outputUs);
+            const uint64_t submitUs = outputUs - 600;
+            frame.setDeliveryTimeline(submitUs - 300, submitUs - 100, submitUs);
+            frame.setDecoderOutputComplete(false);
+            const uint64_t completedUs = std::max(outputUs, decoderFreeUs) + in.decodeUs;
+            decoderFreeUs = completedUs;
+            // The worker collects a frame once the previous present returned,
+            // and then waits for its decode if that is still running.
+            const uint64_t dequeueUs = std::max(outputUs, lastSubmittedUs);
+            const uint64_t now = std::max(dequeueUs, completedUs);
+            frame.noteDecodeSyncWaitUs(now - dequeueUs);
+            if (timestamped) frame.noteDecodeCompletedUs(completedUs);
+            frame.noteGpuReadyUs(now);
+            const auto d = controller.schedule(frame, now);
+            if (d.trajectory.resyncRecommended) controller.noteTrajectoryDeferred();
+            const uint64_t prepareStartUs = std::max(now, d.renderStartUs);
+            const uint64_t preparedUs = prepareStartUs + in.prepareUs;
+            controller.notePreparationDuration(in.prepareUs, 0, preparedUs);
+            const uint64_t targetReachedUs = std::max(preparedUs, d.targetUs);
+            const uint64_t renderedUs = std::max(preparedUs + in.renderUs, targetReachedUs);
+            controller.noteDeferredGpuReady(renderedUs - targetReachedUs, true, renderedUs,
+                renderedUs - prepareStartUs, renderedUs != targetReachedUs);
+            controller.noteSchedulerDelays(0, 0, true);
+            controller.noteSubmission(true, false, renderedUs, renderedUs);
+            lastSubmittedUs = renderedUs;
+            if (i < total / 2) continue;
+            ++result.frames;
+            result.bufferLow = std::min(result.bufferLow, d.playoutDelayUs);
+            result.bufferHigh = std::max(result.bufferHigh, d.playoutDelayUs);
+            result.late += renderedUs > d.targetUs + tolerance;
+            // The mapping as one-second means: it is a slewed clock offset.
+            secondSum += int64_t(d.sourceTimeUs) - int64_t(sourceUs);
+            if (++secondCount == 138) {
+                result.mappingLow = std::min(result.mappingLow, secondSum / 138);
+                result.mappingHigh = std::max(result.mappingHigh, secondSum / 138);
+                secondSum = 0; secondCount = 0;
+            }
+        }
+        return result;
+    };
+    for (const auto& preset : kPresets) {
+        const auto& smoothing = kSmoothing[1];
+        const std::string name = label("slow-gpu-decode", preset, smoothing);
+        const auto session = vrrProductionSession(preset.mode, 144, 144, smoothing.smooth, smoothing.absorb);
+        const Run timestamped = run(session, true), collected = run(session, false);
+        report("%-52s buffer %5" PRIu64 "-%5" PRIu64 " mapping moved %4" PRId64 " late %4zu of %zu | collection time only: buffer %5" PRIu64 "-%5" PRIu64 " mapping moved %4" PRId64 " late %4zu\n",
+            name.c_str(), timestamped.bufferLow, timestamped.bufferHigh, timestamped.mappingHigh - timestamped.mappingLow,
+            timestamped.late, timestamped.frames, collected.bufferLow, collected.bufferHigh,
+            collected.mappingHigh - collected.mappingLow, collected.late);
+        // The target lies within the margin's cost (500 us) of what the goal
+        // needs and moves on a 250 us grid.
+        check(timestamped.bufferHigh - timestamped.bufferLow <= 750, name,
+            "a settled buffer stays within the solver's margin on a steady slow-decode workload",
+            "applied buffer moved between %" PRIu64 " and %" PRIu64 " us over the last half",
+            timestamped.bufferLow, timestamped.bufferHigh);
+        // The span's own fastest decode moves 0.7 ms between its light and
+        // heavy passages, and the mapping follows it (vrr18: 0.6 ms).
+        check(timestamped.mappingHigh - timestamped.mappingLow <= 1000, name,
+            "the source clock does not move with the buffer on a steady slow-decode workload",
+            "one-second mean mapping moved %" PRId64 " us over the last half",
+            timestamped.mappingHigh - timestamped.mappingLow);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1501,6 +1729,7 @@ int main(int argc, char** argv)
     const Scenario scenarios[] = {
         {"start-release", testStartingDelayReleasesOnCleanInput},
         {"within-allowance", testMissesWithinAllowanceBuyNoDelay},
+        {"unabsorbable-loss", testUnabsorbableLossBuysNoDelay},
         {"earn-protection", testGenuineLateInputEarnsProtection},
         {"plateau-history", testPlateauFollowsSelectedHistory},
         {"rate-round-trip", testRateRoundTripRestoresProtection},
@@ -1515,6 +1744,7 @@ int main(int argc, char** argv)
         {"catch-up-carry", testCatchUpCarryDrainsBetweenLateFrames},
         {"invalid-expiry", testExpiryThroughInvalidEvidence},
         {"smoothing-budget", testSmoothingStaysInsideItsBudget},
+        {"slow-gpu-decode", testSlowGpuDecodeHoldsASteadyBuffer},
     };
     std::vector<const char*> selection;
     for (int i = 1; i < argc; ++i) {

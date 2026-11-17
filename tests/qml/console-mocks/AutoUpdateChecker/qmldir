@@ -1,0 +1,2 @@
+module AutoUpdateChecker
+singleton AutoUpdateChecker 1.0 AutoUpdateChecker.qml

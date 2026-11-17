@@ -33,7 +33,7 @@ VrrSessionConfig prepareProductionConfig(VrrSessionConfig config)
     }
     const auto target = config.experimentalInputPercentilePpm;
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Adaptive buffer: client-timing goal %.2f%% (network and decode jitter only); least buffer meeting it over the last %llu s, aiming at 70%% of the allowed loss; beyond reach maximize timing quality within the buffer cap; rise 4 ms/s, fall 1 ms/s; history %llu s",
+        "Adaptive buffer: client-timing goal %.2f%% (network and decode jitter, plus render work after a blocked D3D11 decode); least buffer meeting it over the last %llu s, aiming at 70%% of the allowed loss above what the buffer cap cannot absorb; rise 4 ms/s, fall 1 ms/s; history %llu s",
         target / 10000.0,
         static_cast<unsigned long long>(target >= 999000 ? 120 : target >= 995000 ? 60 : 20),
         static_cast<unsigned long long>(config.timingOptions.resolved(config.latencyMode).historySeconds));
@@ -421,6 +421,11 @@ int VrrPacingWorker::run()
         }
         if (preparedAhead) {
             frame.noteGpuReadyUs(queuedFrame.preparation->timing.decodeReadyUs);
+        }
+        if (decodeReadiness.completedUs) {
+            // The backend timestamped the completion when it happened, so it
+            // does not depend on how long this frame waited for the worker.
+            frame.noteDecodeCompletedUs(decodeReadiness.completedUs);
         }
         if (decodeReadiness.completionObserved) {
             // This is an upper bound on completion, sampled after the native
@@ -1551,6 +1556,7 @@ void VrrPacingWorker::recordFrameCompletion(const QueuedFrame& queuedFrame,
     row.lostPackets = frame.lostPackets();
     row.timestampValid = frame.timestampValid();
     row.decodeCompleteUs = frame.decodeCompleteUs();
+    row.decodeCompletionExact = frame.decodeCompletionExact();
     row.decoderOutputUs = frame.decoderOutputUs();
     row.latencyMode = m_Config.latencyMode;
     row.receiveUs = frame.receiveUs();

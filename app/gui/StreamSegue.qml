@@ -1,4 +1,5 @@
 import QtQuick 2.0
+import "ConsoleStyle.js" as Style
 import QtQuick.Controls 2.2
 import QtQuick.Window 2.2
 
@@ -7,6 +8,8 @@ import Session 1.0
 import SystemProperties 1.0
 
 Item {
+    property url artwork: ""
+    ConsoleBackdrop { anchors.fill: parent; artwork: parent.artwork }
     property Session session
     property string appName
     property string stageText : isResume ? qsTr("Resuming %1...").arg(appName) :
@@ -208,8 +211,13 @@ Item {
         sourceComponent: Item {}
     }
 
+    Column {
+        anchors.centerIn: parent; width: parent.width * 0.75
+        Image { anchors.horizontalCenter: parent.horizontalCenter; source: artwork; width: Style.px(130, Window.window); height: Style.px(175, Window.window); fillMode: Image.PreserveAspectFit }
+        Label { text: appName; width: parent.width; horizontalAlignment: Text.AlignHCenter; font.pixelSize: Style.typeSize("title", Window.window); wrapMode: Text.Wrap }
+    }
     Row {
-        anchors.centerIn: parent
+        anchors.horizontalCenter: parent.horizontalCenter; y: parent.height * 0.70
         spacing: 5
 
         BusyIndicator {
@@ -222,7 +230,7 @@ Item {
             id: stageLabel
             height: stageSpinner.height
             text: stageText
-            font.pointSize: 20
+            font.pixelSize: Style.typeSize("body", Window.window)
             verticalAlignment: Text.AlignVCenter
 
             wrapMode: Text.Wrap
@@ -232,9 +240,11 @@ Item {
     Label {
         id: hintText
         anchors.bottom: parent.bottom
-        anchors.bottomMargin: 50
+        anchors.bottomMargin: Style.px(48, Window.window)
         anchors.horizontalCenter: parent.horizontalCenter
-        font.pointSize: 18
+        width: parent.width * 0.85
+        horizontalAlignment: Text.AlignHCenter
+        font.pixelSize: Style.typeSize("body", Window.window)
         verticalAlignment: Text.AlignVCenter
 
         wrapMode: Text.Wrap

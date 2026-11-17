@@ -1,4 +1,5 @@
 #include "appmodel.h"
+#include "settings/streamingpreferences.h"
 
 AppModel::AppModel(QObject *parent)
     : QAbstractListModel(parent)
@@ -11,6 +12,18 @@ bool AppModel::frameLimiterSupported() const { return m_FrameLimiterSupported; }
 bool AppModel::frameLimiterEnabled() const { return m_FrameLimiterEnabled; }
 bool AppModel::virtualDisplayFrameLimiterEnabled() const { return m_VirtualDisplayFrameLimiterEnabled; }
 double AppModel::frameLimiterFpsLimit() const { return m_FrameLimiterFpsLimit; }
+
+void AppModel::updateAppListState()
+{
+    QReadLocker lock(&m_Computer->lock);
+    const bool loading = !m_Computer->appListFetchCompleted && m_Computer->appList.isEmpty();
+    const bool unavailable = m_Computer->appListFetchFailed;
+    lock.unlock();
+    if (loading == m_AppListLoading && unavailable == m_AppListUnavailable) return;
+    m_AppListLoading = loading;
+    m_AppListUnavailable = unavailable;
+    emit appListStateChanged();
+}
 
 void AppModel::updateFrameLimiterCapabilities()
 {
@@ -40,6 +53,7 @@ void AppModel::initialize(ComputerManager* computerManager, int computerIndex, b
     m_ShowHiddenGames = showHiddenGames;
 
     updateAppList(m_Computer->appList);
+    updateAppListState();
     updateFrameLimiterCapabilities();
     updateSleepAction();
     const QString uuid = m_Computer->uuid;
@@ -73,7 +87,15 @@ Session* AppModel::createSessionForApp(int appIndex)
     if (appIndex < 0 || appIndex >= m_VisibleApps.count()) return nullptr;
     NvApp app = m_VisibleApps.at(appIndex);
 
-    return new Session(m_Computer, app);
+    auto* session = new Session(m_Computer, app);
+    auto* preferences = StreamingPreferences::get();
+    const auto uuid = m_Computer->uuid;
+    // Allocation, failed connections and cancelled launch confirmations do not
+    // count as play. This also covers resume, direct launch and quit-then-play.
+    connect(session, &Session::connectionStarted, preferences, [preferences, uuid, appId = app.id]() {
+        preferences->recordUiPlay(uuid, appId);
+    });
+    return session;
 }
 
 int AppModel::getDirectLaunchAppIndex()
@@ -163,8 +185,13 @@ void AppModel::quitRunningApp()
 void AppModel::updateSleepAction()
 {
     QReadLocker lock(&m_Computer->lock);
-    const bool visible = m_Computer->sleepActionSupportedAndAllowed;
+    const bool available = m_Computer->sleepActionSupportedAndAllowed;
     lock.unlock(); // Model notifications can re-enter UI/backend code.
+    if (available != m_HostSleepAvailable) {
+        m_HostSleepAvailable = available;
+        emit hostSleepAvailableChanged();
+    }
+    const bool visible = available && m_IncludeHostActions;
     if (visible == m_SleepActionVisible) return;
     const int row = m_VisibleApps.count();
     if (visible) beginInsertRows(QModelIndex(), row, row);
@@ -176,7 +203,7 @@ void AppModel::updateSleepAction()
 
 void AppModel::requestHostSleep()
 {
-    if (!m_SleepActionVisible || !m_ComputerManager->requestHostSleep(m_Computer))
+    if (!m_HostSleepAvailable || !m_ComputerManager->requestHostSleep(m_Computer))
         emit hostSleepCompleted(tr("Sleep is unavailable or a request is already pending."));
 }
 
@@ -319,6 +346,7 @@ void AppModel::handleComputerStateChanged(NvComputer* computer)
         return;
     }
 
+    updateAppListState();
     updateFrameLimiterCapabilities();
     updateSleepAction();
 
@@ -382,4 +410,28 @@ void AppModel::handleBoxArtLoaded(NvComputer* computer, NvApp app, QUrl /* image
     else {
         qWarning() << "App not found for box art callback:" << app.name;
     }
+}
+
+void AppModel::setIncludeHostActions(bool include)
+{
+    if (m_IncludeHostActions == include) return;
+    m_IncludeHostActions = include;
+    if (m_Computer) updateSleepAction();
+}
+
+QVariantMap AppModel::get(int appIndex) const
+{
+    QVariantMap result;
+    if (appIndex < 0 || appIndex >= m_VisibleApps.size()) return result;
+    const auto roles = roleNames();
+    for (auto it = roles.cbegin(); it != roles.cend(); ++it)
+        result.insert(QString::fromUtf8(it.value()), data(index(appIndex), it.key()));
+    return result;
+}
+
+int AppModel::indexOfApp(int appId) const
+{
+    for (int i = 0; i < m_VisibleApps.size(); ++i)
+        if (m_VisibleApps[i].id == appId) return i;
+    return -1;
 }

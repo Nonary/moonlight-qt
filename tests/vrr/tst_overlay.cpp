@@ -88,6 +88,7 @@ public:
             }
         }
         SDL_FreeSurface(surface);
+        if (type == OverlayStatusUpdate) ++statusCalls;
         ++calls;
         if (type == OverlayDebug && enabled && block) {
             entered = true;
@@ -98,7 +99,10 @@ public:
     }
     void awaitText(const std::string& text) {
         std::unique_lock<std::mutex> guard(lock);
-        assert(ready.wait_for(guard, 3s, [&] { return last == text; }));
+        if (!ready.wait_for(guard, 3s, [&] { return last == text; })) {
+            std::cerr << "awaitText expected=[" << text << "] actual=[" << last << "]\n";
+            assert(false);
+        }
     }
     void awaitSize(int expectedWidth) {
         std::unique_lock<std::mutex> guard(lock);
@@ -109,13 +113,58 @@ public:
     std::mutex lock;
     std::condition_variable ready;
     bool block = false, entered = false, bottomTransparent = false;
-    unsigned calls = 0, statsInk = 0, statsShadow = 0;
+    unsigned calls = 0, statusCalls = 0, statsInk = 0, statsShadow = 0;
     std::string last;
     int height = 0, width = 0;
     std::array<unsigned, 10> colors{};
     std::array<std::array<unsigned, 10>, TimingGraphLayout::Lanes + 1> rowColors{};
     std::array<int, TimingGraphLayout::Lanes + 1> minInkY{}, maxInkY{};
 };
+
+namespace Overlay {
+// Hold dispatch while the worker consumes the hide request. This establishes
+// the exact interleaving without depending on scheduler timing or raster cost.
+struct OverlayManagerTestAccess {
+    static void updateHiddenAfterHideConsumed(OverlayManager& manager) {
+        std::unique_lock<std::mutex> dispatch(manager.m_RendererLock);
+        manager.setOverlayState(OverlayDebug, false);
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> state(manager.m_StateLock);
+                if (!manager.m_Overlays[OverlayDebug].dirty) break;
+            }
+            assert(std::chrono::steady_clock::now() < deadline);
+            std::this_thread::yield();
+        }
+        manager.updateOverlayText(OverlayDebug, "hidden after consumed hide");
+    }
+};
+}
+
+static void testHiddenUpdatePreservesConsumedHide()
+{
+    OverlayManager manager;
+    Presenter presenter(manager);
+    manager.setOverlayRenderer(&presenter);
+    manager.updateOverlayText(OverlayDebug, "visible before hide");
+    manager.setOverlayState(OverlayDebug, true);
+    presenter.awaitText("visible before hide");
+    {
+        // Attachment queues both overlay types. Drain initial status dispatch
+        // before gating the worker so it cannot block ahead of the debug hide.
+        std::unique_lock<std::mutex> guard(presenter.lock);
+        assert(presenter.ready.wait_for(guard, 3s, [&] { return presenter.statusCalls > 0; }));
+    }
+    OverlayManagerTestAccess::updateHiddenAfterHideConsumed(manager);
+    presenter.awaitText("hidden after consumed hide");
+    {
+        std::lock_guard<std::mutex> guard(presenter.lock);
+        assert(presenter.height == 0 && presenter.width == 0);
+    }
+    assert(!manager.isOverlayEnabled(OverlayDebug));
+    manager.setOverlayRenderer(nullptr);
+}
 
 static TimingGraphSnapshot testTimingGraph()
 {
@@ -702,6 +751,7 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     assert(argc == 2 && QDir::setCurrent(argv[1])); // Directory containing ModeSeven.ttf.
     assert(SDL_Init(SDL_INIT_TIMER) == 0);
+    testHiddenUpdatePreservesConsumedHide();
     const auto graph = testTimingGraph();
     {
         OverlayManager manager;

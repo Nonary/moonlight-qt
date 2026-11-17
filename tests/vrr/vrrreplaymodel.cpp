@@ -26,11 +26,20 @@ bool vrrDecodeReadinessOrderValid(uint64_t decoderOutputUs, uint64_t readyUs,
                                   bool readinessExcludesQueue,
                                   bool readinessUsesPostWaitClock,
                                   bool completionObserved,
-                                  bool readinessStateAvailable)
+                                  bool readinessStateAvailable,
+                                  bool completionExact)
 {
     if (!decoderOutputUs || decoderOutputUs > arrivalUs || readyUs < decoderOutputUs)
         return false;
     if (decisionValid && readyUs > decisionUs) return false;
+    if (completionExact) {
+        // The backend's own completion timestamp may precede the dequeue: the
+        // decode finished while the frame waited for the worker. A worker
+        // that did wait saw it complete during that wait.
+        return completionObserved && decisionValid && dequeueUs >= arrivalUs &&
+            decisionUs >= dequeueUs && decodeWaitUs <= decisionUs - dequeueUs &&
+            (decodeWaitUs == 0 || readyUs >= dequeueUs);
+    }
     if (completionObserved) {
         return decisionValid && dequeueUs >= arrivalUs && readyUs >= dequeueUs &&
             decodeWaitUs <= readyUs - dequeueUs;

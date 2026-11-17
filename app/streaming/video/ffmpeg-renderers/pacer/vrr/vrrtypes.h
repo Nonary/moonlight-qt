@@ -94,9 +94,25 @@ public:
     // Captured controller policy selects which boundary anchors source time.
     void noteGpuReadyUs(uint64_t gpuReadyUs)
     {
-        if (gpuReadyUs > m_DecodeCompleteUs) {
+        if (!m_DecodeCompletionExact && gpuReadyUs > m_DecodeCompleteUs) {
             m_DecodeCompleteUs = gpuReadyUs;
         }
+    }
+
+    // Decode completion as the backend timestamped it when it happened. The
+    // bound above is sampled when the pacing worker collects the frame, so it
+    // moves with our own schedule: once the playout buffer exceeds one source
+    // interval the worker reaches every fast frame after it finished, and the
+    // bound reported the worker's arrival as that frame's completion.
+    void noteDecodeCompletedUs(uint64_t completedUs)
+    {
+        m_DecodeCompleteUs = (std::max)(completedUs, m_DecoderOutputUs);
+        m_DecodeCompletionExact = true;
+    }
+
+    bool decodeCompletionExact() const
+    {
+        return m_DecodeCompletionExact;
     }
 
     // The worker may have to block on a decoder/backend completion primitive
@@ -241,6 +257,7 @@ private:
     uint32_t m_RtpTimestamp = 0;
     bool m_TimestampValid = false;
     bool m_DecoderOutputComplete = true;
+    bool m_DecodeCompletionExact = false;
     uint64_t m_DecoderOutputUs = 0;
     uint64_t m_DecodeCompleteUs = 0;
     uint64_t m_DecodeSyncWaitUs = 0;

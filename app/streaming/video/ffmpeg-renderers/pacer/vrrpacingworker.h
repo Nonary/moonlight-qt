@@ -161,6 +161,9 @@ private:
         uint32_t lostPackets = 0;
         bool timestampValid = false;
         uint64_t decodeCompleteUs = 0;
+        // decodeCompleteUs is the backend's own completion timestamp rather
+        // than the time the worker collected the frame.
+        bool decodeCompletionExact = false;
         uint64_t decoderOutputUs = 0;
         int latencyMode = 0;
         uint64_t historySamples = 0;

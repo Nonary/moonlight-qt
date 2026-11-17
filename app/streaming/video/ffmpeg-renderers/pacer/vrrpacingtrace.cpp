@@ -79,6 +79,7 @@ constexpr char kTraceHeader[] =
     ",lost_packets"
     ",input_percentile_target_us,input_percentile_current_us,input_percentile_samples,input_percentile_window_us,input_percentile_probability_ppm,input_percentile_tail_uncertain,input_percentile_evidence_valid,input_percentile_clipped,input_percentile_expired_unknown,input_percentile_history_truncated,input_percentile_eligible,input_percentile_ineligible,input_percentile_absorbed,input_percentile_missed,input_percentile_raises,input_percentile_lowers,input_percentile_epoch_resets,input_percentile_recent_eligible,input_percentile_recent_absorbed,input_percentile_recent_missed,input_percentile_last_input_eligible,input_percentile_last_input_required_us,input_percentile_last_input_observation_us,input_percentile_growth_blocked,input_network_buffer_miss,input_decode_buffer_miss,input_buffer_miss_observation_us,input_percentile_last_buffer_miss_us,input_percentile_last_network_miss_us,input_percentile_last_decoder_miss_us,input_percentile_network_misses,input_percentile_decoder_misses,input_percentile_release_samples,input_percentile_release_misses,input_percentile_effective_fall_rate_us_per_second"
     ",trajectory_nominal_us,trajectory_existing_us,trajectory_target_us,trajectory_added_us,trajectory_carry_us,trajectory_minimum_interval_us,trajectory_physical_period_us,trajectory_allowance_us,trajectory_intended_interval_us,trajectory_plans,trajectory_limited,trajectory_resets,trajectory_resync_drops,trajectory_deferred,trajectory_continuity,trajectory_no_headroom,trajectory_resync_recommended,trajectory_resync_dropped,trajectory_resync_deferred,trajectory_successor_frame,trajectory_successor_proof"
+    ",decode_completion_exact"
     "\n";
 #undef VRR_TRACE_PARAMETER_HEADER
 
@@ -624,6 +625,7 @@ void VrrPacingWorker::writeTraceRow(const TraceRow& row)
     addUnsigned(row.telemetry.trajectoryResyncDeferred);
     addSigned(row.telemetry.trajectorySuccessorFrame);
     addUnsigned(row.telemetry.trajectorySuccessorProof);
+    addBool(row.decodeCompletionExact);
     line.append('\n');
 
     if (m_TraceFormat == TraceFormat::ChunkedCompressed) {

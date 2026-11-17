@@ -1,0 +1,2 @@
+module SystemProperties
+singleton SystemProperties 1.0 SystemProperties.qml

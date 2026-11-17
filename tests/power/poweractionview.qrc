@@ -1,5 +1,15 @@
-<RCC><qresource prefix="/res">
+<RCC><qresource prefix="/">
+<file alias="fonts/Inter.ttf">../../app/res/fonts/Inter.ttf</file>
+<file alias="res/fixture-racing.svg">../qml/artwork/racing.svg</file>
+<file alias="res/fixture-hollow.svg">../qml/artwork/hollow.svg</file>
+<file alias="res/fixture-space.svg">../qml/artwork/space.svg</file>
+<file alias="res/fixture-control.svg">../qml/artwork/control.svg</file>
+<file alias="res/moonlight.svg">../../app/res/moonlight.svg</file>
+</qresource><qresource prefix="/res">
 <file alias="no_app_image.png">../../app/res/no_app_image.png</file>
+<file alias="desktop_windows-48px.svg">../../app/res/desktop_windows-48px.svg</file>
+<file alias="warning_FILL1_wght300_GRAD200_opsz24.svg">../../app/res/warning_FILL1_wght300_GRAD200_opsz24.svg</file>
+<file alias="baseline-lock-24px.svg">../../app/res/baseline-lock-24px.svg</file>
 <file alias="baseline-error_outline-24px.svg">../../app/res/baseline-error_outline-24px.svg</file>
 <file alias="baseline-help_outline-24px.svg">../../app/res/baseline-help_outline-24px.svg</file>
 <file alias="baseline-check_circle_outline-24px.svg">../../app/res/baseline-check_circle_outline-24px.svg</file>

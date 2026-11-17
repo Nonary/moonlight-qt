@@ -9,6 +9,10 @@
 class AppModel : public QAbstractListModel
 {
     Q_OBJECT
+    Q_PROPERTY(bool appListLoading READ appListLoading NOTIFY appListStateChanged)
+    Q_PROPERTY(bool appListUnavailable READ appListUnavailable NOTIFY appListStateChanged)
+    Q_PROPERTY(bool includeHostActions READ includeHostActions WRITE setIncludeHostActions)
+    Q_PROPERTY(bool hostSleepAvailable READ hostSleepAvailable NOTIFY hostSleepAvailableChanged)
     Q_PROPERTY(bool frameLimiterSupported READ frameLimiterSupported NOTIFY frameLimiterChanged)
     Q_PROPERTY(bool frameLimiterEnabled READ frameLimiterEnabled NOTIFY frameLimiterChanged)
     Q_PROPERTY(bool virtualDisplayFrameLimiterEnabled READ virtualDisplayFrameLimiterEnabled NOTIFY frameLimiterChanged)
@@ -28,6 +32,13 @@ class AppModel : public QAbstractListModel
 
 public:
     explicit AppModel(QObject *parent = nullptr);
+    bool appListLoading() const { return m_AppListLoading; }
+    bool appListUnavailable() const { return m_AppListUnavailable; }
+    bool includeHostActions() const { return m_IncludeHostActions; }
+    void setIncludeHostActions(bool include);
+    bool hostSleepAvailable() const { return m_HostSleepAvailable; }
+    Q_INVOKABLE QVariantMap get(int appIndex) const;
+    Q_INVOKABLE int indexOfApp(int appId) const;
     bool frameLimiterSupported() const;
     bool frameLimiterEnabled() const;
     bool virtualDisplayFrameLimiterEnabled() const;
@@ -65,6 +76,8 @@ private slots:
 
 signals:
     void computerLost();
+    void appListStateChanged();
+    void hostSleepAvailableChanged();
     void frameLimiterChanged();
     void hostSleepCompleted(QString error);
 
@@ -76,7 +89,12 @@ private:
     bool isAppCurrentlyVisible(const NvApp& app);
 
     void updateSleepAction();
+    void updateAppListState();
+    bool m_AppListLoading = true;
+    bool m_AppListUnavailable = false;
     bool m_SleepActionVisible = false;
+    bool m_IncludeHostActions = true;
+    bool m_HostSleepAvailable = false;
     void updateFrameLimiterCapabilities();
     bool m_FrameLimiterSupported = false;
     bool m_FrameLimiterEnabled = false;

@@ -102,7 +102,8 @@ bool vrrDecodeReadinessOrderValid(uint64_t decoderOutputUs, uint64_t readyUs,
                                   bool readinessExcludesQueue = false,
                                   bool readinessUsesPostWaitClock = false,
                                   bool completionObserved = false,
-                                  bool readinessStateAvailable = false);
+                                  bool readinessStateAvailable = false,
+                                  bool completionExact = false);
 
 bool vrrPreparedReadinessOrderValid(uint64_t outputUs, uint64_t arrivalUs,
     uint64_t dequeueUs, uint64_t decisionUs, uint64_t decodeCompleteUs,

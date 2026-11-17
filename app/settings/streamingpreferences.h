@@ -207,6 +207,13 @@ public:
     Q_PROPERTY(RendererSelection rendererSelection MEMBER rendererSelection NOTIFY rendererSelectionChanged)
     Q_PROPERTY(WindowMode windowMode MEMBER windowMode NOTIFY windowModeChanged)
     Q_PROPERTY(WindowMode recommendedFullScreenMode MEMBER recommendedFullScreenMode CONSTANT)
+    Q_PROPERTY(QString uiLastHostUuid MEMBER uiLastHostUuid NOTIFY uiPreferencesChanged)
+    Q_PROPERTY(bool uiReducedMotion MEMBER uiReducedMotion NOTIFY uiPreferencesChanged)
+    Q_PROPERTY(bool uiControllerFullscreen MEMBER uiControllerFullscreen NOTIFY uiControllerFullscreenChanged)
+    Q_INVOKABLE void rememberUiSelection(const QString& hostUuid, int appId);
+    Q_INVOKABLE int selectedUiApp(const QString& hostUuid) const;
+    Q_INVOKABLE QVariantList recentUiApps(const QString& hostUuid) const;
+    Q_INVOKABLE void recordUiPlay(const QString& hostUuid, int appId);
     Q_PROPERTY(UIDisplayMode uiDisplayMode MEMBER uiDisplayMode NOTIFY uiDisplayModeChanged)
     Q_PROPERTY(bool swapMouseButtons MEMBER swapMouseButtons NOTIFY mouseButtonsChanged)
     Q_PROPERTY(bool muteOnFocusLoss MEMBER muteOnFocusLoss NOTIFY muteOnFocusLossChanged)
@@ -287,6 +294,9 @@ public:
     WindowMode windowMode;
     WindowMode recommendedFullScreenMode;
     UIDisplayMode uiDisplayMode;
+    QString uiLastHostUuid;
+    bool uiReducedMotion = false;
+    bool uiControllerFullscreen = true;
     Language language;
     CaptureSysKeysMode captureSysKeysMode;
     RendererSelection rendererSelection;
@@ -334,6 +344,9 @@ signals:
     void enableYUV444Changed();
     void videoDecoderSelectionChanged();
     void uiDisplayModeChanged();
+    void uiPreferencesChanged();
+    void uiControllerFullscreenChanged();
+    void recentUiAppsChanged(QString hostUuid);
     void windowModeChanged();
     void framePacingChanged();
     void connectionWarningsChanged();

@@ -13,6 +13,10 @@ struct VrrDecodeReadiness {
     uint64_t waitUs = 0;
     bool completionObserved = false;
     bool asynchronousOutput = false;
+    // When the decode finished, on the LiGetMicroseconds() clock, if the
+    // backend timestamped the completion itself. Zero when all it knows is
+    // that the decode had finished by the time it was asked.
+    uint64_t completedUs = 0;
 };
 
 // Renderer-facing VRR contract. A backend with native timed presentation may

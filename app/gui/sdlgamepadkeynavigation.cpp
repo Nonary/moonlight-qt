@@ -16,12 +16,14 @@ SdlGamepadKeyNavigation::SdlGamepadKeyNavigation(StreamingPreferences* prefs)
       m_HasFocus(false),
       m_LastAxisNavigationEventTime(0)
 {
+    QCoreApplication::instance()->installEventFilter(this);
     m_PollingTimer = new QTimer(this);
     connect(m_PollingTimer, &QTimer::timeout, this, &SdlGamepadKeyNavigation::onPollingTimerFired);
 }
 
 SdlGamepadKeyNavigation::~SdlGamepadKeyNavigation()
 {
+    QCoreApplication::instance()->removeEventFilter(this);
     disable();
 }
 
@@ -69,6 +71,9 @@ void SdlGamepadKeyNavigation::enable()
         }
     }
 
+    if (!m_Gamepads.isEmpty()) noteController(m_Gamepads.first());
+    else { m_InputMethod = "keyboard"; m_ControllerFamily = "xbox"; }
+    emit navigationStateChanged();
     m_Enabled = true;
 
     // Start the polling timer if the window is focused
@@ -92,6 +97,7 @@ void SdlGamepadKeyNavigation::disable()
     }
 
     SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
+    emit navigationStateChanged();
 }
 
 void SdlGamepadKeyNavigation::notifyWindowFocus(bool hasFocus)
@@ -133,6 +139,7 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
                     event.type == SDL_CONTROLLERBUTTONDOWN ?
                         QEvent::Type::KeyPress : QEvent::Type::KeyRelease;
 
+            noteController(SDL_GameControllerFromInstanceID(event.cbutton.which));
             const quint64 buttonId = (quint64(quint32(event.cbutton.which)) << 8) |
                                       event.cbutton.button;
             if (type == QEvent::KeyRelease) {
@@ -153,7 +160,10 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
                                                Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
                 auto* target = QGuiApplication::focusWindow();
                 if (!target) return;
-                m_PressedControllerKeys.insert(buttonId, {key, modifiers, target});
+                const bool directional = event.cbutton.button >= SDL_CONTROLLER_BUTTON_DPAD_UP &&
+                                         event.cbutton.button <= SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
+                m_PressedControllerKeys.insert(buttonId, {key, modifiers, target,
+                    SDL_GetTicks() + 350, directional, m_UiNavMode});
                 sendKey(type, key, modifiers, target);
             };
 
@@ -179,7 +189,7 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
             case SDL_CONTROLLER_BUTTON_DPAD_UP:
                 if (m_UiNavMode) {
                     // Back-tab
-                    sendControllerKey(Qt::Key_Tab, Qt::ShiftModifier);
+                    sendControllerKey(Qt::Key_Backtab);
                 }
                 else {
                     sendControllerKey(Qt::Key_Up);
@@ -198,6 +208,12 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
                 break;
             case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
                 sendControllerKey(Qt::Key_Right);
+                break;
+            case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
+                sendControllerKey(Qt::Key_PageUp);
+                break;
+            case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:
+                sendControllerKey(Qt::Key_PageDown);
                 break;
             case SDL_CONTROLLER_BUTTON_A:
                 if (m_UiNavMode) {
@@ -225,6 +241,18 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
             }
             break;
         }
+        case SDL_CONTROLLERDEVICEREMOVED:
+            // A disconnected pad must not leave a pressed key or stale hints.
+            releaseControllerKeys();
+            for (int i = m_Gamepads.size() - 1; i >= 0; --i) {
+                if (!SDL_GameControllerGetAttached(m_Gamepads[i])) {
+                    SDL_GameControllerClose(m_Gamepads.takeAt(i));
+                }
+            }
+            if (!m_Gamepads.isEmpty()) noteController(m_Gamepads.first());
+            else { m_InputMethod = "keyboard"; m_ControllerFamily = "xbox"; }
+            emit navigationStateChanged();
+            break;
         case SDL_CONTROLLERDEVICEADDED:
             SDL_GameController* gc = SDL_GameControllerOpen(event.cdevice.which);
             if (gc != nullptr) {
@@ -234,6 +262,8 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
                 // before we've processed the add event.
                 if (!m_Gamepads.contains(gc)) {
                     m_Gamepads.append(gc);
+                    noteController(gc);
+                    emit navigationStateChanged();
                 }
                 else {
                     // We already have this game controller open
@@ -244,18 +274,38 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
         }
     }
 
+    // Repeat only directional buttons. Keep the original release route and
+    // stop repeating if a popup changes the navigation mode during the hold.
+    const auto heldKeys = m_PressedControllerKeys;
+    const Uint32 now = SDL_GetTicks();
+    for (auto held = heldKeys.cbegin(); held != heldKeys.cend(); ++held) {
+        auto live = m_PressedControllerKeys.find(held.key());
+        if (live == m_PressedControllerKeys.end()) continue;
+        const ControllerKey key = live.value();
+        if (key.repeatable && key.navigationMode == m_UiNavMode && key.window &&
+            key.window == QGuiApplication::focusWindow() && Sint32(now - key.nextRepeat) >= 0) {
+            live->nextRepeat = now + 90;
+            sendKey(QEvent::KeyPress, key.key, key.modifiers, key.window, true);
+        }
+    }
+
     // Handle analog sticks by polling
     for (auto gc : std::as_const(m_Gamepads)) {
         short leftX = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
         short leftY = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
+        const auto axisController = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc));
+        if (qAbs(int(leftX)) <= 30000 && qAbs(int(leftY)) <= 30000)
+            m_SuppressedAxes.remove(axisController);
+        if (m_SuppressedAxes.contains(axisController)) continue;
+        if (qAbs(int(leftX)) > 30000 || qAbs(int(leftY)) > 30000) noteController(gc);
         if (SDL_GetTicks() - m_LastAxisNavigationEventTime < AXIS_NAVIGATION_REPEAT_DELAY) {
             // Do nothing
         }
         else if (leftY < -30000) {
             if (m_UiNavMode) {
                 // Back-tab
-                sendKey(QEvent::Type::KeyPress, Qt::Key_Tab, Qt::ShiftModifier);
-                sendKey(QEvent::Type::KeyRelease, Qt::Key_Tab, Qt::ShiftModifier);
+                sendKey(QEvent::Type::KeyPress, Qt::Key_Backtab);
+                sendKey(QEvent::Type::KeyRelease, Qt::Key_Backtab);
             }
             else {
                 sendKey(QEvent::Type::KeyPress, Qt::Key_Up);
@@ -300,13 +350,16 @@ void SdlGamepadKeyNavigation::releaseControllerKeys()
 }
 
 void SdlGamepadKeyNavigation::sendKey(QEvent::Type type, Qt::Key key, Qt::KeyboardModifiers modifiers,
-                                     QWindow* target)
+                                     QWindow* target, bool autoRepeat)
 {
     QGuiApplication* app = static_cast<QGuiApplication*>(QGuiApplication::instance());
     QWindow* focusWindow = target ? target : app->focusWindow();
     if (focusWindow != nullptr) {
-        QKeyEvent keyPressEvent(type, key, modifiers);
+        QKeyEvent keyPressEvent(type, key, modifiers, QString(), autoRepeat);
+        const bool wasSending = m_SendingKey;
+        m_SendingKey = true;
         app->sendEvent(focusWindow, &keyPressEvent);
+        m_SendingKey = wasSending;
     }
 }
 
@@ -326,6 +379,15 @@ void SdlGamepadKeyNavigation::updateTimerState()
 
 void SdlGamepadKeyNavigation::setUiNavMode(bool uiNavMode)
 {
+    // An explicit call marks a focus-context boundary even when both contexts
+    // use arrows. A held direction must not continue into a newly opened editor.
+    for (auto key = m_PressedControllerKeys.begin(); key != m_PressedControllerKeys.end(); ++key)
+        key->repeatable = false;
+    for (auto gc : std::as_const(m_Gamepads)) {
+        if (qAbs(int(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX))) > 30000 ||
+            qAbs(int(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY))) > 30000)
+            m_SuppressedAxes.insert(SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc)));
+    }
     m_UiNavMode = uiNavMode;
 }
 
@@ -342,4 +404,57 @@ int SdlGamepadKeyNavigation::getConnectedGamepads()
     }
 
     return count;
+}
+
+QString SdlGamepadKeyNavigation::familyForControllerType(int type)
+{
+    QString family = "xbox"; // Unknown and older SDL devices use ABXY prompts.
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+    {
+
+        if (type == SDL_CONTROLLER_TYPE_PS3 || type == SDL_CONTROLLER_TYPE_PS4
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+            || type == SDL_CONTROLLER_TYPE_PS5
+#endif
+        ) family = "playstation";
+        else if (type == SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+                 || type == SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT
+                 || type == SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT
+                 || type == SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR
+#endif
+        ) family = "nintendo";
+    }
+#endif
+    return family;
+}
+
+void SdlGamepadKeyNavigation::noteController(SDL_GameController* controller)
+{
+    if (!controller) return;
+    const QString family = familyForControllerType(
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+        SDL_GameControllerGetType(controller)
+#else
+        0
+#endif
+    );
+    if (m_InputMethod != "controller" || m_ControllerFamily != family) {
+        m_InputMethod = "controller";
+        m_ControllerFamily = family;
+        emit navigationStateChanged();
+    }
+}
+
+bool SdlGamepadKeyNavigation::eventFilter(QObject* watched, QEvent* event)
+{
+    QString method = m_InputMethod;
+    if (!m_SendingKey && event->type() == QEvent::KeyPress) method = "keyboard";
+    else if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::Wheel) method = "mouse";
+    else if (event->type() == QEvent::TouchBegin) method = "touch";
+    if (method != m_InputMethod) {
+        m_InputMethod = method;
+        emit navigationStateChanged();
+    }
+    return QObject::eventFilter(watched, event);
 }

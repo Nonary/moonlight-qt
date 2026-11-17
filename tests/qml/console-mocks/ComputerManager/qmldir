@@ -1,0 +1,2 @@
+module ComputerManager
+singleton ComputerManager 1.0 ComputerManager.qml
