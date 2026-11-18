@@ -3,9 +3,6 @@
 This Windows desktop renderer sends already-decoded 5.1, 7.1 or native 7.1.4 PCM to six, eight or twelve static
 `ISpatialAudioObject`s through `ISpatialAudioClient`. It is opt-in for 5.1/7.1 and required when 7.1.4 is selected.
 Stereo/5.1/7.1 retain their existing SDL fallback. Native 7.1.4 uses the explicit twelve-channel Common extension.
-There are no host, driver, video, HDR, VRR or PyroWave changes.
-
-
 ## Native 7.1.4
 
 Select **7.1.4 surround sound**. Moonlight automatically selects the required
@@ -14,6 +11,10 @@ FL FR FC LFE BL BR SL SR TFL TFR TBL TBR in that order. Dynamic object count is
 zero. There is no upmix, scene estimator, synthetic height or Dolby codec.
 The host and Common must explicitly negotiate twelve channels. The wire layout
 identifier `0xF63F` is not the Windows speaker mask (`0x2D63F`).
+For capture on a compatible Vibeshine host, select the Vibe Speakers option in
+its regular Windows installer and then choose **Vibe Speakers** in Audio
+settings. [The host contribution](https://github.com/Nonary/vibeshine/pull/422)
+documents the optional device and its requirements.
 
 A compatible active default HDMI/DisplayPort endpoint must already have its
 Windows spatial provider enabled. The client does not install/activate a
@@ -24,9 +25,7 @@ Switch layouts at the next session boundary. The bounded queue has the same
 1440-frame capacity and 480-frame startup threshold as the original PR.
 
 Depends on [Common PR #4](https://github.com/Nonary/moonlight-common-c/pull/4).
-Applications must rebuild against its expanded mapping array. Existing PR #40
-history is retained. New upstream binaries need separate hardware acceptance;
-private RC1 listening results are historical evidence only.
+Applications must rebuild against its expanded mapping array.
 
 ## Enable and select an output
 
@@ -85,15 +84,16 @@ render events, so it is not a hard bound on startup delay.
 
 API failures and event timeouts reach the existing Session recovery path through
 `submitAudio(false)`. A non-null decoder buffer remains available after worker
-failure so Session can observe that result. Recovery retries spatial output and
-can fall back to SDL. After a successful SDL fallback, starting a new session is
-required to try spatial output again. Existing downtime-drop behavior is retained.
+failure so Session can observe that result. Recovery retries spatial output.
+For 5.1 and 7.1, it can fall back to SDL. After a successful SDL fallback,
+start a new session to try spatial output again. Native 7.1.4 requires the
+Spatial renderer throughout the session.
 The worker's wait is cancellable; an in-progress system COM/driver call cannot be
 forcibly cancelled safely, so initialization/cleanup has no hard wall-time bound.
 
 ## Diagnostics and validation limits
 
-`Spatial Audio active` confirms successful activation and an actual six- or eight-object
+`Spatial Audio active` confirms successful activation and an actual static-object
 update. Moonlight also opens the renderer during its audio preflight, which has
 zero submitted PCM frames. A streaming result must include nonzero submitted
 and consumed counters from the actual session.
