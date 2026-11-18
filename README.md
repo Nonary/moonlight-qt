@@ -26,6 +26,7 @@ You can follow development on our [Discord server](https://moonlight-stream.org/
 - [Snap (for Ubuntu-based Linux distros)](https://snapcraft.io/moonlight)
 - [Flatpak (for other Linux distros)](https://flathub.org/apps/details/com.moonlight_stream.Moonlight)
 - [AppImage](https://github.com/moonlight-stream/moonlight-qt/releases)
+- This fork's nightly AppImage and Flatpak are also built for aarch64 (64-bit Arm Linux), with the PyroWave decoder enabled
 - [Raspberry Pi 4 and 5](https://github.com/moonlight-stream/moonlight-docs/wiki/Installing-Moonlight-Qt-on-Raspberry-Pi-4)
 - [Generic ARM 32-bit and 64-bit Debian packages](https://github.com/moonlight-stream/moonlight-docs/wiki/Installing-Moonlight-Qt-on-ARM%E2%80%90based-Single-Board-Computers) (not for Raspberry Pi)
 - [Experimental RISC-V Debian packages](https://github.com/moonlight-stream/moonlight-docs/wiki/Installing-Moonlight-Qt-on-RISC%E2%80%90V-Single-Board-Computers)
@@ -70,6 +71,7 @@ Hosting for Moonlight's Debian and L4T package repositories is graciously provid
     * Qt 6 (Recommended): `qt6-qtsvg-devel qt6-qtdeclarative-devel`
     * Qt 5: `qt5-qtsvg-devel qt5-qtquickcontrols2-devel`
 * Building the Vulkan renderer requires a `libplacebo-dev`/`libplacebo-devel` version of at least v7.349.0 and FFmpeg 6.1 or later.
+* The PyroWave decoder builds on x86_64 and arm64 (AArch64) Linux when libplacebo is available; on other architectures, or with `CONFIG+=disable-pyrowave`, it is left out.
 
 ### Steam Link Build Requirements
 * [Steam Link SDK](https://github.com/ValveSoftware/steamlink-sdk) cloned on your build system

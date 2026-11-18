@@ -37,6 +37,7 @@ class NightlyNotesTests(unittest.TestCase):
         self.assertIn('flatpak install --user --reinstall ./Moonlight-6.2.0-daily.183-x86_64.flatpak', notes)
         self.assertIn('flatpak run --user com.moonlight_stream.Moonlight//master', notes)
         self.assertIn('chmod +x ./Moonlight-6.2.0-daily.183-x86_64.AppImage', notes)
+        self.assertIn('aarch64', notes)
         self.assertIn('--appimage-extract-and-run', notes)
 
     def test_package_metadata_lists_exact_source_and_hashes(self):
