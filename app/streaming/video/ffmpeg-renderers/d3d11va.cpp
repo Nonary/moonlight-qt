@@ -3392,11 +3392,46 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         // In particular, DXGI_STATUS_OCCLUDED is a successful HRESULT but
         // does not mean that the image reached a monitor.
         releasePreparedVrrFrame();
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                     "IDXGISwapChain::Present() returned non-display status on D3D11 VRR path: %x",
-                     hr);
+        // While the display is off this happens on every frame, so log the
+        // first one, a running count once a minute, and the recovery.
+        const uint64_t nowUs = LiGetMicroseconds();
+        if (hr != m_VrrNonDisplayStatus) {
+            if (m_VrrNonDisplayStatus != S_OK) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "IDXGISwapChain::Present() returned %x for %llu frames over %.1f s on D3D11 VRR path",
+                            m_VrrNonDisplayStatus,
+                            (unsigned long long)m_VrrNonDisplayFrames,
+                            (nowUs - m_VrrNonDisplaySinceUs) / 1000000.0);
+            }
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                         "IDXGISwapChain::Present() returned non-display status on D3D11 VRR path: %x (repeats are summarized)",
+                         hr);
+            m_VrrNonDisplayStatus = hr;
+            m_VrrNonDisplayFrames = 0;
+            m_VrrNonDisplaySinceUs = nowUs;
+            m_VrrNonDisplayLastLogUs = nowUs;
+        }
+        m_VrrNonDisplayFrames++;
+        if (nowUs - m_VrrNonDisplayLastLogUs >= 60000000) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "IDXGISwapChain::Present() still returning %x on D3D11 VRR path: %llu frames over %.0f s",
+                        hr,
+                        (unsigned long long)m_VrrNonDisplayFrames,
+                        (nowUs - m_VrrNonDisplaySinceUs) / 1000000.0);
+            m_VrrNonDisplayLastLogUs = nowUs;
+        }
         feedback.cancelled = true;
         return feedback;
+    }
+
+    if (m_VrrNonDisplayStatus != S_OK) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "IDXGISwapChain::Present() is displaying again on D3D11 VRR path after %llu frames with status %x over %.1f s",
+                    (unsigned long long)m_VrrNonDisplayFrames,
+                    m_VrrNonDisplayStatus,
+                    (LiGetMicroseconds() - m_VrrNonDisplaySinceUs) / 1000000.0);
+        m_VrrNonDisplayStatus = S_OK;
+        m_VrrNonDisplayFrames = 0;
     }
 
     feedback.presented = true;
