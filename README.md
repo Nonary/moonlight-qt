@@ -70,6 +70,7 @@ Hosting for Moonlight's Debian and L4T package repositories is graciously provid
     * Qt 6 (Recommended): `qt6-qtsvg-devel qt6-qtdeclarative-devel`
     * Qt 5: `qt5-qtsvg-devel qt5-qtquickcontrols2-devel`
 * Building the Vulkan renderer requires a `libplacebo-dev`/`libplacebo-devel` version of at least v7.349.0 and FFmpeg 6.1 or later.
+* The PyroWave decoder builds on Windows x64 and ARM64, on x86_64 Linux when libplacebo is available, and on macOS; on other architectures, or with `CONFIG+=disable-pyrowave`, it is left out.
 
 ### Steam Link Build Requirements
 * [Steam Link SDK](https://github.com/ValveSoftware/steamlink-sdk) cloned on your build system
