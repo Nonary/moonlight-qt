@@ -4,6 +4,7 @@
 #include "settings/mappingmanager.h"
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
+#include <QQmlComponent>
 #include <QQmlContext>
 #include <QQmlIncubator>
 #include <QQuickWindow>
@@ -169,6 +170,41 @@ private slots:
         prefs->uiControllerFullscreen = false;
         window.keys.clear();
         window.onPress = {};
+    }
+    void consoleBackdropLoadsWithOptionalBlur() {
+        QQmlEngine engine;
+        QQmlComponent component(&engine, QUrl(QStringLiteral("qrc:/gui/ConsoleBackdrop.qml")));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QQuickWindow backdropWindow;
+        std::unique_ptr<QObject> object(component.create());
+        auto* backdrop = qobject_cast<QQuickItem*>(object.get());
+        QVERIFY2(backdrop != nullptr, qPrintable(component.errorString()));
+        backdropWindow.resize(64, 64);
+        backdrop->setSize(QSizeF(64, 64));
+        backdrop->setParentItem(backdropWindow.contentItem());
+        backdropWindow.show();
+        auto* loader = backdrop->findChild<QObject*>(QStringLiteral("consoleBackdropBlur"));
+        QVERIFY(loader);
+        const auto blur = [loader] { return loader->property("item").value<QObject*>(); };
+        QVERIFY(!blur());
+
+        const QUrl artwork(QStringLiteral("qrc:/res/moonlight.svg"));
+        QVERIFY(backdrop->setProperty("artwork", artwork));
+        QTRY_COMPARE(backdrop->property("settledArtwork").toUrl(), artwork);
+
+        const bool sceneGraphHasEffects = backdropWindow.rendererInterface()->graphicsApi() != QSGRendererInterface::Software;
+        QTRY_COMPARE(backdrop->property("effectsAvailable").toBool(), sceneGraphHasEffects);
+        const bool canBlur = QT_VERSION >= QT_VERSION_CHECK(6, 5, 0) && sceneGraphHasEffects;
+        if (canBlur) {
+            QTRY_VERIFY(blur());
+            QCOMPARE(blur()->property("artwork").toUrl(), artwork);
+        } else {
+            QVERIFY(!blur());
+        }
+
+        QVERIFY(backdrop->setProperty("artwork", QUrl()));
+        QTRY_VERIFY(backdrop->property("settledArtwork").toUrl().isEmpty());
+        QVERIFY(!blur());
     }
     void controllerFamiliesAndPrompts() {
 #if SDL_VERSION_ATLEAST(2, 0, 14)

@@ -12,6 +12,7 @@
         <file>gui/ConsoleSlider.qml</file>
         <file>gui/ConsoleButton.qml</file>
         <file>gui/ConsoleBackdrop.qml</file>
+        <file>gui/effects/ConsoleBackdropBlur.qml</file>
         <file>gui/ConsoleKeyboard.qml</file>
         <file>gui/ConsoleKeyboardService.js</file>
         <file>gui/ConsoleTextField.qml</file>
