@@ -7,6 +7,7 @@
 #include <QQmlComponent>
 #include <QQmlContext>
 #include <QQmlIncubator>
+#include <QPointer>
 #include <QQuickWindow>
 #include <QQuickItem>
 #include <QDir>
@@ -1240,7 +1241,15 @@ private slots:
         prefs->swapFaceButtons=true;
         press(SDL_CONTROLLER_BUTTON_B); QVERIFY(!rail->hasActiveFocus());
         press(SDL_CONTROLLER_BUTTON_A); QVERIFY(rail->hasActiveFocus());
-        press(SDL_CONTROLLER_BUTTON_A); QTRY_VERIFY(!rail->isVisible());
+        // StackView owns the Settings page and can destroy it during Back.
+        const QPointer<QQuickItem> settingsRail(rail);
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(!settingsRail || !settingsRail->isVisible());
+        const auto hostsVisible = [root] {
+            auto* hosts = root->findChild<QQuickItem*>("Computers");
+            return hosts && hosts->isVisible();
+        };
+        QTRY_VERIFY(hostsVisible());
         prefs->swapFaceButtons=false;
         prefs->uiDisplayMode=savedUiMode;
         navigation->notifyWindowFocus(false);
