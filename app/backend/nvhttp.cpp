@@ -635,6 +635,34 @@ void NvHTTP::requestHostSleep()
 }
 
 QString
+NvHTTP::getClipboardText(int timeoutMs)
+{
+    // NVLL_ERROR keeps routine syncs out of the verbose request log
+    return openConnectionToString(m_BaseUrlHttps,
+                                  "actions/clipboard",
+                                  "type=text",
+                                  timeoutMs,
+                                  NvLogLevel::NVLL_ERROR);
+}
+
+void
+NvHTTP::setClipboardText(const QByteArray& utf8Text, int timeoutMs)
+{
+    QNetworkReply* reply = openConnection(m_BaseUrlHttps,
+                                          "actions/clipboard",
+                                          "type=text",
+                                          timeoutMs,
+                                          NvLogLevel::NVLL_ERROR,
+                                          {},
+                                          false,
+                                          QNetworkAccessManager::PostOperation,
+                                          QSslCertificate(),
+                                          utf8Text,
+                                          "text/plain; charset=utf-8");
+    delete reply;
+}
+
+QString
 NvHTTP::openConnectionToString(QUrl baseUrl,
                                QString command,
                                QString arguments,
@@ -667,7 +695,9 @@ NvHTTP::openConnection(QUrl baseUrl,
                        const std::function<QString(QNetworkReply*)>& receiveHeaders,
                        bool powerAction,
                        QNetworkAccessManager::Operation operation,
-                       QSslCertificate pairedServerCert)
+                       QSslCertificate pairedServerCert,
+                       const QByteArray& postBody,
+                       const QByteArray& postContentType)
 {
     // Port must be set
     Q_ASSERT(baseUrl.port(0) != 0);
@@ -691,6 +721,9 @@ NvHTTP::openConnection(QUrl baseUrl,
         request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
         if (operation == QNetworkAccessManager::PostOperation)
             request.setHeader(QNetworkRequest::ContentTypeHeader, "application/x-www-form-urlencoded");
+    }
+    else if (operation == QNetworkAccessManager::PostOperation && !postContentType.isEmpty()) {
+        request.setHeader(QNetworkRequest::ContentTypeHeader, postContentType);
     }
 
     // Add our client certificate
@@ -749,7 +782,7 @@ NvHTTP::openConnection(QUrl baseUrl,
         sslErrorsConnection = connect(network, &QNetworkAccessManager::sslErrors, this, &NvHTTP::handleSslErrors);
     }
     QNetworkReply* reply = operation == QNetworkAccessManager::PostOperation
-        ? network->post(request, QByteArray()) : network->get(request);
+        ? network->post(request, postBody) : network->get(request);
     if (powerAction) connect(reply, &QObject::destroyed, network, &QObject::deleteLater);
 
     // Run the request with a timeout if requested

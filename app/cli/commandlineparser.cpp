@@ -371,6 +371,9 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     parser.addToggleOption("audio-on-host", "audio on host PC");
     parser.addToggleOption("frame-pacing", "frame pacing");
     parser.addToggleOption("mute-on-focus-loss", "mute audio when Moonlight window loses focus");
+    parser.addToggleOption("clipboard-sync-to-host", "send local clipboard text to the host (requires host support)");
+    parser.addToggleOption("clipboard-sync-from-host", "copy host clipboard text locally when leaving the stream (requires host support)");
+    parser.addValueOption("clipboard-sync-max-size", "largest clipboard text to sync, in MB (1-100)");
     parser.addToggleOption("background-gamepad", "background gamepad input");
     parser.addToggleOption("reverse-scroll-direction", "inverted scroll direction");
     parser.addToggleOption("swap-gamepad-buttons", "swap A/B and X/Y gamepad buttons (Nintendo-style)");
@@ -497,6 +500,16 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
 
     // Resolve --mute-on-focus-loss and --no-mute-on-focus-loss options
     preferences->muteOnFocusLoss = parser.getToggleOptionValue("mute-on-focus-loss", preferences->muteOnFocusLoss);
+
+    // Resolve --clipboard-sync-to-host and --clipboard-sync-from-host options
+    preferences->clipboardSyncToHost = parser.getToggleOptionValue("clipboard-sync-to-host", preferences->clipboardSyncToHost);
+    preferences->clipboardSyncFromHost = parser.getToggleOptionValue("clipboard-sync-from-host", preferences->clipboardSyncFromHost);
+    if (parser.isSet("clipboard-sync-max-size")) {
+        preferences->clipboardSyncMaxSizeMB = parser.getIntOption("clipboard-sync-max-size");
+        if (preferences->clipboardSyncMaxSizeMB < 1 || preferences->clipboardSyncMaxSizeMB > 100) {
+            parser.showError("Clipboard sync max size must be between 1 and 100 MB");
+        }
+    }
 
     // Resolve --background-gamepad and --no-background-gamepad options
     preferences->backgroundGamepad = parser.getToggleOptionValue("background-gamepad", preferences->backgroundGamepad);

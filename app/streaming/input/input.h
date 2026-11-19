@@ -161,6 +161,8 @@ private:
         KeyComboQuitAndExit,
         KeyComboToggleKeyboardGrab,
         KeyComboToggleTimingGraph,
+        KeyComboSendClipboard,
+        KeyComboReceiveClipboard,
         KeyComboMax
     };
 
