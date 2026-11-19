@@ -16,6 +16,7 @@
 
 #include <Limelight.h>
 #include "SDL_compat.h"
+#include "decoderprobecache.h"
 #include "utils.h"
 
 #ifdef HAVE_FFMPEG
@@ -437,6 +438,24 @@ void Session::getDecoderInfo(SDL_Window* window,
                              bool& isHardwareAccelerated, bool& isFullScreenOnly,
                              bool& isHdrSupported, QSize& maxResolution)
 {
+    DecoderProbeCache::DecoderInfo cached;
+    if (DecoderProbeCache::lookupDecoderInfo(cached)) {
+        isHardwareAccelerated = cached.hardwareAccelerated;
+        isFullScreenOnly = cached.fullScreenOnly;
+        isHdrSupported = cached.hdrSupported;
+        maxResolution = cached.maxResolution;
+        return;
+    }
+
+    if (getDecoderInfoUncached(window, isHardwareAccelerated, isFullScreenOnly, isHdrSupported, maxResolution)) {
+        DecoderProbeCache::storeDecoderInfo({ isHardwareAccelerated, isFullScreenOnly, isHdrSupported, maxResolution });
+    }
+}
+
+bool Session::getDecoderInfoUncached(SDL_Window* window,
+                                     bool& isHardwareAccelerated, bool& isFullScreenOnly,
+                                     bool& isHdrSupported, QSize& maxResolution)
+{
     IVideoDecoder* decoder;
 
     // Since AV1 support on the host side is in its infancy, let's not consider
@@ -454,7 +473,7 @@ void Session::getDecoderInfo(SDL_Window* window,
         maxResolution = decoder->getDecoderMaxResolution();
         delete decoder;
 
-        return;
+        return true;
     }
 
     // Try an AV1 Main10 decoder next to see if we have HDR support
@@ -499,7 +518,7 @@ void Session::getDecoderInfo(SDL_Window* window,
         maxResolution = decoder->getDecoderMaxResolution();
         delete decoder;
 
-        return;
+        return true;
     }
 
 
@@ -513,7 +532,7 @@ void Session::getDecoderInfo(SDL_Window* window,
         maxResolution = decoder->getDecoderMaxResolution();
         delete decoder;
 
-        return;
+        return true;
     }
 #endif
 
@@ -528,17 +547,36 @@ void Session::getDecoderInfo(SDL_Window* window,
         maxResolution = decoder->getDecoderMaxResolution();
         delete decoder;
 
-        return;
+        return true;
     }
 
     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                  "Failed to find ANY working H.264 or HEVC decoder!");
+    return false;
 }
 
 Session::DecoderAvailability
 Session::getDecoderAvailability(SDL_Window* window,
                                 StreamingPreferences::VideoDecoderSelection vds,
                                 int videoFormat, int width, int height, int frameRate)
+{
+    int cached;
+    if (DecoderProbeCache::lookupAvailability(vds, videoFormat, width, height, frameRate, cached)) {
+        return (DecoderAvailability)cached;
+    }
+
+    DecoderAvailability availability = getDecoderAvailabilityUncached(window, vds, videoFormat, width, height, frameRate);
+    if (availability != DecoderAvailability::None) {
+        // Failures are not cached: they may be transient (e.g. a GPU reset) and are cheap to re-probe
+        DecoderProbeCache::storeAvailability(vds, videoFormat, width, height, frameRate, (int)availability);
+    }
+    return availability;
+}
+
+Session::DecoderAvailability
+Session::getDecoderAvailabilityUncached(SDL_Window* window,
+                                        StreamingPreferences::VideoDecoderSelection vds,
+                                        int videoFormat, int width, int height, int frameRate)
 {
     IVideoDecoder* decoder;
 
@@ -558,29 +596,58 @@ Session::getDecoderAvailability(SDL_Window* window,
 
 bool Session::populateDecoderProperties(SDL_Window* window)
 {
-    IVideoDecoder* decoder;
+    // The answers only depend on which decoder/renderer chooseDecoder() picks for these
+    // parameters, so remember them and skip the probe (a full GPU device + decoder
+    // instantiation and test decode) on later launches with the same settings.
+    DecoderProbeCache::StreamProperties props;
+    if (!DecoderProbeCache::lookupStreamProperties(m_PresentationSettings.decoderSelection,
+                                                   m_PresentationSettings.rendererSelection,
+                                                   m_SupportedVideoFormats.first(),
+                                                   m_StreamConfig.width,
+                                                   m_StreamConfig.height,
+                                                   m_StreamConfig.fps,
+                                                   m_PresentationSettings.enableVrr,
+                                                   props)) {
+        IVideoDecoder* decoder;
 
-    // NB: We pass the real renderer selection rather than RS_PROBE_ONLY
-    // here because this is operating on the real streaming window, and
-    // instantiating Metal or AVSBDL renderers can interfere with MoltenVK's
-    // attempt to change the window's colorspace, causing washed out colors.
-    // Match playback's Linux Vulkan preference so the host color-range request
-    // is valid for the renderer that will actually present. Do not pass
-    // enableVrr here: test-only probing must not start VRR presentation.
-    if (!chooseDecoder(m_PresentationSettings.decoderSelection,
-                       m_PresentationSettings.rendererSelection,
-                       window,
-                       m_SupportedVideoFormats.first(),
-                       m_StreamConfig.width,
-                       m_StreamConfig.height,
-                       m_StreamConfig.fps,
-                       false, false, true, decoder,
-                       false,
-                       m_PresentationSettings.enableVrr)) {
-        return false;
+        // NB: We pass the real renderer selection rather than RS_PROBE_ONLY
+        // here because this is operating on the real streaming window, and
+        // instantiating Metal or AVSBDL renderers can interfere with MoltenVK's
+        // attempt to change the window's colorspace, causing washed out colors.
+        // Match playback's Linux Vulkan preference so the host color-range request
+        // is valid for the renderer that will actually present. Do not pass
+        // enableVrr here: test-only probing must not start VRR presentation.
+        if (!chooseDecoder(m_PresentationSettings.decoderSelection,
+                           m_PresentationSettings.rendererSelection,
+                           window,
+                           m_SupportedVideoFormats.first(),
+                           m_StreamConfig.width,
+                           m_StreamConfig.height,
+                           m_StreamConfig.fps,
+                           false, false, true, decoder,
+                           false,
+                           m_PresentationSettings.enableVrr)) {
+            return false;
+        }
+
+        props.capabilities = decoder->getDecoderCapabilities();
+        props.colorSpace = decoder->getDecoderColorspace();
+        props.colorRange = decoder->getDecoderColorRange();
+        props.alwaysFullScreen = decoder->isAlwaysFullScreen();
+
+        delete decoder;
+
+        DecoderProbeCache::storeStreamProperties(m_PresentationSettings.decoderSelection,
+                                                 m_PresentationSettings.rendererSelection,
+                                                 m_SupportedVideoFormats.first(),
+                                                 m_StreamConfig.width,
+                                                 m_StreamConfig.height,
+                                                 m_StreamConfig.fps,
+                                                 m_PresentationSettings.enableVrr,
+                                                 props);
     }
 
-    m_VideoCallbacks.capabilities = decoder->getDecoderCapabilities();
+    m_VideoCallbacks.capabilities = props.capabilities;
     if (m_VideoCallbacks.capabilities & CAPABILITY_PULL_RENDERER) {
         // It is an error to pass a push callback when in pull mode
         m_VideoCallbacks.submitDecodeUnit = nullptr;
@@ -595,7 +662,7 @@ bool Session::populateDecoderProperties(SDL_Window* window)
                     m_StreamConfig.colorSpace);
     }
     else {
-        m_StreamConfig.colorSpace = decoder->getDecoderColorspace();
+        m_StreamConfig.colorSpace = props.colorSpace;
     }
 
     if (Utils::getEnvironmentVariableOverride("COLOR_RANGE_OVERRIDE", &m_StreamConfig.colorRange)) {
@@ -604,7 +671,7 @@ bool Session::populateDecoderProperties(SDL_Window* window)
                     m_StreamConfig.colorRange);
     }
     else {
-        m_StreamConfig.colorRange = decoder->getDecoderColorRange();
+        m_StreamConfig.colorRange = props.colorRange;
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -612,11 +679,9 @@ bool Session::populateDecoderProperties(SDL_Window* window)
                 m_StreamConfig.colorRange == COLOR_RANGE_FULL ? "full" : "limited",
                 m_PresentationSettings.enableVrr ? "active" : "inactive");
 
-    if (decoder->isAlwaysFullScreen()) {
+    if (props.alwaysFullScreen) {
         m_IsFullScreen = true;
     }
-
-    delete decoder;
 
     return true;
 }

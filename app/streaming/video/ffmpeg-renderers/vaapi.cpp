@@ -7,6 +7,7 @@
 
 #include "vaapi.h"
 #include "utils.h"
+#include "streaming/decoderprobecache.h"
 #include <streaming/streamutils.h>
 
 #ifdef HAVE_LIBVA_DRM
@@ -17,6 +18,14 @@
 
 #include <unistd.h>
 #include <fcntl.h>
+
+// Set once the NVIDIA VAAPI driver has been deprioritized in this process, and
+// remembered across runs by the probe cache (keyed on GPU/driver/video backend).
+// Opening the VA display and calling vaInitialize() on that driver costs 0.5-0.8 s
+// on every attempt only to reach the same verdict, which otherwise lands squarely
+// in the stream-start decoder creation window.
+static bool s_Pass0DeprioritizedForNvidia = false;
+#define VAAPI_NVIDIA_DEPRIORITIZED_FLAG "vaapi_nvidia_deprioritized"
 
 VAAPIRenderer::VAAPIRenderer(int decoderSelectionPass)
     : IFFmpegRenderer(RendererType::VAAPI),
@@ -249,6 +258,14 @@ VAAPIRenderer::initialize(PDECODER_PARAMETERS params)
     m_Window = params->window;
     m_VideoFormat = params->videoFormat;
 
+    if (m_DecoderSelectionPass == 0 && qgetenv("FORCE_VAAPI") != "1" &&
+            (s_Pass0DeprioritizedForNvidia || DecoderProbeCache::lookupFlag(VAAPI_NVIDIA_DEPRIORITIZED_FLAG))) {
+        s_Pass0DeprioritizedForNvidia = true;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Skipping VAAPI on pass 0: NVIDIA driver is deprioritized on this GPU");
+        return false;
+    }
+
     m_HwContext = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VAAPI);
     if (!m_HwContext) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -451,6 +468,8 @@ VAAPIRenderer::initialize(PDECODER_PARAMETERS params)
             vendorStr.contains("VA-API NVDEC", Qt::CaseInsensitive)) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "Deprioritizing VAAPI for NVIDIA driver. Set FORCE_VAAPI=1 to override.");
+            s_Pass0DeprioritizedForNvidia = true;
+            DecoderProbeCache::storeFlag(VAAPI_NVIDIA_DEPRIORITIZED_FLAG, true);
             return false;
         }
     }

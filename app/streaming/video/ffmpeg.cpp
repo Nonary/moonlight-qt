@@ -1,4 +1,5 @@
 #include <Limelight.h>
+#include <chrono>
 #include "ffmpeg.h"
 #include "performancestats.h"
 #include "videothreadpriority.h"
@@ -287,6 +288,8 @@ enum AVPixelFormat FFmpegVideoDecoder::ffGetFormat(AVCodecContext* context,
     return AV_PIX_FMT_NONE;
 }
 
+std::set<IFFmpegRenderer::RendererType> FFmpegVideoDecoder::s_FailedRenderers;
+
 FFmpegVideoDecoder::FFmpegVideoDecoder(bool testOnly)
     : m_Pkt(av_packet_alloc()),
       m_VideoDecoderCtx(nullptr),
@@ -451,7 +454,7 @@ void FFmpegVideoDecoder::reset()
 bool FFmpegVideoDecoder::initializeRendererInternal(IFFmpegRenderer* renderer, PDECODER_PARAMETERS params)
 {
     if (renderer->getRendererType() != IFFmpegRenderer::RendererType::Unknown &&
-            m_FailedRenderers.find(renderer->getRendererType()) != m_FailedRenderers.end()) {
+            s_FailedRenderers.find(renderer->getRendererType()) != s_FailedRenderers.end()) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Skipping '%s' due to prior failure",
                     renderer->getRendererName());
@@ -460,10 +463,10 @@ bool FFmpegVideoDecoder::initializeRendererInternal(IFFmpegRenderer* renderer, P
 
     if (!renderer->initialize(params)) {
         if (renderer->getInitFailureReason() == IFFmpegRenderer::InitFailureReason::NoSoftwareSupport) {
-            m_FailedRenderers.insert(renderer->getRendererType());
+            s_FailedRenderers.insert(renderer->getRendererType());
 
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "'%s' failed to initialize. It will not be tried again.",
+                        "'%s' failed to initialize. It will not be tried again this session.",
                         renderer->getRendererName());
         }
 
@@ -1987,6 +1990,12 @@ bool FFmpegVideoDecoder::tryInitializeRenderer(const AVCodec* decoder,
             break;
         }
 
+        const char* attemptName = m_BackendRenderer->getRendererName();
+        const auto attemptStart = std::chrono::steady_clock::now();
+        auto attemptMs = [&attemptStart]() -> long long {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - attemptStart).count();
+        };
+
         // Initialize the backend renderer for testing
         if (initializeRendererInternal(m_BackendRenderer, &testFrameDecoderParams)) {
             if (completeInitialization(decoder, requiredFormat, &testFrameDecoderParams,
@@ -1995,6 +2004,9 @@ bool FFmpegVideoDecoder::tryInitializeRenderer(const AVCodec* decoder,
                 if (m_TestOnly) {
                     // This decoder is only for testing capabilities, so don't bother
                     // creating a usable renderer
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "Renderer '%s' passed the test-only probe in %lld ms",
+                                attemptName, attemptMs());
                     return true;
                 }
 
@@ -2013,6 +2025,9 @@ bool FFmpegVideoDecoder::tryInitializeRenderer(const AVCodec* decoder,
 
                     if (initializeRendererInternal(m_BackendRenderer, params) &&
                         completeInitialization(decoder, requiredFormat, params, TestMode::NoTesting, i == 0 /* EGL/DRM */)) {
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                    "Renderer '%s' initialized in %lld ms (separate test decoder)",
+                                    attemptName, attemptMs());
                         return true;
                     }
                     else {
@@ -2022,6 +2037,9 @@ bool FFmpegVideoDecoder::tryInitializeRenderer(const AVCodec* decoder,
                 }
                 else {
                     // The test decoder can be used for real decoding
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "Renderer '%s' initialized in %lld ms",
+                                attemptName, attemptMs());
                     return true;
                 }
             }
@@ -2037,6 +2055,10 @@ bool FFmpegVideoDecoder::tryInitializeRenderer(const AVCodec* decoder,
         if (failureReason != nullptr) {
             *failureReason = backendFailureReason;
         }
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Renderer '%s' rejected after %lld ms",
+                    attemptName, attemptMs());
 
         reset();
     }

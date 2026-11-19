@@ -16,7 +16,11 @@
 
 #include <atomic>
 #include <deque>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 #include <QMutex>
 #include <QWaitCondition>
 
@@ -139,6 +143,11 @@ private:
                             pl_tex* textures = nullptr);
     void unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
     bool populateQueues(int videoFormat);
+    bool createLeanDevice(VkPhysicalDevice device, VkPhysicalDeviceProperties* deviceProps,
+                          const std::vector<const char*>& optionalExtensions,
+                          const VkPhysicalDeviceFeatures2* extraFeatures);
+    static void leanLockQueue(void* ctx, uint32_t qf, uint32_t qidx);
+    static void leanUnlockQueue(void* ctx, uint32_t qf, uint32_t qidx);
     bool chooseVulkanDevice(PDECODER_PARAMETERS params, bool hdrOutputRequired);
     bool tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDeviceProperties* deviceProps,
                              PDECODER_PARAMETERS decoderParams, bool hdrOutputRequired);
@@ -174,6 +183,33 @@ private:
     VkPresentModeKHR m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     VkPresentModeKHR m_VrrAdaptivePresentMode = VK_PRESENT_MODE_FIFO_KHR;
     pl_vulkan m_Vulkan = nullptr;
+
+    // "Lean" device state: when we create the VkDevice ourselves (one queue per
+    // family) and hand it to libplacebo via pl_vulkan_import(). libplacebo's own
+    // pl_vulkan_create() enables every queue of every family, which costs ~130 ms
+    // per queue on some drivers (NVIDIA: 20+ queues -> ~2 s per renderer).
+    struct LeanQueueFamily {
+        uint32_t index;
+        VkQueueFlags flags;
+        VkVideoCodecOperationFlagsKHR videoCaps;
+    };
+    VkDevice m_OwnDevice = VK_NULL_HANDLE;
+    std::vector<LeanQueueFamily> m_OwnQueueFamilies;
+    std::vector<std::string> m_OwnExtensionStorage;
+    std::vector<const char*> m_OwnExtensions;
+    VkPhysicalDeviceFeatures2 m_OwnFeatures = {};
+    VkPhysicalDeviceVulkan11Features m_OwnFeatures11 = {};
+    VkPhysicalDeviceVulkan12Features m_OwnFeatures12 = {};
+    VkPhysicalDeviceVulkan13Features m_OwnFeatures13 = {};
+#ifdef VK_VERSION_1_4
+    VkPhysicalDeviceVulkan14Features m_OwnFeatures14 = {};
+#endif
+#ifdef VK_EXT_swapchain_maintenance1
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT m_OwnSwapchainMaint1 = {};
+#endif
+    std::map<uint64_t, std::unique_ptr<std::mutex>> m_OwnQueueLocks;
+    PFN_vkDestroyDevice fn_vkDestroyDevice = nullptr;
+
     pl_swapchain m_Swapchain = nullptr;
     pl_renderer m_Renderer = nullptr;
     pl_tex m_Textures[PL_MAX_PLANES] = {};
@@ -322,4 +358,6 @@ private:
     PFN_vkGetPhysicalDeviceProperties fn_vkGetPhysicalDeviceProperties = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR fn_vkGetPhysicalDeviceSurfaceSupportKHR = nullptr;
     PFN_vkEnumerateDeviceExtensionProperties fn_vkEnumerateDeviceExtensionProperties = nullptr;
+    PFN_vkGetPhysicalDeviceFeatures2 fn_vkGetPhysicalDeviceFeatures2 = nullptr;
+    PFN_vkCreateDevice fn_vkCreateDevice = nullptr;
 };
