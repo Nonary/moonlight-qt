@@ -877,24 +877,24 @@ private slots:
         if (!capture.isEmpty()) QVERIFY(root->grabWindow().save(capture+"/pcs.png"));
         QTest::keyClick(root,Qt::Key_Return);
         QTRY_VERIFY(root->findChild<QQuickItem*>("gameShelf"));
-        auto* shelf=root->findChild<QQuickItem*>("gameShelf");
-        QTRY_VERIFY(shelf->isVisible());
+        const QPointer<QQuickItem> shelf(root->findChild<QQuickItem*>("gameShelf"));
+        QTRY_VERIFY(shelf && shelf->isVisible());
         QKeyEvent settingsPress(QEvent::KeyPress,Qt::Key_Hangup,Qt::NoModifier);
         QCoreApplication::sendEvent(root,&settingsPress);
         QKeyEvent settingsRelease(QEvent::KeyRelease,Qt::Key_Hangup,Qt::NoModifier);
         QCoreApplication::sendEvent(root,&settingsRelease);
-        auto* categories=root->findChild<QQuickItem*>("settingsCategories");
+        const QPointer<QQuickItem> categories(root->findChild<QQuickItem*>("settingsCategories"));
         QTRY_VERIFY(categories && categories->isVisible());
         QTest::qWait(60);
         if (!capture.isEmpty()) QVERIFY(root->grabWindow().save(capture+"/settings-main.png"));
         QTest::keyClick(root,Qt::Key_Escape);
-        QTRY_VERIFY(shelf->isVisible());
+        QTRY_VERIFY(shelf && shelf->isVisible());
         QTest::keyClick(root,Qt::Key_Menu);
         auto* play=root->findChild<QQuickItem*>("gamePlayButton");
         QTRY_VERIFY(play && play->hasActiveFocus());
         QTest::keyClick(root,Qt::Key_Menu);
-        QTRY_VERIFY(shelf->hasActiveFocus());
-        QVERIFY(!categories->isVisible());
+        QTRY_VERIFY(shelf && shelf->hasActiveFocus());
+        QTRY_VERIFY(!categories || !categories->isVisible());
         QTest::keyClick(root,Qt::Key_Menu);
         QTRY_VERIFY(play->hasActiveFocus());
         for (int i=0;i<10;++i) QTest::keyClick(root,Qt::Key_Down);
@@ -902,7 +902,7 @@ private slots:
         QVERIFY(lastAction != play);
         QTest::keyClick(root,Qt::Key_Down); QCOMPARE(root->activeFocusItem(),lastAction);
         QTest::keyClick(root,Qt::Key_Escape);
-        QTRY_VERIFY(shelf->hasActiveFocus());
+        QTRY_VERIFY(shelf && shelf->hasActiveFocus());
         QTest::keyClick(root,Qt::Key_Menu);
         for (const QSize size : {QSize(800,500),QSize(1280,720),QSize(1920,1080),QSize(3840,2160)}) {
             root->resize(size);
@@ -1338,7 +1338,9 @@ private slots:
         navigation->notifyWindowFocus(true);
         QVERIFY(QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired"));
         const auto press=[&](Uint8 code) { button(SDL_CONTROLLERBUTTONDOWN,code); button(SDL_CONTROLLERBUTTONUP,code); };
-        auto* add=root->findChild<QQuickItem*>("addPcTile"); QVERIFY(add); add->forceActiveFocus();
+        const QPointer<QQuickItem> add(root->findChild<QQuickItem*>("addPcTile"));
+        QVERIFY(add);
+        add->forceActiveFocus();
         press(SDL_CONTROLLER_BUTTON_DPAD_LEFT); press(SDL_CONTROLLER_BUTTON_A);
         auto* shelf=root->findChild<QQuickItem*>("gameShelf"); QTRY_VERIFY(shelf && shelf->isVisible());
         auto* page=shelf->parentItem(); while(page && !page->property("appModel").isValid()) page=page->parentItem(); QVERIFY(page);
@@ -1346,8 +1348,8 @@ private slots:
         model->setProperty("appListLoading",true);
         for(int id : QList<int>(model->ids)) model->removeApp(id);
         QTRY_VERIFY(!page->property("hasGames").toBool());
-        auto* choose=root->findChild<QQuickItem*>("emptyLibraryChoosePc"); QVERIFY(choose);
-        QTRY_VERIFY(choose->hasActiveFocus());
+        const QPointer<QQuickItem> choose(root->findChild<QQuickItem*>("emptyLibraryChoosePc"));
+        QTRY_VERIFY(choose && choose->hasActiveFocus());
         QCOMPARE(page->property("primaryVerb").toString(),QString("Choose PC"));
         auto* emptySleep = root->findChild<QQuickItem*>("emptyHostSleepAction"); QVERIFY(emptySleep);
         // Expose the optional host capability without performing a power action.
@@ -1360,6 +1362,7 @@ private slots:
         QTest::keyClick(root, Qt::Key_Escape);
         QTRY_VERIFY(!sleepConfirmation->property("visible").toBool());
         emptySleep->setProperty("visible", false);
+        QVERIFY(choose);
         choose->forceActiveFocus();
         auto* title=root->findChild<QObject*>("emptyLibraryTitle"); QVERIFY(title);
         QTRY_COMPARE(title->property("text").toString(),QString::fromUtf8("Loading games…"));
@@ -1377,9 +1380,10 @@ private slots:
         press(SDL_CONTROLLER_BUTTON_X); QTRY_VERIFY(page->property("detailsExpanded").toBool());
         press(SDL_CONTROLLER_BUTTON_X); QTRY_VERIFY(!page->property("detailsExpanded").toBool());
         QTRY_VERIFY(shelf->hasActiveFocus());
-        model->removeApp(2); QTRY_VERIFY(choose->hasActiveFocus());
-        press(SDL_CONTROLLER_BUTTON_A); QTRY_VERIFY(!choose->isVisible());
-        QVERIFY(root->findChild<QQuickItem*>("addPcTile")->isVisible());
+        model->removeApp(2); QTRY_VERIFY(choose && choose->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(!choose || !choose->isVisible());
+        QTRY_VERIFY(add && add->isVisible());
         navigation->notifyWindowFocus(false);
     }
     void desktopLaunchWithoutControllerAndControllerHotplug() {
