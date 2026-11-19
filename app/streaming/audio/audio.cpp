@@ -173,10 +173,13 @@ int Session::arInit(int audioConfiguration,
                     const POPUS_MULTISTREAM_CONFIGURATION opusConfig,
                     void* /* arContext */, int /* arFlags */)
 {
-    if (!opusConfig || (CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(audioConfiguration) == 12 && opusConfig->channelCount != 12))
+    const bool requiresSpatial = CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(audioConfiguration) == 12;
+    if (!opusConfig || (requiresSpatial && opusConfig->channelCount != 12))
         return ML_ERROR_UNSUPPORTED_AUDIO_CONFIGURATION;
     SDL_memcpy(&s_ActiveSession->m_OriginalAudioConfig, opusConfig, sizeof(*opusConfig));
-    if (!s_ActiveSession->initializeAudioRenderer()) return -1;
+    // Existing layouts can retry renderer initialization when audio packets arrive.
+    if (!s_ActiveSession->initializeAudioRenderer() && requiresSpatial)
+        return ML_ERROR_UNSUPPORTED_AUDIO_CONFIGURATION;
     return 0;
 }
 
