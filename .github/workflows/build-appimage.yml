@@ -271,6 +271,8 @@ jobs:
           "$image" --appimage-extract > extract.log
           test -x squashfs-root/AppRun
           test -x squashfs-root/usr/bin/moonlight
+          # appimagetool requires a PNG .DirIcon; linuxdeploy must not have picked an SVG.
+          file -L squashfs-root/.DirIcon | grep -F 'PNG image data, 256 x 256'
           readelf -h squashfs-root/usr/bin/moonlight | grep -F 'Advanced Micro Devices X86-64'
           LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib:${LD_LIBRARY_PATH:-}" python3 "$GITHUB_WORKSPACE/scripts/verify-linux-features.py" --root "$PWD/squashfs-root" --host-wayland
           # Exercise the packaged X11 plugin; offscreen is intentionally not bundled.
