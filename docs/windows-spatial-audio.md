@@ -106,28 +106,12 @@ identify audible dropouts, network loss or the cause of missing input. Queued
 frames can also be abandoned during immediate stop or device recovery without
 incrementing the overflow counter.
 
-The explicit-endpoint prototype was exercised in a real Windows 11 7.1 streaming
-session lasting approximately four minutes. The user observed an Atmos indicator
-on the HDMI/eARC soundbar during streaming. Two deliberate DTS/Atmos provider
-changes triggered successful spatial reinitializations (12 and 21 ms spent in
-renderer initialization, not total audible interruption). An eight-second
-standalone channel-tone run had no missing-frame or overflow events. The stream
-had no queue overflows, but accumulated missing-frame silence whose cause was not
-localized; uninterrupted long-duration playback is still a validation item.
-
-The subsequent GUI/default-endpoint build was also tested on a Windows client
-connected through a Samsung TV and eARC soundbar. The tester confirmed working
-playback with **both 5.1 and 7.1 selected** and reported very good sound quality.
-This is a user-reported listening test, not an instrumented speaker-routing or
-latency measurement.
-Automated tests do not substitute for hardware/provider testing.
-
-The application supplies ordinary **5.1 or 7.1 audio**, not native Atmos passthrough,
-7.1.4 content, MAT capture or bit-identical HDMI transport. The selected Windows
-provider decides how to render/encode it. An Atmos indicator is an observed
-output-mode result, not verification of source Atmos metadata or speaker routing.
-Queue/fill timings do not measure acoustic latency or A/V synchronization. Audio
-continues to follow the device clock independently of video presentation.
+Moonlight supplies decoded **5.1, 7.1 or 7.1.4 PCM** to static spatial objects.
+The selected Windows provider controls the physical output format. Use known
+per-channel signals on the actual output to verify speaker routing. An Atmos
+indicator reflects the output mode. Acoustic latency and A/V synchronization
+require measurement beyond the queue counters. Audio follows the device clock
+independently of video presentation.
 
 The implementation uses documented Microsoft Spatial Audio APIs and follows
 this repository's existing license.
