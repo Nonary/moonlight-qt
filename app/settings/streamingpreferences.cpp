@@ -41,6 +41,7 @@
 #define SER_HOSTAUDIO "hostaudio"
 #define SER_MULTICONT "multicontroller"
 #define SER_AUDIOCFG "audiocfg"
+#define SER_SPATIALAUDIO "spatialaudio"
 #define SER_VIDEOCFG "videocfg"
 #define SER_HDR "hdr"
 #define SER_YUV444 "yuv444"
@@ -261,8 +262,18 @@ void StreamingPreferences::reload()
     steamControllerHapticBoost = qBound(0, settings.value(SER_STEAMCONTROLLERHAPTICBOOST, 0).toInt(), 30);
     steamControllerHapticPulseScale = qBound(100, settings.value(SER_STEAMCONTROLLERHAPTICPULSESCALE, 100).toInt(), 400);
     steamControllerHapticMasterGain = qBound(0, settings.value(SER_STEAMCONTROLLERHAPTICMASTERGAIN, 0).toInt(), 24);
-    audioConfig = static_cast<AudioConfig>(settings.value(SER_AUDIOCFG,
-                                                  static_cast<int>(AudioConfig::AC_STEREO)).toInt());
+    const int savedAudio = settings.value(SER_AUDIOCFG, static_cast<int>(AC_STEREO)).toInt();
+#if defined(Q_OS_WIN) && !defined(Q_OS_WINRT)
+    constexpr int lastAudioLayout = AC_714_SURROUND;
+#else
+    constexpr int lastAudioLayout = AC_71_SURROUND;
+#endif
+    audioConfig = savedAudio >= AC_STEREO && savedAudio <= lastAudioLayout
+            ? static_cast<AudioConfig>(savedAudio) : AC_STEREO;
+    spatialAudio = settings.value(SER_SPATIALAUDIO, false).toBool();
+#if defined(Q_OS_WIN) && !defined(Q_OS_WINRT)
+    if (audioConfig == AC_714_SURROUND) spatialAudio = true;
+#endif
     videoCodecConfig = static_cast<VideoCodecConfig>(settings.value(SER_VIDEOCFG,
                                                   static_cast<int>(VideoCodecConfig::VCC_AUTO)).toInt());
     // Retired optional transports must not be restored by old settings.
@@ -478,6 +489,7 @@ void StreamingPreferences::save()
     settings.setValue(SER_SHOWPERFOVERLAY, showPerformanceOverlay);
     settings.setValue(SER_SHOWFRAMETIMEGRAPH, showFrametimeGraph);
     settings.setValue(SER_AUDIOCFG, static_cast<int>(audioConfig));
+    settings.setValue(SER_SPATIALAUDIO, spatialAudio);
     settings.setValue(SER_HDR, enableHdr);
     settings.setValue(SER_YUV444, enableYUV444);
     settings.setValue(SER_VIDEOCFG, static_cast<int>(videoCodecConfig));

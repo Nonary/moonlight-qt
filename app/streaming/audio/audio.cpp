@@ -7,6 +7,12 @@
 
 #include "renderers/sdl.h"
 
+#if defined(Q_OS_WIN) && !defined(Q_OS_WINRT)
+#include "renderers/spatialaudio.h"
+#include <memory>
+#include <new>
+#endif
+
 #include <Limelight.h>
 
 #define TRY_INIT_RENDERER(renderer, opusConfig)        \
@@ -19,8 +25,14 @@
 
 IAudioRenderer* Session::createAudioRenderer(const POPUS_MULTISTREAM_CONFIGURATION opusConfig)
 {
+    if (!opusConfig) return nullptr;
+    const bool requiresSpatial = opusConfig->channelCount == 12;
     // Handle explicit ML_AUDIO setting and fail if the requested backend fails
     QString mlAudio = qgetenv("ML_AUDIO").toLower();
+    if (requiresSpatial && !mlAudio.isEmpty()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Native 7.1.4 requires Windows Spatial Audio; an explicit backend override cannot downmix it");
+        return nullptr;
+    }
     if (mlAudio == "sdl") {
         TRY_INIT_RENDERER(SdlAudioRenderer, opusConfig)
         return nullptr;
@@ -39,6 +51,34 @@ IAudioRenderer* Session::createAudioRenderer(const POPUS_MULTISTREAM_CONFIGURATI
     }
 
     // -------------- Automatic backend selection below this line ---------------
+
+#if defined(Q_OS_WIN) && !defined(Q_OS_WINRT)
+    if (requiresSpatial || m_Preferences->spatialAudio) {
+        if ((opusConfig->channelCount == 6 || opusConfig->channelCount == 8 || requiresSpatial) && opusConfig->sampleRate == 48000) {
+            try {
+                // The GUI option uses the current default render endpoint.
+                // Ignore legacy prototype endpoint overrides after HDMI changes.
+                // No Windows default is set; the output must support Spatial Audio.
+                auto renderer = std::make_unique<SpatialAudioRenderer>(QString());
+                if (renderer->prepareForPlayback(opusConfig)) {
+                    return renderer.release();
+                }
+            }
+            catch (const std::bad_alloc&) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Unable to allocate Spatial Audio renderer");
+            }
+            if (requiresSpatial) return nullptr;
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Spatial Audio unavailable; falling back to the regular audio renderer");
+        }
+        else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Spatial Audio requires six, eight or twelve channels at 48000 Hz");
+        }
+    }
+#endif
+
+    if (requiresSpatial) return nullptr;
 
 #if defined(HAVE_SLAUDIO)
     // Steam Link should always have SLAudio
@@ -129,12 +169,17 @@ bool Session::testAudio(int audioConfiguration)
     return true;
 }
 
-int Session::arInit(int /* audioConfiguration */,
+int Session::arInit(int audioConfiguration,
                     const POPUS_MULTISTREAM_CONFIGURATION opusConfig,
                     void* /* arContext */, int /* arFlags */)
 {
+    const bool requiresSpatial = CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(audioConfiguration) == 12;
+    if (!opusConfig || (requiresSpatial && opusConfig->channelCount != 12))
+        return ML_ERROR_UNSUPPORTED_AUDIO_CONFIGURATION;
     SDL_memcpy(&s_ActiveSession->m_OriginalAudioConfig, opusConfig, sizeof(*opusConfig));
-    s_ActiveSession->initializeAudioRenderer();
+    // Existing layouts can retry renderer initialization when audio packets arrive.
+    if (!s_ActiveSession->initializeAudioRenderer() && requiresSpatial)
+        return ML_ERROR_UNSUPPORTED_AUDIO_CONFIGURATION;
     return 0;
 }
 

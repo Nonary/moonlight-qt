@@ -1381,9 +1381,44 @@ Audio packet duration controls its sample cadence, independent of video FPS.
 The SDL renderer requests at least 480 samples (10 ms) or three Opus frames,
 providing buffering for audio jitter. It uses pending-audio and device-queue
 limits (including 30 ms and 50 ms checks) rather than video timestamps to control
-backpressure. Audio startup intentionally discards an initial backlog of about
-500 ms; renderer reinitialization similarly prevents downtime becoming permanent
+backpressure. Ordinary audio startup discards an initial backlog of about
+500 ms. A compatible host can explicitly advertise fresh-after-ping capture:
+the audio ping is then sent only after renderer readiness, avoiding that stale
+startup backlog. Older peers retain the existing synchronization.
+Renderer reinitialization similarly prevents downtime becoming permanent
 queued audio latency. Muting can suppress audio processing without retiming VRR.
+
+Windows desktop also has a [static Spatial Audio renderer](docs/windows-spatial-audio.md)
+for 5.1/7.1 and explicitly negotiated native 7.1.4 (audio contract updated 2026-11-17).
+The Windows-only Audio Settings checkbox persists `spatialaudio` (default false)
+and enables it only for six or eight channels at 48 kHz. The checkbox is available
+with 5.1 or 7.1 selected; switching to stereo retains the preference without using
+the renderer. The GUI renderer resolves the current default console render
+endpoint and ignores the prototype's endpoint environment override. The output must be an
+active HDMI/DisplayPort endpoint supporting the requested static objects and mono
+float32/48 kHz. No Windows setting is changed. Explicit `ML_AUDIO=sdl` retains
+precedence, and initialization failure continues through normal SDL selection.
+Stereo and non-opted-in legacy sessions retain their existing paths.
+Selecting native 7.1.4 automatically requires the Spatial renderer, twelve static
+objects at 48 kHz and the Common native12 negotiation extension. This mode rejects
+backend overrides, missing output/provider capabilities and initialization failures
+instead of silently falling back to fewer channels. It does not enable a proprietary
+provider or change Windows defaults. Applications and Common must rebuild together
+because the Opus mapping array has expanded to twelve entries.
+
+One MTA worker owns the spatial COM objects, event-driven output and teardown.
+The decoded FL/FR/FC/LFE/BL/BR order maps directly to six static objects for 5.1;
+7.1 adds SL/SR; native 7.1.4 additionally maps TFL/TFR/TBL/TBR to four static objects.
+The native12 Windows speaker mask is `0x2D63F`, static object mask `0x1FFE`, and
+wire layout identifier `0xF63F`; these are different namespaces. Dynamic object
+minimum/maximum are both zero. No upmix, estimated objects or synthetic heights
+are included. Existing 5.1/7.1 mappings remain unchanged. A 1,440-frame FIFO bounds
+queued PCM to 30 ms; overflow drops oldest complete frames and underflow fills
+zeros. All channels share one queue cursor, and every object is updated even
+when input is muted. Worker faults reach `submitAudio(false)` and existing
+Session reinitialization, including its downtime-drop window. After a working
+SDL fallback, spatial output is retried on the next session. Software queue,
+event and fill statistics do not establish acoustic latency or Dolby/MAT output.
 
 Input goes from SDL handlers to common-library input APIs and a separate sender.
 

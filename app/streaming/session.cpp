@@ -881,6 +881,9 @@ bool Session::initialize(QQuickWindow* qtWindow)
     case StreamingPreferences::AC_71_SURROUND:
         m_StreamConfig.audioConfiguration = AUDIO_CONFIGURATION_71_SURROUND;
         break;
+    case StreamingPreferences::AC_714_SURROUND:
+        m_StreamConfig.audioConfiguration = AUDIO_CONFIGURATION_714_SURROUND;
+        break;
     }
 
     LiInitializeAudioCallbacks(&m_AudioCallbacks);
@@ -1412,6 +1415,12 @@ bool Session::validateLaunch(SDL_Window* testWindow)
 
     // Test if audio works at the specified audio configuration
     bool audioTestPassed = testAudio(m_StreamConfig.audioConfiguration);
+
+    // A requested native 12-channel bed must not silently lose its height lanes.
+    if (!audioTestPassed && CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(m_StreamConfig.audioConfiguration) == 12) {
+        emit displayLaunchError(tr("7.1.4 requires Windows Spatial Audio on a compatible HDMI/DisplayPort output. Enable spatial sound or select 7.1 before starting a new stream."));
+        return false;
+    }
 
     // Gracefully degrade to stereo if surround sound doesn't work
     if (!audioTestPassed && CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(m_StreamConfig.audioConfiguration) > 2) {
