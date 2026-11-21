@@ -975,6 +975,10 @@ The fallback DXGI statistics provider supplies no verified display events.
 The graph separately joins its image IDs and measured refresh-count/QPC anchors
 to show `Display refresh (DXGI)`. That observation does not enter verified
 display-event cadence, latency learning, or adaptation.
+The frametime graph marks a VRR18 input hitch with a red X when observed decode
+readiness reaches the applied buffer plus the configured tolerance, measured
+against that frame's retimed source slot. The dashed line shows this threshold.
+A frame with unknown decode completion has no marker.
 Production uses submission estimates for its client cadence report. Matched
 DXGI refresh observations populate the separately labeled graph lane;
 independent-flip events from composition populate display-event timing

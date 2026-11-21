@@ -29,6 +29,10 @@ a gap rather than one long interval, and a backend without feedback shows
 for display feedback, and OS/compositor timestamps are not physical panel
 measurements.
 
+The VRR18 input lane shows the applied buffer in green. Its dashed line is one
+configured tolerance above that buffer. A red X marks a frame whose measured
+decode readiness reaches or crosses that line.
+
 On a 4K output, the entire stats surface (text and chart) is about 30% larger.
 It follows the drawable window's pixel size, including high-DPI windows, and
 returns to normal size on smaller outputs. The chart refreshes at 10 Hz while it

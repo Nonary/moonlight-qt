@@ -867,6 +867,26 @@ int main(int argc, char** argv)
             }
             return snapshot;
         };
+        // VRR18 compares observed decode readiness with each frame's applied
+        // buffer, even when the requested buffer is larger.
+        for (const int excessUs : {499, 500, 501}) {
+            for (const bool observed : {false, true}) {
+                auto snapshot = adaptiveGraph(0, false, observed);
+                for (auto& point : snapshot.points) {
+                    point.inputPercentileEnabled = false;
+                    point.toleranceUs = 500;
+                    point.decoderOutputUs = point.sourceTimeUs + point.bufferUs + excessUs;
+                    point.decoderReadyUs = observed ? point.decoderOutputUs : 0;
+                }
+                const auto name = std::string("VRR18 hitch marker ") + std::to_string(excessUs) +
+                    (observed ? " measured" : " unknown");
+                manager.updateOverlayText(OverlayDebug, name.c_str(), std::move(snapshot));
+                replacement.awaitText(name);
+                std::lock_guard<std::mutex> guard(replacement.lock);
+                assert((replacement.rowColors[TimingGraphLayout::BufferLane][3] > 0) ==
+                       (observed && excessUs >= 500));
+            }
+        }
         for(const auto scenario : {0,1,2,3}) {
             const bool eligible=scenario!=3;
             const auto name=std::string("Adaptive causal coverage ")+std::to_string(scenario);
@@ -874,11 +894,12 @@ int main(int argc, char** argv)
             replacement.awaitText(name.c_str());
             std::lock_guard<std::mutex> guard(replacement.lock);
             const auto& incoming=replacement.rowColors[TimingGraphLayout::BufferLane];
-            assert((incoming[3]>0)==(scenario==2)); // Raw late stage alone never paints a causal red X.
+            const bool marked = scenario == 1 || scenario == 2;
+            assert((incoming[3]>0)==marked); // Raw late stage alone never paints a causal red X.
             assert(incoming[6]>100); // Raw stage remains visible independently of causal coverage.
             assert(incoming[7]>100); // Applied buffer stays readable even beneath dense exact-crossing markers.
-            assert((incoming[5]>100)==(eligible && scenario!=2)); // Dense red X marks cover the producer line only when every frame misses.
-            assert((incoming[8]>100)==(scenario!=2)); // B+T allowance band is independent of actual B.
+            assert((incoming[5]>100)==(eligible && !marked)); // Dense red X marks cover the producer line only when every frame misses.
+            assert((incoming[8]>100)==!marked); // B+T allowance band is independent of actual B.
             assert(incoming[9]>100); // Learned quantile remains distinct from both B and B+T.
         }
         int normalWidth, normalHeight;
@@ -917,7 +938,7 @@ int main(int argc, char** argv)
             manager.updateOverlayText(OverlayDebug, name.c_str(), credited);
             replacement.awaitText(name);
             std::lock_guard<std::mutex> guard(replacement.lock);
-            assert((replacement.rowColors[TimingGraphLayout::BufferLane][3] > 0) == (excess > 500));
+            assert((replacement.rowColors[TimingGraphLayout::BufferLane][3] > 0) == (excess >= 500));
         }
         const auto previewFolder = qEnvironmentVariable("MOONLIGHT_READABILITY_PREVIEW_DIR");
         for (const bool fourK : {false, true}) {
