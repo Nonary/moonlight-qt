@@ -45,11 +45,12 @@ sustained jitter beyond the cap still reaches it, and that the aim's margin
 costs at most 500 us beyond what the goal itself needs.
 
 `tst_vrrbufferregressions` is the adaptive-buffer gate described in
-`AGENTS.md`. It was dropped from `vrr.pro` and stopped compiling when the
-goal-buffer policy was merged on 2026-10-29, and was restored on 2026-11-09.
-The contracts that merge broke are listed in its `g_Known` table with their
-evidence; each is a decision still to make. Its `unabsorbable-loss` scenario
-pins the three solver rules above through a production session. Its
+`AGENTS.md`. It exercises the live interval controller on latching and
+non-latching presenters, with Reduce Judder on and off. `interval-pressure`
+follows earned protection through a full score history and clean release.
+`rate-round-trip` checks buffer continuity and presented cadence through a
+90–30–90 FPS transition. Ceiling comparisons score the same arrivals through
+the VRR and fixed-refresh models. Its
 `slow-gpu-decode` scenario replays a recorded Radeon 780M span
 (`slowdecodespan.h`, decode close to the 138 FPS source interval) through a
 serial decoder and worker, and requires a settled buffer and source mapping

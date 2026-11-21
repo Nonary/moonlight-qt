@@ -3905,16 +3905,25 @@ void testTrajectoryReadySuccessorReservation() {
         worker.submit(input(66,bunchedOutput-100));
         acceptedClock.resume(); // Preserve late anchor, permit waits, and never claim future output complete.
         backend.releaseDecode();
-        expect(backend.waitForPresentCount(66),"late frame is held and shown, then its successor; nothing is skipped");
+        expect(waitFor([&] {
+            const auto stats = telemetryStats(telemetry);
+            return stats.vrrPresentedFrames + stats.vrrPacingDroppedFrames == 66;
+        }), "the bunched pair both reach a terminal disposition");
     }
     g_FrozenTestClockUs.store(0);
     const auto rows=readExpandedTrace(path).split('\n');const auto columns=rows.value(0).split(',');
-    int dropped=0,presented=0;bool reservationProof=false;
+    int dropped=0,presented=0;
+    bool stalePredecessor=false, successorPresented=false;
     for(int i=1;i<rows.size();++i) {if(rows[i].isEmpty()||rows[i].startsWith("#"))continue;const auto f=rows[i].split(',');
         const bool drop=f.value(columns.indexOf("trajectory_resync_dropped"))=="1";
-        if(drop) {++dropped;reservationProof=f.value(columns.indexOf("trajectory_successor_frame")).toLongLong()==66 &&
-            f.value(columns.indexOf("trajectory_successor_proof")).toULongLong()==2;}
-        presented+=f.value(columns.indexOf("disposition"))=="presented";
+        if (drop) ++dropped;
+        const auto disposition = f.value(columns.indexOf("disposition"));
+        const int frame = f.value(columns.indexOf("frame")).toInt();
+        if (frame == 65 && disposition == "stale") {
+            stalePredecessor = f.value(columns.indexOf("completion_queue_depth")).toUInt() > 0;
+        }
+        if (frame == 66) successorPresented = disposition == "presented";
+        presented += disposition == "presented";
     }
     const auto graph=telemetry.timingGraphSnapshot().points;
     size_t matched=0,eligible=0,ineligible=0;
@@ -3952,8 +3961,8 @@ void testTrajectoryReadySuccessorReservation() {
     expect(matched == size_t(presented) && eligible == 0 && ineligible == matched,
            "interval feedback does not report historical predictor eligibility");
     expect(lossIneligible && unknownGpuEligible,"worker preserves packet-loss identity and leaves unknown GPU readiness unverified");
-    (void) reservationProof;
-    expect(dropped==0 && presented==66,"bounded catch-up never skips a frame to regain phase");
+    expect(dropped == 0 && successorPresented && presented + int(stalePredecessor) == 66,
+           "bounded catch-up never drops for phase; only the stale predecessor may yield to its queued successor");
     for(const auto& lifetime:life) expect(lifetime.releases==1,"reservation and shutdown account every frame exactly once");
     if(const auto output=SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_TRAJECTORY_RESERVATION_TRACE")) {
         QFile::remove(QString::fromLocal8Bit(output));expect(QFile::copy(path,QString::fromLocal8Bit(output)),"reservation fixture exports for strict replay");

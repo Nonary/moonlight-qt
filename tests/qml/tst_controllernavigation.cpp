@@ -1729,9 +1729,14 @@ private slots:
         press(SDL_CONTROLLER_BUTTON_X); QTRY_VERIFY(page->property("detailsExpanded").toBool());
         press(SDL_CONTROLLER_BUTTON_B); QTRY_VERIFY(grid->hasActiveFocus());
         QCOMPARE(grid->property("selectedAppId").toInt(),2);
-        press(SDL_CONTROLLER_BUTTON_A);
-        QTRY_COMPARE(root->activeFocusItem()->property("text").toString(),QString("Cancel"));
         auto* confirmation=root->findChild<QObject*>("switchGameConfirmation"); QVERIFY(confirmation);
+        // A headless window need not advance the popup transition to opened(),
+        // where the dialog assigns focus to the non-destructive action.
+        confirmation->setProperty("enter", QVariant::fromValue<QObject*>(nullptr));
+        confirmation->setProperty("exit", QVariant::fromValue<QObject*>(nullptr));
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(confirmation->property("opened").toBool());
+        QTRY_COMPARE(root->activeFocusItem()->property("text").toString(),QString("Cancel"));
         const QString prompt=confirmation->property("text").toString();
         QVERIFY(prompt.contains("Forza Horizon 5") && prompt.contains("Hollow Knight") && prompt.contains("unsaved"));
         press(SDL_CONTROLLER_BUTTON_A); QTRY_VERIFY(!confirmation->property("visible").toBool());
