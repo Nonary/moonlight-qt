@@ -1553,7 +1553,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             cadence.frameDelta == 1 && m_HaveLastSubmission) {
         const uint64_t latchedFloorUs = decision.latchedPresentation &&
             !m_Parameters.nativeScheduledPresentation ?
-            saturatingAdd(spacingAnchorUs(), m_DisplayPeriodUs) : 0;
+            saturatingAdd(m_LastSubmissionUs, m_DisplayPeriodUs) : 0;
         m_Pending.intervalSpacingFloorUs = std::max(earliestUs, latchedFloorUs);
     }
     // Reuse the chart's input-slot basis, but use the producer's decoder
