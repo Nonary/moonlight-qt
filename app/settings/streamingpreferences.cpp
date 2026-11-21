@@ -34,7 +34,6 @@
 #define SER_VRRLATENCYMODE "vrrlatencymode"
 #define SER_VRRTIMINGPRESETREVISION "vrrtimingpresetrevision"
 #define SER_SMOOTHVRRFRAMETIMING "smoothvrrframetiming"
-#define SER_ABSORBVRRMICROSTUTTER "absorbvrrmicrostutter"
 #define SER_HIGHPERFORMANCEGPUPOWER "highperformancegpupower"
 #define SER_TRACEVRRFRAMES "tracevrrframes"
 #define SER_GAMEOPTS "gameopts"
@@ -225,7 +224,7 @@ void StreamingPreferences::reload()
         settings.setValue(SER_VRRTIMINGPRESETREVISION, CURRENT_VRR_TIMING_PRESET_REVISION);
     }
     smoothVrrFrameTiming = settings.value(SER_SMOOTHVRRFRAMETIMING, true).toBool();
-    absorbVrrMicrostutter = settings.value(SER_ABSORBVRRMICROSTUTTER, false).toBool();
+    settings.remove("absorbvrrmicrostutter");
     highPerformanceGpuPower = settings.value(SER_HIGHPERFORMANCEGPUPOWER, false).toBool();
     traceVrrFrames = settings.value(SER_TRACEVRRFRAMES, false).toBool();
     settings.remove("vrrdiagnosticmode"); // Retired, unpublished timing comparison selector.
@@ -460,7 +459,6 @@ void StreamingPreferences::save()
     settings.remove("gamescoperepaint");
     settings.remove("gamescopeforcecomposition");
     settings.setValue(SER_SMOOTHVRRFRAMETIMING, smoothVrrFrameTiming);
-    settings.setValue(SER_ABSORBVRRMICROSTUTTER, absorbVrrMicrostutter);
     settings.setValue(SER_HIGHPERFORMANCEGPUPOWER, highPerformanceGpuPower);
     settings.setValue(SER_TRACEVRRFRAMES, traceVrrFrames);
     settings.remove("v2queue"); // The interval queue is now the production policy.

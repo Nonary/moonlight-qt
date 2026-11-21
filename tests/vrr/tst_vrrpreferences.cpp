@@ -47,6 +47,20 @@ private slots:
             QCOMPARE(prefs->rendererSelection, renderer);
         }
     }
+    void retiredAbsorbMicrostutterPreference()
+    {
+        auto* prefs = StreamingPreferences::get();
+        for (bool reduceJudder : {false, true}) {
+            QSettings().setValue("smoothvrrframetiming", reduceJudder);
+            QSettings().setValue("absorbvrrmicrostutter", true);
+            prefs->reload();
+            QCOMPARE(prefs->smoothVrrFrameTiming, reduceJudder);
+            QVERIFY(!QSettings().contains("absorbvrrmicrostutter"));
+            prefs->save();
+            QVERIFY(!QSettings().contains("absorbvrrmicrostutter"));
+            QCOMPARE(QSettings().value("smoothvrrframetiming").toBool(), reduceJudder);
+        }
+    }
     void migration()
     {
         auto* prefs = StreamingPreferences::get();
