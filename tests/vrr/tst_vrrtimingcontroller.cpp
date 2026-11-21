@@ -3567,6 +3567,29 @@ void testIntervalBufferReleaseAcrossShortGaps()
            "an invalid observation must not hide a long unobserved gap");
 }
 
+void testIntervalBufferReleaseTapersNearFloor()
+{
+    const auto remaining = [](uint64_t startUs, uint64_t releaseTauUs) {
+        Vrr13::IntervalBuffer buffer;
+        constexpr uint64_t floorUs = 1000;
+        for (uint64_t i = 1; i <= 250; ++i) {
+            const uint64_t atUs = 1000000 + i * 10000;
+            buffer.observe({i, atUs, atUs, atUs, atUs, startUs, true, true},
+                           floorUs, 16000, 0, 500, true, 995000, 500,
+                           120000000, 500000, 32, true, releaseTauUs);
+        }
+        return buffer.demand(startUs);
+    };
+    constexpr uint64_t releaseTauUs = 12000000;
+    expect(remaining(12000, releaseTauUs) == remaining(12000, 0),
+           "large excess delay must still release at the full configured rate");
+    const auto nearFloor = remaining(2000, releaseTauUs);
+    expect(nearFloor < 2000 && nearFloor > remaining(2000, 0),
+           "release must taper near the floor while continuing to drain");
+    expect(remaining(1000, releaseTauUs) == 1000,
+           "tapering must preserve the minimum delay");
+}
+
 void testAlternatingSlowCadenceLeavesFastRate()
 {
     auto session = config(120, 120);
@@ -4442,6 +4465,7 @@ int main()
     testIntervalQualityBuffer();
     testPerIntervalBufferPreventsRecoverableSpikes();
     testIntervalBufferReleaseAcrossShortGaps();
+    testIntervalBufferReleaseTapersNearFloor();
     testTwoMinuteScoreCoverage();
     testAlternatingSlowCadenceLeavesFastRate();
     testInitialPreparationIsNotTypicalRender();

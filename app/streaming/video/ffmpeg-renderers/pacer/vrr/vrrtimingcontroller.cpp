@@ -238,10 +238,14 @@ VrrTimingParameters vrrTimingParametersForSession(
     // it and reacquiring it. Explicit captured values preserve older release.
     parameters.playoutMeanMissHoldUs = vrr18 && latencyMode == 2 ? 6000000 :
         vrr18 && latencyMode == 0 ? 10000000 : 8000000;
-    // Balanced's 250 us/s recovery is the measured latency/smoothness knee:
-    // faster recovery saved little additional latency and raised presented
-    // jerk. All custom settings use this shared release policy.
     parameters.playoutMeanMissReleaseUsPerSecond = vrr18 && latencyMode == 0 ? 50 : 250;
+    if (vrr18 && latencyMode == 1) {
+        // Release the large starting reserve sooner. Slow the release as
+        // the delay approaches the floor, where another step can discard
+        // needed protection and start a rebuild.
+        parameters.playoutIntervalReleaseTauUs = 12000000;
+        parameters.playoutIntervalTaperHoldUs = 5000000;
+    }
 
     // No profile floors its delay at a recent ready-offset percentile. Such a
     // floor counts every late frame, including a decoder that has fallen
@@ -2506,6 +2510,13 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
             m_Parameters.playoutSmoothingReadinessBound != 0 ? p.smoothingAdvance : 0;
         const auto deadline = saturatingAdd(m_Pending.smoothness.intended,
                                              smoothingAdvanceUs);
+        const uint64_t toleranceUs = intervalQualityToleranceUs(m_Parameters);
+        // At the refresh ceiling the physical spacing floor can retain phase
+        // after the buffer releases. Keep the established release law there.
+        const bool taperRelease = m_Parameters.playoutIntervalReleaseTauUs &&
+            m_SourcePeriodUs > saturatingAdd(m_DisplayPeriodUs, m_DisplayPeriodUs / 1000);
+        const uint64_t intervalHoldUs = taperRelease && m_Parameters.playoutIntervalTaperHoldUs ?
+            m_Parameters.playoutIntervalTaperHoldUs : m_Parameters.playoutMeanMissHoldUs;
         {
             m_IntervalBuffer.observe({m_Pending.smoothness.frame, m_Pending.intervalIntendedUs,
                 submissionUs, deadline, ready, p.applied,
@@ -2513,13 +2524,14 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 p.eligible,
                 serialServiceUs, p.decoderQueue, m_Pending.intervalSpacingFloorUs},
                 playoutDelayMinimumUs(), playoutDelayMaximumUs(),
-                m_Parameters.playoutMeanMissHoldUs, m_Parameters.playoutMeanMissReleaseUsPerSecond,
+                intervalHoldUs, m_Parameters.playoutMeanMissReleaseUsPerSecond,
                 true, m_Parameters.playoutOnTimeTargetPerMillion,
-                intervalQualityToleranceUs(m_Parameters),
+                toleranceUs,
                 intervalQualityWindowUs(m_Parameters),
                 m_Parameters.playoutIntervalInitialWarmupUs,
                 m_Parameters.playoutIntervalInitialMinimumSamples,
-                m_Parameters.playoutVrr18IntervalFeedback != 0);
+                m_Parameters.playoutVrr18IntervalFeedback != 0,
+                taperRelease ? m_Parameters.playoutIntervalReleaseTauUs : 0);
             if (m_Parameters.playoutInputPercentileEnabled) {
                 const auto capacity = m_IntervalBuffer.stats();
                 const bool validInput = submitted && !cancelled && m_Pending.intervalValid &&
@@ -2530,7 +2542,6 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 // to this frame's readiness missing its intended deadline.
                 // A compressed successor is not a second miss for that hitch.
                 const auto& outcome = capacity.update;
-                const uint64_t toleranceUs = intervalQualityToleranceUs(m_Parameters);
                 const bool inputHitch = outcome.frame == m_Pending.smoothness.frame &&
                     outcome.attributedFrame == m_Pending.smoothness.frame &&
                     outcome.intervalErrorUs > toleranceUs && outcome.latenessUs > toleranceUs;

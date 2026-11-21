@@ -81,6 +81,9 @@
     X(size_t, playout_interval_initial_minimum_samples, playoutIntervalInitialMinimumSamples, 2) \
     X(uint64_t, playout_mean_miss_hold_us, playoutMeanMissHoldUs, 4000000) \
     X(uint64_t, playout_mean_miss_release_us_per_second, playoutMeanMissReleaseUsPerSecond, 200) \
+    /* Time constant for reducing release speed as the interval buffer nears its floor. */ \
+    X(uint64_t, playout_interval_release_tau_us, playoutIntervalReleaseTauUs, 0) \
+    X(uint64_t, playout_interval_taper_hold_us, playoutIntervalTaperHoldUs, 0) \
     /* Nonzero floors the adaptive playout delay at this per-mille percentile */ \
     /* of recent timestamp-playout ready offsets (decode completion after the */ \
     /* mapped source slot), so release cannot drain below what current frames */ \
