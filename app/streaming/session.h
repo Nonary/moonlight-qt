@@ -288,6 +288,7 @@ private:
     };
 
     StreamingPreferences* m_Preferences;
+    const StreamingPreferences::StreamVideoSettings m_RequestedVideo;
     ClientPacingWarning m_ClientPacingWarning;
     PresentationSettings m_PresentationSettings;
     std::unique_ptr<DiagnosticCapture> m_DiagnosticCapture;

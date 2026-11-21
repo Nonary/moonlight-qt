@@ -7,7 +7,7 @@ import "ConsoleStyle.js" as Style
 
 Dialog {
     id: dialog
-    readonly property var hostWindow: parent ? parent.Window.window : null
+    property var hostWindow: parent ? parent.Window.window : null
     property bool previousNavigationMode: false
     property bool tabNavigation: true
     modal: true

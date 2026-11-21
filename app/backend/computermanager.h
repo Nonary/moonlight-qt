@@ -164,6 +164,8 @@ public:
         return m_ActiveThread != nullptr;
     }
 
+    QThread* activeThread() const { return m_ActiveThread; }
+
     void setActiveThread(QThread* thread)
     {
         cleanInactiveList();
@@ -235,6 +237,7 @@ public:
     void pairHost(NvComputer* computer, QString pin);
 
     void quitRunningApp(NvComputer* computer);
+    void retryAppList(NvComputer* computer);
 
     bool requestHostSleep(NvComputer* computer);
 

@@ -25,6 +25,11 @@ void AppModel::updateAppListState()
     emit appListStateChanged();
 }
 
+void AppModel::retryAppList()
+{
+    if (m_Computer && m_AppListUnavailable) m_ComputerManager->retryAppList(m_Computer);
+}
+
 void AppModel::updateFrameLimiterCapabilities()
 {
     // Snapshot discovery state; QML getters use only this GUI-thread cache.

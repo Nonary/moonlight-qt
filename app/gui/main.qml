@@ -35,6 +35,8 @@ ApplicationWindow {
     Material.background: Style.background
     Material.foreground: Style.text
     readonly property bool toolbarFocused: homeButton.activeFocus || pcsButton.activeFocus || settingsButton.activeFocus || uiFullscreenButton.activeFocus
+    readonly property var pcPage: stackView.depth ? stackView.get(0, StackView.DontLoad) : null
+    readonly property bool libraryAvailable: !!(pcPage && pcPage.rememberedHostAvailable) || stackView.currentItem instanceof AppView
     readonly property bool controllerInput: SdlGamepadKeyNavigation.inputMethod === "controller"
     property bool uiDisplayReady: false
     property bool controllerFullscreenRequested: false
@@ -140,11 +142,17 @@ ApplicationWindow {
         if (!toolBar.visible || popupHasFocus()) return
         var section = stackView.currentItem instanceof SettingsView ? 2 : stackView.currentItem instanceof AppView ? 0 : 1
         section = (section + direction + 3) % 3
+        if (section === 0 && !libraryAvailable) section = direction > 0 ? 1 : 2
         if (section === 0) showHome()
         else if (section === 1) showPcs()
         else settingsButton.clicked()
     }
     function controllerLabel(action) {
+        if (action === "triggers") {
+            if (!controllerInput) return "Ctrl+PgUp / PgDn"
+            return SdlGamepadKeyNavigation.controllerFamily === "playstation" ? "L2 / R2" :
+                   SdlGamepadKeyNavigation.controllerFamily === "nintendo" ? "ZL / ZR" : "LT / RT"
+        }
         if (!controllerInput) return action === "confirm" ? "Enter" : action === "back" ? "Esc" : action === "options" ? "Menu" : action === "done" ? "Enter" : "PgUp / PgDn"
         var family = SdlGamepadKeyNavigation.controllerFamily
         var swapped = StreamingPreferences.swapFaceButtons
@@ -260,7 +268,7 @@ ApplicationWindow {
         Window.onActiveFocusItemChanged: PopupFocus.keepModalFocus(Overlay.overlay)
 
         Keys.onPressed: function(event) {
-            if (event.key === Qt.Key_PageUp || event.key === Qt.Key_PageDown) {
+            if (!(event.modifiers & Qt.ControlModifier) && (event.key === Qt.Key_PageUp || event.key === Qt.Key_PageDown)) {
                 window.switchSection(event.key === Qt.Key_PageUp ? -1 : 1)
                 event.accepted = true
             }
@@ -392,14 +400,15 @@ ApplicationWindow {
             spacing: Style.px(24, window)
             Image { source: "qrc:/res/moonlight.svg"; sourceSize.width: Style.px(24, window); sourceSize.height: Style.px(24, window); visible: window.width >= 1100 }
             ConsoleText { text: qsTr("Moonlight"); font.weight: Font.DemiBold; visible: window.width >= 1100; Layout.rightMargin: Style.px(24, window) }
+            ConsoleText { objectName: "previousSectionHint"; role: "caption"; visible: window.controllerInput; text: window.controllerLabel("sections").split(" / ")[0] }
             ConsoleButton {
-                id: homeButton; text: qsTr("Home"); textOnly: true; selected: stackView.currentItem instanceof AppView
+                id: homeButton; text: qsTr("Library"); enabled: window.libraryAvailable; textOnly: true; selected: stackView.currentItem instanceof AppView
                 onClicked: window.showHome(); KeyNavigation.right: pcsButton
                 Keys.onDownPressed: stackView.currentItem.forceActiveFocus()
             }
             ConsoleButton {
                 id: pcsButton; text: qsTr("PCs"); textOnly: true; selected: stackView.currentItem instanceof PcView
-                onClicked: window.showPcs(); KeyNavigation.left: homeButton; KeyNavigation.right: settingsButton
+                onClicked: window.showPcs(); KeyNavigation.left: homeButton.enabled ? homeButton : null; KeyNavigation.right: settingsButton
                 Keys.onDownPressed: stackView.currentItem.forceActiveFocus()
             }
             ConsoleButton {
@@ -408,6 +417,7 @@ ApplicationWindow {
                 Keys.onDownPressed: stackView.currentItem.forceActiveFocus()
                 Shortcut { sequences: [StandardKey.Preferences]; onActivated: settingsButton.clicked() }
             }
+            ConsoleText { objectName: "nextSectionHint"; role: "caption"; visible: window.controllerInput; text: window.controllerLabel("sections").split(" / ")[1] }
             Item { Layout.fillWidth: true }
             Rectangle { visible: window.selectedHostName.length > 0 && window.width >= 1100; Layout.preferredWidth: Style.px(8, window); Layout.preferredHeight: Style.px(8, window); radius: width/2; color: Style.ok }
             ConsoleText { text: window.selectedHostName; role: "secondary"; elide: Text.ElideRight; Layout.maximumWidth: window.width * 0.2; visible: window.width >= 1100 }
@@ -459,8 +469,12 @@ ApplicationWindow {
                 }
             }
             Item { Layout.fillWidth: true }
-              ConsoleText { role: "caption"; text: qsTr("◀  Categories"); visible: stackView.currentItem instanceof SettingsView && !stackView.currentItem.categoryMenuFocused && !window.toolbarFocused && !window.popupHasFocus() }
-            ConsoleText { role: "caption"; text: window.controllerLabel("sections") + "  " + qsTr("Sections"); visible: window.width >= 1100 }
+            ConsoleText {
+                role: "caption"; text: qsTr("%1  Page").arg(window.controllerLabel("triggers"))
+                visible: !window.toolbarFocused && stackView.currentItem instanceof AppView && stackView.currentItem.pagingAvailable
+            }
+            ConsoleText { role: "caption"; text: qsTr("◀  Categories"); visible: stackView.currentItem instanceof SettingsView && !stackView.currentItem.categoryMenuFocused && !window.toolbarFocused && !window.popupHasFocus() }
+            ConsoleText { role: "caption"; text: window.controllerLabel("sections") + "  " + qsTr("Sections"); visible: !window.controllerInput && window.width >= 1100 }
         }
     }
     // Settings > About owns secondary application actions and update notices.
@@ -548,7 +562,7 @@ ApplicationWindow {
     }
 
     NavigableDialog {
-        id: addPcDialog
+        id: addPcDialog; objectName: "addPcDialog"
         property string label: qsTr("Enter the IP address of your host PC:")
 
         standardButtons: Dialog.Ok | Dialog.Cancel
@@ -557,6 +571,11 @@ ApplicationWindow {
             // Force keyboard focus on the textbox so keyboard navigation works
             SdlGamepadKeyNavigation.setUiNavMode(true)
             editText.forceActiveFocus()
+            var connectButton = standardButton(Dialog.Ok)
+            if (connectButton) {
+                connectButton.text = qsTr("Connect")
+                connectButton.enabled = Qt.binding(function() { return editText.text.trim().length > 0 })
+            }
         }
 
         onClosed: {
@@ -580,18 +599,19 @@ ApplicationWindow {
                 id: editText
                 objectName: "hostAddress"
                 addressInput: true
+                keyboardSubmit: function() { if (addPcDialog.visible) addPcDialog.accept() }
                 placeholderText: qsTr("PC address")
                 Layout.fillWidth: true
                 focus: true
 
                 Keys.onReturnPressed: {
                     if (controllerEditing) openKeyboard()
-                    else addPcDialog.accept()
+                    else if (text.trim().length) addPcDialog.accept()
                 }
 
                 Keys.onEnterPressed: {
                     if (controllerEditing) openKeyboard()
-                    else addPcDialog.accept()
+                    else if (text.trim().length) addPcDialog.accept()
                 }
             }
         }

@@ -26,21 +26,29 @@ FocusScope {
     property int recentCount: 0
     function refreshLibraryCount() { libraryCount = appModel.rowCount() }
     function refreshRecentCount() { recentCount = recentModel.rowCount() }
-    readonly property real shelfHeight: Math.max(Style.px(100, Window.window), Math.min(Style.px(196, Window.window),
-        Math.floor((shelfScroll.height - recentHeading.height - libraryHeading.height - shelfRows.spacing -
-                    recentRow.spacing - libraryRow.spacing - (appPage.recentCount ? 0 : recentEmpty.height + recentRow.spacing)) /
-                   (appPage.recentCount ? 2 : 1))))
+    readonly property real sideMargin: Style.px(64, Window.window)
+    readonly property int libraryColumns: Math.max(1, Math.floor((width - 2 * sideMargin) / Style.px(152, Window.window)))
+    readonly property bool libraryGrid: libraryCount > libraryColumns
+    readonly property bool pagingAvailable: libraryGrid && !recentRowActive && !detailsExpanded
+    readonly property real shelfHeight: Math.max(Style.px(100, Window.window), Math.min(Style.px(216, Window.window),
+        recentCount && !libraryGrid ? Math.floor((shelfScroll.height - recentHeading.height - libraryHeading.height -
+            shelfRows.spacing - recentRow.spacing - libraryRow.spacing) / 2) : Style.px(216, Window.window)))
     property bool recentRowActive: false
     readonly property var activeShelf: recentRowActive ? recentShelf : shelf
     readonly property bool hasGames: appPage.libraryCount > 0
     readonly property bool hasMultipleShelves: appPage.recentCount > 0 && hasGames
     property var selectedApp: ({})
+    readonly property int selectedAppId: selectedApp.appid || 0
+    property var videoOverrides: ({})
+    onSelectedAppIdChanged: refreshVideoOverrides()
+    onHostUuidChanged: refreshVideoOverrides()
     property AppModel appModel: AppModel { includeHostActions: false }
     property RecentAppsModel recentModel: RecentAppsModel { sourceModel: appPage.appModel }
     readonly property real uiScale: Style.windowScale(Window.window)
     // Invokable lookups have no model-change notification for a QML binding.
     // Catalogue rows can move independently of the selected Recent shelf item.
     function selectedAppIndex() { return selectedApp.appid ? appModel.indexOfApp(selectedApp.appid) : -1 }
+    function refreshVideoOverrides() { videoOverrides = StreamingPreferences.appVideoOverrides(hostUuid, selectedAppId) }
     focus: true
 
     function restoreSelection() {
@@ -55,7 +63,7 @@ FocusScope {
         else if (detailsExpanded) collapseDetails()
     }
     function focusShelf(recent) {
-        if (!hasGames) { choosePcButton.forceActiveFocus(); return }
+        if (!hasGames) { (retryButton.visible ? retryButton : choosePcButton).forceActiveFocus(); return }
         recentRowActive = recent && appPage.recentCount > 0
         activeShelf.forceActiveFocus()
         updateSelection()
@@ -144,12 +152,17 @@ FocusScope {
     }
     Connections {
         target: StreamingPreferences
+        function onAppVideoOverridesChanged(uuid, appId) {
+            if (uuid === appPage.hostUuid && appId === appPage.selectedAppId) appPage.refreshVideoOverrides()
+        }
         function onRecentUiAppsChanged(uuid) {
             if (uuid === appPage.hostUuid) appPage.recentModel.appIds = StreamingPreferences.recentUiApps(uuid)
         }
     }
     Connections {
         target: appPage.recentModel
+        function onLayoutChanged() { appPage.refreshRecentCount() }
+        function onAppIdsChanged() { appPage.refreshRecentCount() }
         function onRowsInserted() { appPage.refreshRecentCount() }
         function onRowsRemoved() { appPage.refreshRecentCount() }
         function onModelReset() { appPage.refreshRecentCount() }
@@ -160,8 +173,8 @@ FocusScope {
         if (!detailsExpanded && visible && activeFocus) shelf.forceActiveFocus()
         updateSelection()
     }
-    readonly property string primaryVerb: !hasGames ? (emptySleepButton.activeFocus ? qsTr("Sleep PC") : qsTr("Choose PC")) : selectedApp.running ? qsTr("Resume") : qsTr("Play")
-    function primaryAction() { if (hasGames) launchSelected(); else if (emptySleepButton.activeFocus && emptySleepButton.enabled) sleepDialog.open(); else stackView.pop(null) }
+    readonly property string primaryVerb: !hasGames ? (retryButton.activeFocus ? qsTr("Retry") : emptySleepButton.activeFocus ? qsTr("Sleep PC") : qsTr("Choose PC")) : selectedApp.running ? qsTr("Resume") : qsTr("Play")
+    function primaryAction() { if (hasGames) launchSelected(); else if (retryButton.activeFocus) appModel.retryAppList(); else if (emptySleepButton.activeFocus && emptySleepButton.enabled) sleepDialog.open(); else stackView.pop(null) }
     Keys.onMenuPressed: { if (detailsExpanded) collapseDetails(); else if (hasGames) expandDetails() }
     onHasGamesChanged: {
         if (!ready) return
@@ -205,6 +218,7 @@ FocusScope {
                 spacing: Style.px(16, appPage.Window.window)
                 Column {
                     id: recentRow
+                    visible: appPage.recentCount > 0
                     width: parent.width
                     spacing: Style.px(4, appPage.Window.window)
                     Row {
@@ -213,13 +227,6 @@ FocusScope {
                         spacing: Style.px(16, appPage.Window.window)
                         ConsoleText { role: "heading"; text: qsTr("Recently played") }
                         ConsoleText { role: "caption"; text: qsTr("Latest first"); visible: appPage.recentCount > 0; anchors.verticalCenter: parent.verticalCenter }
-                    }
-                    ConsoleText {
-                        id: recentEmpty
-                        x: Style.px(64, appPage.Window.window)
-                        width: parent.width - 2 * x
-                        role: "secondary"; text: qsTr("Games you play will appear here.")
-                        visible: appPage.recentCount === 0
                     }
                     GameShelf {
                         id: recentShelf; objectName: "recentGameShelf"
@@ -250,7 +257,11 @@ FocusScope {
                     GameShelf {
                         id: shelf; objectName: "gameShelf"
                         showCurrent: !appPage.recentRowActive
-                        width: parent.width; height: appPage.shelfHeight
+                        gridMode: appPage.libraryGrid
+                        columns: appPage.libraryColumns
+                        x: gridMode ? appPage.sideMargin : 0
+                        width: parent.width - 2 * x
+                        height: gridMode ? Math.max(1, shelfScroll.height - libraryHeading.height - libraryRow.spacing) : appPage.shelfHeight
                         model: appPage.appModel
                         focus: true
                         onSelectionChanged: {
@@ -316,14 +327,21 @@ FocusScope {
                 id: playButton; objectName: "gamePlayButton"
                 width: parent.width; text: appPage.primaryVerb; textOnly: true; textAlignment: Text.AlignLeft
                 onClicked: appPage.launchSelected()
-                KeyNavigation.down: quitGame.visible ? quitGame : directButton
+                KeyNavigation.down: quitGame.visible ? quitGame : streamProfileButton
                 Keys.onUpPressed: appPage.collapseDetails()
             }
             ConsoleListRow {
                 id: quitGame; width: parent.width; visible: !!appPage.selectedApp.running
                 text: qsTr("Quit game"); textOnly: true; textAlignment: Text.AlignLeft
                 onClicked: appPage.quitSelected()
-                KeyNavigation.up: playButton; KeyNavigation.down: directButton
+                KeyNavigation.up: playButton; KeyNavigation.down: streamProfileButton
+            }
+            ConsoleListRow {
+                id: streamProfileButton; objectName: "gameStreamProfileButton"
+                width: parent.width; text: qsTr("Stream profile")
+                onClicked: streamProfile.openFor(appPage.hostUuid, appPage.selectedAppId, appPage.selectedApp.name, appPage.videoOverrides)
+                KeyNavigation.up: quitGame.visible ? quitGame : playButton
+                KeyNavigation.down: directButton
             }
             ConsoleListRow {
                 id: directButton; width: parent.width
@@ -334,7 +352,7 @@ FocusScope {
                     var row = appPage.selectedAppIndex()
                     if (row >= 0) appPage.appModel.setAppDirectLaunch(row, !appPage.selectedApp.directLaunch)
                 }
-                KeyNavigation.up: quitGame.visible ? quitGame : playButton; KeyNavigation.down: hideButton
+                KeyNavigation.up: streamProfileButton; KeyNavigation.down: hideButton
             }
             ConsoleListRow {
                 id: hideButton; objectName: "hideGameButton"; width: parent.width
@@ -346,58 +364,77 @@ FocusScope {
                     if (row >= 0) appPage.appModel.setAppHidden(row, !appPage.selectedApp.hidden)
                     appPage.collapseDetails()
                 }
-                KeyNavigation.up: directButton; KeyNavigation.down: streamSettingsButton
-            }
-            ConsoleListRow {
-                id: streamSettingsButton; width: parent.width; text: qsTr("Stream settings"); textOnly: true; textAlignment: Text.AlignLeft
-                onClicked: { if (typeof window !== "undefined") window.openSettings(0) }
-                KeyNavigation.up: hideButton
-                Keys.onDownPressed: { if (sleepButton.visible) sleepButton.forceActiveFocus() }
+                KeyNavigation.up: directButton; KeyNavigation.down: sleepButton
             }
             ConsoleListRow {
                 id: sleepButton; objectName: "hostSleepAction"; width: parent.width
                 visible: appPage.appModel.hostSleepAvailable; enabled: !appPage.sleepPending
                 text: qsTr("Sleep PC"); textOnly: true; textAlignment: Text.AlignLeft
                 onClicked: sleepDialog.open()
-                KeyNavigation.up: streamSettingsButton
+                KeyNavigation.up: hideButton
                 Keys.onDownPressed: { }
             }
             Rectangle { width: parent.width; height: 1; color: Style.outline }
             GridLayout {
                 columns: 2; columnSpacing: Style.px(24, appPage.Window.window); rowSpacing: Style.px(8, appPage.Window.window)
+                readonly property var overrides: appPage.videoOverrides
+                readonly property size resolution: overrides.resolution || Qt.size(StreamingPreferences.width, StreamingPreferences.height)
+                readonly property int fps: overrides.fps === undefined ? StreamingPreferences.fps : overrides.fps
+                readonly property int bitrate: overrides.bitrateKbps === undefined ? StreamingPreferences.bitrateKbps : overrides.bitrateKbps
+                readonly property bool hdr: overrides.hdr === undefined ? StreamingPreferences.enableHdr : overrides.hdr
                 ConsoleText { role: "secondary"; text: qsTr("Resolution") }
-                ConsoleText { role: "secondary"; text: qsTr("%1 × %2").arg(StreamingPreferences.width).arg(StreamingPreferences.height) }
+                ConsoleText { role: "secondary"; text: qsTr("%1 × %2").arg(parent.resolution.width).arg(parent.resolution.height) }
                 ConsoleText { role: "secondary"; text: qsTr("Frame rate") }
-                ConsoleText { role: "secondary"; text: qsTr("%1 FPS").arg(StreamingPreferences.fps) }
+                ConsoleText { role: "secondary"; text: qsTr("%1 FPS").arg(parent.fps) }
                 ConsoleText { role: "secondary"; text: qsTr("Bitrate") }
-                ConsoleText { role: "secondary"; text: qsTr("%1 Mbps").arg((StreamingPreferences.bitrateKbps / 1000).toFixed(1)) }
+                ConsoleText { role: "secondary"; text: qsTr("%1 Mbps").arg(parent.bitrate / 1000) }
+                ConsoleText { role: "secondary"; text: qsTr("HDR") }
+                ConsoleText { role: "secondary"; text: parent.hdr ? qsTr("On") : qsTr("Off") }
             }
             ConsoleText { role: "caption"; text: qsTr("Requested settings. The negotiated stream mode may differ."); width: parent.width; wrapMode: Text.Wrap }
         }
         ScrollBar.vertical: ScrollBar { }
     }
+    GameStreamProfile {
+        id: streamProfile
+        hostWindow: appPage.Window.window
+        onClosed: if (appPage.activated && appPage.detailsExpanded) streamProfileButton.forceActiveFocus()
+    }
     Column {
         x: Style.px(64, appPage.Window.window); y: Style.px(100, appPage.Window.window)
         width: parent.width - 2 * x; spacing: Style.px(24, appPage.Window.window); visible: !appPage.hasGames
         ConsoleText { objectName: "emptyLibraryTitle"; width: parent.width; text: appPage.appModel.appListLoading ? qsTr("Loading games…") : appPage.appModel.appListUnavailable ? qsTr("Games unavailable") : qsTr("No games available"); role: "display"; wrapMode: Text.Wrap }
-        ConsoleText { width: parent.width; text: appPage.appModel.appListLoading ? qsTr("Waiting for the game list from %1.").arg(appPage.objectName) : appPage.appModel.appListUnavailable ? qsTr("Could not load games from this PC. Check the host and connection, or choose another PC.") : qsTr("Add apps on your host, or choose View all apps from its options."); role: "secondary"; wrapMode: Text.Wrap }
+        ConsoleText { width: parent.width; text: appPage.appModel.appListLoading ? qsTr("Waiting for the game list from %1.").arg(appPage.objectName) : appPage.appModel.appListUnavailable ? qsTr("Could not load games from this PC. Check the connection and try again.") : qsTr("Add apps on your host, or choose View all apps from its options."); role: "secondary"; wrapMode: Text.Wrap }
+        ConsoleButton {
+            id: retryButton; objectName: "emptyLibraryRetry"; text: qsTr("Retry")
+            visible: !appPage.hasGames && appPage.appModel.appListUnavailable && !appPage.appModel.appListLoading
+            onClicked: appPage.appModel.retryAppList()
+            Keys.onUpPressed: { if (typeof window !== "undefined") window.focusNavigation() }
+            KeyNavigation.down: choosePcButton
+            onVisibleChanged: {
+                if (!choosePcButton) return
+                if (visible && choosePcButton.activeFocus) forceActiveFocus()
+                else if (!visible && activeFocus && !appPage.hasGames) choosePcButton.forceActiveFocus()
+            }
+        }
         ConsoleButton {
             id: choosePcButton; objectName: "emptyLibraryChoosePc"; text: qsTr("Choose PC"); onClicked: stackView.pop(null)
-            Keys.onUpPressed: { if (typeof window !== "undefined") window.focusNavigation() }
+            Keys.onUpPressed: { if (retryButton.visible) retryButton.forceActiveFocus(); else if (typeof window !== "undefined") window.focusNavigation() }
             Keys.onDownPressed: { if (emptySleepButton.visible && emptySleepButton.enabled) emptySleepButton.forceActiveFocus() }
         }
         ConsoleButton { id: emptySleepButton; KeyNavigation.up: choosePcButton; Keys.onDownPressed: { }
             objectName: "emptyHostSleepAction"; visible: appPage.appModel.hostSleepAvailable; text: qsTr("Sleep PC"); enabled: !appPage.sleepPending; onClicked: sleepDialog.open() }
     }
     NavigableMessageDialog {
-        id: quitAppDialog
-        acceptText: qsTr("Quit game")
-        rejectText: qsTr("Keep playing")
+        id: quitAppDialog; objectName: "switchGameConfirmation"
+        acceptText: segueToStream ? qsTr("Switch games") : qsTr("Quit game")
+        rejectText: segueToStream ? qsTr("Cancel") : qsTr("Keep playing")
         property string appName : ""
         property bool segueToStream : false
         property string nextAppName: ""
         property int nextAppId: 0
-        text:qsTr("Are you sure you want to quit %1? Any unsaved progress will be lost.").arg(appName)
+        text: segueToStream ? qsTr("Close %1 and launch %2? Any unsaved progress in %1 will be lost.").arg(appName).arg(nextAppName) :
+                              qsTr("Are you sure you want to quit %1? Any unsaved progress will be lost.").arg(appName)
         standardButtons: Dialog.Yes | Dialog.No
         initialFocusButton: Dialog.No
 

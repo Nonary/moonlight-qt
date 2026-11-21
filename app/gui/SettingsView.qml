@@ -20,8 +20,8 @@ FocusScope {
     property int category: 0
     readonly property real uiScale: Style.windowScale(Window.window)
     readonly property bool categoryMenuFocused: categoryList.activeFocus
-    readonly property string primaryVerb: categoryMenuFocused ? qsTr("Open") : activeRow && activeRow.disabledSettingProxy === true ? qsTr("Help") : activeRow && activeRow.settingsAction === true ? qsTr("Select") : qsTr("Change")
-    readonly property bool optionsAvailable: !categoryMenuFocused && !!activeRow && !!activeRow.settingsHelp
+    readonly property string primaryVerb: categoryMenuFocused ? qsTr("Open") : activeRow && activeRow.disabledSettingProxy === true ? (activeRow.unlockSetting ? qsTr("Go to %1").arg(activeRow.unlockSetting.settingsLabel) : qsTr("Help")) : activeRow && activeRow.settingsAction === true ? qsTr("Select") : qsTr("Change")
+    readonly property bool optionsAvailable: !categoryMenuFocused && !!activeRow && !!activeRow.settingsHelp && (!activeRow.disabledSettingProxy || !!activeRow.unlockSetting)
     property var activeRow: null
     property var rememberedRows: ({})
     property var categoryRows: []
@@ -120,7 +120,11 @@ FocusScope {
             return
         }
         rowFocused(row)
-        if (row.disabledSettingProxy === true) { optionsAction(); return }
+        if (row.disabledSettingProxy === true) {
+            if (row.unlockSetting && items.indexOf(row.unlockSetting) >= 0) focusRow(row.unlockSetting)
+            else helpDialog.open()
+            return
+        }
         row.activateSetting()
         // Actions such as Use Default can remove their own row. Keep focus
         // within the list when that happens instead of falling into the shell.
@@ -181,8 +185,16 @@ FocusScope {
             readonly property bool disabledSettingProxy: true
             readonly property bool settingsEntry: true
             readonly property string settingsLabel: target ? target.settingsLabel : ""
-            readonly property string settingsHelp: qsTr("Unavailable with the current settings or device.") +
-                (target && target.settingsHelp ? "\n" + target.settingsHelp : "")
+            // A whole section may be disabled by the same prerequisite as its children.
+            function inheritedHint(name) {
+                for (var item = target && (target.editor || target); item && item !== settingsPage; item = item.parent)
+                    if (item[name]) return item[name]
+                return null
+            }
+            readonly property var unlockSetting: inheritedHint("prerequisiteRow")
+            readonly property string settingsHelp: inheritedHint("unavailableReason") ||
+                (unlockSetting ? qsTr("Turn on %1 to change %2.").arg(unlockSetting.settingsLabel).arg(settingsLabel) :
+                 target && target.settingsHelp ? target.settingsHelp : qsTr("Unavailable on this device."))
             visible: !!target && target.visible && (!target.editor || target.editor.visible) && (!target.enabled || !!target.editor && !target.editor.enabled)
             activeFocusOnTab: visible
             onVisibleChanged: if (visible && target) Qt.callLater(syncGeometry)
@@ -195,15 +207,20 @@ FocusScope {
             onActiveFocusChanged: if (activeFocus) { syncGeometry(); settingsShell.rowFocused(this) }
             Keys.onPressed: function(event) { event.accepted = settingsShell.handleRowKey(this, event) }
             ConsoleFocus { focused: parent.activeFocus; radius: Style.px(6, settingsShell.Window.window) }
-            MouseArea { anchors.fill: parent; onClicked: { parent.forceActiveFocus(); settingsShell.optionsAction() } }
+            MouseArea { anchors.fill: parent; onClicked: { parent.forceActiveFocus(); settingsShell.activateRow(parent) } }
         }
     }
-    ConsoleValueEditor { id: valueEditor }
+    ConsoleValueEditor { id: valueEditor; hostWindow: settingsShell.Window.window }
     NavigableMessageDialog {
         id: helpDialog
         objectName: "settingsHelpDialog"
         title: settingsShell.activeRow ? settingsShell.activeRow.settingsLabel : ""
-        text: settingsShell.activeRow ? settingsShell.activeRow.settingsHelp : ""
+        text: {
+            var row = settingsShell.activeRow
+            if (!row) return ""
+            var detail = row.disabledSettingProxy && row.target ? row.target.settingsHelp : ""
+            return detail && detail !== row.settingsHelp ? row.settingsHelp + "\n\n" + detail : row.settingsHelp
+        }
         standardButtons: Dialog.Close
         width: Math.min(Style.px(720, settingsShell.Window.window), settingsShell.width - Style.px(48, settingsShell.Window.window))
         onClosed: Qt.callLater(function() { if (settingsShell.activeRow) settingsShell.activeRow.forceActiveFocus() })
@@ -1081,6 +1098,7 @@ FocusScope {
                         ConsoleListRow {
                             text: qsTr("Fix it")
                             visible: NetworkBuffers.canApply
+                            property string unavailableReason: qsTr("Wait for the current network change to finish.")
                             enabled: !NetworkBuffers.busy
                             onClicked: NetworkBuffers.apply()
 
@@ -1115,6 +1133,7 @@ FocusScope {
                     objectName: "pyrowaveCalibrationOpen"
                     text: qsTr("Calibrate PyroWave…")
                     visible: SystemProperties.hasPyroWave && slider.pyroWave
+                    property string unavailableReason: qsTr("Wait for calibration to finish.")
                     enabled: !PyroWaveCalibrator.running
                     onClicked: calibrationDialog.open()
                 }
@@ -1146,7 +1165,7 @@ FocusScope {
                     readonly property bool canContinue: resultsMatch && PyroWaveCalibrator.bandwidthReady
                     title: step === 0 ? qsTr("1 of 2 · Connection & quality") : qsTr("2 of 2 · Decoder stress test")
                     width: Math.min(settingsPage.width - 24, step === 0 ? 850 : 1100)
-                    height: Math.min(settingsPage.height - 24, step === 0 ? 480 : 760)
+                    height: Math.min(settingsShell.height - 24, step === 0 ? Style.px(540, settingsShell.Window.window) : 760)
                     standardButtons: Dialog.NoButton
                     focus: true
                     background: Rectangle {
@@ -1450,16 +1469,23 @@ FocusScope {
                         }
                     }
 
-                    contentItem: StackLayout {
-                        currentIndex: calibrationDialog.step
-                        ScrollView {
+                    contentItem: Item {
+                        // The dialog sizes the viewport. Wrapped text and scrollable
+                        // content must not feed size hints back into that viewport.
+                        Flickable {
                             id: calibrationConnectionScroll
                             objectName: "pyrowaveCalibrationConnectionScroll"
+                            anchors.fill: parent
+                            visible: calibrationDialog.step === 0
                             clip: true
-                            contentWidth: availableWidth
+                            contentWidth: width
+                            contentHeight: connectionContent.height
+                            boundsBehavior: Flickable.StopAtBounds
+                            ScrollBar.vertical: ScrollBar {}
                             ColumnLayout {
-                                width: calibrationConnectionScroll.availableWidth
-                                height: Math.max(implicitHeight, calibrationConnectionScroll.availableHeight)
+                                id: connectionContent
+                                width: calibrationConnectionScroll.width
+                                height: Math.max(implicitHeight, calibrationConnectionScroll.height)
                                 spacing: Style.px(12, settingsShell.Window.window)
                                 RowLayout {
                                     Layout.fillWidth: true
@@ -1468,6 +1494,7 @@ FocusScope {
                                         id: calibrationHost
                                         objectName: "pyrowaveCalibrationHost"
                                         Layout.fillWidth: true
+                                        Layout.preferredWidth: 1
                                         model: calibrationSelection.hosts
                                         textRole: "name"
                                         currentIndex: calibrationSelection.currentIndex
@@ -1506,7 +1533,9 @@ FocusScope {
                                             objectName: "pyrowaveCalibrationTarget" + index
                                             Layout.fillWidth: true
                                             Layout.preferredWidth: Style.px(1, settingsShell.Window.window)
-                                            Layout.preferredHeight: Style.px(82, settingsShell.Window.window)
+                                            Layout.preferredHeight: Math.max(Style.px(82, settingsShell.Window.window),
+                                                                             implicitContentHeight + topPadding + bottomPadding)
+                                            padding: Style.px(8, settingsShell.Window.window)
                                             text: modelData.text
                                             checked: calibrationDialog.targetIndex === index
                                             enabled: !PyroWaveCalibrator.running
@@ -1518,6 +1547,7 @@ FocusScope {
                                                 ConsoleText {
                                                     width: parent.width
                                                     text: (targetCard.checked ? "\u2713 " : "") + targetCard.text
+                                                    role: "caption"
                                                     font.bold: targetCard.checked
                                                     horizontalAlignment: Text.AlignHCenter
                                                     elide: Text.ElideRight
@@ -1526,6 +1556,7 @@ FocusScope {
                                                 ConsoleText {
                                                     width: parent.width
                                                     text: modelData.summary
+                                                    role: "caption"
                                                     horizontalAlignment: Text.AlignHCenter
                                                     wrapMode: Text.Wrap
                                                     color: "#c7c7c7"
@@ -1624,6 +1655,8 @@ FocusScope {
                             }
                         }
                         ColumnLayout {
+                            anchors.fill: parent
+                            visible: calibrationDialog.step === 1
                             spacing: Style.px(8, settingsShell.Window.window)
                             ConsoleText {
                                 Layout.fillWidth: true
@@ -1945,6 +1978,8 @@ FocusScope {
                     property bool vrrForced: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
                     onVrrForcedChanged: reinitialize()
                     visible: SystemProperties.hasDesktopEnvironment
+                    property Item prerequisiteRow: SystemProperties.rendererAlwaysFullScreen ? null : vrrCheck
+                    property string unavailableReason: SystemProperties.rendererAlwaysFullScreen ? qsTr("This renderer requires fullscreen.") : qsTr("Turn off VRR to choose a display mode.")
                     enabled: !SystemProperties.rendererAlwaysFullScreen && !vrrForced
                     hoverEnabled: true
                     textRole: "text"
@@ -1990,6 +2025,7 @@ FocusScope {
                         hoverEnabled: true
                         text: qsTr("Frame pacing")
                         font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
+                        property Item prerequisiteRow: vsyncCheck
                         enabled: StreamingPreferences.enableVsync
                         checked: StreamingPreferences.enableVsync && StreamingPreferences.framePacing
                         onCheckedChanged: {
@@ -2004,8 +2040,10 @@ FocusScope {
                     ConsoleCheckBox {
                         width: parent.width
                         hoverEnabled: true
+                        id: vrrCheck
                         text: qsTr("VRR")
                         font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
+                        property Item prerequisiteRow: vsyncCheck
                         enabled: StreamingPreferences.enableVsync
                         checked: StreamingPreferences.enableVrr
                         onCheckedChanged: {
@@ -2025,6 +2063,7 @@ FocusScope {
                 VrrTimingSettings {
                     width: parent.width
                     visible: StreamingPreferences.enableVrr
+                    property Item prerequisiteRow: StreamingPreferences.enableVsync ? vrrCheck : vsyncCheck
                     enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
                     bufferPerMille: StreamingPreferences.vrrBufferPerMille
                     targetHundredths: StreamingPreferences.vrrTargetHundredths
@@ -2039,9 +2078,11 @@ FocusScope {
 
                 ConsoleCheckBox {
                     hoverEnabled: true
+                    id: reduceJudderCheck
                     text: qsTr("Reduce judder")
                     font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
                     visible: StreamingPreferences.enableVrr
+                    property Item prerequisiteRow: StreamingPreferences.enableVsync ? vrrCheck : vsyncCheck
                     enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
                     checked: StreamingPreferences.smoothVrrFrameTiming
                     onCheckedChanged: StreamingPreferences.smoothVrrFrameTiming = checked
@@ -2058,6 +2099,7 @@ FocusScope {
                     text: qsTr("Absorb microstutter (adds latency)")
                     font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
                     visible: StreamingPreferences.enableVrr
+                    property Item prerequisiteRow: !StreamingPreferences.enableVsync ? vsyncCheck : !StreamingPreferences.enableVrr ? vrrCheck : reduceJudderCheck
                     enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr &&
                              StreamingPreferences.smoothVrrFrameTiming
                     checked: StreamingPreferences.absorbVrrMicrostutter
@@ -2156,6 +2198,7 @@ FocusScope {
 
                 ConsoleListRow {
                     text: StreamingPreferences.exportingDiagnostics ? qsTr("Exporting...") : qsTr("Export latest recording (ZIP)")
+                    property string unavailableReason: qsTr("Wait for the current export to finish.")
                     enabled: !StreamingPreferences.exportingDiagnostics
                     onClicked: StreamingPreferences.exportLatestDiagnostics()
                 }
@@ -2776,6 +2819,14 @@ FocusScope {
                 anchors.fill: parent
                 spacing: 0
 
+                ConsoleText {
+                    width: parent.width; leftPadding: Style.px(16, settingsShell.Window.window)
+                    bottomPadding: Style.px(12, settingsShell.Window.window)
+                    role: "secondary"; wrapMode: Text.Wrap
+                    text: SdlGamepadKeyNavigation.disconnectShortcut ?
+                          qsTr("Disconnect from a stream: %1").arg(SdlGamepadKeyNavigation.disconnectShortcut) :
+                          qsTr("Disconnect from a stream: Ctrl+Alt+Shift+Q")
+                }
                 ConsoleCheckBox {
                     id: swapFaceButtonsCheck
                     width: parent.width
@@ -2861,6 +2912,7 @@ FocusScope {
                     id: steamControllerMotionCheck
                     hoverEnabled: true
                     width: parent.width
+                    property Item prerequisiteRow: steamControllerCheck
                     enabled: steamControllerCheck.checked
                     text: qsTr("Steam Controller: gyro and accelerometer")
                     font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
@@ -2879,6 +2931,7 @@ FocusScope {
                     id: steamControllerSplitPadsCheck
                     hoverEnabled: true
                     width: parent.width
+                    property Item prerequisiteRow: steamControllerCheck
                     enabled: steamControllerCheck.checked
                     text: qsTr("Steam Controller: trackpads as DualShock touchpad halves")
                     font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
@@ -2904,6 +2957,7 @@ FocusScope {
                 }
                     editor: AutoResizingComboBox {
                     id: steamControllerGripsComboBox
+                    property Item prerequisiteRow: steamControllerCheck
                     enabled: steamControllerCheck.checked
                     textRole: "text"
 
@@ -2954,6 +3008,7 @@ FocusScope {
                 }
                     editor: AutoResizingComboBox {
                     id: steamControllerRumbleHoldComboBox
+                    property Item prerequisiteRow: steamControllerCheck
                     enabled: steamControllerCheck.checked
                     textRole: "text"
 
@@ -3008,6 +3063,7 @@ FocusScope {
                     id: steamControllerStickStretchCheck
                     hoverEnabled: true
                     width: parent.width
+                    property Item prerequisiteRow: steamControllerCheck
                     enabled: steamControllerCheck.checked
                     text: qsTr("Steam Controller: stretch the sticks to the rim")
                     font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
@@ -3032,6 +3088,7 @@ FocusScope {
                 }
                     editor: AutoResizingComboBox {
                     id: steamControllerHapticBoostComboBox
+                    property Item prerequisiteRow: steamControllerCheck
                     enabled: steamControllerCheck.checked
                     textRole: "text"
 
@@ -3088,6 +3145,7 @@ FocusScope {
                 }
                     editor: AutoResizingComboBox {
                     id: steamControllerHapticPulseScaleComboBox
+                    property Item prerequisiteRow: steamControllerCheck
                     enabled: steamControllerCheck.checked
                     textRole: "text"
 
@@ -3144,6 +3202,7 @@ FocusScope {
                 }
                     editor: AutoResizingComboBox {
                     id: steamControllerHapticMasterGainComboBox
+                    property Item prerequisiteRow: steamControllerCheck
                     enabled: steamControllerCheck.checked
                     textRole: "text"
 

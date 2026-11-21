@@ -4,7 +4,7 @@ import QtQuick.Window 2.2
 import StreamingPreferences 1.0
 import "ConsoleStyle.js" as Style
 
-ListView {
+GridView {
     id: shelf
     property int selectedAppId: 0
     property bool modelChanging: false
@@ -15,18 +15,28 @@ ListView {
     signal moveDown()
     signal playRequested()
     signal detailsRequested()
-    orientation: ListView.Horizontal
+    property bool gridMode: false
+    property int columns: 1
+    readonly property int pageRows: gridMode ? Math.max(1, Math.floor(height / Style.px(170, Window.window))) : 1
+    readonly property int gap: Style.px(16, Window.window)
+    readonly property int captionHeight: Style.px(28, Window.window)
+    flow: gridMode ? GridView.FlowLeftToRight : GridView.FlowTopToBottom
     clip: true
     activeFocusOnTab: true
-    leftMargin: Style.px(64, Window.window)
+    keyNavigationEnabled: false
+    leftMargin: gridMode ? 0 : Style.px(64, Window.window)
     rightMargin: leftMargin
-    spacing: Style.px(20, Window.window)
+    cellHeight: Math.max(1, Math.floor(height / pageRows))
+    cellWidth: gridMode ? Math.max(1, Math.floor(width / columns)) :
+                          Math.max(1, (cellHeight - captionHeight - Style.px(12, Window.window)) * 0.72 + gap)
     boundsBehavior: Flickable.StopAtBounds
     highlightMoveDuration: StreamingPreferences.uiReducedMotion ? 0 : 120
-    highlightRangeMode: ListView.ApplyRange
-    preferredHighlightBegin: leftMargin
-    preferredHighlightEnd: width - rightMargin
 
+    function jumpPage(direction) {
+        if (!gridMode || count === 0) return
+        currentIndex = Math.max(0, Math.min(count - 1, currentIndex + direction * columns * pageRows))
+        positionViewAtIndex(currentIndex, GridView.Contain)
+    }
     function currentApp() { return model ? model.get(currentIndex) : ({}) }
     function updateSelection() {
         if (modelChanging) return
@@ -55,26 +65,49 @@ ListView {
         function onLayoutChanged() { shelf.queueRestore() }
         function onDataChanged() { shelf.selectionChanged() }
     }
-    Keys.onLeftPressed: { if (currentIndex > 0) decrementCurrentIndex() }
-    Keys.onRightPressed: { if (currentIndex < count - 1) incrementCurrentIndex() }
-    Keys.onUpPressed: moveUp()
-    Keys.onDownPressed: moveDown()
+    Keys.onPressed: function(event) {
+        if (gridMode && (event.modifiers & Qt.ControlModifier) && (event.key === Qt.Key_PageUp || event.key === Qt.Key_PageDown)) {
+            jumpPage(event.key === Qt.Key_PageUp ? -1 : 1)
+            event.accepted = true
+        }
+    }
+    Keys.onLeftPressed: if (currentIndex > 0) --currentIndex
+    Keys.onRightPressed: if (currentIndex + 1 < count) ++currentIndex
+    Keys.onUpPressed: {
+        if (gridMode && currentIndex >= columns) currentIndex -= columns
+        else moveUp()
+    }
+    Keys.onDownPressed: {
+        if (gridMode && Math.floor(currentIndex / columns) < Math.floor((count - 1) / columns))
+            currentIndex = Math.min(count - 1, currentIndex + columns)
+        else moveDown()
+    }
     Keys.onReturnPressed: playRequested()
     Keys.onEnterPressed: playRequested()
     Keys.onSpacePressed: playRequested()
     Keys.onMenuPressed: detailsRequested()
     delegate: Item {
-        width: cover.width
-        height: shelf.height
+        width: shelf.cellWidth
+        height: shelf.cellHeight
+        Accessible.role: Accessible.ListItem
+        Accessible.name: model.name
+        ConsoleText {
+            anchors.top: cover.bottom; anchors.topMargin: Style.px(2, shelf.Window.window)
+            x: shelf.gridMode ? shelf.gap / 2 : 0; width: parent.width - shelf.gap
+            horizontalAlignment: shelf.gridMode ? Text.AlignHCenter : Text.AlignLeft
+            role: "secondary"; text: model.name; elide: Text.ElideRight
+            visible: cover.current
+        }
         Rectangle {
             id: cover
             readonly property bool current: shelf.currentIndex === index && shelf.showCurrent
             readonly property bool selected: current && shelf.activeFocus
             readonly property bool appRunning: !!model.running
             readonly property bool appHidden: !!model.hidden
-            x: 0; y: Style.px(6, shelf.Window.window)
-            height: parent.height - 2 * y
-            width: height * 0.72
+            x: shelf.gridMode ? (parent.width - width) / 2 : 0
+            y: Style.px(6, shelf.Window.window)
+            width: Math.max(1, Math.min(parent.width - shelf.gap, (parent.height - shelf.captionHeight - 2 * y) * 0.72))
+            height: width / 0.72
             color: Style.surface
             border.width: 1; border.color: Style.outline
             Image {

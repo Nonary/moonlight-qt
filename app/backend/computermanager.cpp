@@ -5,6 +5,7 @@
 
 #include <Limelight.h>
 #include <QtEndian>
+#include <atomic>
 
 #include <QThread>
 #include <QThreadPool>
@@ -27,6 +28,8 @@ public:
     {
         setObjectName("Polling thread for " + computer->name);
     }
+
+    void requestAppList() { m_AppListRequested.store(true); }
 
 private:
     bool tryPollComputer(QNetworkAccessManager* nam, NvAddress address, bool& changed)
@@ -99,6 +102,7 @@ private:
         // Always fetch the applist the first time
         int pollsSinceLastAppListFetch = POLLS_PER_APPLIST_FETCH;
         while (!isInterruptionRequested()) {
+            const bool refreshApps = m_AppListRequested.exchange(false);
             bool stateChanged = false;
             bool online = false;
             bool wasOnline = m_Computer->state == NvComputer::CS_ONLINE;
@@ -131,7 +135,7 @@ private:
             pollsSinceLastAppListFetch++;
             if (m_Computer->state == NvComputer::CS_ONLINE &&
                     m_Computer->pairState == NvComputer::PS_PAIRED &&
-                    (m_Computer->appList.isEmpty() || pollsSinceLastAppListFetch >= POLLS_PER_APPLIST_FETCH)) {
+                    (refreshApps || m_Computer->appList.isEmpty() || pollsSinceLastAppListFetch >= POLLS_PER_APPLIST_FETCH)) {
                 // Notify prior to the app list poll since it may take a while, and we don't
                 // want to delay onlining of a machine, especially if we already have a cached list.
                 if (stateChanged) {
@@ -152,7 +156,7 @@ private:
             // Wait a bit to poll again, but do it in 100 ms chunks
             // so we can be interrupted reasonably quickly.
             // FIXME: QWaitCondition would be better.
-            for (int i = 0; i < 30 && !isInterruptionRequested(); i++) {
+            for (int i = 0; i < 30 && !isInterruptionRequested() && !m_AppListRequested.load(); i++) {
                 QThread::msleep(100);
             }
         }
@@ -163,6 +167,7 @@ signals:
 
 private:
     NvComputer* m_Computer;
+    std::atomic_bool m_AppListRequested{false};
 };
 
 ComputerManager::ComputerManager(StreamingPreferences* prefs)
@@ -422,6 +427,22 @@ void ComputerManager::startPollingComputer(NvComputer* computer)
         pollingEntry->setActiveThread(thread);
         thread->start();
     }
+}
+
+void ComputerManager::retryAppList(NvComputer* computer)
+{
+    QReadLocker managerLock(&m_Lock);
+    auto* entry = m_PollEntries.value(computer->uuid);
+    if (!entry || !entry->activeThread()) return;
+    {
+        QWriteLocker hostLock(&computer->lock);
+        if (!computer->appListFetchFailed) return;
+        computer->appListFetchFailed = false;
+        computer->appListFetchCompleted = false;
+    }
+    static_cast<PcMonitorThread*>(entry->activeThread())->requestAppList();
+    managerLock.unlock();
+    emit computerStateChanged(computer);
 }
 
 void ComputerManager::handleMdnsServiceResolved(MdnsPendingComputer* computer,

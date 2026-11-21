@@ -6,15 +6,19 @@
 
 #include "settings/mappingmanager.h"
 
-#define AXIS_NAVIGATION_REPEAT_DELAY 150
+namespace {
+constexpr int AxisPress = SDL_JOYSTICK_AXIS_MAX * 60 / 100;
+constexpr int AxisRelease = SDL_JOYSTICK_AXIS_MAX * 40 / 100;
+constexpr Uint32 InitialRepeatMs = 350;
+constexpr Uint32 RepeatMs = 90;
+}
 
 SdlGamepadKeyNavigation::SdlGamepadKeyNavigation(StreamingPreferences* prefs)
     : m_Prefs(prefs),
       m_Enabled(false),
       m_UiNavMode(false),
       m_FirstPoll(false),
-      m_HasFocus(false),
-      m_LastAxisNavigationEventTime(0)
+      m_HasFocus(false)
 {
     QCoreApplication::instance()->installEventFilter(this);
     m_PollingTimer = new QTimer(this);
@@ -87,6 +91,7 @@ void SdlGamepadKeyNavigation::disable()
     }
 
     m_Enabled = false;
+    m_Axes.clear();
     releaseControllerKeys();
     updateTimerState();
     Q_ASSERT(!m_PollingTimer->isActive());
@@ -120,6 +125,7 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
         releaseControllerKeys();
         SDL_FlushEvent(SDL_CONTROLLERBUTTONDOWN);
         SDL_FlushEvent(SDL_CONTROLLERBUTTONUP);
+        suppressHeldAxes();
         m_FirstPoll = false;
     }
 
@@ -163,7 +169,7 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
                 const bool directional = event.cbutton.button >= SDL_CONTROLLER_BUTTON_DPAD_UP &&
                                          event.cbutton.button <= SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
                 m_PressedControllerKeys.insert(buttonId, {key, modifiers, target,
-                    SDL_GetTicks() + 350, directional, m_UiNavMode});
+                    SDL_GetTicks() + InitialRepeatMs, directional, m_UiNavMode});
                 sendKey(type, key, modifiers, target);
             };
 
@@ -242,6 +248,7 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
             break;
         }
         case SDL_CONTROLLERDEVICEREMOVED:
+            m_Axes.remove(event.cdevice.which);
             // A disconnected pad must not leave a pressed key or stale hints.
             releaseControllerKeys();
             for (int i = m_Gamepads.size() - 1; i >= 0; --i) {
@@ -284,58 +291,68 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
         const ControllerKey key = live.value();
         if (key.repeatable && key.navigationMode == m_UiNavMode && key.window &&
             key.window == QGuiApplication::focusWindow() && Sint32(now - key.nextRepeat) >= 0) {
-            live->nextRepeat = now + 90;
+            live->nextRepeat = now + RepeatMs;
             sendKey(QEvent::KeyPress, key.key, key.modifiers, key.window, true);
         }
     }
 
-    // Handle analog sticks by polling
+    // Dispatch can synchronously hand controller ownership to a stream.
+    const auto gamepads = m_Gamepads;
+    for (auto* gc : gamepads) {
+        if (m_Gamepads.contains(gc)) pollAxes(gc, now);
+    }
+}
+
+void SdlGamepadKeyNavigation::pollAxes(SDL_GameController* gc, Uint32 now)
+{
+    auto& state = m_Axes[SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc))];
+    // Triggers page the focused grid or value editor. Hysteresis makes one
+    // physical pull one page even if the analog reading varies while held.
+    const auto trigger = [&](SDL_GameControllerAxis axis, bool& held, Qt::Key key) {
+        const int value = SDL_GameControllerGetAxis(gc, axis);
+        if (value <= AxisRelease) held = false;
+        if (held || value < AxisPress) return false;
+        held = true;
+        noteController(gc);
+        sendKey(QEvent::KeyPress, key, Qt::ControlModifier);
+        sendKey(QEvent::KeyRelease, key, Qt::ControlModifier);
+        return true;
+    };
+    // A handler may clear the device state. Read the next axis on the next poll.
+    if (trigger(SDL_CONTROLLER_AXIS_TRIGGERLEFT, state.leftTrigger, Qt::Key_PageUp) ||
+        trigger(SDL_CONTROLLER_AXIS_TRIGGERRIGHT, state.rightTrigger, Qt::Key_PageDown)) return;
+
+    const int x = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
+    const int y = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
+    const int magnitude = qMax(qAbs(x), qAbs(y));
+    if (magnitude <= AxisRelease) {
+        state.direction = Qt::Key_unknown;
+        state.stickBlocked = false;
+        return;
+    }
+    if (state.stickBlocked || magnitude < AxisPress) return;
+    Qt::Key key = qAbs(x) > qAbs(y) ? (x > 0 ? Qt::Key_Right : Qt::Key_Left)
+                                    : (y > 0 ? Qt::Key_Down : Qt::Key_Up);
+    const bool repeat = state.direction == key;
+    if (repeat && Sint32(now - state.nextRepeat) < 0) return;
+    state.direction = key;
+    state.nextRepeat = now + (repeat ? RepeatMs : InitialRepeatMs);
+    if (m_UiNavMode && key == Qt::Key_Down) key = Qt::Key_Tab;
+    if (m_UiNavMode && key == Qt::Key_Up) key = Qt::Key_Backtab;
+    noteController(gc);
+    sendKey(QEvent::KeyPress, key, Qt::NoModifier, nullptr, repeat);
+    sendKey(QEvent::KeyRelease, key);
+}
+
+void SdlGamepadKeyNavigation::suppressHeldAxes()
+{
     for (auto gc : std::as_const(m_Gamepads)) {
-        short leftX = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
-        short leftY = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
-        const auto axisController = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc));
-        if (qAbs(int(leftX)) <= 30000 && qAbs(int(leftY)) <= 30000)
-            m_SuppressedAxes.remove(axisController);
-        if (m_SuppressedAxes.contains(axisController)) continue;
-        if (qAbs(int(leftX)) > 30000 || qAbs(int(leftY)) > 30000) noteController(gc);
-        if (SDL_GetTicks() - m_LastAxisNavigationEventTime < AXIS_NAVIGATION_REPEAT_DELAY) {
-            // Do nothing
-        }
-        else if (leftY < -30000) {
-            if (m_UiNavMode) {
-                // Back-tab
-                sendKey(QEvent::Type::KeyPress, Qt::Key_Backtab);
-                sendKey(QEvent::Type::KeyRelease, Qt::Key_Backtab);
-            }
-            else {
-                sendKey(QEvent::Type::KeyPress, Qt::Key_Up);
-                sendKey(QEvent::Type::KeyRelease, Qt::Key_Up);
-            }
-
-            m_LastAxisNavigationEventTime = SDL_GetTicks();
-        }
-        else if (leftY > 30000) {
-            if (m_UiNavMode) {
-                sendKey(QEvent::Type::KeyPress, Qt::Key_Tab);
-                sendKey(QEvent::Type::KeyRelease, Qt::Key_Tab);
-            }
-            else {
-                sendKey(QEvent::Type::KeyPress, Qt::Key_Down);
-                sendKey(QEvent::Type::KeyRelease, Qt::Key_Down);
-            }
-
-            m_LastAxisNavigationEventTime = SDL_GetTicks();
-        }
-        else if (leftX < -30000) {
-            sendKey(QEvent::Type::KeyPress, Qt::Key_Left);
-            sendKey(QEvent::Type::KeyRelease, Qt::Key_Left);
-            m_LastAxisNavigationEventTime = SDL_GetTicks();
-        }
-        else if (leftX > 30000) {
-            sendKey(QEvent::Type::KeyPress, Qt::Key_Right);
-            sendKey(QEvent::Type::KeyRelease, Qt::Key_Right);
-            m_LastAxisNavigationEventTime = SDL_GetTicks();
-        }
+        auto& state = m_Axes[SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc))];
+        state.direction = Qt::Key_unknown;
+        state.stickBlocked = qAbs(int(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX))) > AxisRelease ||
+                             qAbs(int(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY))) > AxisRelease;
+        state.leftTrigger = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > AxisRelease;
+        state.rightTrigger = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > AxisRelease;
     }
 }
 
@@ -383,11 +400,7 @@ void SdlGamepadKeyNavigation::setUiNavMode(bool uiNavMode)
     // use arrows. A held direction must not continue into a newly opened editor.
     for (auto key = m_PressedControllerKeys.begin(); key != m_PressedControllerKeys.end(); ++key)
         key->repeatable = false;
-    for (auto gc : std::as_const(m_Gamepads)) {
-        if (qAbs(int(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX))) > 30000 ||
-            qAbs(int(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY))) > 30000)
-            m_SuppressedAxes.insert(SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc)));
-    }
+    suppressHeldAxes();
     m_UiNavMode = uiNavMode;
 }
 
@@ -429,19 +442,40 @@ QString SdlGamepadKeyNavigation::familyForControllerType(int type)
     return family;
 }
 
+QString SdlGamepadKeyNavigation::shortcutForControllerType(int type)
+{
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+    if (type == SDL_CONTROLLER_TYPE_PS3) return QStringLiteral("Select + Start + L1 + R1");
+    if (type == SDL_CONTROLLER_TYPE_PS4) return QStringLiteral("Share + Options + L1 + R1");
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    if (type == SDL_CONTROLLER_TYPE_PS5) return QStringLiteral("Create + Options + L1 + R1");
+#endif
+    if (type == SDL_CONTROLLER_TYPE_XBOX360) return QStringLiteral("Back + Start + LB + RB");
+    if (familyForControllerType(type) == "nintendo") return tr("Minus + Plus + L + R");
+#endif
+    return QStringLiteral("View + Menu + LB + RB");
+}
+
+QString SdlGamepadKeyNavigation::disconnectShortcut() const
+{
+    if (m_Gamepads.isEmpty() || qgetenv("NO_GAMEPAD_QUIT") == "1") return {};
+    return m_DisconnectShortcut;
+}
+
 void SdlGamepadKeyNavigation::noteController(SDL_GameController* controller)
 {
     if (!controller) return;
-    const QString family = familyForControllerType(
 #if SDL_VERSION_ATLEAST(2, 0, 12)
-        SDL_GameControllerGetType(controller)
+    const int type = SDL_GameControllerGetType(controller);
 #else
-        0
+    const int type = 0;
 #endif
-    );
-    if (m_InputMethod != "controller" || m_ControllerFamily != family) {
+    const QString family = familyForControllerType(type);
+    const QString shortcut = shortcutForControllerType(type);
+    if (m_InputMethod != "controller" || m_ControllerFamily != family || m_DisconnectShortcut != shortcut) {
         m_InputMethod = "controller";
         m_ControllerFamily = family;
+        m_DisconnectShortcut = shortcut;
         emit navigationStateChanged();
     }
 }

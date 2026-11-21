@@ -32,6 +32,7 @@ Column {
     ConsoleListRow {
         objectName: "pyrowavePacketSpeedAutomatic"
         text: qsTr("Use automatic packet speed")
+        property string unavailableReason: qsTr("Packet speed is already automatic.")
         enabled: root.paceMbps !== 0
         onClicked: root.paceEdited(0)
     }

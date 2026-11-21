@@ -168,8 +168,8 @@ Item {
             // in the hintText control itself to synchronize
             // with Session.exec() which requires no concurrent
             // gamepad usage.
-            hintText.text = qsTr("Tip:") + " " + qsTr("Press %1 to disconnect your session").arg(SdlGamepadKeyNavigation.getConnectedGamepads() > 0 ?
-                                                  qsTr("Start+Select+L1+R1") : qsTr("Ctrl+Alt+Shift+Q"))
+            var shortcut = SdlGamepadKeyNavigation.disconnectShortcut || qsTr("Ctrl+Alt+Shift+Q")
+            hintText.text = qsTr("Press %1 to disconnect your session.").arg(shortcut)
 
             // Stop GUI gamepad usage now
             SdlGamepadKeyNavigation.disable()

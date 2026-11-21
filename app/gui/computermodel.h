@@ -54,6 +54,7 @@ public:
 
 signals:
     void onlineHostsChanged();
+    void wakeRequestFinished(QString uuid, bool sent);
     void pairingCompleted(QVariant error);
     void connectionTestCompleted(int result, QString blockedPorts);
 

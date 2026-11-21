@@ -166,27 +166,31 @@ void ComputerModel::deleteComputer(int computerIndex)
     emit onlineHostsChanged();
 }
 
-class DeferredWakeHostTask : public QRunnable
+class DeferredWakeHostTask : public QObject, public QRunnable
 {
+    Q_OBJECT
 public:
-    DeferredWakeHostTask(NvComputer* computer)
-        : m_Computer(computer) {}
+    explicit DeferredWakeHostTask(const NvComputer& computer) : m_Computer(computer) {}
 
-    void run()
-    {
-        m_Computer->wake();
-    }
+    void run() override { emit finished(m_Computer.uuid, m_Computer.wake()); }
+
+signals:
+    void finished(QString uuid, bool sent);
 
 private:
-    NvComputer* m_Computer;
+    // Network resolution can outlive the card or even removal of the host.
+    NvComputer m_Computer;
 };
 
 void ComputerModel::wakeComputer(int computerIndex)
 {
-    Q_ASSERT(computerIndex < m_Computers.count());
-
-    DeferredWakeHostTask* wakeTask = new DeferredWakeHostTask(m_Computers[computerIndex]);
-    QThreadPool::globalInstance()->start(wakeTask);
+    if (computerIndex < 0 || computerIndex >= m_Computers.size()) return;
+    auto* computer = m_Computers.at(computerIndex);
+    QReadLocker lock(&computer->lock);
+    auto* task = new DeferredWakeHostTask(*computer);
+    lock.unlock();
+    connect(task, &DeferredWakeHostTask::finished, this, &ComputerModel::wakeRequestFinished);
+    QThreadPool::globalInstance()->start(task);
 }
 
 void ComputerModel::renameComputer(int computerIndex, QString name)

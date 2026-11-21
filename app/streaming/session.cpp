@@ -623,6 +623,7 @@ bool Session::populateDecoderProperties(SDL_Window* window)
 
 Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *preferences)
     : m_Preferences(preferences ? preferences : StreamingPreferences::get()),
+      m_RequestedVideo(m_Preferences->videoSettingsForApp(preferences ? QString() : computer->uuid, app.id)),
       m_IsFullScreen(m_Preferences->windowMode != StreamingPreferences::WM_WINDOWED || !WMUtils::isRunningDesktopEnvironment()),
       m_Computer(computer),
       m_App(app),
@@ -764,13 +765,13 @@ bool Session::initialize(QQuickWindow* qtWindow)
             // Check if this display has a notch (safeArea != desktopMode)
             if (desktopMode.h != safeArea.h || desktopMode.w != safeArea.w) {
                 // Check if we're trying to stream at the full native resolution (including notch)
-                if (m_Preferences->width == desktopMode.w && m_Preferences->height == desktopMode.h) {
+                if (m_RequestedVideo.resolution.width() == desktopMode.w && m_RequestedVideo.resolution.height() == desktopMode.h) {
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                                 "Overriding default fullscreen mode for native fullscreen resolution");
                     shouldUseFullScreenSpaces = false;
                     break;
                 }
-                else if (m_Preferences->width == safeArea.w && m_Preferences->height == safeArea.h) {
+                else if (m_RequestedVideo.resolution.width() == safeArea.w && m_RequestedVideo.resolution.height() == safeArea.h) {
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                                 "Overriding default fullscreen mode for native safe area resolution");
                     shouldUseFullScreenSpaces = true;
@@ -815,8 +816,8 @@ bool Session::initialize(QQuickWindow* qtWindow)
     SDL_StopTextInput();
 
     LiInitializeStreamConfiguration(&m_StreamConfig);
-    m_StreamConfig.width = m_Preferences->width;
-    m_StreamConfig.height = m_Preferences->height;
+    m_StreamConfig.width = m_RequestedVideo.resolution.width();
+    m_StreamConfig.height = m_RequestedVideo.resolution.height();
 
     int x, y, width, height;
     getWindowDimensions(x, y, width, height);
@@ -843,9 +844,9 @@ bool Session::initialize(QQuickWindow* qtWindow)
     LiInitializeVideoCallbacks(&m_VideoCallbacks);
     m_VideoCallbacks.setup = drSetup;
 
-    m_StreamConfig.fps = m_Preferences->fps;
+    m_StreamConfig.fps = m_RequestedVideo.fps;
     snapshotPresentationSettings(testWindow);
-    m_StreamConfig.bitrate = m_Preferences->bitrateKbps;
+    m_StreamConfig.bitrate = m_RequestedVideo.bitrateKbps;
 
 #ifndef STEAM_LINK
     // Opt-in to all encryption features if we detect that the platform
@@ -921,12 +922,12 @@ bool Session::initialize(QQuickWindow* qtWindow)
         auto hevcDA = getDecoderAvailability(testWindow,
                                              m_Preferences->videoDecoderSelection,
                                              m_Preferences->enableYUV444 ?
-                                                 (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_REXT10_444 : VIDEO_FORMAT_H265_REXT8_444) :
-                                                 (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_MAIN10 : VIDEO_FORMAT_H265),
+                                                 (m_RequestedVideo.hdr ? VIDEO_FORMAT_H265_REXT10_444 : VIDEO_FORMAT_H265_REXT8_444) :
+                                                 (m_RequestedVideo.hdr ? VIDEO_FORMAT_H265_MAIN10 : VIDEO_FORMAT_H265),
                                              m_StreamConfig.width,
                                              m_StreamConfig.height,
                                              m_StreamConfig.fps);
-        if (hevcDA == DecoderAvailability::None && m_Preferences->enableHdr) {
+        if (hevcDA == DecoderAvailability::None && m_RequestedVideo.hdr) {
             // Remove all 10-bit HEVC profiles
             m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_H265 & VIDEO_FORMAT_MASK_10BIT);
 
@@ -957,7 +958,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
             // Deprioritize HEVC unless the user forced software decoding and enabled HDR.
             // We need HEVC in that case because we cannot support 10-bit content with H.264,
             // which would ordinarily be prioritized for software decoding performance.
-            if (m_Preferences->videoDecoderSelection != StreamingPreferences::VDS_FORCE_SOFTWARE || !m_Preferences->enableHdr) {
+            if (m_Preferences->videoDecoderSelection != StreamingPreferences::VDS_FORCE_SOFTWARE || !m_RequestedVideo.hdr) {
                 m_SupportedVideoFormats.deprioritizeByMask(VIDEO_FORMAT_MASK_H265);
             }
         }
@@ -984,12 +985,12 @@ bool Session::initialize(QQuickWindow* qtWindow)
         // because dav1d is higher performance than FFmpeg's HEVC software decoder.
         if (hevcDA == DecoderAvailability::Hardware
 #if !defined(Q_OS_WIN32) && (!(defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN)) || defined(Q_PROCESSOR_X86))
-            || !m_Preferences->enableHdr
+            || !m_RequestedVideo.hdr
 #endif
             ) {
             m_SupportedVideoFormats.deprioritizeByMask(VIDEO_FORMAT_MASK_AV1);
         }
-        else if (!m_Preferences->enableHdr &&
+        else if (!m_RequestedVideo.hdr &&
                    getDecoderAvailability(testWindow,
                                           m_Preferences->videoDecoderSelection,
                                           m_Preferences->enableYUV444 ? VIDEO_FORMAT_AV1_HIGH8_444 : VIDEO_FORMAT_AV1_MAIN8,
@@ -1062,7 +1063,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
     }
 
     // Mask off 10-bit codecs if HDR is not enabled
-    if (!m_Preferences->enableHdr) {
+    if (!m_RequestedVideo.hdr) {
         m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_10BIT);
     }
     else {
@@ -1128,8 +1129,8 @@ bool Session::initialize(QQuickWindow* qtWindow)
         m_Computer->maxLumaPixelsHEVC != 0 &&
         getDecoderAvailability(testWindow, m_Preferences->videoDecoderSelection,
             m_Preferences->enableYUV444 ?
-                (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_REXT10_444 : VIDEO_FORMAT_H265_REXT8_444) :
-                (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_MAIN10 : VIDEO_FORMAT_H265),
+                (m_RequestedVideo.hdr ? VIDEO_FORMAT_H265_REXT10_444 : VIDEO_FORMAT_H265_REXT8_444) :
+                (m_RequestedVideo.hdr ? VIDEO_FORMAT_H265_MAIN10 : VIDEO_FORMAT_H265),
             m_StreamConfig.width, m_StreamConfig.height, m_StreamConfig.fps) == DecoderAvailability::Hardware;
 
     // Check for validation errors/warnings and emit
@@ -1224,7 +1225,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
             m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_AV1);
         }
         else {
-            if (!m_Preferences->enableHdr && // HDR is checked below
+            if (!m_RequestedVideo.hdr && // HDR is checked below
                  m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_AUTO && // Force hardware decoding checked below
                  m_Preferences->videoCodecConfig != StreamingPreferences::VCC_AUTO && // Auto VCC is already checked in initialize()
                  getDecoderAvailability(testWindow,
@@ -1254,7 +1255,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
             m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_H265);
         }
         else {
-            if (!m_Preferences->enableHdr && // HDR is checked below
+            if (!m_RequestedVideo.hdr && // HDR is checked below
                  m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_AUTO && // Force hardware decoding checked below
                  m_Preferences->videoCodecConfig != StreamingPreferences::VCC_AUTO && // Auto VCC is already checked in initialize()
                  getDecoderAvailability(testWindow,
@@ -1300,7 +1301,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         }
     }
 
-    if (m_Preferences->enableHdr) {
+    if (m_RequestedVideo.hdr) {
         if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_H264) {
             emitLaunchWarning(tr("HDR is not supported using the H.264 codec."));
             m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_10BIT);
@@ -1949,7 +1950,7 @@ bool Session::startConnectionAsync()
                                                                                   m_StreamConfig.height,
                                                                                   m_StreamConfig.fps,
                                                                                   m_Preferences->enableYUV444,
-                                                                                  m_Preferences->enableHdr)) {
+                                                                                  m_RequestedVideo.hdr)) {
         m_StreamConfig.bitrate = StreamingPreferences::getDefaultBitrate(m_StreamConfig.width,
                                                                          m_StreamConfig.height,
                                                                          m_StreamConfig.fps,

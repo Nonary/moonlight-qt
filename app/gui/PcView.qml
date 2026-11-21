@@ -15,8 +15,39 @@ CenteredGridView {
     property ComputerModel computerModel : createModel()
 
     property bool startupRestorePending: true
+    readonly property string rememberedUuid: StreamingPreferences.uiLastHostUuid
+    onRememberedUuidChanged: if (computerModel) updateRememberedHost()
+    property bool rememberedHostAvailable: false
+    property var wakeStates: ({})
+    readonly property string wakeState: wakeStates[selectedHost.uuid] || ""
     readonly property string rememberedStatus: selectedHost.uuid === StreamingPreferences.uiLastHostUuid && !selectedHost.online ?
-        qsTr("%1 is unavailable. Use Options to wake it, or choose another PC.").arg(selectedHost.name) : ""
+        qsTr("%1 is unavailable.").arg(selectedHost.name) : ""
+    function updateRememberedHost() {
+        var host = computerModel.get(computerModel.indexOfUuid(rememberedUuid))
+        rememberedHostAvailable = !!(host.online && host.paired && host.serverSupported)
+    }
+    function setWakeState(uuid, state) {
+        var next = Object.assign({}, wakeStates)
+        if (state) next[uuid] = state
+        else delete next[uuid]
+        wakeStates = next
+    }
+    function wakeHost(row) {
+        var host = computerModel.get(row)
+        if (!host.wakeable || host.online || wakeStates[host.uuid] === "sending") return
+        setWakeState(host.uuid, "sending")
+        computerModel.wakeComputer(row)
+    }
+    function hostStatus() {
+        if (selectedHost.statusUnknown) return qsTr("Checking PC status…")
+        if (selectedHost.online) return !selectedHost.serverSupported ? qsTr("This host version is unsupported.") :
+                                         selectedHost.paired ? qsTr("Ready to connect") : qsTr("Pair this PC to open its library.")
+        if (wakeState === "sending") return qsTr("Sending wake request…")
+        if (wakeState === "sent") return qsTr("Wake request sent · Waiting for %1").arg(selectedHost.name)
+        if (wakeState === "failed") return qsTr("Could not send the wake request. Try again or choose another PC.")
+        return [rememberedStatus, selectedHost.wakeable ? qsTr("Wake this PC or choose another.") :
+                                                       qsTr("Open Options or choose another PC.")].filter(Boolean).join(" ")
+    }
     function openHost(row, allApps, automatic) {
         var host = computerModel.get(row)
         if (!host.online || !host.paired || !host.serverSupported) return false
@@ -30,7 +61,7 @@ CenteredGridView {
         return true
     }
     function openRememberedHost() {
-        var row = computerModel.indexOfUuid(StreamingPreferences.uiLastHostUuid)
+        var row = computerModel.indexOfUuid(rememberedUuid)
         if (row < 0) return false
         currentIndex = row
         return openHost(row, false, true)
@@ -38,7 +69,7 @@ CenteredGridView {
     function tryStartupRestore() {
         if (!startupRestorePending || StackView.status !== StackView.Active) return
         if (typeof window !== "undefined" && window.popupHasFocus()) return
-        var row = computerModel.indexOfUuid(StreamingPreferences.uiLastHostUuid)
+        var row = computerModel.indexOfUuid(rememberedUuid)
         if (row >= 0 && !computerModel.get(row).statusUnknown) {
             openRememberedHost()
             startupRestorePending = false
@@ -46,6 +77,11 @@ CenteredGridView {
     }
     Connections {
         target: pcGrid.computerModel
+        function onWakeRequestFinished(uuid, sent) {
+            var host = pcGrid.computerModel.get(pcGrid.computerModel.indexOfUuid(uuid))
+            if (host.uuid === uuid && !host.online && pcGrid.wakeStates[uuid] === "sending")
+                pcGrid.setWakeState(uuid, sent ? "sent" : "failed")
+        }
         function onDataChanged() { pcGrid.refreshHost(); Qt.callLater(pcGrid.tryStartupRestore) }
         function onRowsInserted() { Qt.callLater(pcGrid.refreshAfterModelChange) }
         function onRowsRemoved() { Qt.callLater(pcGrid.refreshAfterModelChange) }
@@ -58,7 +94,9 @@ CenteredGridView {
     property var selectedHost: ({})
     readonly property bool optionsAvailable: count > 0 && !addingPc
     readonly property bool addingPc: footerItem && footerItem.button.activeFocus
-    readonly property string primaryVerb: count === 0 || addingPc ? qsTr("Add PC") : !selectedHost.online ? qsTr("Wake") : !selectedHost.paired ? qsTr("Pair") : qsTr("Open")
+    readonly property string primaryVerb: count === 0 || addingPc ? qsTr("Add PC") :
+        !selectedHost.online ? (!selectedHost.wakeable ? qsTr("Options") : wakeState === "sending" ? qsTr("Sending…") : wakeState === "sent" ? qsTr("Wake again") : qsTr("Wake")) :
+        !selectedHost.serverSupported ? qsTr("Details") : !selectedHost.paired ? qsTr("Pair") : qsTr("Open")
     function focusContent() {
         if (count === 0 && footerItem) footerItem.button.forceActiveFocus()
         else if (currentItem) currentItem.forceActiveFocus()
@@ -74,7 +112,14 @@ CenteredGridView {
         else if (currentItem) currentItem.activateHost()
     }
     function optionsAction() { if (currentItem) currentItem.pcContextMenu.open() }
-    function refreshHost() { selectedHost = computerModel.get(currentIndex) }
+    function refreshHost() {
+        selectedHost = computerModel.get(currentIndex)
+        updateRememberedHost()
+        for (var uuid in wakeStates) {
+            var host = computerModel.get(computerModel.indexOfUuid(uuid))
+            if (!host.uuid || host.online) setWakeState(uuid, "")
+        }
+    }
     function refreshAfterModelChange() {
         // A reset or reorder can replace the host at an unchanged row number.
         refreshHost()
@@ -89,7 +134,7 @@ CenteredGridView {
         ConsoleText { width: parent.width; role: "display"; text: pcGrid.count === 0 || pcGrid.addingPc ? qsTr("Add a PC") : pcGrid.selectedHost.name || qsTr("PCs"); elide: Text.ElideRight }
         ConsoleText {
             width: parent.width; role: "secondary"; wrapMode: Text.Wrap
-            text: pcGrid.count === 0 ? qsTr("PCs on your network will appear here. You can also enter an address.") : pcGrid.addingPc ? qsTr("Enter the address of your gaming PC.") : pcGrid.rememberedStatus || (pcGrid.selectedHost.online ? qsTr("Ready to connect") : qsTr("Wake your PC, or choose another host."))
+            text: pcGrid.count === 0 ? qsTr("PCs on your network will appear here. You can also enter an address.") : pcGrid.addingPc ? qsTr("Enter the address of your gaming PC.") : pcGrid.hostStatus()
         }
     }
     readonly property real cardY: Math.max(Style.px(24, Window.window), Math.min(Style.px(178, Window.window), height - Style.px(300, Window.window)))
@@ -113,7 +158,7 @@ CenteredGridView {
     }
     Rectangle {
         parent: pcGrid; anchors.fill: parent; color: Style.background; z: 10
-        visible: pcGrid.startupRestorePending && StreamingPreferences.uiLastHostUuid.length > 0 && pcGrid.computerModel.indexOfUuid(StreamingPreferences.uiLastHostUuid) >= 0
+        visible: pcGrid.startupRestorePending && StreamingPreferences.uiLastHostUuid.length > 0 && pcGrid.computerModel.indexOfUuid(rememberedUuid) >= 0
         ConsoleText { anchors.centerIn: parent; role: "title"; text: qsTr("Connecting to your PC…") }
     }
     Keys.onPressed: startupRestorePending = false
@@ -133,6 +178,7 @@ CenteredGridView {
         // We do this here instead of onActivated to avoid losing the user's
         // selection when backing out of a different page of the app.
         currentIndex = 0
+        refreshHost()
     }
 
     // Note: Any initialization done here that is critical for streaming must
@@ -243,7 +289,7 @@ CenteredGridView {
                 }
                 NavigableMenuItem {
                     text: qsTr("Wake PC")
-                    onTriggered: computerModel.wakeComputer(index)
+                    onTriggered: pcGrid.wakeHost(index)
                     visible: !model.online && model.wakeable
                 }
                 NavigableMenuItem {
@@ -310,7 +356,7 @@ CenteredGridView {
                 }
             } else if (!model.online) {
                 // Using open() here because it may be activated by keyboard
-                if (model.wakeable) computerModel.wakeComputer(index)
+                if (model.wakeable) pcGrid.wakeHost(index)
                 else pcContextMenu.open()
             }
         }

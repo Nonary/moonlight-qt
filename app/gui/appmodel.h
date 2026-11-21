@@ -56,6 +56,7 @@ public:
     Q_INVOKABLE QString getRunningAppName();
 
     Q_INVOKABLE void quitRunningApp();
+    Q_INVOKABLE void retryAppList();
 
     Q_INVOKABLE void requestHostSleep();
 

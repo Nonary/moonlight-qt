@@ -14,8 +14,11 @@ NavigableDialog {
     property var targetField: null
     property bool numeric: false
     property var commitHandler: null
+    property bool committing: false
     property bool allowText: true
     readonly property bool addressMode: targetField && !!targetField.addressInput
+    readonly property string submitLabel: addressMode ? qsTr("Connect") : qsTr("Done")
+    readonly property bool canSubmit: draft.acceptableInput && (!addressMode || draft.text.trim().length > 0)
     property bool upperCase: false
     property bool symbols: false
     property bool previousNavMode: false
@@ -23,6 +26,8 @@ NavigableDialog {
     property alias keyGrid: keyGrid
     title: targetField && targetField.addressInput ? qsTr("Enter PC address") : numeric ? qsTr("Enter a value") : qsTr("Keyboard")
     width: Math.min(Style.px(880, hostWindow), (Overlay.overlay ? Overlay.overlay.width : 900) - Style.px(32, hostWindow))
+    height: Math.min(implicitHeight, (Overlay.overlay ? Overlay.overlay.height : 720) - Style.px(16, hostWindow))
+    footer: Item { implicitHeight: 0 }
     standardButtons: Dialog.NoButton
     closePolicy: Popup.CloseOnEscape
 
@@ -41,33 +46,38 @@ NavigableDialog {
         draft.insert(draft.cursorPosition, key)
     }
     function commit() {
-        if (draft.acceptableInput) accept()
+        if (!canSubmit || !opened || committing) return
+        committing = true
+        accept()
     }
     onOpened: {
         SdlGamepadKeyNavigation.setUiNavMode(false)
         keyGrid.currentIndex = 0
         keyGrid.forceActiveFocus()
     }
-    onAccepted: {
-        if (targetField) {
-            targetField.text = draft.text
-            if (typeof targetField.editingFinished === "function") targetField.editingFinished()
-            if (commitHandler) commitHandler(draft.text)
-        }
-    }
     onClosed: {
-        SdlGamepadKeyNavigation.setUiNavMode(previousNavMode)
-        if (targetField) targetField.forceActiveFocus()
+        var field = targetField
+        var handler = committing && field ? commitHandler : null
+        var value = draft.text
+        if (committing && field) {
+            field.text = value
+            if (typeof field.editingFinished === "function") field.editingFinished()
+        }
         targetField = null
         commitHandler = null
+        committing = false
+        SdlGamepadKeyNavigation.setUiNavMode(previousNavMode)
+        if (field) field.forceActiveFocus()
+        // The parent form may close itself. Hand it the result only after
+        // this popup has finished restoring focus and navigation mode.
+        if (handler) Qt.callLater(function() { handler(value) })
     }
-    ColumnLayout {
-        width: parent.width
+    contentItem: ColumnLayout {
         spacing: Style.px(12, keyboard.hostWindow)
         Keys.onMenuPressed: keyboard.erase()
         Keys.onHangupPressed: keyboard.commit()
         Keys.onPressed: function(event) {
-            if (event.key === Qt.Key_PageUp || event.key === Qt.Key_PageDown) {
+            if (!(event.modifiers & Qt.ControlModifier) && (event.key === Qt.Key_PageUp || event.key === Qt.Key_PageDown)) {
                 draft.cursorPosition = Math.max(0, Math.min(draft.length, draft.cursorPosition + (event.key === Qt.Key_PageUp ? -1 : 1)))
                 event.accepted = true
             }
@@ -92,10 +102,13 @@ NavigableDialog {
             id: keyGrid
             objectName: "keyboardKeys"
             Layout.fillWidth: true
-            Layout.preferredHeight: cellHeight * Math.ceil(count / columns)
+            Layout.fillHeight: true
+            Layout.minimumHeight: 0
+            Layout.preferredHeight: Style.px(56, keyboard.hostWindow) * rowLengths.length
+            clip: true
             property int columns: keyboard.numeric ? 6 : 10
             cellWidth: width / columns
-            cellHeight: Style.px(56, keyboard.hostWindow)
+            cellHeight: Math.max(Style.px(32, keyboard.hostWindow), Math.floor(height / rowLengths.length))
             interactive: false
             property var rowLengths: keyboard.numeric ? (keyboard.allowText || keyboard.addressMode ? [6,6] : [6,4]) : keyboard.symbols ? [10,10,10,10,2] : [10,9,7]
             model: keyboard.numeric ? (keyboard.addressMode ? "1234567890.:" : keyboard.allowText ? "1234567890.," : "1234567890").split("") : keyboard.symbols ?
@@ -151,10 +164,10 @@ NavigableDialog {
         }
         RowLayout {
             spacing: Style.px(12, keyboard.hostWindow)
-            ConsoleText { role: "caption"; text: keyboard.commandLabel("options") + " " + qsTr("Backspace") + " · " + keyboard.commandLabel("done") + " " + qsTr("Done") + " · " + keyboard.commandLabel("sections") + " " + qsTr("Cursor"); visible: SdlGamepadKeyNavigation.inputMethod === "controller" }
+            ConsoleText { role: "caption"; text: keyboard.commandLabel("options") + " " + qsTr("Backspace") + " · " + keyboard.commandLabel("done") + " " + keyboard.submitLabel + " · " + keyboard.commandLabel("sections") + " " + qsTr("Cursor"); visible: SdlGamepadKeyNavigation.inputMethod === "controller" }
             Item { Layout.fillWidth: true }
             ConsoleButton { id: cancelButton; text: qsTr("Cancel"); onClicked: keyboard.reject() }
-            ConsoleButton { id: doneButton; text: qsTr("Done"); enabled: draft.acceptableInput; onClicked: keyboard.commit() }
+            ConsoleButton { id: doneButton; objectName: "keyboardSubmit"; text: keyboard.submitLabel; enabled: keyboard.canSubmit; onClicked: keyboard.commit() }
             Layout.fillWidth: true
             Keys.onUpPressed: backspace.forceActiveFocus()
             Keys.onLeftPressed: keyboard.focusPrevious()

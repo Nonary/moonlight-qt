@@ -333,7 +333,7 @@ bool NvComputer::wake() const
 
             // Send to all static ports
             for (quint16 port : STATIC_WOL_PORTS) {
-                if (sock.writeDatagram(wolPayload, address, port)) {
+                if (sock.writeDatagram(wolPayload, address, port) == wolPayload.size()) {
                     qInfo().nospace().noquote() << "Sent WoL packet to " << name << " via " << address.toString() << ":" << port;
                     success = true;
                 }
@@ -357,7 +357,7 @@ bool NvComputer::wake() const
                 for (quint16 port : DYNAMIC_WOL_PORTS) {
                     port = (port - 47989) + basePort;
 
-                    if (sock.writeDatagram(wolPayload, address, port)) {
+                    if (sock.writeDatagram(wolPayload, address, port) == wolPayload.size()) {
                         qInfo().nospace().noquote() << "Sent WoL packet to " << name << " via " << address.toString() << ":" << port;
                         success = true;
                     }

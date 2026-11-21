@@ -11,10 +11,14 @@ TextField {
     selectionColor: Style.text
     selectedTextColor: Style.surface
     property bool addressInput: false
+    property var keyboardSubmit: null
     font.family: "Inter"
     font.pixelSize: Style.typeSize("body", Window.window)
     property bool controllerEditing: SdlGamepadKeyNavigation.inputMethod === "controller"
-    function openKeyboard() { Keyboard.openFor(field, Window.window, addressInput || (inputMethodHints & Qt.ImhDigitsOnly) !== 0, null) }
+    function openKeyboard() {
+        var numericHints = Qt.ImhDigitsOnly | Qt.ImhFormattedNumbersOnly
+        Keyboard.openFor(field, Window.window, addressInput || (inputMethodHints & numericHints) !== 0, keyboardSubmit)
+    }
     Keys.onPressed: function(event) {
         event.accepted = false
         if (controllerEditing && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space)) {
