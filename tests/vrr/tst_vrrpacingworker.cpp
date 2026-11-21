@@ -1438,7 +1438,7 @@ private:
 
 void testNativeScheduledEnqueueCadenceAndLifecycle()
 {
-    for (const char* variant : {"accepted", "late", "failed"}) {
+    for (const char* variant : {"accepted", "late", "failed", "absorb"}) {
         resetFakeClock();
         QTemporaryDir directory;
         const QString path = directory.filePath("native-scheduled.vrrtrace");
@@ -1452,6 +1452,7 @@ void testNativeScheduledEnqueueCadenceAndLifecycle()
         auto session = enabledConfig();
         session.streamRateHz = 120;
         session.latencyMode = 2;
+        session.absorbMicrostutter = std::string(variant) == "absorb";
         unsigned clearCountBeforeShutdown = 0;
         unsigned completed = 0;
         {
@@ -1569,6 +1570,11 @@ void testNativeScheduledEnqueueCadenceAndLifecycle()
                        value("native_target_us") == (value("presented") ? value("target_us") : 0) &&
                        value("native_backend_valid") == 1 && value("native_backend") == 3,
                    "scheduled trace must preserve the capability and native display deadline");
+            if (session.absorbMicrostutter) {
+                expect(value("param_playout_smoothing_own_movement") == 1 &&
+                           value("render_start_us") == value("decision_us"),
+                       "timed Absorb applies its own correction and prepares immediately");
+            }
             expect(value("target_wait_entry_us") >= value("present_end_us") &&
                        value("target_wait_final_us") >= value("target_us"),
                    "native trace must place the worker cadence hold after enqueue and through the deadline");

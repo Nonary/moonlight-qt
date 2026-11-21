@@ -626,10 +626,15 @@ rate. The normalized producer mapping uses prompt GPU completion observations;
 a delayed collection can include queue residence and is not treated as GPU
 service. Real readiness still constrains the submitted frame.
 
-Worker-paced Reduce judder uses bounded phase-locked smoothing. Native
-future-target Reduce judder uses the tolerance-bounded source-gap path.
-Absorb uses its fixed 2T pad and its own bounded smoothing; worker smoothing
-owns its movement while native scheduled presentation retains its gate.
+Worker-paced Reduce judder uses bounded phase-locked smoothing and limits
+advances to the time left after decode readiness. Native future-target
+Reduce judder uses the tolerance-bounded source-gap path.
+Absorb Microstutter applies its own correction within a fixed 2T pad on both
+presenters. Native Absorb prepares as soon as decode is ready and queues the
+image for the planned display deadline. Decode holds for GPU contention are
+coordinated around the predicted enqueue, and an unconfirmed future source
+projection falls back to an arrival-based deadline so the worker can
+observe the next frame.
 Smoothing is independently controlled by the session preference. The
 controller also uses bounded phase-trajectory catch-up, readiness and display
 floors, and presenter-specific latch protection. Applied input buffering,

@@ -1,5 +1,5 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/sourcegapsmoothing.h"
-#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
+#include "vrrproductionsession.h"
 
 #include <array>
 #include <cstdio>
@@ -83,18 +83,22 @@ void testProductionSelection()
                "production selects the native or worker smoothing path");
         expect(ordinary.playoutSmoothingOwnMovement == (native ? 0u : 1u),
                "worker smoothing owns its movement and native scheduling keeps its gate");
+        expect(ordinary.playoutSmoothingReadinessBound == 1 && !ordinary.playoutInputPercentileEnabled,
+               "Reduce judder restores the readiness bound with the VRR18 interval buffer");
         session.absorbMicrostutter = true;
         const auto absorb = vrrTimingParametersForSession(session, native, native);
         expect(absorb.smoothingMode == 7 &&
                absorb.playoutSmoothingMaxLagUs == uint64_t(2 * tolerance) &&
                absorb.playoutSmoothingAbsorbReserveUs == uint64_t(2 * tolerance) &&
                absorb.playoutSmoothingReserveMaxUs == 0 &&
-               absorb.playoutSmoothingOwnMovement == (native ? 0u : 1u),
-               "Absorb uses its fixed 2T pad and the presenter's movement ownership");
+               absorb.playoutSmoothingOwnMovement == 1 &&
+               absorb.nativeScheduledAbsorb() == native,
+               "Absorb owns its fixed 2T correction on either presenter");
         session.smoothFrameTiming = false;
         const auto disabled = vrrTimingParametersForSession(session, native, native);
         expect(disabled.playoutSmoothingGainPerMille == 0 &&
-               disabled.playoutSmoothingAbsorbReserveUs == 0,
+               disabled.playoutSmoothingAbsorbReserveUs == 0 &&
+               disabled.playoutSmoothingReadinessBound == 0,
                "disabling smooth timing also disables Absorb");
     }
 }
@@ -114,6 +118,7 @@ void testAbsorbCurrentController()
         VrrTimingController controller(session, true, policy);
         uint32_t stamp = 0;
         uint64_t previousAt = 0, previousBuffer = 0, submitted = 0;
+        bool spentPad = false;
         for (int frameNumber = 0; frameNumber < 700; ++frameNumber) {
             stamp += frameNumber >= 150 && frameNumber < 400 ? (frameNumber % 2 ? 990 : 810) : 900;
             const uint64_t source = 1000000 + uint64_t(stamp) * 100 / 9;
@@ -126,6 +131,12 @@ void testAbsorbCurrentController()
             expect(decision.cadenceSmoothingUs >= 0 && decision.cadenceSmoothingUs <= int64_t(tolerance * 2),
                    "Absorb phase remains within its configured pad");
             expect(decision.targetUs >= frame.decoderOutputUs(), "the target respects decoder readiness");
+            spentPad |= decision.cadenceSmoothingUs < 2 * tolerance;
+            if (native) {
+                expect(decision.renderStartUs == now, "native Absorb prepares as soon as decode is ready");
+                expect(decision.targetUs >= controller.earliestSubmissionUs(),
+                       "native Absorb preserves the display deadline floor");
+            }
             if (previousAt) {
                 const uint64_t difference = std::max(decision.playoutDelayUs, previousBuffer) -
                     std::min(decision.playoutDelayUs, previousBuffer);
@@ -140,6 +151,56 @@ void testAbsorbCurrentController()
             controller.noteSchedulerDelays(0, 0, true);
             controller.noteSubmission(true, false, submitted, submitted);
         }
+        expect(spentPad, "source-gap smoothing uses Absorb's fixed pad");
+    }
+}
+
+void testNativeAbsorbRejectsFutureProjection()
+{
+    // A gap in frame identity made the old native queue reserve a display
+    // deadline hundreds of milliseconds after this capture's last arrival.
+    struct Input {
+        int frame;
+        uint32_t timestamp;
+        uint64_t receive, reassembled, decodeSubmit, output, decision, preparation, enqueue;
+    };
+    constexpr Input inputs[] = {
+        {1, 14172, 3848161, 3851402, 3851514, 3856667, 3858620, 4922, 3864364},
+        {2, 16189, 3851594, 3855269, 3856780, 3857967, 3870747, 2196, 3872994},
+        {3, 19880, 3855298, 3859031, 3859172, 3860285, 3878800, 0, 0},
+        {4, 23021, 3859052, 3862921, 3863084, 3863778, 3878828, 4384, 3883276},
+        {9, 87521, 3904397, 3912884, 3912965, 3913436, 3946313, 1963, 3948309},
+    };
+    const auto session = vrrProductionSession(1, 120, 120, true, true);
+    for (bool restored : {false, true}) {
+        auto policy = vrrTimingParametersForSession(session, true, true);
+        policy.playoutSmoothingOwnMovement = restored;
+        VrrTimingController controller(session, true, policy);
+        for (const auto& input : inputs) {
+            PacedFrame frame(nullptr, input.frame, input.timestamp, true, input.output);
+            frame.setDeliveryTimeline(input.receive, input.reassembled, input.decodeSubmit);
+            frame.setDecoderOutputComplete(false);
+            frame.noteGpuReadyUs(input.decision);
+            frame.noteDecodeSyncWaitUs(input.frame == 1 ? input.decision - input.output : 0);
+            const auto plan = controller.schedule(frame, input.decision);
+            if (input.frame == 9) {
+                if (restored) {
+                    expect(plan.phaseDiscontinuity && plan.targetUs < input.decision + 30000 &&
+                               plan.targetUs >= controller.earliestSubmissionUs(),
+                           "native Absorb discards the poisoned deadline and retains the display floor");
+                }
+                else {
+                    expect(plan.targetUs > input.decision + 500000,
+                           "the fixture reproduces the historical future projection");
+                }
+            }
+            if (!input.enqueue) {
+                controller.noteSubmission(false, false, 0);
+                continue;
+            }
+            controller.notePreparationDuration(input.preparation, 0, input.enqueue);
+            controller.noteSubmission(true, false, std::max(input.enqueue, plan.targetUs), input.enqueue);
+        }
     }
 }
 } // namespace
@@ -150,6 +211,7 @@ int main()
     testConsecutiveGaps();
     testProductionSelection();
     testAbsorbCurrentController();
+    testNativeAbsorbRejectsFutureProjection();
     if (!failures) std::puts("Current source-gap smoothing tests passed");
     return failures ? 1 : 0;
 }
