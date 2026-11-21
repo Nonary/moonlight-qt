@@ -315,7 +315,7 @@ void testPreparedFramesOverlapAndTrace()
                graph[0].decoderReadyUs == graph[0].decoderOutputUs &&
                graph[1].decoderReadyUs == graph[1].decoderOutputUs,
            "input graph must retain frame-specific network and proven staged decoder readiness");
-    expect(graph.size() == 2 && graph[0].toleranceUs == 500 && graph[1].toleranceUs == 500,
+    expect(graph.size() == 2 && graph[0].toleranceUs == 200 && graph[1].toleranceUs == 200,
            "input graph must carry the active Smooth profile tolerance on each frame");
     const auto lines = readExpandedTrace(path).split('\n');
     const auto columns = lines.value(0).split(',');
@@ -3928,23 +3928,24 @@ void testTrajectoryReadySuccessorReservation() {
                    "published producer eligibility belongs to the same CPU submission, including cold invalid input");
             expect(point.producerRequiredUs==fields.value(columns.indexOf("input_percentile_last_input_required_us")).toLongLong(),
                    "graph producer requirement copies the exact signed causal controller observation");
-            expect(point.inputToleranceUs==u("param_playout_input_percentile_tolerance_us"),
-                   "worker graph copies actual adaptive input tolerance independently of interval display tolerance");
-            expect(point.inputTargetUs==u("input_percentile_target_us") && point.inputProbabilityPpm==995000 && point.inputWindowUs==200000000,
-                   "graph copies the goal target and effective user probability/history");
+            expect(point.inputToleranceUs==u("param_playout_interval_tolerance_us"),
+                   "worker graph copies the active VRR18 interval tolerance");
+            expect(point.inputProbabilityPpm == 995000 && point.inputWindowUs == 200000000 &&
+                       !point.inputPercentileEnabled,
+                   "graph publishes the VRR18 timing target and custom history");
             expect(point.inputSamples==u("input_percentile_recent_eligible") && point.inputAbsorbed==u("input_percentile_recent_absorbed") &&
                 point.inputMissed==u("input_percentile_recent_missed") && point.trajectoryCarryUs==u("trajectory_carry_us"),
                    "graph copies current-window causal outcomes and same-plan pacing carry");
             if(u("frame")==24) lossIneligible=!point.producerEligible && u("lost_packets")==1;
-            if(u("frame")==64) unknownGpuEligible=point.producerEligible && point.decoderReadyUs==0;
+            if(u("frame")==64) unknownGpuEligible=!point.producerEligible && point.decoderReadyUs==0;
             eligible+=point.producerEligible; ineligible+=!point.producerEligible;
             break;
         }
         expect(found,"every graph point matches its own presented trace row rather than a predecessor observation");
     }
-    expect(matched==66 && eligible>0 && ineligible>0,
-           "worker graph fixture exercises qualified and cold-invalid observations");
-    expect(lossIneligible && unknownGpuEligible,"worker does not promote packet-loss input but retains causal eligibility when GPU completion is unknown");
+    expect(matched == size_t(presented) && eligible == 0 && ineligible == matched,
+           "interval feedback does not report historical predictor eligibility");
+    expect(lossIneligible && unknownGpuEligible,"worker preserves packet-loss identity and leaves unknown GPU readiness unverified");
     (void) reservationProof;
     expect(dropped==0 && presented==66,"bounded catch-up never skips a frame to regain phase");
     for(const auto& lifetime:life) expect(lifetime.releases==1,"reservation and shutdown account every frame exactly once");
@@ -4039,7 +4040,7 @@ void testExperimentalInputPercentileActivationTrace()
         { std::lock_guard<std::mutex> lock(logs.mutex);
           for (const auto& message : logs.messages) {
               if (message.find("Adaptive buffer") != std::string::npos && message.find(expectedText) != std::string::npos &&
-                  message.find("history " + std::to_string(effective.historySeconds) + " s") != std::string::npos)
+                  message.find(std::to_string(effective.historySeconds) + " s history") != std::string::npos)
                   loggedTarget = true;
           }
         }
@@ -4052,9 +4053,10 @@ void testExperimentalInputPercentileActivationTrace()
             const auto fields = lines[i].split(',');
             ++rows;
             expect(fields.size() == columns.size() &&
-                       fields.value(columns.indexOf("param_playout_input_percentile_enabled")) == "1" &&
-                       fields.value(columns.indexOf("param_playout_input_percentile_target_per_million")).toULongLong() == expected &&
-                       fields.value(columns.indexOf("param_playout_input_percentile_window_us")).toULongLong() == expectedWindow,
+                       fields.value(columns.indexOf("param_playout_vrr18_interval_feedback")) == "1" &&
+                       fields.value(columns.indexOf("param_playout_input_percentile_enabled")) == "0" &&
+                       fields.value(columns.indexOf("param_playout_on_time_target_per_million")).toULongLong() == expected &&
+                       fields.value(columns.indexOf("param_playout_readiness_window_us")).toULongLong() == expectedWindow,
                    "worker trace must serialize adaptive probability and history from the effective profile");
             expect(columns.indexOf("param_bounded_catchup_enabled")>=0 &&
                        fields.value(columns.indexOf("param_bounded_catchup_enabled")).toULongLong()==uint64_t(expectedBoundedCatchup),
@@ -4066,10 +4068,12 @@ void testExperimentalInputPercentileActivationTrace()
             expect(fields.value(columns.indexOf("param_playout_on_time_target_per_million")).toULongLong() ==
                        normalPolicy.playoutOnTimeTargetPerMillion,
                    "adaptive activation must preserve selected interval quality target diagnostics");
-            expect(fields.value(columns.indexOf("input_percentile_probability_ppm")).toULongLong() == expected,
-                   "runtime direct-buffer diagnostic must follow the profile target rather than retired environment percentage");
-            expect(fields.value(columns.indexOf("input_percentile_window_us")).toULongLong() == expectedWindow,
-                   "runtime direct-buffer history diagnostic must match the effective profile");
+            expect(fields.value(columns.indexOf("param_playout_interval_tolerance_us")).toULongLong() ==
+                       uint64_t(effective.toleranceUs),
+                   "worker trace serializes the effective interval tolerance");
+            expect(fields.value(columns.indexOf("input_percentile_probability_ppm")).toULongLong() == 0 &&
+                       fields.value(columns.indexOf("input_percentile_window_us")).toULongLong() == 0,
+                   "live traces keep the historical predictor inactive");
             expect(columns.indexOf("input_percentile_recent_eligible") >= 0 &&
                        columns.indexOf("input_percentile_recent_absorbed") >= 0 &&
                        columns.indexOf("input_percentile_recent_missed") >= 0 &&
@@ -4084,8 +4088,8 @@ void testExperimentalInputPercentileActivationTrace()
                        columns.indexOf("input_percentile_last_input_required_us") >= 0 &&
                        columns.indexOf("input_percentile_last_input_observation_us") >= 0 &&
                        columns.indexOf("input_percentile_growth_blocked") >= 0 &&
-                       fields.value(columns.indexOf("input_percentile_last_input_observation_us")).toULongLong() > 0,
-                   "worker trace exposes the causal last-input boundary and blocked-growth diagnostic");
+                       fields.value(columns.indexOf("input_percentile_last_input_observation_us")).toULongLong() == 0,
+                   "schema-6 predictor diagnostics remain inactive under interval feedback");
             if(caseIndex==4 && rows>=2) {
                 const bool network=fields.value(columns.indexOf("input_network_buffer_miss"))=="1";
                 const bool decode=fields.value(columns.indexOf("input_decode_buffer_miss"))=="1";

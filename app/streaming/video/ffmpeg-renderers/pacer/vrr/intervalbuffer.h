@@ -10,10 +10,9 @@
 #include "cadencedetection.h"
 
 namespace Vrr13 {
-// Client-added interval error, including zero-error intervals. Production
-// applies tolerance to each interval before averaging loss for both reporting
-// and control. All observed adjacent intervals contribute to the long score;
-// capacity qualification gates adaptation rather than measurement.
+// Client-added interval error, including zero-error intervals. Reporting
+// scores each adjacent interval. VRR18 feedback scores the mean error over a
+// qualified one-second window and uses that score to adapt the buffer.
 class IntervalBuffer {
 public:
     static constexpr uint64_t ToleranceUs = 500;

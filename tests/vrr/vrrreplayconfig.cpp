@@ -302,8 +302,8 @@ bool validateVrrCurrentPolicy(const VrrTimingParameters& value, QString& error)
         smoothingMode == (!smoothing ? VrrSmoothingOff : scheduled ?
             VrrSmoothingNativeToleranceBounded : VrrSmoothingWorkerPhaseLocked);
     if (value.playoutVrr18IntervalFeedback == 1 && !value.playoutInputPercentileEnabled &&
-            !value.boundedCatchupEnabled && value.playoutPredictionOnly &&
-            value.latchedFloorDisabled == 1 && currentSmoothing) {
+            value.boundedCatchupEnabled && value.playoutPredictionOnly &&
+            value.latchedFloorDisabled == (scheduled ? 1U : 3U) && currentSmoothing) {
         return true;
     }
     if (!value.playoutInputPercentileEnabled ||
