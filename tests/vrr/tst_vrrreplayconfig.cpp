@@ -130,6 +130,7 @@ void VrrReplayConfigTest::windowedSmoothingPolicyRoundTrip()
     QCOMPARE(parameters.smoothingMode, uint64_t(2));
     VrrSessionConfig absorbing;
     absorbing.absorbMicrostutter = true;
+    absorbing.timingOptions.toleranceUs = 500;
     QCOMPARE(vrrTimingParametersForSession(absorbing).playoutSmoothingOwnMovement, uint64_t(1));
     QCOMPARE(vrrTimingParametersForSession(absorbing, true, true).playoutSmoothingOwnMovement, uint64_t(0));
     VrrTimingParameters absorbed;
@@ -225,14 +226,14 @@ void VrrReplayConfigTest::customToleranceRoundTrip()
     VrrTimingParameters policy;
     QString error;
     QCOMPARE(policy.playoutIntervalToleranceUs, uint64_t(0));
-    for (int tolerance = 250; tolerance <= 2000; tolerance += 250) {
+    for (int tolerance = 200; tolerance <= 2000; tolerance += 50) {
         QVERIFY2(applyVrrReplayControllerSnapshot(
             {{"playout_interval_tolerance_us", tolerance}}, policy, error), qPrintable(error));
         VrrTimingParameters restored;
         QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(policy), restored, error), qPrintable(error));
         QCOMPARE(restored.playoutIntervalToleranceUs, uint64_t(tolerance));
     }
-    for (int tolerance : {1, 200, 251, 2001}) {
+    for (int tolerance : {1, 150, 199, 201, 251, 2001}) {
         QVERIFY(!applyVrrReplayControllerSnapshot(
             {{"playout_interval_tolerance_us", tolerance}}, policy, error));
         QCOMPARE(policy.playoutIntervalToleranceUs, uint64_t(2000));
