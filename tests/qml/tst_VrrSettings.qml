@@ -10,7 +10,7 @@ Item {
         id: settings
         width: 420
         onPresetPicked: function(mode) {
-            var values = mode === 2 ? [500, 9900, 60, 500] : mode === 0 ? [4000, 9995, 300, 500] : [1000, 9950, 120, 500]
+            var values = mode === 2 ? [1000, 9900, 60, 500] : mode === 0 ? [4000, 9999, 300, 200] : [2000, 9950, 120, 500]
             bufferPerMille = values[0]; targetHundredths = values[1]
             historySeconds = values[2]; toleranceUs = values[3]
         }
@@ -48,7 +48,7 @@ Item {
             var preset = control("vrrPreset")
             preset.forceActiveFocus()
             keyClick(Qt.Key_Left)
-            compare(settings.bufferPerMille, 500)
+            compare(settings.bufferPerMille, 1000)
             compare(settings.targetHundredths, 9900)
             compare(settings.historySeconds, 60)
             compare(settings.toleranceUs, 500)
@@ -61,8 +61,8 @@ Item {
             compare(preset.currentIndex, 3)
             settings.presetPicked(0)
             compare(preset.currentIndex, 2)
-            compare(settings.targetHundredths, 9995)
-            compare(settings.toleranceUs, 500)
+            compare(settings.targetHundredths, 9999)
+            compare(settings.toleranceUs, 200)
             settings.presetPicked(1)
             compare(preset.currentIndex, 1)
             compare(settings.targetHundredths, 9950)
@@ -70,7 +70,7 @@ Item {
         function test_adjust_and_bounds() {
             var names = ["vrrBuffer", "vrrTarget", "vrrHistory", "vrrTolerance"]
             var properties = ["bufferPerMille", "targetHundredths", "historySeconds", "toleranceUs"]
-            var minima = [250, 9000, 10, 250]
+            var minima = [250, 9000, 10, 200]
             var maxima = [4000, 9999, 300, 2000]
             for (var i = 0; i < names.length; i++) {
                 var spin = control(names[i])

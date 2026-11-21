@@ -31,12 +31,11 @@ VrrSessionConfig prepareProductionConfig(VrrSessionConfig config)
         if (qEnvironmentVariableIsSet(name))
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Retired VRR switch %s is ignored", name);
     }
-    const auto target = config.experimentalInputPercentilePpm;
+    const auto options = config.timingOptions.resolved(config.latencyMode);
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-        "Adaptive buffer: client-timing goal %.2f%% (network and decode jitter, plus render work after a blocked D3D11 decode); least buffer meeting it over the last %llu s, aiming at 70%% of the allowed loss above what the buffer cap cannot absorb; rise 4 ms/s, fall 1 ms/s; history %llu s",
-        target / 10000.0,
-        static_cast<unsigned long long>(target >= 999000 ? 120 : target >= 995000 ? 60 : 20),
-        static_cast<unsigned long long>(config.timingOptions.resolved(config.latencyMode).historySeconds));
+        "Adaptive buffer: VRR18 interval feedback, %.2f%% timing target, %.2f ms tolerance, %d s history, %.2f source-frame allowance",
+        options.targetHundredths / 100.0, options.toleranceUs / 1000.0,
+        options.historySeconds, options.bufferPerMille / 1000.0);
     return config;
 }
 

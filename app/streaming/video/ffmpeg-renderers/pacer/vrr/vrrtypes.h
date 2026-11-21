@@ -40,6 +40,7 @@ struct VrrSessionConfig {
     // profile smoothness target supplies probability (never this marker value).
     bool experimentalBoundedCatchup = false;
     uint64_t experimentalInputPercentilePpm = 0;
+    bool vrr18IntervalFeedback = false;
     // Session-native A/B choice, recorded separately from controller timing.
     bool allowTearing = true;
     std::string calibrationKey;
@@ -53,6 +54,7 @@ inline VrrSessionConfig vrrProductionSessionConfig(VrrSessionConfig config)
     const auto options = config.timingOptions.resolved(config.latencyMode);
     config.experimentalBoundedCatchup = true;
     config.experimentalInputPercentilePpm = uint64_t(options.targetHundredths) * 100;
+    config.vrr18IntervalFeedback = true;
     return config;
 }
 

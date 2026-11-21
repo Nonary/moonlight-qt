@@ -13,9 +13,14 @@ struct VrrTimingOptions {
 
     static VrrTimingOptions preset(int mode)
     {
-        return mode == 2 ? VrrTimingOptions{500, 9900, 60, 500} :
-               mode == 0 ? VrrTimingOptions{2000, 9995, 300, 500} :
-                           VrrTimingOptions{1000, 9950, 120, 500};
+        return mode == 2 ? VrrTimingOptions{1000, 9900, 60, 500} :
+               mode == 0 ? VrrTimingOptions{4000, 9999, 300, 200} :
+                           VrrTimingOptions{2000, 9950, 120, 500};
+    }
+
+    static int resolvedTolerance(int toleranceUs)
+    {
+        return ((std::clamp(toleranceUs, 200, 2000) + 25) / 50) * 50;
     }
 
     VrrTimingOptions resolved(int mode) const
@@ -25,7 +30,7 @@ struct VrrTimingOptions {
             std::max(250, std::min(4000, bufferPerMille == 0 ? defaults.bufferPerMille : bufferPerMille)),
             std::max(9000, std::min(9999, targetHundredths == 0 ? defaults.targetHundredths : targetHundredths)),
             std::max(10, std::min(300, historySeconds == 0 ? defaults.historySeconds : historySeconds)),
-            ((std::max(250, std::min(2000, toleranceUs == 0 ? defaults.toleranceUs : toleranceUs)) + 125) / 250) * 250
+            resolvedTolerance(toleranceUs == 0 ? defaults.toleranceUs : toleranceUs)
         };
     }
 };

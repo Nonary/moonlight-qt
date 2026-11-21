@@ -11934,6 +11934,11 @@ int main(int argc, char* argv[])
                 if (!path.startsWith("controller.")) continue;
                 const auto column = columns.capturedParameterColumns.find(path);
                 if (column == columns.capturedParameterColumns.end()) {
+                    if (path == QStringLiteral("controller.playout_vrr18_interval_feedback")) {
+                        // Existing schema-6 captures predate the VRR18 feedback option.
+                        capturedControllerSnapshot.insert(QStringLiteral("playout_vrr18_interval_feedback"), 0);
+                        continue;
+                    }
                     std::fprintf(stderr, "Schema 6 trace is missing captured controller parameter: %s\n", qPrintable(path));
                     return 1;
                 }

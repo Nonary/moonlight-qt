@@ -1,4 +1,4 @@
-#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
+#include "vrrproductionsession.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -21,7 +21,7 @@ static uint64_t run(int preset, int smoothing, int presentation, bool custom)
     session.smoothFrameTiming = smoothing != 0;
     session.absorbMicrostutter = smoothing == 2;
     if (custom) session.timingOptions = {1500, 9975, 30, 750};
-    session = vrrProductionSessionConfig(session);
+    session = vrrHistoricalGoalConfig(session);
     const bool latch = presentation != 0;
     const bool scheduled = presentation == 2;
     auto policy = vrrTimingParametersForSession(session, scheduled, scheduled);

@@ -1,4 +1,4 @@
-#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
+#include "vrrproductionsession.h"
 #include "../../app/streaming/video/timinggraph.h"
 
 #include <algorithm>
@@ -21,7 +21,7 @@ DriftResult runDrift(double ppm, bool sparseEarly)
     config.streamRateHz = 116; config.displayRefreshHz = 120;
     config.latencyMode = 1; config.smoothFrameTiming = false;
     config.timingOptions = {1000, 9950, 60, 500};
-    config = vrrProductionSessionConfig(config);
+    config = vrrHistoricalGoalConfig(config);
     auto policy = vrrTimingParametersForSession(config);
     policy.playoutDelayStartSeedUs = 1000;
     VrrTimingController controller(config, true, policy);
@@ -80,7 +80,7 @@ void testRecoveryCredit()
     VrrSessionConfig config;
     config.streamRateHz = 76; config.displayRefreshHz = 120;
     config.timingOptions = {4000, 9995, 300, 500};
-    config = vrrProductionSessionConfig(config);
+    config = vrrHistoricalGoalConfig(config);
     for (const auto& [target, share] : {std::pair<int, uint64_t>{9900, 1000},
                                          {9950, 500}, {9995, 50}, {9000, 1000}}) {
         auto selected = config;
@@ -115,7 +115,7 @@ void testGraphAccounting()
 }
 struct SpanRun{uint64_t peakBufferUs,missed;double tailLatencyUs;};
 SpanRun sendSpanRun(uint64_t normalization,bool bursts,uint64_t latencyDropUs=0,bool sustainedSmall=false) {
- VrrSessionConfig cfg; cfg.latencyMode=1; cfg.streamRateHz=120; cfg.displayRefreshHz=120; cfg=vrrProductionSessionConfig(cfg);
+ VrrSessionConfig cfg; cfg.latencyMode=1; cfg.streamRateHz=120; cfg.displayRefreshHz=120; cfg=vrrHistoricalGoalConfig(cfg);
  auto policy=vrrTimingParametersForSession(cfg);policy.playoutDelayStartSeedUs=1000;
  policy.playoutOffsetSendSpanNormalization=normalization;
  VrrTimingController c(cfg,true,policy);uint64_t slot=1000000,submitted=0,peak=0;uint32_t pts=0;

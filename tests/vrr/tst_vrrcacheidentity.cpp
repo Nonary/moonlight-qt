@@ -22,8 +22,8 @@ int main(int argc, char** argv) {
     raw.timingOptions = {1000, 9950, 120, 500};
     const auto resolved = vrrProductionSessionConfig(raw);
     const auto policy = vrrTimingParametersForSession(resolved, false, false);
-    assert(policy.playoutInputPercentileTargetPerMillion == 995000);
-    assert(policy.playoutInputPercentileWindowUs == 120000000);
+    assert(policy.playoutOnTimeTargetPerMillion == 995000);
+    assert(policy.playoutReadinessWindowUs == 120000000);
     const auto identity = [](const VrrTimingParameters& p, bool canLatch) {
         return Vrr13::calibrationKey("same-device-codec-settings",
             QByteArray::fromStdString(vrrCalibrationPolicy(p)), canLatch, true);
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
     assert(Vrr13::loadStartDelay(path, key) == 8378);
     assert(Vrr13::loadStartDelay(path, identity(policy, true)) == 0);
     auto changed = policy;
-    changed.playoutInputPercentileTargetPerMillion = 990000;
+    changed.playoutOnTimeTargetPerMillion = 990000;
     assert(Vrr13::loadStartDelay(path, identity(changed, false)) == 0);
     const char* switches[] = {"MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER",
                               "MOONLIGHT_VRR_INPUT_ACCOUNTING", "MOONLIGHT_VRR_BOUNDED_CATCHUP"};

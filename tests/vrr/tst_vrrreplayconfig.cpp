@@ -317,7 +317,7 @@ void VrrReplayConfigTest::productionPolicyValidation()
             retired.playoutPredictionOnly = 0;
             QVERIFY(!validateVrrCurrentPolicy(retired, error));
             retired = current;
-            retired.playoutInputGoalWindowUs = 0;
+            retired.boundedCatchupEnabled = 1;
             QVERIFY(!validateVrrCurrentPolicy(retired, error));
             retired = current;
             retired.smoothingMode = 5;
