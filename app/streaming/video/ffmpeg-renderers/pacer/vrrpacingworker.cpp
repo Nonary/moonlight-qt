@@ -1479,14 +1479,17 @@ void VrrPacingWorker::publishReceiveDeadline(const PacedFrame& frame,
     m_DecodeGpuCost.observeGpuCompletion(
         frame.decodeSubmitUs(), frame.decoderOutputUs(), frame.decodeCompleteUs(),
         frame.decoderOutputComplete());
-    if (m_DecodeGpuCost.ready() && m_PresentCallCost.ready()) {
+    const bool timedAbsorb = m_TimingController->parameters().nativeScheduledAbsorb();
+    if (m_DecodeGpuCost.ready() && m_PresentCallCost.ready() &&
+            (!timedAbsorb || m_PreparationCost.ready())) {
         // A decode submitted from here on would still be running when this
-        // frame is presented. The window closes when the Present call returns;
-        // the expected close only decides whether a hold is affordable.
-        const uint64_t startUs = decision.targetUs -
-            std::min(decision.targetUs, m_DecodeGpuCost.percentileUs());
+        // frame is enqueued. Timed Absorb enqueues once preparation ends.
+        // The later display deadline still decides whether a hold is affordable.
+        const uint64_t enqueueUs = timedAbsorb ?
+            decision.renderStartUs + m_PreparationCost.percentileUs() : decision.targetUs;
+        const uint64_t startUs = enqueueUs - std::min(enqueueUs, m_DecodeGpuCost.percentileUs());
         VrrReceiveDeadline::publishPresentWindow(
-            startUs, decision.targetUs + m_PresentCallCost.percentileUs());
+            startUs, enqueueUs + m_PresentCallCost.percentileUs());
     }
     if (!m_RecentDuration.ready()) {
         return;

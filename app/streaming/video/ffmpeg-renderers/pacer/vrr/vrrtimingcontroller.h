@@ -264,6 +264,12 @@ struct VrrTimingParameters {
     type memberName = defaultValue;
     VRR_TIMING_PARAMETER_FIELDS(VRR_DECLARE_TIMING_PARAMETER)
 #undef VRR_DECLARE_TIMING_PARAMETER
+
+    bool nativeScheduledAbsorb() const
+    {
+        return nativeScheduledPresentation && smoothingMode == VrrSmoothingAbsorb &&
+               playoutSmoothingOwnMovement;
+    }
 };
 
 // Stable serialization of the effective policy for calibration identity.

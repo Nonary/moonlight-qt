@@ -133,6 +133,13 @@ void VrrReplayConfigTest::windowedSmoothingPolicyRoundTrip()
     absorbing.timingOptions.toleranceUs = 500;
     QCOMPARE(vrrTimingParametersForSession(absorbing).playoutSmoothingOwnMovement, uint64_t(1));
     QCOMPARE(vrrTimingParametersForSession(absorbing, true, true).playoutSmoothingOwnMovement, uint64_t(0));
+    const auto liveAbsorb = vrrTimingParametersForSession(vrrProductionSessionConfig(absorbing), true, true);
+    VrrTimingParameters restoredNative;
+    QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(liveAbsorb),
+                  restoredNative, error), qPrintable(error));
+    QVERIFY2(validateVrrCurrentPolicy(restoredNative, error), qPrintable(error));
+    QVERIFY(restoredNative.nativeScheduledAbsorb());
+    QVERIFY(restoredNative.playoutVrr18IntervalFeedback && !restoredNative.playoutInputPercentileEnabled);
     VrrTimingParameters absorbed;
     QVERIFY2(applyVrrReplayControllerSnapshot(
         vrrTimingParametersToJson(vrrTimingParametersForSession(absorbing)), absorbed, error), qPrintable(error));

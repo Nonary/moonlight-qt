@@ -309,16 +309,16 @@ VrrTimingParameters vrrTimingParametersForSession(
     // Reduce judder may spend available readiness slack, but cannot buy a
     // larger interval buffer by advancing an otherwise on-time deadline.
     // Zero preserves both the old smoother and its attribution for replay.
-    parameters.playoutSmoothingReadinessBound =
-        !vrr18 && config.smoothFrameTiming ? 1 : 0;
+    parameters.playoutSmoothingReadinessBound = config.smoothFrameTiming ? 1 : 0;
     parameters.smoothingMode = VrrSmoothingWorkerPhaseLocked;
     if (config.smoothFrameTiming && config.absorbMicrostutter) {
         parameters.smoothingMode = VrrSmoothingAbsorb;
         // Absorb already bounds its retiming and fixed reserve. Charging its
         // corrections to the input policy's T/second movement budget reduces
         // a 500 us tolerance to ~4 us/frame at 120 FPS and passes jitter through.
-        // Native future deadlines retain their existing movement policy.
-        parameters.playoutSmoothingOwnMovement = nativeScheduledPresentation ? 0 : 1;
+        // Live Absorb applies the same bounded source correction on both
+        // presenters. Historical native snapshots retain the movement gate.
+        parameters.playoutSmoothingOwnMovement = vrr18 || !nativeScheduledPresentation;
         parameters.playoutSmoothingAbsorbReserveUs = uint64_t(options.toleranceUs) * 2;
         parameters.playoutSmoothingResetSlewUs = std::min<uint64_t>(
             kPlayoutSmoothingResetSlewUs, std::max<uint64_t>(1, options.toleranceUs / 2));
@@ -349,7 +349,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         // adaptive buffer's T/second movement budget as well reduced a 500 us
         // tolerance to roughly 4 us per frame and passed source jitter through.
         parameters.playoutSmoothingOwnMovement = 1;
-        parameters.playoutSmoothingReadinessBound = 0;
+        parameters.playoutSmoothingReadinessBound = vrr18;
     }
     // Four consecutive intervals qualify the new window. Source-rate changes
     // already have their own confirmation gate; another 200 ms without
@@ -1001,12 +1001,10 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             playoutDelayUs,
             saturatingAdd(renderOffsetUs,
                           m_Parameters.presentationSafetyUs)));
-    const uint64_t originalTargetUs = targetUs;
-    targetUs = std::max(
-        targetUs,
-        saturatingAdd(nowUs,
-                      saturatingAdd(renderOffsetUs,
-                                    m_Parameters.presentationSafetyUs)));
+    uint64_t originalTargetUs = targetUs;
+    const uint64_t readyTargetUs = saturatingAdd(nowUs,
+        saturatingAdd(renderOffsetUs, m_Parameters.presentationSafetyUs));
+    targetUs = std::max(targetUs, readyTargetUs);
 
     // This is a live, one-slot path. An unconfirmed RTP/frame jump may
     // describe already-skipped content, never hundreds of milliseconds that
@@ -1021,7 +1019,9 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                 playoutDelayUs,
                 saturatingAdd(m_RenderLeadUs,
                               m_Parameters.presentationSafetyUs))));
-    bool reseedPhase = targetUs > maximumDirectTargetUs;
+    const bool futureProjection = targetUs > maximumDirectTargetUs;
+    const bool nativeAbsorb = m_Parameters.nativeScheduledAbsorb();
+    bool reseedPhase = futureProjection;
     if (reseedPhase && timestampPlayout) {
         // Under timestamp playout one early outlier is not a clock jump.
         // The frame simply waits for its slot; only a run of frames that
@@ -1070,6 +1070,17 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                 playoutDelayUs,
                 saturatingAdd(m_RenderLeadUs,
                               m_Parameters.presentationSafetyUs)));
+        if (nativeAbsorb) originalTargetUs = targetUs;
+    }
+    else if (futureProjection && nativeAbsorb) {
+        // Keep the native queue available for the next observation instead
+        // of reserving a distant deadline from an unconfirmed clock jump.
+        const uint64_t fallbackUs = saturatingAdd(addSigned(sourceMappingUs(frame), smoothingUs),
+                                                  saturatingAdd(playoutDelayUs, leadUs));
+        originalTargetUs = std::min(originalTargetUs, fallbackUs);
+        targetUs = std::max(originalTargetUs, readyTargetUs);
+        cadence.phaseDiscontinuity = true;
+        cadence.eligible = false;
     }
     if (timestampPlayout && smoothingReserveEnabled()) {
         // This frame has already arrived, so its own readiness against the
@@ -1291,6 +1302,11 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             renderStartUs = std::min(earliestStartUs,
                                      std::max(renderStartUs, latestStartUs));
         }
+    }
+
+    if (nativeAbsorb) {
+        // The presenter holds this image until the display deadline.
+        renderStartUs = nowUs;
     }
 
     VrrTimingDecision decision;
