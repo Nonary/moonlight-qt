@@ -162,6 +162,8 @@ VrrTimingParameters vrrTimingParametersForSession(
     const int latencyMode = config.latencyMode >= 0 && config.latencyMode <= 2 ?
         config.latencyMode : 1;
     const auto options = config.timingOptions.resolved(latencyMode);
+    const bool vrr18 = config.vrr18IntervalFeedback;
+    parameters.playoutVrr18IntervalFeedback = vrr18;
     parameters.playoutIntervalToleranceUs = options.toleranceUs;
     // Presets change only the four user-visible values. Admission, release,
     // and late-frame recovery use the same policy for every combination.
@@ -176,12 +178,12 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayCapUsesObservedPeriod = 1;
     parameters.playoutQueueFrames = kPlayoutQueueFrames;
     parameters.playoutCapacityTelemetry = 1;
-    parameters.playoutInputPercentileEnabled = config.experimentalInputPercentilePpm != 0;
-    parameters.boundedCatchupEnabled = config.experimentalBoundedCatchup;
-    parameters.normalizedSourceMapping = config.experimentalBoundedCatchup;
-    parameters.normalizedSourceIntrinsicDecodeGpu = config.experimentalBoundedCatchup;
-    parameters.playoutCeilingPhaseReplacement = 3;
-    parameters.playoutOffsetSendSpanNormalization = 1;
+    parameters.playoutInputPercentileEnabled = !vrr18 && config.experimentalInputPercentilePpm != 0;
+    parameters.boundedCatchupEnabled = !vrr18 && config.experimentalBoundedCatchup;
+    parameters.normalizedSourceMapping = parameters.boundedCatchupEnabled;
+    parameters.normalizedSourceIntrinsicDecodeGpu = parameters.boundedCatchupEnabled;
+    parameters.playoutCeilingPhaseReplacement = vrr18 ? 0 : 3;
+    parameters.playoutOffsetSendSpanNormalization = !vrr18;
     if (parameters.boundedCatchupEnabled) {
         parameters.playoutCatchupCarryLimitUs = kCatchupCarryLimitUs;
         parameters.playoutCatchupCarryLimitPeriodPerMille = kCatchupCarryLimitPeriodPerMille;
@@ -215,8 +217,8 @@ VrrTimingParameters vrrTimingParametersForSession(
         parameters.playoutInputPercentileFallUsPerSecond = 1000;
     }
     // Late-frame recovery is independent of optional source-cadence smoothing.
-    parameters.playoutCatchupPerMille = 20;
-    parameters.playoutLateRecovery = 1;
+    parameters.playoutCatchupPerMille = vrr18 && !config.smoothFrameTiming ? 0 : 20;
+    parameters.playoutLateRecovery = !vrr18;
     parameters.playoutGpuReadinessAdaptation = 1;
     parameters.playoutPredictionOnly = 1;
 
@@ -234,11 +236,12 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutIntervalInitialMinimumSamples = 32;
     // Retain earned protection between bursts instead of repeatedly shedding
     // it and reacquiring it. Explicit captured values preserve older release.
-    parameters.playoutMeanMissHoldUs = 8000000;
+    parameters.playoutMeanMissHoldUs = vrr18 && latencyMode == 2 ? 6000000 :
+        vrr18 && latencyMode == 0 ? 10000000 : 8000000;
     // Balanced's 250 us/s recovery is the measured latency/smoothness knee:
     // faster recovery saved little additional latency and raised presented
     // jerk. All custom settings use this shared release policy.
-    parameters.playoutMeanMissReleaseUsPerSecond = 250;
+    parameters.playoutMeanMissReleaseUsPerSecond = vrr18 && latencyMode == 0 ? 50 : 250;
 
     // No profile floors its delay at a recent ready-offset percentile. Such a
     // floor counts every late frame, including a decoder that has fallen
@@ -307,7 +310,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     // larger interval buffer by advancing an otherwise on-time deadline.
     // Zero preserves both the old smoother and its attribution for replay.
     parameters.playoutSmoothingReadinessBound =
-        config.smoothFrameTiming ? 1 : 0;
+        !vrr18 && config.smoothFrameTiming ? 1 : 0;
     parameters.smoothingMode = VrrSmoothingWorkerPhaseLocked;
     if (config.smoothFrameTiming && config.absorbMicrostutter) {
         parameters.smoothingMode = VrrSmoothingAbsorb;
@@ -372,7 +375,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.renderStartAfterSubmissionUs = 0;
     parameters.renderStartMinimumLeadUs = kRenderStartMinimumLeadUs;
     parameters.renderLeadFloorUs = kRenderLeadFloorUs;
-    parameters.preparationInitialSampleExcluded = 2;
+    parameters.preparationInitialSampleExcluded = vrr18 ? 1 : 2;
     parameters.preparationPredictionLead = 1;
     // A source-rate epoch of at least 1.5x returns to the delay previously
     // sustained at that rate; decreases slew so a restore is not a jump.
@@ -387,7 +390,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.candidateCadenceRatioNumerator = 5;
     parameters.candidateCadenceRatioDenominator = 4;
     parameters.playoutStallBurstExclusion = 1;
-    parameters.latchedFloorDisabled = nativeScheduledPresentation ? 1 : 3;
+    parameters.latchedFloorDisabled = vrr18 || nativeScheduledPresentation ? 1 : 3;
     // A latched present flips no earlier than one display period after the
     // previous flip, not at its call. Anchoring the next tearing present to
     // the call let it flip inside the panel's minimum period after a late or
@@ -1542,6 +1545,13 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     // Follow the host and deliberate judder correction. Buffer/render-budget
     // changes do not redefine the intended motion or conceal client errors.
     m_Pending.intervalIntendedUs = addSigned(decision.sourceTimeUs, decision.cadenceSmoothingUs);
+    if (m_Parameters.playoutVrr18IntervalFeedback && timestampPlayout && !rebased &&
+            !reseedPhase && !cadence.phaseDiscontinuity && !cadence.sourceRateChanged &&
+            cadence.frameDelta == 1 && m_HaveLastSubmission) {
+        const uint64_t latchedFloorUs = decision.latchedPresentation ?
+            saturatingAdd(m_LastSubmissionUs, m_DisplayPeriodUs) : 0;
+        m_Pending.intervalSpacingFloorUs = std::max(earliestUs, latchedFloorUs);
+    }
     // Reuse the chart's input-slot basis, but use the producer's decoder
     // output timestamp. GPU completion sampled after a pacing-queue wait is
     // only an upper bound and would count our own delay as fresh jitter.
@@ -2481,14 +2491,15 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 submissionUs, deadline, ready, p.applied,
                 submitted && !cancelled && m_Pending.intervalValid && m_Pending.hasPreparationDuration,
                 p.eligible,
-                serialServiceUs, p.decoderQueue},
+                serialServiceUs, p.decoderQueue, m_Pending.intervalSpacingFloorUs},
                 playoutDelayMinimumUs(), playoutDelayMaximumUs(),
                 m_Parameters.playoutMeanMissHoldUs, m_Parameters.playoutMeanMissReleaseUsPerSecond,
                 true, m_Parameters.playoutOnTimeTargetPerMillion,
                 intervalQualityToleranceUs(m_Parameters),
                 intervalQualityWindowUs(m_Parameters),
                 m_Parameters.playoutIntervalInitialWarmupUs,
-                m_Parameters.playoutIntervalInitialMinimumSamples);
+                m_Parameters.playoutIntervalInitialMinimumSamples,
+                m_Parameters.playoutVrr18IntervalFeedback != 0);
             if (m_Parameters.playoutInputPercentileEnabled) {
                 const auto capacity = m_IntervalBuffer.stats();
                 const bool validInput = submitted && !cancelled && m_Pending.intervalValid &&

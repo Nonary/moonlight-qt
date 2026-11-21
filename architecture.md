@@ -1,13 +1,18 @@
 # Streaming and VRR architecture
 
-Source baseline: master plus the decode-buffer accounting correction on 2026-10-30,
+Source baseline: the published `v6.2.0-daily.201` client with VRR18 interval
+feedback restored for live sessions. Its custom profile exposes the frame
+allowance, timing target, score history, and interval tolerance. The renderer,
+observed D3D11 completion, and schema-6 capture contracts come from the newer
+client. The earlier platform changes include the decode-buffer accounting
+correction on 2026-10-30,
 the buffer evidence corrections on 2026-11-04, the absorbable-loss solver,
 release hold and blocked-evidence correction on 2026-11-09, and timestamped
 D3D11 decode completion with the capped solver margin on 2026-11-13 (the D3D11
 presenter part had not been run on Windows when this was written). The
 production worker
-resolves one adaptive input policy, bounded catch-up and corrected input
-accounting. The calibration key includes effective policy and presenter
+resolves VRR18 interval feedback and bounded per-frame catch-up. The
+calibration key includes effective policy and presenter
 capabilities; existing keys are not reused. Schema-6 capture and schema-2
 replay configs support this current policy. Old compressed captures can still
 be decoded, but older controller revisions require a fresh capture for replay.
@@ -630,6 +635,16 @@ floors, and presenter-specific latch protection. Applied input buffering,
 planned extra delay, queue capacity and retained phase are distinct quantities.
 
 ## 9. Adaptive input buffer and calibration
+
+Live sessions adjust the buffer from observed presentation spacing after a
+qualification window. The controller grows only for attributable readiness
+misses within the configured allowance and releases gradually after clean
+evidence. Its readiness deadline includes any spacing already provided by the
+presentation floor. With 8.0 ms covered and readiness at 8.6 ms, the observer
+sees a 0.6 ms miss before applying tolerance.
+
+The following describes the historical goal-solver policy, retained for replay
+of its schema-6 captures.
 
 `InputGoalBuffer` observes eligible input readiness against the unbuffered
 source slot. The goal solver selects the smallest buffer meeting the selected

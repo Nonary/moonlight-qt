@@ -7,7 +7,7 @@ import QtQuick.Layouts 1.2
 ConsoleSettingsSection {
     id: root
     title: qsTr("VRR timing")
-    property int bufferPerMille: 1000
+    property int bufferPerMille: 2000
     property int targetHundredths: 9950
     property int historySeconds: 120
     property int toleranceUs: 500
@@ -16,9 +16,9 @@ ConsoleSettingsSection {
     signal targetEdited(int value)
     signal historyEdited(int value)
     signal toleranceEdited(int value)
-    readonly property int presetIndex: bufferPerMille === 500 && targetHundredths === 9900 && historySeconds === 60 && toleranceUs === 500 ? 0 :
-                                       bufferPerMille === 1000 && targetHundredths === 9950 && historySeconds === 120 && toleranceUs === 500 ? 1 :
-                                       bufferPerMille === 4000 && targetHundredths === 9995 && historySeconds === 300 && toleranceUs === 500 ? 2 : 3
+    readonly property int presetIndex: bufferPerMille === 1000 && targetHundredths === 9900 && historySeconds === 60 && toleranceUs === 500 ? 0 :
+                                       bufferPerMille === 2000 && targetHundredths === 9950 && historySeconds === 120 && toleranceUs === 500 ? 1 :
+                                       bufferPerMille === 4000 && targetHundredths === 9999 && historySeconds === 300 && toleranceUs === 200 ? 2 : 3
 
     ColumnLayout {
         width: parent.width
@@ -131,7 +131,7 @@ ConsoleSettingsSection {
             id: tolerance
             objectName: "vrrTolerance"
             width: parent.width
-            from: 250; to: 2000; stepSize: 250
+            from: 200; to: 2000; stepSize: 50
             value: root.toleranceUs
             editable: false
             Component.onCompleted: {

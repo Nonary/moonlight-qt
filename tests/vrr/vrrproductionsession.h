@@ -21,6 +21,22 @@ inline VrrSessionConfig vrrProductionInputConfig(VrrSessionConfig config)
     return vrrProductionSessionConfig(std::move(config));
 }
 
+// Historical goal-solver fixtures keep their original session parameters.
+inline VrrSessionConfig vrrHistoricalGoalConfig(VrrSessionConfig config)
+{
+    const auto defaults = config.latencyMode == 2 ? VrrTimingOptions{500, 9900, 60, 500} :
+        config.latencyMode == 0 ? VrrTimingOptions{2000, 9995, 300, 500} :
+                                 VrrTimingOptions{1000, 9950, 120, 500};
+    auto& options = config.timingOptions;
+    if (!options.bufferPerMille) options.bufferPerMille = defaults.bufferPerMille;
+    if (!options.targetHundredths) options.targetHundredths = defaults.targetHundredths;
+    if (!options.historySeconds) options.historySeconds = defaults.historySeconds;
+    if (!options.toleranceUs) options.toleranceUs = defaults.toleranceUs;
+    config = vrrProductionSessionConfig(config);
+    config.vrr18IntervalFeedback = false;
+    return config;
+}
+
 // Mirrors Pacer::initialize() for a preset (latencyMode 0 Smooth, 1 Balanced,
 // 2 Low Latency) and then applies the worker's resolution.
 inline VrrSessionConfig vrrProductionSession(int latencyMode, int streamRateHz,

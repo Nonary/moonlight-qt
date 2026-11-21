@@ -301,6 +301,11 @@ bool validateVrrCurrentPolicy(const VrrTimingParameters& value, QString& error)
     const bool currentSmoothing = smoothingMode == VrrSmoothingAbsorb ? smoothing :
         smoothingMode == (!smoothing ? VrrSmoothingOff : scheduled ?
             VrrSmoothingNativeToleranceBounded : VrrSmoothingWorkerPhaseLocked);
+    if (value.playoutVrr18IntervalFeedback == 1 && !value.playoutInputPercentileEnabled &&
+            !value.boundedCatchupEnabled && value.playoutPredictionOnly &&
+            value.latchedFloorDisabled == 1 && currentSmoothing) {
+        return true;
+    }
     if (!value.playoutInputPercentileEnabled ||
             !value.playoutInputGoalWindowUs || !value.boundedCatchupEnabled ||
             !value.normalizedSourceMapping || !value.normalizedSourceIntrinsicDecodeGpu ||
@@ -388,14 +393,14 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.renderStartPreserveLearnedLead > 1 ||
             value.playoutDelayCapUsesObservedPeriod > 1 ||
             value.playoutCapacityTelemetry > 1 ||
-            value.playoutInputPercentileEnabled > 1 ||
+            value.playoutInputPercentileEnabled > 1 || value.playoutVrr18IntervalFeedback > 1 ||
             value.playoutGpuReadinessAdaptation > 1) {
         return fail("prediction-only, display event requirement, native hitch adaptation, readiness adaptation, stable smoothness reference, learned preparation lead, observed-period cap, capacity telemetry, absorbed jitter release, and GPU readiness flags must be 0 or 1");
     }
     if (value.playoutInputPercentileToleranceUs != 0 &&
-        (value.playoutInputPercentileToleranceUs < 250 || value.playoutInputPercentileToleranceUs > 2000 ||
-         value.playoutInputPercentileToleranceUs % 250 != 0)) {
-        return fail("input percentile tolerance must be zero for historical strict coverage, or 250..2000us in 250us steps");
+        (value.playoutInputPercentileToleranceUs < 200 || value.playoutInputPercentileToleranceUs > 2000 ||
+         value.playoutInputPercentileToleranceUs % 50 != 0)) {
+        return fail("input percentile tolerance must be zero for historical strict coverage, or 200..2000us in 50us steps");
     }
     if (value.playoutInputPercentileEnabled &&
         (value.playoutPredictionOnly != 1 ||
@@ -560,9 +565,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
         return fail("playout_catchup_per_mille must be in 0..100");
     }
     if (value.playoutIntervalToleranceUs != 0 &&
-            (value.playoutIntervalToleranceUs < 250 || value.playoutIntervalToleranceUs > 2000 ||
-             value.playoutIntervalToleranceUs % 250 != 0)) {
-        return fail("playout_interval_tolerance_us must be 0 (legacy) or 250..2000 in steps of 250");
+            (value.playoutIntervalToleranceUs < 200 || value.playoutIntervalToleranceUs > 2000 ||
+             value.playoutIntervalToleranceUs % 50 != 0)) {
+        return fail("playout_interval_tolerance_us must be 0 (legacy) or 200..2000 in steps of 50");
     }
     if (value.playoutLateRecovery > 1 ||
             (value.playoutLateRecovery && value.playoutCatchupPerMille == 0)) {

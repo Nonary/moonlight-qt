@@ -5,7 +5,7 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/extrabufferslew.h"
 #include "../../app/streaming/video/performancestats.h"
 #ifdef INPUT_PERCENTILE_CONTROLLER_TEST
-#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
+#include "vrrproductionsession.h"
 #endif
 #include <cstdio>
 #include <cstdlib>
@@ -165,7 +165,7 @@ void testFactoryProfileOwnsAdaptiveTarget() {
             session.latencyMode = mode; session.timingOptions.targetHundredths = custom;
             session.timingOptions.historySeconds = custom == 0 ? 0 : 200;
             const auto options = session.timingOptions.resolved(mode);
-            session = vrrProductionSessionConfig(session);
+            session = vrrHistoricalGoalConfig(session);
             const auto policy = vrrTimingParametersForSession(session);
             check(policy.playoutInputPercentileEnabled &&
                   policy.playoutInputPercentileTargetPerMillion == uint64_t(options.targetHundredths) * 100 &&
@@ -182,7 +182,7 @@ void testActualControllerRateBandsRestoreProtection() {
     VrrSessionConfig session;session.streamRateHz=120;session.displayRefreshHz=144;
     session.smoothFrameTiming=false;
     session.timingOptions={2000,9950,60,500};
-    session = vrrProductionSessionConfig(session);
+    session = vrrHistoricalGoalConfig(session);
     auto policy=vrrTimingParametersForSession(session);
     policy.playoutDelayStartSeedUs=1000;
     VrrTimingController controller(session,true,policy);
@@ -226,7 +226,7 @@ void testActualControllerRepeatedZeroTimestampDrops() {
     VrrSessionConfig session;session.streamRateHz=60;session.displayRefreshHz=120;
     session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=990000;
     session.timingOptions.historySeconds=30;
-    session = vrrProductionSessionConfig(session);
+    session = vrrHistoricalGoalConfig(session);
     auto policy=vrrTimingParametersForSession(session);
     policy.playoutDelayStartSeedUs=6000;
     VrrTimingController controller(session,true,policy);
@@ -251,7 +251,7 @@ void testActualControllerPostInputErrorsCannotInflateBuffer() {
     VrrSessionConfig session;session.streamRateHz=60;session.displayRefreshHz=120;
     session.latencyMode=1;session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=1;
     session.timingOptions={1000,9950,10,500};
-    session = vrrProductionSessionConfig(session);
+    session = vrrHistoricalGoalConfig(session);
     auto policy=vrrTimingParametersForSession(session);
     policy.playoutDelayStartSeedUs=1000;policy.playoutDelayMinimumUs=1000;
     policy.playoutDelayMaximumUs=6000;
@@ -287,7 +287,7 @@ void testActualControllerEligibility() {
     VrrSessionConfig session;
     session.streamRateHz = 120; session.displayRefreshHz = 144;
     session.smoothFrameTiming = false;
-    session = vrrProductionSessionConfig(session);
+    session = vrrHistoricalGoalConfig(session);
     const auto policy = vrrTimingParametersForSession(session);
     VrrTimingController controller(session,true,policy);
     uint64_t submitted=0;
@@ -545,12 +545,12 @@ static void testGoalBufferLifecycle() {
 }
 
 #ifdef INPUT_PERCENTILE_CONTROLLER_TEST
-static void testProductionUsesGoalSolver() {
+static void testHistoricalGoalSolverParameters() {
     struct Expect { int mode; uint64_t windowUs, capPerMille; };
     for(const auto e:{Expect{2,20000000,500},Expect{1,60000000,1000},Expect{0,120000000,2000}}){
         VrrSessionConfig session;session.streamRateHz=116;session.displayRefreshHz=120;session.latencyMode=e.mode;
         session.experimentalInputPercentilePpm=1;session.experimentalBoundedCatchup=true;
-        session.timingOptions=VrrTimingOptions::preset(e.mode);
+        session = vrrHistoricalGoalConfig(session);
         const auto policy=vrrTimingParametersForSession(session);
         check(policy.playoutInputGoalWindowUs==e.windowUs &&
               policy.playoutInputGoalTailPerMille==700 && policy.playoutInputIntrinsicDecodeGpu==1 &&
@@ -566,7 +566,7 @@ int main() {
     testSharedExtraBufferAllowance();
     testGoalSolverMeetsGoalWithLeastBuffer();testGoalSolverUnreachableGoals();testGoalSolverIgnoresStallsBeyondTheCap();testGoalSolverNeedsARateBeforeItRaises();testGoalBufferFollowsRecentJitter();testGoalBufferHoldsReleaseAgainstTargetSteps();testGoalBufferSpendsNothingOnStallsBeyondTheCap();testGoalBufferMarginCostIsCapped();testGoalBufferLifecycle();
 #ifdef INPUT_PERCENTILE_CONTROLLER_TEST
-    testProductionUsesGoalSolver();
+    testHistoricalGoalSolverParameters();
     testFactoryProfileOwnsAdaptiveTarget();
 #endif
 #ifdef INPUT_PERCENTILE_CONTROLLER_TEST

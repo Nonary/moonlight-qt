@@ -23,6 +23,7 @@ public:
         uint64_t frame = 0, intended = 0, submitted = 0, deadline = 0, ready = 0, buffer = 0;
         bool valid = false, absorbable = false;
         uint64_t serialService = 0, decoderQueue = 0;
+        uint64_t spacingFloor = 0;
     };
     // Observation only. This explains the request made after an outcome;
     // the controller applies that request to subsequent frames. In particular,
@@ -44,7 +45,7 @@ public:
         uint64_t evaluatedUs = 0, failedUs = 0;
         double weightedLossUs = 0;
         // Separate control history: never substitute it for client timing.
-        uint64_t bufferFailedUs = 0;
+        uint64_t bufferEvaluatedUs = 0, bufferFailedUs = 0;
         double bufferWeightedLossUs = 0;
         uint64_t toleranceUs = ToleranceUs;
         uint64_t scoreWindowUs = 30000000;
@@ -69,8 +70,8 @@ public:
         }
         double qualityPercent() const { return 100.0 * (1.0 - lossFraction()); }
         double bufferLossFraction() const {
-            return evaluatedUs ? std::clamp(
-                (severityWeighted ? bufferWeightedLossUs : double(bufferFailedUs)) / evaluatedUs,
+            return bufferEvaluatedUs ? std::clamp(
+                (severityWeighted ? bufferWeightedLossUs : double(bufferFailedUs)) / bufferEvaluatedUs,
                 0.0, 1.0) : 0.0;
         }
         double bufferQualityPercent() const { return 100.0 * (1.0 - bufferLossFraction()); }
@@ -81,7 +82,8 @@ public:
                  uint64_t toleranceUs = 500,
                  uint64_t scoreWindowUs = 30000000,
                  uint64_t initialWarmupUs = 1000000,
-                 size_t initialMinimumSamples = 2) {
+                 size_t initialMinimumSamples = 2,
+                 bool vrr18Feedback = false) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -124,6 +126,9 @@ public:
         update.minimumUs = minimum;
         update.maximumUs = maximum;
         m_Previous = s;
+        if (adjacent) {
+            m_Previous.deadline = std::max(s.deadline, s.spacingFloor);
+        }
         m_HavePrevious = s.valid && s.submitted && s.intended;
         if (!adjacent) {
             updateScore(s.submitted, scoreWindowUs);
@@ -176,10 +181,16 @@ public:
             (double(error)) - toleranceUs);
         const double loss = std::min(1.0, excessUs / intended);
         if (severityWeighted) score.weightedLoss += actual * loss;
-        const double bufferExcessUs = excessUs;
-        const double bufferLoss = loss;
-        if (error > toleranceUs) score.bufferFailed += actual;
-        if (severityWeighted) score.bufferWeightedLoss += actual * loss;
+        // Keep display reporting on individual intervals. VRR18 feedback
+        // qualifies the service window before scoring its mean interval error.
+        const double bufferExcessUs = vrr18Feedback ?
+            std::max(0.0, m_Stats.averageErrorUs - toleranceUs) : excessUs;
+        const double bufferLoss = std::min(1.0, bufferExcessUs / intended);
+        if (!vrr18Feedback || m_Stats.averageValid) {
+            score.bufferEvaluated += actual;
+            if (bufferExcessUs > 0) score.bufferFailed += actual;
+            if (severityWeighted) score.bufferWeightedLoss += actual * bufferLoss;
+        }
         updateScore(s.submitted, scoreWindowUs);
 
         if (!m_Stats.averageValid) return;
@@ -190,15 +201,15 @@ public:
         // Old score debt holds protection, but cannot authorize another attack
         // without current, attributable error outside the preset's allowance.
         const bool historicalPressure = severityWeighted && belowTarget;
-        const bool historyHolds = historicalPressure;
-        const auto& delayed = actual >= intended ? s : previous;
+        const bool historyHolds = !vrr18Feedback && historicalPressure;
+        const auto& delayed = actual >= intended ? m_Previous : previous;
         const auto lateness = delayed.ready > delayed.deadline ? delayed.ready - delayed.deadline : 0;
         const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
         const bool windowAbsorbable = service <= intendedTime && decoderQueue <= intendedTime;
         const bool delayedAbsorbable = delayed.absorbable &&
             (windowAbsorbable);
         const bool targetAllowsHold = !severityWeighted || belowTarget;
-        const bool pressureHolds = targetAllowsHold && currentPressure &&
+        const bool pressureHolds = (vrr18Feedback || targetAllowsHold) && currentPressure &&
             (freshError && delayedAbsorbable && lateness);
         const bool holdProtection = pressureHolds ||
             (targetAllowsHold && historyHolds);
@@ -209,7 +220,7 @@ public:
             if (severityWeighted) m_ReleaseFraction = 0;
         }
         {
-            if (renewsHold || ((targetAllowsHold) &&
+            if (renewsHold || ((vrr18Feedback || targetAllowsHold) &&
                                (!s.absorbable || !windowAbsorbable))) {
                 m_CleanEvidenceUs = 0;
                 m_LastCleanEvidenceUs = 0;
@@ -306,13 +317,13 @@ private:
     struct ScoreBucket {
         uint64_t tick = 0, evaluated = 0, failed = 0;
         double weightedLoss = 0;
-        uint64_t bufferFailed = 0;
+        uint64_t bufferEvaluated = 0, bufferFailed = 0;
         double bufferWeightedLoss = 0;
     };
     void updateScore(uint64_t at, uint64_t windowUs) {
         m_Stats.evaluatedUs = m_Stats.failedUs = 0;
         m_Stats.weightedLossUs = 0;
-        m_Stats.bufferFailedUs = 0;
+        m_Stats.bufferEvaluatedUs = m_Stats.bufferFailedUs = 0;
         m_Stats.bufferWeightedLossUs = 0;
         const uint64_t windowBuckets = std::clamp<uint64_t>(
             (windowUs + ScoreBucketUs - 1) / ScoreBucketUs,
@@ -322,6 +333,7 @@ private:
             if (tick >= b.tick && tick - b.tick < windowBuckets) {
                 m_Stats.evaluatedUs += b.evaluated; m_Stats.failedUs += b.failed;
                 m_Stats.weightedLossUs += b.weightedLoss;
+                m_Stats.bufferEvaluatedUs += b.bufferEvaluated;
                 m_Stats.bufferFailedUs += b.bufferFailed;
                 m_Stats.bufferWeightedLossUs += b.bufferWeightedLoss;
             }

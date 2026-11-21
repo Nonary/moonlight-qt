@@ -3,7 +3,7 @@
 // owns the optional qmake harness.
 
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h"
-#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
+#include "vrrproductionsession.h"
 #include "../../app/streaming/vrrratepolicy.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrcatchup.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h"
@@ -2993,7 +2993,7 @@ void testProductionWorkerSmoothingOwnsMovement()
             auto session = config(120, 120);
             session.smoothFrameTiming = true;
             session.absorbMicrostutter = absorb;
-            session = vrrProductionSessionConfig(session);
+            session = vrrHistoricalGoalConfig(session);
             auto policy = vrrTimingParametersForSession(session);
             expect(policy.playoutSmoothingOwnMovement == 1 &&
                        policy.smoothingMode == (absorb ? 7u : 2u) &&
@@ -3026,7 +3026,7 @@ void testProductionWorkerSmoothingOwnsMovement()
         std::fprintf(stderr, "worker smoothing movement (absorb=%d): jerk %llu -> %llu us\n", int(absorb),
                      static_cast<unsigned long long>(jerk[0]), static_cast<unsigned long long>(jerk[1]));
         expect(absorb ? jerk[1] * 4 < jerk[0] * 3 : jerk[1] * 2 < jerk[0],
-               "both production smoothers must remove source wobble instead of spending T/second");
+               "both goal-solver smoothers must remove source wobble instead of spending T/second");
     }
 }
 
@@ -3036,9 +3036,9 @@ void testProductionPreservesRelativeGameSpacing()
     session.smoothFrameTiming = false;
     auto policy = vrrTimingParametersForSession(session);
     expect(policy.playoutDelayMaximumUs == policy.playoutDelayMinimumUs &&
-               policy.playoutDelayMaximumPeriodPerMille == 2000 &&
-               policy.playoutDelayCapSourcePeriodPerMille == 2000,
-           "production Smooth must allow two fitted source periods");
+               policy.playoutDelayMaximumPeriodPerMille == 4000 &&
+               policy.playoutDelayCapSourcePeriodPerMille == 4000,
+           "production Smooth must allow four fitted source periods");
     // Hold padding constant to isolate the spacing contract from adaptation.
     policy.playoutDelayMaximumPeriodPerMille = 0;
     policy.playoutDelayCapSourcePeriodPerMille = 0;
@@ -3117,15 +3117,15 @@ void testLatencyPresetsAcrossSourceAndDisplayRates()
         const auto ordinaryPolicy = vrrTimingParametersForSession(ordinarySession);
         expect(ordinaryPolicy.latencyFixEnabled == 1 &&
                    ordinaryPolicy.latencyFixAllRates == 1 &&
-                   ordinaryPolicy.playoutDelayCapSourcePeriodPerMille == 2000 &&
+                   ordinaryPolicy.playoutDelayCapSourcePeriodPerMille == 4000 &&
                    ordinaryPolicy.playoutDelayMaximumUs == ordinaryPolicy.playoutDelayMinimumUs &&
-                   ordinaryPolicy.playoutDelayMaximumPeriodPerMille == 2000,
-               "Smooth must allow two fitted source frames within capacity limits");
+                   ordinaryPolicy.playoutDelayMaximumPeriodPerMille == 4000,
+               "Smooth must allow four fitted source frames within capacity limits");
         for (int mode : {1, 2}) {
             auto session = ordinarySession;
             session.latencyMode = mode;
             const auto policy = vrrTimingParametersForSession(session);
-            const uint64_t capPerMille = mode == 2 ? 500 : 1000;
+            const uint64_t capPerMille = mode == 2 ? 1000 : 2000;
             expect(policy.latencyFixEnabled == 1 && policy.latencyFixAllRates == 1 &&
                        policy.latencyFixDelayPeriodPerMille == 500 &&
                        policy.playoutDelayCapSourcePeriodPerMille == capPerMille,
@@ -3193,7 +3193,7 @@ void testLatencyPresetsBoundHitchesThroughCadenceChanges()
         selectedSession.latencyMode = mode;
         VrrTimingController ordinary(ordinarySession, true, vrrTimingParametersForSession(ordinarySession));
         VrrTimingController selected(selectedSession, true, vrrTimingParametersForSession(selectedSession));
-        const uint64_t capPerMille = mode == 2 ? 500 : 1000;
+        const uint64_t capPerMille = mode == 2 ? 1000 : 2000;
         uint64_t ordinaryBeforeHitches = 0;
         uint64_t ordinaryMaximum = 0;
         double ticks = 0;
@@ -3276,7 +3276,7 @@ void testPresetReadinessTargets()
         auto session = config(120, 116);
         session.latencyMode = mode;
         const auto policy = vrrTimingParametersForSession(session);
-        const uint64_t target = mode == 2 ? 990000 : mode == 1 ? 995000 : 999500;
+        const uint64_t target = mode == 2 ? 990000 : mode == 1 ? 995000 : 999900;
         const uint64_t window = mode == 2 ? 60000000 : mode == 1 ? 120000000 : 300000000;
         expect(policy.playoutOnTimeTargetPerMillion == target &&
                    policy.playoutReadinessWindowUs == window,
@@ -3362,8 +3362,8 @@ void testPresetIntervalTolerances()
         controller.notePreparationDuration(1000, 0, 101000);
         controller.noteSubmission(true, false, decision.targetUs);
 
-        expect(controller.intervalStats().toleranceUs == 500,
-               "every preset, including Smooth (revision 3), must use 0.5 ms interval tolerance");
+        expect(controller.intervalStats().toleranceUs == (mode == 0 ? 200 : 500),
+               "VRR18 presets retain 0.2 ms Smooth and 0.5 ms Balanced and Low Latency tolerances");
     }
 }
 
@@ -3372,9 +3372,34 @@ void testProductionIntervalParameters()
     for (int mode : {0, 1, 2}) {
         auto session = config(116, 120);
         session.latencyMode = mode;
+        session = vrrProductionSessionConfig(session);
         const auto policy = vrrTimingParametersForSession(session);
         expect(policy.playoutSourceMappingDecoderOutput == 0, "mapping excludes worker waits");
+        expect(policy.playoutVrr18IntervalFeedback && !policy.playoutInputPercentileEnabled &&
+               !policy.boundedCatchupEnabled, "the live session uses VRR18 interval feedback");
     }
+    auto session = vrrProductionSessionConfig(config(116, 120));
+    session.timingOptions = {1750, 9925, 35, 350};
+    const auto policy = vrrTimingParametersForSession(session);
+    expect(policy.playoutDelayMaximumPeriodPerMille == 1750 &&
+           policy.playoutOnTimeTargetPerMillion == 992500 &&
+           policy.playoutReadinessWindowUs == 35000000 &&
+           policy.playoutIntervalToleranceUs == 350, "custom settings resolve on the VRR18 live path");
+}
+
+void testIntervalBufferCreditsAlreadyScheduledSpacing()
+{
+    Vrr13::IntervalBuffer buffer;
+    for (uint64_t i = 1; i <= 8; ++i) {
+        const uint64_t intended = 1000000 + i * 8000;
+        const uint64_t ready = intended + (i == 8 ? 8600 : 0);
+        const uint64_t floor = intended + 8000;
+        buffer.observe({i, intended, std::max(ready, floor), intended, ready, 0,
+                        true, true, 0, 0, floor},
+                       0, 16000, 6000000, 125, true, 999900, 500, 60000000, 0, 2, true);
+    }
+    expect(buffer.stats().update.latenessUs == 600,
+           "the VRR18 observer credits 8 ms of scheduled spacing once");
 }
 
 void testIntervalQualityBuffer()
@@ -4431,6 +4456,7 @@ int main()
     testPresetIntervalTolerances();
     testCustomTimingOptions();
     testProductionIntervalParameters();
+    testIntervalBufferCreditsAlreadyScheduledSpacing();
     testPresetReadinessTargets();
     testLatencyFixBufferlessLateFrameSafety();
     testLatencyPresetsAcrossSourceAndDisplayRates();

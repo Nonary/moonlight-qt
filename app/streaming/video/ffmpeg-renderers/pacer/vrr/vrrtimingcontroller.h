@@ -46,6 +46,7 @@
     /* Input-buffer learning ignores the largest `trim` requirements until the */ \
     /* profile tail is supported. */ \
     X(uint64_t, playout_input_percentile_enabled, playoutInputPercentileEnabled, 0) \
+    X(uint64_t, playout_vrr18_interval_feedback, playoutVrr18IntervalFeedback, 0) \
     /* Only preventable input misses that caused an interval hitch score/grow. */ \
     /* Stable target adaptation is independent of miss eligibility. */ \
     X(uint64_t, playout_input_goal_window_us, playoutInputGoalWindowUs, 0) \
@@ -603,6 +604,7 @@ private:
         uint64_t deferredGpuReadyUs = 0;
         uint64_t preparationCompleteUs = 0;
         uint64_t intervalIntendedUs = 0;
+        uint64_t intervalSpacingFloorUs = 0;
         uint64_t inputSlotUs = 0;
         uint64_t inputObservationUs = 0;
         int64_t inputReadinessBudgetUs = 0;
