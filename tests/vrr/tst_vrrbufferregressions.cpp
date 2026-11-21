@@ -1599,7 +1599,10 @@ void testSmoothingStaysInsideItsBudget()
             const size_t from = size_t(10 * rate);
             std::vector<uint64_t> extra;
             for (size_t i = from; i < total; ++i) extra.push_back(f[i].extraUs);
-            runs[mode] = {maximum(f, from, total, applied), s.input().minimumUs, percentile(extra, 500),
+            const auto interval = s.controller().intervalStats();
+            const uint64_t floorUs = interval.inputPercentileEnabled ?
+                interval.inputPercentile.minimumUs : interval.update.minimumUs;
+            runs[mode] = {maximum(f, from, total, applied), floorUs, percentile(extra, 500),
                           mean(f, from, total, latency), percentile(presentedJerk(f, from, total), 950)};
         }
         const uint64_t tolerance = uint64_t(vrrProductionSession(1, rate, 120).timingOptions.toleranceUs);
@@ -1619,7 +1622,7 @@ void testSmoothingStaysInsideItsBudget()
                 r.extraP50, runs[0].extraP50, budget);
             check(r.latency <= runs[0].latency + budget + 250, name, "smoothing adds no standing delay beyond its budget",
                 "mean latency %" PRIu64 " us vs %" PRIu64 " us with smoothing off", r.latency, runs[0].latency);
-            // Pass-through measures 1.0x; Reduce judder currently about 0.69x.
+            // Both smoothing modes must improve output cadence on imperfect input.
             if (smoothing.smooth)
                 check(r.jerkP95 * 5 <= runs[0].jerkP95 * 4, name, "smoothing actually evens out short/long source pairs",
                     "presented jerk p95 %" PRIu64 " us vs %" PRIu64 " us with smoothing off", r.jerkP95, runs[0].jerkP95);
