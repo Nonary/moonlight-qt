@@ -11975,8 +11975,6 @@ int main(int argc, char* argv[])
             }
             capturedConfig.latencyMode = int(unsignedField(fields, latencyModeColumn));
             capturedConfig.smoothFrameTiming = capturedParameters.playoutSmoothingGainPerMille != 0;
-            capturedConfig.absorbMicrostutter =
-                capturedConfig.smoothFrameTiming && capturedParameters.smoothingMode == 7;
             if (capturedParameters.playoutIntervalToleranceUs != 0) {
                 // The explicit tolerance identifies customizable sessions. Replay
                 // their actual values rather than guessing the last preset name.

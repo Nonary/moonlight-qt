@@ -29,8 +29,8 @@ struct VrrSessionConfig {
     // A session preference resolved into the recorded controller parameters.
     // All presets retain jitter buffering and display-spacing protection.
     bool smoothFrameTiming = true;
-    // Adds a standing presentation reserve that Reduce judder may spend on
-    // late source frames. Has no effect unless smoothFrameTiming is set.
+    // Historical policy fixtures only. Live sessions use smoothFrameTiming.
+    // Exact replay restores the recorded smoothing mode from its snapshot.
     bool absorbMicrostutter = false;
     // 0: Smooth, 1: Balanced Target, 2: Low Latency, across all VRR rates.
     // The IDs are persisted and therefore remain stable across label changes.

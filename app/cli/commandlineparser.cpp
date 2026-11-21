@@ -356,7 +356,6 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     parser.addToggleOption("vsync", "V-Sync");
     parser.addToggleOption("vrr", "VRR");
     parser.addToggleOption("vrr-smooth-frame-timing", "VRR frame timing smoothing");
-    parser.addToggleOption("vrr-absorb-microstutter", "VRR microstutter absorption (adds latency)");
     parser.addValueOption("fps", "FPS");
     parser.addValueOption("bitrate", "bitrate in Kbps");
     parser.addValueOption("packet-size", "video packet size");
@@ -463,8 +462,6 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     preferences->enableVrr = parser.getToggleOptionValue("vrr", preferences->enableVrr);
     preferences->smoothVrrFrameTiming = parser.getToggleOptionValue(
         "vrr-smooth-frame-timing", preferences->smoothVrrFrameTiming);
-    preferences->absorbVrrMicrostutter = parser.getToggleOptionValue(
-        "vrr-absorb-microstutter", preferences->absorbVrrMicrostutter);
 
     // Resolve --audio-config option
     if (parser.isSet("audio-config")) {

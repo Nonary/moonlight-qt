@@ -18,8 +18,8 @@ capabilities; existing keys are not reused. Schema-6 capture and schema-2
 replay configs support this current policy. Old compressed captures can still
 be decoded, but older controller revisions require a fresh capture for replay.
 The three former experimental environment switches are ignored with a warning.
-Smoothing uses named off, worker phase-locked, native tolerance-bounded and
-Absorb modes. Retired interval-scoring/release selectors and metronome state
+Live smoothing is off, worker phase-locked, or native tolerance-bounded.
+Exact replay can restore the retired Absorb mode from recorded parameters. Retired interval-scoring/release selectors and metronome state
 are absent from the current capture and replay parameter contract. The follow-up
 audit also removes metronome-specific frame dropping, its constant trace column,
 the old absolute render ceiling, base-guard latch exit, and pre-schema queue
@@ -629,13 +629,9 @@ service. Real readiness still constrains the submitted frame.
 Worker-paced Reduce judder uses bounded phase-locked smoothing and limits
 advances to the time left after decode readiness. Native future-target
 Reduce judder uses the tolerance-bounded source-gap path.
-Absorb Microstutter applies its own correction within a fixed 2T pad on both
-presenters. Native Absorb prepares as soon as decode is ready and queues the
-image for the planned display deadline. Decode holds for GPU contention are
-coordinated around the predicted enqueue, and an unconfirmed future source
-projection falls back to an arrival-based deadline so the worker can
-observe the next frame.
-Smoothing is independently controlled by the session preference. The
+Existing installations keep their saved Reduce judder choice when the retired
+Absorb Microstutter setting is removed. Session-policy replay uses the same
+Reduce judder choice for captures recorded with Absorb enabled. The
 controller also uses bounded phase-trajectory catch-up, readiness and display
 floors, and presenter-specific latch protection. Applied input buffering,
 planned extra delay, queue capacity and retained phase are distinct quantities.

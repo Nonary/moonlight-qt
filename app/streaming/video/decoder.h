@@ -107,7 +107,6 @@ typedef struct _DECODER_PARAMETERS {
     bool gamescopeMailbox = false;
     bool gamescopeRepaint = false;
     bool smoothVrrFrameTiming;
-    bool absorbVrrMicrostutter = false;
     // Strictly obtained during Session initialization. A value of zero means
     // the session was not qualified for VRR; Pacer must not substitute a
     // legacy 60 Hz fallback when this path is requested.

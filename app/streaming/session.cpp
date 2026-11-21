@@ -290,7 +290,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             bool enableVrr, bool preferVrrRenderer, int vrrDisplayRefreshHz,
                             [[maybe_unused]] bool* effectiveVrr, bool smoothVrrFrameTiming,
                             bool gamescopeMailbox, int vrrLatencyMode, bool gamescopeRepaint,
-                            VrrTimingOptions vrrTimingOptions, bool absorbVrrMicrostutter)
+                            VrrTimingOptions vrrTimingOptions)
 {
     DECODER_PARAMETERS params = {};
 
@@ -316,7 +316,6 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.gamescopeMailbox = gamescopeMailbox;
     params.gamescopeRepaint = gamescopeRepaint;
     params.smoothVrrFrameTiming = smoothVrrFrameTiming;
-    params.absorbVrrMicrostutter = absorbVrrMicrostutter;
     params.vrrDisplayRefreshHz = vrrDisplayRefreshHz;
     params.testOnly = testOnly;
     params.vds = vds;
@@ -687,7 +686,6 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
     m_PresentationSettings.gamescopeRepaint = false; // Retired repaint experiment.
     m_PresentationSettings.gamescopeMailbox = false; // Retired Mailbox experiment.
     m_PresentationSettings.smoothVrrFrameTiming = m_Preferences->smoothVrrFrameTiming;
-    m_PresentationSettings.absorbVrrMicrostutter = m_Preferences->absorbVrrMicrostutter;
 
     if (requestedVrr) {
         bool hasAdaptiveDisplay = true;
@@ -2057,8 +2055,7 @@ void Session::start()
             {"vrr_target_hundredths", m_PresentationSettings.vrrTimingOptions.targetHundredths},
             {"vrr_history_seconds", m_PresentationSettings.vrrTimingOptions.historySeconds},
             {"vrr_tolerance_us", m_PresentationSettings.vrrTimingOptions.toleranceUs},
-            {"reduce_judder", m_PresentationSettings.smoothVrrFrameTiming},
-            {"absorb_microstutter", m_PresentationSettings.absorbVrrMicrostutter}
+            {"reduce_judder", m_PresentationSettings.smoothVrrFrameTiming}
         };
         QString error;
         m_DiagnosticCapture = DiagnosticCapture::begin(DiagnosticCapture::rootDirectory(), metadata, error);
@@ -2633,8 +2630,7 @@ void Session::exec()
                                m_PresentationSettings.gamescopeMailbox,
                                m_PresentationSettings.vrrLatencyMode,
                                m_PresentationSettings.gamescopeRepaint,
-                               m_PresentationSettings.vrrTimingOptions,
-                               m_PresentationSettings.absorbVrrMicrostutter)) {
+                               m_PresentationSettings.vrrTimingOptions)) {
                 SDL_UnlockMutex(m_DecoderLock);
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "Failed to recreate decoder after reset");
