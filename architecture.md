@@ -10,8 +10,9 @@ the buffer evidence corrections on 2026-11-04, the absorbable-loss solver,
 release hold and blocked-evidence correction on 2026-11-09, and timestamped
 D3D11 decode completion with the capped solver margin on 2026-11-13 (the D3D11
 presenter part had not been run on Windows when this was written). The
-production worker
-resolves VRR18 interval feedback and bounded per-frame catch-up. The
+production worker resolves VRR18 interval feedback with bounded per-frame
+catch-up. Smoothing and recovery keep their shared movement limit even when
+the input predictor is inactive. The
 calibration key includes effective policy and presenter
 capabilities; existing keys are not reused. Schema-6 capture and schema-2
 replay configs support this current policy. Old compressed captures can still

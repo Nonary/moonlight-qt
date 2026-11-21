@@ -164,15 +164,15 @@ void testFactoryProfileOwnsAdaptiveTarget() {
             session.streamRateHz = 120; session.displayRefreshHz = 144;
             session.latencyMode = mode; session.timingOptions.targetHundredths = custom;
             session.timingOptions.historySeconds = custom == 0 ? 0 : 200;
-            const auto options = session.timingOptions.resolved(mode);
             session = vrrHistoricalGoalConfig(session);
+            const auto options = session.timingOptions.resolved(mode);
             const auto policy = vrrTimingParametersForSession(session);
             check(policy.playoutInputPercentileEnabled &&
                   policy.playoutInputPercentileTargetPerMillion == uint64_t(options.targetHundredths) * 100 &&
                   policy.playoutInputPercentileToleranceUs == uint64_t(options.toleranceUs) &&
                   policy.playoutInputPercentileWindowUs == uint64_t(options.historySeconds) * 1000000 &&
                   policy.playoutOnTimeTargetPerMillion == uint64_t(options.targetHundredths) * 100,
-                  "production resolves custom target, tolerance and history together");
+                  "historical goal solver resolves custom target, tolerance and history together");
         }
     }
 }

@@ -464,7 +464,7 @@ int VrrPacingWorker::run()
         // slow release; that feedback uses corrected causal input evidence.
         Overlay::TimingGraphPoint bufferPoint;
         bufferPoint.inputPercentileEnabled = m_TimingController->parameters().playoutInputPercentileEnabled != 0;
-        bufferPoint.inputToleranceUs = m_TimingController->parameters().playoutInputPercentileToleranceUs;
+        bufferPoint.inputToleranceUs = m_TimingController->parameters().playoutIntervalToleranceUs;
         bufferPoint.sourceTimeUs = decision.sourceTimeUs;
         bufferPoint.bufferUs = decision.playoutDelayUs;
         bufferPoint.cadenceRetimingUs = decision.cadenceSmoothingUs + decision.readinessBudgetUs;
@@ -972,13 +972,16 @@ int VrrPacingWorker::run()
                 input.lastInputObservationUs == telemetry.submissionBoundaryUs && input.lastInputEligible;
             sample.graph.producerRequiredUs = input.lastInputRequiredUs;
             sample.graph.inputVrrHeadroomUs = input.vrrHeadroomUs;
-            sample.graph.inputTargetUs = input.targetUs;
-            sample.graph.inputTargetValid = input.evidenceValid;
-            sample.graph.inputTargetCapped = input.clipped;
-            sample.graph.inputProbabilityPpm = input.probabilityPpm;
-            sample.graph.inputWindowUs = input.windowUs;
+            sample.graph.inputTargetUs = graphInterval.inputPercentileEnabled ? input.targetUs :
+                decision.requestedPlayoutDelayUs;
+            sample.graph.inputTargetValid = graphInterval.inputPercentileEnabled ? input.evidenceValid :
+                graphInterval.averageValid;
+            sample.graph.inputTargetCapped = graphInterval.inputPercentileEnabled ? input.clipped :
+                decision.playoutCapacityLimited;
+            sample.graph.inputProbabilityPpm = m_TimingController->parameters().playoutOnTimeTargetPerMillion;
+            sample.graph.inputWindowUs = graphInterval.scoreWindowUs;
             // Profile allowance remains known while reset evidence is unavailable.
-            sample.graph.inputToleranceUs = m_TimingController->parameters().playoutInputPercentileToleranceUs;
+            sample.graph.inputToleranceUs = graphInterval.toleranceUs;
             sample.graph.inputCoverageWindowUs = input.reportingWindowUs;
             sample.graph.inputSamples = input.reportingWindowUs ? input.reportingEligible : input.recentEligible;
             sample.graph.inputAbsorbed = input.reportingWindowUs ? input.reportingAbsorbed : input.recentAbsorbed;

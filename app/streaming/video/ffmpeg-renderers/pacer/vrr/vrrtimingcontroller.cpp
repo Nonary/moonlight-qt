@@ -179,11 +179,11 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutQueueFrames = kPlayoutQueueFrames;
     parameters.playoutCapacityTelemetry = 1;
     parameters.playoutInputPercentileEnabled = !vrr18 && config.experimentalInputPercentilePpm != 0;
-    parameters.boundedCatchupEnabled = !vrr18 && config.experimentalBoundedCatchup;
+    parameters.boundedCatchupEnabled = config.experimentalBoundedCatchup;
     parameters.normalizedSourceMapping = parameters.boundedCatchupEnabled;
     parameters.normalizedSourceIntrinsicDecodeGpu = parameters.boundedCatchupEnabled;
-    parameters.playoutCeilingPhaseReplacement = vrr18 ? 0 : 3;
-    parameters.playoutOffsetSendSpanNormalization = !vrr18;
+    parameters.playoutCeilingPhaseReplacement = 3;
+    parameters.playoutOffsetSendSpanNormalization = 1;
     if (parameters.boundedCatchupEnabled) {
         parameters.playoutCatchupCarryLimitUs = kCatchupCarryLimitUs;
         parameters.playoutCatchupCarryLimitPeriodPerMille = kCatchupCarryLimitPeriodPerMille;
@@ -375,7 +375,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.renderStartAfterSubmissionUs = 0;
     parameters.renderStartMinimumLeadUs = kRenderStartMinimumLeadUs;
     parameters.renderLeadFloorUs = kRenderLeadFloorUs;
-    parameters.preparationInitialSampleExcluded = vrr18 ? 1 : 2;
+    parameters.preparationInitialSampleExcluded = 2;
     parameters.preparationPredictionLead = 1;
     // A source-rate epoch of at least 1.5x returns to the delay previously
     // sustained at that rate; decreases slew so a restore is not a jump.
@@ -390,7 +390,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.candidateCadenceRatioNumerator = 5;
     parameters.candidateCadenceRatioDenominator = 4;
     parameters.playoutStallBurstExclusion = 1;
-    parameters.latchedFloorDisabled = vrr18 || nativeScheduledPresentation ? 1 : 3;
+    parameters.latchedFloorDisabled = nativeScheduledPresentation ? 1 : 3;
     // A latched present flips no earlier than one display period after the
     // previous flip, not at its call. Anchoring the next tearing present to
     // the call let it flip inside the panel's minimum period after a late or
@@ -976,14 +976,17 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         m_Parameters.sourcePlayoutDelayUs;
     const uint64_t playoutDelayUs = m_Parameters.playoutInputPercentileEnabled ?
         proposedPlayoutDelayUs : std::min(proposedPlayoutDelayUs, playoutDelayCapUs());
+    // Recovery still shares the smoothing budget under interval feedback.
+    // Toggling the input predictor must not remove the recovery slew limit.
     const bool limitedBuffers = timestampPlayout &&
-        (m_Parameters.playoutInputPercentileEnabled || m_Parameters.smoothingMode == VrrSmoothingAbsorb);
+        (m_Parameters.playoutVrr18IntervalFeedback || m_Parameters.playoutInputPercentileEnabled ||
+         m_Parameters.smoothingMode == VrrSmoothingAbsorb);
     const int64_t desiredSmoothingUs = smoothingUs;
     if (limitedBuffers) {
         m_ExtraBufferSlew.begin(uint64_t(frame.frameNumber()), nowUs, playoutDelayUs,
             intervalQualityToleranceUs(m_Parameters), int64_t(absorbReserveUs()),
             m_BufferLayerChanged, m_BufferLayerDrain && !m_Parameters.playoutInputPercentileEnabled,
-            !m_Parameters.playoutInputPercentileEnabled);
+            !m_Parameters.playoutVrr18IntervalFeedback && !m_Parameters.playoutInputPercentileEnabled);
         if (!m_Parameters.playoutSmoothingOwnMovement)
             smoothingUs = m_ExtraBufferSlew.smoothing(smoothingUs);
         m_LastSmoothingRetimingUs = smoothingUs - int64_t(smoothingReserveUs);
@@ -1548,8 +1551,9 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     if (m_Parameters.playoutVrr18IntervalFeedback && timestampPlayout && !rebased &&
             !reseedPhase && !cadence.phaseDiscontinuity && !cadence.sourceRateChanged &&
             cadence.frameDelta == 1 && m_HaveLastSubmission) {
-        const uint64_t latchedFloorUs = decision.latchedPresentation ?
-            saturatingAdd(m_LastSubmissionUs, m_DisplayPeriodUs) : 0;
+        const uint64_t latchedFloorUs = decision.latchedPresentation &&
+            !m_Parameters.nativeScheduledPresentation ?
+            saturatingAdd(spacingAnchorUs(), m_DisplayPeriodUs) : 0;
         m_Pending.intervalSpacingFloorUs = std::max(earliestUs, latchedFloorUs);
     }
     // Reuse the chart's input-slot basis, but use the producer's decoder

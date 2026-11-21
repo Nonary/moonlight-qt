@@ -3376,7 +3376,7 @@ void testProductionIntervalParameters()
         const auto policy = vrrTimingParametersForSession(session);
         expect(policy.playoutSourceMappingDecoderOutput == 0, "mapping excludes worker waits");
         expect(policy.playoutVrr18IntervalFeedback && !policy.playoutInputPercentileEnabled &&
-               !policy.boundedCatchupEnabled, "the live session uses VRR18 interval feedback");
+               policy.boundedCatchupEnabled, "the live session uses VRR18 interval feedback with bounded recovery");
     }
     auto session = vrrProductionSessionConfig(config(116, 120));
     session.timingOptions = {1750, 9925, 35, 350};
