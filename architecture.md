@@ -649,6 +649,14 @@ evidence. Its readiness deadline includes any spacing already provided by the
 presentation floor. With 8.0 ms covered and readiness at 8.6 ms, the observer
 sees a 0.6 ms miss before applying tolerance.
 
+Balanced interval feedback tapers release below the controller's display
+ceiling threshold, with the same 0.1% margin used for phase recovery. In that
+case release begins after five seconds of qualified recovery and slows to
+the current excess above the floor divided by 12 seconds, capped at the
+usual 250 us/s. Near the display ceiling it keeps its original release law
+so the presentation floor can shed standing phase as before. Older captures
+without the taper parameters use constant-rate release during exact replay.
+
 The following describes the historical goal-solver policy, retained for replay
 of its schema-6 captures.
 

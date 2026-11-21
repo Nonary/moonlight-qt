@@ -82,7 +82,8 @@ public:
                  uint64_t scoreWindowUs = 30000000,
                  uint64_t initialWarmupUs = 1000000,
                  size_t initialMinimumSamples = 2,
-                 bool vrr18Feedback = false) {
+                 bool vrr18Feedback = false,
+                 uint64_t releaseTauUs = 0) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -271,7 +272,15 @@ public:
         else if (!holdProtection && s.absorbable &&
                 (windowAbsorbable && m_CleanEvidenceUs >= hold) &&
                 (!m_LastPressure || s.submitted - m_LastPressure >= hold)) {
-            m_ReleaseFraction += std::min<uint64_t>(actual, 100000) * releaseRate;
+            uint64_t rate = releaseRate;
+            if (releaseTauUs) {
+                const uint64_t excessUs = m_Target - minimum;
+                // Leave enough time to observe pressure near the floor
+                // before shedding the remaining protection in one pass.
+                if (excessUs <= rate * releaseTauUs / 1000000)
+                    rate = (excessUs * 1000000 + releaseTauUs - 1) / releaseTauUs;
+            }
+            m_ReleaseFraction += std::min<uint64_t>(actual, 100000) * rate;
             const auto release = m_ReleaseFraction / 1000000;
             m_ReleaseFraction %= 1000000;
             const auto candidate = m_Target - std::min(m_Target - minimum, release);
