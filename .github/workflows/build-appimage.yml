@@ -243,8 +243,8 @@ jobs:
           g++ -std=c++17 -fsyntax-only -Iapp/streaming scripts/linux-gpu-capability.cpp
           scripts/build-appimage.sh
 
-      - name: Test nightly updater and DualSense haptics
-        if: contains(inputs.ci_version, '-daily.')
+      # Run the release gates in branch and PR CI too, using the same older Qt as the packaged app.
+      - name: Test Linux release regressions
         timeout-minutes: 30
         run: |
           set -euo pipefail
@@ -258,8 +258,7 @@ jobs:
           (cd build/nightly-tests-gpu && qmake6 ../../tests/vrr/gpuperformancehold.pro && make -j"$BUILD_JOBS" && ./tst_gpuperformancehold)
           bash scripts/test-linux-integration.sh qmake6
 
-      - name: Verify nightly AppImage payload and embedded version
-        if: contains(inputs.ci_version, '-daily.')
+      - name: Verify AppImage payload and embedded version
         timeout-minutes: 5
         run: |
           set -euo pipefail
