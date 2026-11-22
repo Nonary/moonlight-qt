@@ -1416,22 +1416,29 @@ Output is padded to the descriptor's maximum report length while preserving the
 142-byte waveform report's CRC offset. A pending write has a 40 ms completion
 wait; timeout cancels and drains the operation before its buffer can be reused
 or freed. This is not a hard bound on a faulty driver's cancellation completion.
-Input stays with SDL; no kernel module or Bluetooth reconfiguration is added on
-the client. Windows USB additionally matches the exact SDL Sony USB controller's
-HID device container to its active four-channel WASAPI render endpoint. The
-worker submits 48 kHz float samples to actuator channels 3/4 while keeping
-channels 1/2 silent; endpoints whose mix format is not four channels are rejected.
-Shared-mode conversion uses the endpoint's channel mask. Startup buffers 10 ms
-(or waits at most 10 ms); the software FIFO is capped at 40 ms, separately from
-the requested 20 ms engine buffer. The actual engine buffer size is queried.
-Idle output drains to silence, and disconnect joins the worker before SDL closes
-the controller. Linux USB and other platforms keep ordinary rumble. Native game
-haptics must originate from the host's controller audio endpoint. Linux uses
-its composite DS5; Windows uses the optional local usbip-win2 composite DS5,
-selected per application with `dualsense-haptics` or globally with `usbip_ds5`.
-The wired host identity is independent of the physical client's USB/Bluetooth
-connection. USB/IP stays on the Windows host; no USB/IP transport is required
-on the Moonlight client. Game soundtrack audio is not a substitute.
+Input stays with SDL. The separate speaker extension uses encrypted control type
+`0x5602` and negotiates on Windows and Linux. A controller advertises
+`LI_CCAP_PS_SPEAKER_PCM` after its renderer accepts output. The owner token and
+producer generation prevent queued samples from a previous controller binding
+from reaching its replacement. Bluetooth speaker audio uses 10.67 ms reports
+with a stereo Opus payload and an optional, independent haptic payload. The
+microphone remains disabled. Speaker-only playback leaves ordinary rumble
+available.
+
+For USB, Windows matches the SDL controller's HID container to its WASAPI render
+endpoint. It uses a four-channel shared mix when available and can open native
+four-channel PCM in exclusive mode when the shared mix is stereo. Linux matches
+the SDL HID or input path to a raw ALSA PCM on the same USB parent. USB playback
+writes 48 kHz audio with speaker samples in channels 1/2 and actuator samples in
+channels 3/4. The worker buffers up to 10 ms at startup, caps its software FIFO
+at 40 ms, and joins before SDL closes the controller. If the endpoint is busy
+or unavailable, ordinary controller feedback remains available. A compatible
+Pico bridge is treated as a USB controller.
+
+Native game effects originate at the host's composite controller audio endpoint.
+Linux uses its composite DS5, and Windows uses the optional local usbip-win2
+composite DS5. USB/IP stays on the Windows host. The main stream audio has its
+own renderer.
 
 Bluetooth playback drops old/duplicate packets, resets conversion history on
 packet loss,
@@ -1441,17 +1448,13 @@ rumble when waveform playback starts and suppresses legacy rumble while active;
 LED, motion and adaptive-trigger callbacks retain their own paths. Shared
 receive admission rejects late/duplicate sequences, including wrap, before
 changing rumble priority; the sequence remains tracked across idle silence.
-A silent PCM stream cannot start playback. Both workers idle 60 ms after the
-last nonzero actuator sample, send/drain final silence, and stay inactive while
-an open host audio endpoint continues to submit zeros. This prevents silent
-audio from indefinitely suppressing rumble or overwriting it with silent
-Bluetooth reports. Windows HID transport includes the SDK before SDL so
-`CancelIoEx` remains declared when compiled separately. Write failure
-stops that waveform worker and logs the need to reconnect; ordinary controller
-input continues. Hardware coexistence with other applications writing the same
-controller still requires physical testing. The USB backend has not been validated
-on Windows hardware; Linux deterministic tests cover the shared input queue and
-existing Bluetooth worker, not WASAPI endpoint discovery or physical output.
+Silent actuator packets cannot start playback. The workers give legacy rumble
+priority again after 60 ms without an actuator signal. Windows HID transport
+includes the SDK before SDL so `CancelIoEx` remains declared when compiled
+separately. A device write failure stops feedback from that renderer. Reconnecting
+reopens the device. The Haptics tests validate channel isolation, report
+framing, and owner changes with simulated output. Hearing an in-game speaker
+effect still requires a physical controller check.
 
 Adaptive triggers already use `SDL_GameControllerSendEffect` on Windows and
 Linux, independently of PCM support. SDL owns Bluetooth framing/CRC. The shared

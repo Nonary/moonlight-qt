@@ -33,6 +33,8 @@ public:
     HANDLE completed = nullptr;
     std::vector<uint8_t> buffer;
 
+    bool supportsReport(size_t size) const override { return size <= buffer.size(); }
+
     ~WindowsHidOutput() override {
         if (device != INVALID_HANDLE_VALUE) CloseHandle(device);
         if (completed) CloseHandle(completed);
@@ -71,6 +73,11 @@ public:
         const auto result = ::write(device, report, size);
         return result == static_cast<ssize_t>(size) ||
                (result < 0 && (errno == EAGAIN || errno == EINTR));
+    }
+    bool configure(const uint8_t* report, size_t size) override {
+        ssize_t result;
+        do { result = ::write(device, report, size); } while (result < 0 && errno == EINTR);
+        return result == static_cast<ssize_t>(size);
     }
 };
 #endif

@@ -12,6 +12,10 @@ class DualSenseHidOutput {
 public:
     virtual ~DualSenseHidOutput() = default;
     virtual bool write(const uint8_t* report, size_t size) = 0;
+    virtual bool supportsReport(size_t) const { return true; }
+    // Initial feature negotiation must not mistake a transient drop for a
+    // successfully configured device.
+    virtual bool configure(const uint8_t* report, size_t size) { return write(report, size); }
 };
 
 std::unique_ptr<DualSenseHidOutput> openDualSenseBluetoothOutput(SDL_GameController* controller);

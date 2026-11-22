@@ -1985,7 +1985,7 @@ bool Session::startConnectionAsync()
                                                    &m_VideoCallbacks,
                                                    &m_AudioCallbacks,
                                                    NULL, 0, NULL, 0,
-#if defined(Q_OS_WIN) && SDL_VERSION_ATLEAST(2, 24, 0)
+#if (defined(Q_OS_WIN) || defined(Q_OS_LINUX)) && SDL_VERSION_ATLEAST(2, 24, 0)
                                                    DualSenseHaptics::receiveSpeaker,
 #else
                                                    nullptr,
