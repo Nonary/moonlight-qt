@@ -9,6 +9,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <future>
+#include <vector>
 
 static void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -206,6 +207,18 @@ static void testSpeakerQueueLifecycle() {
   require(reused->speakerQueue.size() == 1 &&
               reused->speakerQueue.front().generation == 11,
           "reused client slot accepts the new generation");
+  require(DualSenseHaptics::speakerReady(5), "working renderer advertises speaker output");
+  {
+    std::lock_guard<std::mutex> lock(reused->mutex);
+    reused->failed = true;
+  }
+  require(!DualSenseHaptics::speakerReady(5), "terminal output failure clears speaker readiness");
+  {
+    std::lock_guard<std::mutex> lock(reused->mutex);
+    reused->failed = false;
+    reused->stopped = true;
+  }
+  require(!DualSenseHaptics::speakerReady(5), "stopped renderer clears speaker readiness");
   DualSenseHaptics::detach(5);
 }
 
@@ -433,6 +446,185 @@ static void testTriggers() {
     require(memcmp(captured.data(), &report, sizeof(report)) == 0, "SDL trigger dispatch");
 }
 
+#if defined(_WIN32) || defined(HAVE_DUALSENSE_ALSA)
+void testUsbWorkerRouting() {
+    struct RecordingUsb final : UsbPlayback {
+        std::mutex deviceMutex;
+        std::condition_variable deviceEvent;
+        std::vector<float> output;
+        bool changed = false;
+
+        ~RecordingUsb() override { stop(); }
+
+        void notify() override {
+            { std::lock_guard<std::mutex> lock(deviceMutex); changed = true; }
+            deviceEvent.notify_all();
+        }
+
+        long availableFrames() override { return 240; }
+
+        long renderFrames(const float* samples, size_t frames) override {
+            {
+                std::lock_guard<std::mutex> lock(deviceMutex);
+                output.insert(output.end(), samples, samples + frames * 4);
+            }
+            deviceEvent.notify_all();
+            return long(frames);
+        }
+
+        bool waitForDevice(bool) override {
+            std::unique_lock<std::mutex> lock(deviceMutex);
+            deviceEvent.wait_for(lock, std::chrono::milliseconds(5), [&] { return changed; });
+            changed = false;
+            return true;
+        }
+    } playback;
+    std::array<uint8_t, 960> speaker{}, haptics{};
+    for (size_t i = 0; i < 240; ++i) {
+        MlHapticsWrite16(speaker.data() + i * 4, 8192);
+        MlHapticsWrite16(speaker.data() + i * 4 + 2, uint16_t(-8192));
+        MlHapticsWrite16(haptics.data() + i * 4, 16384);
+        MlHapticsWrite16(haptics.data() + i * 4 + 2, uint16_t(-16384));
+    }
+    const auto owner = playback.speakerOwnerToken.load();
+    playback.receiveSpeaker(owner, 1, 0, 0, ML_SPEAKER_PCM_FLAG_DISCONTINUITY, speaker.data(), 240);
+    playback.receiveSpeaker(owner, 1, 1, 240, 0, speaker.data(), 240);
+    playback.receive(0, haptics.data(), 240);
+    playback.receive(1, haptics.data(), 240);
+    playback.worker = std::thread([&] { playback.play(240); SDL_TLSCleanup(); });
+    {
+        std::unique_lock<std::mutex> lock(playback.deviceMutex);
+        require(playback.deviceEvent.wait_for(lock, std::chrono::milliseconds(250),
+                    [&] { return playback.output.size() >= 960; }),
+                "USB worker writes a four-channel block");
+        for (size_t i = 0; i < 960; i += 4) {
+            require(playback.output[i] == 0.25f && playback.output[i + 1] == -0.25f &&
+                    playback.output[i + 2] == 0.5f && playback.output[i + 3] == -0.5f,
+                    "USB worker routes speaker and actuators to the correct channels");
+        }
+    }
+}
+#endif
+
+#if defined(__linux__) || defined(_WIN32)
+static void testBluetoothSpeakerAndHaptics() {
+    {
+        Playback probe;
+        probe.speaker = std::make_unique<DualSenseBtAudio>();
+        std::array<uint8_t, 960> silent{};
+        const auto owner = probe.speakerOwnerToken.load();
+        probe.receiveSpeaker(owner, 1, 0, 0, 0, silent.data(), 240);
+        require(probe.speakerQueue.empty(), "idle silence remains suppressed");
+        // The worker has a partial prebuffer even though it has not begun
+        // rendering. A silent new generation must invalidate that buffer.
+        probe.speakerMode = true;
+        probe.receiveSpeaker(owner, 2, 0, 0, 0, silent.data(), 240);
+        require(probe.speakerQueue.size() == 1 &&
+                (probe.speakerQueue.front().flags & ML_SPEAKER_PCM_FLAG_DISCONTINUITY),
+                "silent generation change reaches the pending prebuffer as a boundary");
+        probe.speakerQueue.clear();
+        probe.receiveSpeaker(owner, 2, 1, 480, 0, silent.data(), 240);
+        require(probe.speakerQueue.size() == 1 &&
+                (probe.speakerQueue.front().flags & ML_SPEAKER_PCM_FLAG_DISCONTINUITY),
+                "silent sample gap reaches the pending prebuffer as a boundary");
+    }
+    struct MixedOutput final : DualSenseHidOutput {
+        std::mutex mutex;
+        std::vector<std::vector<uint8_t>> reports;
+        bool write(const uint8_t* report, size_t size) override {
+            std::lock_guard<std::mutex> lock(mutex);
+            reports.emplace_back(report, report + size);
+            return true;
+        }
+    };
+    auto playback = std::make_shared<Playback>();
+    auto output = std::make_unique<MixedOutput>();
+    auto* recorded = output.get();
+    playback->output = std::move(output);
+    playback->speaker = std::make_unique<DualSenseBtAudio>();
+    require(playback->speaker->ready(), "Bluetooth Opus encoder ready");
+    playback->converter = SDL_NewAudioStream(AUDIO_S16LSB, 2, 48000, AUDIO_S8, 2, 3000);
+    require(playback->converter != nullptr, "Bluetooth haptics resampler ready");
+    playback->worker = std::thread([p = playback.get()] { p->run(); });
+    std::array<uint8_t, 960> speaker{}, haptics{};
+    for (unsigned i = 0; i < 240; ++i) {
+        auto tone = int16_t(10000 * std::sin(2 * 3.141592653589793 * 880 * i / 48000));
+        MlHapticsWrite16(speaker.data() + i * 4, uint16_t(tone));
+        MlHapticsWrite16(speaker.data() + i * 4 + 2, uint16_t(tone));
+        MlHapticsWrite16(haptics.data() + i * 4, 12000);
+    }
+    const auto owner = playback->speakerOwnerToken.load();
+    std::array<uint8_t, 960> silence{};
+    playback->receiveSpeaker(owner, 1, 0, 0, ML_SPEAKER_PCM_FLAG_DISCONTINUITY, silence.data(), 240);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    { std::lock_guard<std::mutex> lock(recorded->mutex);
+      require(recorded->reports.empty(), "idle speaker silence does not write HID or suppress rumble"); }
+    for (unsigned i = 0; i < 25; ++i) {
+        playback->receive(i, haptics.data(), 240);
+        playback->receiveSpeaker(owner, 1, i + 1, (i + 1) * 240, 0, speaker.data(), 240);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    for (unsigned i = 26; i < 50; ++i) {
+        playback->receiveSpeaker(owner, 1, i, i * 240, 0, speaker.data(), 240);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    bool combined = false;
+    bool speakerOnly = false;
+    bool decodedSpeaker = false;
+    int opusError = 0;
+    OpusDecoder* decoder = opus_decoder_create(48000, 2, &opusError);
+    require(decoder && opusError == OPUS_OK, "speaker payload decoder ready");
+    {
+        std::lock_guard<std::mutex> lock(recorded->mutex);
+        uint8_t reportSequence = 0;
+        uint8_t audioSequence = 0;
+        for (const auto &report : recorded->reports) {
+            require(report[1] == uint8_t((reportSequence++ & 15) << 4),
+                    "Bluetooth audio and actuator reports share the HID sequence");
+            if (report.size() != DualSenseBtAudio::reportBytes) continue;
+            require(report[0] == 0x36 && report[4] == 0xfe,
+                    "Bluetooth audio report disables microphone capture");
+            require(report[10] == audioSequence++,
+                    "speaker sequence advances only for encoded speaker frames");
+            uint32_t crc = UINT32_MAX;
+            for (size_t n = 0; n < report.size() - 3; ++n) {
+                const uint8_t byte = n ? report[n - 1] : 0xa2;
+                for (unsigned bit = 0; bit < 8; ++bit) {
+                    const bool low = (crc ^ (byte >> bit)) & 1;
+                    crc >>= 1;
+                    if (low) crc ^= 0xedb88320;
+                }
+            }
+            require(MlHapticsRead32(report.data() + report.size() - 4) == ~crc,
+                    "Bluetooth speaker report CRC covers the entire payload");
+            if (report[76] == 0x93) {
+                speakerOnly = report[77] == 200;
+                continue;
+            }
+            require(report[76] == 0x92 &&
+                    report[77] == 64 && report[142] == 0x93 && report[143] == 200,
+                    "combined report carries speaker and stereo haptics with microphone disabled");
+            combined |= std::any_of(report.begin() + 78, report.begin() + 142,
+                                    [](uint8_t value) { return value != 0; });
+            for (unsigned i = 0; i < 32; ++i)
+                require(report[79 + i * 2] == 0, "speaker and left actuator must not leak into right actuator");
+            std::array<int16_t, 960> decoded{};
+            require(report[144] == 0xf4, "speaker uses the expected stereo CELT frame format");
+            require(opus_decode(decoder, report.data() + 144, 200, decoded.data(), 480, 0) == 480,
+                    "combined speaker payload is a valid Opus frame");
+            decodedSpeaker |= std::any_of(decoded.begin(), decoded.end(), [](int16_t sample) { return sample != 0; });
+        }
+    }
+    opus_decoder_destroy(decoder);
+    require(combined, "speaker playback retains independent nonzero actuator data");
+    require(decodedSpeaker, "combined report carries nonzero speaker audio");
+    require(speakerOnly, "speaker-only playback stops writing haptic samples");
+    { std::lock_guard<std::mutex> lock(playback->mutex); playback->stopped = true; }
+    playback->wake.notify_all();
+    playback->worker.join();
+}
+#endif
+
 int main(int argc, char** argv) {
     SDL_SetMainReady();
     SDL_Init(SDL_INIT_GAMECONTROLLER);
@@ -447,6 +639,12 @@ int main(int argc, char** argv) {
             return 0;
         }
         testAdmission();
+#if defined(__linux__) || defined(_WIN32)
+        testBluetoothSpeakerAndHaptics();
+#endif
+#if defined(_WIN32) || defined(HAVE_DUALSENSE_ALSA)
+        testUsbWorkerRouting();
+#endif
         testSpeakerWireAndNegotiation();
         testSpeakerQueueLifecycle();
         testSpeakerRendererRouting();

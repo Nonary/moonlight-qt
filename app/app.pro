@@ -70,6 +70,10 @@ macx:!disable-prebuilts {
 unix:if(!macx|disable-prebuilts) {
     CONFIG += link_pkgconfig
     PKGCONFIG += openssl sdl2 SDL2_ttf
+    linux:packagesExist(alsa) {
+        PKGCONFIG += alsa
+        DEFINES += HAVE_DUALSENSE_ALSA
+    }
 
     # We have our own optimized libopus.a for Steam Link
     if(!config_SL|disable-prebuilts) {
@@ -233,6 +237,7 @@ HEADERS += \
     streaming/video/videothreadpriority.h \
     streaming/video/timinggraph.h \
     streaming/input/dualsensehid.h \
+    streaming/input/dualsensebtaudio.h \
     streaming/input/steamcontroller/steamcontrollerprotocol.h \
     streaming/input/steamcontroller/steamcontrollerattributes.h \
     streaming/input/steamcontroller/steamcontrollercore.h \
