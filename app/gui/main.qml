@@ -179,6 +179,13 @@ ApplicationWindow {
         uiDisplayReady = true
         applyUiDisplayMode(true)
 
+        // Request keyboard focus once the startup window has been shown.
+        Qt.callLater(function() {
+            if (window.visible && window.visibility !== Window.Minimized && !window.active) {
+                window.requestActivate()
+            }
+        })
+
         // Display any modal dialogs for configuration warnings
         if (runConfigChecks) {
             if (SystemProperties.isWow64) {
