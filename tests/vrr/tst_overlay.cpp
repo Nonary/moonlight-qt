@@ -146,15 +146,18 @@ static void testHiddenUpdatePreservesConsumedHide()
 {
     OverlayManager manager;
     Presenter presenter(manager);
-    manager.setOverlayRenderer(&presenter);
+    // Queue the initial state before attachment so only one debug callback can
+    // be in flight when the fixture takes the renderer lock below.
     manager.updateOverlayText(OverlayDebug, "visible before hide");
     manager.setOverlayState(OverlayDebug, true);
+    manager.setOverlayRenderer(&presenter);
     presenter.awaitText("visible before hide");
     {
         // Attachment queues both overlay types. Drain initial status dispatch
         // before gating the worker so it cannot block ahead of the debug hide.
         std::unique_lock<std::mutex> guard(presenter.lock);
         assert(presenter.ready.wait_for(guard, 3s, [&] { return presenter.statusCalls > 0; }));
+        assert(presenter.height > 0 && presenter.width > 0);
     }
     OverlayManagerTestAccess::updateHiddenAfterHideConsumed(manager);
     presenter.awaitText("hidden after consumed hide");
