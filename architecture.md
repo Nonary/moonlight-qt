@@ -1,8 +1,9 @@
 # Streaming and VRR architecture
 
 Source baseline: the published `v6.2.0-daily.201` client with VRR18 interval
-feedback restored for live sessions. Its custom profile exposes the frame
-allowance, timing target, score history, and interval tolerance. The renderer,
+feedback restored for live sessions. Buffer growth also considers source pacing
+after Reduce judder. The custom profile exposes the frame allowance, timing
+target, score history, and interval tolerance. The renderer,
 observed D3D11 completion, and schema-6 capture contracts come from the newer
 client. The earlier platform changes include the decode-buffer accounting
 correction on 2026-10-30,
@@ -11,7 +12,8 @@ release hold and blocked-evidence correction on 2026-11-09, and timestamped
 D3D11 decode completion with the capped solver margin on 2026-11-13 (the D3D11
 presenter part had not been run on Windows when this was written). The
 production worker resolves VRR18 interval feedback with bounded per-frame
-catch-up. Smoothing and recovery keep their shared movement limit even when
+catch-up and one timing score for display and buffer control. Smoothing and
+recovery keep their shared movement limit even when
 the input predictor is inactive. The
 calibration key includes effective policy and presenter
 capabilities; existing keys are not reused. Schema-6 capture and schema-2
@@ -19,8 +21,9 @@ replay configs support this current policy. Old compressed captures can still
 be decoded, but older controller revisions require a fresh capture for replay.
 The three former experimental environment switches are ignored with a warning.
 Live smoothing is off, worker phase-locked, or native tolerance-bounded.
-Exact replay can restore the retired Absorb mode from recorded parameters. Retired interval-scoring/release selectors and metronome state
-are absent from the current capture and replay parameter contract. The follow-up
+Exact replay can restore the retired Absorb mode and the earlier averaged
+VRR18 control score from recorded parameters. Metronome state is absent
+from the current capture and replay parameter contract. The follow-up
 audit also removes metronome-specific frame dropping, its constant trace column,
 the old absolute render ceiling, base-guard latch exit, and pre-schema queue
 budget/disabled-budget alternatives. Current pacing budgets require a nonzero
@@ -644,6 +647,33 @@ misses within the configured allowance and releases gradually after clean
 evidence. Its readiness deadline includes any spacing already provided by the
 presentation floor. With 8.0 ms covered and readiness at 8.6 ms, the observer
 sees a 0.6 ms miss before applying tolerance.
+
+The buffer uses the same rolling Client timing score shown in the overlay.
+Each adjacent interval contributes only its deviation beyond the configured
+tolerance, weighted by the time represented by that interval. The one-second
+window qualifies service capacity, supplies a diagnostic mean, and bounds how
+quickly sustained misses can grow the buffer. Growth also requires fresh
+readiness evidence and available buffer capacity. Schema-6
+captures with VRR18 feedback revision 1 retain the separate averaged control
+score in exact replay. Revision 2 records the shared score policy.
+Revision 3 compares adjacent RTP slots after Reduce judder with the fitted
+source period. A source interval outside the configured tolerance cannot
+authorize growth or renew the pressure hold, including when its late frame
+is blamed for a compressed successor. The one-second qualification window
+also requires mean absolute source-spacing error within that same tolerance.
+A steady lower frame rate can qualify at its own period.
+
+Revision 4 keeps the normal growth rule for settled source pacing. During
+irregular pacing, it checks whether delivery or decode added an independently
+recoverable miss against the planned handoff. For both ends of the interval,
+it estimates readiness from producer decode completion and normal render cost,
+excluding queue residence and intentional waits. It considers the remaining
+buffer allowance and the spacing already covered by the display floor.
+Only intervals that could come back within tolerance contribute growth pressure.
+The one-second window measures their severity against the selected timing target.
+It limits each increase to the average interval improvement predicted for one
+tolerance of extra delay, subject to the existing attack and capacity limits.
+A compressed successor is attributed to the preceding late frame.
 
 Balanced interval feedback tapers release below the controller's display
 ceiling threshold, with the same 0.1% margin used for phase recovery. In that

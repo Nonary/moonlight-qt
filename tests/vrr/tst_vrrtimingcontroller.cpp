@@ -3459,6 +3459,43 @@ void testPerIntervalBufferPreventsRecoverableSpikes()
            "buffering must reduce modeled recoverable excess without chasing the delay cap");
 }
 
+void testLiveBufferUsesReportedIntervalScore()
+{
+    using Buffer = Vrr13::IntervalBuffer;
+    Buffer historical, live, lateFenceCheck;
+    uint64_t attempts = 0, markers = 0, expectedMarkers = 0, previousLate = 0;
+    for (uint64_t i = 1; i <= 800; ++i) {
+        const uint64_t intended = 1000000 + i * 10000;
+        const uint64_t late = (i > 200 && i % 25 == 0) ||
+            (i > 750 && i < 783 && i % 2 != 0) ? 2000 : 0;
+        expectedMarkers += late > previousLate;
+        previousLate = late;
+        for (auto* buffer : {&historical, &live, &lateFenceCheck}) {
+            const bool falseObservation = buffer == &lateFenceCheck;
+            const uint64_t submitted = intended + 1000 + (falseObservation ? 0 : late);
+            const uint64_t ready = falseObservation ? submitted + 750 : submitted;
+            buffer->observe({i, intended, submitted, intended + 1000, ready, 1000,
+                             true, true, 1000},
+                            1000, 8000, 8000000, 250, true, 995000, 500, 120000000,
+                            500000, 32, true, 0, buffer != &historical);
+        }
+        const auto stats = live.stats();
+        if (stats.update.attemptedIncreaseUs) {
+            ++attempts;
+            expect(stats.qualityPercent() < 99.50,
+                   "interval feedback must only grow below the reported goal");
+        }
+        markers += stats.update.stretchedBeyondTolerance;
+    }
+    expect(attempts > 0 && live.demand(1000) > 1000 && historical.demand(1000) == 1000 &&
+               live.stats().qualityPercent() == historical.stats().qualityPercent(),
+           "the reported misses must drive live feedback while the legacy control score still clears its target");
+    expect(markers == expectedMarkers && lateFenceCheck.stats().qualityPercent() == 100.0 &&
+               lateFenceCheck.demand(1000) == 1000 &&
+               !lateFenceCheck.stats().update.stretchedBeyondTolerance,
+           "mark each real stretch once and ignore readiness observations with steady cadence");
+}
+
 void testProductionIntervalHistoryUsesCustomSeconds()
 {
     const auto run = [](int historySeconds) {
@@ -4067,6 +4104,57 @@ void testInitialIntervalCalibration()
     expect(growths > 2, "the bounded-attack test must actually exercise growth");
 }
 
+void testHostToleranceBoundary()
+{
+    for (const uint64_t sourceErrorUs : {500u, 501u}) {
+        Vrr13::IntervalBuffer buffer;
+        uint64_t slotUs = 1000000;
+        for (uint64_t frame = 1; frame <= 202; ++frame) {
+            slotUs += 10000 + (frame == 201 ? sourceErrorUs : 0);
+            // Existing client timing pressure, but only frame 201 was late
+            // getting ready. Frame 202 compresses back to its on-time slot.
+            const uint64_t submitted = slotUs + (frame % 2 ? 3000 : 0);
+            const uint64_t ready = frame == 201 ? submitted : slotUs;
+            buffer.observe({frame, slotUs, submitted, slotUs, ready, 1000,
+                            true, true, 0, 0, 0, slotUs, 10000},
+                           1000, 4000, 6000000, 125, true, 990000,
+                           500, 30000000, 1000000, 2, true, 0, true);
+            if (frame >= 201) {
+                expect((buffer.demand(1000) > 1000) == (sourceErrorUs == 500),
+                       "the tolerance boundary must apply to a late frame and its compressed successor");
+            }
+        }
+    }
+}
+
+void testRecoverableIntervalPressure()
+{
+    // Both source intervals deviate by 2 ms. Submit 3 ms late on every
+    // other frame whether the delay is input readiness or a later CPU wake.
+    const auto demand = [](uint64_t lateReady, uint64_t otherReady, uint64_t floorLead,
+                           uint64_t cap, bool measured) {
+        Vrr13::IntervalBuffer buffer;
+        uint64_t slot = 1000000;
+        for (uint64_t i = 1; i <= 300; ++i) {
+            slot += i % 2 ? 12000 : 8000;
+            const auto readiness = i % 2 ? lateReady : otherReady;
+            const auto submit = slot + otherReady + (i % 2 ? 3000 : 0);
+            buffer.observe({i, slot, submit, slot, submit, 1000, true, true,
+                            0, 0, slot + floorLead, slot, 10000,
+                            measured ? slot + readiness : 0},
+                           1000, cap, 6000000, 125, true, 995000,
+                           500, 30000000, 1000000, 2, true, 0, true, true);
+        }
+        return buffer.demand(1000);
+    };
+    expect(demand(3000, 0, 0, 3500, true) > 1000, "a reachable delivery miss earns protection at the cap boundary");
+    expect(demand(3000, 0, 0, 3499, true) == 1000, "a miss one microsecond beyond the allowance cannot buy buffer");
+    expect(demand(0, 0, 0, 6000, true) == 1000, "late CPU wakes alone cannot buy delivery buffer during source stagger");
+    expect(demand(3000, 3000, 0, 9000, true) == 1000, "equal readiness delays cannot improve interval spacing");
+    expect(demand(3000, 0, 2000, 4000, true) == 1000, "spacing already covered by the display floor cannot be bought twice");
+    expect(demand(3000, 0, 0, 6000, false) == 1000, "missing producer timestamps cannot establish preventable loss");
+}
+
 void testBufferDecisionDiagnostics()
 {
     Vrr13::IntervalBuffer buffer;
@@ -4461,9 +4549,12 @@ int main()
     testIntervalBufferSeparatesDeliveryFromSerialService();
     testProductionCalibrationSurvivesFpsChanges();
     testInitialIntervalCalibration();
+    testHostToleranceBoundary();
+    testRecoverableIntervalPressure();
     testBufferDecisionDiagnostics();
     testIntervalQualityBuffer();
     testPerIntervalBufferPreventsRecoverableSpikes();
+    testLiveBufferUsesReportedIntervalScore();
     testIntervalBufferReleaseAcrossShortGaps();
     testIntervalBufferReleaseTapersNearFloor();
     testTwoMinuteScoreCoverage();

@@ -4068,7 +4068,8 @@ void testExperimentalInputPercentileActivationTrace()
             const auto fields = lines[i].split(',');
             ++rows;
             expect(fields.size() == columns.size() &&
-                       fields.value(columns.indexOf("param_playout_vrr18_interval_feedback")) == "1" &&
+                       fields.value(columns.indexOf("param_playout_vrr18_interval_feedback")).toULongLong() ==
+                           Vrr18RecoverableIntervalFeedback &&
                        fields.value(columns.indexOf("param_playout_input_percentile_enabled")) == "0" &&
                        fields.value(columns.indexOf("param_playout_on_time_target_per_million")).toULongLong() == expected &&
                        fields.value(columns.indexOf("param_playout_readiness_window_us")).toULongLong() == expectedWindow,
