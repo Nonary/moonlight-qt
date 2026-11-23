@@ -41,7 +41,7 @@ struct TimingGraphInput {
     // frame moves its final target. Zero timestamps mean unavailable.
     uint64_t sourceTimeUs = 0, networkReadyUs = 0, decoderOutputUs = 0, decoderReadyUs = 0;
     int64_t cadenceRetimingUs = 0;
-    bool sourceTimingValid = false;
+    bool sourceTimingValid = false, decoderReadyUpperBound = false, clientTimingHitch = false;
     uint32_t backend = 0;
     bool submitted = false, idValid = false, displayValid = false, discontinuity = false;
 };
@@ -67,7 +67,7 @@ struct TimingGraphPoint {
     bool refreshReferenceRecorded = false, refreshReferenceValid = false, refreshReferenceConflict = false;
     uint64_t sourceTimeUs = 0, networkReadyUs = 0, decoderOutputUs = 0, decoderReadyUs = 0;
     int64_t cadenceRetimingUs = 0;
-    bool sourceTimingValid = false;
+    bool sourceTimingValid = false, decoderReadyUpperBound = false, clientTimingHitch = false;
     uint32_t backend = 0;
     bool idValid = false, breakBefore = false;
 };
@@ -147,7 +147,12 @@ inline BufferGraphSample bufferGraphSample(const TimingGraphPoint& p)
     s.readyValid = p.decoderReadyUs != 0 && s.outputValid && p.decoderReadyUs >= p.decoderOutputUs;
     if (s.networkValid) s.networkUs = relative(p.networkReadyUs);
     if (s.outputValid) s.decoderOutputUs = relative(p.decoderOutputUs);
-    if (s.readyValid) s.decoderReadyUs = relative(p.decoderReadyUs);
+    if (s.readyValid) {
+        s.decoderReadyUs = relative(p.decoderReadyUs);
+        // Observing a signaled fence proves readiness by this time. If the
+        // check itself was late, the actual stage coverage is unknown.
+        if (p.decoderReadyUpperBound && s.decoderReadyUs > s.bufferLimitUs) s.readyValid = false;
+    }
     return s;
 }
 
@@ -206,7 +211,8 @@ public:
         const auto s = bufferGraphSample(p);
         if (!s.valid || !p.toleranceUs) return;
         if (!s.readyValid) {
-            if ((s.networkValid && s.networkUs > p.toleranceUs) ||
+            if ((p.decoderReadyUpperBound && p.decoderReadyUs) ||
+                (s.networkValid && s.networkUs > p.toleranceUs) ||
                 (s.outputValid && s.decoderOutputUs > p.toleranceUs)) ++stats.unknown;
             return;
         }
@@ -285,6 +291,8 @@ public:
             p.sourceTimingValid = in.sourceTimingValid;
             p.networkReadyUs = in.networkReadyUs; p.decoderOutputUs = in.decoderOutputUs;
             p.decoderReadyUs = in.decoderReadyUs;
+            p.decoderReadyUpperBound = in.decoderReadyUpperBound;
+            p.clientTimingHitch = in.clientTimingHitch && !m_Break;
             p.submissionId = in.submissionId; p.idValid = in.idValid;
             p.backend = in.backend; p.generation = m_Generation; p.breakBefore = m_Break;
             m_Hitches.record(p);

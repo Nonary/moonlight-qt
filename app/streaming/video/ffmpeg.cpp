@@ -1204,12 +1204,12 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
     const auto& interval = snapshot.vrrReadiness.interval;
     const auto warning = Session::get()->clientPacingWarning().observe(LiGetMicroseconds(),
         snapshot.vrrActive && Session::get()->clientPacingWarningsEnabled(),
-        interval.initialCalibrationComplete && interval.evaluatedUs != 0,
+        interval.initialCalibrationComplete && interval.clientEvaluatedUs != 0,
         snapshot.vrrBufferCapUs != 0 && snapshot.vrrAppliedBufferUs >= snapshot.vrrBufferCapUs,
         interval.averageValid && interval.serviceOverloaded,
         delta(snapshot.vrrPacingDroppedFrames, m_LastPacerTelemetry.vrrPacingDroppedFrames) != 0 ||
         delta(snapshot.vrrPrepareLateFrames, m_LastPacerTelemetry.vrrPrepareLateFrames) != 0,
-        interval.qualityPercent());
+        interval.clientQualityPercent());
     Session::get()->getOverlayManager().setStatusMessage(Overlay::StatusSource::ClientPacing,
         ClientPacingWarning::message(warning, (m_VideoFormat & VIDEO_FORMAT_MASK_AV1) != 0,
             Session::get()->hevcPacingAlternative(), m_VrrUsesMaximumBuffer));
@@ -1478,8 +1478,10 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             vrr.toleranceUs = interval.toleranceUs;
             vrr.nowUs = LiGetMicroseconds();
             vrr.input = interval.inputPercentile;
-            vrr.clientTimingValid = stats.vrrReadiness.intervalPolicy && interval.evaluatedUs;
-            vrr.clientTimingPercent = vrr.clientTimingValid ? interval.qualityPercent() : 0;
+            vrr.clientTimingValid = stats.vrrReadiness.intervalPolicy && interval.clientEvaluatedUs;
+            vrr.clientTimingPercent = interval.clientQualityPercent();
+            vrr.pacingTimingValid = stats.vrrReadiness.intervalPolicy && interval.evaluatedUs;
+            vrr.pacingTimingPercent = interval.qualityPercent();
             vrr.present = interval.present;
             ret = snprintf(&output[offset], length - offset, "%s", PerformanceStats::formatVrr(vrr).c_str());
             if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
@@ -1601,7 +1603,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
             if (readiness.intervalPolicy) {
                 const auto& interval = readiness.interval;
-                char score[32], average[32];
+                char score[32], clientScore[32], average[32];
                 char scoreWindow[32];
                 const auto historySeconds = interval.scoreWindowUs / 1000000;
                 if (historySeconds && historySeconds % 60 == 0)
@@ -1614,8 +1616,11 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                     snprintf(score, sizeof(score), "%.2f%%",
                         interval.qualityPercent());
                 else snprintf(score, sizeof(score), "collecting");
-                if (interval.averageValid)
-                    snprintf(average, sizeof(average), "%.3f ms", interval.averageErrorUs / 1000.0);
+                if (interval.clientEvaluatedUs)
+                    snprintf(clientScore, sizeof(clientScore), "%.2f%%", interval.clientQualityPercent());
+                else snprintf(clientScore, sizeof(clientScore), "collecting");
+                if (interval.clientAverageValid)
+                    snprintf(average, sizeof(average), "%.3f ms", interval.clientAverageErrorUs / 1000.0);
                 else snprintf(average, sizeof(average), "collecting");
                 // Display timing added after submission. The buffer cannot
                 // correct it, so it is reported apart from Smoothness.
@@ -1637,28 +1642,28 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 else snprintf(presentTiming, sizeof(presentTiming), "unavailable");
                 if (advancedStats) {
                     ret = snprintf(&output[offset], length - offset,
-                        "Client timing (CPU submissions): %s (target %.2f%%)\n"
-                        "Scored time: %.1fs / %s history (gaps excluded)\n"
-                        "Timing error (1s avg): %s | Allowed: %.2f ms | Drops (30s): %llu\n"
+                        "Pacing score: %s / %.2f%% target\n"
+                        "Client timing (CPU submissions): %s | Scored time: %.1fs / %s history\n"
+                        "Client interval error (1s avg): %s | Allowed: %.2f ms | Drops (30s): %llu\n"
                         "Present timing issues (30s): %s\n",
                         score,
                         stats.vrrOnTimeTargetPerMillion / 10000.0,
-                        interval.evaluatedUs / 1000000.0, scoreWindow, average,
+                        clientScore, interval.clientEvaluatedUs / 1000000.0, scoreWindow, average,
                         interval.toleranceUs / 1000.0,
                         static_cast<unsigned long long>(readiness.dropped),
                         presentTiming);
                 }
                 else {
                     ret = snprintf(&output[offset], length - offset,
-                        "VRR pacing: %s | Client timing (CPU submissions): %s / %.2f%% target%s\n"
-                        "Scored time: %.1fs / %s history (gaps excluded)\n"
+                        "VRR pacing: %s | Pacing score: %s / %.2f%% target%s\n"
+                        "Client timing (CPU submissions): %s | Scored time: %.1fs / %s history\n"
                         "Client interval error (1s): %s | Tolerance: %.2f ms | Dropped (30s): %llu\n"
                         "Present timing issues (30s): %s\n",
                         stats.vrrTelemetryActive ? "Active" : "Inactive",
                         score,
                         stats.vrrOnTimeTargetPerMillion / 10000.0,
                         stats.vrrBufferAtLimit ? " (buffer limit)" : "",
-                        interval.evaluatedUs / 1000000.0, scoreWindow, average,
+                        clientScore, interval.clientEvaluatedUs / 1000000.0, scoreWindow, average,
                         interval.toleranceUs / 1000.0,
                         static_cast<unsigned long long>(readiness.dropped),
                         presentTiming);

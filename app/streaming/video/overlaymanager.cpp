@@ -188,7 +188,8 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
             uint64_t interval;
             if (!timingGraphInterval(points, i, lanes[lane], interval)) { havePrevious = false; continue; }
             const double v = double(interval);
-            const bool flat = std::abs(v - double(nominal)) <= Layout::FlatUs;
+            const bool hitch = lanes[lane] == TimingGraphLane::Submit && points[i].clientTimingHitch;
+            const bool flat = !hitch && std::abs(v - double(nominal)) <= Layout::FlatUs;
             const int x = xAt(i), y = yAt(flat ? double(nominal) : v);
             if (havePrevious) line(previousX, previousY, x, y, colors[lane], stroke);
             else line(x, y, x + 1, y, colors[lane], stroke);
@@ -196,6 +197,10 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
                 const int inward = v > maximum ? S(4) : -S(4);
                 line(x - S(3), y, x, y + inward, clipColor);
                 line(x, y + inward, x + S(3), y, clipColor);
+            }
+            if (hitch) {
+                line(x - S(3), y - S(3), x + S(3), y + S(3), clipColor, stroke);
+                line(x - S(3), y + S(3), x + S(3), y - S(3), clipColor, stroke);
             }
             previousX = x; previousY = y; havePrevious = true;
         }
@@ -298,13 +303,13 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
     };
     for (int series = 0; series < 4; ++series) drawInputSeries(series);
     drawInputSeries(5); // Tolerance allowance is distinct from actual buffer delay.
-    // Mark measured input lateness at the inclusive graph threshold. The
-    // controller and the stage coverage counters have their own contracts.
+    // The historical input-percentile graph marks its eligible observations.
+    // In the interval policy, red Xs come from scored client timing above.
     for (size_t i = first; i < points.size(); ++i) {
         const auto& point = points[i];
         const auto sample = bufferGraphSample(point);
-        if (!(point.inputPercentileEnabled ? sample.producerValid : sample.readyValid)) continue;
-        const double latenessUs = point.inputPercentileEnabled ? sample.producerUs : sample.decoderReadyUs;
+        if (!sample.producerValid) continue;
+        const double latenessUs = sample.producerUs;
         if (latenessUs <= sample.bufferUs || latenessUs < hitchThresholdUs(point)) continue;
         const int x = xAt(i), y = inputY(latenessUs);
         line(x - S(2), y - S(2), x + S(2), y + S(2), clipColor, stroke);
@@ -330,7 +335,7 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
         latestPoint.extraDelayUs / 1000.0,
         (latestPoint.bufferUs + latestPoint.extraDelayUs) / 1000.0);
     label(caption, left, height - S(160), labelColor);
-    std::snprintf(caption, sizeof(caption), "Dashed hitch threshold %.2f ms (buffer + tolerance)",
+    std::snprintf(caption, sizeof(caption), "Dashed input allowance %.2f ms (buffer + tolerance)",
                   hitchThresholdUs(latestPoint) / 1000.0);
     label(caption, left, height - S(140), labelColor);
     if (adaptiveInput) {
@@ -367,7 +372,7 @@ SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingG
         label(caption, left, height - S(40), labelColor);
     }
     else label(adaptiveInput ? "Red X at or above hitch threshold. Gray: GPU/queue." :
-          "Red X when decode readiness reaches the hitch threshold.", left, height - S(40), labelColor);
+          "Red X: a client timing interval stretched beyond tolerance.", left, height - S(40), labelColor);
     label("Extra = smoothing/recovery; total = buffer + extra.", left, height - S(20), labelColor);
     return surface;
 }

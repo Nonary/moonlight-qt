@@ -4140,7 +4140,7 @@ void testRecoverableIntervalPressure()
             const auto readiness = i % 2 ? lateReady : otherReady;
             const auto submit = slot + otherReady + (i % 2 ? 3000 : 0);
             buffer.observe({i, slot, submit, slot, submit, 1000, true, true,
-                            0, 0, slot + floorLead, slot, 10000,
+                            0, 0, slot + floorLead, slot, 10000, false,
                             measured ? slot + readiness : 0},
                            1000, cap, 6000000, 125, true, 995000,
                            500, 30000000, 1000000, 2, true, 0, true, true);

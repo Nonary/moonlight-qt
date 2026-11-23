@@ -21,11 +21,10 @@ int main(int argc, char** argv)
     s.present.intervals = 3300; s.present.misses = 33; s.present.hitches = 1; s.present.worstAddedUs = 4200;
     s.present.lastObservedUs = s.nowUs = 10000000;
     auto text = formatVrr(s);
-    // Only the CPU interval score shares a line with the profile timing goal.
-    assert(has(text, "VRR buffer: 5.70 ms (target 5.42) | Client timing (CPU): collecting / 99.95% target\nInput coverage: 99.95%\n"));
+    assert(has(text, "VRR buffer: 5.70 ms (target 5.42) | Pacing score: collecting / 99.95% target\nClient timing (CPU): collecting\nInput coverage: 99.95%\n"));
     assert(has(text, "Present timing issues (30s): 1.00% >0.50 ms | hitches 1 | worst +4.2 ms\n"));
     assert(has(text, "Extra delay: 0.00 ms (smoothing/recovery) | Planned total: 5.70 ms\n"));
-    assert(std::count(text.begin(), text.end(), '\n') == 4);
+    assert(std::count(text.begin(), text.end(), '\n') == 5);
     if (argc > 1 && std::string(argv[1]) == "--fixture") { std::cout << text; return 0; }
 
     // A short reporting window responds independently of the profile history.
@@ -67,18 +66,19 @@ int main(int argc, char** argv)
     assert(has(formatVrr(s), "VRR buffer: 5.70 ms at limit (target 5.42 learning) | "));
     // The CPU interval score remains visible without adaptive input coverage.
     s.adaptive = false; s.atLimit = false;
-    assert(has(formatVrr(s), "VRR buffer: 5.70 ms | Client timing (CPU): collecting / 99.95% target\n"));
+    assert(has(formatVrr(s), "VRR buffer: 5.70 ms | Pacing score: collecting / 99.95% target\nClient timing (CPU): collecting\n"));
+    s.pacingTimingValid = true; s.pacingTimingPercent = 98.25;
     s.clientTimingValid = true; s.clientTimingPercent = 99.53;
-    assert(has(formatVrr(s), "VRR buffer: 5.70 ms | Client timing (CPU): 99.53% / 99.95% target\n"));
+    assert(has(formatVrr(s), "Pacing score: 98.25% / 99.95% target\nClient timing (CPU): 99.53%\n"));
     assert(!has(formatVrr(s), "Input coverage"));
     const auto nonadaptive = formatVrr(s);
-    assert(std::count(nonadaptive.begin(), nonadaptive.end(), '\n') == 3);
+    assert(std::count(nonadaptive.begin(), nonadaptive.end(), '\n') == 4);
     // Completed live run: binary coverage and weighted timing legitimately diverge.
     s.adaptive = true; s.targetPpm = 990000;
     s.clientTimingPercent = 98.73;
     s.input.recentEligible = 6960; s.input.recentMissed = 284;
     const auto divergent = formatVrr(s);
-    assert(has(divergent, "Client timing (CPU): 98.73% / 99.00% target\n"));
+    assert(has(divergent, "Pacing score: 98.25% / 99.00% target\nClient timing (CPU): 98.73%\n"));
     assert(has(divergent, "Input coverage: 95.92%\n"));
     assert(!has(divergent, "95.92% / 99.00%"));
     s.vrr = false;

@@ -29,9 +29,16 @@ a gap rather than one long interval, and a backend without feedback shows
 for display feedback, and OS/compositor timestamps are not physical panel
 measurements.
 
-The VRR18 input lane shows the applied buffer in green. Its dashed line is one
-configured tolerance above that buffer. A red X marks a frame whose measured
-decode readiness reaches or crosses that line.
+The VRR18 graph marks a stretched client interval with a red X in the
+submission lane when both frames had timely input and the interval exceeds the
+configured tolerance relative to intended cadence. **Client timing (CPU)**
+scores intervals with evidence of timely complete-frame delivery, allowing for
+normal decode time. Late or unknown delivery excludes both intervals touching
+that frame. **Pacing score** includes eligible timing errors from delivery as
+well as client processing. The buffer can grow on fresh readiness errors it
+can absorb when the Pacing score is below target. The input lane shows the applied buffer in green
+and the buffer plus tolerance as a dashed line. An asynchronous fence check
+after the buffer deadline leaves decode completion unknown.
 
 On a 4K output, the entire stats surface (text and chart) is about 30% larger.
 It follows the drawable window's pixel size, including high-DPI windows, and
@@ -44,9 +51,12 @@ planned spacing by more than the tolerance, and by more than the submitted
 spacing did. A display that smooths out uneven submissions (for example by
 queueing frames) is not blamed, and nothing faster than the panel's maximum
 refresh is expected. It is kept out of Smoothness and never grows the buffer,
-because more buffering cannot correct it. Smoothness only reflects timing the
-buffer can fix. A GPU that cannot finish its work in time (high GPU decode or
-rendering time in the stats) also shows up here. **Hitches** counts intervals
+because more buffering cannot correct it. Client timing measures cadence errors
+at the client's submission or scheduled presentation boundary after timely
+delivery. The buffer reacts
+to fresh readiness errors it can absorb. A GPU that cannot finish its work in time
+(high GPU decode or rendering time in the stats) can affect those observations.
+**Hitches** counts intervals
 at least one whole frame worse on screen than they were submitted, and
 **Worst** is the largest such delay in the window. A few large stalls are very
 visible but barely change the percentage.

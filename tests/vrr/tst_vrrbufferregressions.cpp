@@ -659,6 +659,55 @@ void testSourceCadenceBufferGrowth()
     }
 }
 
+void testClientTimingAttribution()
+{
+    const auto name = scenarioName("client-timing-attribution");
+    const auto session = vrrProductionSession(1, 100, 120, false);
+    Stream delivery(session, 1000), client(session, 1000);
+    for (size_t i = 0; i < 400; ++i) {
+        delivery.step(1000);
+        client.step(1000);
+    }
+    const auto initial = delivery.interval();
+    check(initial.clientEvaluatedUs > 0 && initial.clientQualityPercent() == 100.0,
+          name, "timely 90 FPS input scores cleanly in a 100 FPS session",
+          "scored %" PRIu64 " us at %.4f%%", initial.clientEvaluatedUs, initial.clientQualityPercent());
+
+    delivery.step(1000, {4000});
+    const auto lateDelivery = delivery.interval();
+    delivery.step(1000);
+    const auto afterDelivery = delivery.interval();
+    check(lateDelivery.qualityPercent() < initial.qualityPercent() &&
+              lateDelivery.clientEvaluatedUs == initial.clientEvaluatedUs &&
+              afterDelivery.clientEvaluatedUs == initial.clientEvaluatedUs &&
+              !lateDelivery.update.clientTimingHitch && !afterDelivery.update.clientTimingHitch,
+          name, "late delivery still counts for pacing, while both affected intervals skip client timing",
+          "pacing %.4f%%, client scored %" PRIu64 " -> %" PRIu64 " -> %" PRIu64 " us",
+          lateDelivery.qualityPercent(), initial.clientEvaluatedUs,
+          lateDelivery.clientEvaluatedUs, afterDelivery.clientEvaluatedUs);
+
+    Input backlog;
+    backlog.decoderQueueUs += 4000;
+    client.step(1000, backlog);
+    const auto lateClient = client.interval();
+    check(lateClient.clientEvaluatedUs > initial.clientEvaluatedUs &&
+              lateClient.clientQualityPercent() < initial.clientQualityPercent() &&
+              lateClient.update.clientTimingHitch,
+          name, "the same delay after reassembly lowers client timing and marks the stretched interval",
+          "client scored %" PRIu64 " us at %.4f%%, marker %d", lateClient.clientEvaluatedUs,
+          lateClient.clientQualityPercent(), lateClient.update.clientTimingHitch);
+
+    Stream varying(session, 1000);
+    for (size_t i = 0; i < 400; ++i) varying.step(1000);
+    const auto beforeRateChange = varying.interval().clientEvaluatedUs;
+    for (size_t i = 0; i < 400; ++i) varying.step(i % 2 ? 900 : 1000);
+    const auto variableRate = varying.interval();
+    check(variableRate.clientEvaluatedUs > beforeRateChange &&
+              variableRate.clientQualityPercent() >= 99.95,
+          name, "variable 90 to 100 FPS input remains eligible and does not create client timing errors",
+          "client score %.4f%%", variableRate.clientQualityPercent());
+}
+
 // Source cadence, not requested FPS, determines the interval being followed.
 // Returning to 90 FPS must not restore an obsolete predictor layer when the
 // new arrivals are clean. A short ramp tests the transitions as well as dwell.
@@ -1615,6 +1664,7 @@ int main(int argc, char** argv)
         {"unabsorbable-loss", testUnabsorbableLossBuysNoDelay},
         {"interval-pressure", testIntervalPressureAndRelease},
         {"source-cadence-buffer", testSourceCadenceBufferGrowth},
+        {"client-timing-attribution", testClientTimingAttribution},
         {"rate-round-trip", testRateRoundTrip},
         {"ordinary-variation", testOrdinaryVariation},
         {"display-ceiling", testDisplayCeilingShedsStandingPhase},

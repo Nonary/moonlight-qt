@@ -24,6 +24,7 @@ public:
         uint64_t spacingFloor = 0;
         // Sender clock after Reduce judder. A zero period selects historical replay.
         uint64_t smoothedRtpSlotUs = 0, sourcePeriodUs = 0;
+        bool inputOnTime = false;
         // Producer decode readiness plus normal render service, excluding
         // intentional queue residence. Zero means no independent measurement.
         uint64_t independentReadyUs = 0;
@@ -44,11 +45,17 @@ public:
         uint64_t holdRemainingUs = 0, cooldownRemainingUs = 0;
         Action action = Action::Learning;
         bool stretchedBeyondTolerance = false;
+        bool clientTimingHitch = false;
     };
     struct Stats {
         double averageErrorUs = 0;
         uint64_t evaluatedUs = 0, failedUs = 0;
         double weightedLossUs = 0;
+        // Reporting uses only intervals with timely input at both ends.
+        uint64_t clientEvaluatedUs = 0;
+        double clientWeightedLossUs = 0;
+        double clientAverageErrorUs = 0;
+        bool clientAverageValid = false;
         // Historical control history, retained for exact replay.
         uint64_t bufferEvaluatedUs = 0, bufferFailedUs = 0;
         double bufferWeightedLossUs = 0;
@@ -74,6 +81,10 @@ public:
                 0.0, 1.0) : 0.0;
         }
         double qualityPercent() const { return 100.0 * (1.0 - lossFraction()); }
+        double clientQualityPercent() const {
+            return clientEvaluatedUs ?
+                100.0 * (1.0 - std::clamp(clientWeightedLossUs / clientEvaluatedUs, 0.0, 1.0)) : 0.0;
+        }
         double bufferLossFraction() const {
             return bufferEvaluatedUs ? std::clamp(
                 (severityWeighted ? bufferWeightedLossUs : double(bufferFailedUs)) / bufferEvaluatedUs,
@@ -147,8 +158,12 @@ public:
         const auto actual = s.submitted - previous.submitted;
         const auto intended = s.intended - previous.intended;
         const auto error = std::max(actual, intended) - std::min(actual, intended);
+        // One late input can stretch its incoming interval and compress its
+        // outgoing interval. Require delivery evidence for both endpoints.
+        const bool clientInterval = s.inputOnTime && previous.inputOnTime;
         update.intervalErrorUs = error;
         update.stretchedBeyondTolerance = actual > intended && error > toleranceUs;
+        update.clientTimingHitch = clientInterval && update.stretchedBeyondTolerance;
         // Offset learning and presentation waits move the client clock. Neither
         // changes when the host produced the two frames.
         uint64_t sourceErrorUs = 0;
@@ -169,6 +184,10 @@ public:
         bucket.total += error;
         bucket.marginalUs += benefit.nearbyUs;
         bucket.recoverableLossUs += actual * std::min(1.0, double(benefit.excessUs) / intended);
+        if (clientInterval) {
+            ++bucket.clientSamples;
+            bucket.clientErrorUs += error;
+        }
         bucket.sourceErrorUs += sourceErrorUs;
         bucket.evaluatedUs += actual;
         bucket.service += s.serialService;
@@ -187,6 +206,7 @@ public:
         uint64_t windowSourceErrorUs = 0;
         double recoverableLossUs = 0;
         uint64_t evaluatedUs = 0, marginalTotalUs = 0;
+        uint64_t clientSamples = 0, clientErrorUs = 0;
         for (const auto& b : m_Window) {
             if (tick >= b.tick && tick - b.tick < m_Window.size()) {
                 samples += b.samples; total += b.total;
@@ -194,10 +214,14 @@ public:
                 recoverableLossUs += b.recoverableLossUs;
                 evaluatedUs += b.evaluatedUs;
                 marginalTotalUs += b.marginalUs;
+                clientSamples += b.clientSamples;
+                clientErrorUs += b.clientErrorUs;
                 service += b.service; decoderQueue += b.decoderQueue; intendedTime += b.intended;
             }
         }
         m_Stats.averageErrorUs = samples ? double(total) / samples : 0;
+        m_Stats.clientAverageValid = clientSamples != 0;
+        m_Stats.clientAverageErrorUs = clientSamples ? double(clientErrorUs) / clientSamples : 0;
         m_Stats.calibrationSamples = m_SequenceSamples;
         m_Stats.calibrationCoverageUs = s.submitted - m_First;
         m_Stats.averageValid = samples >= 2 && m_SequenceSamples >= m_SequenceMinimumSamples &&
@@ -213,6 +237,10 @@ public:
         const double excessUs = error > toleranceUs ? double(error - toleranceUs) : 0.0;
         const double loss = std::min(1.0, excessUs / intended);
         if (severityWeighted) score.weightedLoss += actual * loss;
+        if (clientInterval) {
+            score.clientEvaluatedUs += actual;
+            score.clientWeightedLossUs += actual * loss;
+        }
         const double bufferExcessUs = vrr18Feedback ?
             std::max(0.0, m_Stats.averageErrorUs - toleranceUs) : excessUs;
         const double bufferLoss = std::min(1.0, bufferExcessUs / intended);
@@ -354,6 +382,7 @@ public:
     void breakSequence() {
         m_Window = {}; m_First = m_ReleaseFraction = m_SequenceSamples = 0; m_HavePrevious = false;
         m_Stats.averageErrorUs = 0; m_Stats.averageValid = false;
+        m_Stats.clientAverageErrorUs = 0; m_Stats.clientAverageValid = false;
         m_Stats.calibrationCoverageUs = m_Stats.calibrationSamples = 0;
         m_Stats.update = {};
         m_Stats.update.action = Action::SequenceBreak;
@@ -396,18 +425,22 @@ private:
     struct Bucket {
         uint64_t tick = 0, samples = 0, total = 0;
         uint64_t service = 0, decoderQueue = 0, intended = 0, sourceErrorUs = 0;
-        uint64_t evaluatedUs = 0, marginalUs = 0;
+        uint64_t clientSamples = 0, clientErrorUs = 0, evaluatedUs = 0, marginalUs = 0;
         double recoverableLossUs = 0;
     };
     struct ScoreBucket {
         uint64_t tick = 0, evaluated = 0, failed = 0;
         double weightedLoss = 0;
+        uint64_t clientEvaluatedUs = 0;
+        double clientWeightedLossUs = 0;
         uint64_t bufferEvaluated = 0, bufferFailed = 0;
         double bufferWeightedLoss = 0;
     };
     void updateScore(uint64_t at, uint64_t windowUs) {
         m_Stats.evaluatedUs = m_Stats.failedUs = 0;
         m_Stats.weightedLossUs = 0;
+        m_Stats.clientEvaluatedUs = 0;
+        m_Stats.clientWeightedLossUs = 0;
         m_Stats.bufferEvaluatedUs = m_Stats.bufferFailedUs = 0;
         m_Stats.bufferWeightedLossUs = 0;
         const uint64_t windowBuckets = std::clamp<uint64_t>(
@@ -418,6 +451,8 @@ private:
             if (tick >= b.tick && tick - b.tick < windowBuckets) {
                 m_Stats.evaluatedUs += b.evaluated; m_Stats.failedUs += b.failed;
                 m_Stats.weightedLossUs += b.weightedLoss;
+                m_Stats.clientEvaluatedUs += b.clientEvaluatedUs;
+                m_Stats.clientWeightedLossUs += b.clientWeightedLossUs;
                 m_Stats.bufferEvaluatedUs += b.bufferEvaluated;
                 m_Stats.bufferFailedUs += b.bufferFailed;
                 m_Stats.bufferWeightedLossUs += b.bufferWeightedLoss;

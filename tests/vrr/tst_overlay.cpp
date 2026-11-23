@@ -249,12 +249,16 @@ static void testBufferCoverage()
     assert(sample.valid && sample.networkValid && sample.outputValid && sample.readyValid);
     assert(sample.networkUs == -1000 && sample.decoderOutputUs == 500);
     assert(sample.decoderReadyUs == 2500 && sample.absorbed());
+    p.decoderReadyUpperBound = true;
+    assert(bufferGraphSample(p).absorbed());
+    ++p.decoderReadyUs;
+    assert(!bufferGraphSample(p).readyValid);
+    p.decoderReadyUpperBound = false;
     // No tolerance/flattening at the coverage boundary. A late-clamped final
     // target or an unapplied buffer request must not hide a missed deadline.
-    ++p.decoderReadyUs;
     p.targetUs = 2000000;
     p.requestedBufferUs = 9000;
-    assert(!bufferGraphSample(p).absorbed());
+    assert(bufferGraphSample(p).readyValid && !bufferGraphSample(p).absorbed());
     p.cadenceRetimingUs = -500;
     assert(bufferGraphSample(p).decoderReadyUs == 3501);
     p.decoderReadyUs = 0;
@@ -848,7 +852,7 @@ int main(int argc, char** argv)
             assert(replacement.rowColors[2][3] > 0); // So are display spikes.
             const auto& incoming = replacement.rowColors[TimingGraphLayout::BufferLane];
             for (int ink = 4; ink < 8; ++ink) assert(incoming[ink] > 10);
-            assert(incoming[3] > 0); // Exact decoder/buffer crossings have red X markers.
+            assert(incoming[3] == 0); // Stage readiness alone is not a timing hitch.
             for (int ink = 0; ink < 3; ++ink) assert(incoming[ink] == 0);
         }
         const auto adaptiveGraph=[](int64_t producer,bool eligible,bool gpuKnown) {
@@ -867,25 +871,25 @@ int main(int argc, char** argv)
             }
             return snapshot;
         };
-        // VRR18 compares observed decode readiness with each frame's applied
-        // buffer, even when the requested buffer is larger.
-        for (const int excessUs : {499, 500, 501}) {
-            for (const bool observed : {false, true}) {
-                auto snapshot = adaptiveGraph(0, false, observed);
-                for (auto& point : snapshot.points) {
-                    point.inputPercentileEnabled = false;
-                    point.toleranceUs = 500;
-                    point.decoderOutputUs = point.sourceTimeUs + point.bufferUs + excessUs;
-                    point.decoderReadyUs = observed ? point.decoderOutputUs : 0;
-                }
-                const auto name = std::string("VRR18 hitch marker ") + std::to_string(excessUs) +
-                    (observed ? " measured" : " unknown");
-                manager.updateOverlayText(OverlayDebug, name.c_str(), std::move(snapshot));
-                replacement.awaitText(name);
-                std::lock_guard<std::mutex> guard(replacement.lock);
-                assert((replacement.rowColors[TimingGraphLayout::BufferLane][3] > 0) ==
-                       (observed && excessUs >= 500));
+        for (const bool scoredHitch : {false, true}) {
+            auto snapshot = adaptiveGraph(0, false, true);
+            for (auto& point : snapshot.points) {
+                point.inputPercentileEnabled = false;
+                point.toleranceUs = 500;
+                point.decoderOutputUs = point.sourceTimeUs + 1000;
+                point.decoderReadyUpperBound = true;
+                point.submissionIntervalUs += scoredHitch ? 501 : 0;
+                point.clientTimingHitch = scoredHitch;
+                assert(!bufferGraphSample(point).readyValid);
             }
+            const auto name = scoredHitch ? "VRR18 scored hitch" : "VRR18 late fence check";
+            manager.updateOverlayText(OverlayDebug, name, std::move(snapshot));
+            replacement.awaitText(name);
+            std::lock_guard<std::mutex> guard(replacement.lock);
+            assert(replacement.rowColors[TimingGraphLayout::BufferLane][3] == 0);
+            // 501 us fits inside the graph's visual deadband. The score
+            // still marks the stretched interval over its own 500 us limit.
+            assert((replacement.rowColors[1][3] > 0) == scoredHitch);
         }
         for(const auto scenario : {0,1,2,3}) {
             const bool eligible=scenario!=3;

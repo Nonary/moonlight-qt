@@ -10,6 +10,7 @@
 #include "intervalbuffer.h"
 #include "inputbuffer.h"
 #include "phasetrajectory.h"
+#include "receivedeadline.h"
 
 #include <cstddef>
 #include <algorithm>
@@ -631,6 +632,7 @@ private:
         uint64_t inputRenderReserveUs = 0;
         int64_t inputClockOffsetUs = 0;
         bool inputValid = false;
+        bool intervalInputOnTime = false;
         bool intervalValid = false;
         bool trajectoryValid = false;
     };
@@ -868,6 +870,7 @@ private:
     std::array<uint64_t, 64> m_DecodeGpuSamples {};
     size_t m_DecodeGpuNext = 0, m_DecodeGpuCount = 0;
     uint64_t m_DecodeGpuTypicalUs = 0;
+    VrrReceiveDeadline::RecentDuration m_ClientDecodeService;
     std::array<uint32_t, 512> m_SendSpanSamples {};
     size_t m_SendSpanNext = 0, m_SendSpanCount = 0;
     uint64_t m_SendSpanTypicalUs = 0;

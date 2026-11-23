@@ -22,9 +22,11 @@ struct Snapshot {
     uint64_t targetPpm = 0, toleranceUs = 0;
     uint64_t nowUs = 0;
     Vrr13::InputGoalBuffer::Stats input;
-    // Interval-policy CPU submission score, independent of input coverage.
+    // Timely-input intervals can be attributed past the reassembly boundary.
     bool clientTimingValid = false;
     double clientTimingPercent = 0;
+    bool pacingTimingValid = false;
+    double pacingTimingPercent = 0;
     // Display error added after submission, judged against the plan. Source
     // timestamp jitter is the host's cadence, not a display error.
     Vrr13::PresentTiming::Stats present;
@@ -59,7 +61,7 @@ inline std::string formatVrr(const Snapshot& s)
 {
     if (!s.vrr) return "VRR pacing: inactive\n";
 
-    char buffer[96], coverage[192] = {}, timing[128], present[128], text[768];
+    char buffer[96], coverage[192] = {}, timing[32], pacing[32], present[128], text[768];
     const double totalMs = (s.bufferUs + s.smoothingUs) / 1000.0;
     if (s.adaptive && s.input.samples)
         std::snprintf(buffer, sizeof(buffer), "%.2f ms%s (target %.2f%s)",
@@ -93,9 +95,11 @@ inline std::string formatVrr(const Snapshot& s)
         }
     }
     if (s.clientTimingValid)
-        std::snprintf(timing, sizeof(timing), "Client timing (CPU): %.2f%% / %.2f%% target",
-            s.clientTimingPercent, target);
-    else std::snprintf(timing, sizeof(timing), "Client timing (CPU): collecting / %.2f%% target", target);
+        std::snprintf(timing, sizeof(timing), "%.2f%%", s.clientTimingPercent);
+    else std::snprintf(timing, sizeof(timing), "collecting");
+    if (s.pacingTimingValid)
+        std::snprintf(pacing, sizeof(pacing), "%.2f%%", s.pacingTimingPercent);
+    else std::snprintf(pacing, sizeof(pacing), "collecting");
 
     if (s.present.intervals && fresh(s.present.lastObservedUs, s.nowUs))
         std::snprintf(present, sizeof(present), "%.2f%% >%.2f ms | hitches %llu | worst +%.1f ms",
@@ -106,11 +110,12 @@ inline std::string formatVrr(const Snapshot& s)
     else std::snprintf(present, sizeof(present), "N/A (no recent display feedback)");
 
     std::snprintf(text, sizeof(text),
-        "VRR buffer: %s | %s\n"
+        "VRR buffer: %s | Pacing score: %s / %.2f%% target\n"
+        "Client timing (CPU): %s\n"
         "%s"
         "Extra delay: %.2f ms (smoothing/recovery) | Planned total: %.2f ms\n"
         "Present timing issues (30s): %s\n",
-        buffer, timing, coverage, s.smoothingUs / 1000.0, totalMs, present);
+        buffer, pacing, target, timing, coverage, s.smoothingUs / 1000.0, totalMs, present);
     return text;
 }
 }

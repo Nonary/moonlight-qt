@@ -472,9 +472,12 @@ int VrrPacingWorker::run()
             !decision.phaseDiscontinuity && !externalRebaseApplied;
         bufferPoint.networkReadyUs = frame.reassembledUs();
         bufferPoint.decoderOutputUs = frame.decoderOutputUs();
-        bufferPoint.decoderReadyUs = preparedAhead ? telemetry.preparationStage.decodeReadyUs :
+        bufferPoint.decoderReadyUs = frame.decodeCompletionExact() ? frame.decodeCompleteUs() :
+            preparedAhead ? telemetry.preparationStage.decodeReadyUs :
             (decodeReadiness.completionObserved || frame.decoderOutputComplete() ?
                 frame.decodeCompleteUs() : 0);
+        bufferPoint.decoderReadyUpperBound = !frame.decodeCompletionExact() &&
+            (preparedAhead || decodeReadiness.completionObserved);
         const auto bufferSample = Overlay::bufferGraphSample(bufferPoint);
         telemetry.inputNetworkBufferMiss = bufferSample.networkValid &&
             bufferSample.networkUs > bufferSample.bufferLimitUs;
@@ -988,17 +991,17 @@ int VrrPacingWorker::run()
             sample.graph.inputMissed = input.reportingWindowUs ? input.reportingMissed : input.recentMissed;
             sample.graph.trajectoryCarryUs = decision.trajectory.carryUs;
             sample.graph.toleranceUs = m_TimingController->intervalToleranceUs();
+            sample.graph.clientTimingHitch = graphInterval.update.frame == frame.frameNumber() &&
+                graphInterval.update.atUs == telemetry.schedulingBoundaryUs &&
+                graphInterval.update.clientTimingHitch;
             sample.graph.sourceTimeUs = decision.sourceTimeUs;
             sample.graph.cadenceRetimingUs = decision.cadenceSmoothingUs + decision.readinessBudgetUs;
             sample.graph.sourceTimingValid = decision.usedRtpTimestamp &&
                 !decision.rebased && !decision.phaseDiscontinuity && !externalRebaseApplied;
             sample.graph.networkReadyUs = frame.reassembledUs();
             sample.graph.decoderOutputUs = frame.decoderOutputUs();
-            // Preserve known completion only. An asynchronous decoder output
-            // alone cannot prove that its GPU work fit inside the buffer.
-            sample.graph.decoderReadyUs = preparedAhead ? telemetry.preparationStage.decodeReadyUs :
-                (decodeReadiness.completionObserved || frame.decoderOutputComplete() ?
-                    frame.decodeCompleteUs() : 0);
+            sample.graph.decoderReadyUs = bufferPoint.decoderReadyUs;
+            sample.graph.decoderReadyUpperBound = bufferPoint.decoderReadyUpperBound;
             sample.graph.discontinuity = decision.rebased || decision.phaseDiscontinuity || externalRebaseApplied;
             sample.graph.backend = feedback.nativeBackendValid ? uint32_t(feedback.nativeBackend) : 0;
             sample.graph.idValid = feedback.submissionIdValid;

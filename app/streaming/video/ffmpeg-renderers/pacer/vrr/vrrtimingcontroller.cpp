@@ -441,6 +441,7 @@ VrrTimingController::VrrTimingController(const VrrSessionConfig& config,
 void VrrTimingController::reset()
 {
     m_PhaseTrajectory.reset();
+    m_ClientDecodeService = {};
     m_HaveMappingBasis = false;
     m_CorrectedMappingBasis = false;
     m_DisplayPeriodUs = periodForRate(m_Config.displayRefreshHz, 16667);
@@ -1614,6 +1615,23 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         m_Pending.independentReadyUs = saturatingAdd(inputReadyUs, renderOffsetUs);
     }
     m_Pending.intervalValid = decision.usedRtpTimestamp && !decision.rebased && !decision.phaseDiscontinuity;
+    const uint64_t reassembledUs = frame.reassembledUs();
+    const uint64_t decodeSubmitUs = frame.decodeSubmitUs();
+    if (timestampPlayout && !frame.lostPackets() && reassembledUs &&
+            decodeSubmitUs >= reassembledUs && frame.decoderOutputUs() >= decodeSubmitUs &&
+            decodeReadyUs >= frame.decoderOutputUs()) {
+        // Compare complete-frame arrival against the nominal decode deadline
+        // with the service cost learned before this frame. Decoder backlog,
+        // intentional holds and this frame's own decode time are client work.
+        const uint64_t decodeDeadlineUs =
+            originalTargetUs - std::min(originalTargetUs, m_Pending.inputRenderReserveUs);
+        m_Pending.intervalInputOnTime = m_ClientDecodeService.ready() &&
+            reassembledUs <= decodeDeadlineUs &&
+            m_ClientDecodeService.percentileUs() <= decodeDeadlineUs - reassembledUs;
+        if (decodeReadyUs - decodeSubmitUs <= decision.sourcePeriodUs) {
+            m_ClientDecodeService.observe(decodeSubmitUs, decodeReadyUs);
+        }
+    }
     // Timestamp playout never feeds the learned readiness reserve.
     m_Pending.cadenceEligible = decision.cadenceEligible && !timestampPlayout;
     m_Pending.readyOffsetUs = readyOffsetUs;
@@ -2529,7 +2547,7 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 serialServiceUs, p.decoderQueue, m_Pending.intervalSpacingFloorUs,
                 m_Pending.smoothedRtpSlotUs,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18SourceCadenceFeedback ? m_SourcePeriodUs : 0,
-                m_Pending.independentReadyUs},
+                m_Pending.intervalInputOnTime, m_Pending.independentReadyUs},
                 playoutDelayMinimumUs(), playoutDelayMaximumUs(),
                 intervalHoldUs, m_Parameters.playoutMeanMissReleaseUsPerSecond,
                 true, m_Parameters.playoutOnTimeTargetPerMillion,

@@ -12,7 +12,8 @@ release hold and blocked-evidence correction on 2026-11-09, and timestamped
 D3D11 decode completion with the capped solver margin on 2026-11-13 (the D3D11
 presenter part had not been run on Windows when this was written). The
 production worker resolves VRR18 interval feedback with bounded per-frame
-catch-up and one timing score for display and buffer control. Smoothing and
+catch-up, a pacing score for buffer control, and a client timing score for
+intervals with timely input. Smoothing and
 recovery keep their shared movement limit even when
 the input predictor is inactive. The
 calibration key includes effective policy and presenter
@@ -648,8 +649,8 @@ evidence. Its readiness deadline includes any spacing already provided by the
 presentation floor. With 8.0 ms covered and readiness at 8.6 ms, the observer
 sees a 0.6 ms miss before applying tolerance.
 
-The buffer uses the same rolling Client timing score shown in the overlay.
-Each adjacent interval contributes only its deviation beyond the configured
+The buffer uses the rolling Pacing score shown with the timing target.
+Each adjacent pacing interval contributes only its deviation beyond the configured
 tolerance, weighted by the time represented by that interval. The one-second
 window qualifies service capacity, supplies a diagnostic mean, and bounds how
 quickly sustained misses can grow the buffer. Growth also requires fresh
@@ -673,7 +674,21 @@ Only intervals that could come back within tolerance contribute growth pressure.
 The one-second window measures their severity against the selected timing target.
 It limits each increase to the average interval improvement predicted for one
 tolerance of extra delay, subject to the existing attack and capacity limits.
-A compressed successor is attributed to the preceding late frame.
+A compressed successor is attributed to the preceding late frame. The Pacing
+and Client timing scores continue to report their full eligible populations.
+
+The Client timing score and its one-second mean require timely complete-frame
+arrival at both ends of an interval. The controller compares compressed-frame
+reassembly with the nominal decode-ready deadline, leaving time for normal
+decode service estimated from the recent 95th percentile of decode submission
+to completion. It uses preceding service observations and excludes decoder
+queue residence and intentional decode holds from that estimate. A late,
+loss-affected or unmeasured input excludes both neighboring intervals from
+Client timing and its hitch markers. It can still contribute to the Pacing
+score under the existing interval rules. This is an attribution boundary at
+complete-frame delivery. A mixed interval can contain real client delay, and
+the available receive timestamps alone cannot distinguish host, transport,
+and client receive-thread delay before reassembly.
 
 Balanced interval feedback tapers release below the controller's display
 ceiling threshold, with the same 0.1% margin used for phase recovery. In that
@@ -1005,10 +1020,13 @@ The fallback DXGI statistics provider supplies no verified display events.
 The graph separately joins its image IDs and measured refresh-count/QPC anchors
 to show `Display refresh (DXGI)`. That observation does not enter verified
 display-event cadence, latency learning, or adaptation.
-The frametime graph marks a VRR18 input hitch with a red X when observed decode
-readiness reaches the applied buffer plus the configured tolerance, measured
-against that frame's retimed source slot. The dashed line shows this threshold.
-A frame with unknown decode completion has no marker.
+The frametime graph marks a VRR18 client hitch with a red X in the submission
+lane when both frames had timely input and their scored interval stretches
+beyond the tolerance against intended cadence. Each marker belongs to the
+stretched interval.
+The input lane shows the applied buffer and the dashed allowance. An
+asynchronous completion check can establish coverage if its timestamp fits the
+buffer. A check made after that deadline leaves actual completion unknown.
 Production uses submission estimates for its client cadence report. Matched
 DXGI refresh observations populate the separately labeled graph lane;
 independent-flip events from composition populate display-event timing
@@ -1591,8 +1609,9 @@ matching identities and do not establish optical output.
 
 Compare presented-interval jerk and sender-spacing fidelity together with
 latency, drift, interval violations and modeled raster bounds. Input coverage is
-a binary measurement and differs from the severity-weighted client timing
-score; neither by itself proves visible smoothness. Fixed-admission replay can
+a binary measurement. Client timing and Pacing scores both weight the severity
+of interval errors, with different eligibility as described above. Use matched
+display evidence for visible smoothness. Fixed-admission replay can
 become saturated where the live worker would shed frames, invalidating its
 latency result. Use matched live A/B evidence for visible behavior.
 
