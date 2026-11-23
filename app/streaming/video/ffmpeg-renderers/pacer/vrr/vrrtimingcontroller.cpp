@@ -163,7 +163,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         config.latencyMode : 1;
     const auto options = config.timingOptions.resolved(latencyMode);
     const bool vrr18 = config.vrr18IntervalFeedback;
-    parameters.playoutVrr18IntervalFeedback = vrr18;
+    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18RecoverableIntervalFeedback : 0;
     parameters.playoutIntervalToleranceUs = options.toleranceUs;
     // Presets change only the four user-visible values. Admission, release,
     // and late-frame recovery use the same policy for every combination.
@@ -1568,6 +1568,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     // Follow the host and deliberate judder correction. Buffer/render-budget
     // changes do not redefine the intended motion or conceal client errors.
     m_Pending.intervalIntendedUs = addSigned(decision.sourceTimeUs, decision.cadenceSmoothingUs);
+    m_Pending.smoothedRtpSlotUs = addSigned(rtpUs, decision.cadenceSmoothingUs);
     if (m_Parameters.playoutVrr18IntervalFeedback && timestampPlayout && !rebased &&
             !reseedPhase && !cadence.phaseDiscontinuity && !cadence.sourceRateChanged &&
             cadence.frameDelta == 1 && m_HaveLastSubmission) {
@@ -1609,6 +1610,9 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         frame.decoderOutputUs() >= frame.decodeSubmitUs() &&
         !decision.sourceRateChanged &&
         (!m_Parameters.normalizedSourceMapping || m_CorrectedMappingBasis);
+    if (m_Pending.inputValid && !frame.lostPackets() && decodeReadyUs >= frame.decoderOutputUs()) {
+        m_Pending.independentReadyUs = saturatingAdd(inputReadyUs, renderOffsetUs);
+    }
     m_Pending.intervalValid = decision.usedRtpTimestamp && !decision.rebased && !decision.phaseDiscontinuity;
     // Timestamp playout never feeds the learned readiness reserve.
     m_Pending.cadenceEligible = decision.cadenceEligible && !timestampPlayout;
@@ -2522,7 +2526,10 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 submissionUs, deadline, ready, p.applied,
                 submitted && !cancelled && m_Pending.intervalValid && m_Pending.hasPreparationDuration,
                 p.eligible,
-                serialServiceUs, p.decoderQueue, m_Pending.intervalSpacingFloorUs},
+                serialServiceUs, p.decoderQueue, m_Pending.intervalSpacingFloorUs,
+                m_Pending.smoothedRtpSlotUs,
+                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18SourceCadenceFeedback ? m_SourcePeriodUs : 0,
+                m_Pending.independentReadyUs},
                 playoutDelayMinimumUs(), playoutDelayMaximumUs(),
                 intervalHoldUs, m_Parameters.playoutMeanMissReleaseUsPerSecond,
                 true, m_Parameters.playoutOnTimeTargetPerMillion,
@@ -2531,7 +2538,9 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutIntervalInitialWarmupUs,
                 m_Parameters.playoutIntervalInitialMinimumSamples,
                 m_Parameters.playoutVrr18IntervalFeedback != 0,
-                taperRelease ? m_Parameters.playoutIntervalReleaseTauUs : 0);
+                taperRelease ? m_Parameters.playoutIntervalReleaseTauUs : 0,
+                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18SharedIntervalScore,
+                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18RecoverableIntervalFeedback);
             if (m_Parameters.playoutInputPercentileEnabled) {
                 const auto capacity = m_IntervalBuffer.stats();
                 const bool validInput = submitted && !cancelled && m_Pending.intervalValid &&

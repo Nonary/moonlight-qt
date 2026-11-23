@@ -20,6 +20,12 @@
 #include <limits>
 #include <vector>
 
+// Recorded values of playout_vrr18_interval_feedback.
+constexpr uint64_t Vrr18AveragedIntervalFeedback = 1;
+constexpr uint64_t Vrr18SharedIntervalScore = 2;
+constexpr uint64_t Vrr18SourceCadenceFeedback = 3;
+constexpr uint64_t Vrr18RecoverableIntervalFeedback = 4;
+
 // This list is also the replay/trace parameter schema. Keeping the JSON name,
 // C++ member, type, and production default together prevents those copies from
 // drifting while avoiding hand-written serialization for every field. The
@@ -613,6 +619,8 @@ private:
         uint64_t deferredGpuReadyUs = 0;
         uint64_t preparationCompleteUs = 0;
         uint64_t intervalIntendedUs = 0;
+        uint64_t smoothedRtpSlotUs = 0;
+        uint64_t independentReadyUs = 0;
         uint64_t intervalSpacingFloorUs = 0;
         uint64_t inputSlotUs = 0;
         uint64_t inputObservationUs = 0;

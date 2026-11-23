@@ -622,6 +622,43 @@ void testIntervalPressureAndRelease()
     }
 }
 
+// Use identical sender timestamps in a source-only and a mixed impairment.
+// Late delivery also stretches the interval ending at a late frame and
+// compresses its successor. Neither interval can erase a host-only gap.
+void testSourceCadenceBufferGrowth()
+{
+    for (const auto& smoothing : kSmoothing) {
+        const auto name = scenarioName("source-cadence-buffer") + "/" + smoothing.name;
+        auto session = vrrProductionSession(1, 120, 120, smoothing.smooth);
+        session.timingOptions = {2000, 9950, 120, 500};
+        Stream sourceOnly(session, 1000), mixed(session, 1000);
+        for (size_t i = 0; i < 400; ++i) {
+            sourceOnly.step(1500);
+            mixed.step(1500);
+        }
+        constexpr uint32_t staggeredTicks[] = {2040, 1500, 960, 1500};
+        const size_t start = sourceOnly.size();
+        for (size_t i = 0; i < 1200; ++i) {
+            const auto ticks = staggeredTicks[i % 4];
+            sourceOnly.step(ticks);
+            // The independent 4 ms delivery miss coincides with a long host interval.
+            mixed.step(ticks, {i % 4 == 0 ? 4000u : 0u});
+        }
+        const auto hostPeak = maximum(sourceOnly.frames(), start, sourceOnly.size(), applied);
+        const auto mixedPeak = maximum(mixed.frames(), start, mixed.size(), applied);
+        check(hostPeak == 1000, name, "host stagger alone cannot grow the buffer",
+              "host-only peak %" PRIu64 " us", hostPeak);
+        check(mixedPeak > hostPeak && mixedPeak <= hostPeak + 4000, name,
+              "independent delivery jitter during host stagger earns bounded protection",
+              "host-only peak %" PRIu64 " us, mixed peak %" PRIu64 " us", hostPeak, mixedPeak);
+
+        for (size_t i = 0; i < 1200; ++i) sourceOnly.step(1500, {i % 4 == 1 ? 4000u : 0u});
+        check(sourceOnly.frames().back().appliedUs > 1000, name,
+              "steady 60 FPS delivery can requalify at its own rate",
+              "final %" PRIu64 " us", sourceOnly.frames().back().appliedUs);
+    }
+}
+
 // Source cadence, not requested FPS, determines the interval being followed.
 // Returning to 90 FPS must not restore an obsolete predictor layer when the
 // new arrivals are clean. A short ramp tests the transitions as well as dwell.
@@ -1577,6 +1614,7 @@ int main(int argc, char** argv)
         {"within-allowance", testMissesWithinAllowanceBuyNoDelay},
         {"unabsorbable-loss", testUnabsorbableLossBuysNoDelay},
         {"interval-pressure", testIntervalPressureAndRelease},
+        {"source-cadence-buffer", testSourceCadenceBufferGrowth},
         {"rate-round-trip", testRateRoundTrip},
         {"ordinary-variation", testOrdinaryVariation},
         {"display-ceiling", testDisplayCeilingShedsStandingPhase},

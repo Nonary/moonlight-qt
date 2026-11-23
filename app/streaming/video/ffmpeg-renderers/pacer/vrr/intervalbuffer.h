@@ -10,9 +10,8 @@
 #include "cadencedetection.h"
 
 namespace Vrr13 {
-// Client-added interval error, including zero-error intervals. Reporting
-// scores each adjacent interval. VRR18 feedback scores the mean error over a
-// qualified one-second window and uses that score to adapt the buffer.
+// Score each adjacent interval against its intended spacing. Historical VRR18
+// feedback retained a separate score based on the one-second mean error.
 class IntervalBuffer {
 public:
     static constexpr uint64_t ToleranceUs = 500;
@@ -23,6 +22,12 @@ public:
         bool valid = false, absorbable = false;
         uint64_t serialService = 0, decoderQueue = 0;
         uint64_t spacingFloor = 0;
+        // Sender clock after Reduce judder. A zero period selects historical replay.
+        uint64_t smoothedRtpSlotUs = 0, sourcePeriodUs = 0;
+        // Producer decode readiness plus normal render service, excluding
+        // intentional queue residence. Zero means no independent measurement.
+        uint64_t independentReadyUs = 0;
+        bool sourceInTolerance = true; // Set by the observer for attribution on the following frame.
     };
     // Observation only. This explains the request made after an outcome;
     // the controller applies that request to subsequent frames. In particular,
@@ -38,12 +43,13 @@ public:
         uint64_t attemptedIncreaseUs = 0, clippedIncreaseUs = 0;
         uint64_t holdRemainingUs = 0, cooldownRemainingUs = 0;
         Action action = Action::Learning;
+        bool stretchedBeyondTolerance = false;
     };
     struct Stats {
         double averageErrorUs = 0;
         uint64_t evaluatedUs = 0, failedUs = 0;
         double weightedLossUs = 0;
-        // Separate control history: never substitute it for client timing.
+        // Historical control history, retained for exact replay.
         uint64_t bufferEvaluatedUs = 0, bufferFailedUs = 0;
         double bufferWeightedLossUs = 0;
         uint64_t toleranceUs = ToleranceUs;
@@ -83,7 +89,8 @@ public:
                  uint64_t initialWarmupUs = 1000000,
                  size_t initialMinimumSamples = 2,
                  bool vrr18Feedback = false,
-                 uint64_t releaseTauUs = 0) {
+                 uint64_t releaseTauUs = 0,
+                 bool sharedScore = false, bool requireRecoverableInterval = false) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -126,11 +133,12 @@ public:
         update.minimumUs = minimum;
         update.maximumUs = maximum;
         m_Previous = s;
-        if (adjacent) {
-            m_Previous.deadline = std::max(s.deadline, s.spacingFloor);
-        }
         m_HavePrevious = s.valid && s.submitted && s.intended;
         if (!adjacent) {
+            // Without an incoming source interval, this frame cannot explain
+            // a compressed successor as a recoverable late frame.
+            m_Previous.spacingFloor = 0;
+            m_Previous.sourceInTolerance = s.sourcePeriodUs == 0;
             updateScore(s.submitted, scoreWindowUs);
             if (beforeUs == boundedUs) update.action = Action::SequenceBreak;
             return;
@@ -140,11 +148,29 @@ public:
         const auto intended = s.intended - previous.intended;
         const auto error = std::max(actual, intended) - std::min(actual, intended);
         update.intervalErrorUs = error;
+        update.stretchedBeyondTolerance = actual > intended && error > toleranceUs;
+        // Offset learning and presentation waits move the client clock. Neither
+        // changes when the host produced the two frames.
+        uint64_t sourceErrorUs = 0;
+        if (s.sourcePeriodUs) {
+            const uint64_t expected = previous.smoothedRtpSlotUs + s.sourcePeriodUs;
+            sourceErrorUs = std::max(expected, s.smoothedRtpSlotUs) - std::min(expected, s.smoothedRtpSlotUs);
+        }
+        const bool sourceInTolerance = sourceErrorUs <= toleranceUs;
+        m_Previous.sourceInTolerance = sourceInTolerance;
+        const auto& delayed = actual >= intended ? m_Previous : previous;
+        const auto& other = actual >= intended ? previous : m_Previous;
+        const auto benefit = requireRecoverableInterval ?
+            intervalBenefit(delayed, other, error, toleranceUs, maximum) : Benefit{};
         const auto tick = s.submitted / 10000;
         auto& bucket = m_Window[tick % m_Window.size()];
         if (bucket.tick != tick) bucket = Bucket{tick};
         ++bucket.samples;
         bucket.total += error;
+        bucket.marginalUs += benefit.nearbyUs;
+        bucket.recoverableLossUs += actual * std::min(1.0, double(benefit.excessUs) / intended);
+        bucket.sourceErrorUs += sourceErrorUs;
+        bucket.evaluatedUs += actual;
         bucket.service += s.serialService;
         bucket.decoderQueue += s.decoderQueue;
         bucket.intended += intended;
@@ -158,9 +184,16 @@ public:
         }
         ++m_SequenceSamples;
         uint64_t samples = 0, total = 0, service = 0, decoderQueue = 0, intendedTime = 0;
+        uint64_t windowSourceErrorUs = 0;
+        double recoverableLossUs = 0;
+        uint64_t evaluatedUs = 0, marginalTotalUs = 0;
         for (const auto& b : m_Window) {
             if (tick >= b.tick && tick - b.tick < m_Window.size()) {
                 samples += b.samples; total += b.total;
+                windowSourceErrorUs += b.sourceErrorUs;
+                recoverableLossUs += b.recoverableLossUs;
+                evaluatedUs += b.evaluatedUs;
+                marginalTotalUs += b.marginalUs;
                 service += b.service; decoderQueue += b.decoderQueue; intendedTime += b.intended;
             }
         }
@@ -177,16 +210,13 @@ public:
         if (score.tick != s.submitted / 100000) score = ScoreBucket{s.submitted / 100000};
         score.evaluated += actual;
         if (error > toleranceUs) score.failed += actual;
-        const double excessUs = std::max(0.0,
-            (double(error)) - toleranceUs);
+        const double excessUs = error > toleranceUs ? double(error - toleranceUs) : 0.0;
         const double loss = std::min(1.0, excessUs / intended);
         if (severityWeighted) score.weightedLoss += actual * loss;
-        // Keep display reporting on individual intervals. VRR18 feedback
-        // qualifies the service window before scoring its mean interval error.
         const double bufferExcessUs = vrr18Feedback ?
             std::max(0.0, m_Stats.averageErrorUs - toleranceUs) : excessUs;
         const double bufferLoss = std::min(1.0, bufferExcessUs / intended);
-        if (!vrr18Feedback || m_Stats.averageValid) {
+        if (!sharedScore && (!vrr18Feedback || m_Stats.averageValid)) {
             score.bufferEvaluated += actual;
             if (bufferExcessUs > 0) score.bufferFailed += actual;
             if (severityWeighted) score.bufferWeightedLoss += actual * bufferLoss;
@@ -196,20 +226,29 @@ public:
         if (!m_Stats.averageValid) return;
 
         const double allowedLoss = (1000000 - std::min<uint64_t>(targetPerMillion, 1000000)) / 1000000.0;
-        const bool belowTarget = m_Stats.bufferLossFraction() > allowedLoss;
-        const bool currentPressure = severityWeighted ? bufferLoss > allowedLoss : pressure;
+        const double scoreLoss = sharedScore ? m_Stats.lossFraction() : m_Stats.bufferLossFraction();
+        const bool belowTarget = scoreLoss > allowedLoss;
+        const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
+        const bool sourceQualified = sourceInTolerance && delayed.sourceInTolerance &&
+            windowSourceErrorUs <= samples * toleranceUs;
+        const bool useDeliveryEvidence = requireRecoverableInterval && !sourceQualified;
+        const bool deliveryPressure = marginalTotalUs > 0 && recoverableLossUs > allowedLoss * evaluatedUs;
+        const bool sustainedPressure = useDeliveryEvidence ? deliveryPressure :
+            (severityWeighted ? bufferLoss > allowedLoss : pressure);
         // Old score debt holds protection, but cannot authorize another attack
         // without current, attributable error outside the preset's allowance.
         const bool historicalPressure = severityWeighted && belowTarget;
         const bool historyHolds = !vrr18Feedback && historicalPressure;
-        const auto& delayed = actual >= intended ? m_Previous : previous;
-        const auto lateness = delayed.ready > delayed.deadline ? delayed.ready - delayed.deadline : 0;
-        const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
+        const auto deadline = std::max(delayed.deadline, delayed.spacingFloor);
+        const auto lateness = delayed.ready - std::min(delayed.ready, deadline);
         const bool windowAbsorbable = service <= intendedTime && decoderQueue <= intendedTime;
-        const bool delayedAbsorbable = delayed.absorbable &&
-            (windowAbsorbable);
+        const auto headroom = maximum - std::min(maximum, delayed.buffer);
+        const bool withinBudget = !requireRecoverableInterval ||
+            lateness - std::min(lateness, toleranceUs) <= headroom;
+        const bool delayedAbsorbable = delayed.absorbable && windowAbsorbable && withinBudget &&
+            (useDeliveryEvidence ? benefit.excessUs != 0 : sourceQualified);
         const bool targetAllowsHold = !severityWeighted || belowTarget;
-        const bool pressureHolds = (vrr18Feedback || targetAllowsHold) && currentPressure &&
+        const bool pressureHolds = (vrr18Feedback || targetAllowsHold) && sustainedPressure &&
             (freshError && delayedAbsorbable && lateness);
         const bool holdProtection = pressureHolds ||
             (targetAllowsHold && historyHolds);
@@ -243,13 +282,16 @@ public:
             remaining(s.submitted - m_LastAttack, 250000) : 0;
         update.action = pressureHolds ? Action::CurrentPressure :
             (targetAllowsHold && historyHolds) ? Action::HistoryHold : Action::RecoveryHold;
-        const bool grow = currentPressure && (!severityWeighted || belowTarget);
+        const bool grow = sustainedPressure && (!severityWeighted || belowTarget);
         if (grow && freshError && delayedAbsorbable && lateness &&
                 (!m_LastAttack || s.submitted - m_LastAttack >= 250000)) {
-            const auto excess = severityWeighted ?
+            const auto excess = useDeliveryEvidence ?
+                (marginalTotalUs + samples - 1) / samples :
+                severityWeighted ?
                 uint64_t(std::ceil(std::min(250.0, std::max(0.0, bufferExcessUs - allowedLoss * intended)))) :
                 (total - samples * toleranceUs + samples - 1) / samples;
-            const auto freshExcess = severityWeighted ? error - toleranceUs : error;
+            const auto freshExcess = useDeliveryEvidence ? benefit.excessUs :
+                severityWeighted ? error - toleranceUs : error;
             const auto increase = std::min({uint64_t(250), excess, lateness,
                 severityWeighted ? freshExcess : uint64_t(250)});
             const auto base = std::min(delayed.buffer, maximum);
@@ -318,9 +360,44 @@ public:
     }
     void reset() { *this = IntervalBuffer{}; }
 private:
+    struct Benefit {
+        uint64_t excessUs = 0;  // Error outside tolerance that the remaining buffer can cover.
+        uint64_t nearbyUs = 0;  // Part of that error covered by one tolerance of extra buffer.
+    };
+
+    static uint64_t coveredReadiness(const Sample& sample, uint64_t extraUs) {
+        const auto ready = std::min(sample.ready, sample.independentReadyUs);
+        const auto deadline = std::max(sample.deadline, sample.spacingFloor);
+        const auto floorLead = deadline - sample.deadline;
+        const auto usable = extraUs - std::min(extraUs, floorLead);
+        return std::min(usable, ready - std::min(ready, deadline));
+    }
+
+    // Both deadlines move together. Equal lateness at the two endpoints
+    // leaves their spacing unchanged. Any residual from host cadence,
+    // scheduler wakeups or present waits stays in the measured handoff error.
+    static Benefit intervalBenefit(const Sample& delayed, const Sample& other,
+                                    uint64_t error, uint64_t tolerance, uint64_t maximum) {
+        if (error <= tolerance || !delayed.absorbable ||
+                !delayed.independentReadyUs || !other.independentReadyUs) return {};
+        const auto headroom = maximum - std::min(maximum, std::max(delayed.buffer, other.buffer));
+        const auto deadline = std::max(delayed.deadline, delayed.spacingFloor);
+        const auto lateness = delayed.ready - std::min(delayed.ready, deadline);
+        if (lateness - std::min(lateness, tolerance) > headroom) return {};
+        const auto improvement = [&](uint64_t extraUs) {
+            const auto late = coveredReadiness(delayed, extraUs);
+            return late - std::min(late, coveredReadiness(other, extraUs));
+        };
+        const auto excess = error - tolerance;
+        if (improvement(headroom) < excess) return {};
+        return {excess, std::min(excess, improvement(std::min(headroom, tolerance)))};
+    }
+
     struct Bucket {
         uint64_t tick = 0, samples = 0, total = 0;
-        uint64_t service = 0, decoderQueue = 0, intended = 0;
+        uint64_t service = 0, decoderQueue = 0, intended = 0, sourceErrorUs = 0;
+        uint64_t evaluatedUs = 0, marginalUs = 0;
+        double recoverableLossUs = 0;
     };
     struct ScoreBucket {
         uint64_t tick = 0, evaluated = 0, failed = 0;
