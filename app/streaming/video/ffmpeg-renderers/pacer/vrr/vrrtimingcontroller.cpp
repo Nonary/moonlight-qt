@@ -163,7 +163,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         config.latencyMode : 1;
     const auto options = config.timingOptions.resolved(latencyMode);
     const bool vrr18 = config.vrr18IntervalFeedback;
-    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18RecoverableIntervalFeedback : 0;
+    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18GoalIntervalFeedback : 0;
     parameters.playoutIntervalToleranceUs = options.toleranceUs;
     // Presets change only the four user-visible values. Admission, release,
     // and late-frame recovery use the same policy for every combination.
@@ -1134,17 +1134,18 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                                 (targetUs < safeAdaptiveUs || beyondVrrFloor);
     }
     const uint64_t unflooredTargetUs = targetUs;
-    uint64_t requestedPhaseTargetUs = originalTargetUs;
+    const uint64_t earliestUs = earliestSubmissionUs();
+    uint64_t spacingFloorUs = earliestUs;
+    uint64_t scanoutSubmissionFloorUs = 0;
     if (m_Parameters.playoutPredictionEnabled && !m_Parameters.playoutPredictionOnly &&
         !m_LatchedPresentation) {
         const auto scanoutFloor = m_PresentationPrediction.floor(nowUs, m_DisplayPeriodUs, m_GuardUs);
         const uint64_t requestedFloorUs = scanoutFloor > compositorLeadUs ? scanoutFloor - compositorLeadUs : 0;
-        targetUs = std::max(targetUs, requestedFloorUs);
-        requestedPhaseTargetUs = std::max(requestedPhaseTargetUs, requestedFloorUs);
+        spacingFloorUs = std::max(spacingFloorUs, requestedFloorUs);
+        scanoutSubmissionFloorUs = requestedFloorUs;
     }
-    const uint64_t earliestUs = earliestSubmissionUs();
-    targetUs = std::max(targetUs, earliestUs);
-    requestedPhaseTargetUs = std::max(requestedPhaseTargetUs, earliestUs);
+    targetUs = std::max(targetUs, spacingFloorUs);
+    uint64_t requestedPhaseTargetUs = std::max(originalTargetUs, spacingFloorUs);
     const uint64_t presentationFloorPushUs = targetUs - unflooredTargetUs;
     const uint64_t physicalTargetUs = targetUs;
     const uint64_t physicalRequestedPhaseTargetUs = requestedPhaseTargetUs;
@@ -1573,10 +1574,20 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     if (m_Parameters.playoutVrr18IntervalFeedback && timestampPlayout && !rebased &&
             !reseedPhase && !cadence.phaseDiscontinuity && !cadence.sourceRateChanged &&
             cadence.frameDelta == 1 && m_HaveLastSubmission) {
-        const uint64_t latchedFloorUs = decision.latchedPresentation &&
-            !m_Parameters.nativeScheduledPresentation ?
-            saturatingAdd(m_LastSubmissionUs, m_DisplayPeriodUs) : 0;
-        m_Pending.intervalSpacingFloorUs = std::max(earliestUs, latchedFloorUs);
+        if (m_Parameters.playoutVrr18IntervalFeedback >= Vrr18GoalIntervalFeedback) {
+            // A latched flip may be enqueued before the next refresh. Only
+            // spacing enforced on this handoff can cover its readiness miss.
+            m_Pending.intervalSpacingFloorUs = spacingFloorUs;
+            m_Pending.intervalScanoutFloorUs = scanoutSubmissionFloorUs;
+            m_Pending.intervalFloorFollowsSubmission = earliestUs && earliestUs == spacingFloorUs &&
+                !m_Parameters.nativeScheduledPresentation && spacingAnchorUs() == m_LastSubmissionUs;
+        }
+        else {
+            const uint64_t latchedFloorUs = decision.latchedPresentation &&
+                !m_Parameters.nativeScheduledPresentation ?
+                saturatingAdd(m_LastSubmissionUs, m_DisplayPeriodUs) : 0;
+            m_Pending.intervalSpacingFloorUs = std::max(earliestUs, latchedFloorUs);
+        }
     }
     // Reuse the chart's input-slot basis, but use the producer's decoder
     // output timestamp. GPU completion sampled after a pacing-queue wait is
@@ -2547,7 +2558,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 serialServiceUs, p.decoderQueue, m_Pending.intervalSpacingFloorUs,
                 m_Pending.smoothedRtpSlotUs,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18SourceCadenceFeedback ? m_SourcePeriodUs : 0,
-                m_Pending.intervalInputOnTime, m_Pending.independentReadyUs},
+                m_Pending.intervalInputOnTime, m_Pending.independentReadyUs, true,
+                m_Pending.intervalFloorFollowsSubmission, m_Pending.intervalScanoutFloorUs},
                 playoutDelayMinimumUs(), playoutDelayMaximumUs(),
                 intervalHoldUs, m_Parameters.playoutMeanMissReleaseUsPerSecond,
                 true, m_Parameters.playoutOnTimeTargetPerMillion,
@@ -2558,7 +2570,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutVrr18IntervalFeedback != 0,
                 taperRelease ? m_Parameters.playoutIntervalReleaseTauUs : 0,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18SharedIntervalScore,
-                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18RecoverableIntervalFeedback);
+                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18RecoverableIntervalFeedback,
+                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18GoalIntervalFeedback);
             if (m_Parameters.playoutInputPercentileEnabled) {
                 const auto capacity = m_IntervalBuffer.stats();
                 const bool validInput = submitted && !cancelled && m_Pending.intervalValid &&

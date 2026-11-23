@@ -29,6 +29,23 @@ public:
         // intentional queue residence. Zero means no independent measurement.
         uint64_t independentReadyUs = 0;
         bool sourceInTolerance = true; // Set by the observer for attribution on the following frame.
+        bool floorFollowsPrevious = false;
+        uint64_t scanoutFloor = 0;
+        uint64_t predecessorBufferUs = 0, predecessorAdvanceUs = 0;
+
+        uint64_t maximumSubmissionAdvanceUs(uint64_t minimumBufferUs) const {
+            if (!ready || !independentReadyUs) return 0;
+            // A previous handoff can move earlier only as far as its own
+            // readiness and spacing allow. Carry the fixed part of its floor
+            // through successive handoffs, even when each frame was ready early.
+            const uint64_t predecessorRelease = predecessorBufferUs -
+                std::min(predecessorBufferUs, minimumBufferUs);
+            const uint64_t floorAdvance = floorFollowsPrevious ?
+                std::min({spacingFloor, predecessorAdvanceUs, predecessorRelease}) : 0;
+            const uint64_t earliest = std::max({std::min(ready, independentReadyUs),
+                                                scanoutFloor, spacingFloor - floorAdvance});
+            return submitted - std::min(submitted, earliest);
+        }
     };
     // Observation only. This explains the request made after an outcome;
     // the controller applies that request to subsequent frames. In particular,
@@ -101,7 +118,8 @@ public:
                  size_t initialMinimumSamples = 2,
                  bool vrr18Feedback = false,
                  uint64_t releaseTauUs = 0,
-                 bool sharedScore = false, bool requireRecoverableInterval = false) {
+                 bool sharedScore = false, bool requireRecoverableInterval = false,
+                 bool goalFeedback = false) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -148,7 +166,10 @@ public:
         if (!adjacent) {
             // Without an incoming source interval, this frame cannot explain
             // a compressed successor as a recoverable late frame.
-            m_Previous.spacingFloor = 0;
+            // Without an adjacent predecessor there is no evidence that
+            // this handoff's floor could move. Retain it for the next frame.
+            if (goalFeedback) m_Previous.predecessorAdvanceUs = 0;
+            else m_Previous.spacingFloor = 0;
             m_Previous.sourceInTolerance = s.sourcePeriodUs == 0;
             updateScore(s.submitted, scoreWindowUs);
             if (beforeUs == boundedUs) update.action = Action::SequenceBreak;
@@ -173,9 +194,13 @@ public:
         }
         const bool sourceInTolerance = sourceErrorUs <= toleranceUs;
         m_Previous.sourceInTolerance = sourceInTolerance;
+        if (goalFeedback && s.floorFollowsPrevious && previous.independentReadyUs) {
+            m_Previous.predecessorBufferUs = previous.buffer;
+            m_Previous.predecessorAdvanceUs = previous.maximumSubmissionAdvanceUs(minimum);
+        }
         const auto& delayed = actual >= intended ? m_Previous : previous;
         const auto& other = actual >= intended ? previous : m_Previous;
-        const auto benefit = requireRecoverableInterval ?
+        const auto benefit = requireRecoverableInterval && !goalFeedback ?
             intervalBenefit(delayed, other, error, toleranceUs, maximum) : Benefit{};
         const auto tick = s.submitted / 10000;
         auto& bucket = m_Window[tick % m_Window.size()];
@@ -251,6 +276,16 @@ public:
         }
         updateScore(s.submitted, scoreWindowUs);
 
+        const bool steadySource = sourceInTolerance && previous.sourceInTolerance &&
+            windowSourceErrorUs <= samples * toleranceUs;
+        if (goalFeedback) {
+            m_Reserve.expire(s.submitted, scoreWindowUs);
+            if (s.absorbable && previous.absorbable && service <= intendedTime &&
+                    decoderQueue <= intendedTime && s.independentReadyUs && previous.independentReadyUs) {
+                m_Reserve.observe(previous, m_Previous, intended, minimum, maximum, toleranceUs,
+                                  steadySource, targetPerMillion, hold);
+            }
+        }
         if (!m_Stats.averageValid) return;
 
         const double allowedLoss = (1000000 - std::min<uint64_t>(targetPerMillion, 1000000)) / 1000000.0;
@@ -261,7 +296,7 @@ public:
             windowSourceErrorUs <= samples * toleranceUs;
         const bool useDeliveryEvidence = requireRecoverableInterval && !sourceQualified;
         const bool deliveryPressure = marginalTotalUs > 0 && recoverableLossUs > allowedLoss * evaluatedUs;
-        const bool sustainedPressure = useDeliveryEvidence ? deliveryPressure :
+        const bool sustainedPressure = goalFeedback ? m_Reserve.targetUs > m_Target : useDeliveryEvidence ? deliveryPressure :
             (severityWeighted ? bufferLoss > allowedLoss : pressure);
         // Old score debt holds protection, but cannot authorize another attack
         // without current, attributable error outside the preset's allowance.
@@ -273,14 +308,25 @@ public:
         const auto headroom = maximum - std::min(maximum, delayed.buffer);
         const bool withinBudget = !requireRecoverableInterval ||
             lateness - std::min(lateness, toleranceUs) <= headroom;
+        const auto freshBenefitUs = goalFeedback ?
+            freshReadinessBenefit(delayed, other, error, toleranceUs, maximum, intended) : 0;
+        const bool corroborated = freshBenefitUs && delayed.absorbable &&
+            m_Reserve.corroborates(s.submitted, delayed.frame);
         const bool delayedAbsorbable = delayed.absorbable && windowAbsorbable && withinBudget &&
-            (useDeliveryEvidence ? benefit.excessUs != 0 : sourceQualified);
+            (goalFeedback ? corroborated :
+             useDeliveryEvidence ? benefit.excessUs != 0 : sourceQualified);
         const bool targetAllowsHold = !severityWeighted || belowTarget;
         const bool pressureHolds = (vrr18Feedback || targetAllowsHold) && sustainedPressure &&
             (freshError && delayedAbsorbable && lateness);
-        const bool holdProtection = pressureHolds ||
+        const bool uncertainRelease = goalFeedback && belowTarget && windowAbsorbable &&
+            freshError && delayed.absorbable && delayed.independentReadyUs > deadline &&
+            lateness > toleranceUs && bufferLoss > allowedLoss;
+        const uint64_t releaseTarget = m_Reserve.targetUs > minimum ? m_Reserve.targetUs +
+            std::min(toleranceUs, maximum - std::min(maximum, m_Reserve.targetUs)) : minimum;
+        const bool goalHold = goalFeedback && m_Target <= releaseTarget;
+        const bool holdProtection = goalHold || uncertainRelease || pressureHolds ||
             (targetAllowsHold && historyHolds);
-        const bool renewsHold = holdProtection &&
+        const bool renewsHold = (goalFeedback ? pressureHolds || uncertainRelease : holdProtection) &&
             (!severityWeighted || belowTarget);
         if (renewsHold) {
             m_LastPressure = s.submitted;
@@ -306,13 +352,13 @@ public:
         update.holdRemainingUs = std::max(
             remaining(m_CleanEvidenceUs, hold),
             m_LastPressure ? remaining(s.submitted - m_LastPressure, hold) : 0);
-        update.cooldownRemainingUs = m_LastAttack ?
+        update.cooldownRemainingUs = !goalFeedback && m_LastAttack ?
             remaining(s.submitted - m_LastAttack, 250000) : 0;
-        update.action = pressureHolds ? Action::CurrentPressure :
+        update.action = pressureHolds || goalHold ? Action::CurrentPressure :
             (targetAllowsHold && historyHolds) ? Action::HistoryHold : Action::RecoveryHold;
-        const bool grow = sustainedPressure && (!severityWeighted || belowTarget);
+        const bool grow = sustainedPressure && (goalFeedback || !severityWeighted || belowTarget);
         if (grow && freshError && delayedAbsorbable && lateness &&
-                (!m_LastAttack || s.submitted - m_LastAttack >= 250000)) {
+                (goalFeedback || !m_LastAttack || s.submitted - m_LastAttack >= 250000)) {
             const auto excess = useDeliveryEvidence ?
                 (marginalTotalUs + samples - 1) / samples :
                 severityWeighted ?
@@ -320,9 +366,10 @@ public:
                 (total - samples * toleranceUs + samples - 1) / samples;
             const auto freshExcess = useDeliveryEvidence ? benefit.excessUs :
                 severityWeighted ? error - toleranceUs : error;
-            const auto increase = std::min({uint64_t(250), excess, lateness,
-                severityWeighted ? freshExcess : uint64_t(250)});
             const auto base = std::min(delayed.buffer, maximum);
+            const auto increase = goalFeedback ?
+                std::min(m_Reserve.targetUs - std::min(m_Reserve.targetUs, base), lateness) :
+                std::min({uint64_t(250), excess, lateness, severityWeighted ? freshExcess : uint64_t(250)});
             update.attemptedIncreaseUs = increase;
             update.clippedIncreaseUs = increase - std::min(increase, maximum - base);
             if (update.clippedIncreaseUs) {
@@ -333,6 +380,10 @@ public:
             update.action = update.clippedIncreaseUs ? Action::Capped :
                 m_Target > boundedUs ? Action::Grow : Action::CurrentPressure;
             if (m_Target > boundedUs) {
+                if (goalFeedback) {
+                    m_LastPressure = s.submitted;
+                    m_CleanEvidenceUs = 0;
+                }
                 m_Stats.lastGrowthAtUs = s.submitted;
                 m_Stats.lastGrowthUs = m_Target - boundedUs;
             }
@@ -354,7 +405,7 @@ public:
             const auto release = m_ReleaseFraction / 1000000;
             m_ReleaseFraction %= 1000000;
             const auto candidate = m_Target - std::min(m_Target - minimum, release);
-            m_Target = candidate;
+            m_Target = goalFeedback ? std::max(candidate, std::min(m_Target, releaseTarget)) : candidate;
             update.action = m_Target == minimum ? Action::Minimum : Action::Release;
         }
         else if (grow) {
@@ -422,6 +473,106 @@ private:
         return {excess, std::min(excess, improvement(std::min(headroom, tolerance)))};
     }
 
+    static uint64_t freshReadinessBenefit(const Sample& delayed, const Sample& other,
+                                          uint64_t error, uint64_t tolerance,
+                                          uint64_t maximum, uint64_t intended) {
+        if (error <= tolerance || !delayed.independentReadyUs || !other.independentReadyUs) return 0;
+        const auto headroom = maximum - std::min(maximum, std::max(delayed.buffer, other.buffer));
+        const auto late = coveredReadiness(delayed, headroom);
+        const auto early = coveredReadiness(other, headroom);
+        const auto excess = error - tolerance;
+        const auto remaining = excess - std::min(excess, late - std::min(late, early));
+        return std::min(excess, intended) - std::min(remaining, intended);
+    }
+
+    // Integrate only adjacent, independently timed input outcomes. The shadow
+    // reserve asks how much lateness would survive at a given standing delay.
+    // Nothing is purchased until actual handoff errors corroborate that need.
+    struct ReadinessReserve {
+        uint64_t targetUs = 0;
+
+        void expire(uint64_t nowUs, uint64_t historyUs) {
+            if (lastObservedUs && (nowUs < lastObservedUs || nowUs - lastObservedUs >= historyUs)) {
+                *this = {};
+            }
+        }
+
+        bool corroborates(uint64_t nowUs, uint64_t frame) {
+            // A missed deadline can spoil both neighboring intervals. Require
+            // two distinct late frames before increasing standing latency.
+            if (frame != lastMissFrame) {
+                previousMissUs = lastMissUs;
+                lastMissUs = nowUs;
+                lastMissFrame = frame;
+            }
+            return previousMissUs && nowUs >= previousMissUs && nowUs - previousMissUs <= 2000000;
+        }
+
+        static double lateUs(const Sample& frame, double reserveUs) {
+            const uint64_t readyUs = std::min(frame.ready, frame.independentReadyUs);
+            const uint64_t unbufferedUs = frame.deadline - std::min(frame.buffer, frame.deadline);
+            const double reductionUs = std::min(double(frame.predecessorAdvanceUs),
+                std::max(0.0, double(frame.predecessorBufferUs) - reserveUs));
+            const double floorUs = std::max(double(frame.scanoutFloor), double(frame.spacingFloor) - reductionUs);
+            return std::max(0.0, double(readyUs) - std::max(double(unbufferedUs) + reserveUs, floorUs));
+        }
+
+        void observe(const Sample& previous, const Sample& current, uint64_t intendedUs,
+                     uint64_t minimumUs, uint64_t maximumUs, uint64_t toleranceUs,
+                     bool steadySource, uint64_t targetPpm, uint64_t holdUs) {
+            estimateUs = std::clamp(estimateUs, double(minimumUs), double(maximumUs));
+            const auto lossUs = [&](double reserveUs) {
+                const double difference = std::abs(lateUs(current, reserveUs) - lateUs(previous, reserveUs));
+                return std::clamp(difference - toleranceUs, 0.0, double(intendedUs));
+            };
+            const uint64_t actualUs = current.submitted - previous.submitted;
+            const bool stretched = actualUs >= intendedUs;
+            const auto measuredUs = freshReadinessBenefit(stretched ? current : previous,
+                stretched ? previous : current, std::max(actualUs, intendedUs) - std::min(actualUs, intendedUs),
+                toleranceUs, maximumUs, intendedUs);
+            const double appliedUs = double(std::min(current.buffer, previous.buffer));
+            const double remainingUs = std::clamp(measuredUs + appliedUs - estimateUs, 0.0, double(measuredUs));
+            const double capLossUs = lossUs(maximumUs);
+            const double predictedUs = std::max(0.0, lossUs(estimateUs) - capLossUs);
+            const bool withinCap = std::max(lateUs(previous, maximumUs), lateUs(current, maximumUs)) <= toleranceUs;
+            double needUs = 0;
+            if (withinCap) {
+                needUs = steadySource ? std::max(predictedUs, remainingUs) :
+                    std::min(predictedUs, remainingUs + predictedUs / 2);
+            }
+
+            const double elapsedUs = lastObservedUs && current.submitted > lastObservedUs ?
+                double(std::min<uint64_t>(200000, current.submitted - lastObservedUs)) : 0.0;
+            lastObservedUs = current.submitted;
+            const bool coveredAtMinimum = lossUs(minimumUs) <= capLossUs;
+            if (!coveredAtMinimum && withinCap) lastNeedUs = current.submitted;
+            const bool clean = coveredAtMinimum && !needUs && current.submitted - lastNeedUs >= holdUs;
+            if (clean) estimateUs = std::max(double(minimumUs), estimateUs - 0.002 * intendedUs);
+
+            // A tolerance of growth per second buys repeated costly losses
+            // promptly without acquiring a whole frame for an isolated burst.
+            // The observed pairs cover only independently demonstrable input
+            // loss, so reserve part of the profile budget for the other stages.
+            const double budgetUs = double(1000000 - std::min<uint64_t>(targetPpm, 1000000)) * intendedUs / 10000000;
+            const double burstUs = double(toleranceUs) / 2;
+            riseCreditUs = std::min(burstUs, riseCreditUs + double(toleranceUs) * elapsedUs / 1000000);
+            const double changeUs = std::clamp((needUs - budgetUs) / 12, -burstUs, riseCreditUs);
+            riseCreditUs -= std::max(0.0, changeUs);
+            estimateUs = std::clamp(estimateUs + changeUs, double(minimumUs), double(maximumUs));
+
+            if (clean || !smoothedUs) smoothedUs = clean ? estimateUs : double(minimumUs);
+            else smoothedUs += (estimateUs - smoothedUs) * std::min(1.0, elapsedUs / std::max(1000000.0, double(holdUs)));
+            const uint64_t stepUs = std::max<uint64_t>(1, toleranceUs / 4);
+            const double excessUs = std::max(0.0, smoothedUs - minimumUs);
+            targetUs = minimumUs + std::min(maximumUs - minimumUs, uint64_t(std::ceil(excessUs / stepUs)) * stepUs);
+        }
+
+    private:
+        double estimateUs = 0, smoothedUs = 0, riseCreditUs = 0;
+        uint64_t lastObservedUs = 0, lastNeedUs = 0;
+        uint64_t lastMissFrame = 0, lastMissUs = 0, previousMissUs = 0;
+    };
+
     struct Bucket {
         uint64_t tick = 0, samples = 0, total = 0;
         uint64_t service = 0, decoderQueue = 0, intended = 0, sourceErrorUs = 0;
@@ -459,6 +610,7 @@ private:
             }
         }
     }
+    ReadinessReserve m_Reserve;
     std::array<Bucket, 100> m_Window{};
     // Keep the long score history off the controller's stack. The controller
     // is instantiated in several independent workers and test fixtures.

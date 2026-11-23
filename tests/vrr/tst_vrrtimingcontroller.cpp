@@ -3402,6 +3402,41 @@ void testIntervalBufferCreditsAlreadyScheduledSpacing()
            "the VRR18 observer credits 8 ms of scheduled spacing once");
 }
 
+void testLatchedHandoffCreditsOnlyEnforcedSpacing()
+{
+    for (uint64_t revision : {Vrr18RecoverableIntervalFeedback, Vrr18GoalIntervalFeedback}) {
+        auto session = config(120, 120);
+        session.smoothFrameTiming = false;
+        auto policy = vrrTimingParametersForSession(session, true, false);
+        policy.playoutVrr18IntervalFeedback = revision;
+        policy.playoutDelayAdaptive = 0;
+        policy.sourcePlayoutDelayUs = 1000;
+        VrrTimingController controller(session, true, policy);
+        for (int number = 1; number <= 152; ++number) {
+            const uint64_t decoded = 1000000 + uint64_t(number) * 1000000 / 120;
+            const auto decision = controller.schedule(
+                frame(number, uint32_t(number * 750), true, decoded), decoded);
+            uint64_t latenessUs = number == 151 ? 1500 : number == 152 ? 3000 : 0;
+            const uint64_t ready = decision.originalTargetUs + latenessUs;
+            const uint64_t submitted = std::max(ready, decision.targetUs);
+            controller.notePreparationDuration(500, 0, ready);
+            controller.noteSubmission(true, false, submitted);
+            if (number == 152) {
+                const auto update = controller.intervalStats().update;
+                expect(decision.latchedPresentation && controller.earliestSubmissionUs() == 0 &&
+                           update.attributedFrame == 152,
+                       "the second late handoff stretches an eligible interval with no software floor");
+                if (revision == Vrr18GoalIntervalFeedback)
+                    expect(update.latenessUs == latenessUs,
+                           "a future display refresh cannot cover a late CPU handoff");
+                else
+                    expect(update.latenessUs < latenessUs,
+                           "historical replay retains the inferred latched refresh floor");
+            }
+        }
+    }
+}
+
 void testIntervalQualityBuffer()
 {
     // Constant lateness must cancel from spacing; alternating late readiness
@@ -4572,6 +4607,7 @@ int main()
     testCustomTimingOptions();
     testProductionIntervalParameters();
     testIntervalBufferCreditsAlreadyScheduledSpacing();
+    testLatchedHandoffCreditsOnlyEnforcedSpacing();
     testPresetReadinessTargets();
     testLatencyFixBufferlessLateFrameSafety();
     testLatencyPresetsAcrossSourceAndDisplayRates();

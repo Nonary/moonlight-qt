@@ -301,10 +301,8 @@ bool validateVrrCurrentPolicy(const VrrTimingParameters& value, QString& error)
     const bool currentSmoothing = smoothingMode == VrrSmoothingAbsorb ? smoothing :
         smoothingMode == (!smoothing ? VrrSmoothingOff : scheduled ?
             VrrSmoothingNativeToleranceBounded : VrrSmoothingWorkerPhaseLocked);
-    const bool intervalFeedback = value.playoutVrr18IntervalFeedback == Vrr18AveragedIntervalFeedback ||
-        value.playoutVrr18IntervalFeedback == Vrr18SharedIntervalScore ||
-        value.playoutVrr18IntervalFeedback == Vrr18SourceCadenceFeedback ||
-        value.playoutVrr18IntervalFeedback == Vrr18RecoverableIntervalFeedback;
+    const bool intervalFeedback = value.playoutVrr18IntervalFeedback >= Vrr18AveragedIntervalFeedback &&
+        value.playoutVrr18IntervalFeedback <= Vrr18GoalIntervalFeedback;
     if (intervalFeedback && !value.playoutInputPercentileEnabled &&
             value.boundedCatchupEnabled && value.playoutPredictionOnly &&
             value.latchedFloorDisabled == (scheduled ? 1U : 3U) && currentSmoothing) {
@@ -390,8 +388,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
         return fail("latched_floor_disabled revision must be 0..3");
     if (value.preparationPredictionLead > 1)
         return fail("preparation prediction lead must be 0 or 1");
-    if (value.playoutVrr18IntervalFeedback > Vrr18RecoverableIntervalFeedback)
-        return fail("playout_vrr18_interval_feedback revision must be 0..4");
+    if (value.playoutVrr18IntervalFeedback > Vrr18GoalIntervalFeedback)
+        return fail("playout_vrr18_interval_feedback revision must be 0..5");
     if (value.playoutIntervalReleaseTauUs > 60000000 ||
             (value.playoutIntervalReleaseTauUs && !value.playoutVrr18IntervalFeedback))
         return fail("playout_interval_release_tau_us requires VRR18 feedback and must be in 0..60000000");

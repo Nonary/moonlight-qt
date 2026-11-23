@@ -231,6 +231,7 @@ struct Input {
     // The next frame's lateness, which decides whether a replacement finds a
     // ready successor. Late input that persists (a latency step) sets it.
     uint64_t successorLatenessUs = 0;
+    bool hasDeliveryTimeline = true;
 };
 
 // One production controller driven through the worker's per-frame calls.
@@ -259,7 +260,8 @@ public:
         // of readiness, like the mapping that measures it; excluding it would
         // under-protect every frame by its length.
         const uint64_t submitUs = f.decodedUs - 600;
-        frame.setDeliveryTimeline(submitUs - input.decoderQueueUs - 200, submitUs - input.decoderQueueUs, submitUs);
+        if (input.hasDeliveryTimeline)
+            frame.setDeliveryTimeline(submitUs - input.decoderQueueUs - 200, submitUs - input.decoderQueueUs, submitUs);
         frame.setLostPackets(input.lostPackets);
         const uint64_t now = std::max(f.decodedUs, m_LastSubmittedUs);
         const auto d = m_Controller.schedule(frame, now);
@@ -620,6 +622,148 @@ void testIntervalPressureAndRelease()
               name, "clean intervals release earned protection without rebuilding it",
               "peak %" PRIu64 " us, final %" PRIu64 " us", peak, frames.back().appliedUs);
     }
+}
+
+// A few costly long/short pairs per second can exceed the selected loss
+// allowance even when their one-second mean error stays inside tolerance.
+void testSparseDeliveryPressure()
+{
+    for (const int fps : {60, 120}) {
+        const auto name = scenarioName("sparse-delivery") + "/" + std::to_string(fps) + "fps";
+        auto session = vrrProductionSession(1, fps, 2 * fps, false);
+        session.timingOptions.toleranceUs = fps == 120 ? 500 : 750;
+        session.timingOptions.historySeconds = 15;
+        Stream delivery(session, 1000), lateWake(session, 1000);
+        const uint32_t ticks = 90000 / fps;
+        const int interval = fps / 3;
+        constexpr uint64_t delayUs = 5000;
+        for (int i = 0; i < 3 * fps; ++i) {
+            delivery.step(ticks);
+            lateWake.step(ticks);
+        }
+        const uint64_t floor = delivery.interval().update.minimumUs;
+        const size_t disturbed = delivery.size();
+        for (int i = 0; i < fps * 60; ++i) {
+            const uint64_t excursion = i % interval == 0 ? delayUs : 0;
+            delivery.step(ticks, {excursion});
+            Input wake;
+            wake.presentLatencyUs = excursion;
+            lateWake.step(ticks, wake);
+        }
+        const auto stats = delivery.interval();
+        const auto& frames = delivery.frames();
+        const size_t settled = disturbed + 30 * fps;
+        const uint64_t low = minimum(frames, settled, frames.size(), applied);
+        const uint64_t high = maximum(frames, settled, frames.size(), applied);
+        const auto score = stats.qualityPercent();
+        const auto goal = session.timingOptions.targetHundredths / 100.0;
+        report("%-52s settled %.3f%%, goal %.2f%%, buffer %" PRIu64 " to %" PRIu64 " us\n",
+               name.c_str(), score, goal, low, high);
+        check(stats.evaluatedUs > 14000000 && score >= goal, name,
+              "occasional costly delivery pairs meet the configured pacing goal",
+              "score %.4f%% over %" PRIu64 " us, goal %.2f%%", score, stats.evaluatedUs, goal);
+        check(low > floor && high <= floor + delayUs && high - low <= delivery.toleranceUs(),
+              name, "recurring delivery pressure keeps a stable bounded reserve",
+              "settled buffer %" PRIu64 " to %" PRIu64 " us, floor %" PRIu64, low, high, floor);
+        const auto wakeStats = lateWake.interval();
+        const auto wakePeak = maximum(lateWake.frames(), disturbed, lateWake.size(), applied);
+        check(wakeStats.qualityPercent() < goal && wakePeak == floor, name,
+              "late handoffs with already-ready frames cannot buy input protection",
+              "score %.4f%%, peak %" PRIu64 " us for a %" PRIu64 " us floor",
+              wakeStats.qualityPercent(), wakePeak, floor);
+
+        // Keep observing handoffs for two entire score windows without
+        // producer timing. Late wakeups cannot renew input growth. Once
+        // visible, fresh clean delivery must drain the learned protection.
+        const size_t missing = delivery.size();
+        for (int i = 0; i < fps * session.timingOptions.historySeconds * 2; ++i) {
+            Input wake;
+            wake.hasDeliveryTimeline = false;
+            wake.presentLatencyUs = i % interval == 0 ? delayUs : 0;
+            delivery.step(ticks, wake);
+        }
+        const auto unseenPeak = maximum(delivery.frames(), missing, delivery.size(), applied);
+        check(unseenPeak <= high, name, "hand-off errors with missing producer timing cannot grow stale demand",
+              "previous maximum %" PRIu64 " us, peak after losing visibility %" PRIu64, high, unseenPeak);
+        for (int i = 0; i < fps * 90; ++i) delivery.step(ticks);
+        const auto cleanStats = delivery.interval();
+        check(delivery.frames().back().appliedUs <= floor + 250 && cleanStats.qualityPercent() >= goal &&
+                  cleanStats.evaluatedUs > 14000000, name,
+              "fresh clean input drains learned protection after prior evidence expires",
+              "last buffer %" PRIu64 " us, floor %" PRIu64 ", score %.4f%% over %" PRIu64 " us",
+              delivery.frames().back().appliedUs, floor, cleanStats.qualityPercent(), cleanStats.evaluatedUs);
+    }
+}
+
+// A 6 ms starting buffer covers all input variation. If a
+// real 4 ms spacing floor also covers it, removing that buffer is free.
+// Use the same ready times without a floor to check the inverse decision.
+void testReleaseBehindSpacingFloor()
+{
+    const auto name = scenarioName("release-with-spacing-floor");
+
+    // The first image was ready at 8 ms but a fixed floor held it to 10 ms.
+    // Its successor was ready at 16 ms; its 8 ms spacing floor still puts
+    // the handoff at 18 ms, even if either frame's 3 ms buffer drops to 1 ms.
+    Vrr13::IntervalBuffer::Sample first;
+    first.ready = first.independentReadyUs = 8000;
+    first.submitted = first.spacingFloor = 10000;
+    first.buffer = 3000;
+    auto successor = first;
+    successor.ready = successor.independentReadyUs = 16000;
+    successor.submitted = successor.spacingFloor = 18000;
+    successor.floorFollowsPrevious = true;
+    successor.predecessorBufferUs = first.buffer;
+    successor.predecessorAdvanceUs = first.maximumSubmissionAdvanceUs(1000);
+    check(successor.maximumSubmissionAdvanceUs(1000) == 0, name,
+          "an immovable earlier floor still holds the next early-ready handoff",
+          "predicted advance %" PRIu64 " us", successor.maximumSubmissionAdvanceUs(1000));
+
+    // A genuinely movable earlier handoff can buy back 2 ms, up to the
+    // successor's own independent floor. Preserve this partial release.
+    first.spacingFloor = 0;
+    successor.predecessorAdvanceUs = first.maximumSubmissionAdvanceUs(1000);
+    successor.scanoutFloor = 17000;
+    check(successor.maximumSubmissionAdvanceUs(1000) == 1000, name,
+          "a moving predecessor never moves the successor's independent floor",
+          "predicted advance %" PRIu64 " us", successor.maximumSubmissionAdvanceUs(1000));
+    const auto run = [](uint64_t floorOffsetUs, uint64_t occasionalReadinessUs) {
+        const auto policy = vrrTimingParametersForSession(vrrProductionSession(1, 100, 144, false));
+        Vrr13::IntervalBuffer observer;
+        for (uint64_t frame = 1; frame <= 6000; ++frame) {
+            Vrr13::IntervalBuffer::Sample sample;
+            sample.frame = frame;
+            sample.intended = kOriginUs + frame * 10000;
+            sample.buffer = observer.demand(6000);
+            sample.deadline = sample.intended + sample.buffer;
+            sample.ready = sample.intended + (frame % 5 ? 0 : occasionalReadinessUs);
+            sample.independentReadyUs = sample.ready;
+            sample.valid = sample.absorbable = true;
+            sample.serialService = 500;
+            sample.smoothedRtpSlotUs = sample.intended;
+            sample.sourcePeriodUs = 10000;
+            sample.spacingFloor = floorOffsetUs ? sample.intended + floorOffsetUs : 0;
+            sample.submitted = std::max({sample.deadline, sample.ready, sample.spacingFloor});
+            observer.observe(sample, 1000, 10000, policy.playoutMeanMissHoldUs,
+                policy.playoutMeanMissReleaseUsPerSecond, true, policy.playoutOnTimeTargetPerMillion,
+                policy.playoutIntervalToleranceUs, 15000000, policy.playoutIntervalInitialWarmupUs,
+                policy.playoutIntervalInitialMinimumSamples, true, 0, true, true,
+                policy.playoutVrr18IntervalFeedback >= Vrr18GoalIntervalFeedback);
+        }
+        return observer.stats().update.requestedUs;
+    };
+    const uint64_t covered = run(4000, 3500), unconstrained = run(0, 3500);
+    check(covered == 1000 && unconstrained > covered && unconstrained <= 3500, name,
+          "a real pacing floor can cover input even when earlier than the currently buffered deadline",
+          "requested %" PRIu64 " us with a hard floor and %" PRIu64 " us without", covered, unconstrained);
+    const uint64_t withinTolerance = run(4000, 4300);
+    check(withinTolerance == 1000, name,
+          "an excursion just past the floor costs only its remaining lateness",
+          "requested %" PRIu64 " us despite only 300 us beyond the floor", withinTolerance);
+    const uint64_t beyondTolerance = run(4000, 6000);
+    check(beyondTolerance > 4000 && beyondTolerance <= 6000, name,
+          "repeated misses beyond the floor can still earn protection",
+          "requested %" PRIu64 " us for recurring 2 ms overruns", beyondTolerance);
 }
 
 // Use identical sender timestamps in a source-only and a mixed impairment.
@@ -1663,6 +1807,8 @@ int main(int argc, char** argv)
         {"within-allowance", testMissesWithinAllowanceBuyNoDelay},
         {"unabsorbable-loss", testUnabsorbableLossBuysNoDelay},
         {"interval-pressure", testIntervalPressureAndRelease},
+        {"sparse-delivery", testSparseDeliveryPressure},
+        {"release-with-spacing-floor", testReleaseBehindSpacingFloor},
         {"source-cadence-buffer", testSourceCadenceBufferGrowth},
         {"client-timing-attribution", testClientTimingAttribution},
         {"rate-round-trip", testRateRoundTrip},

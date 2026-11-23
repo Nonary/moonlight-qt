@@ -1,8 +1,8 @@
 # Streaming and VRR architecture
 
 Source baseline: the published `v6.2.0-daily.201` client with VRR18 interval
-feedback restored for live sessions. Buffer growth also considers source pacing
-after Reduce judder. The custom profile exposes the frame allowance, timing
+feedback restored for live sessions, with revision 5 used for new streams.
+Buffer growth uses delivery and decode readiness at both ends of an interval. The custom profile exposes the frame allowance, timing
 target, score history, and interval tolerance. The renderer,
 observed D3D11 completion, and schema-6 capture contracts come from the newer
 client. The earlier platform changes include the decode-buffer accounting
@@ -652,8 +652,7 @@ sees a 0.6 ms miss before applying tolerance.
 The buffer uses the rolling Pacing score shown with the timing target.
 Each adjacent pacing interval contributes only its deviation beyond the configured
 tolerance, weighted by the time represented by that interval. The one-second
-window qualifies service capacity, supplies a diagnostic mean, and bounds how
-quickly sustained misses can grow the buffer. Growth also requires fresh
+window qualifies service capacity and supplies the diagnostic mean. Growth also requires fresh
 readiness evidence and available buffer capacity. Schema-6
 captures with VRR18 feedback revision 1 retain the separate averaged control
 score in exact replay. Revision 2 records the shared score policy.
@@ -676,6 +675,26 @@ It limits each increase to the average interval improvement predicted for one
 tolerance of extra delay, subject to the existing attack and capacity limits.
 A compressed successor is attributed to the preceding late frame. The Pacing
 and Client timing scores continue to report their full eligible populations.
+
+Revision 5 uses the scheduling constraint actually enforced on each CPU
+handoff. A latched presentation queue can accept another frame before the
+next refresh. Crediting that future refresh as available buffer time hid
+readiness misses in revision 4. For software-spaced submissions, the next
+handoff can move earlier only if its predecessor could also move earlier.
+The observer bounds that movement by the predecessor's readiness and keeps
+any independent scanout floor in force.
+
+The controller estimates how much of each interval's excess error the allowed
+buffer can absorb. It compares both frames' independent readiness, including
+when a late frame compresses the next interval. Repeated, corroborated misses
+can raise the request on a steady source even when its one-second mean error
+is below tolerance. Growth credit accumulates with elapsed time and is capped
+between frames. The applied reserve follows that estimate with a release hold
+and a tolerance band, so covering the disturbance does not immediately count
+as evidence that the reserve can be removed. Clean observations allow release
+back to the configured minimum. The pacing score, its tolerance and its
+history window keep their existing definitions. Exact replay selects the
+feedback revision recorded in each capture.
 
 The Client timing score and its one-second mean require timely complete-frame
 arrival at both ends of an interval. The controller compares compressed-frame

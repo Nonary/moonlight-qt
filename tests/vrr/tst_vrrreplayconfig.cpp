@@ -320,7 +320,15 @@ void VrrReplayConfigTest::productionPolicyValidation()
             session.absorbMicrostutter = absorb;
             const auto current = vrrTimingParametersForSession(
                 vrrProductionSessionConfig(session), scheduled, scheduled);
+            QCOMPARE(current.playoutVrr18IntervalFeedback, Vrr18GoalIntervalFeedback);
             QVERIFY2(validateVrrCurrentPolicy(current, error), qPrintable(error));
+            auto historical = current;
+            historical.playoutVrr18IntervalFeedback = Vrr18RecoverableIntervalFeedback;
+            QVERIFY2(validateVrrCurrentPolicy(historical, error), qPrintable(error));
+            QVERIFY(vrrCalibrationPolicy(current) != vrrCalibrationPolicy(historical));
+            auto future = current;
+            future.playoutVrr18IntervalFeedback = Vrr18GoalIntervalFeedback + 1;
+            QVERIFY(!validateVrrTimingParameters(future, error));
             auto retired = current;
             retired.playoutPredictionOnly = 0;
             QVERIFY(!validateVrrCurrentPolicy(retired, error));
