@@ -3405,7 +3405,7 @@ void testIntervalBufferCreditsAlreadyScheduledSpacing()
 void testLatchedHandoffCreditsOnlyEnforcedSpacing()
 {
     for (uint64_t revision : {Vrr18RecoverableIntervalFeedback, Vrr18GoalIntervalFeedback,
-                              Vrr18PredictiveIntervalFeedback}) {
+                              Vrr18PredictiveIntervalFeedback, Vrr18CostAwareIntervalFeedback}) {
         auto session = config(120, 120);
         session.smoothFrameTiming = false;
         auto policy = vrrTimingParametersForSession(session, true, false);

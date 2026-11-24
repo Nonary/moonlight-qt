@@ -700,9 +700,8 @@ void testSparseDeliveryPressure()
     }
 }
 
-// Interleave identical arrivals through the live policy and its immediate
-// predecessor. An anticipatory request must occur between delivery misses
-// and improve the spacing of later handoffs on the same source timeline.
+// Keep the revision 6 comparison reproducible. Its advance between misses
+// must improve subsequent handoff spacing over revision 5.
 void testRecurringHitchForecast()
 {
     using Action = Vrr13::IntervalBuffer::Action;
@@ -712,15 +711,17 @@ void testRecurringHitchForecast()
     const uint32_t ticks = 900;
     auto historical = vrrTimingParametersForSession(session);
     historical.playoutVrr18IntervalFeedback = Vrr18GoalIntervalFeedback;
-    Stream live(session, 1000), revision5(session, historical, 1000);
+    auto forecast = historical;
+    forecast.playoutVrr18IntervalFeedback = Vrr18PredictiveIntervalFeedback;
+    Stream revision6(session, forecast, 1000), revision5(session, historical, 1000);
     for (size_t i = 0; i < 300; ++i) {
-        live.step(ticks);
+        revision6.step(ticks);
         revision5.step(ticks);
     }
     size_t cleanPairForecasts = 0;
     uint64_t largestForecastUs = 0;
-    uint64_t liveExcessUs = 0, baselineExcessUs = 0;
-    uint64_t liveLatencyUs = 0, baselineLatencyUs = 0;
+    uint64_t forecastExcessUs = 0, baselineExcessUs = 0;
+    uint64_t forecastLatencyUs = 0, baselineLatencyUs = 0;
     const auto stretch = [&](const Stream& stream) {
         const auto& frames = stream.frames();
         const auto& current = frames.back();
@@ -733,41 +734,44 @@ void testRecurringHitchForecast()
     for (size_t i = 0; i < disturbedFrames; ++i) {
         Input input;
         if (i % 11 == 3) input.latenessUs = 5000;
-        const auto& liveFrame = live.step(ticks, input);
+        const auto& newFrame = revision6.step(ticks, input);
         const auto& oldFrame = revision5.step(ticks, input);
-        liveLatencyUs += liveFrame.submittedUs - liveFrame.sourceUs;
+        forecastLatencyUs += newFrame.submittedUs - newFrame.sourceUs;
         baselineLatencyUs += oldFrame.submittedUs - oldFrame.sourceUs;
-        liveExcessUs += stretch(live);
+        forecastExcessUs += stretch(revision6);
         baselineExcessUs += stretch(revision5);
-        const auto update = live.interval().update;
+        const auto update = revision6.interval().update;
         if (update.action == Action::ForecastGrow && update.requestedUs > update.beforeUs) {
             largestForecastUs = std::max(largestForecastUs, update.requestedUs - update.beforeUs);
-            if (i % 11 != 3 && i % 11 != 4 && update.intervalErrorUs <= live.toleranceUs())
+            if (i % 11 != 3 && i % 11 != 4 && update.intervalErrorUs <= revision6.toleranceUs())
                 ++cleanPairForecasts;
         }
     }
     report("%-52s %zu clean-pair forecasts, largest %" PRIu64 " us, cumulative stretch %" PRIu64
            " -> %" PRIu64 " us, mean handoff latency %.1f -> %.1f us\n", name.c_str(), cleanPairForecasts,
-           largestForecastUs, baselineExcessUs, liveExcessUs,
-           double(baselineLatencyUs) / disturbedFrames, double(liveLatencyUs) / disturbedFrames);
-    check(cleanPairForecasts > 0 && largestForecastUs <= live.toleranceUs(), name,
+           largestForecastUs, baselineExcessUs, forecastExcessUs,
+           double(baselineLatencyUs) / disturbedFrames, double(forecastLatencyUs) / disturbedFrames);
+    check(cleanPairForecasts > 0 && largestForecastUs <= revision6.toleranceUs(), name,
           "recoverable recurring misses earn a bounded advance on a clean adjacent pair",
           "%zu clean-pair forecasts, largest %" PRIu64 " us", cleanPairForecasts, largestForecastUs);
-    check(liveExcessUs < baselineExcessUs && !live.replacements() && !revision5.replacements(), name,
+    check(forecastExcessUs < baselineExcessUs && !revision6.replacements() && !revision5.replacements(), name,
           "anticipation reduces measured stretch without shedding frames",
-          "revision 5 %" PRIu64 " us, live %" PRIu64 " us, replacements %zu -> %zu",
-          baselineExcessUs, liveExcessUs, revision5.replacements(), live.replacements());
-    check(liveLatencyUs <= baselineLatencyUs + disturbedFrames * live.toleranceUs(), name,
+          "revision 5 %" PRIu64 " us, revision 6 %" PRIu64 " us, replacements %zu -> %zu",
+          baselineExcessUs, forecastExcessUs, revision5.replacements(), revision6.replacements());
+    check(forecastLatencyUs <= baselineLatencyUs + disturbedFrames * revision6.toleranceUs(), name,
           "the average latency cost of earlier protection stays within one tolerance",
-          "revision 5 %.1f us, live %.1f us",
-          double(baselineLatencyUs) / disturbedFrames, double(liveLatencyUs) / disturbedFrames);
+          "revision 5 %.1f us, revision 6 %.1f us",
+          double(baselineLatencyUs) / disturbedFrames, double(forecastLatencyUs) / disturbedFrames);
 
     // Each interrupted burst is long enough to fill one evidence window.
     // Two such windows separated by a source epoch cannot predict a miss.
-    Stream interrupted(session, 1000), unmeasured(session, 1000), wake(session, 1000), tooLate(session, 1000);
+    Stream interrupted(session, forecast, 1000), unmeasured(session, forecast, 1000);
+    Stream wake(session, forecast, 1000), tooLate(session, forecast, 1000);
     auto lenient = session;
     lenient.timingOptions.targetHundredths = 9900;
-    Stream rare(lenient, 1000);
+    auto rareParameters = vrrTimingParametersForSession(lenient);
+    rareParameters.playoutVrr18IntervalFeedback = Vrr18PredictiveIntervalFeedback;
+    Stream rare(lenient, rareParameters, 1000);
     size_t interruptedForecasts = 0, unmeasuredForecasts = 0, wakeForecasts = 0, overCapForecasts = 0, rareForecasts = 0;
     for (size_t i = 0; i < 1500; ++i) {
         const uint64_t delayUs = i % 11 == 3 ? 5000 : 0;
@@ -796,6 +800,237 @@ void testRecurringHitchForecast()
           "%zu wake forecasts, %zu over-cap forecasts", wakeForecasts, overCapForecasts);
     check(!rareForecasts, name, "within-budget recurring misses cannot authorize a forecast",
           "%zu forecasts at a %.2f%% goal", rareForecasts, lenient.timingOptions.targetHundredths / 100.0);
+}
+
+// Drive both policies with identical frames. Measure the last score violation
+// so briefly crossing the goal cannot be mistaken for sustained recovery.
+void testForecastGoalRecovery()
+{
+    const auto name = scenarioName("forecast-goal-recovery");
+    constexpr size_t fps = 120;
+    constexpr uint32_t ticks = 750;
+    // At 120 Hz the unlatched presenter's spacing guard blocks input
+    // observations. Give it display headroom to exercise the same predictor.
+    auto session = vrrProductionSession(1, fps, t_CanLatch ? 120 : 240, false);
+    session.timingOptions.historySeconds = 15;
+    const double goal = session.timingOptions.targetHundredths / 100.0;
+    auto baseline = vrrTimingParametersForSession(session);
+    baseline.playoutVrr18IntervalFeedback = Vrr18PredictiveIntervalFeedback;
+    Stream revision6(session, baseline, 1000), live(session, 1000);
+
+    struct Result {
+        size_t recoveryFrame = 0, hitches = 0;
+        uint64_t excessUs = 0, meanUs = 0, p99Us = 0, peakUs = 0;
+    };
+    const auto measure = [&](Stream& stream) {
+        for (size_t i = 0; i < 3 * fps; ++i) stream.step(ticks);
+        const size_t onset = stream.size();
+        Result result;
+        Frame previous = stream.frames().back();
+        std::vector<uint64_t> handoffLatency;
+        for (size_t i = 0; i < 90 * fps; ++i) {
+            const auto& frame = stream.step(ticks, {i % 11 == 3 ? 5000u : 0u});
+            if (stream.interval().qualityPercent() < goal) result.recoveryFrame = i + 1;
+            if (frame.dropped) continue;
+            handoffLatency.push_back(frame.submittedUs - frame.decodedUs);
+            if (i < 20 * fps) {
+                const int64_t stretch = int64_t(frame.submittedUs - previous.submittedUs) -
+                                        int64_t(frame.sourceUs - previous.sourceUs);
+                result.hitches += stretch > 2000;
+                result.excessUs += uint64_t(std::max<int64_t>(0, stretch - int64_t(stream.toleranceUs())));
+            }
+            previous = frame;
+        }
+        const auto latencyUs = [](const Frame& f) { return f.submittedUs - f.decodedUs; };
+        result.meanUs = mean(stream.frames(), onset, stream.size(), latencyUs);
+        result.peakUs = maximum(stream.frames(), onset, stream.size(), latencyUs);
+        result.p99Us = percentile(handoffLatency, 990);
+        return result;
+    };
+    const auto old = measure(revision6);
+    const auto now = measure(live);
+    report("%-52s sustained goal %.2f -> %.2f s, first 20 s hitches %zu -> %zu, stretch %" PRIu64
+           " -> %" PRIu64 " us, handoff mean/p99/max %" PRIu64 "/%" PRIu64 "/%" PRIu64
+           " -> %" PRIu64 "/%" PRIu64 "/%" PRIu64 " us\n", name.c_str(),
+           double(old.recoveryFrame) / fps, double(now.recoveryFrame) / fps,
+           old.hitches, now.hitches, old.excessUs, now.excessUs,
+           old.meanUs, old.p99Us, old.peakUs, now.meanUs, now.p99Us, now.peakUs);
+    check(live.interval().qualityPercent() >= goal && revision6.interval().qualityPercent() >= goal &&
+              now.recoveryFrame + fps <= old.recoveryFrame,
+          name, "persistent delivery errors reach and retain the configured goal sooner",
+          "goal %.2f%%, sustained after %.2f -> %.2f s", goal,
+          double(old.recoveryFrame) / fps, double(now.recoveryFrame) / fps);
+    check(now.hitches < old.hitches && now.excessUs < old.excessUs &&
+              live.replacements() <= revision6.replacements(),
+          name, "quicker recovery reduces both costly handoff hitches and stretch",
+          "2 ms hitches %zu -> %zu, excess %" PRIu64 " -> %" PRIu64 " us, replacements %zu -> %zu",
+          old.hitches, now.hitches, old.excessUs, now.excessUs, revision6.replacements(), live.replacements());
+    check(now.meanUs <= old.meanUs + 1000 && now.p99Us <= old.p99Us + 1000 && now.peakUs <= old.peakUs + 1000,
+          name, "mean, p99 and peak decode-to-handoff latency each stay within 1 ms of revision 6",
+          "mean/p99/peak %" PRIu64 "/%" PRIu64 "/%" PRIu64 " -> %" PRIu64 "/%" PRIu64 "/%" PRIu64 " us",
+          old.meanUs, old.p99Us, old.peakUs, now.meanUs, now.p99Us, now.peakUs);
+
+    const uint64_t oldReserveUs = live.frames().back().appliedUs;
+    for (size_t i = 0; i < 90 * fps; ++i) live.step(ticks);
+    const uint64_t floorUs = live.interval().update.minimumUs;
+    check(live.frames().back().appliedUs <= floorUs + 250 && live.interval().qualityPercent() >= goal, name,
+          "clean delivery releases the reserve earned by recurring hitches",
+          "reserve after recovery %" PRIu64 " us, last %" PRIu64 " us, floor %" PRIu64 " us",
+          oldReserveUs, live.frames().back().appliedUs, floorUs);
+    const size_t nextOnset = live.size();
+    for (size_t i = 0; i < 60 * fps; ++i) live.step(ticks, {i % 11 == 3 ? 3000u : 0u});
+    const auto high = maximum(live.frames(), nextOnset, live.size(), applied);
+    check(live.interval().qualityPercent() >= goal && high > floorUs && high + 500 <= oldReserveUs, name,
+          "a later smaller delivery excursion earns a correspondingly smaller reserve",
+          "3 ms excursion peak %" PRIu64 " us, previous 5 ms reserve %" PRIu64 " us, score %.3f%%",
+          high, oldReserveUs, live.interval().qualityPercent());
+}
+
+void testForecastRequiresRecurringDelivery()
+{
+    using Action = Vrr13::IntervalBuffer::Action;
+    const auto name = scenarioName("forecast-evidence");
+    auto session = vrrProductionSession(1, 120, 240, false);
+    session.timingOptions.historySeconds = 15;
+    Stream tooLate(session, 1000), wake(session, 1000);
+    Stream irregular(session, 1000), missing(session, 1000), interrupted(session, 1000);
+    auto lenient = session;
+    lenient.timingOptions.targetHundredths = 9900;
+    Stream rare(lenient, 1000);
+    size_t capForecasts = 0, wakeForecasts = 0, cadenceForecasts = 0;
+    size_t missingForecasts = 0, interruptedForecasts = 0, rareForecasts = 0;
+    const auto forecast = [](const Stream& stream) { return stream.interval().update.action == Action::ForecastGrow; };
+    for (size_t i = 0; i < 3600; ++i) {
+        const auto delayUs = i % 11 == 3 ? 5000u : 0u;
+        tooLate.step(750, {delayUs ? 25000u : 0u});
+        Input wakeOnly;
+        wakeOnly.presentLatencyUs = delayUs;
+        wake.step(750, wakeOnly);
+        irregular.step(i % 2 ? 600 : 900);
+        Input invisible;
+        invisible.latenessUs = delayUs;
+        invisible.hasDeliveryTimeline = false;
+        missing.step(750, invisible);
+        interrupted.step(750, {delayUs});
+        if (i % 11 == 10) interrupted.rebase();
+        rare.step(750, {i % 97 == 3 ? 3000u : 0u});
+        capForecasts += forecast(tooLate);
+        wakeForecasts += forecast(wake);
+        cadenceForecasts += forecast(irregular);
+        missingForecasts += forecast(missing);
+        interruptedForecasts += forecast(interrupted);
+        rareForecasts += forecast(rare);
+    }
+    // Enter each run below goal because of presenter wakes. Slide the
+    // delivery burst across window boundaries to check both an isolated
+    // stretch/catch-up pair and two genuinely late frames only 150 ms apart.
+    for (size_t delayedFrames : {1u, 2u}) {
+        size_t forecasts = 0, belowGoal = 0;
+        for (size_t phase = 0; phase < 120; ++phase) {
+            Stream shortBurst(session, 1000);
+            const size_t first = 780 + phase;
+            for (size_t i = 0; i < 1200; ++i) {
+                Input input;
+                if (i < 720 && i % 11 == 3) input.presentLatencyUs = 5000;
+                if (i == first || (delayedFrames == 2 && i == first + 18)) input.latenessUs = 5000;
+                shortBurst.step(750, input);
+                if (i == first) belowGoal += shortBurst.interval().qualityPercent() <
+                                             session.timingOptions.targetHundredths / 100.0;
+                forecasts += forecast(shortBurst);
+            }
+        }
+        check(belowGoal == 120 && !forecasts, name,
+              "a brief episode cannot corroborate itself across observation windows",
+              "%zu late frames, %zu of 120 phases below goal, %zu forecasts", delayedFrames, belowGoal, forecasts);
+    }
+    check(!capForecasts && !wakeForecasts && !cadenceForecasts, name,
+          "over-cap stalls, presenter wakes and irregular source intervals cannot earn forecasts",
+          "over-cap %zu, wake-only %zu, irregular cadence %zu", capForecasts, wakeForecasts, cadenceForecasts);
+    check(!missingForecasts && !interruptedForecasts, name,
+          "forecasts require adjacent measured deliveries from the same source epoch",
+          "missing readiness %zu, rebased %zu", missingForecasts, interruptedForecasts);
+    check(!rareForecasts && rare.interval().qualityPercent() >= 99.0, name,
+          "recurring deliveries inside the configured budget cannot earn forecasts",
+          "%zu forecasts, final score %.3f%%", rareForecasts, rare.interval().qualityPercent());
+}
+
+// Normally ready frames wake 1.9 ms after their deadline. That wait masks
+// most of the alternating 3 ms input delays. Protecting occasional 6 ms
+// deliveries more aggressively would compress the masked handoffs.
+void testForecastChargesInducedCompression()
+{
+    using Buffer = Vrr13::IntervalBuffer;
+    const auto name = scenarioName("forecast-mixed-wakes");
+    struct Result { size_t forecasts = 0; uint64_t peakUs = 0; double score = 0; };
+    const auto run = [](bool costAware) {
+        Buffer observer;
+        Result result;
+        for (uint64_t i = 1; i < 4500; ++i) {
+            Buffer::Sample sample;
+            sample.frame = i;
+            sample.smoothedRtpSlotUs = sample.intended = kOriginUs + i * 10000;
+            sample.sourcePeriodUs = 10000;
+            sample.buffer = observer.demand(1000);
+            sample.deadline = sample.intended + sample.buffer;
+            uint64_t deliveryUs = 0, wakeUs = 0;
+            if (i > 350) {
+                if (i % 47 == 1) deliveryUs = 6000;
+                else if (i % 2 == 0) deliveryUs = 3000;
+                else wakeUs = 1900;
+            }
+            sample.independentReadyUs = sample.ready = sample.intended + deliveryUs;
+            sample.submitted = std::max(sample.ready, sample.deadline) + wakeUs;
+            sample.absorbable = sample.valid = true;
+            sample.serialService = 500;
+            observer.observe(sample, 1000, 8333, 3000000, 500, true, 995000,
+                500, 15000000, 1000000, 2, true, 0, true, true, true, true, costAware);
+            result.forecasts += observer.stats().update.action == Buffer::Action::ForecastGrow;
+            result.peakUs = std::max(result.peakUs, sample.buffer);
+        }
+        result.score = observer.stats().qualityPercent();
+        return result;
+    };
+    const auto baseline = run(false), live = run(true);
+    check(!live.forecasts && live.peakUs <= baseline.peakUs && live.score + 0.001 >= baseline.score, name,
+          "shadow reserves pay for the compressions they induce on masked handoffs",
+          "%zu forecasts, revision 6 to 7 peak %" PRIu64 " -> %" PRIu64 " us, score %.3f -> %.3f%%",
+          live.forecasts, baseline.peakUs, live.peakUs, baseline.score, live.score);
+}
+
+// The same 5 ms delivery excursions fit the available reserve on both
+// clocks. Alternate 7/13 ms source intervals around a 10 ms nominal period
+// to keep source deviation above twice the 500 us pacing tolerance.
+void testForecastRequiresBoundedSourceWander()
+{
+    using Buffer = Vrr13::IntervalBuffer;
+    const auto name = scenarioName("forecast-erratic-source");
+    for (bool erratic : {false, true}) {
+        Buffer observer;
+        uint64_t slotUs = kOriginUs;
+        size_t forecasts = 0, belowGoal = 0;
+        for (uint64_t frame = 1; frame <= 1800; ++frame) {
+            slotUs += erratic ? (frame % 2 ? 7000 : 13000) : 10000;
+            Buffer::Sample sample;
+            sample.frame = frame;
+            sample.smoothedRtpSlotUs = sample.intended = slotUs;
+            sample.sourcePeriodUs = 10000;
+            sample.buffer = observer.demand(1000);
+            sample.deadline = slotUs + sample.buffer;
+            sample.ready = sample.independentReadyUs = slotUs + (frame > 300 && frame % 11 == 3 ? 5000 : 0);
+            sample.submitted = std::max(sample.ready, sample.deadline);
+            sample.valid = sample.absorbable = true;
+            sample.serialService = 500;
+            observer.observe(sample, 1000, 8333, 3000000, 500, true, 995000,
+                500, 15000000, 1000000, 2, true, 0, true, true, true, true, true);
+            const auto stats = observer.stats();
+            belowGoal += stats.averageValid && stats.qualityPercent() < 99.5;
+            forecasts += stats.update.action == Buffer::Action::ForecastGrow;
+        }
+        check(belowGoal && (erratic ? forecasts == 0 : forecasts > 0), name,
+              "recurring late input forecasts only while source deviation remains bounded",
+              "%s source, %zu below-goal intervals, %zu forecasts", erratic ? "alternating" : "steady",
+              belowGoal, forecasts);
+    }
 }
 
 // A 6 ms starting buffer covers all input variation. If a
@@ -852,7 +1087,8 @@ void testReleaseBehindSpacingFloor()
                 policy.playoutIntervalToleranceUs, 15000000, policy.playoutIntervalInitialWarmupUs,
                 policy.playoutIntervalInitialMinimumSamples, true, 0, true, true,
                 policy.playoutVrr18IntervalFeedback >= Vrr18GoalIntervalFeedback,
-                policy.playoutVrr18IntervalFeedback >= Vrr18PredictiveIntervalFeedback);
+                policy.playoutVrr18IntervalFeedback >= Vrr18PredictiveIntervalFeedback,
+                policy.playoutVrr18IntervalFeedback >= Vrr18CostAwareIntervalFeedback);
         }
         return observer.stats().update.requestedUs;
     };
@@ -1913,6 +2149,10 @@ int main(int argc, char** argv)
         {"interval-pressure", testIntervalPressureAndRelease},
         {"sparse-delivery", testSparseDeliveryPressure},
         {"recurring-hitch-forecast", testRecurringHitchForecast},
+        {"forecast-goal-recovery", testForecastGoalRecovery},
+        {"forecast-evidence", testForecastRequiresRecurringDelivery},
+        {"forecast-mixed-wakes", testForecastChargesInducedCompression},
+        {"forecast-erratic-source", testForecastRequiresBoundedSourceWander},
         {"release-with-spacing-floor", testReleaseBehindSpacingFloor},
         {"source-cadence-buffer", testSourceCadenceBufferGrowth},
         {"client-timing-attribution", testClientTimingAttribution},

@@ -163,7 +163,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         config.latencyMode : 1;
     const auto options = config.timingOptions.resolved(latencyMode);
     const bool vrr18 = config.vrr18IntervalFeedback;
-    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18PredictiveIntervalFeedback : 0;
+    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18CostAwareIntervalFeedback : 0;
     parameters.playoutIntervalToleranceUs = options.toleranceUs;
     // Presets change only the four user-visible values. Admission, release,
     // and late-frame recovery use the same policy for every combination.
@@ -2572,7 +2572,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18SharedIntervalScore,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18RecoverableIntervalFeedback,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18GoalIntervalFeedback,
-                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18PredictiveIntervalFeedback);
+                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18PredictiveIntervalFeedback,
+                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18CostAwareIntervalFeedback);
             if (m_Parameters.playoutInputPercentileEnabled) {
                 const auto capacity = m_IntervalBuffer.stats();
                 const bool validInput = submitted && !cancelled && m_Pending.intervalValid &&

@@ -120,7 +120,8 @@ public:
                  bool vrr18Feedback = false,
                  uint64_t releaseTauUs = 0,
                  bool sharedScore = false, bool requireRecoverableInterval = false,
-                 bool goalFeedback = false, bool predictiveFeedback = false) {
+                 bool goalFeedback = false, bool predictiveFeedback = false,
+                 bool costAwareFeedback = false) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -307,7 +308,16 @@ public:
         const auto lateness = delayed.ready - std::min(delayed.ready, deadline);
         const bool windowAbsorbable = service <= intendedTime && decoderQueue <= intendedTime;
         uint64_t forecastUs = 0;
-        if (predictiveFeedback) {
+        if (costAwareFeedback) {
+            if (windowAbsorbable && s.absorbable && previous.absorbable &&
+                    s.independentReadyUs && previous.independentReadyUs) {
+                const bool cadenceBounded = windowSourceErrorUs <= 2 * samples * toleranceUs;
+                forecastUs = m_ReserveCosts.observe(delayed, other, actual, intended,
+                    error, toleranceUs, maximum, allowedLoss, steadySource, cadenceBounded);
+            }
+            else m_ReserveCosts = {};
+        }
+        else if (predictiveFeedback) {
             if (steadySource && windowAbsorbable && s.absorbable && previous.absorbable &&
                     s.independentReadyUs && previous.independentReadyUs) {
                 // A late input may stretch one pair and compress the following pair.
@@ -455,6 +465,7 @@ public:
     void restoreTarget(uint64_t target, uint64_t atUs) {
         if (!m_Initialized) return;
         m_Forecast = {};
+        m_ReserveCosts = {};
         m_Target = target;
         m_LastPressure = atUs;
         m_ReleaseFraction = 0;
@@ -462,6 +473,7 @@ public:
     Stats stats() const { return m_Stats; }
     void breakSequence() {
         m_Forecast = {};
+        m_ReserveCosts = {};
         m_Window = {}; m_First = m_ReleaseFraction = m_SequenceSamples = 0; m_HavePrevious = false;
         m_Stats.averageErrorUs = 0; m_Stats.averageValid = false;
         m_Stats.clientAverageErrorUs = 0; m_Stats.clientAverageValid = false;
@@ -551,6 +563,99 @@ private:
         const auto remaining = excess - std::min(excess, late - std::min(late, early));
         return std::min(excess, intended) - std::min(remaining, intended);
     }
+
+    // Evaluate the same observed interval at several absolute reserve sizes.
+    // Only its independently recoverable error can justify spending latency.
+    struct ReserveCosts {
+        static constexpr uint64_t WindowUs = 375000;
+        static constexpr uint64_t StepUs = 250;
+        static constexpr size_t Levels = 13; // Up to 3 ms beyond the applied reserve.
+
+        uint64_t observe(const Sample& delayed, const Sample& other, uint64_t actualUs,
+                         uint64_t intendedUs, uint64_t errorUs, uint64_t toleranceUs,
+                         uint64_t maximumUs, double allowedLoss, bool steadySource, bool cadenceBounded) {
+            const uint64_t appliedUs = std::max(delayed.buffer, other.buffer);
+            if (!elapsedUs) anchorUs = std::min(appliedUs, maximumUs);
+            elapsedUs += actualUs;
+            const double weight = double(actualUs) / intendedUs;
+            const auto excess = [=](double error) {
+                return std::clamp(error - toleranceUs, 0.0, double(intendedUs));
+            };
+            const double observedLoss = excess(double(errorUs));
+            observedLossUs += weight * observedLoss;
+            const uint64_t headroomUs = maximumUs - std::min(maximumUs, appliedUs);
+            const uint64_t lateAtCapUs = coveredReadiness(delayed, headroomUs);
+            const uint64_t earlyAtCapUs = coveredReadiness(other, headroomUs);
+            if (lateAtCapUs || earlyAtCapUs) {
+                // When the source rate varies, require independent input lateness
+                // to explain the observed interval error to within tolerance.
+                const double inputErrorUs = double(lateAtCapUs) - double(earlyAtCapUs);
+                const bool explained = steadySource ||
+                    (cadenceBounded && inputErrorUs > 0 && std::abs(errorUs - inputErrorUs) <= toleranceUs);
+                const bool recoverable = explained &&
+                    intervalBenefit(delayed, other, errorUs, toleranceUs, maximumUs).excessUs != 0;
+                bool improvesStretch = false;
+                for (size_t i = 0; i < Levels; ++i) {
+                    const uint64_t candidateUs = candidate(i, maximumUs);
+                    const uint64_t extraUs = candidateUs - std::min(candidateUs, appliedUs);
+                    const double remaining = double(errorUs) - double(coveredReadiness(delayed, extraUs))
+                        + double(coveredReadiness(other, extraUs));
+                    const double gain = observedLoss - excess(std::abs(remaining));
+                    // Charge a new compression even if this pair was clean.
+                    // Only independently attributable delivery can earn a benefit.
+                    savedLossUs[i] += weight * (recoverable ? gain : std::min(0.0, gain));
+                    improvesStretch |= recoverable && actualUs > intendedUs && gain > 0;
+                }
+                if (improvesStretch) {
+                    if (!firstStretchUs) firstStretchUs = delayed.submitted;
+                    lastStretchUs = delayed.submitted;
+                }
+            }
+            if (elapsedUs < WindowUs) return 0;
+
+            const uint64_t proposalUs = proposal(maximumUs, elapsedUs * allowedLoss);
+            // A burst straddling a block boundary is still a single episode.
+            const bool recurring = previousFirstStretchUs && lastStretchUs >= previousFirstStretchUs &&
+                lastStretchUs - previousFirstStretchUs >= WindowUs;
+            const uint64_t corroboratedUs = recurring ? std::min(previousProposalUs, proposalUs) : 0;
+            previousProposalUs = proposalUs;
+            previousFirstStretchUs = firstStretchUs;
+            elapsedUs = firstStretchUs = lastStretchUs = 0;
+            observedLossUs = 0;
+            savedLossUs = {};
+            return corroboratedUs;
+        }
+
+    private:
+        uint64_t elapsedUs = 0, anchorUs = 0, previousProposalUs = 0;
+        uint64_t firstStretchUs = 0, lastStretchUs = 0, previousFirstStretchUs = 0;
+        double observedLossUs = 0;
+        std::array<double, Levels> savedLossUs{};
+
+        uint64_t proposal(uint64_t maximumUs, double lossBudgetUs) const {
+            const double initialGainUs = savedLossUs.front();
+            const double deficitUs = observedLossUs - initialGainUs - lossBudgetUs;
+            const double availableGainUs = *std::max_element(savedLossUs.begin(), savedLossUs.end()) - initialGainUs;
+            if (!firstStretchUs || deficitUs <= 0 || availableGainUs <= 0) return 0;
+
+            // If the goal is out of reach, buy only material progress toward it.
+            // Take the cheapest level recovering 90% of that available gain.
+            double neededGainUs = deficitUs;
+            if (availableGainUs < deficitUs) {
+                if (availableGainUs < 0.1 * std::max(lossBudgetUs, deficitUs)) return 0;
+                neededGainUs = 0.9 * availableGainUs;
+            }
+            for (size_t i = 1; i < Levels; ++i) {
+                if (savedLossUs[i] >= initialGainUs + neededGainUs) return candidate(i, maximumUs);
+            }
+            return 0;
+        }
+
+        uint64_t candidate(size_t level, uint64_t maximumUs) const {
+            const uint64_t anchor = std::min(anchorUs, maximumUs);
+            return anchor + std::min<uint64_t>(level * StepUs, maximumUs - anchor);
+        }
+    };
 
     // Integrate only adjacent, independently timed input outcomes. The shadow
     // reserve asks how much lateness would survive at a given standing delay.
@@ -679,6 +784,7 @@ private:
     }
     ReadinessReserve m_Reserve;
     HitchForecast m_Forecast;
+    ReserveCosts m_ReserveCosts;
     std::array<Bucket, 100> m_Window{};
     // Keep the long score history off the controller's stack. The controller
     // is instantiated in several independent workers and test fixtures.

@@ -59,12 +59,14 @@ int main(int argc, char** argv) {
     measured.addData(QByteArray::fromStdString(vrrCalibrationPolicy(policy)));
     assert(Vrr13::saveStartDelay(path, QString::fromLatin1(measured.result().toHex()), 10750));
     assert(Vrr13::loadStartDelay(path, key) == 0);
-    auto previousFeedback = policy;
-    previousFeedback.playoutVrr18IntervalFeedback = Vrr18GoalIntervalFeedback;
-    const auto previousFeedbackKey = identity(previousFeedback, false);
-    assert(Vrr13::saveStartDelay(path, previousFeedbackKey, 3000));
-    assert(Vrr13::loadStartDelay(path, key) == 0);
-    assert(Vrr13::loadStartDelay(path, previousFeedbackKey) == 3000);
+    for (const auto revision : {Vrr18GoalIntervalFeedback, Vrr18PredictiveIntervalFeedback}) {
+        auto previousFeedback = policy;
+        previousFeedback.playoutVrr18IntervalFeedback = revision;
+        const auto previousFeedbackKey = identity(previousFeedback, false);
+        assert(Vrr13::saveStartDelay(path, previousFeedbackKey, 3000));
+        assert(Vrr13::loadStartDelay(path, key) == 0);
+        assert(Vrr13::loadStartDelay(path, previousFeedbackKey) == 3000);
+    }
     assert(Vrr13::saveStartDelay(path, key, 8378));
     assert(Vrr13::loadStartDelay(path, key) == 8378);
     assert(Vrr13::loadStartDelay(path, identity(policy, true)) == 0);

@@ -1,7 +1,7 @@
 # Streaming and VRR architecture
 
 Source baseline: the published `v6.2.0-daily.201` client with VRR18 interval
-feedback restored for live sessions, with revision 6 used for new streams.
+feedback restored for live sessions, with revision 7 used for new streams.
 Buffer growth uses delivery and decode readiness at both ends of an interval. The custom profile exposes the frame allowance, timing
 target, score history, and interval tolerance. The renderer,
 observed D3D11 completion, and schema-6 capture contracts come from the newer
@@ -708,6 +708,29 @@ Gaps, cadence changes, missing readiness and overload discard the forecast.
 The ordinary response to a fresh miss and the release law still apply.
 Replay reports forecast growths and qualified time at goal in
 `simulation.pacing_score`.
+
+Revision 7 compares the pacing benefit of several standing buffer sizes in
+250 µs increments, up to 3 ms above the reserve at the start of each
+375 ms window. Each window includes the time and measured
+severity of every qualified pair. For each candidate, the observer estimates
+how much independent readiness at each endpoint would be covered and scores
+the resulting signed interval error. An increase that turns a stretch into a
+compression pays for the excess on either side of the tolerance. A benefit
+requires independently measured input lateness that the allowed reserve can
+cover. During rate variation, the difference in readiness at the two endpoints
+must also explain the measured error to within tolerance, and the preceding
+second's mean deviation from the estimated source period must fit within two
+tolerances. This limits delay during erratic changes in source cadence.
+
+The controller selects the smallest candidate predicted to reach the profile
+goal. When the whole goal is out of reach, it selects the smallest candidate
+providing 90% of the estimated additional benefit, provided that benefit is
+at least a tenth of both the window's allowed loss and its gap to goal. Two consecutive windows must
+agree, with recoverable stretches at least one window apart. The smaller
+proposal can raise the target while the observed pacing score is below goal.
+Missing readiness, overload and sequence breaks clear the evidence.
+The reserve continues to follow its normal per-frame movement limit,
+configured frame allowance and clean-stream release.
 
 The Client timing score and its one-second mean require timely complete-frame
 arrival at both ends of an interval. The controller compares compressed-frame
