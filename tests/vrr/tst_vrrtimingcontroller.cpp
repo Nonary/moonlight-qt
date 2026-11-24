@@ -3404,7 +3404,8 @@ void testIntervalBufferCreditsAlreadyScheduledSpacing()
 
 void testLatchedHandoffCreditsOnlyEnforcedSpacing()
 {
-    for (uint64_t revision : {Vrr18RecoverableIntervalFeedback, Vrr18GoalIntervalFeedback}) {
+    for (uint64_t revision : {Vrr18RecoverableIntervalFeedback, Vrr18GoalIntervalFeedback,
+                              Vrr18PredictiveIntervalFeedback}) {
         auto session = config(120, 120);
         session.smoothFrameTiming = false;
         auto policy = vrrTimingParametersForSession(session, true, false);
@@ -3426,7 +3427,7 @@ void testLatchedHandoffCreditsOnlyEnforcedSpacing()
                 expect(decision.latchedPresentation && controller.earliestSubmissionUs() == 0 &&
                            update.attributedFrame == 152,
                        "the second late handoff stretches an eligible interval with no software floor");
-                if (revision == Vrr18GoalIntervalFeedback)
+                if (revision >= Vrr18GoalIntervalFeedback)
                     expect(update.latenessUs == latenessUs,
                            "a future display refresh cannot cover a late CPU handoff");
                 else

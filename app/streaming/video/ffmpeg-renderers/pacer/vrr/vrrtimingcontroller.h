@@ -27,6 +27,7 @@ constexpr uint64_t Vrr18SharedIntervalScore = 2;
 constexpr uint64_t Vrr18SourceCadenceFeedback = 3;
 constexpr uint64_t Vrr18RecoverableIntervalFeedback = 4;
 constexpr uint64_t Vrr18GoalIntervalFeedback = 5;
+constexpr uint64_t Vrr18PredictiveIntervalFeedback = 6;
 
 // This list is also the replay/trace parameter schema. Keeping the JSON name,
 // C++ member, type, and production default together prevents those copies from

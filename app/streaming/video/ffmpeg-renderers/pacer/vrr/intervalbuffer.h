@@ -52,7 +52,8 @@ public:
     // rejected growth is not retained as debt or fed back into demand().
     enum class Action : uint8_t {
         Learning, SequenceBreak, Grow, Capped, CurrentPressure, HistoryHold,
-        RecoveryHold, Release, Minimum, NotAbsorbable, Cooldown, NoFreshMiss, LimitChange, InputPercentileGrow, InputPercentileRelease, InputPercentileHold, InputPercentileUnknown
+        RecoveryHold, Release, Minimum, NotAbsorbable, Cooldown, NoFreshMiss, LimitChange, InputPercentileGrow, InputPercentileRelease, InputPercentileHold, InputPercentileUnknown,
+        ForecastGrow
     };
     struct Update {
         uint64_t atUs = 0, frame = 0, attributedFrame = 0;
@@ -119,7 +120,7 @@ public:
                  bool vrr18Feedback = false,
                  uint64_t releaseTauUs = 0,
                  bool sharedScore = false, bool requireRecoverableInterval = false,
-                 bool goalFeedback = false) {
+                 bool goalFeedback = false, bool predictiveFeedback = false) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -305,6 +306,20 @@ public:
         const auto deadline = std::max(delayed.deadline, delayed.spacingFloor);
         const auto lateness = delayed.ready - std::min(delayed.ready, deadline);
         const bool windowAbsorbable = service <= intendedTime && decoderQueue <= intendedTime;
+        uint64_t forecastUs = 0;
+        if (predictiveFeedback) {
+            if (steadySource && windowAbsorbable && s.absorbable && previous.absorbable &&
+                    s.independentReadyUs && previous.independentReadyUs) {
+                // A late input may stretch one pair and compress the following pair.
+                // Count its recoverable stretch once. Every observed pair, including
+                // a covered hitch, still contributes time to the loss allowance.
+                const Benefit stretch = actual > intended ?
+                    intervalBenefit(m_Previous, previous, error, toleranceUs, maximum) : Benefit{};
+                forecastUs = m_Forecast.observe(actual, intended, stretch, allowedLoss,
+                    std::min(previous.buffer, s.buffer), toleranceUs);
+            }
+            else m_Forecast = {};
+        }
         const auto headroom = maximum - std::min(maximum, delayed.buffer);
         const bool withinBudget = !requireRecoverableInterval ||
             lateness - std::min(lateness, toleranceUs) <= headroom;
@@ -417,6 +432,20 @@ public:
                    (windowAbsorbable))) {
             update.action = Action::NotAbsorbable;
         }
+        forecastUs = std::min(forecastUs, maximum);
+        if (belowTarget && forecastUs > m_Target && forecastUs > boundedUs) {
+            m_Target = forecastUs;
+            m_LastPressure = s.submitted;
+            m_CleanEvidenceUs = m_ReleaseFraction = 0;
+            m_Stats.lastGrowthAtUs = s.submitted;
+            m_Stats.lastGrowthUs = m_Target - boundedUs;
+            update.action = Action::ForecastGrow;
+            update.attributedFrame = 0;
+            update.latenessUs = 0;
+            update.holdRemainingUs = hold;
+            update.attemptedIncreaseUs = m_Target - boundedUs;
+            update.clippedIncreaseUs = 0;
+        }
         if (beforeUs != boundedUs) update.action = Action::LimitChange;
         update.requestedUs = m_Target;
     }
@@ -425,12 +454,14 @@ public:
     // hold from the given time, as if pressure had just been observed.
     void restoreTarget(uint64_t target, uint64_t atUs) {
         if (!m_Initialized) return;
+        m_Forecast = {};
         m_Target = target;
         m_LastPressure = atUs;
         m_ReleaseFraction = 0;
     }
     Stats stats() const { return m_Stats; }
     void breakSequence() {
+        m_Forecast = {};
         m_Window = {}; m_First = m_ReleaseFraction = m_SequenceSamples = 0; m_HavePrevious = false;
         m_Stats.averageErrorUs = 0; m_Stats.averageValid = false;
         m_Stats.clientAverageErrorUs = 0; m_Stats.clientAverageValid = false;
@@ -443,6 +474,42 @@ private:
     struct Benefit {
         uint64_t excessUs = 0;  // Error outside tolerance that the remaining buffer can cover.
         uint64_t nearbyUs = 0;  // Part of that error covered by one tolerance of extra buffer.
+    };
+
+    // Forecast the reserve for the next second from the measured cost of
+    // recurring stretches. Each completed window makes one absolute proposal.
+    // Taking the smaller of two consecutive proposals keeps one burst from
+    // buying a standing reserve and prevents spending the same evidence twice.
+    struct HitchForecast {
+        uint64_t observe(uint64_t actualUs, uint64_t intendedUs, Benefit stretch,
+                         double allowedLoss, uint64_t appliedUs, uint64_t stepUs) {
+            minimumAppliedUs = elapsedUs ? std::min(minimumAppliedUs, appliedUs) : appliedUs;
+            elapsedUs += actualUs;
+            // Use the same duration weighting and one-interval loss ceiling as
+            // the observed pacing score, including when a hitch saturates it.
+            const double weight = double(actualUs) / intendedUs;
+            const uint64_t before = std::min(intendedUs, stretch.excessUs);
+            const uint64_t after = std::min(intendedUs, stretch.excessUs - stretch.nearbyUs);
+            lossUs += weight * before;
+            improvementUs += weight * (before - after);
+            if (elapsedUs < 1000000) return 0;
+
+            const double shortfallUs = lossUs - allowedLoss * elapsedUs;
+            uint64_t proposalUs = 0;
+            if (shortfallUs > 0 && improvementUs > 0) {
+                const double fraction = std::min(1.0, shortfallUs / improvementUs);
+                proposalUs = minimumAppliedUs + uint64_t(std::ceil(stepUs * fraction));
+            }
+            const uint64_t forecastUs = std::min(previousProposalUs, proposalUs);
+            previousProposalUs = proposalUs;
+            elapsedUs = 0;
+            lossUs = improvementUs = 0;
+            return forecastUs;
+        }
+
+    private:
+        uint64_t elapsedUs = 0, minimumAppliedUs = 0, previousProposalUs = 0;
+        double lossUs = 0, improvementUs = 0;
     };
 
     static uint64_t coveredReadiness(const Sample& sample, uint64_t extraUs) {
@@ -611,6 +678,7 @@ private:
         }
     }
     ReadinessReserve m_Reserve;
+    HitchForecast m_Forecast;
     std::array<Bucket, 100> m_Window{};
     // Keep the long score history off the controller's stack. The controller
     // is instantiated in several independent workers and test fixtures.

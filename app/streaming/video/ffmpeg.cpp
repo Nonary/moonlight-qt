@@ -1505,6 +1505,9 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             case Action::Grow:
                 reason = "Increasing - frames were not ready in time";
                 break;
+            case Action::ForecastGrow:
+                reason = "Increasing - preparing for recurring late frames";
+                break;
             case Action::Capped:
                 reason = "Limited - late frames need more buffer than allowed";
                 break;

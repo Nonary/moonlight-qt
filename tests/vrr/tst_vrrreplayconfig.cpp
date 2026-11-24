@@ -320,14 +320,20 @@ void VrrReplayConfigTest::productionPolicyValidation()
             session.absorbMicrostutter = absorb;
             const auto current = vrrTimingParametersForSession(
                 vrrProductionSessionConfig(session), scheduled, scheduled);
-            QCOMPARE(current.playoutVrr18IntervalFeedback, Vrr18GoalIntervalFeedback);
+            QCOMPARE(current.playoutVrr18IntervalFeedback, Vrr18PredictiveIntervalFeedback);
             QVERIFY2(validateVrrCurrentPolicy(current, error), qPrintable(error));
-            auto historical = current;
-            historical.playoutVrr18IntervalFeedback = Vrr18RecoverableIntervalFeedback;
-            QVERIFY2(validateVrrCurrentPolicy(historical, error), qPrintable(error));
-            QVERIFY(vrrCalibrationPolicy(current) != vrrCalibrationPolicy(historical));
+            for (uint64_t revision = Vrr18AveragedIntervalFeedback; revision < Vrr18PredictiveIntervalFeedback; ++revision) {
+                auto historical = current;
+                historical.playoutVrr18IntervalFeedback = revision;
+                auto snapshot = vrrTimingParametersToJson(historical);
+                VrrTimingParameters restored;
+                QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error), qPrintable(error));
+                QCOMPARE(restored.playoutVrr18IntervalFeedback, revision);
+                QVERIFY2(validateVrrCurrentPolicy(restored, error), qPrintable(error));
+                QVERIFY(vrrCalibrationPolicy(current) != vrrCalibrationPolicy(restored));
+            }
             auto future = current;
-            future.playoutVrr18IntervalFeedback = Vrr18GoalIntervalFeedback + 1;
+            future.playoutVrr18IntervalFeedback = Vrr18PredictiveIntervalFeedback + 1;
             QVERIFY(!validateVrrTimingParameters(future, error));
             auto retired = current;
             retired.playoutPredictionOnly = 0;

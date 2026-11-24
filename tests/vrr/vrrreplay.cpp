@@ -1765,6 +1765,11 @@ struct Metrics {
     Vrr13::InputGoalBuffer::Stats simulatedInputPercentile;
     double simulatedInputBufferSumUs = 0;
     uint64_t simulatedInputBufferRows = 0;
+    uint64_t forecastGrowths = 0;
+    uint64_t lastPacingSampleUs = 0;
+    uint64_t qualifiedPacingUs = 0, pacingAtGoalUs = 0;
+    double closingPacingPercent = 0;
+    bool previousPacingQualified = false;
 
     uint64_t delivered = 0;
     uint64_t preparedAheadFrames = 0;
@@ -5717,6 +5722,13 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
 
     QJsonObject simulation;
     simulation["model"] = kReplayModel;
+    if (metrics.lastPacingSampleUs) {
+        simulation["pacing_score"] = QJsonObject{
+            {"closing_percent", metrics.closingPacingPercent},
+            {"qualified_us", qint64(metrics.qualifiedPacingUs)},
+            {"at_goal_us", qint64(metrics.pacingAtGoalUs)},
+            {"forecast_growths", qint64(metrics.forecastGrowths)}};
+    }
     QJsonObject smoothnessFeedback;
     const auto& feedback = metrics.lastFeedbackDecision;
     smoothnessFeedback["protection_us"] = double(feedback.smoothnessProtectionUs);
@@ -15277,7 +15289,22 @@ int main(int argc, char* argv[])
             auditBufferUpdate();
         }
         {
-            const auto input = simulatedController->intervalStats().inputPercentile;
+            const auto stats = simulatedController->intervalStats();
+            const auto now = stats.update.atUs;
+            if (now && stats.evaluatedUs && now != metrics.lastPacingSampleUs) {
+                if (stats.averageValid && metrics.previousPacingQualified &&
+                        now > metrics.lastPacingSampleUs && now - metrics.lastPacingSampleUs < 1000000) {
+                    const auto elapsed = now - metrics.lastPacingSampleUs;
+                    metrics.qualifiedPacingUs += elapsed;
+                    if (metrics.closingPacingPercent >= scenario.controller.playoutOnTimeTargetPerMillion / 10000.0)
+                        metrics.pacingAtGoalUs += elapsed;
+                }
+                metrics.forecastGrowths += stats.update.action == Vrr13::IntervalBuffer::Action::ForecastGrow;
+                metrics.lastPacingSampleUs = now;
+                metrics.closingPacingPercent = stats.qualityPercent();
+                metrics.previousPacingQualified = stats.averageValid;
+            }
+            const auto input = stats.inputPercentile;
             metrics.simulatedInputPercentile = input;
             if (input.initialized) {
                 metrics.simulatedInputBufferSumUs += double(input.currentUs);

@@ -163,7 +163,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         config.latencyMode : 1;
     const auto options = config.timingOptions.resolved(latencyMode);
     const bool vrr18 = config.vrr18IntervalFeedback;
-    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18GoalIntervalFeedback : 0;
+    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18PredictiveIntervalFeedback : 0;
     parameters.playoutIntervalToleranceUs = options.toleranceUs;
     // Presets change only the four user-visible values. Admission, release,
     // and late-frame recovery use the same policy for every combination.
@@ -2571,7 +2571,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 taperRelease ? m_Parameters.playoutIntervalReleaseTauUs : 0,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18SharedIntervalScore,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18RecoverableIntervalFeedback,
-                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18GoalIntervalFeedback);
+                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18GoalIntervalFeedback,
+                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18PredictiveIntervalFeedback);
             if (m_Parameters.playoutInputPercentileEnabled) {
                 const auto capacity = m_IntervalBuffer.stats();
                 const bool validInput = submitted && !cancelled && m_Pending.intervalValid &&
@@ -4021,8 +4022,8 @@ void VrrTimingController::updatePlayoutHistory(
             m_RequestedPlayoutDelayUs = clampUnsigned(
                 requestedDemandUs, playoutDelayMinimumUs(),
                 playoutDelayMaximumUs());
-            // Increases spread over several frames; release is time-based in
-            // the observer. No prediction or cached percentile can authorize growth.
+            // The observer can request protection for recurring, corroborated misses.
+            // Apply increases across frames to limit the change in handoff spacing.
             if (m_RequestedPlayoutDelayUs > m_AppliedPlayoutDelayUs)
                 m_AppliedPlayoutDelayUs += std::min<uint64_t>(125,
                     m_RequestedPlayoutDelayUs - m_AppliedPlayoutDelayUs);

@@ -1,7 +1,7 @@
 # Streaming and VRR architecture
 
 Source baseline: the published `v6.2.0-daily.201` client with VRR18 interval
-feedback restored for live sessions, with revision 5 used for new streams.
+feedback restored for live sessions, with revision 6 used for new streams.
 Buffer growth uses delivery and decode readiness at both ends of an interval. The custom profile exposes the frame allowance, timing
 target, score history, and interval tolerance. The renderer,
 observed D3D11 completion, and schema-6 capture contracts come from the newer
@@ -695,6 +695,19 @@ as evidence that the reserve can be removed. Clean observations allow release
 back to the configured minimum. The pacing score, its tolerance and its
 history window keep their existing definitions. Exact replay selects the
 feedback revision recorded in each capture.
+
+Revision 6 can request more buffer between hitches. It measures the mean
+recoverable cost of stretched intervals over two successive seconds of
+qualified input at a steady source cadence. Each second includes clean and
+already-covered pairs in its elapsed time. A compressed successor adds no
+second growth vote for the same late frame. Each proposal starts from the
+smallest applied buffer in that window and asks for at most one tolerance
+of extra delay, scaled by the measured benefit of that step. The controller
+uses the smaller proposal only while the observed pacing score is below goal.
+Gaps, cadence changes, missing readiness and overload discard the forecast.
+The ordinary response to a fresh miss and the release law still apply.
+Replay reports forecast growths and qualified time at goal in
+`simulation.pacing_score`.
 
 The Client timing score and its one-second mean require timely complete-frame
 arrival at both ends of an interval. The controller compares compressed-frame
