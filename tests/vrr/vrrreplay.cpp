@@ -11944,13 +11944,11 @@ int main(int argc, char* argv[])
             QJsonObject capturedControllerSnapshot;
             for (const QString& path : vrrReplayParameterNames()) {
                 if (!path.startsWith("controller.")) continue;
+                const QString name = path.section('.', 1, 1);
                 const auto column = columns.capturedParameterColumns.find(path);
                 if (column == columns.capturedParameterColumns.end()) {
-                    if (path == QStringLiteral("controller.playout_vrr18_interval_feedback") ||
-                            path == QStringLiteral("controller.playout_interval_release_tau_us") ||
-                            path == QStringLiteral("controller.playout_interval_taper_hold_us")) {
-                        // Older schema-6 captures predate these interval-buffer options.
-                        capturedControllerSnapshot.insert(path.section('.', 1, 1), 0);
+                    if (vrrCaptureDefaultsControllerFieldToZero(name)) {
+                        capturedControllerSnapshot.insert(name, 0);
                         continue;
                     }
                     std::fprintf(stderr, "Schema 6 trace is missing captured controller parameter: %s\n", qPrintable(path));
@@ -11962,7 +11960,7 @@ int main(int argc, char* argv[])
                     std::fprintf(stderr, "Schema 6 trace has an inexact captured controller parameter: %s\n", qPrintable(path));
                     return 1;
                 }
-                capturedControllerSnapshot.insert(path.section('.', 1, 1), static_cast<double>(capturedValue));
+                capturedControllerSnapshot.insert(name, static_cast<double>(capturedValue));
             }
             if (!applyVrrReplayControllerSnapshot(capturedControllerSnapshot, capturedParameters, error)) {
                 std::fprintf(stderr, "Schema 6 trace has invalid captured parameters: %s\n", qPrintable(error));

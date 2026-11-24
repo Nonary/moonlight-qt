@@ -127,9 +127,9 @@ QJsonObject vrrExecutionParametersToJson(
     const VrrReplayExecutionParameters& value);
 QJsonObject vrrDefaultReplayConfigurationJson();
 QStringList vrrReplayParameterNames();
-// Historical schema-5 semantics for a missing captured controller field.
-// Accepts a bare JSON name or controller.<name>; empty means unknown.
-QString vrrLegacyControllerParameterDefaultText(const QString& path);
+// These policy fields were added after schema 6 shipped. Captures without
+// them used the original behavior, represented by zero in each case.
+bool vrrCaptureDefaultsControllerFieldToZero(const QString& name);
 
 bool loadVrrReplayConfiguration(const QByteArray& json,
                                 VrrReplayConfiguration& configuration,

@@ -13,6 +13,7 @@ class VrrReplayConfigTest : public QObject
 private slots:
     void defaultsRoundTrip();
     void productionPolicyValidation();
+    void reseedNominalTargetPolicy();
     void customToleranceRoundTrip();
     void inputPercentileToleranceRoundTrip();
     void initialCalibrationPolicyRoundTrip();
@@ -308,6 +309,26 @@ void VrrReplayConfigTest::queuedRecoveryFloorRoundTrip()
     }
     QVERIFY(!applyVrrReplayControllerSnapshot({{"latched_floor_disabled", 4}}, restored, error));
     QCOMPARE(restored.latchedFloorDisabled, uint64_t(3));
+}
+
+void VrrReplayConfigTest::reseedNominalTargetPolicy()
+{
+    VrrTimingParameters historical;
+    QCOMPARE(historical.playoutReseedNominalTarget, uint64_t(0));
+    QVERIFY(vrrCaptureDefaultsControllerFieldToZero("playout_reseed_nominal_target"));
+    QVERIFY(!vrrCaptureDefaultsControllerFieldToZero("playout_offset_reseed_frames"));
+
+    const auto current = vrrTimingParametersForSession(VrrSessionConfig{}, false, false);
+    QCOMPARE(current.playoutReseedNominalTarget, uint64_t(1));
+    QString error;
+    auto snapshot = vrrTimingParametersToJson(current);
+    snapshot.remove("playout_reseed_nominal_target");
+    QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, historical, error), qPrintable(error));
+    QCOMPARE(historical.playoutReseedNominalTarget, uint64_t(0));
+    QVERIFY2(applyVrrReplayControllerSnapshot({{"playout_reseed_nominal_target", 1}}, historical, error),
+             qPrintable(error));
+    QCOMPARE(historical.playoutReseedNominalTarget, uint64_t(1));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_reseed_nominal_target", 2}}, historical, error));
 }
 
 void VrrReplayConfigTest::productionPolicyValidation()

@@ -339,6 +339,14 @@ QJsonObject vrrDefaultReplayConfigurationJson()
     return root;
 }
 
+bool vrrCaptureDefaultsControllerFieldToZero(const QString& name)
+{
+    return name == QStringLiteral("playout_vrr18_interval_feedback") ||
+           name == QStringLiteral("playout_interval_release_tau_us") ||
+           name == QStringLiteral("playout_interval_taper_hold_us") ||
+           name == QStringLiteral("playout_reseed_nominal_target");
+}
+
 QStringList vrrReplayParameterNames()
 {
     QStringList names;
@@ -476,6 +484,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.playoutOffsetCadenceGate > 1) {
         return fail("playout_offset_cadence_gate must be 0 or 1");
+    }
+    if (value.playoutReseedNominalTarget > 1) {
+        return fail("playout_reseed_nominal_target must be 0 or 1");
     }
     if (value.playoutOffsetSourceClock > 1) {
         return fail("playout_offset_source_clock must be 0 or 1");

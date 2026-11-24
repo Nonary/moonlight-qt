@@ -147,7 +147,19 @@ public:
             if(!parameterKeys.contains(key)){error="unsupported controller parameter: "+QString::fromLatin1(key);return false;}
             sessionKeys.append(key);
         }
-        bool session=false;QJsonObject snapshot;QMap<QByteArray,QByteArray> sessionValues;
+        QJsonObject snapshot;
+        if (columns.contains("trace_schema")) {
+            for (const auto& key : parameterKeys) {
+                if (columns.contains(key)) continue;
+                const QString name = QString::fromLatin1(key.mid(6)); // Strip "param_".
+                if (!vrrCaptureDefaultsControllerFieldToZero(name)) {
+                    error = "capture is missing required controller parameter: " + name;
+                    return false;
+                }
+                snapshot.insert(name, 0);
+            }
+        }
+        bool session=false;QMap<QByteArray,QByteArray> sessionValues;
         for(int line=1;line<lines.size();++line){
             if(lines[line].trimmed().isEmpty()||lines[line].startsWith('#'))continue;
             const auto v=lines[line].trimmed().split(',');if(v.size()!=header.size()){error="malformed CSV";return false;}
@@ -222,8 +234,7 @@ public:
                 config.experimentalInputPercentileWindowUs=value("param_playout_input_percentile_window_us");
                 if(columns.contains("playout_initial_profile"))initialProfile=v[columns["playout_initial_profile"]];
 #define VRR_READ_REPLAY_PARAMETER(type,name,member,defaultValue) \
-                if(columns.contains("param_" #name)) snapshot[#name]=double(value("param_" #name)); \
-                else if(columns.contains("trace_schema")) snapshot[#name]=vrrLegacyControllerParameterDefaultText(QStringLiteral(#name)).toDouble();
+                if(columns.contains("param_" #name)) snapshot[#name]=double(value("param_" #name));
                 VRR_TIMING_PARAMETER_FIELDS(VRR_READ_REPLAY_PARAMETER)
 #undef VRR_READ_REPLAY_PARAMETER
                 session=true;
@@ -237,7 +248,7 @@ public:
         std::vector<uint64_t> sequences;for(auto&i:inputs)sequences.push_back(i.sequence);
         std::sort(sequences.begin(),sequences.end());
         for(size_t k=0;k<sequences.size();++k)if(sequences[k]!=k+1){error="incomplete/duplicate arrival sequence";return false;}
-        // Captured omissions use the frozen reader's historical mapping above;
+        // Captured omissions are allowed only for fields with a known historical default;
         // declared synthetic omissions use the explicitly compiled schema defaults.
         // Neither path silently imports today's live-session resolver.
         parameters=VrrTimingParameters{};

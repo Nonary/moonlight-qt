@@ -172,6 +172,8 @@ constexpr uint64_t Vrr18CostAwareIntervalFeedback = 7;
     X(uint64_t, playout_delay_start_period_per_mille, playoutDelayStartPeriodPerMille, 0) \
     X(uint64_t, playout_delay_maximum_period_per_mille, playoutDelayMaximumPeriodPerMille, 0) \
     X(uint64_t, playout_offset_reseed_frames, playoutOffsetReseedFrames, 1) \
+    /* Older captures kept the nominal deadline across a non-native reseed. */ \
+    X(uint64_t, playout_reseed_nominal_target, playoutReseedNominalTarget, 0) \
     X(uint64_t, playout_delay_slew_across_bands, playoutDelaySlewAcrossBands, 0) \
     X(uint64_t, playout_prepare_on_arrival, playoutPrepareOnArrival, 0) \
     X(uint64_t, render_start_after_submission_us, renderStartAfterSubmissionUs, 0) \

@@ -640,6 +640,12 @@ controller also uses bounded phase-trajectory catch-up, readiness and display
 floors, and presenter-specific latch protection. Applied input buffering,
 planned extra delay, queue capacity and retained phase are distinct quantities.
 
+After a confirmed source-clock jump, the controller recomputes the nominal
+submission deadline from the new clock mapping. Phase recovery and the render
+wait use that deadline and still respect readiness and display spacing.
+The recorded `playout_reseed_nominal_target` parameter lets exact replay
+restore the earlier deadline behavior for captures made before this change.
+
 ## 9. Adaptive input buffer and calibration
 
 Live sessions adjust the buffer from observed presentation spacing after a

@@ -962,6 +962,59 @@ void testFutureSourceProjectionReseedsPhase()
            "a source projection ahead of decoded local time must reseed phase without discarding cadence");
 }
 
+void testConfirmedClockReseedReplacesNominalDeadline()
+{
+    constexpr uint32_t jumpTicks = 36000; // 400 ms at 90 kHz.
+    for (bool nativeAbsorb : {false, true}) for (bool historical : {false, true}) {
+        const auto session = vrrProductionSession(1, 120, 120, nativeAbsorb, nativeAbsorb);
+        auto policy = vrrTimingParametersForSession(session, nativeAbsorb, nativeAbsorb);
+        if (nativeAbsorb) {
+            // Exact replay can still select the retired native Absorb path.
+            policy.smoothingMode = VrrSmoothingAbsorb;
+            policy.playoutSmoothingOwnMovement = 1;
+        }
+        if (historical) policy.playoutReseedNominalTarget = 0;
+        VrrTimingController controller(session, true, policy);
+
+        uint32_t timestamp = 0;
+        uint64_t nowUs = 1000000;
+        int frameNumber = 0;
+        const auto schedule = [&] {
+            timestamp += 750;
+            nowUs += 8333;
+            return controller.schedule(frame(++frameNumber, timestamp, true, nowUs), nowUs);
+        };
+        for (int i = 0; i < 7; ++i) {
+            const auto decision = schedule();
+            controller.noteSubmission(true, false, decision.targetUs);
+        }
+        timestamp += jumpTicks;
+        for (uint64_t i = 1; i < policy.playoutOffsetReseedFrames; ++i) {
+            const auto pending = schedule();
+            expect(pending.sourceTimeUs > nowUs + 300000,
+                   "one future RTP projection must not reset the clock before confirmation");
+            controller.noteSubmission(false, false, 0);
+        }
+
+        const auto confirmed = schedule();
+        expect(confirmed.phaseDiscontinuity && confirmed.sourceTimeUs == nowUs,
+               "the confirmed RTP jump must reset the source clock to this arrival");
+        if (historical && !nativeAbsorb) {
+            expect(confirmed.originalTargetUs > nowUs + 300000 &&
+                   confirmed.targetUs == confirmed.originalTargetUs,
+                   "historical worker replay must reproduce the old nominal deadline");
+        }
+        else {
+            const uint64_t corrected = nowUs + confirmed.playoutDelayUs +
+                confirmed.renderLeadUs + policy.presentationSafetyUs;
+            expect(confirmed.originalTargetUs == corrected && confirmed.targetUs == corrected,
+                   "the target limiter must keep the corrected nominal deadline after a clock reseed");
+            expect(confirmed.renderStartUs <= corrected,
+                   "the worker must begin preparing the reset frame by its corrected deadline");
+        }
+    }
+}
+
 void testDecodeTailAdaptation()
 {
     VrrTimingController controller(config());
@@ -4660,6 +4713,7 @@ int main()
     testHeadroomAwareReadinessReserve();
     testCadenceGapAndRateChange();
     testFutureSourceProjectionReseedsPhase();
+    testConfirmedClockReseedReplacesNominalDeadline();
     testDecodeTailAdaptation();
     testRateChangeReseedsReadinessBudget();
     testFractionalQuantizedCadenceLearning();

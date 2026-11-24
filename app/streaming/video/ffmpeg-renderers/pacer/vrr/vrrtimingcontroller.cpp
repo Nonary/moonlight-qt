@@ -367,6 +367,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         options.bufferPerMille;
     parameters.playoutSmoothingSnapPerMille = kPlayoutSmoothingSnapPerMille;
     parameters.playoutOffsetReseedFrames = kPlayoutOffsetReseedFrames;
+    parameters.playoutReseedNominalTarget = 1;
     parameters.playoutDelaySlewAcrossBands = 1;
     // Spend the existing playout interval on preparation on both platforms.
     // Vulkan can hand off a pending GPU render using its present semaphore;
@@ -1075,7 +1076,11 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                 playoutDelayUs,
                 saturatingAdd(m_RenderLeadUs,
                               m_Parameters.presentationSafetyUs)));
-        if (nativeAbsorb) originalTargetUs = targetUs;
+        // The old nominal deadline belongs to the discarded clock mapping.
+        // Recovery and pacing must start from the corrected deadline too.
+        if (m_Parameters.playoutReseedNominalTarget || nativeAbsorb) {
+            originalTargetUs = targetUs;
+        }
     }
     else if (futureProjection && nativeAbsorb) {
         // Keep the native queue available for the next observation instead
