@@ -273,6 +273,7 @@ HEADERS += \
     cli/startstream.h \
     settings/streamingpreferences.h \
     settings/vrrtimingoptions.h \
+    diagnostics/asynclogwriter.h \
     diagnostics/diagnosticcapture.h \
     diagnostics/gputrace.h \
     diagnostics/diagnosticzip.h \

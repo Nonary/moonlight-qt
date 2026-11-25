@@ -1631,6 +1631,13 @@ boundaries and obtaining the missing evidence.
 
 ## 13. Trace architecture and replay fidelity
 
+SDL, Qt and FFmpeg messages share a process log writer. During streaming,
+callbacks enqueue messages on a dedicated worker started before the handlers
+are installed. This avoids re-entering the logger while SDL holds its log lock
+and Qt starts a pool thread. Log writes suppress recursion on the writing
+thread. If the worker cannot start, logging falls back to synchronous writes.
+A drain waits for queued and in-flight writes before closing a session capture.
+
 `MOONLIGHT_VRR_TRACE` enables a local CSV or compressed `.vrrtrace` capture;
 `MOONLIGHT_VRR_DEEP_TRACE` adds diagnostic detail. The bounded producer queue
 and background writer keep formatting, compression and I/O off frame delivery.

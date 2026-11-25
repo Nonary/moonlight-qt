@@ -6,6 +6,8 @@
 #include <QIcon>
 #include <QQuickStyle>
 #include <QMutex>
+#include <QScopedValueRollback>
+#include <QThreadPool>
 #include <QtDebug>
 #include <QNetworkProxyFactory>
 #include <QPalette>
@@ -49,6 +51,7 @@
 #include "path.h"
 #include "utils.h"
 #include "diagnostics/diagnosticcapture.h"
+#include "diagnostics/asynclogwriter.h"
 #include "gui/computermodel.h"
 #include "gui/appmodel.h"
 #include "gui/recentappsmodel.h"
@@ -82,8 +85,8 @@ QAtomicInt g_AsyncLoggingEnabled;
 
 static QElapsedTimer s_LoggerTime;
 static QTextStream s_LoggerStream(stderr);
-static QThreadPool s_LoggerThread;
 static QMutex s_SyncLoggerMutex;
+static thread_local bool s_WritingLog;
 static bool s_SuppressVerboseOutput;
 static QRegularExpression k_RikeyRegex("&rikey=\\w+");
 static QRegularExpression k_RikeyIdRegex("&rikeyid=[\\d-]+");
@@ -98,42 +101,33 @@ static QFile* s_LoggerFile;
 extern "C" bool g_DisableDrmHooks;
 #endif
 
-class LoggerTask : public QRunnable
+static void writeLogMessage(const QString& message, bool normalOutput)
 {
-public:
-    LoggerTask(const QString& msg, bool normalOutput = true) : m_Msg(msg), m_NormalOutput(normalOutput)
-    {
-        setAutoDelete(true);
+    QScopedValueRollback<bool> writingLog(s_WritingLog, true);
+    QMutexLocker locker(&s_SyncLoggerMutex);
+    if (normalOutput) {
+        s_LoggerStream << message;
+        s_LoggerStream.flush();
     }
+    DiagnosticCapture::appendLog(message);
+}
 
-    void run() override
-    {
-        // QTextStream is not thread-safe, so we must lock. This will generally
-        // only contend in synchronous logging mode or during a transition
-        // between synchronous and asynchronous. Asynchronous won't contend in
-        // the common case because we only have a single logging thread.
-        QMutexLocker locker(&s_SyncLoggerMutex);
-        if (m_NormalOutput) {
-            s_LoggerStream << m_Msg;
-            s_LoggerStream.flush();
-        }
-        DiagnosticCapture::appendLog(m_Msg);
-    }
-
-private:
-    QString m_Msg;
-    bool m_NormalOutput;
-};
+static AsyncLogWriter s_AsyncLogWriter(writeLogMessage);
 
 void Utils::flushLogs()
 {
-    s_LoggerThread.waitForDone();
+    s_AsyncLogWriter.drain();
     QMutexLocker locker(&s_SyncLoggerMutex);
     s_LoggerStream.flush();
 }
 
 void logToLoggerStream(QString& message)
 {
+    // Qt may report a write error through the same logger.
+    if (s_WritingLog) {
+        return;
+    }
+
 #if defined(QT_DEBUG) && defined(Q_OS_WIN32)
     // Output log messages to a debugger if attached
     if (IsDebuggerPresent()) {
@@ -163,13 +157,8 @@ void logToLoggerStream(QString& message)
     }
 #endif
 
-    if (g_AsyncLoggingEnabled) {
-        // Queue the log message to be written asynchronously
-        s_LoggerThread.start(new LoggerTask(message, normalOutput));
-    }
-    else {
-        // Log the message immediately
-        LoggerTask(message, normalOutput).run();
+    if (!g_AsyncLoggingEnabled || !s_AsyncLogWriter.enqueue(message, normalOutput)) {
+        writeLogMessage(message, normalOutput);
     }
 }
 
@@ -512,9 +501,10 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    // Serialize log messages on a single thread
-    s_LoggerThread.setMaxThreadCount(1);
     s_LoggerTime.start();
+    // A logging callback can run under SDL's log lock. Keep worker creation
+    // outside it, since Qt can log synchronously while starting a pool thread.
+    const bool asyncLogWriterStarted = s_AsyncLogWriter.start();
 
     // Register our logger with all libraries
 #if SDL_VERSION_ATLEAST(3, 0, 0)
@@ -526,6 +516,9 @@ int main(int argc, char *argv[])
     SDL_LogSetOutputFunction(sdlLogToDiskHandler, nullptr);
 #endif
     qInstallMessageHandler(qtLogToDiskHandler);
+    if (!asyncLogWriterStarted) {
+        qWarning("Could not start the log writer. Logging will be synchronous.");
+    }
 
 #if defined(Q_OS_LINUX) && defined(HAVE_LIBVA)
     // Mesa snapshots driver options when its screen is first created, which
@@ -1155,7 +1148,7 @@ int main(int argc, char *argv[])
     Q_ASSERT(g_AsyncLoggingEnabled == 0);
 
     // Wait for pending log messages to be printed
-    s_LoggerThread.waitForDone();
+    Utils::flushLogs();
 
 #ifdef Q_OS_WIN32
     // Without an explicit flush, console redirection for the list command
