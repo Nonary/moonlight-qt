@@ -1088,7 +1088,10 @@ void testReleaseBehindSpacingFloor()
                 policy.playoutIntervalInitialMinimumSamples, true, 0, true, true,
                 policy.playoutVrr18IntervalFeedback >= Vrr18GoalIntervalFeedback,
                 policy.playoutVrr18IntervalFeedback >= Vrr18PredictiveIntervalFeedback,
-                policy.playoutVrr18IntervalFeedback >= Vrr18CostAwareIntervalFeedback);
+                policy.playoutVrr18IntervalFeedback >= Vrr18CostAwareIntervalFeedback,
+                policy.playoutVrr18IntervalFeedback >= Vrr18AnticipatoryIntervalFeedback,
+                policy.playoutVrr18IntervalFeedback >= Vrr18TargetAwareRelease,
+                policy.playoutVrr18IntervalFeedback);
         }
         return observer.stats().update.requestedUs;
     };

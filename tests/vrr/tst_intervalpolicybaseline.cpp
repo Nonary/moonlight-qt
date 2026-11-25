@@ -1,9 +1,163 @@
 #include "vrrproductionsession.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <vector>
+
+// Scan the original physical rings on every observation. This independent
+// reference also sees retained future buckets again after a backwards clock.
+static bool rollingScoresMatchScan()
+{
+    using Buffer = Vrr13::IntervalBuffer;
+    enum Field { Evaluated, Failed, Loss, ClientEvaluated, ClientLoss, BufferEvaluated,
+                 BufferFailed, BufferLoss, FieldCount };
+    using Scores = std::array<double, FieldCount>;
+    struct ScoreEntry { uint64_t tick = 0; Scores value{}; };
+    struct ShortSample { uint64_t tick, error, service, intended; bool client; };
+    std::vector<ScoreEntry> reference(Buffer::MaximumScoreBuckets);
+    std::deque<ShortSample> recent;
+    Buffer buffer;
+    Buffer::Sample previous;
+    uint64_t source = 297000000, first = 0, samples = 0, warmup = 0;
+    bool calibrated = false;
+    for (uint64_t i = 1; i <= 6600; ++i) {
+        if (i == 1900) source -= 17000000;
+        if (i == 3300) source += 401000000;
+        if (i == 3411) source -= 400000000;
+        if (i == 5000) {
+            buffer.reset();
+            std::fill(reference.begin(), reference.end(), ScoreEntry{});
+            previous = {};
+            calibrated = false;
+        }
+        source += i % 5 ? 33333 : 2501;
+        const uint64_t lag = i % 11 == 0 ? 4100 : i % 7 * 213;
+        Buffer::Sample s{i, source, source + lag, source, source + lag, 1500, true, true};
+        s.serialService = i % 37 < 23 ? 45000 : 400;
+        s.inputOnTime = i % 13 < 9;
+        if (i % 711 == 0) s.valid = false;
+        if (i % 881 == 0) s.submitted = 0;
+        constexpr uint64_t windows[] = {300000000, 120000001, 200000, 0, 900000000};
+        const uint64_t window = windows[(i / 193) % 5];
+        const bool weighted = i % 79 < 64, averaged = i % 107 < 71, shared = i % 131 < 41;
+        buffer.observe(s, 0, 8000, 1000000, 250, weighted, 995000, 500, window,
+                       250000, 2, averaged, 0, shared);
+        const auto observed = buffer.stats();
+        const bool adjacent = previous.valid && s.valid && s.submitted > previous.submitted &&
+            previous.submitted && s.submitted - previous.submitted < 1000000 &&
+            s.intended > previous.intended && s.intended - previous.intended < 1000000;
+        const auto tick = s.submitted / Buffer::ScoreBucketUs;
+        double average = 0, clientAverage = 0;
+        bool clientAverageValid = false, averageValid = false, overloaded = false;
+        if (adjacent) {
+            const uint64_t actual = s.submitted - previous.submitted, intended = s.intended - previous.intended;
+            const uint64_t error = std::max(actual, intended) - std::min(actual, intended);
+            const bool client = previous.inputOnTime && s.inputOnTime;
+            const uint64_t shortTick = s.submitted / 10000;
+            recent.push_back({shortTick, error, s.serialService, intended, client});
+            while (shortTick - recent.front().tick >= 100) recent.pop_front();
+            uint64_t total = 0, clientError = 0, clients = 0, service = 0, intendedTotal = 0;
+            for (const auto& item : recent) {
+                total += item.error;
+                if (item.client) { clientError += item.error; ++clients; }
+                service += item.service;
+                intendedTotal += item.intended;
+            }
+            average = double(total) / recent.size();
+            clientAverageValid = clients > 0;
+            clientAverage = clients ? double(clientError) / clients : 0;
+            if (!samples) { first = s.submitted; warmup = calibrated ? 1000000 : 250000; }
+            ++samples;
+            averageValid = recent.size() >= 2 && samples >= 2 && s.submitted - first >= warmup;
+            calibrated |= averageValid;
+            overloaded = averageValid && service > intendedTotal;
+
+            auto& bucket = reference[tick % reference.size()];
+            if (bucket.tick != tick) bucket = {tick, {}};
+            auto& score = bucket.value;
+            const double loss = actual * std::clamp((double(error) - 500) / intended, 0.0, 1.0);
+            score[Evaluated] += actual;
+            if (error > 500) score[Failed] += actual;
+            if (weighted) score[Loss] += loss;
+            if (client) { score[ClientEvaluated] += actual; score[ClientLoss] += loss; }
+            if (!shared && (!averaged || averageValid)) {
+                const double excess = std::max(0.0, (averaged ? average : double(error)) - 500);
+                score[BufferEvaluated] += actual;
+                if (excess > 0) score[BufferFailed] += actual;
+                if (weighted) score[BufferLoss] += actual * std::min(1.0, excess / intended);
+            }
+        } else {
+            recent.clear();
+            samples = 0;
+        }
+        previous = s;
+        if (observed.averageErrorUs != average || observed.clientAverageErrorUs != clientAverage ||
+            observed.clientAverageValid != clientAverageValid || observed.averageValid != averageValid ||
+            (adjacent && observed.serviceOverloaded != overloaded)) {
+            std::fprintf(stderr, "one-second history differs from scan at frame %llu\n",
+                         static_cast<unsigned long long>(i));
+            return false;
+        }
+
+        const auto width = std::clamp<uint64_t>((window + Buffer::ScoreBucketUs - 1) / Buffer::ScoreBucketUs,
+                                                 1, reference.size());
+        Scores expected{};
+        for (const auto& b : reference) {
+            if (b.tick <= tick && tick - b.tick < width)
+                for (size_t j = 0; j < expected.size(); ++j) expected[j] += b.value[j];
+        }
+        const Scores actual{double(observed.evaluatedUs), double(observed.failedUs), observed.weightedLossUs,
+            double(observed.clientEvaluatedUs), observed.clientWeightedLossUs, double(observed.bufferEvaluatedUs),
+            double(observed.bufferFailedUs), observed.bufferWeightedLossUs};
+        for (size_t j = 0; j < expected.size(); ++j) {
+            const bool fractional = j == Loss || j == ClientLoss || j == BufferLoss;
+            const double tolerance = fractional ? 1e-12 * expected[j] : 0;
+            if (std::abs(actual[j] - expected[j]) > tolerance) {
+                std::fprintf(stderr, "score field %zu at frame %llu: expected %.17g, got %.17g\n",
+                             j, static_cast<unsigned long long>(i), expected[j], actual[j]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// This stream sits exactly on a 99% goal in real arithmetic. Each pair
+// loses 101.51 us in binary floating point. A different summation order can
+// put it on the other side of the growth/release branch.
+static bool thresholdMatchesOriginalOrder()
+{
+    using Buffer = Vrr13::IntervalBuffer;
+    Buffer buffer;
+    struct Entry { uint64_t tick = 0; double loss = 0; };
+    std::vector<Entry> ring(Buffer::MaximumScoreBuckets);
+    for (uint64_t i = 1; i <= 1200; ++i) {
+        const uint64_t submitted = 297000000 + i * 10151;
+        Buffer::Sample s{i, 297000000 + i * 10000, submitted, submitted - 100, submitted,
+                         1000, true, true};
+        buffer.observe(s, 0, 9000, 100000, 250, true, 990000, 51, 5100000, 0, 2,
+                       false, 0, true);
+        const auto tick = submitted / Buffer::ScoreBucketUs;
+        auto& bucket = ring[tick % ring.size()];
+        if (bucket.tick != tick) bucket = {tick, 0};
+        if (i > 1) bucket.loss += 10151 * (100.0 / 10000);
+        double expected = 0;
+        for (const auto& entry : ring)
+            if (entry.tick <= tick && tick - entry.tick < 51) expected += entry.loss;
+        const auto stats = buffer.stats();
+        if (stats.averageValid && stats.weightedLossUs != expected) {
+            std::fprintf(stderr, "target-boundary summation changed at frame %llu\n",
+                         static_cast<unsigned long long>(i));
+            return false;
+        }
+    }
+    return true;
+}
 
 // These fingerprints record current interval diagnostics before removing
 // the remaining retired interval policy branches. They are a regression guard, not an optical measurement.
@@ -89,6 +243,7 @@ static uint64_t run(int preset, int smoothing, int presentation, bool custom)
 
 int main(int argc, char** argv)
 {
+    if (!rollingScoresMatchScan() || !thresholdMatchesOriginalOrder()) return 1;
     const bool generate = argc == 2 && std::strcmp(argv[1], "--generate") == 0;
     // Recorded before removing the historical policies.
     static const uint64_t expected[] = {

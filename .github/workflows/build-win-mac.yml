@@ -146,6 +146,16 @@ jobs:
           & ./build/tests-vrr/updates/release/tst_autoupdatechecker.exe
           if ($LASTEXITCODE -ne 0) { throw "Nightly updater tests failed: $LASTEXITCODE" }
 
+      - name: Test adaptive buffer with virtual streams (Windows x64)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $deploy = (Resolve-Path build/deploy-x64-release).Path
+          $env:Path = "$deploy;$env:Path"
+          New-Item -ItemType Directory -Force build/trace-contracts | Out-Null
+          & ./build/tests-vrr/vrr/release/vrrbuffersim.exe --budget-ms 5000 --output build/trace-contracts/buffer-simulator.json
+          if ($LASTEXITCODE -ne 0) { throw "Buffer simulator failed with exit $LASTEXITCODE" }
+
       - name: Test VRR diagnostics (Windows x64)
         timeout-minutes: 10
         if: runner.os == 'Windows'

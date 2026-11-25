@@ -163,7 +163,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         config.latencyMode : 1;
     const auto options = config.timingOptions.resolved(latencyMode);
     const bool vrr18 = config.vrr18IntervalFeedback;
-    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18CostAwareIntervalFeedback : 0;
+    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18SelectedGoalRelease : 0;
     parameters.playoutIntervalToleranceUs = options.toleranceUs;
     // Presets change only the four user-visible values. Admission, release,
     // and late-frame recovery use the same policy for every combination.
@@ -2551,8 +2551,8 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         const uint64_t toleranceUs = intervalQualityToleranceUs(m_Parameters);
         // At the refresh ceiling the physical spacing floor can retain phase
         // after the buffer releases. Keep the established release law there.
-        const bool taperRelease = m_Parameters.playoutIntervalReleaseTauUs &&
-            m_SourcePeriodUs > saturatingAdd(m_DisplayPeriodUs, m_DisplayPeriodUs / 1000);
+        const bool belowCeiling = m_SourcePeriodUs > saturatingAdd(m_DisplayPeriodUs, m_DisplayPeriodUs / 1000);
+        const bool taperRelease = m_Parameters.playoutIntervalReleaseTauUs && belowCeiling;
         const uint64_t intervalHoldUs = taperRelease && m_Parameters.playoutIntervalTaperHoldUs ?
             m_Parameters.playoutIntervalTaperHoldUs : m_Parameters.playoutMeanMissHoldUs;
         {
@@ -2578,7 +2578,10 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18RecoverableIntervalFeedback,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18GoalIntervalFeedback,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18PredictiveIntervalFeedback,
-                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18CostAwareIntervalFeedback);
+                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18CostAwareIntervalFeedback,
+                m_Parameters.playoutVrr18IntervalFeedback >= Vrr18AnticipatoryIntervalFeedback,
+                belowCeiling && m_Parameters.playoutVrr18IntervalFeedback >= Vrr18TargetAwareRelease,
+                belowCeiling && m_CanLatchPresentation ? m_Parameters.playoutVrr18IntervalFeedback : 0);
             if (m_Parameters.playoutInputPercentileEnabled) {
                 const auto capacity = m_IntervalBuffer.stats();
                 const bool validInput = submitted && !cancelled && m_Pending.intervalValid &&

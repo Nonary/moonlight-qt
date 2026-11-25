@@ -335,15 +335,16 @@ void VrrReplayConfigTest::productionPolicyValidation()
 {
     QString error;
     for (bool smoothing : {false, true}) for (bool absorb : {false, true})
-        for (bool scheduled : {false, true}) {
+        for (bool scheduled : {false, true}) for (int target : {9500, 9900, 9950}) {
             VrrSessionConfig session;
             session.smoothFrameTiming = smoothing;
             session.absorbMicrostutter = absorb;
+            session.timingOptions.targetHundredths = target;
             const auto current = vrrTimingParametersForSession(
                 vrrProductionSessionConfig(session), scheduled, scheduled);
-            QCOMPARE(current.playoutVrr18IntervalFeedback, Vrr18CostAwareIntervalFeedback);
+            QCOMPARE(current.playoutVrr18IntervalFeedback, Vrr18SelectedGoalRelease);
             QVERIFY2(validateVrrCurrentPolicy(current, error), qPrintable(error));
-            for (uint64_t revision = Vrr18AveragedIntervalFeedback; revision < Vrr18CostAwareIntervalFeedback; ++revision) {
+            for (uint64_t revision = Vrr18AveragedIntervalFeedback; revision < current.playoutVrr18IntervalFeedback; ++revision) {
                 auto historical = current;
                 historical.playoutVrr18IntervalFeedback = revision;
                 auto snapshot = vrrTimingParametersToJson(historical);
@@ -354,7 +355,7 @@ void VrrReplayConfigTest::productionPolicyValidation()
                 QVERIFY(vrrCalibrationPolicy(current) != vrrCalibrationPolicy(restored));
             }
             auto future = current;
-            future.playoutVrr18IntervalFeedback = Vrr18CostAwareIntervalFeedback + 1;
+            future.playoutVrr18IntervalFeedback = Vrr18SelectedGoalRelease + 1;
             QVERIFY(!validateVrrTimingParameters(future, error));
             auto retired = current;
             retired.playoutPredictionOnly = 0;

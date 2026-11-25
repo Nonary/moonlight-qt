@@ -4000,7 +4000,7 @@ void testExperimentalInputPercentileActivationTrace()
         capture->messages.emplace_back(message);
     }, &logs);
     struct Case { int mode, target, history; };
-    const Case cases[] = {{0,0,0},{1,0,0},{2,0,0},{1,9900,10},{1,9950,200},{1,9999,300},{1,-1,1},{1,10000,999}};
+    const Case cases[] = {{0,0,0},{1,0,0},{2,0,0},{1,9900,10},{1,9950,200},{1,9999,300},{1,-1,1},{1,10000,999},{1,9500,120}};
     const bool expectedBoundedCatchup = true;
     for (size_t caseIndex=0;caseIndex<std::size(cases);++caseIndex) {
         resetFakeClock();
@@ -4069,7 +4069,7 @@ void testExperimentalInputPercentileActivationTrace()
             ++rows;
             expect(fields.size() == columns.size() &&
                        fields.value(columns.indexOf("param_playout_vrr18_interval_feedback")).toULongLong() ==
-                           Vrr18CostAwareIntervalFeedback &&
+                           Vrr18SelectedGoalRelease &&
                        fields.value(columns.indexOf("param_playout_input_percentile_enabled")) == "0" &&
                        fields.value(columns.indexOf("param_playout_on_time_target_per_million")).toULongLong() == expected &&
                        fields.value(columns.indexOf("param_playout_readiness_window_us")).toULongLong() == expectedWindow,

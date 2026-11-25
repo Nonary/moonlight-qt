@@ -2004,6 +2004,37 @@ void testProfilesOrderEveryTrade()
     }
 }
 
+void testRelaxedReleaseRequiresMeasuredMargin()
+{
+    using Buffer = Vrr13::IntervalBuffer;
+    Buffer previous, relaxed;
+    bool held = true;
+    for (uint64_t i = 1; i <= 1200; ++i) {
+        Buffer::Sample s{};
+        s.frame = i;
+        s.intended = 1000000 + i * 10000;
+        s.buffer = 7000;
+        s.deadline = s.intended + s.buffer;
+        // Independently ready frames, with alternating 1.2 ms handoff error
+        // for 4.5 s. At 100 Hz and 500 us tolerance this costs 7% of the score.
+        s.submitted = s.deadline + (i <= 450 && i % 2 ? 1200 : 0);
+        s.ready = s.independentReadyUs = s.intended;
+        s.valid = s.absorbable = s.inputOnTime = true;
+        s.smoothedRtpSlotUs = s.intended;
+        s.sourcePeriodUs = 10000;
+        for (Buffer* observer : {&previous, &relaxed}) {
+            observer->observe(s, 1000, 10000, 5000000, 250, true, 950000, 500,
+                              120000000, 500000, 32, true, 12000000, true, true,
+                              true, true, true, true, observer == &relaxed);
+        }
+        // At 6 s the last second is clean but the accumulated cost still
+        // exceeds the 5% budget. Neither period justifies an accelerated drain.
+        if (i <= 600) held &= previous.demand(7000) == relaxed.demand(7000);
+    }
+    expect(held && relaxed.demand(7000) + 500 < previous.demand(7000),
+           "relaxed release must wait for score headroom and reclaim delay once it returns");
+}
+
 void testFirstPresentAfterVrrFloorGapLatches()
 {
     auto session = config(116, 120);
@@ -3458,7 +3489,9 @@ void testIntervalBufferCreditsAlreadyScheduledSpacing()
 void testLatchedHandoffCreditsOnlyEnforcedSpacing()
 {
     for (uint64_t revision : {Vrr18RecoverableIntervalFeedback, Vrr18GoalIntervalFeedback,
-                              Vrr18PredictiveIntervalFeedback, Vrr18CostAwareIntervalFeedback}) {
+                              Vrr18PredictiveIntervalFeedback, Vrr18CostAwareIntervalFeedback,
+                              Vrr18AnticipatoryIntervalFeedback, Vrr18TargetAwareRelease,
+                              Vrr18ScoreQualifiedRelease, Vrr18ProfileReleaseBudget, Vrr18SelectedGoalRelease}) {
         auto session = config(120, 120);
         session.smoothFrameTiming = false;
         auto policy = vrrTimingParametersForSession(session, true, false);
@@ -4685,6 +4718,7 @@ int main()
     testNativeFlipProtectionPreventsScanoutTears();
     testBalancedReadinessFloorFollowsLoad();
     testProfilesOrderEveryTrade();
+    testRelaxedReleaseRequiresMeasuredMargin();
     testFirstPresentAfterVrrFloorGapLatches();
     testExplicitAdaptiveOnlyPolicy();
     testProductionAdaptiveProtectionRecoversWithoutDrift();

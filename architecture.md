@@ -1,7 +1,7 @@
 # Streaming and VRR architecture
 
 Source baseline: `master` based on `v6.2.0-daily.202` with VRR18 interval
-feedback revision 7 for new streams and the source-clock deadline correction.
+feedback revision 12 and the source-clock deadline correction.
 Buffer growth uses delivery and decode readiness at both ends of an interval.
 The custom profile exposes the frame allowance, timing target, score history,
 and interval tolerance. The earlier platform changes include the decode-buffer accounting
@@ -655,6 +655,10 @@ presentation floor. With 8.0 ms covered and readiness at 8.6 ms, the observer
 sees a 0.6 ms miss before applying tolerance.
 
 The buffer uses the rolling Pacing score shown with the timing target.
+The observer accumulates closed buckets and caches the still-active tail of
+the preceding time block. This avoids scanning five minutes of history on
+ordinary frames. For weighted comparisons close to the control threshold it
+can sum in the historical bucket order to preserve the original decision.
 Each adjacent pacing interval contributes only its deviation beyond the configured
 tolerance, weighted by the time represented by that interval. The one-second
 window qualifies service capacity and supplies the diagnostic mean. Growth also requires fresh
@@ -736,6 +740,75 @@ proposal can raise the target while the observed pacing score is below goal.
 Missing readiness, overload and sequence breaks clear the evidence.
 The reserve continues to follow its normal per-frame movement limit,
 configured frame allowance and clean-stream release.
+
+Revision 8 lets a corroborated cost-window proposal anticipate a change in
+delivery while the trailing Pacing score is still at goal. It holds that
+proposal for the next 375 ms evaluation window. A fresh, independently
+recoverable stretched interval in that window can authorize the increase.
+Clean input lets the proposal expire. Overload, a sequence break or an epoch
+restore clears pending evidence. Once the trailing score is below goal the
+normal two-window feedback path can act immediately. The production score,
+buffer limits, slew and release rules retain their existing definitions.
+Replay restores the captured revision, including revision 7's at-goal gate.
+
+Revision 9 releases excess reserve faster for a user target below 99% when
+the observed source cadence has room below the display ceiling. The release
+factor uses the unused loss allowance after charging the larger of the
+history's scored loss and the last second's absolute handoff error divided
+by its total intended interval time. Each percentage point of unused allowance
+permits one multiple of the normal release speed, up to 10. A full point of
+remaining margin is required to accelerate. The recovery hold and taper time
+scale inversely, with a one-second lower bound, and the requested release rate
+is capped at 1,000 µs/s. The readiness estimator keeps its original observation
+period and protects reserve with independently measured benefit. Qualification,
+overload checks, the applied per-frame movement limit and physical spacing
+still govern any actual advance. At the display ceiling the normal release
+law applies. Before revision 10, targets of 99% and above used revision 8.
+
+Revision 10 qualifies a lower reserve against the pacing goal when the source
+cadence is steady and below the refresh ceiling on a latch-capable presenter.
+The old release floor was the readiness estimate plus one tolerance, so a
+recurring late input could keep all available protection even when its two
+neighboring intervals would fit within the selected loss budget. For each
+250 µs reserve step from the minimum through 3 ms above it, the controller
+projects the change in readiness at both endpoints and charges additional
+interval error on top of the observed loss. Two consecutive four-second
+windows must fit within 90% of the goal's loss budget, capped at the Balanced
+allowance. If the current reserve is already qualified, the same evidence
+prevents the readiness estimate from immediately buying the delay back.
+The ordinary recovery hold, slew, growth forecast, and queue limits still
+apply. A below-goal score, an ineligible interval, a sequence break, or a
+changed reserve range clears qualification. New evidence that exhausts the
+current window's budget withdraws approval before the window finishes.
+Exact replay and calibration identity use the recorded revision.
+
+Revision 11 raises the release-budget cap from the Balanced allowance (0.5%)
+to the Low Latency allowance (1%). The two four-second observations must fit
+within 90% of the smaller of this cap and the configured goal's loss allowance.
+For targets below 99.50%, an approved current reserve also takes precedence
+over a short forecast of future loss. New interval losses can withdraw approval
+mid-window and a score below goal permits growth immediately. This rule applies
+to latch-capable presentation with observed source cadence below the ceiling.
+When source and display both sustain 120 Hz, reducing the requested buffer
+alone cannot advance flips already spaced at the 8.33 ms display minimum.
+
+Revision 12 qualifies reserve against the user's selected pacing target throughout
+the supported 90% to 99.99% range. It projects how far each actual handoff could
+advance at a lower reserve using independent readiness and the spacing floors
+that applied to that frame. The difference between the two advances gives the
+projected interval. Each trial pays the observed loss plus any additional
+projected loss. The budget accounts for the partial 100 ms bucket at the end
+of the selected score history. The controller collects eligible evidence even
+while recovering from a score deficit. It uses that evidence for release once
+the measured score meets goal and two consecutive four-second windows approve
+the reserve. If losses exhaust a low trial, a higher trial that still fits can
+retain approval. While at goal, readiness growth can retry one step above a
+recent approval. The short forecast can still respond to deteriorating input.
+Trials cover the full permitted
+range, in 250 µs steps near the minimum and at most 20 further steps above
+that range. Replay selects the earlier budget and projection from the recorded
+revision. The configured tolerance, movement limits and display ceiling still
+apply.
 
 The Client timing score and its one-second mean require timely complete-frame
 arrival at both ends of an interval. The controller compares compressed-frame
@@ -1696,7 +1769,30 @@ checks cover IPv4/IPv6 setup/removal, real IPv4 UDP redirection and overflow,
 host isolation, existing-rule refusal and failed-setup rollback; live gameplay
 and sustained gigabit throughput remain separate validation.
 
-The deterministic suites are
+The fast adaptive-buffer gate, [vrrbuffersim](tests/vrr/vrrstreamsimulator.cpp),
+executes the live controller and frame-drop policies on a virtual event clock.
+Source frames and their seeded transport costs are independent of the controller.
+Optional serial encoder service defers host sends while capture and RTP timing
+continue. Queued frames leave in order at the encode service cadence before
+the independent transport delay is applied.
+Decoded-queue residence, replacement eligibility, submission and modeled display
+feedback depend on earlier scheduling decisions. The simulator measures pacing
+target coverage over virtual time, delay and display-interval distributions, and
+frame loss. Its optional waitable DXGI model applies the production admission
+limit ahead of preparation, so a fast burst can wait in the decoded queue rather
+than entering an unbounded display queue. Minimum display spacing grows from
+the preceding flip and preserves dynamic cadence. Its fixed-buffer sweep and
+saved-report comparisons use matching
+workloads. Its optional gap recovery reference uses the measured next flip to
+find a spare display slot for a replaced frame at matched stream and display
+rates. It preserves the baseline timeline and requires available preparation
+time and presentation capacity. This is an offline comparison for the jitter
+cases. See the [scenario guide](tests/vrr/README.md#virtual-buffer-simulator)
+for editing a workload, running the fast gate and comparing a controller change.
+The extended buffer contracts and exact replay retain recorded regression and
+worker lifecycle coverage.
+
+The other deterministic suites include
 [tst_vrrtimingcontroller.cpp](tests/vrr/tst_vrrtimingcontroller.cpp),
 [tst_vrrratepolicy.cpp](tests/vrr/tst_vrrratepolicy.cpp),
 [tst_vrrpacingworker.cpp](tests/vrr/tst_vrrpacingworker.cpp),
@@ -1715,8 +1811,8 @@ check verifies contents and CRCs. Windows CI includes that test and exact replay
 of cold and warm-history worker fixtures under the unchanged production policy.
 
 The ordinary application build does not build the opt-in replay/tests.
-Follow AGENTS.md to build diagnostics separately and run all four suites plus
-`vrrreplay --help` when required. Missing runtime DLLs are environment failures,
+Follow AGENTS.md to build diagnostics separately and run the deterministic
+gates and `vrrreplay --help` when required. Missing runtime DLLs are environment failures,
 not pacing failures. The macOS native presenter smoke test exercises the actual
 Metal/VideoToolbox renderer separately from the hardware-free worker fixture.
 The display-range test checks range validation independently of a particular

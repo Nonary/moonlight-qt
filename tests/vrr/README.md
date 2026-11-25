@@ -44,8 +44,170 @@ lateness is held to its rate, that release waits out its hold, that
 sustained jitter beyond the cap still reaches it, and that the aim's margin
 costs at most 500 us beyond what the goal itself needs.
 
-`tst_vrrbufferregressions` is the adaptive-buffer gate described in
-`AGENTS.md`. It exercises the live interval controller on latching and
+## Virtual buffer simulator
+
+Run `vrrbuffersim` for the fast development gate. On this Windows checkout the
+helper builds only the simulator and passes through its arguments. From the
+repository root:
+
+```powershell
+.\scripts\test-vrr-buffer.cmd
+.\scripts\test-vrr-buffer.cmd --list
+.\scripts\test-vrr-buffer.cmd mixed --output build/buffer-before.json
+# After a controller edit, rerun the identical virtual stream.
+.\scripts\test-vrr-buffer.cmd mixed --compare build/buffer-before.json --output build/buffer-after.json
+.\scripts\test-vrr-buffer.cmd sustained-jitter --target 99.90 --oracle 0,500,1000,1500,2000,3000,5000
+.\scripts\test-vrr-buffer.cmd --stress --budget-ms 30000
+```
+
+On Linux or macOS, build `tests/vrr/buffersim.pro` in a qmake shadow build or
+use the binary from the full test build. Run `vrrbuffersim --help` for the
+available settings. Running the binary directly skips the build check.
+The default suite checks named Balanced workloads and the simulator's accounting,
+repeatability, queue feedback and fixed-buffer reference. The stress tier adds
+a 30-minute run and a repeatable matrix from 30 to 240 FPS. CPU wall time is
+reported for each simulation. Use `--budget-ms 5000` for the fast-suite
+performance check on an optimized build.
+
+The sustained-jitter gate also checks a 99.90% target after 75 virtual
+seconds of clean input. It bounds time below goal, reserve cost against fixed
+trials, reversals and drops. A separate 450 ms jitter burst checks that the
+proposal expires when clean delivery resumes.
+
+The 95% checks compare identical clean, queued and jitter-to-clean streams
+against Balanced. They bound latency, qualified time at goal, cadence, drops
+and reversals. The report includes per-presented-frame means for decoded queue
+residence (admission to dequeue), decode readiness to modeled display, and
+source production to modeled display. Queue residence can reach zero while
+the pacer still holds a frame it has dequeued.
+
+Run the surplus-drain regression for the reported 99% Low Latency configuration with:
+
+```powershell
+.\scripts\test-vrr-buffer.cmd surplus-drain --preset low-latency --target 99 --output build/surplus-drain.json
+```
+
+The default fast and stress gates run this workload at 95%, 99%, 99.50%
+and 99.90%. The host delivers 118 FPS on a 120 Hz display, with 3 ms of
+extra transport delay once per second throughout the 120-second session.
+Each adaptive run and its fixed-reserve trials receive identical source frames
+and delivery costs. The gate scores the final 30 seconds, after startup has
+settled. The smallest tested fixed reserve with zero drops, at least 99%
+scoring coverage and at least 99% of qualified time at goal is the reference.
+The adaptive controller must meet the same quality bounds and settle within
+250 µs of the reference for both mean reserve and mean decode-ready-to-display
+latency. During continuous scored time strictly above goal and more than
+250 µs above the reference, it must make a net 250 µs of downward progress
+within 20 seconds. The JSON records the longest such wait in the adaptive run's
+metrics and lists each fixed trial under `steady_drain_reference`.
+The steady pacing target is evaluated separately from interval-jerk metrics so
+the amount of timing protection reclaimed by a lower reserve is measurable.
+
+The default surplus-drain gate also runs the 99% Low Latency profile with
+5 ms of extra delivery delay every 500 ms, a 120 FPS request and a 118 FPS
+source on a 120 Hz display. It compares settled display wait with fixed
+reserves, bounds reserve oscillation, then checks that protection grows
+when the same delivery spike occurs every 125 ms. At 95%, 97% and 99.50%
+it compares the adaptive run against adjacent fixed reserves that straddle
+each goal on that frequent-spike workload. The jitter-to-clean check also
+measures sustained jitter at 95% against a fixed trial at the buffer minimum.
+
+To design an experiment, export a built-in scenario, edit the JSON, and run it:
+
+```powershell
+.\scripts\test-vrr-buffer.cmd mixed --export build/my-stream.json
+.\scripts\test-vrr-buffer.cmd --load build/my-stream.json --output build/my-results.json
+```
+
+A schema-1 workload has a seed, stream rate, display rate, and ordered phases.
+Each phase specifies a positive duration in microseconds. Its optional settings
+apply only to that phase. For example, this injects one 8 ms network spike every
+two seconds for 30 seconds. The final phase measures recovery from the last spike.
+
+```json
+{
+  "schema": 1, "name": "periodic-network-spike", "seed": 42,
+  "stream_hz": 120, "display_hz": 144, "recovery_start_us": 60000000,
+  "phases": [
+    {"duration_us": 30000000},
+    {"duration_us": 30000000, "network_spike_us": 8000, "disturbance_period_us": 2000000},
+    {"duration_us": 150000000}
+  ]
+}
+```
+
+The `encoder-backlog` case keeps capture and RTP at 120 FPS on a 144 Hz
+display. Frames normally take 2 ms to encode. For 30 seconds one encode per
+second takes 40 ms longer, so the following captures queue and then send
+2 ms apart until the encoder catches up. The final 150 seconds use clean
+encoder timing. Run it with `scripts/test-vrr-buffer.cmd encoder-backlog`.
+`encode_us` and `encoder_stall_us` configure these costs, with both defaulting
+to zero. Reports with encoder timing include the peak capture-to-send delay
+and the count of send intervals shorter than their matching capture intervals.
+This workload selects the waitable DXGI model via `dxgi_waitable`. It admits
+at most two outstanding presents and stalls worker preparation when that queue
+is full. The source and decoder continue in the meantime. The report includes
+peak pending presents, worker time waiting for admission, and admission drops.
+Display cadence still follows the frames with a minimum refresh interval.
+
+For matched stream and display rates, use `--gap-recovery-reference` to check
+which ceiling replacements could have filled an earlier display slot. The
+reference uses the next baseline flip's measured time to place an already
+decoded replacement one refresh earlier. It requires enough time to prepare
+the frame before the next baseline render, an available presenter slot, and
+the same or lower local jerk peak and count above 2 ms. All baseline frames
+keep their original display times. This reference uses future flip evidence
+and is separate from the online controller metrics.
+
+```powershell
+.\scripts\test-vrr-buffer.cmd encoder-backlog --display 120 --gap-recovery-reference
+.\scripts\test-vrr-buffer.cmd encoder-backlog --fps 144 --display 144 --gap-recovery-reference
+```
+
+The reference reports display gaps and jerk for frames captured in the
+encoder-stall phases, or the full session if there are no such phases. Drop
+counts and preserved frame counts cover the whole session. It also reports
+the oldest inserted frame's capture-to-display age. The stress gate checks
+the reference with 250, 750 and 1,500 microseconds of delivery jitter at both
+refresh rates.
+
+`vrrstreamsimulator.cpp` advances a virtual clock to source, delivery, decode,
+worker and presentation events. It runs the production controller and drop
+policies. A changed target occupies the worker for a different duration, which
+changes the queue, replacements, future submissions and display feedback.
+Built-in phases also exercise independent source cadence changes, a serial
+decode bottleneck, RTP jumps, reconnects and the display ceiling.
+The display is a modeled immediate or latched presenter. The waitable DXGI
+model covers admission and minimum spacing. Native raster state and detailed
+compositor timing require a capture. Generated pictures are
+independently decodable after a queue overflow. Predictive-codec recovery,
+native scheduled presentation, packet-level transport and physical scanout
+require separate integration evidence.
+
+**Reading a run.** At-goal percentage divides qualified time at goal by all
+qualified time. Read it alongside coverage, the fraction of post-calibration
+time that qualified. The JSON partitions the whole virtual session into
+calibration, unavailable, at-goal and below-goal microseconds. It also records
+the longest continuous shortfall and time to the first sustained second back at
+goal after the declared disturbance. Reserve, queue residence and source-to-display
+latency are separate measurements. Presented jerk uses changes in consecutive
+modeled display intervals. Hitch magnitude compares display spacing with the
+same two source frames. Drop counters account for frames that never reached display.
+
+**Reading an oracle or comparison.** A fixed-buffer trial uses the same
+producer seed, presentation model and production scoring as the adaptive run.
+The oracle reports the smallest *tested* reserve that meets the timing target
+for 95% of qualified time, with at least 90% post-calibration coverage and zero
+drops. The JSON includes individual candidates. An empty result means the grid
+had no qualifying size. For comparisons, phase definitions, seed and policy
+options must match. Numeric deltas are candidate minus baseline. Catalog
+workloads have policy-specific assertions. Custom inputs and overrides check
+the model invariants and report the resulting policy tradeoffs.
+
+## Extended regression contracts
+
+`tst_vrrbufferregressions` preserves the historical buffer contracts and
+recorded-span comparisons. It exercises the live interval controller on latching and
 non-latching presenters, with Reduce Judder on and off. `interval-pressure`
 follows earned protection through a full score history and clean release.
 `rate-round-trip` checks buffer continuity and presented cadence through a

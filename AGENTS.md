@@ -283,6 +283,7 @@ a new published release:
 
 ```bat
 vrr\release\tst_vrrbufferregressions.exe
+vrr\release\vrrbuffersim.exe
 vrr\release\tst_vrrtimingcontroller.exe
 vrr\release\tst_vrrratepolicy.exe
 vrr\release\tst_vrrpacingworker.exe
@@ -293,13 +294,18 @@ vrr\release\vrrreplay.exe --help
 ```
 
 Finish all pacing, controller, replay, and test-source edits before this build.
-If any such source is edited afterward, run `nmake` again and rerun all eight
+If any such source is edited afterward, run `nmake` again and rerun all nine
 checks. Do not assume a successful application build rebuilt the diagnostics.
 
-`tst_vrrbufferregressions` is the adaptive-buffer regression gate. It builds
-every controller exactly as a live session does and pins no policy revision,
-so run it after any buffer, rate-layer, catch-up, smoothing or ceiling
-replacement change, not only before deployment; it takes about 9 s. Its
+For the fast adaptive-buffer development gate, run `scripts\test-vrr-buffer.cmd`
+from the repository root. It incrementally builds and runs `vrrbuffersim`. Use a
+named scenario to iterate, `--stress` for the extended matrix, and `--output`
+and `--compare` to compare identical workloads across edits. See
+`tests/vrr/README.md` for the editable phase format and metric definitions.
+
+Run the extended `tst_vrrbufferregressions` contracts after buffer, rate-layer,
+catch-up, smoothing or ceiling replacement changes as well. This suite builds
+every controller as a live session does and pins no policy revision. Its
 `versus-fixed-refresh` scenarios fail when VRR at the display ceiling shows
 more visible stutter than the fixed-refresh pacer would on the same input.
 `KNOWN` lines are open regressions the
@@ -320,6 +326,7 @@ $qtBin = "C:\Users\Chase\sources\.tools\Qt\6.11.1\msvc2022_64\bin"
 $env:Path = "$deploy;$qtBin;$env:Path"
 
 $tests = @(
+    "vrrbuffersim.exe",
     "tst_vrrbufferregressions.exe",
     "tst_vrrtimingcontroller.exe",
     "tst_vrrratepolicy.exe",

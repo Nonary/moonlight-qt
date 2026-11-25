@@ -8,6 +8,7 @@
 // worker acquires/consumes a permit; interruption is safe on the UI/owner thread.
 namespace DxgiWaitable {
 constexpr unsigned MaximumFrameLatency = 2;
+constexpr uint64_t AdmissionTimeoutUs = 50000;
 inline bool compositionRequested(bool vrr, const char* overrideValue)
 {
     return vrr && overrideValue && std::strcmp(overrideValue, "1") == 0;
@@ -41,7 +42,7 @@ public:
             if (interrupted(expected)) return Status::Interrupted;
             if (m_Held) return Status::Admitted;
             const auto now = clock();
-            if (now < start || now - start >= 50000) return Status::Timeout;
+            if (now < start || now - start >= AdmissionTimeoutUs) return Status::Timeout;
             const auto wake = wait(1); // Never hold presentation/decode locks here.
             if (wake == Wake::Failed) return Status::Failed;
             if (wake == Wake::Signalled) {
