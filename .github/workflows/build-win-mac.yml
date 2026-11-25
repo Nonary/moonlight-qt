@@ -314,6 +314,15 @@ jobs:
           trap 'hdiutil detach "$mount"' EXIT
           app="$mount/Moonlight.app"
           test -d "$app"
+          python3 - "$app/Contents/Info.plist" <<'PY'
+          import plistlib
+          import sys
+
+          with open(sys.argv[1], "rb") as plist:
+              services = plistlib.load(plist).get("NSBonjourServices")
+          if not isinstance(services, list) or "_nvstream._tcp" not in services:
+              sys.exit("Packaged Moonlight.app is missing _nvstream._tcp in NSBonjourServices")
+          PY
           codesign --verify --deep --strict "$app"
           lipo "$app/Contents/MacOS/Moonlight" -verify_arch x86_64 arm64
           version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
