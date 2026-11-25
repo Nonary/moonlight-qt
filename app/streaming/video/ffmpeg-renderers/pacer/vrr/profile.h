@@ -2,6 +2,7 @@
 #include "reserve.h"
 #include <QByteArray>
 #include <QString>
+#include <optional>
 
 namespace Vrr13 {
 // Identity follows the effective controller and presenter, not revision labels.
@@ -14,7 +15,7 @@ enum class PresentationValidation { Unavailable, Passed, Failed };
 bool saveProfile(const QString& path, const QString& key, const Reserve& reserve,
                  PresentationValidation presentation = PresentationValidation::Unavailable);
 // The playout delay a session with this key settled at, used to start the
-// next session there instead of at a generic guess. Zero means none.
-uint64_t loadStartDelay(const QString& path, const QString& key);
+// next session there instead of at a generic guess, including a settled zero.
+std::optional<uint64_t> loadStartDelay(const QString& path, const QString& key);
 bool saveStartDelay(const QString& path, const QString& key, uint64_t delayUs);
 }

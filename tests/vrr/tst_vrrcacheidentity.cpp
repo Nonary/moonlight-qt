@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
     assert(dir.isValid());
     const auto path = dir.filePath("seed.json");
     assert(Vrr13::saveStartDelay(path, previousKey, 14492));
-    assert(Vrr13::loadStartDelay(path, key) == 0);
+    assert(!Vrr13::loadStartDelay(path, key));
     QCryptographicHash promptOnly(QCryptographicHash::Sha256);
     promptOnly.addData(QByteArrayLiteral("vrr-calibration-v3\n"));
     promptOnly.addData(QByteArrayLiteral("prompt-decode-accounting\n"));
@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
     promptOnly.addData(QByteArrayLiteral("\ncan-latch=0\nallow-tearing=1"));
     promptOnly.addData(QByteArray::fromStdString(vrrCalibrationPolicy(policy)));
     assert(Vrr13::saveStartDelay(path, QString::fromLatin1(promptOnly.result().toHex()), 13889));
-    assert(Vrr13::loadStartDelay(path, key) == 0);
+    assert(!Vrr13::loadStartDelay(path, key));
     // Delay learned while a stall beyond the cap still raised the buffer.
     QCryptographicHash measured(QCryptographicHash::Sha256);
     measured.addData(QByteArrayLiteral("vrr-calibration-v3\n"));
@@ -58,21 +58,21 @@ int main(int argc, char** argv) {
     measured.addData(QByteArrayLiteral("\ncan-latch=0\nallow-tearing=1"));
     measured.addData(QByteArray::fromStdString(vrrCalibrationPolicy(policy)));
     assert(Vrr13::saveStartDelay(path, QString::fromLatin1(measured.result().toHex()), 10750));
-    assert(Vrr13::loadStartDelay(path, key) == 0);
+    assert(!Vrr13::loadStartDelay(path, key));
     for (const auto revision : {Vrr18GoalIntervalFeedback, Vrr18PredictiveIntervalFeedback}) {
         auto previousFeedback = policy;
         previousFeedback.playoutVrr18IntervalFeedback = revision;
         const auto previousFeedbackKey = identity(previousFeedback, false);
         assert(Vrr13::saveStartDelay(path, previousFeedbackKey, 3000));
-        assert(Vrr13::loadStartDelay(path, key) == 0);
+        assert(!Vrr13::loadStartDelay(path, key));
         assert(Vrr13::loadStartDelay(path, previousFeedbackKey) == 3000);
     }
     assert(Vrr13::saveStartDelay(path, key, 8378));
     assert(Vrr13::loadStartDelay(path, key) == 8378);
-    assert(Vrr13::loadStartDelay(path, identity(policy, true)) == 0);
+    assert(!Vrr13::loadStartDelay(path, identity(policy, true)));
     auto changed = policy;
     changed.playoutOnTimeTargetPerMillion = 990000;
-    assert(Vrr13::loadStartDelay(path, identity(changed, false)) == 0);
+    assert(!Vrr13::loadStartDelay(path, identity(changed, false)));
     const char* switches[] = {"MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER",
                               "MOONLIGHT_VRR_INPUT_ACCOUNTING", "MOONLIGHT_VRR_BOUNDED_CATCHUP"};
     for (unsigned mask = 0; mask < 8; ++mask) {

@@ -6,6 +6,7 @@ HERE=Path(__file__).resolve().parent
 spec=importlib.util.spec_from_file_location('quality',HERE/'buffer-quality.py');quality=importlib.util.module_from_spec(spec);spec.loader.exec_module(quality)
 def generate(case,plan,parameters,path):
  p={**parameters,'playout_input_percentile_target_per_million':plan['session']['target_ppm'],'playout_input_percentile_window_us':plan['session']['window_us'],'playout_input_percentile_tolerance_us':plan['session']['tolerance_us'],'playout_delay_start_seed_us':0}
+ if 'playout_delay_start_seed_valid' in p: p['playout_delay_start_seed_valid']=0
  keys=['arrival_sequence','frame','rtp_timestamp','rtp_valid','pacer_arrival_us','decoder_output_us','decode_complete_us','model_decode_observed','frame_receive_us','frame_reassembled_us','decode_submit_us','prepare_us','present_call_us','cancelled','display_refresh_hz','stream_rate_hz','can_latch_present','session_latency_mode']+['param_'+k for k in p]
  seed=plan['seed'];ticks=0.0;frame=0;t=0;gap=False
  with path.open('w',newline='') as f:

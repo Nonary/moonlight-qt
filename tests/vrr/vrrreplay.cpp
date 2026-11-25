@@ -11973,6 +11973,7 @@ int main(int argc, char* argv[])
             serializedStartSeedUs = capturedParameters.playoutDelayStartSeedUs;
             if (parser.isSet(restoredStartSeedOption)) {
                 capturedParameters.playoutDelayStartSeedUs = restoredStartSeedUs;
+                capturedParameters.playoutDelayStartSeedValid = capturedParameters.playoutVrr18IntervalFeedback >= Vrr18ZeroReserve;
                 std::fprintf(stderr,
                     "Startup input reconstructed explicitly: serialized start-delay seed=%llu us, restored=%llu us; original decision audits remain active\n",
                     (unsigned long long)serializedStartSeedUs,
@@ -12018,6 +12019,7 @@ int main(int argc, char* argv[])
                 // The start seed came from this machine's cache, not policy.
                 scenario.controller.playoutDelayStartSeedUs =
                     capturedParameters.playoutDelayStartSeedUs;
+                scenario.controller.playoutDelayStartSeedValid = capturedParameters.playoutDelayStartSeedValid;
                 if (scenario.controllerFromSession &&
                         !scenario.controllerOverrides.isEmpty()) {
                     QString overrideError;

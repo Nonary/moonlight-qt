@@ -342,20 +342,23 @@ void VrrReplayConfigTest::productionPolicyValidation()
             session.timingOptions.targetHundredths = target;
             const auto current = vrrTimingParametersForSession(
                 vrrProductionSessionConfig(session), scheduled, scheduled);
-            QCOMPARE(current.playoutVrr18IntervalFeedback, Vrr18SelectedGoalRelease);
+            QCOMPARE(current.playoutVrr18IntervalFeedback, Vrr18ZeroReserve);
             QVERIFY2(validateVrrCurrentPolicy(current, error), qPrintable(error));
             for (uint64_t revision = Vrr18AveragedIntervalFeedback; revision < current.playoutVrr18IntervalFeedback; ++revision) {
                 auto historical = current;
                 historical.playoutVrr18IntervalFeedback = revision;
+                historical.playoutDelayMinimumUs = historical.playoutDelayMaximumUs = 1000;
                 auto snapshot = vrrTimingParametersToJson(historical);
+                snapshot.remove("playout_delay_start_seed_valid");
                 VrrTimingParameters restored;
                 QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error), qPrintable(error));
+                QCOMPARE(restored.playoutDelayStartSeedValid, uint64_t(0));
                 QCOMPARE(restored.playoutVrr18IntervalFeedback, revision);
                 QVERIFY2(validateVrrCurrentPolicy(restored, error), qPrintable(error));
                 QVERIFY(vrrCalibrationPolicy(current) != vrrCalibrationPolicy(restored));
             }
             auto future = current;
-            future.playoutVrr18IntervalFeedback = Vrr18SelectedGoalRelease + 1;
+            future.playoutVrr18IntervalFeedback = Vrr18ZeroReserve + 1;
             QVERIFY(!validateVrrTimingParameters(future, error));
             auto retired = current;
             retired.playoutPredictionOnly = 0;

@@ -5,6 +5,7 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h"
 
 #include <algorithm>
+#include <optional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -154,7 +155,8 @@ private:
     Time workerEvent = Never, preparationStarted = 0, prepared = 0;
     Time encoderFree = 0;
     Time decoderFree = 0, lastAssembly = 0, lastShown = 0, lastSource = 0;
-    Time firstDecision = 0, lastDelaySample = 0, savedSeed = 0;
+    Time firstDecision = 0, lastDelaySample = 0;
+    std::optional<Time> savedSeed;
     std::vector<Time> settledDelays;
     uint64_t session = 0;
     size_t phaseIndex = 0;
@@ -208,7 +210,7 @@ private:
         // transport/decode/pacer ownership belongs to the closing session.
         controller = std::make_unique<VrrTimingController>(config, options.canLatch, params);
         controller->loadPlayoutHistory(history);
-        controller->seedPlayoutDelayStart(savedSeed);
+        if (savedSeed) controller->seedPlayoutDelayStart(*savedSeed);
         counts.reconnectDrops += network.size() + compressed.size() + decoded.size() + pendingFlips.size() +
                                  (state != State::Idle) + (state == State::ReservedFence);
         network.clear(); compressed.clear(); decoded.clear(); pendingFlips.clear();
@@ -344,7 +346,7 @@ private:
                 // immediate check cannot prove their decode fence. A timed
                 // reservation can wait for a queue arrival, take ownership,
                 // and then collect that specific fence (even after timeout).
-                if (wait) {
+                if (wait && !options.deferReplacements) {
                     state = State::Replacing;
                     workerEvent = decoded.size() ? now : now + ((wait + 999) / 1000) * 1000;
                 }

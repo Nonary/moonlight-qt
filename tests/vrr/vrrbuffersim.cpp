@@ -448,7 +448,7 @@ int run(const QCommandLineParser& cli)
         std::optional<OracleResult> drainReference;
         std::optional<uint64_t> qualifyingReserveUs;
         if (experiment.catalogChecks && w.scenario.name == "surplus-drain" && o.fixedBufferUs < 0) {
-            drainReference = fixedBufferOracle(w, o, {1000, 1500, 2000, 2250, 2500, 3000},
+            drainReference = fixedBufferOracle(w, o, {0, 250, 500, 750, 1000, 1500, 2000, 2250, 2500, 3000},
                                               99, OracleWindow::FinalQuarter);
             if (drainReference->found) qualifyingReserveUs = drainReference->minimumUs;
         }

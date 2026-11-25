@@ -133,19 +133,20 @@ static QJsonObject readStartDelays(const QString& path)
     return root.value("entries").toObject();
 }
 
-uint64_t loadStartDelay(const QString& path, const QString& key)
+std::optional<uint64_t> loadStartDelay(const QString& path, const QString& key)
 {
-    if (key.isEmpty()) return 0;
+    if (key.isEmpty()) return std::nullopt;
     const auto entry = readStartDelays(path).value(key).toObject();
     const auto age = QDateTime::currentSecsSinceEpoch() - jsonInteger(entry.value("updated"));
-    if (age < 0 || age > 14 * 86400) return 0;
-    const auto delay = jsonInteger(entry.value("delay_us"));
-    return delay > 0 && delay <= 1000000 ? uint64_t(delay) : 0;
+    if (age < 0 || age > 14 * 86400) return std::nullopt;
+    const auto delay = jsonInteger(entry.value("delay_us"), -1);
+    if (delay < 0 || delay > 1000000) return std::nullopt;
+    return uint64_t(delay);
 }
 
 bool saveStartDelay(const QString& path, const QString& key, uint64_t delayUs)
 {
-    if (key.isEmpty() || delayUs == 0 || delayUs > 1000000) return false;
+    if (key.isEmpty() || delayUs > 1000000) return false;
     if (!QDir().mkpath(QFileInfo(path).absolutePath())) return false;
     QLockFile lock(path + ".lock");
     if (!lock.tryLock(0)) return false;

@@ -55,14 +55,15 @@ int main(int argc, char** argv)
     }
     {
         const auto startPath = dir.filePath("start-delay.json");
-        assert(Vrr13::loadStartDelay(startPath, "setup-A") == 0);
+        assert(!Vrr13::loadStartDelay(startPath, "setup-A"));
         assert(!Vrr13::saveStartDelay(startPath, "", 4000));
-        assert(!Vrr13::saveStartDelay(startPath, "setup-A", 0));
+        assert(Vrr13::saveStartDelay(startPath, "setup-A", 0));
+        assert(Vrr13::loadStartDelay(startPath, "setup-A") == 0);
         assert(Vrr13::saveStartDelay(startPath, "setup-A", 4200));
         assert(Vrr13::saveStartDelay(startPath, "setup-B", 9100));
         assert(Vrr13::loadStartDelay(startPath, "setup-A") == 4200);
         assert(Vrr13::loadStartDelay(startPath, "setup-B") == 9100);
-        assert(Vrr13::loadStartDelay(startPath, "setup-C") == 0);
+        assert(!Vrr13::loadStartDelay(startPath, "setup-C"));
         assert(Vrr13::saveStartDelay(startPath, "setup-A", 3100));
         assert(Vrr13::loadStartDelay(startPath, "setup-A") == 3100);
     }

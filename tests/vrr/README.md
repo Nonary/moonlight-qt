@@ -109,8 +109,15 @@ source on a 120 Hz display. It compares settled display wait with fixed
 reserves, bounds reserve oscillation, then checks that protection grows
 when the same delivery spike occurs every 125 ms. At 95%, 97% and 99.50%
 it compares the adaptive run against adjacent fixed reserves that straddle
-each goal on that frequent-spike workload. The jitter-to-clean check also
-measures sustained jitter at 95% against a fixed trial at the buffer minimum.
+each goal on that frequent-spike workload. With spikes every 500 ms the same
+gate requires 95% to settle at zero and 98.30% at 500 µs. The jitter-to-clean
+check compares sustained jitter at 95% against fixed trials from zero to
+1,000 µs in 250 µs steps.
+
+In the matched-refresh mixed workload, one replacement is permitted only
+when the same simulation presenting every frame shows at least 250 microseconds
+of additional mean decode-ready-to-display latency. The adaptive run must
+sustain the selected goal for 99% of qualified time and have 99% coverage.
 
 To design an experiment, export a built-in scenario, edit the JSON, and run it:
 

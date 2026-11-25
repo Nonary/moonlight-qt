@@ -199,9 +199,10 @@ bool VrrPacingWorker::start()
                               QString::fromStdString(m_Config.calibrationKey), prior)) {
             m_CalibrationLoaded = m_TimingController->loadPlayoutHistory(prior.profile());
         }
-        m_StartDelaySeedUs = Vrr13::loadStartDelay(startDelayPath(),
-            QString::fromStdString(m_Config.calibrationKey));
-        m_TimingController->seedPlayoutDelayStart(m_StartDelaySeedUs);
+        if (const auto seed = Vrr13::loadStartDelay(startDelayPath(), QString::fromStdString(m_Config.calibrationKey))) {
+            m_StartDelaySeedUs = *seed;
+            m_TimingController->seedPlayoutDelayStart(*seed);
+        }
     }
     m_InitialPlayoutProfile = encodeVrrPlayoutProfile(m_TimingController->playoutHistory());
     m_TraceParameters = m_TimingController->parameters();

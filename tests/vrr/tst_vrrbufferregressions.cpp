@@ -35,6 +35,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -237,18 +238,18 @@ struct Input {
 // One production controller driven through the worker's per-frame calls.
 class Stream {
 public:
-    explicit Stream(const VrrSessionConfig& session, uint64_t seedUs = 0, int64_t driftPpm = 0) :
+    explicit Stream(const VrrSessionConfig& session, std::optional<uint64_t> seedUs = std::nullopt, int64_t driftPpm = 0) :
         Stream(session, vrrTimingParametersForSession(session), seedUs, driftPpm)
     {}
 
     Stream(const VrrSessionConfig& session, const VrrTimingParameters& parameters,
-           uint64_t seedUs, int64_t driftPpm = 0) :
+           std::optional<uint64_t> seedUs, int64_t driftPpm = 0) :
         m_Session(session),
         m_Controller(session, t_CanLatch, parameters),
         m_DriftPpm(driftPpm)
     {
         // Same call the worker makes with the previous session's settled delay.
-        if (seedUs) m_Controller.seedPlayoutDelayStart(seedUs);
+        if (seedUs) m_Controller.seedPlayoutDelayStart(*seedUs);
     }
 
     const Frame& step(uint32_t ticks, const Input& input = {})
@@ -274,7 +275,10 @@ public:
         f.targetUs = d.targetUs;
         f.appliedUs = d.playoutDelayUs;
         f.recoveryUs = d.recoveryAddedUs;
-        f.carryUs = d.trajectory.carryUs;
+        // Measure carry the pacer could actually repay. At zero reserve the
+        // current frame's own decode and preparation can outlast its nominal slot.
+        const auto readyTargetUs = f.decodedUs + input.prepareUs + m_Controller.parameters().presentationSafetyUs;
+        f.carryUs = d.trajectory.targetUs - std::min(d.trajectory.targetUs, std::max(d.originalTargetUs, readyTargetUs));
         f.extraUs = d.plannedExtraDelayUs();
         f.originalUs = d.originalTargetUs;
         f.smoothingUs = d.cadenceSmoothingUs;
@@ -467,12 +471,14 @@ void testStartingDelayReleasesOnCleanInput()
 {
     for (const auto& preset : kPresets) for (const auto& smoothing : kSmoothing) for (uint64_t seed : {uint64_t(0), uint64_t(4000)}) {
         const std::string name = label("start-release", preset, smoothing) + (seed ? "/cached-4ms" : "/cold");
-        Stream s(vrrProductionSession(preset.mode, 116, 120, smoothing.smooth), seed);
+        Stream s(vrrProductionSession(preset.mode, 116, 120, smoothing.smooth), seed ? std::optional<uint64_t>(seed) : std::nullopt);
         Rng rng(11 + uint64_t(preset.mode) * 3 + seed);
         const auto& policy = s.controller().parameters();
         const double holdSeconds = double(policy.playoutMeanMissHoldUs) / 1e6;
         const size_t total = frames116(holdSeconds + 8334.0 / s.fallUsPerSecond() + 4.0 * s.releaseTauUs() / 1e6 + 5);
-        for (size_t i = 0; i < total; ++i) s.step(k116Ticks, {rng.below(400)});
+        // Keep this clean workload within the preset tolerance even after
+        // the controller releases the entire reserve.
+        for (size_t i = 0; i < total; ++i) s.step(k116Ticks, {rng.below(std::min<uint64_t>(400, s.toleranceUs()))});
         const auto& f = s.frames();
         const auto in = s.interval();
         const uint64_t start = f[0].appliedUs, floor = in.update.minimumUs + 250;
@@ -505,13 +511,13 @@ void testMissesWithinAllowanceBuyNoDelay()
 {
     for (const auto& preset : kPresets) for (const auto& smoothing : kSmoothing) {
         const std::string name = label("within-allowance", preset, smoothing);
-        Stream s(vrrProductionSession(preset.mode, 116, 120, smoothing.smooth), 1000);
+        Stream s(vrrProductionSession(preset.mode, 116, 120, smoothing.smooth), 0);
         // A quarter of each profile's allowance: 0.25%, 0.125%, 0.0125%.
         const size_t spacing = size_t(4000000 / s.allowancePpm());
         Rng rng(23 + uint64_t(preset.mode));
         const size_t total = frames116(180);
         for (size_t i = 0; i < total; ++i)
-            s.step(k116Ticks, {i % spacing == spacing / 2 ? 3000 : rng.below(400)});
+            s.step(k116Ticks, {i % spacing == spacing / 2 ? 3000 : rng.below(std::min<uint64_t>(400, s.toleranceUs()))});
         const auto& f = s.frames();
         const auto in = s.interval();
         const uint64_t peak = maximum(f, frames116(1), total, applied);
@@ -540,10 +546,10 @@ void testUnabsorbableLossBuysNoDelay()
         const auto session = vrrProductionSession(preset.mode, 116, 120, smoothing.smooth);
         {
             // A 30 ms delivery stall every 45 s: beyond every profile's cap.
-            Stream s(session, 1000);
+            Stream s(session, 0);
             Rng rng(131 + uint64_t(preset.mode));
             const size_t total = frames116(300), every = frames116(45);
-            for (size_t i = 0; i < total; ++i) s.step(k116Ticks, {i % every == every / 2 ? 30000 : rng.below(400)});
+            for (size_t i = 0; i < total; ++i) s.step(k116Ticks, {i % every == every / 2 ? 30000 : rng.below(std::min<uint64_t>(400, s.toleranceUs()))});
             const uint64_t floor = s.interval().update.minimumUs, peak = maximum(s.frames(), frames116(1), total, applied);
             report("%-52s stalls: peak %5" PRIu64 " floor %5" PRIu64 "\n", name.c_str(), peak, floor);
             check(peak <= floor + 250, name, "a stall beyond the cap never buys latency",
@@ -551,10 +557,10 @@ void testUnabsorbableLossBuysNoDelay()
         }
         {
             // One 6 ms frame 8 s into the session, then clean input.
-            Stream s(session, 1000);
+            Stream s(session, 0);
             Rng rng(137 + uint64_t(preset.mode));
             const size_t total = frames116(90), late = frames116(8);
-            for (size_t i = 0; i < total; ++i) s.step(k116Ticks, {i == late ? 6000 : rng.below(400)});
+            for (size_t i = 0; i < total; ++i) s.step(k116Ticks, {i == late ? 6000 : rng.below(std::min<uint64_t>(400, s.toleranceUs()))});
             const uint64_t floor = s.interval().update.minimumUs, peak = maximum(s.frames(), late, total, applied);
             report("%-52s one late frame: peak %5" PRIu64 " floor %5" PRIu64 "\n", name.c_str(), peak, floor);
             check(peak <= floor + 250, name, "one late frame in a window that has only begun to fill never buys latency",
@@ -563,7 +569,7 @@ void testUnabsorbableLossBuysNoDelay()
         {
             // Heavy-tailed lateness (exponential, mean 0.6 ms): the solved
             // target steps between neighbouring values every few seconds.
-            Stream s(session, 1000);
+            Stream s(session, 0);
             Rng rng(139 + uint64_t(preset.mode));
             const size_t total = frames116(180);
             for (size_t i = 0; i < total; ++i) {
@@ -603,7 +609,7 @@ void testIntervalPressureAndRelease()
     for (const auto& preset : kPresets) for (const auto& smoothing : kSmoothing) {
         const auto name = label("interval-pressure", preset, smoothing);
         const auto session = vrrProductionSession(preset.mode, 90, 120, smoothing.smooth);
-        Stream stream(session, 1000);
+        Stream stream(session, 0);
         for (size_t i = 0; i < frames90(5); ++i) stream.step(1000);
         const auto floor = stream.interval().update.minimumUs;
         const size_t burst = stream.size();
@@ -638,7 +644,7 @@ void testSparseDeliveryPressure()
         auto session = vrrProductionSession(1, fps, 2 * fps, false);
         session.timingOptions.toleranceUs = fps == 120 ? 500 : 750;
         session.timingOptions.historySeconds = 15;
-        Stream delivery(session, 1000), lateWake(session, 1000);
+        Stream delivery(session, 0), lateWake(session, 0);
         const uint32_t ticks = 90000 / fps;
         const int interval = fps / 3;
         constexpr uint64_t delayUs = 5000;
@@ -710,6 +716,7 @@ void testRecurringHitchForecast()
     session.timingOptions.historySeconds = 15;
     const uint32_t ticks = 900;
     auto historical = vrrTimingParametersForSession(session);
+    historical.playoutDelayMinimumUs = historical.playoutDelayMaximumUs = 1000;
     historical.playoutVrr18IntervalFeedback = Vrr18GoalIntervalFeedback;
     auto forecast = historical;
     forecast.playoutVrr18IntervalFeedback = Vrr18PredictiveIntervalFeedback;
@@ -770,6 +777,7 @@ void testRecurringHitchForecast()
     auto lenient = session;
     lenient.timingOptions.targetHundredths = 9900;
     auto rareParameters = vrrTimingParametersForSession(lenient);
+    rareParameters.playoutDelayMinimumUs = rareParameters.playoutDelayMaximumUs = 1000;
     rareParameters.playoutVrr18IntervalFeedback = Vrr18PredictiveIntervalFeedback;
     Stream rare(lenient, rareParameters, 1000);
     size_t interruptedForecasts = 0, unmeasuredForecasts = 0, wakeForecasts = 0, overCapForecasts = 0, rareForecasts = 0;
@@ -815,6 +823,7 @@ void testForecastGoalRecovery()
     session.timingOptions.historySeconds = 15;
     const double goal = session.timingOptions.targetHundredths / 100.0;
     auto baseline = vrrTimingParametersForSession(session);
+    baseline.playoutDelayMinimumUs = baseline.playoutDelayMaximumUs = 1000;
     baseline.playoutVrr18IntervalFeedback = Vrr18PredictiveIntervalFeedback;
     Stream revision6(session, baseline, 1000), live(session, 1000);
 
@@ -892,8 +901,8 @@ void testForecastRequiresRecurringDelivery()
     const auto name = scenarioName("forecast-evidence");
     auto session = vrrProductionSession(1, 120, 240, false);
     session.timingOptions.historySeconds = 15;
-    Stream tooLate(session, 1000), wake(session, 1000);
-    Stream irregular(session, 1000), missing(session, 1000), interrupted(session, 1000);
+    Stream tooLate(session, 0), wake(session, 0);
+    Stream irregular(session, 0), missing(session, 0), interrupted(session, 0);
     auto lenient = session;
     lenient.timingOptions.targetHundredths = 9900;
     Stream rare(lenient, 1000);
@@ -927,7 +936,7 @@ void testForecastRequiresRecurringDelivery()
     for (size_t delayedFrames : {1u, 2u}) {
         size_t forecasts = 0, belowGoal = 0;
         for (size_t phase = 0; phase < 120; ++phase) {
-            Stream shortBurst(session, 1000);
+            Stream shortBurst(session, 0);
             const size_t first = 780 + phase;
             for (size_t i = 0; i < 1200; ++i) {
                 Input input;
@@ -1118,7 +1127,7 @@ void testSourceCadenceBufferGrowth()
         const auto name = scenarioName("source-cadence-buffer") + "/" + smoothing.name;
         auto session = vrrProductionSession(1, 120, 120, smoothing.smooth);
         session.timingOptions = {2000, 9950, 120, 500};
-        Stream sourceOnly(session, 1000), mixed(session, 1000);
+        Stream sourceOnly(session, 0), mixed(session, 0);
         for (size_t i = 0; i < 400; ++i) {
             sourceOnly.step(1500);
             mixed.step(1500);
@@ -1133,14 +1142,14 @@ void testSourceCadenceBufferGrowth()
         }
         const auto hostPeak = maximum(sourceOnly.frames(), start, sourceOnly.size(), applied);
         const auto mixedPeak = maximum(mixed.frames(), start, mixed.size(), applied);
-        check(hostPeak == 1000, name, "host stagger alone cannot grow the buffer",
+        check(hostPeak == sourceOnly.interval().update.minimumUs, name, "host stagger alone cannot grow the buffer",
               "host-only peak %" PRIu64 " us", hostPeak);
         check(mixedPeak > hostPeak && mixedPeak <= hostPeak + 4000, name,
               "independent delivery jitter during host stagger earns bounded protection",
               "host-only peak %" PRIu64 " us, mixed peak %" PRIu64 " us", hostPeak, mixedPeak);
 
         for (size_t i = 0; i < 1200; ++i) sourceOnly.step(1500, {i % 4 == 1 ? 4000u : 0u});
-        check(sourceOnly.frames().back().appliedUs > 1000, name,
+        check(sourceOnly.frames().back().appliedUs > hostPeak, name,
               "steady 60 FPS delivery can requalify at its own rate",
               "final %" PRIu64 " us", sourceOnly.frames().back().appliedUs);
     }
@@ -1150,7 +1159,7 @@ void testClientTimingAttribution()
 {
     const auto name = scenarioName("client-timing-attribution");
     const auto session = vrrProductionSession(1, 100, 120, false);
-    Stream delivery(session, 1000), client(session, 1000);
+    Stream delivery(session, 0), client(session, 1000);
     for (size_t i = 0; i < 400; ++i) {
         delivery.step(1000);
         client.step(1000);
@@ -1203,7 +1212,7 @@ void testRateRoundTrip()
     for (const auto& preset : kPresets) for (const auto& smoothing : kSmoothing) {
         const auto name = label("rate-round-trip", preset, smoothing);
         const auto session = vrrProductionSession(preset.mode, 90, 120, smoothing.smooth);
-        Stream stream(session, 1000);
+        Stream stream(session, 0);
         for (size_t i = 0; i < frames90(35); ++i)
             stream.step(1000, {i % 2 ? 3000u : 0u});
         const size_t change = stream.size();
@@ -1236,7 +1245,7 @@ void testOrdinaryVariation()
         // The same disturbance sequence at a varying and at a steady rate.
         struct Run { uint64_t largestRampDrop; size_t hitches; };
         const auto run = [&](bool varying) {
-            Stream s(session, 1000);
+            Stream s(session, 0);
             Rng rng(113 + uint64_t(preset.mode)), rateRng(127);
             uint64_t spikeUs = 3000, elapsedTicks = 0;
             size_t counter = 0;
@@ -1288,22 +1297,27 @@ void testOrdinaryVariation()
         Rng excursionRng(131 + uint64_t(preset.mode));
         for (size_t i = 0; i < frames116(20); ++i)
             excursion.step(k116Ticks, {excursionRng.below(400) + (i % 20 == 10 ? 3000 : 0)});
-        const uint64_t excursionLearned = excursion.frames().back().appliedUs;
         const size_t excursionBegin = excursion.size();
+        uint64_t largestExcursionDrop = 0;
         for (int stall = 0; stall < 6; ++stall) {
+            const auto before = excursion.frames().back().appliedUs;
+            const auto first = excursion.size();
             for (uint32_t tail : {1138u, 1198u, 1224u}) excursion.step(tail, {excursionRng.below(400)});
             for (size_t i = 0; i < frames116(5); ++i)
                 excursion.step(k116Ticks, {excursionRng.below(400) + (excursion.size() % 20 == 10 ? 3000 : 0)});
+            // Charge the excursion and its first returning frames. A gradual
+            // release during five seconds of normal cadence is legitimate.
+            const auto lowest = minimum(excursion.frames(), first, first + 6, applied);
+            largestExcursionDrop = std::max(largestExcursionDrop, before - std::min(before, lowest));
         }
         const auto& e = excursion.frames();
-        const uint64_t excursionMinimum = minimum(e, excursionBegin, e.size(), applied);
         uint64_t largestRise = 0;
         for (size_t i = excursionBegin + 1; i < e.size(); ++i)
             if (e[i].appliedUs > e[i - 1].appliedUs) largestRise = std::max(largestRise, e[i].appliedUs - e[i - 1].appliedUs);
-        report("%-52s stall excursions: min %5" PRIu64 " of %5" PRIu64 ", largest restore step %4" PRIu64 "\n",
-            name.c_str(), excursionMinimum, excursionLearned, largestRise);
-        check(excursionMinimum + 250 >= excursionLearned, name, "a three-frame stall excursion costs no protection",
-            "fell to %" PRIu64 " us from %" PRIu64 " us around a brief long-interval run", excursionMinimum, excursionLearned);
+        report("%-52s stall excursions: largest loss %5" PRIu64 ", largest restore step %4" PRIu64 "\n",
+            name.c_str(), largestExcursionDrop, largestRise);
+        check(largestExcursionDrop <= 250, name, "a three-frame stall excursion costs no protection",
+            "buffer fell %" PRIu64 " us across a brief long-interval run and return", largestExcursionDrop);
         check(largestRise <= excursion.toleranceUs(), name, "returning from a stall excursion needs no visible restore step",
             "buffer jumped %" PRIu64 " us in one frame", largestRise);
     }
@@ -1330,7 +1344,7 @@ void testDisplayCeilingShedsStandingPhase()
         const size_t total = 120 * 240, settledFrom = total - 20 * 120;
         constexpr uint64_t kLateUs = 4000, kJitterUs = 400, kRefreshUs = 8333;
         // One late frame every 5 s adds carry that running faster cannot repay.
-        const auto run = [&](uint64_t seedUs) {
+        const auto run = [&](std::optional<uint64_t> seedUs) {
             auto stream = std::make_unique<Stream>(session, seedUs);
             Rng rng(137 + uint64_t(preset.mode));
             for (size_t i = 0; i < total; ++i)
@@ -1339,7 +1353,7 @@ void testDisplayCeilingShedsStandingPhase()
         };
         // Cold start releases the starting delay at the ceiling; the reference
         // starts at the floor with the same input.
-        const auto cold = run(0), floor = run(1000);
+        const auto cold = run(std::nullopt), floor = run(0);
         const auto& f = cold->frames();
         std::vector<uint64_t> planned, shown;
         for (size_t i = settledFrom; i < total; ++i) {
@@ -1755,7 +1769,7 @@ void testRateDropReleasesMappingExcess()
         const auto session = vrrProductionSession(preset.mode, 116, 120, smoothing.smooth);
         // The largest early offset each profile's buffer ceiling can protect.
         const uint64_t early = preset.mode == 2 ? 3000 : preset.mode == 1 ? 6000 : 8000;
-        Stream s(session, 1000);
+        Stream s(session, 0);
         Rng rng(61 + uint64_t(preset.mode));
         for (size_t i = 0; i < 3000; ++i) s.step(k116Ticks, {i % 10 == 0 ? 0 : early + rng.below(600)});
         const size_t drop = s.size();
@@ -1764,7 +1778,7 @@ void testRateDropReleasesMappingExcess()
             int(4 * s.releaseTauUs() / 1000000));
         for (size_t i = 0; i < recoveryFrames; ++i) s.step(k30Ticks, {early + rng.below(600)});
         // The same 30 FPS input from a session that never ran faster.
-        Stream reference(session, 1000);
+        Stream reference(session, 0);
         Rng referenceRng(67 + uint64_t(preset.mode));
         for (size_t i = 0; i < 1050; ++i) reference.step(k30Ticks, {early + referenceRng.below(600)});
         const auto age = [](const Frame& f) { return f.shownUs - f.decodedUs; };
@@ -1842,11 +1856,11 @@ void testLossAndDownstreamWorkBuyNoInputDelay()
         const size_t total = frames116(60);
         {
             const std::string name = label("lossy-late-frames", preset, smoothing);
-            Stream s(session, 1000);
+            Stream s(session, 0);
             Rng rng(83 + uint64_t(preset.mode));
             for (size_t i = 0; i < total; ++i) {
                 const bool lossy = i % 20 == 10;
-                s.step(k116Ticks, {rng.below(400) + (lossy ? 3000 : 0), lossy ? 4u : 0u});
+                s.step(k116Ticks, {rng.below(std::min<uint64_t>(400, s.toleranceUs())) + (lossy ? 3000 : 0), lossy ? 4u : 0u});
             }
             const auto in = s.interval();
             const uint64_t peak = maximum(s.frames(), frames116(1), total, applied);
@@ -1862,7 +1876,7 @@ void testLossAndDownstreamWorkBuyNoInputDelay()
             for (bool decoder : {false, true}) for (bool overloaded : {false, true}) {
                 const auto name = label(decoder ? "decoder-backlog" : "slow-preparation", preset, smoothing)
                     + (overloaded ? "/overloaded" : "/intermittent");
-                Stream s(session, 1000);
+                Stream s(session, 0);
                 Rng rng(79 + uint64_t(preset.mode));
                 for (size_t i = 0; i < frames116(10); ++i) s.step(k116Ticks);
                 const size_t start = s.size();
@@ -1910,7 +1924,7 @@ void testCatchUpCarryDrainsBetweenLateFrames()
     for (const auto& smoothing : kSmoothing) for (int index : {0, 1}) {
         const Preset& preset = kPresets[index];
         const std::string name = label("catch-up-carry", preset, smoothing);
-        Stream s(vrrProductionSession(preset.mode, 116, 120, smoothing.smooth), 1000);
+        Stream s(vrrProductionSession(preset.mode, 116, 120, smoothing.smooth), 0);
         const size_t spacing = index == 0 ? 200 : 400;
         Rng rng(97 + uint64_t(index));
         const size_t total = frames116(60);
@@ -1960,7 +1974,7 @@ void testExpiryThroughInvalidEvidence()
 {
     for (const auto& preset : kPresets) for (const auto& smoothing : kSmoothing) {
         const std::string name = label("invalid-expiry", preset, smoothing);
-        Stream s(vrrProductionSession(preset.mode, 90, 120, smoothing.smooth), 1000);
+        Stream s(vrrProductionSession(preset.mode, 90, 120, smoothing.smooth), 0);
         Rng rng(101 + uint64_t(preset.mode));
         const size_t earned = frames90(30);
         for (size_t i = 0; i < earned; ++i) s.step(1000, {rng.below(400) + (i % 2 ? 3000 : 0)});
@@ -1994,13 +2008,13 @@ void testExpiryThroughInvalidEvidence()
 // short/long pairs through unchanged.
 void testSmoothingStaysInsideItsBudget()
 {
-    for (int rate : {90, 116}) {
+    for (const auto& [rate, displayHz] : {std::pair<int, int>{90, 120}, {116, 120}, {116, 144}}) {
         const uint32_t ticks = uint32_t(90000 / rate);
         struct Run { uint64_t peakApplied, floor, extraP50, latency, jerkP95; };
         Run runs[std::size(kSmoothing)] = {};
         for (size_t mode = 0; mode < std::size(kSmoothing); ++mode) {
             const auto& smoothing = kSmoothing[mode];
-            Stream s(vrrProductionSession(1, rate, 120, smoothing.smooth), 1000);
+            Stream s(vrrProductionSession(1, rate, displayHz, smoothing.smooth), 0);
             Rng sourceRng(103), inputRng(107);
             const size_t total = size_t(40 * rate);
             for (size_t i = 0; i < total; ++i) {
@@ -2018,10 +2032,10 @@ void testSmoothingStaysInsideItsBudget()
             runs[mode] = {maximum(f, from, total, applied), floorUs, percentile(extra, 500),
                           mean(f, from, total, latency), percentile(presentedJerk(f, from, total), 950)};
         }
-        const uint64_t tolerance = uint64_t(vrrProductionSession(1, rate, 120).timingOptions.toleranceUs);
+        const uint64_t tolerance = uint64_t(vrrProductionSession(1, rate, displayHz).timingOptions.toleranceUs);
         for (size_t mode = 0; mode < std::size(kSmoothing); ++mode) {
             const auto& smoothing = kSmoothing[mode];
-            const std::string name = label("smoothing-budget", kPresets[1], smoothing) + "/" + std::to_string(rate) + "fps";
+            const std::string name = label("smoothing-budget", kPresets[1], smoothing) + "/" + std::to_string(rate) + "fps-" + std::to_string(displayHz) + "hz";
             const Run& r = runs[mode];
             const uint64_t budget = !smoothing.smooth ? 0 : tolerance;
             report("%-52s buffer %5" PRIu64 " extra p50 %4" PRIu64 " (budget %4" PRIu64 ") latency %5" PRIu64 " (off %5" PRIu64 ") jerk p95 %4" PRIu64 " (off %4" PRIu64 ")\n",
@@ -2035,10 +2049,15 @@ void testSmoothingStaysInsideItsBudget()
                 r.extraP50, runs[0].extraP50, budget);
             check(r.latency <= runs[0].latency + budget + 250, name, "smoothing adds no standing delay beyond its budget",
                 "mean latency %" PRIu64 " us vs %" PRIu64 " us with smoothing off", r.latency, runs[0].latency);
-            // Reduce Judder must improve output cadence on imperfect input.
-            if (smoothing.smooth)
-                check(r.jerkP95 * 5 <= runs[0].jerkP95 * 4, name, "smoothing actually evens out short/long source pairs",
+            if (smoothing.smooth) {
+                // At zero reserve the display already spaces short source
+                // intervals that arrive faster than it can refresh. Demand
+                // an additional improvement where the full input fits.
+                const bool hasHeadroom = uint64_t(ticks - 90) * 1000000 / 90000 >= uint64_t(1000000 / displayHz);
+                const auto limit = hasHeadroom ? runs[0].jerkP95 * 4 / 5 : runs[0].jerkP95;
+                check(r.jerkP95 <= limit, name, "smoothing respects display headroom and evens out eligible pairs",
                     "presented jerk p95 %" PRIu64 " us vs %" PRIu64 " us with smoothing off", r.jerkP95, runs[0].jerkP95);
+            }
         }
     }
 }

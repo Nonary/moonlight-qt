@@ -239,6 +239,7 @@
     X(uint64_t, preparation_initial_sample_excluded, preparationInitialSampleExcluded, 0) \
     X(uint64_t, preparation_prediction_lead, preparationPredictionLead, 0) \
     X(uint64_t, playout_delay_start_seed_us, playoutDelayStartSeedUs, 0) \
+    X(uint64_t, playout_delay_start_seed_valid, playoutDelayStartSeedValid, 0) \
     X(uint64_t, playout_epoch_rate_ratio_per_mille, playoutEpochRateRatioPerMille, 0) \
     X(uint64_t, playout_epoch_sustain_us, playoutEpochSustainUs, 0) \
     X(uint64_t, playout_delay_decrease_slew_us, playoutDelayDecreaseSlewUs, 0) \
@@ -570,7 +571,10 @@ public:
     // Start at the delay a previous session with the same calibration key
     // settled at. Recorded as a parameter so replay reproduces the start.
     void seedPlayoutDelayStart(uint64_t delayUs) {
-        if (!m_HaveTimeline) m_Parameters.playoutDelayStartSeedUs = delayUs;
+        if (!m_HaveTimeline) {
+            m_Parameters.playoutDelayStartSeedUs = delayUs;
+            m_Parameters.playoutDelayStartSeedValid = 1;
+        }
     }
     uint64_t playoutQueueLimitUs() const;
     bool latencyFixActive() const { return m_LatencyFixActive; }

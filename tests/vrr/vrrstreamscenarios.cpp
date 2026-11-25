@@ -481,8 +481,21 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
     if (name == "mixed") {
         require(m.coveragePercent() >= 90 && m.recovered && m.finalScoreAvailable &&
                 m.finalScorePercent >= m.targetPercent && m.steadyMeanBufferUs <= m.finalMinBufferUs + 250 &&
-                m.steadyBufferRangeUs <= 250 && !drops,
+                m.steadyBufferRangeUs <= 250,
                 "mixed workload failed to sustain coverage and settle near the floor during the clean ending");
+        if (drops && workload.scenario.streamHz == workload.scenario.displayHz && options.canLatch) {
+            // A late frame at the refresh ceiling can leave every successor a
+            // refresh behind. Allow one replacement only with a measured
+            // display-latency saving over presenting the same frame.
+            auto referenceOptions = options;
+            referenceOptions.deferReplacements = true;
+            const auto reference = measure(workload, referenceOptions);
+            require(drops == 1 && m.counts.replacements == 1 && !dropped(reference.counts) &&
+                    m.timeAtTargetPercent() >= 99 && m.coveragePercent() >= 99 &&
+                    m.meanReadyToDisplayUs + 250 < reference.meanReadyToDisplayUs,
+                    "a ceiling replacement must save at least 250 us of mean display wait against a drop-free run");
+        }
+        else require(!drops, "mixed workload dropped a frame with display headroom");
         return failures;
     }
     // Production-quality bounds for the catalog's adaptive Balanced run.
@@ -548,6 +561,19 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
         failures.insert(failures.end(), drainFailures.begin(), drainFailures.end());
         require(sparseRun.steadyBufferRangeUs <= DrainStepUs,
                 "5 ms delivery spikes must settle without repeated reserve purchases");
+
+        for (const auto& [target, reserve] : {std::pair<int, uint64_t>{9500, 0}, {9830, 500}}) {
+            auto submillisecond = low;
+            submillisecond.targetHundredths = target;
+            const auto affordable = fixedBufferOracle(heavier, submillisecond, {0, 250, 500, 750, 1000},
+                                                      99, OracleWindow::FinalQuarter);
+            const auto adaptive = measure(heavier, submillisecond, affordable.minimumUs);
+            const auto issues = checkSurplusDrain(adaptive, affordable);
+            failures.insert(failures.end(), issues.begin(), issues.end());
+            require(affordable.found && affordable.minimumUs == reserve && adaptive.finalBufferUs == reserve &&
+                    adaptive.steadyBufferRangeUs == 0 && adaptive.finalScorePercent >= adaptive.targetPercent,
+                    "the adaptive reserve must settle at the affordable sub-millisecond goal");
+        }
 
         // The previously affordable reserve must lose approval when the same
         // delay occurs four times as often, even with the clean score history.
@@ -631,9 +657,10 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
         jitter.durationUs = 120 * Second;
         sustained.scenario.phases = {jitter};
         sustained.recoveryStartUs = 0;
-        const auto floor = fixedBufferOracle(sustained, relaxed, {recovered.finalMinBufferUs}, 99, OracleWindow::FinalQuarter);
-        const auto duringJitter = measure(sustained, relaxed, recovered.finalMinBufferUs);
-        const auto jitterFailures = checkSurplusDrain(duringJitter, floor);
+        const auto reference = fixedBufferOracle(sustained, relaxed, {0, 250, 500, 750, 1000},
+                                                 99, OracleWindow::FinalQuarter);
+        const auto duringJitter = measure(sustained, relaxed, reference.minimumUs);
+        const auto jitterFailures = checkSurplusDrain(duringJitter, reference);
         failures.insert(failures.end(), jitterFailures.begin(), jitterFailures.end());
     }
     if (name == "rate-round-trip" || name == "isolated-freeze" || name == "clock-jump")

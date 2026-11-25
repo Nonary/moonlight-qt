@@ -16,7 +16,6 @@ constexpr uint64_t kQ16One = 1ULL << 16;
 constexpr uint64_t kQ16Half = kQ16One >> 1;
 constexpr uint64_t kFixedPlayoutDelayUs = 3000;
 constexpr uint64_t kPlayoutStartUs = 6000;
-constexpr uint64_t kPlayoutMinimumUs = 1000;
 constexpr uint64_t kPlayoutMaximumUs = 8000;
 // Profile buffer allowances are measured in fitted source frames, independent
 // of display refresh: half for Low Latency, one for Balanced, two for Smooth.
@@ -163,7 +162,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         config.latencyMode : 1;
     const auto options = config.timingOptions.resolved(latencyMode);
     const bool vrr18 = config.vrr18IntervalFeedback;
-    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18SelectedGoalRelease : 0;
+    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18ZeroReserve : 0;
     parameters.playoutIntervalToleranceUs = options.toleranceUs;
     // Presets change only the four user-visible values. Admission, release,
     // and late-frame recovery use the same policy for every combination.
@@ -285,10 +284,10 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayAdaptive = 1;
     parameters.sourcePlayoutDelayUs = kFixedPlayoutDelayUs;
     parameters.playoutDelayStartUs = kPlayoutStartUs;
-    parameters.playoutDelayMinimumUs = kPlayoutMinimumUs;
+    parameters.playoutDelayMinimumUs = vrr18 ? 0 : 1000;
     // Use a source-frame budget for every preset. Fixed millisecond ceilings
     // made Balanced and Smooth collapse to roughly one frame on slower streams.
-    parameters.playoutDelayMaximumUs = kPlayoutMinimumUs;
+    parameters.playoutDelayMaximumUs = 1000;
     parameters.playoutDelayPercentilePerMille = kPlayoutPercentilePerMille;
     parameters.playoutBurstExclusionPerMille = kPlayoutBurstExclusionPerMille;
     // The independent smoothing preference trades timestamp fidelity for
@@ -1504,8 +1503,17 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             // frame: phase already standing when the ceiling is reached, or
             // after another replacement, is the 32-frame rule's (a decode
             // backlog entered it at 165 ms).
+            // With a sub-millisecond reserve, ordinary source displacement
+            // can make a frame appear more than a refresh late. Allow the
+            // uncovered displacement and selected tolerance before initiating
+            // a skip on a latch-capable presenter.
+            const uint64_t exposedUs = kSourceDisplacementUs - std::min(kSourceDisplacementUs, playoutDelayUs);
+            const uint64_t shedThresholdUs = m_Parameters.playoutVrr18IntervalFeedback >= Vrr18ZeroReserve &&
+                    m_CanLatchPresentation && exposedUs ?
+                saturatingAdd(m_DisplayPeriodUs, saturatingAdd(exposedUs, intervalQualityToleranceUs(m_Parameters))) :
+                m_DisplayPeriodUs;
             const auto stepped = [&](uint64_t valueUs, uint64_t lastUs) {
-                return valueUs > m_DisplayPeriodUs && m_CeilingLastPhaseValid && lastUs <= m_DisplayPeriodUs;
+                return valueUs > shedThresholdUs && m_CeilingLastPhaseValid && lastUs <= shedThresholdUs;
             };
             // The worker's wait for this frame's own GPU decode is client
             // decode work, which every successor queues behind: only input
@@ -1526,7 +1534,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                     saturatingAdd(physicalUs, m_DisplayPeriodUs / 2) <= m_CeilingShedFromUs :
                 m_CeilingFramesSinceShed >= m_FullRatePhase.size() &&
                     (removableStep || stepped(physicalUs, m_CeilingLastPhaseUs)) &&
-                    physicalUs > saturatingAdd(m_DisplayPeriodUs, decodeSideUs);
+                    physicalUs > saturatingAdd(shedThresholdUs, decodeSideUs);
             m_CeilingShedding = replace;
             m_CeilingFramesSinceShed = replace ? 0 : m_CeilingFramesSinceShed + 1;
             if (replace) {
@@ -2581,7 +2589,7 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18CostAwareIntervalFeedback,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18AnticipatoryIntervalFeedback,
                 belowCeiling && m_Parameters.playoutVrr18IntervalFeedback >= Vrr18TargetAwareRelease,
-                belowCeiling && m_CanLatchPresentation ? m_Parameters.playoutVrr18IntervalFeedback : 0);
+                m_Parameters.playoutVrr18IntervalFeedback, belowCeiling && m_CanLatchPresentation);
             if (m_Parameters.playoutInputPercentileEnabled) {
                 const auto capacity = m_IntervalBuffer.stats();
                 const bool validInput = submitted && !cancelled && m_Pending.intervalValid &&
@@ -3632,6 +3640,8 @@ void VrrTimingController::noteIntervalBufferEpoch(uint64_t atUs)
             nearest = &entry;
         }
     }
+    if (m_Parameters.playoutVrr18IntervalFeedback >= Vrr18ZeroReserve)
+        m_IntervalBuffer.forgetReadinessReserve();
     // Delay bought for another source rate is not evidence for this one.
     // Restore only downward; an unfamiliar rate keeps the current protection.
     if (nearest && nearest->second < current) {
@@ -3728,7 +3738,7 @@ uint64_t VrrTimingController::playoutQueueLimitUs() const
 
 uint64_t VrrTimingController::playoutDelayStartUs() const
 {
-    if (m_Parameters.playoutDelayStartSeedUs != 0) {
+    if (m_Parameters.playoutDelayStartSeedValid || m_Parameters.playoutDelayStartSeedUs != 0) {
         return clampUnsigned(m_Parameters.playoutDelayStartSeedUs,
                              playoutDelayMinimumUs(), playoutDelayMaximumUs());
     }

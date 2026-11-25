@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -3491,7 +3492,7 @@ void testLatchedHandoffCreditsOnlyEnforcedSpacing()
     for (uint64_t revision : {Vrr18RecoverableIntervalFeedback, Vrr18GoalIntervalFeedback,
                               Vrr18PredictiveIntervalFeedback, Vrr18CostAwareIntervalFeedback,
                               Vrr18AnticipatoryIntervalFeedback, Vrr18TargetAwareRelease,
-                              Vrr18ScoreQualifiedRelease, Vrr18ProfileReleaseBudget, Vrr18SelectedGoalRelease}) {
+                              Vrr18ScoreQualifiedRelease, Vrr18ProfileReleaseBudget, Vrr18SelectedGoalRelease, Vrr18ZeroReserve}) {
         auto session = config(120, 120);
         session.smoothFrameTiming = false;
         auto policy = vrrTimingParametersForSession(session, true, false);
@@ -3912,19 +3913,19 @@ void testPreparationPredictionCannotStarveAdmission()
 
 void testStartDelaySeedReplacesGenericStart()
 {
-    auto session = config(120, 120);
+    const auto session = vrrProductionSession(1, 120, 120);
     const auto parameters = vrrTimingParametersForSession(session);
-    const auto startOf = [&](uint64_t seedUs) {
+    const auto startOf = [&](std::optional<uint64_t> seedUs) {
         VrrTimingController controller(session, true, parameters);
-        controller.seedPlayoutDelayStart(seedUs);
+        if (seedUs) controller.seedPlayoutDelayStart(*seedUs);
         const auto decoded = decodedTimeForRtp(1000000, 750);
         return controller.schedule(frame(0, 750, true, decoded), decoded).playoutDelayUs;
     };
-    const auto generic = startOf(0);
-    expect(startOf(3000) == 3000 && generic != 3000,
+    const auto generic = startOf(std::nullopt);
+    expect(startOf(3000) == 3000 && generic > 0 && generic != 3000,
            "a cached settled delay must replace the generic starting guess");
-    expect(startOf(1) == parameters.playoutDelayMinimumUs,
-           "a cached delay must stay within the policy minimum");
+    expect(startOf(0) == 0 && startOf(1) == 1 && startOf(250) == 250,
+           "warm zero and sub-millisecond seeds must retain their measured reserve");
 }
 
 void testIntervalBufferRestoreHoldsRestoredTarget()

@@ -1,7 +1,7 @@
 # Streaming and VRR architecture
 
 Source baseline: `master` based on `v6.2.0-daily.202` with VRR18 interval
-feedback revision 12 and the source-clock deadline correction.
+feedback revision 13 and the source-clock deadline correction.
 Buffer growth uses delivery and decode readiness at both ends of an interval.
 The custom profile exposes the frame allowance, timing target, score history,
 and interval tolerance. The earlier platform changes include the decode-buffer accounting
@@ -809,6 +809,19 @@ range, in 250 µs steps near the minimum and at most 20 further steps above
 that range. Replay selects the earlier budget and projection from the recorded
 revision. The configured tolerance, movement limits and display ceiling still
 apply.
+
+Revision 13 lets the adaptive reserve range begin at zero. A sufficiently
+relaxed pacing goal can release the entire reserve. The controller continues
+observing readiness at zero and can rebuild protection when delivery changes.
+It checks fixed reserves in 250 µs steps through 4 ms. A confirmed source-rate
+change clears the previous rate's readiness estimate while the applied reserve
+continues to follow the release law. At the display ceiling, a latch-capable
+presenter also allows for exposed source displacement and the selected
+tolerance before replacing a frame just over one refresh late. Preparation,
+submission and display spacing can still add latency at zero reserve. The
+startup cache and replay parameters distinguish a saved zero
+from a missing seed, which uses the cold-start estimate. Older recordings use
+their recorded lower bound and retain their original startup behavior.
 
 The Client timing score and its one-second mean require timely complete-frame
 arrival at both ends of an interval. The controller compares compressed-frame

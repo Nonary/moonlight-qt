@@ -33,6 +33,7 @@ struct Options {
     int latencyMode = 1, targetHundredths = 0;
     bool smooth = true, canLatch = true;
     int64_t fixedBufferUs = -1;
+    bool deferReplacements = false; // Counterfactual run that presents the current frame.
 };
 
 class FixedBufferUnavailable : public std::invalid_argument {

@@ -3618,7 +3618,8 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     const QList<QByteArray> columns = header.split(',');
     const QList<QByteArray> fields = row.split(',');
     expect(columns.size() == fields.size(), "diagnostic columns must align with every value");
-    expect(fields.value(columns.indexOf("param_playout_delay_start_seed_us")).toULongLong() == startupSeedUs,
+    expect(fields.value(columns.indexOf("param_playout_delay_start_seed_valid")) == "1" &&
+           fields.value(columns.indexOf("param_playout_delay_start_seed_us")).toULongLong() == startupSeedUs,
            "trace must retain the loaded warm startup seed used by the controller");
     expect(columns.contains("lost_packets") && fields.value(columns.indexOf("lost_packets")) == "12",
            "trace must preserve packet loss so replay can reproduce buffer eligibility");
@@ -4069,7 +4070,7 @@ void testExperimentalInputPercentileActivationTrace()
             ++rows;
             expect(fields.size() == columns.size() &&
                        fields.value(columns.indexOf("param_playout_vrr18_interval_feedback")).toULongLong() ==
-                           Vrr18SelectedGoalRelease &&
+                           Vrr18ZeroReserve &&
                        fields.value(columns.indexOf("param_playout_input_percentile_enabled")) == "0" &&
                        fields.value(columns.indexOf("param_playout_on_time_target_per_million")).toULongLong() == expected &&
                        fields.value(columns.indexOf("param_playout_readiness_window_us")).toULongLong() == expectedWindow,

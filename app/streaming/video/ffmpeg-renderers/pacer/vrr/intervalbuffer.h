@@ -23,6 +23,7 @@ constexpr uint64_t Vrr18TargetAwareRelease = 9;
 constexpr uint64_t Vrr18ScoreQualifiedRelease = 10;
 constexpr uint64_t Vrr18ProfileReleaseBudget = 11;
 constexpr uint64_t Vrr18SelectedGoalRelease = 12;
+constexpr uint64_t Vrr18ZeroReserve = 13;
 
 namespace Vrr13 {
 // Score each adjacent interval against its intended spacing. Historical VRR18
@@ -138,7 +139,7 @@ public:
                  bool sharedScore = false, bool requireRecoverableInterval = false,
                  bool goalFeedback = false, bool predictiveFeedback = false,
                  bool costAwareFeedback = false, bool anticipatoryFeedback = false,
-                 bool targetAwareRelease = false, uint64_t releaseRevision = 0) {
+                 bool targetAwareRelease = false, uint64_t releaseRevision = 0, bool canQualifyRelease = true) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -289,7 +290,7 @@ public:
             if (s.absorbable && previous.absorbable && window.service <= window.intended &&
                     window.decoderQueue <= window.intended && s.independentReadyUs && previous.independentReadyUs) {
                 m_Reserve.observe(previous, m_Previous, intended, minimum, maximum, toleranceUs,
-                                  steadySource, targetPerMillion, hold);
+                                  steadySource, targetPerMillion, hold, releaseRevision >= Vrr18ZeroReserve);
             }
         }
         if (!m_Stats.averageValid) return;
@@ -369,7 +370,7 @@ public:
         bool budgetCoversReserve = false;
         bool qualifiedAtCurrentReserve = false;
         auto readinessTarget = m_Reserve.targetUs;
-        if (releaseRevision >= Vrr18ScoreQualifiedRelease && minimum < maximum && steadySource && windowAbsorbable &&
+        if (canQualifyRelease && releaseRevision >= Vrr18ScoreQualifiedRelease && minimum < maximum && steadySource && windowAbsorbable &&
                 s.absorbable && previous.absorbable && s.independentReadyUs && previous.independentReadyUs &&
                 allowedLoss > 0 && (!belowTarget || releaseRevision >= Vrr18SelectedGoalRelease)) {
             // Historical revisions projected release against a fraction of a preset budget.
@@ -383,7 +384,7 @@ public:
                 allowedLoss * (1.0 - double(ScoreBucketUs) / double(std::max(scoreWindowUs, ScoreBucketUs))) :
                 0.9 * std::min(allowedLoss, historicalCap);
             const auto qualifiedReserve = m_ReleaseCosts.observe(previous, m_Previous, actual, intended,
-                error, toleranceUs, minimum, maximum, releaseAllowance, selectedGoal);
+                error, toleranceUs, minimum, maximum, releaseAllowance, selectedGoal, releaseRevision >= Vrr18ZeroReserve);
             const bool appliedQualifies = qualifiedReserve <= std::min(s.buffer, previous.buffer);
             const bool honorApproval = selectedGoal || (releaseRevision >= Vrr18ProfileReleaseBudget && allowedLoss > 0.005);
             qualifiedAtCurrentReserve = honorApproval && appliedQualifies &&
@@ -537,6 +538,10 @@ public:
         m_LastPressure = atUs;
         m_ReleaseFraction = 0;
     }
+    // An independent readiness estimate belongs to the observed source rate.
+    // Keep the applied reserve and pacing score while the new rate earns its
+    // own protection and the release law drains excess from the old stream.
+    void forgetReadinessReserve() { m_Reserve = {}; }
     Stats stats() const { return m_Stats; }
     void breakSequence() {
         m_Forecast = {};
@@ -768,7 +773,7 @@ private:
 
         void observe(const Sample& previous, const Sample& current, uint64_t intendedUs,
                      uint64_t minimumUs, uint64_t maximumUs, uint64_t toleranceUs,
-                     bool steadySource, uint64_t targetPpm, uint64_t holdUs) {
+                     bool steadySource, uint64_t targetPpm, uint64_t holdUs, bool zeroReserve) {
             estimateUs = std::clamp(estimateUs, double(minimumUs), double(maximumUs));
             const auto lossUs = [&](double reserveUs) {
                 const double difference = std::abs(lateUs(current, reserveUs) - lateUs(previous, reserveUs));
@@ -790,6 +795,7 @@ private:
                     std::min(predictedUs, remainingUs + predictedUs / 2);
             }
 
+            const bool initialEstimate = zeroReserve ? lastObservedUs == 0 : smoothedUs == 0;
             const double elapsedUs = lastObservedUs && current.submitted > lastObservedUs ?
                 double(std::min<uint64_t>(200000, current.submitted - lastObservedUs)) : 0.0;
             lastObservedUs = current.submitted;
@@ -809,7 +815,7 @@ private:
             riseCreditUs -= std::max(0.0, changeUs);
             estimateUs = std::clamp(estimateUs + changeUs, double(minimumUs), double(maximumUs));
 
-            if (clean || !smoothedUs) smoothedUs = clean ? estimateUs : double(minimumUs);
+            if (clean || initialEstimate) smoothedUs = clean ? estimateUs : double(minimumUs);
             else smoothedUs += (estimateUs - smoothedUs) * std::min(1.0, elapsedUs / std::max(1000000.0, double(holdUs)));
             const uint64_t stepUs = std::max<uint64_t>(1, toleranceUs / 4);
             const double excessUs = std::max(0.0, smoothedUs - minimumUs);
@@ -830,21 +836,25 @@ private:
         static constexpr uint64_t StepUs = 250;
         static constexpr size_t FineLevels = 13; // 250 us steps through 3 ms above the minimum.
         static constexpr size_t OuterSteps = 20;
-        static constexpr size_t Levels = FineLevels + OuterSteps;
+        static constexpr size_t SubMillisecondSteps = 4;
+        static constexpr size_t Levels = FineLevels + SubMillisecondSteps + OuterSteps;
 
         bool hasHistory() const { return confirmedLevel <= levelCount; }
         uint64_t nextReserveAfterApproval() const { return candidate(std::min(confirmedLevel, previousLevel) + 1); }
 
         uint64_t observe(const Sample& previous, const Sample& current, uint64_t actualUs,
                          uint64_t intendedUs, uint64_t errorUs, uint64_t toleranceUs,
-                         uint64_t minimumUs, uint64_t maximumUs, double allowedLoss, bool selectedGoal) {
+                         uint64_t minimumUs, uint64_t maximumUs, double allowedLoss, bool selectedGoal, bool zeroReserve) {
             if (minimumUs != minimum || maximumUs != maximum) {
                 *this = {};
                 minimum = minimumUs;
                 maximum = maximumUs;
-                levelCount = selectedGoal ? Levels : FineLevels;
+                // Extend the fine grid downward while preserving its coverage of
+                // reserves up to 4 ms and the recorded grids of earlier policies.
+                fineLevels = FineLevels + (zeroReserve ? SubMillisecondSteps : 0);
+                levelCount = fineLevels + (selectedGoal ? OuterSteps : 0);
                 const uint64_t range = maximum - minimum;
-                const uint64_t outerRange = range - std::min(range, StepUs * (FineLevels - 1));
+                const uint64_t outerRange = range - std::min(range, StepUs * (fineLevels - 1));
                 outerStepUs = std::max<uint64_t>(StepUs, outerRange / OuterSteps + (outerRange % OuterSteps != 0));
             }
             elapsedUs += actualUs;
@@ -913,14 +923,14 @@ private:
 
     private:
         uint64_t candidate(size_t level) const {
-            if (level >= levelCount || level == Levels - 1) return maximum;
-            const uint64_t fine = std::min(level, FineLevels - 1);
+            if (level >= levelCount || (levelCount > fineLevels && level == levelCount - 1)) return maximum;
+            const uint64_t fine = std::min(level, fineLevels - 1);
             return minimum + std::min(maximum - minimum, fine * StepUs + (level - fine) * outerStepUs);
         }
 
         uint64_t minimum = 0, maximum = 0, elapsedUs = 0;
         uint64_t outerStepUs = StepUs;
-        size_t levelCount = FineLevels, previousLevel = Levels + 1, confirmedLevel = Levels + 1;
+        size_t fineLevels = FineLevels, levelCount = FineLevels, previousLevel = Levels + 1, confirmedLevel = Levels + 1;
         double observedLossUs = 0;
         std::array<double, Levels> extraLossUs{};
     };
