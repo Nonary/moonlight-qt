@@ -1,7 +1,7 @@
 # Streaming and VRR architecture
 
 Source baseline: `master` based on `v6.2.0-daily.202` with VRR18 interval
-feedback revision 13 and the source-clock deadline correction.
+feedback revision 15, built on the zero-reserve policy in `815ce5af`.
 Buffer growth uses delivery and decode readiness at both ends of an interval.
 The custom profile exposes the frame allowance, timing target, score history,
 and interval tolerance. The earlier platform changes include the decode-buffer accounting
@@ -823,6 +823,45 @@ startup cache and replay parameters distinguish a saved zero
 from a missing seed, which uses the cold-start estimate. Older recordings use
 their recorded lower bound and retain their original startup behavior.
 
+Revision 14 budgets voluntary changes to the applied reserve on each eligible
+frame. The controller compares its planned handoff with the preceding
+presentation anchor plus the actual RTP interval, accounting for smoothing,
+readiness and display spacing. A 0.2 ms late plan with a 0.5 ms tolerance can
+add up to 0.3 ms of exposed delay. It can remove up to 0.5 ms to correct that
+error. A known readiness or spacing constraint can hide part of a change.
+Each step is capped at one tolerance. Sequence breaks, skipped predecessors
+and confirmed rate transitions defer voluntary movement until there is a
+matched interval again. Queue capacity still caps the applied reserve.
+
+Recurring delivery spikes can earn protection during an incomplete forecast
+window when both the previous window and the current observations support it.
+The predictor checks recurrence in frame numbers and sender time. When the
+current loss still fits the score surplus, it also checks that the independently
+measured spike sizes repeat. Below the display ceiling, a lower reserve that
+passes the selected pacing goal can be applied on the next eligible frame.
+A partial clean window can fund a small release by charging both adjacent
+intervals for the reserve it exposes. A software-spaced presenter additionally
+requires independent readiness within tolerance at the minimum reserve.
+Revision 14 kept the earlier release law at the refresh ceiling.
+
+Revision 15 also qualifies release on a latch-capable presenter at the
+observed display ceiling. Each candidate reserve pays the larger of two
+projected interval losses. One uses current handoff and display constraints.
+The other uses the independently measured readiness of both frames at the
+earlier phase, since a previous flip can temporarily conceal a delivery
+spike. Crossing the ceiling boundary starts fresh release evidence. The
+applied reserve still moves by at most one tolerance per eligible frame.
+Physical refresh spacing can retain some delay until source cadence gives
+the display room or the worker can replace a frame with a ready successor.
+
+For an uncalibrated latch-capable session requesting the display's refresh
+rate, the initial reserve spends the selected goal's one-second loss allowance
+on one possible delivery stretch. For period P, tolerance T and stretch x,
+the modeled loss is (P+x) × max(0,x−T)/P microseconds. Stricter goals retain
+more initial protection. A measured startup seed takes precedence, including
+a saved zero. Historical replay uses the startup and release rules recorded
+in the session.
+
 The Client timing score and its one-second mean require timely complete-frame
 arrival at both ends of an interval. The controller compares compressed-frame
 reassembly with the nominal decode-ready deadline, leaving time for normal
@@ -836,12 +875,12 @@ complete-frame delivery. A mixed interval can contain real client delay, and
 the available receive timestamps alone cannot distinguish host, transport,
 and client receive-thread delay before reassembly.
 
-Balanced interval feedback tapers release below the controller's display
+The fallback Balanced release law tapers below the controller's display
 ceiling threshold, with the same 0.1% margin used for phase recovery. In that
 case release begins after five seconds of qualified recovery and slows to
 the current excess above the floor divided by 12 seconds, capped at the
-usual 250 us/s. Near the display ceiling it keeps its original release law
-so the presentation floor can shed standing phase as before. Older captures
+usual 250 us/s. At the ceiling, the fallback uses constant-rate release when
+no lower reserve has qualified. Older captures
 without the taper parameters use constant-rate release during exact replay.
 
 The following describes the historical goal-solver policy, retained for replay
@@ -954,6 +993,15 @@ capabilities before loading. The new key deliberately cold-starts rather than
 borrowing an old policy's cached evidence. Cached history is not proof of live
 coverage or physical presentation, and phase rebases and complete resets have
 different lifecycle effects.
+On normal worker shutdown the startup-delay file prefers a reserve that the
+last submitted interval actually used at both endpoints, while meeting the
+selected score and passing the release trials over two completed windows.
+This lets short, clean connections save zero and lets a recent qualified
+reserve replace an older session median. Without a qualified endpoint, the
+worker uses its previous fallback of at least 60 one-second samples after
+the first 30 seconds. If neither source qualifies, it leaves the saved entry
+alone. The first decision logs the applied reserve and whether it came from
+the matching cache entry or the cold policy.
 The `prompt-decode-accounting` cache marker additionally isolates both saved
 startup delay and reserve history from the former queue-contaminated estimator.
 Existing cache files are preserved, but their prior keys are not loaded. The

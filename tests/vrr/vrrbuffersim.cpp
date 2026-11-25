@@ -482,6 +482,9 @@ int run(const QCommandLineParser& cli)
             metrics.insert("compressed_host_send_intervals", number(c.compressedHostSendIntervals));
         }
         metrics.insert("runtime_ms", ms);
+        metrics.insert("first_buffer_us", number(m.firstBufferUs));
+        if (m.sessionsObserved > 1)
+            metrics.insert("max_reconnect_start_buffer_us", number(m.maxReconnectStartBufferUs));
         QJsonArray errors;
         for (const auto& f : failures) {
             passed = false;

@@ -162,7 +162,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         config.latencyMode : 1;
     const auto options = config.timingOptions.resolved(latencyMode);
     const bool vrr18 = config.vrr18IntervalFeedback;
-    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18ZeroReserve : 0;
+    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18CeilingBuffer : 0;
     parameters.playoutIntervalToleranceUs = options.toleranceUs;
     // Presets change only the four user-visible values. Admission, release,
     // and late-frame recovery use the same policy for every combination.
@@ -523,6 +523,7 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_SmoothingCadenceCount = 0;
     m_SmoothingCadenceIndex = 0;
     m_IntervalBuffer.breakSequence();
+    m_QualifiedStartDelayUs.reset();
     m_InputBuffer.breakSequence();
     m_InputLayerCadence.reset();
     // A rebase moves the slot basis for every rate layer's evidence alike.
@@ -906,9 +907,24 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         // tick still carries lag from a late frame, on-time arrivals would
         // otherwise look early and the cushion would release until frames
         // were late all the time.
-        updatePlayoutDelay(frame, cadence, rebased,
-                           readyOffsetUs - smoothingUs,
-                           nowUs);
+        Vrr13::IntervalBuffer::FrameMovement movement;
+        if (m_Parameters.playoutVrr18IntervalFeedback >= Vrr18FrameBudget &&
+                !rebased && !cadence.phaseDiscontinuity && !cadence.sourceRateChanged &&
+                cadence.eligible && cadence.usedRtpTimestamp && cadence.frameDelta == 1 &&
+                frame.frameNumber() > 0 && m_PhaseTrajectory.anchoredAt(uint64_t(frame.frameNumber()) - 1)) {
+            const auto nominalUs = saturatingAdd(addSigned(rawBasisUs, smoothingUs), leadUs);
+            // Use the preceding presentation anchor for both the intended
+            // interval and the display's earliest next slot. A queued latch
+            // can place that anchor later than its CPU submission.
+            const auto anchorUs = spacingAnchorUs();
+            const auto earliestUs = std::max(saturatingAdd(nowUs, leadUs),
+                                             m_CanLatchPresentation ? saturatingAdd(anchorUs, m_DisplayPeriodUs) :
+                                             earliestSubmissionUs());
+            movement = Vrr13::IntervalBuffer::movementBudget(
+                saturatingAdd(anchorUs, cadence.intervalUs), nominalUs, earliestUs,
+                intervalQualityToleranceUs(m_Parameters));
+        }
+        updatePlayoutDelay(frame, cadence, rebased, readyOffsetUs - smoothingUs, nowUs, movement);
     }
     else {
         resetCadenceSmoothing();
@@ -2557,9 +2573,11 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         const auto deadline = saturatingAdd(m_Pending.smoothness.intended,
                                              smoothingAdvanceUs);
         const uint64_t toleranceUs = intervalQualityToleranceUs(m_Parameters);
-        // At the refresh ceiling the physical spacing floor can retain phase
-        // after the buffer releases. Keep the established release law there.
+        // At the refresh ceiling a previous flip can conceal the cost of
+        // removing reserve. Qualify both the current and released flip phase.
         const bool belowCeiling = m_SourcePeriodUs > saturatingAdd(m_DisplayPeriodUs, m_DisplayPeriodUs / 1000);
+        const bool latchedCeiling = !belowCeiling && m_CanLatchPresentation &&
+            m_Parameters.playoutVrr18IntervalFeedback >= Vrr18CeilingBuffer;
         const bool taperRelease = m_Parameters.playoutIntervalReleaseTauUs && belowCeiling;
         const uint64_t intervalHoldUs = taperRelease && m_Parameters.playoutIntervalTaperHoldUs ?
             m_Parameters.playoutIntervalTaperHoldUs : m_Parameters.playoutMeanMissHoldUs;
@@ -2589,7 +2607,14 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18CostAwareIntervalFeedback,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18AnticipatoryIntervalFeedback,
                 belowCeiling && m_Parameters.playoutVrr18IntervalFeedback >= Vrr18TargetAwareRelease,
-                m_Parameters.playoutVrr18IntervalFeedback, belowCeiling && m_CanLatchPresentation);
+                m_Parameters.playoutVrr18IntervalFeedback, m_CanLatchPresentation && (belowCeiling || latchedCeiling),
+                latchedCeiling);
+            // A cancelled final present supplies no new measurement. Keep
+            // the last submitted outcome until a new submission or rebase.
+            if (submitted && !cancelled) {
+                m_QualifiedStartDelayUs = m_IntervalBuffer.startDelayQualified() ?
+                    std::optional<uint64_t>(p.applied) : std::nullopt;
+            }
             if (m_Parameters.playoutInputPercentileEnabled) {
                 const auto capacity = m_IntervalBuffer.stats();
                 const bool validInput = submitted && !cancelled && m_Pending.intervalValid &&
@@ -3755,13 +3780,39 @@ uint64_t VrrTimingController::playoutDelayStartUs() const
         // inter-frame headroom here: the learned target credits it exactly once.
         startUs = std::min(startUs, std::max(m_DisplayPeriodUs, m_RenderLeadUs));
     }
+    if (m_Parameters.playoutVrr18IntervalFeedback >= Vrr18CeilingBuffer &&
+            m_CanLatchPresentation && m_Config.streamRateHz > 0 && m_Config.streamRateHz == m_Config.displayRefreshHz) {
+        startUs = std::min(startUs, playoutDelayMaximumUs());
+        const uint64_t lossPpm = 1000000 - std::min<uint64_t>(1000000, m_Parameters.playoutOnTimeTargetPerMillion);
+        // An unbuffered stretch x lasts P+x and costs (P+x)*(x-T)/P in
+        // the one-second interval score. Spend up to its loss allowance on
+        // startup exposure rather than assigning a speculative whole frame.
+        const double budget = double(Vrr13::IntervalBuffer::ShortWindowUs) * lossPpm / 1000000;
+        const double period = double(m_DisplayPeriodUs);
+        const double tolerance = double(intervalQualityToleranceUs(m_Parameters));
+        const double sum = period + tolerance;
+        const uint64_t exposureUs = uint64_t(tolerance + 2 * period * budget /
+            (sum + std::sqrt(sum * sum + 4 * period * budget)));
+        startUs -= std::min(startUs, exposureUs);
+    }
     return clampUnsigned(startUs, playoutDelayMinimumUs(),
                          playoutDelayMaximumUs());
 }
 
+std::optional<uint64_t> VrrTimingController::startDelayForCache(std::vector<uint64_t>& settledSamples) const
+{
+    if (m_QualifiedStartDelayUs) return m_QualifiedStartDelayUs;
+    // For streams without an approved end-of-session reserve, retain the
+    // established median of at least sixty settled one-second observations.
+    if (settledSamples.size() < 60) return std::nullopt;
+    const auto median = settledSamples.begin() + settledSamples.size() / 2;
+    std::nth_element(settledSamples.begin(), median, settledSamples.end());
+    return *median;
+}
+
 void VrrTimingController::updatePlayoutDelay(
     const PacedFrame& frame, const CadenceObservation& cadence,
-    bool rebased, int64_t readyOffsetUs, uint64_t nowUs)
+    bool rebased, int64_t readyOffsetUs, uint64_t nowUs, Vrr13::IntervalBuffer::FrameMovement movement)
 {
     if (m_Parameters.playoutDelayAdaptive == 0) {
         m_PlayoutBandValid = false;
@@ -3769,7 +3820,7 @@ void VrrTimingController::updatePlayoutDelay(
     }
 
     if (m_Parameters.playoutHistoryEnabled != 0) {
-        updatePlayoutHistory(frame, cadence, rebased, readyOffsetUs, nowUs);
+        updatePlayoutHistory(frame, cadence, rebased, readyOffsetUs, nowUs, movement);
         return;
     }
 
@@ -3946,7 +3997,7 @@ void VrrTimingController::updatePlayoutDelay(
 
 void VrrTimingController::updatePlayoutHistory(
     const PacedFrame& frame, const CadenceObservation& cadence,
-    bool rebased, int64_t requiredUs, uint64_t nowUs)
+    bool rebased, int64_t requiredUs, uint64_t nowUs, Vrr13::IntervalBuffer::FrameMovement movement)
 {
     const uint64_t at = sourceMappingUs(frame);
     const uint64_t elapsed = m_LastHistoryArrivalUs && at >= m_LastHistoryArrivalUs ?
@@ -4043,11 +4094,12 @@ void VrrTimingController::updatePlayoutHistory(
                 playoutDelayMaximumUs());
             // The observer can request protection for recurring, corroborated misses.
             // Apply increases across frames to limit the change in handoff spacing.
+            const bool frameBudget = m_Parameters.playoutVrr18IntervalFeedback >= Vrr18FrameBudget;
             if (m_RequestedPlayoutDelayUs > m_AppliedPlayoutDelayUs)
-                m_AppliedPlayoutDelayUs += std::min<uint64_t>(125,
+                m_AppliedPlayoutDelayUs += std::min(frameBudget ? movement.riseUs : uint64_t(125),
                     m_RequestedPlayoutDelayUs - m_AppliedPlayoutDelayUs);
-            else if (m_Parameters.playoutDelayDecreaseSlewUs != 0)
-                m_AppliedPlayoutDelayUs -= std::min(m_Parameters.playoutDelayDecreaseSlewUs,
+            else if (frameBudget || m_Parameters.playoutDelayDecreaseSlewUs != 0)
+                m_AppliedPlayoutDelayUs -= std::min(frameBudget ? movement.fallUs : m_Parameters.playoutDelayDecreaseSlewUs,
                     m_AppliedPlayoutDelayUs - m_RequestedPlayoutDelayUs);
             else
                 m_AppliedPlayoutDelayUs = m_RequestedPlayoutDelayUs;

@@ -19,6 +19,7 @@
 #include <deque>
 #include <map>
 #include <limits>
+#include <optional>
 #include <vector>
 
 // This list is also the replay/trace parameter schema. Keeping the JSON name,
@@ -565,6 +566,7 @@ public:
     const VrrTimingParameters& parameters() const;
     VrrTimingDiagnostics diagnostics() const;
     const Vrr13::Reserve& playoutHistory() const { return m_PlayoutHistory; }
+    std::optional<uint64_t> startDelayForCache(std::vector<uint64_t>& settledSamples) const;
     bool loadPlayoutHistory(const std::vector<int64_t>& profile) {
         return !m_HaveTimeline && m_PlayoutHistory.loadProfile(profile);
     }
@@ -681,7 +683,7 @@ private:
     void updatePlayoutDelay(const PacedFrame& frame,
                             const CadenceObservation& cadence,
                             bool rebased, int64_t readyOffsetUs,
-                            uint64_t nowUs);
+                            uint64_t nowUs, Vrr13::IntervalBuffer::FrameMovement movement);
     uint64_t effectivePlayoutDelayUs() const;
     // Cadence smoothing: returns the signed adjustment to add to the raw
     // mapped slot for this frame, tracking the source period and pulling
@@ -705,7 +707,7 @@ private:
     void noteIntervalBufferEpoch(uint64_t atUs);
     void updatePlayoutHistory(const PacedFrame& frame,
                               const CadenceObservation& cadence,
-                              bool rebased, int64_t requiredUs, uint64_t nowUs);
+                              bool rebased, int64_t requiredUs, uint64_t nowUs, Vrr13::IntervalBuffer::FrameMovement movement);
     static uint64_t scaledPerMille(uint64_t value, uint64_t perMille);
 
     void clearTimeline(bool retainLearnedBudgets);
@@ -844,6 +846,7 @@ private:
     int64_t m_InputDriftFitPpb = 0;
     std::map<unsigned int, PlayoutBand> m_PlayoutBands;
     Vrr13::Reserve m_PlayoutHistory;
+    std::optional<uint64_t> m_QualifiedStartDelayUs;
     Vrr13::WorkloadEpisode m_WorkloadEpisode;
     Vrr13::ReadinessPrediction m_ReadinessPrediction;
     Vrr13::IntervalBuffer m_IntervalBuffer;

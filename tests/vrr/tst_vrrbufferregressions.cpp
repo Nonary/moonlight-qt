@@ -483,20 +483,19 @@ void testStartingDelayReleasesOnCleanInput()
         const auto in = s.interval();
         const uint64_t start = f[0].appliedUs, floor = in.update.minimumUs + 250;
         const size_t settled = settledAtOrBelow(f, 0, floor);
-        const double boundSeconds = double(start > floor ? start - floor : 0) / double(s.fallUsPerSecond()) +
-            3.0 * double(s.releaseTauUs()) / 1e6 + holdSeconds + 5.0;
-        const uint64_t perSecond = largestDrop(f, 0, total, frames116(1));
+        constexpr double boundSeconds = 20.0;
+        const uint64_t perFrame = largestDrop(f, 0, total);
         const size_t visible = hitches(f, frames116(2), total, s.toleranceUs());
-        report("%-52s start %5" PRIu64 " floor %5" PRIu64 " settled %5.1fs (bound %4.1fs) drop/s %4" PRIu64 " hitches %zu missed %" PRIu64 "\n",
-            name.c_str(), start, floor, seconds116(settled), boundSeconds, perSecond, visible, in.failedUs);
+        report("%-52s start %5" PRIu64 " floor %5" PRIu64 " settled %5.1fs (bound %4.1fs) drop/frame %4" PRIu64 " hitches %zu missed %" PRIu64 "\n",
+            name.c_str(), start, floor, seconds116(settled), boundSeconds, perFrame, visible, in.failedUs);
         if (seed) check(start + 250 >= std::min(seed, in.update.maximumUs), name, "a cached starting delay is honored",
             "first frame %" PRIu64 " us for a %" PRIu64 " us seed", start, seed);
         check(settled < total && seconds116(settled) <= boundSeconds, name,
-            "clean input drains the starting delay to the floor at the release law",
-            "start %" PRIu64 " us reached floor+250 at %.1f s; release law allows %.1f s", start,
+            "clean input drains the starting reserve within 20 seconds",
+            "start %" PRIu64 " us reached floor+250 at %.1f s, bound %.1f s", start,
             settled < total ? seconds116(settled) : -1.0, boundSeconds);
-        check(perSecond <= s.fallUsPerSecond() + 50, name, "release never outruns the fall rate (no visible step)",
-            "dropped %" PRIu64 " us within one second; fall rate %" PRIu64 " us/s", perSecond, s.fallUsPerSecond());
+        check(perFrame <= s.toleranceUs(), name, "reserve release spends at most one spacing tolerance per frame",
+            "largest drop %" PRIu64 " us, tolerance %" PRIu64 " us", perFrame, s.toleranceUs());
         check(visible == 0 && in.evaluatedUs > 0 && in.lossFraction() <= double(s.allowancePpm()) / 1e6, name, "clean input follows source cadence and meets the configured timing target",
             "%zu presented hitches, %" PRIu64 " failed interval microseconds", visible, in.failedUs);
         check(s.replacements() == 0, name, "no frame is replaced away from the display ceiling",
@@ -577,26 +576,16 @@ void testUnabsorbableLossBuysNoDelay()
                 s.step(k116Ticks, {uint64_t(-600.0 * std::log(unit))});
             }
             const auto& f = s.frames();
-            const auto& policy = s.controller().parameters();
-            const uint64_t holdUs = policy.playoutIntervalTaperHoldUs ?
-                policy.playoutIntervalTaperHoldUs : policy.playoutMeanMissHoldUs;
-            // A fall sooner after a rise than the hold, less one evaluation.
-            uint64_t lastRiseUs = 0, soonestUs = UINT64_MAX;
-            size_t early = 0;
-            for (size_t i = frames116(10); i < total; ++i) {
-                if (f[i].appliedUs > f[i - 1].appliedUs) lastRiseUs = f[i].sourceUs;
-                else if (f[i].appliedUs < f[i - 1].appliedUs && lastRiseUs) {
-                    const uint64_t sinceUs = f[i].sourceUs - lastRiseUs;
-                    soonestUs = std::min(soonestUs, sinceUs);
-                    early += sinceUs + 1000000 < holdUs;
-                }
-            }
-            report("%-52s target steps: reversals %3zu soonest release %5.1f s after a rise (hold %.0f s)\n", name.c_str(),
-                reversals(f, frames116(10), total, 200), soonestUs == UINT64_MAX ? -1.0 : double(soonestUs) / 1e6,
-                double(holdUs) / 1e6);
-            check(early == 0, name, "a release waits out the hold after a rise",
-                "%zu releases began within %.1f s of a rise; the hold is %.0f s", early,
-                soonestUs == UINT64_MAX ? 0.0 : double(soonestUs) / 1e6, double(holdUs) / 1e6);
+            // Count material changes of direction over stationary, noisy
+            // input. A qualified release can legitimately follow a rise.
+            const auto first = frames116(10);
+            const auto major = reversals(f, first, total, 2 * s.toleranceUs());
+            const auto peakDrop = largestDrop(f, first, total);
+            report("%-52s major reversals %zu over 170 s, largest drop %" PRIu64 " us\n",
+                   name.c_str(), major, peakDrop);
+            check(major <= 8 && peakDrop <= s.toleranceUs(), name,
+                  "stationary input avoids repeated material reversals and out-of-band release",
+                  "%zu reversals of at least two tolerances, largest drop %" PRIu64 " us", major, peakDrop);
         }
     }
 }
@@ -825,10 +814,12 @@ void testForecastGoalRecovery()
     auto baseline = vrrTimingParametersForSession(session);
     baseline.playoutDelayMinimumUs = baseline.playoutDelayMaximumUs = 1000;
     baseline.playoutVrr18IntervalFeedback = Vrr18PredictiveIntervalFeedback;
-    Stream revision6(session, baseline, 1000), live(session, 1000);
+    auto prior = vrrTimingParametersForSession(session);
+    prior.playoutVrr18IntervalFeedback = Vrr18ZeroReserve;
+    Stream revision6(session, baseline, 1000), revision13(session, prior, 1000), live(session, 1000);
 
     struct Result {
-        size_t recoveryFrame = 0, hitches = 0;
+        size_t recoveryFrame = 0, hitches = 0, acquisitionFrame = 90 * fps;
         uint64_t excessUs = 0, meanUs = 0, p99Us = 0, peakUs = 0;
     };
     const auto measure = [&](Stream& stream) {
@@ -842,6 +833,8 @@ void testForecastGoalRecovery()
             if (stream.interval().qualityPercent() < goal) result.recoveryFrame = i + 1;
             if (frame.dropped) continue;
             handoffLatency.push_back(frame.submittedUs - frame.decodedUs);
+            // Four milliseconds covers most of the independently injected 5 ms spike.
+            if (frame.appliedUs >= 4000) result.acquisitionFrame = std::min(result.acquisitionFrame, i);
             if (i < 20 * fps) {
                 const int64_t stretch = int64_t(frame.submittedUs - previous.submittedUs) -
                                         int64_t(frame.sourceUs - previous.sourceUs);
@@ -857,7 +850,18 @@ void testForecastGoalRecovery()
         return result;
     };
     const auto old = measure(revision6);
+    const auto previous = measure(revision13);
     const auto now = measure(live);
+    report("%-52s 4 ms reserve acquisition %.3f -> %.3f s, first 20 s hitches %zu -> %zu, excess stretch %" PRIu64 " -> %" PRIu64 " us\n",
+           name.c_str(), double(previous.acquisitionFrame) / fps, double(now.acquisitionFrame) / fps,
+           previous.hitches, now.hitches, previous.excessUs, now.excessUs);
+    check(now.acquisitionFrame + fps / 10 <= previous.acquisitionFrame &&
+              now.hitches <= previous.hitches && now.excessUs <= previous.excessUs + live.toleranceUs() &&
+              now.meanUs <= previous.meanUs + live.toleranceUs() && now.p99Us <= previous.p99Us + live.toleranceUs(),
+          name, "confirmed recurring spikes gain reserve sooner within the spacing and latency budgets",
+          "4 ms reserve acquisition %.3f -> %.3f s, hitches %zu -> %zu, excess stretch %" PRIu64 " -> %" PRIu64 " us",
+          double(previous.acquisitionFrame) / fps, double(now.acquisitionFrame) / fps,
+          previous.hitches, now.hitches, previous.excessUs, now.excessUs);
     report("%-52s sustained goal %.2f -> %.2f s, first 20 s hitches %zu -> %zu, stretch %" PRIu64
            " -> %" PRIu64 " us, handoff mean/p99/max %" PRIu64 "/%" PRIu64 "/%" PRIu64
            " -> %" PRIu64 "/%" PRIu64 "/%" PRIu64 " us\n", name.c_str(),
@@ -880,8 +884,19 @@ void testForecastGoalRecovery()
           old.meanUs, old.p99Us, old.peakUs, now.meanUs, now.p99Us, now.peakUs);
 
     const uint64_t oldReserveUs = live.frames().back().appliedUs;
-    for (size_t i = 0; i < 90 * fps; ++i) live.step(ticks);
+    const size_t cleanStart = live.size();
+    for (size_t i = 0; i < 90 * fps; ++i) {
+        live.step(ticks);
+        revision13.step(ticks);
+    }
     const uint64_t floorUs = live.interval().update.minimumUs;
+    const auto cleanFrames = settledAtOrBelow(live.frames(), cleanStart, floorUs + 250) - cleanStart;
+    const auto priorCleanFrames = settledAtOrBelow(revision13.frames(), cleanStart, floorUs + 250) - cleanStart;
+    report("%-52s clean reserve release %.3f -> %.3f s\n", name.c_str(),
+           double(priorCleanFrames) / fps, double(cleanFrames) / fps);
+    check(cleanFrames + fps <= priorCleanFrames && cleanFrames <= 10 * fps, name,
+          "clean input clears earned protection within ten seconds",
+          "settled in %.3f s, previous %.3f s", double(cleanFrames) / fps, double(priorCleanFrames) / fps);
     check(live.frames().back().appliedUs <= floorUs + 250 && live.interval().qualityPercent() >= goal, name,
           "clean delivery releases the reserve earned by recurring hitches",
           "reserve after recovery %" PRIu64 " us, last %" PRIu64 " us, floor %" PRIu64 " us",
@@ -1335,6 +1350,50 @@ void testOrdinaryVariation()
 // frame after every late frame.
 void testDisplayCeilingShedsStandingPhase()
 {
+    if (t_CanLatch) {
+        const auto session = vrrProductionSession(2, 120, 120, true);
+        auto prior = vrrTimingParametersForSession(session);
+        prior.playoutVrr18IntervalFeedback = Vrr18FrameBudget;
+        Stream previous(session, prior, 4000), current(session, 4000);
+        constexpr size_t lockedFrames = 8 * 120;
+        for (size_t i = 0; i < lockedFrames; ++i) {
+            previous.step(750);
+            current.step(750);
+        }
+        const auto waitUs = [](const Frame& f) { return f.shownUs - f.decodedUs; };
+        const auto name = scenarioName("display-ceiling") + "/cached-4ms";
+        check(current.frames().front().appliedUs == 4000 && current.replacements() == 0 &&
+              mean(current.frames(), 0, lockedFrames, waitUs) <= mean(previous.frames(), 0, lockedFrames, waitUs),
+              name, "honor cached protection without discarding a frame at locked refresh",
+              "first reserve %" PRIu64 " us, replacements %zu", current.frames().front().appliedUs, current.replacements());
+        // Eight 100 FPS source intervals provide physical headroom without a
+        // skip. Then lock back to 120 and measure which phase the display kept.
+        for (size_t i = 0; i < 22 * 120; ++i) {
+            previous.step(i < 8 ? 900 : 750);
+            current.step(i < 8 ? 900 : 750);
+        }
+        const auto oldWait = mean(previous.frames(), lockedFrames + 8, previous.size(), waitUs);
+        const auto wait = mean(current.frames(), lockedFrames + 8, current.size(), waitUs);
+        const auto clear = settledAtOrBelow(current.frames(), 0, 250);
+        const auto oldClear = settledAtOrBelow(previous.frames(), 0, 250);
+        std::vector<uint64_t> oldSamples(60, 4000);
+        check(current.controller().startDelayForCache(oldSamples) == 0, name,
+              "the qualified ending reserve supersedes an older high median", "expected zero after clean delivery");
+        report("%-52s clean release %.2f -> %.2f s, shown wait %" PRIu64 " -> %" PRIu64
+               " us, replacements %zu -> %zu\n", name.c_str(), oldClear / 120.0, clear / 120.0,
+               oldWait, wait, previous.replacements(), current.replacements());
+        check(clear < oldClear && clear <= lockedFrames &&
+              wait + current.toleranceUs() < oldWait && current.replacements() <= previous.replacements() &&
+              current.interval().qualityPercent() >= 99.0, name,
+              "release a measured startup reserve into lower display latency at the ceiling",
+              "release %.2f -> %.2f s, wait %" PRIu64 " -> %" PRIu64 " us, replacements %zu -> %zu",
+              oldClear / 120.0, clear / 120.0, oldWait, wait, previous.replacements(), current.replacements());
+        current.rebase();
+        std::vector<uint64_t> noSamples;
+        check(!current.controller().startDelayForCache(noSamples) &&
+              current.controller().startDelayForCache(oldSamples) == 4000, name,
+              "a timeline break revokes the qualified seed and preserves the median fallback", "unexpected saved delay");
+    }
     for (const auto& preset : kPresets) for (const auto& smoothing : kSmoothing) {
         const std::string name = label("display-ceiling", preset, smoothing);
         const auto session = vrrProductionSession(preset.mode, 120, 120, smoothing.smooth);

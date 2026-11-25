@@ -105,7 +105,7 @@ void testProductionSelection()
 
 void testAbsorbCurrentController()
 {
-    for (bool native : {false, true}) for (int tolerance : {250, 500, 1000}) {
+    for (bool native : {false, true}) for (int tolerance : {250, 500, 1000}) for (bool historical : {false, true}) {
         VrrSessionConfig session;
         session.streamRateHz = 120;
         session.displayRefreshHz = 240;
@@ -114,6 +114,7 @@ void testAbsorbCurrentController()
         session.timingOptions = {4000, 9950, 120, tolerance};
         session = vrrProductionSessionConfig(session);
         auto policy = vrrTimingParametersForSession(session, native, native);
+        if (historical) policy.playoutVrr18IntervalFeedback = Vrr18ZeroReserve;
         policy.playoutDelayStartSeedUs = 4000;
         VrrTimingController controller(session, true, policy);
         uint32_t stamp = 0;
@@ -140,9 +141,15 @@ void testAbsorbCurrentController()
             if (previousAt) {
                 const uint64_t difference = std::max(decision.playoutDelayUs, previousBuffer) -
                     std::min(decision.playoutDelayUs, previousBuffer);
-                const uint64_t rate = decision.playoutDelayUs > previousBuffer ? 1000 : 5000;
-                expect(difference <= rate * (now - previousAt) / 1000000 + 2,
-                       "input-buffer rise and release retain their own rate bounds");
+                if (historical) {
+                    const uint64_t rate = decision.playoutDelayUs > previousBuffer ? 1000 : 5000;
+                    expect(difference <= rate * (now - previousAt) / 1000000 + 2,
+                           "historical input-buffer rise and release retain their rate bounds");
+                }
+                else {
+                    expect(difference <= uint64_t(tolerance),
+                           "adaptive reserve movement fits one frame tolerance while Absorb uses its own pad");
+                }
             }
             previousAt = now;
             previousBuffer = decision.playoutDelayUs;

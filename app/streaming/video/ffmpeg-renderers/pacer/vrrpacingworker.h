@@ -246,7 +246,6 @@ private:
     QString startDelayPath() const;
     void noteSettledDelay(uint64_t nowUs, uint64_t delayUs);
     static constexpr uint64_t kSettledDelayWarmupUs = 30000000;
-    static constexpr size_t kMinimumSettledDelaySamples = 60;
     uint64_t m_StartDelaySeedUs = 0;
     uint64_t m_FirstDecisionUs = 0;
     uint64_t m_LastSettledDelaySampleUs = 0;

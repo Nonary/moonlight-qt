@@ -75,11 +75,36 @@ trials, reversals and drops. A separate 450 ms jitter burst checks that the
 proposal expires when clean delivery resumes.
 
 The 95% checks compare identical clean, queued and jitter-to-clean streams
-against Balanced. They bound latency, qualified time at goal, cadence, drops
+against Balanced and a fixed zero reserve. They bound latency relative to the
+zero-reserve stream even when both goals settle at zero. They also check
+qualified time at goal, cadence, drops
 and reversals. The report includes per-presented-frame means for decoded queue
 residence (admission to dequeue), decode readiness to modeled display, and
 source production to modeled display. Queue residence can reach zero while
 the pacer still holds a frame it has dequeued.
+
+The production-controller contracts `start-release` and `forecast-goal-recovery`
+measure how long protection takes to build and clear. The latter compares the
+live policy with revision 13 on identical 120 FPS input with a 5 ms delivery
+spike every 11 frames, followed by clean delivery. It measures time to 4 ms of
+reserve, early stretches, and decode-to-handoff latency. The noisy-input check
+counts material reversals of at least two configured tolerances. The timing
+controller suite separately checks both directions of the per-frame budget.
+
+The `display-ceiling` simulator gate includes 60 seconds of actual 120 FPS
+at 120 Hz on the waitable DXGI model, both clean and with 1 ms delivery
+spikes every 125 ms. It checks decode-ready-to-display latency, the 99%
+pacing goal, display jerk, reserve reversals and skips. The extended
+`display-ceiling` contract also compares a cached 4 ms start against
+revision 14. Eight 100 FPS source intervals interrupt an otherwise locked
+120 FPS stream. The test checks when the reserve clears and how much display
+latency the controller recovers from that brief headroom without a skip.
+
+The `reconnect` gate also exercises short connections. A clean 17-second
+120/120 session saves its qualified zero reserve, a 2-second session ends
+before qualification, and recurring delivery spikes can earn a nonzero
+startup reserve. JSON reports expose the first applied reserve and the
+largest first-frame reserve across reconnects.
 
 Run the surplus-drain regression for the reported 99% Low Latency configuration with:
 

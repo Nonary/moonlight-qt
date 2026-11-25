@@ -201,11 +201,7 @@ private:
 
     void reconnect() {
         auto history = controller->playoutHistory().profile();
-        if (settledDelays.size() >= 60) {
-            auto median = settledDelays.begin() + settledDelays.size() / 2;
-            std::nth_element(settledDelays.begin(), median, settledDelays.end());
-            savedSeed = *median;
-        }
+        if (const auto seed = controller->startDelayForCache(settledDelays)) savedSeed = *seed;
         // Match the worker's same-key profile and settled-delay load. All
         // transport/decode/pacer ownership belongs to the closing session.
         controller = std::make_unique<VrrTimingController>(config, options.canLatch, params);

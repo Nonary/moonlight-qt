@@ -174,14 +174,9 @@ VrrPacingWorker::~VrrPacingWorker()
         Vrr13::saveProfile(QString::fromStdString(m_Config.calibrationPath),
                           QString::fromStdString(m_Config.calibrationKey),
                           m_TimingController->playoutHistory());
-        // A median over the settled part of the session, not the final value,
-        // which may still carry a transient.
-        if (m_SettledDelaySamples.size() >= kMinimumSettledDelaySamples) {
-            auto samples = m_SettledDelaySamples;
-            std::nth_element(samples.begin(), samples.begin() + samples.size() / 2, samples.end());
-            Vrr13::saveStartDelay(startDelayPath(),
-                                  QString::fromStdString(m_Config.calibrationKey),
-                                  samples[samples.size() / 2]);
+        if (const auto seed = m_TimingController->startDelayForCache(m_SettledDelaySamples)) {
+            if (!Vrr13::saveStartDelay(startDelayPath(), QString::fromStdString(m_Config.calibrationKey), *seed))
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "VRR startup reserve could not be saved");
         }
     }
 }
@@ -1446,7 +1441,12 @@ void VrrPacingWorker::noteSettledDelay(uint64_t nowUs, uint64_t delayUs)
 {
     // Sample once per second after the first half minute: early delay still
     // reflects the starting value rather than what this setup needs.
-    if (!m_FirstDecisionUs) m_FirstDecisionUs = nowUs;
+    if (!m_FirstDecisionUs) {
+        m_FirstDecisionUs = nowUs;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "VRR startup reserve: source=%s applied_us=%llu",
+                    m_TraceParameters.playoutDelayStartSeedValid ? "cache" : "cold",
+                    static_cast<unsigned long long>(delayUs));
+    }
     if (nowUs - m_FirstDecisionUs < kSettledDelayWarmupUs ||
             (m_LastSettledDelaySampleUs && nowUs - m_LastSettledDelaySampleUs < 1000000) ||
             m_SettledDelaySamples.size() >= 36000) {

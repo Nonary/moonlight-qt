@@ -3492,7 +3492,8 @@ void testLatchedHandoffCreditsOnlyEnforcedSpacing()
     for (uint64_t revision : {Vrr18RecoverableIntervalFeedback, Vrr18GoalIntervalFeedback,
                               Vrr18PredictiveIntervalFeedback, Vrr18CostAwareIntervalFeedback,
                               Vrr18AnticipatoryIntervalFeedback, Vrr18TargetAwareRelease,
-                              Vrr18ScoreQualifiedRelease, Vrr18ProfileReleaseBudget, Vrr18SelectedGoalRelease, Vrr18ZeroReserve}) {
+                              Vrr18ScoreQualifiedRelease, Vrr18ProfileReleaseBudget, Vrr18SelectedGoalRelease,
+                              Vrr18ZeroReserve, Vrr18FrameBudget, Vrr18CeilingBuffer}) {
         auto session = config(120, 120);
         session.smoothFrameTiming = false;
         auto policy = vrrTimingParametersForSession(session, true, false);
@@ -3907,6 +3908,37 @@ void testPreparationPredictionCannotStarveAdmission()
             std::printf("preparation recovery: poison=%llu gap=%llu latency=%llu stale_cluster=%u\n",
                         (unsigned long long)poisonUs, (unsigned long long)maximumGapUs,
                         (unsigned long long)maximumLatencyUs, longestStale);
+        }
+    }
+}
+
+void testPerFrameReserveMovement()
+{
+    using Buffer = Vrr13::IntervalBuffer;
+    const auto late = Buffer::movementBudget(10000, 10200, 9000, 500);
+    const auto early = Buffer::movementBudget(10000, 9800, 9000, 500);
+    expect(late.riseUs == 300 && late.fallUs == 500 &&
+           early.riseUs == 500 && early.fallUs == 300,
+           "a 200 us spacing deviation leaves 300 us in its direction and a full corrective step");
+    const auto limit = std::numeric_limits<uint64_t>::max();
+    const auto endpoint = Buffer::movementBudget(limit - 10, limit - 20, limit - 30, 500);
+    expect(endpoint.riseUs == 20 && endpoint.fallUs == 500,
+           "a spacing tolerance near the timestamp limit must saturate");
+    const auto outside = Buffer::movementBudget(10000, 10800, 9000, 500);
+    const auto masked = Buffer::movementBudget(10000, 10000, 10800, 500);
+    expect(outside.riseUs == 0 && outside.fallUs == 500 &&
+           masked.riseUs == 500 && masked.fallUs == 500,
+           "out-of-band spacing can only be improved or preserved behind a known readiness bound");
+    // Check both requested directions, including work that covers only part
+    // of a step. Unavoidable existing errors must never be made worse.
+    for (uint64_t nominal = 9100; nominal <= 10900; nominal += 100) {
+        for (uint64_t ready = 9000; ready <= 11000; ready += 100) {
+            const auto budget = Buffer::movementBudget(10000, nominal, ready, 500);
+            const auto unchanged = std::max(nominal, ready);
+            expect(budget.riseUs <= 500 && budget.fallUs <= 500 &&
+                   std::max(nominal + budget.riseUs, ready) <= std::max(uint64_t(10500), unchanged) &&
+                   std::max(nominal - budget.fallUs, ready) >= std::min(uint64_t(9500), unchanged),
+                   "each reserve step must fit the remaining interval tolerance");
         }
     }
 }
@@ -4685,6 +4717,7 @@ int main()
     testInitialPreparationIsNotTypicalRender();
     testPreparationPredictionCannotStarveAdmission();
     testIntervalBufferRestoreHoldsRestoredTarget();
+    testPerFrameReserveMovement();
     testStartDelaySeedReplacesGenericStart();
     testIntervalBufferAboveTargetDipDoesNotEraseRecovery();
     testIntervalBufferThresholdControlsShrinkage();

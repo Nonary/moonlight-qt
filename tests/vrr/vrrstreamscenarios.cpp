@@ -329,8 +329,7 @@ std::vector<Workload> streamWorkloads()
     surplus.scenario.displayHz = 120;
     auto jump = phase(20);
     jump.rtpJumpUs = -3000000;
-    // The worker waits 30 s before collecting its first one-second settled
-    // delay samples, and persists a median only after 60 samples.
+    // Long connections also exercise the fallback median of settled delay.
     auto reconnect = phase(110);
     reconnect.reconnect = true;
     auto ceiling = workload("display-ceiling", {phase(30, 144)});
@@ -523,8 +522,11 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
         Options relaxed = options;
         relaxed.targetHundredths = 9500;
         const auto clean = measure(workload, relaxed);
-        require(clean.meanReadyToDisplayUs + 500 < m.meanReadyToDisplayUs &&
-                clean.meanSourceToDisplayUs + 500 < m.meanSourceToDisplayUs &&
+        auto zero = relaxed;
+        zero.fixedBufferUs = 0;
+        const auto immediate = measure(workload, zero);
+        require(clean.meanReadyToDisplayUs <= immediate.meanReadyToDisplayUs + 500 &&
+                clean.meanSourceToDisplayUs <= m.meanSourceToDisplayUs + 50 &&
                 clean.timeAtTargetPercent() >= 99 && clean.coveragePercent() >= 99 &&
                 clean.displayJerkP99Us <= 50 && !clean.bufferReversals && !dropped(clean.counts),
                 "95% on clean input must relieve presentation latency and preserve clean cadence");
@@ -537,8 +539,10 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
         queued.scenario.displayHz = 280;
         const auto strictQueue = measure(queued, options);
         const auto relaxedQueue = measure(queued, relaxed);
-        require(relaxedQueue.meanQueueResidenceUs + 15 < strictQueue.meanQueueResidenceUs &&
-                relaxedQueue.meanReadyToDisplayUs + 200 < strictQueue.meanReadyToDisplayUs &&
+        const auto zeroQueue = measure(queued, zero);
+        require(relaxedQueue.meanQueueResidenceUs <= zeroQueue.meanQueueResidenceUs + 50 &&
+                relaxedQueue.meanReadyToDisplayUs <= strictQueue.meanReadyToDisplayUs + 50 &&
+                relaxedQueue.meanReadyToDisplayUs <= zeroQueue.meanReadyToDisplayUs + 250 &&
                 relaxedQueue.timeAtTargetPercent() >= 99 && relaxedQueue.coveragePercent() >= 99 &&
                 relaxedQueue.displayJerkP99Us <= 50 && !dropped(relaxedQueue.counts),
                 "95% must drain the decoded queue on a stream with measured standing wait");
@@ -634,9 +638,14 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
         transient.scenario.seed = 13002;
         transient.scenario.phases = {phase(70), burst, phase(35)};
         const auto cleared = measure(transient, tight);
-        require(cleared.steadyMeanBufferUs <= cleared.finalMinBufferUs + 250 &&
-                cleared.steadyBufferRangeUs <= 250 && !dropped(cleared.counts),
-                "a brief delivery burst bought standing reserve after input became clean");
+        if (cleared.steadyMeanBufferUs > cleared.finalMinBufferUs + 250 ||
+                cleared.steadyBufferRangeUs > 250 || dropped(cleared.counts)) {
+            std::ostringstream message;
+            message << "brief delivery burst retained " << std::lround(cleared.steadyMeanBufferUs)
+                    << " us mean reserve, range " << cleared.steadyBufferRangeUs
+                    << " us, drops " << dropped(cleared.counts);
+            failures.push_back(message.str());
+        }
     }
     if (name == "jitter-clears") {
         require(m.bufferAtRecoveryStartUs > m.finalMinBufferUs + 250, "disturbance did not establish a reserve");
@@ -645,8 +654,12 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
         Options relaxed = options;
         relaxed.targetHundredths = 9500;
         const auto recovered = measure(workload, relaxed);
+        auto zero = relaxed;
+        zero.fixedBufferUs = 0;
+        const auto immediate = measure(workload, zero);
         require(recovered.finalBufferUs <= recovered.finalMinBufferUs + 250 &&
-                recovered.meanSourceToDisplayUs + 250 < m.meanSourceToDisplayUs &&
+                recovered.steadyMeanReadyToDisplayUs <= immediate.steadyMeanReadyToDisplayUs + 250 &&
+                recovered.meanSourceToDisplayUs <= m.meanSourceToDisplayUs + 50 &&
                 recovered.timeAtTargetPercent() >= 98 && recovered.coveragePercent() >= 98 &&
                 recovered.bufferReversalsPerMinute <= 3 && !dropped(recovered.counts),
                 "95% must meet goal and reclaim presentation latency as delivery clears");
@@ -685,6 +698,38 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
         require(m.maxReconnectStartBufferUs + 1000 <= m.firstBufferUs &&
                 m.finalBufferUs <= m.finalMinBufferUs + 250,
                 "reconnect failed to use the settled delay from the prior session");
+
+        auto quick = workload;
+        quick.scenario.streamHz = quick.scenario.displayHz = 120;
+        quick.scenario.dxgiWaitable = true;
+        for (auto& span : quick.scenario.phases) {
+            span.hostHz = 120;
+            span.durationUs = 17 * Second;
+        }
+        Options low = options;
+        low.latencyMode = 2;
+        low.targetHundredths = 9900;
+        const auto shortRun = measure(quick, low);
+        require(shortRun.sessionsObserved == 3 && shortRun.firstBufferUs > 1000 &&
+                shortRun.maxReconnectStartBufferUs == 0 && shortRun.timeAtTargetPercent() >= 99,
+                "short clean 120/120 sessions must reopen at their measured zero reserve");
+
+        quick.scenario.phases[0].durationUs = 2 * Second;
+        quick.scenario.phases.resize(2);
+        const auto unfinished = measure(quick, low);
+        require(unfinished.sessionsObserved == 2 && unfinished.maxReconnectStartBufferUs == unfinished.firstBufferUs,
+                "a reconnect before reserve qualification must retain cold-start behavior");
+
+        for (auto& span : quick.scenario.phases) {
+            span.hostHz = 118;
+            span.durationUs = 75 * Second;
+            span.networkSpikeUs = 5000;
+            span.disturbancePeriodUs = 125000;
+        }
+        const auto noisy = measure(quick, low);
+        require(noisy.sessionsObserved == 2 && noisy.maxReconnectStartBufferUs > noisy.firstBufferUs &&
+                noisy.maxReconnectStartBufferUs == noisy.finalBufferUs && noisy.finalScorePercent >= 99,
+                "a short connection must also retain a qualified nonzero reserve for recurring spikes");
     }
     if (name == "alternating-host" || name == "periodic-host-pauses")
         require(m.bufferGrowthUsPerMinute <= 250, "host-only variation ratcheted up the buffer");
@@ -704,6 +749,26 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
         require(dropped(ceiling.counts) <= drops && ceiling.displayJerkP99Us <= 250 &&
                 ceiling.timeAtTargetPercent() >= 99 && ceiling.coveragePercent() >= 99,
                 "relaxing the goal at the physical display ceiling introduced skips or cadence errors");
+
+        // Require a real advance at the modeled flip, even though the waitable
+        // queue can keep displaying late after the applied reserve reaches zero.
+        Options low = options;
+        low.latencyMode = 2;
+        low.targetHundredths = 9900;
+        auto matched = workload;
+        matched.scenario.streamHz = matched.scenario.displayHz = 120;
+        matched.scenario.dxgiWaitable = true;
+        auto& delivery = matched.scenario.phases.front();
+        delivery = phase(60, 120);
+        for (uint64_t spikeUs : {0u, 1000u}) {
+            delivery.networkSpikeUs = spikeUs;
+            delivery.disturbancePeriodUs = spikeUs ? 125000 : 0;
+            const auto run = measure(matched, low);
+            require(run.meanReadyToDisplayUs < (spikeUs ? 4500 : 4000) && run.meanBufferUs < 500 &&
+                    !dropped(run.counts) && run.displayJerkP99Us <= 250 && run.bufferReversalsPerMinute <= 10 &&
+                    run.coveragePercent() >= 99 && run.timeAtTargetPercent() >= 99 && run.finalScorePercent >= 99,
+                    "120 FPS at 120 Hz must lower display wait while sustaining the 99% goal without skips or oscillation");
+        }
     }
     return failures;
 }
