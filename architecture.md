@@ -1,11 +1,10 @@
 # Streaming and VRR architecture
 
-Source baseline: the published `v6.2.0-daily.201` client with VRR18 interval
-feedback restored for live sessions, with revision 7 used for new streams.
-Buffer growth uses delivery and decode readiness at both ends of an interval. The custom profile exposes the frame allowance, timing
-target, score history, and interval tolerance. The renderer,
-observed D3D11 completion, and schema-6 capture contracts come from the newer
-client. The earlier platform changes include the decode-buffer accounting
+Source baseline: `master` based on `v6.2.0-daily.202` with VRR18 interval
+feedback revision 7 for new streams and the source-clock deadline correction.
+Buffer growth uses delivery and decode readiness at both ends of an interval.
+The custom profile exposes the frame allowance, timing target, score history,
+and interval tolerance. The earlier platform changes include the decode-buffer accounting
 correction on 2026-10-30,
 the buffer evidence corrections on 2026-11-04, the absorbable-loss solver,
 release hold and blocked-evidence correction on 2026-11-09, and timestamped
