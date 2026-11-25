@@ -144,7 +144,10 @@ private:
     PyroWavePacketLossWarning m_PyroWavePacketLossWarning;
     uint64_t m_LastTimingGraphUs = 0;
     bool m_VrrUsesMaximumBuffer = false;
-    std::set<IFFmpegRenderer::RendererType> m_FailedRenderers;
+    // Renderers that reported NoSoftwareSupport. That verdict depends only on the
+    // process environment (window system, drivers), so it is shared by all decoder
+    // instances instead of being rediscovered for every probe and stream start.
+    static std::set<IFFmpegRenderer::RendererType> s_FailedRenderers;
 
     int m_FramesIn;
     int m_FramesOut;

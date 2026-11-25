@@ -29,6 +29,8 @@ extern "C" {
 #include <vector>
 #include <set>
 #include <thread>
+#include <chrono>
+#include <algorithm>
 
 #ifndef VK_KHR_video_decode_av1
 #define VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME "VK_KHR_video_decode_av1"
@@ -218,13 +220,52 @@ static void pl_log_cb(void*, enum pl_log_level level, const char *msg)
 void PlVkRenderer::lockQueue(struct AVHWDeviceContext *dev_ctx, uint32_t queue_family, uint32_t index)
 {
     auto me = (PlVkRenderer*)dev_ctx->user_opaque;
-    me->m_Vulkan->lock_queue(me->m_Vulkan, queue_family, index);
+    if (me->m_OwnDevice != VK_NULL_HANDLE) {
+        leanLockQueue(me, queue_family, index);
+    }
+    else {
+        me->m_Vulkan->lock_queue(me->m_Vulkan, queue_family, index);
+    }
 }
 
 void PlVkRenderer::unlockQueue(struct AVHWDeviceContext *dev_ctx, uint32_t queue_family, uint32_t index)
 {
     auto me = (PlVkRenderer*)dev_ctx->user_opaque;
-    me->m_Vulkan->unlock_queue(me->m_Vulkan, queue_family, index);
+    if (me->m_OwnDevice != VK_NULL_HANDLE) {
+        leanUnlockQueue(me, queue_family, index);
+    }
+    else {
+        me->m_Vulkan->unlock_queue(me->m_Vulkan, queue_family, index);
+    }
+}
+
+// One mutex per (queue family, queue index) of the lean device. libplacebo (via
+// pl_vulkan_import_params.lock_queue) and FFmpeg (via AVVulkanDeviceContext.lock_queue)
+// both go through these, so a queue shared between them is serialized correctly.
+static std::mutex s_LeanFallbackQueueLock;
+
+void PlVkRenderer::leanLockQueue(void* ctx, uint32_t qf, uint32_t qidx)
+{
+    auto me = (PlVkRenderer*)ctx;
+    auto it = me->m_OwnQueueLocks.find(((uint64_t)qf << 32) | qidx);
+    if (it != me->m_OwnQueueLocks.end()) {
+        it->second->lock();
+    }
+    else {
+        s_LeanFallbackQueueLock.lock();
+    }
+}
+
+void PlVkRenderer::leanUnlockQueue(void* ctx, uint32_t qf, uint32_t qidx)
+{
+    auto me = (PlVkRenderer*)ctx;
+    auto it = me->m_OwnQueueLocks.find(((uint64_t)qf << 32) | qidx);
+    if (it != me->m_OwnQueueLocks.end()) {
+        it->second->unlock();
+    }
+    else {
+        s_LeanFallbackQueueLock.unlock();
+    }
 }
 
 void PlVkRenderer::overlayUploadComplete(void* opaque)
@@ -343,6 +384,14 @@ PlVkRenderer::~PlVkRenderer()
 #endif
         m_OverlayCompletion.reset();
         pl_vulkan_destroy(&m_Vulkan);
+
+        // pl_vulkan_destroy() does not destroy an imported VkDevice
+        if (m_OwnDevice != VK_NULL_HANDLE) {
+            if (fn_vkDestroyDevice) {
+                fn_vkDestroyDevice(m_OwnDevice, nullptr);
+            }
+            m_OwnDevice = VK_NULL_HANDLE;
+        }
 
         // This surface was created by SDL, so there's no libplacebo API to destroy it
         if (fn_vkDestroySurfaceKHR && m_VkSurface) {
@@ -556,7 +605,24 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
     }
 #endif
 
-    {
+    // Prefer creating the VkDevice ourselves with a single queue per family.
+    // pl_vulkan_create() enables every queue of every family it uses (and with
+    // extra_queues = all families, that is every queue the GPU exposes). Some
+    // drivers charge ~100+ ms per queue at vkCreateDevice(), which made each
+    // renderer creation cost seconds on NVIDIA. PLVK_LEAN_DEVICE=0 restores the
+    // libplacebo-created device.
+    if (qgetenv("PLVK_LEAN_DEVICE") != "0") {
+        // Don't let Qt take DRM master from us during vkCreateDevice()
+        DrmMasterLocker locker;
+
+        if (!createLeanDevice(device, deviceProps, optionalExtensions, vkParams.features)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Lean Vulkan device creation failed for '%s'; falling back to pl_vulkan_create()",
+                        deviceProps->deviceName);
+        }
+    }
+
+    if (m_Vulkan == nullptr) {
         // Don't let Qt take DRM master from us during pl_vulkan_create()
         DrmMasterLocker locker;
 
@@ -588,6 +654,8 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
         bool enabled = false;
         for (int i = 0; i < m_Vulkan->num_extensions; ++i)
             enabled |= !SDL_strcmp(m_Vulkan->extensions[i], VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+        for (const char* name : m_OwnExtensions)
+            enabled |= !SDL_strcmp(name, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
         auto timing = std::make_unique<VulkanTiming>();
         if (enabled && timing->initialize(m_Vulkan->device)) {
             m_GamescopeTiming = std::move(timing);
@@ -600,6 +668,270 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Vulkan rendering device chosen: %s",
                 deviceProps->deviceName);
+    return true;
+}
+
+bool PlVkRenderer::createLeanDevice(VkPhysicalDevice device, VkPhysicalDeviceProperties* deviceProps,
+                                    const std::vector<const char*>& optionalExtensions,
+                                    const VkPhysicalDeviceFeatures2* extraFeatures)
+{
+    const auto startTime = std::chrono::steady_clock::now();
+
+    if (!fn_vkGetPhysicalDeviceFeatures2 || !fn_vkCreateDevice || !fn_vkDestroyDevice) {
+        return false;
+    }
+
+    // --- Extensions: everything libplacebo recommends plus everything FFmpeg can use, if supported
+    uint32_t extensionCount = 0;
+    fn_vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, nullptr);
+    std::vector<VkExtensionProperties> supportedExtensions(extensionCount);
+    fn_vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, supportedExtensions.data());
+    auto isSupported = [&](const char* name) {
+        for (const VkExtensionProperties& ext : supportedExtensions) {
+            if (strcmp(ext.extensionName, name) == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    m_OwnExtensionStorage.clear();
+    m_OwnExtensions.clear();
+    auto addExtension = [&](const char* name) {
+        if (!isSupported(name)) {
+            return;
+        }
+        // We never encode; skip the encode extensions FFmpeg lists as optional
+        if (strncmp(name, "VK_KHR_video_encode", 19) == 0) {
+            return;
+        }
+        for (const std::string& existing : m_OwnExtensionStorage) {
+            if (existing == name) {
+                return;
+            }
+        }
+        m_OwnExtensionStorage.emplace_back(name);
+    };
+    if (!isSupported(VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Vulkan device '%s' lacks " VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+                    deviceProps->deviceName);
+        return false;
+    }
+    addExtension(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    for (int i = 0; i < pl_vulkan_num_recommended_extensions; i++) {
+        addExtension(pl_vulkan_recommended_extensions[i]);
+    }
+    for (const char* name : optionalExtensions) {
+        addExtension(name);
+    }
+    auto isEnabled = [&](const char* name) {
+        for (const std::string& existing : m_OwnExtensionStorage) {
+            if (existing == name) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (const std::string& name : m_OwnExtensionStorage) {
+        m_OwnExtensions.push_back(name.c_str());
+    }
+
+    // --- Queue families: one graphics (presentable), one compute, one transfer, plus video decode families
+    uint32_t queueFamilyCount = 0;
+    fn_vkGetPhysicalDeviceQueueFamilyProperties2(device, &queueFamilyCount, nullptr);
+    std::vector<VkQueueFamilyProperties2> queueFamilies(queueFamilyCount);
+    std::vector<VkQueueFamilyVideoPropertiesKHR> queueFamilyVideoProps(queueFamilyCount);
+    for (uint32_t i = 0; i < queueFamilyCount; i++) {
+        queueFamilyVideoProps[i].sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR;
+        queueFamilies[i].sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2;
+        queueFamilies[i].pNext = &queueFamilyVideoProps[i];
+    }
+    fn_vkGetPhysicalDeviceQueueFamilyProperties2(device, &queueFamilyCount, queueFamilies.data());
+    auto flagsOf = [&](uint32_t i) { return queueFamilies[i].queueFamilyProperties.queueFlags; };
+
+    int graphicsFamily = -1, computeFamily = -1, transferFamily = -1;
+    for (uint32_t i = 0; i < queueFamilyCount; i++) {
+        if ((flagsOf(i) & VK_QUEUE_GRAPHICS_BIT) && queueFamilies[i].queueFamilyProperties.queueCount > 0) {
+            VkBool32 presentSupported = VK_FALSE;
+            fn_vkGetPhysicalDeviceSurfaceSupportKHR(device, i, m_VkSurface, &presentSupported);
+            if (presentSupported) {
+                graphicsFamily = (int)i;
+                break;
+            }
+        }
+    }
+    if (graphicsFamily < 0) {
+        for (uint32_t i = 0; i < queueFamilyCount; i++) {
+            if (flagsOf(i) & VK_QUEUE_GRAPHICS_BIT) {
+                graphicsFamily = (int)i;
+                break;
+            }
+        }
+    }
+    if (graphicsFamily < 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Vulkan device '%s' has no graphics queue family", deviceProps->deviceName);
+        return false;
+    }
+    for (uint32_t i = 0; i < queueFamilyCount; i++) {
+        if ((flagsOf(i) & VK_QUEUE_COMPUTE_BIT) && !(flagsOf(i) & VK_QUEUE_GRAPHICS_BIT)) {
+            computeFamily = (int)i;
+            break;
+        }
+    }
+    if (computeFamily < 0) {
+        computeFamily = graphicsFamily;
+    }
+    for (uint32_t i = 0; i < queueFamilyCount; i++) {
+        if ((flagsOf(i) & VK_QUEUE_TRANSFER_BIT) && !(flagsOf(i) & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
+            transferFamily = (int)i;
+            break;
+        }
+    }
+    if (transferFamily < 0) {
+        transferFamily = graphicsFamily;
+    }
+
+    m_OwnQueueFamilies.clear();
+    auto addFamily = [&](uint32_t i) {
+        for (const LeanQueueFamily& f : m_OwnQueueFamilies) {
+            if (f.index == i) {
+                return;
+            }
+        }
+        m_OwnQueueFamilies.push_back({ i, flagsOf(i), queueFamilyVideoProps[i].videoCodecOperations });
+    };
+    addFamily((uint32_t)graphicsFamily);
+    addFamily((uint32_t)computeFamily);
+    addFamily((uint32_t)transferFamily);
+    if (m_HwDeviceType == AV_HWDEVICE_TYPE_VULKAN) {
+        for (uint32_t i = 0; i < queueFamilyCount; i++) {
+            if (flagsOf(i) & VK_QUEUE_VIDEO_DECODE_BIT_KHR) {
+                addFamily(i);
+            }
+        }
+    }
+
+    // --- Features: enable everything the device supports in the core feature structs
+    // (plus swapchain maintenance), which covers libplacebo's required/recommended
+    // features, FFmpeg's needs and PyroWave's requests. Robustness features are left
+    // off since they cost performance and nothing here relies on them.
+    const uint32_t apiVersion = std::min(deviceProps->apiVersion, m_PlVkInstance->api_version);
+    m_OwnFeatures = {};
+    m_OwnFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    m_OwnFeatures11 = {};
+    m_OwnFeatures11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    m_OwnFeatures12 = {};
+    m_OwnFeatures12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    m_OwnFeatures13 = {};
+    m_OwnFeatures13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    void** chainTail = &m_OwnFeatures.pNext;
+    auto chain = [&](void* featureStruct) {
+        *chainTail = featureStruct;
+        chainTail = (void**)&((VkBaseOutStructure*)featureStruct)->pNext;
+    };
+    chain(&m_OwnFeatures11);
+    chain(&m_OwnFeatures12);
+    if (apiVersion >= VK_API_VERSION_1_3) {
+        chain(&m_OwnFeatures13);
+    }
+#ifdef VK_VERSION_1_4
+    if (apiVersion >= VK_API_VERSION_1_4) {
+        m_OwnFeatures14 = {};
+        m_OwnFeatures14.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
+        chain(&m_OwnFeatures14);
+    }
+#endif
+#ifdef VK_EXT_swapchain_maintenance1
+    if (isEnabled(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) || isEnabled("VK_KHR_swapchain_maintenance1")) {
+        m_OwnSwapchainMaint1 = {};
+        m_OwnSwapchainMaint1.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
+        chain(&m_OwnSwapchainMaint1);
+    }
+#endif
+    fn_vkGetPhysicalDeviceFeatures2(device, &m_OwnFeatures);
+    m_OwnFeatures.features.robustBufferAccess = VK_FALSE;
+    if (apiVersion >= VK_API_VERSION_1_3) {
+        m_OwnFeatures13.robustImageAccess = VK_FALSE;
+    }
+    if (!m_OwnFeatures12.timelineSemaphore) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Vulkan device '%s' lacks timeline semaphores", deviceProps->deviceName);
+        return false;
+    }
+    Q_UNUSED(extraFeatures); // covered by enabling all supported core features
+
+    // --- Create the device with exactly one queue per family
+    const float queuePriority = 1.0f;
+    std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
+    for (const LeanQueueFamily& f : m_OwnQueueFamilies) {
+        VkDeviceQueueCreateInfo qci = {};
+        qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        qci.queueFamilyIndex = f.index;
+        qci.queueCount = 1;
+        qci.pQueuePriorities = &queuePriority;
+        queueCreateInfos.push_back(qci);
+    }
+    VkDeviceCreateInfo deviceCreateInfo = {};
+    deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    deviceCreateInfo.pNext = &m_OwnFeatures;
+    deviceCreateInfo.queueCreateInfoCount = (uint32_t)queueCreateInfos.size();
+    deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
+    deviceCreateInfo.enabledExtensionCount = (uint32_t)m_OwnExtensions.size();
+    deviceCreateInfo.ppEnabledExtensionNames = m_OwnExtensions.data();
+
+    VkResult result = fn_vkCreateDevice(device, &deviceCreateInfo, nullptr, &m_OwnDevice);
+    if (result != VK_SUCCESS) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "vkCreateDevice() failed for '%s': %d",
+                    deviceProps->deviceName, (int)result);
+        m_OwnDevice = VK_NULL_HANDLE;
+        return false;
+    }
+
+    m_OwnQueueLocks.clear();
+    for (const LeanQueueFamily& f : m_OwnQueueFamilies) {
+        m_OwnQueueLocks[((uint64_t)f.index << 32) | 0] = std::make_unique<std::mutex>();
+    }
+
+    // --- Hand the device to libplacebo
+    pl_vulkan_import_params importParams = {};
+    importParams.instance = m_PlVkInstance->instance;
+    importParams.get_proc_addr = m_PlVkInstance->get_proc_addr;
+    importParams.phys_device = device;
+    importParams.device = m_OwnDevice;
+    importParams.extensions = m_OwnExtensions.data();
+    importParams.num_extensions = (int)m_OwnExtensions.size();
+    importParams.queue_graphics = { (uint32_t)graphicsFamily, 1 };
+    importParams.queue_compute = { (uint32_t)computeFamily, 1 };
+    importParams.queue_transfer = { (uint32_t)transferFamily, 1 };
+    importParams.features = &m_OwnFeatures;
+    importParams.lock_queue = leanLockQueue;
+    importParams.unlock_queue = leanUnlockQueue;
+    importParams.queue_ctx = this;
+
+    m_Vulkan = pl_vulkan_import(m_Log, &importParams);
+    if (m_Vulkan == nullptr) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "pl_vulkan_import() failed for '%s'",
+                    deviceProps->deviceName);
+        fn_vkDestroyDevice(m_OwnDevice, nullptr);
+        m_OwnDevice = VK_NULL_HANDLE;
+        m_OwnQueueLocks.clear();
+        return false;
+    }
+
+    if (qEnvironmentVariableIntValue("PLVK_LEAN_DEBUG")) {
+        for (const char* name : m_OwnExtensions) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "lean: requested ext %s", name);
+        }
+        for (int i = 0; i < m_Vulkan->num_extensions; i++) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "lean: pl_vulkan ext %s", m_Vulkan->extensions[i]);
+        }
+    }
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count();
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Lean Vulkan device created in %lld ms: %zu queue families (1 queue each), %zu extensions",
+                (long long)elapsedMs, m_OwnQueueFamilies.size(), m_OwnExtensions.size());
     return true;
 }
 
@@ -675,6 +1007,9 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     POPULATE_FUNCTION(vkGetPhysicalDeviceProperties);
     POPULATE_FUNCTION(vkGetPhysicalDeviceSurfaceSupportKHR);
     POPULATE_FUNCTION(vkEnumerateDeviceExtensionProperties);
+    POPULATE_FUNCTION(vkGetPhysicalDeviceFeatures2);
+    POPULATE_FUNCTION(vkCreateDevice);
+    POPULATE_FUNCTION(vkDestroyDevice);
 
     {
         // Don't let Qt take DRM master from us during SDL_Vulkan_CreateSurface()
@@ -800,11 +1135,19 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
         vkDeviceContext->inst = m_PlVkInstance->instance;
         vkDeviceContext->phys_dev = m_Vulkan->phys_device;
         vkDeviceContext->act_dev = m_Vulkan->device;
-        vkDeviceContext->device_features = *m_Vulkan->features;
         vkDeviceContext->enabled_inst_extensions = m_PlVkInstance->extensions;
         vkDeviceContext->nb_enabled_inst_extensions = m_PlVkInstance->num_extensions;
-        vkDeviceContext->enabled_dev_extensions = m_Vulkan->extensions;
-        vkDeviceContext->nb_enabled_dev_extensions = m_Vulkan->num_extensions;
+        if (m_OwnDevice != VK_NULL_HANDLE) {
+            // pl_vulkan_import() does not echo the extensions/features back, so use our own lists
+            vkDeviceContext->device_features = m_OwnFeatures;
+            vkDeviceContext->enabled_dev_extensions = m_OwnExtensions.data();
+            vkDeviceContext->nb_enabled_dev_extensions = (int)m_OwnExtensions.size();
+        }
+        else {
+            vkDeviceContext->device_features = *m_Vulkan->features;
+            vkDeviceContext->enabled_dev_extensions = m_Vulkan->extensions;
+            vkDeviceContext->nb_enabled_dev_extensions = m_Vulkan->num_extensions;
+        }
 #if LIBAVUTIL_VERSION_INT > AV_VERSION_INT(58, 9, 100) && LIBAVUTIL_VERSION_MAJOR < 62
         vkDeviceContext->lock_queue = lockQueue;
         vkDeviceContext->unlock_queue = unlockQueue;
@@ -1166,6 +1509,21 @@ bool PlVkRenderer::populateQueues(int videoFormat)
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 34, 100)
     Q_UNUSED(videoFormat);
 
+    if (m_OwnDevice != VK_NULL_HANDLE) {
+        // Lean device: only the families we enabled exist, with one queue each.
+        // The list is already in preference order (graphics, compute, transfer, decode).
+        int n = 0;
+        for (const LeanQueueFamily& f : m_OwnQueueFamilies) {
+            vkDeviceContext->qf[n].idx = (int)f.index;
+            vkDeviceContext->qf[n].num = 1;
+            vkDeviceContext->qf[n].flags = (VkQueueFlagBits)f.flags;
+            vkDeviceContext->qf[n].video_caps = (VkVideoCodecOperationFlagBitsKHR)f.videoCaps;
+            n++;
+        }
+        vkDeviceContext->nb_qf = n;
+        return true;
+    }
+
     for (uint32_t i = 0; i < queueFamilyCount; i++) {
         vkDeviceContext->qf[i].idx = i;
         vkDeviceContext->qf[i].num = queueFamilies[i].queueFamilyProperties.queueCount;
@@ -1180,6 +1538,7 @@ bool PlVkRenderer::populateQueues(int videoFormat)
     vkDeviceContext->nb_tx_queues = m_Vulkan->queue_transfer.count;
     vkDeviceContext->queue_family_comp_index = m_Vulkan->queue_compute.index;
     vkDeviceContext->nb_comp_queues = m_Vulkan->queue_compute.count;
+    const bool leanDevice = m_OwnDevice != VK_NULL_HANDLE;
 
     // Select a video decode queue that is capable of decoding our chosen format
     for (uint32_t i = 0; i < queueFamilyCount; i++) {
@@ -1187,14 +1546,14 @@ bool PlVkRenderer::populateQueues(int videoFormat)
             if (videoFormat & VIDEO_FORMAT_MASK_H264) {
                 if (queueFamilyVideoProps[i].videoCodecOperations & VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR) {
                     vkDeviceContext->queue_family_decode_index = i;
-                    vkDeviceContext->nb_decode_queues = queueFamilies[i].queueFamilyProperties.queueCount;
+                    vkDeviceContext->nb_decode_queues = leanDevice ? 1 : queueFamilies[i].queueFamilyProperties.queueCount;
                     break;
                 }
             }
             else if (videoFormat & VIDEO_FORMAT_MASK_H265) {
                 if (queueFamilyVideoProps[i].videoCodecOperations & VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR) {
                     vkDeviceContext->queue_family_decode_index = i;
-                    vkDeviceContext->nb_decode_queues = queueFamilies[i].queueFamilyProperties.queueCount;
+                    vkDeviceContext->nb_decode_queues = leanDevice ? 1 : queueFamilies[i].queueFamilyProperties.queueCount;
                     break;
                 }
             }
@@ -1208,7 +1567,7 @@ bool PlVkRenderer::populateQueues(int videoFormat)
 #endif
                 {
                     vkDeviceContext->queue_family_decode_index = i;
-                    vkDeviceContext->nb_decode_queues = queueFamilies[i].queueFamilyProperties.queueCount;
+                    vkDeviceContext->nb_decode_queues = leanDevice ? 1 : queueFamilies[i].queueFamilyProperties.queueCount;
                     break;
                 }
             }

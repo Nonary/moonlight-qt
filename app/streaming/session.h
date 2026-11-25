@@ -120,6 +120,11 @@ public:
                         bool& isHardwareAccelerated, bool& isFullScreenOnly,
                         bool& isHdrSupported, QSize& maxResolution);
 
+    static
+    bool getDecoderInfoUncached(SDL_Window* window,
+                                bool& isHardwareAccelerated, bool& isFullScreenOnly,
+                                bool& isHdrSupported, QSize& maxResolution);
+
     static Session* get()
     {
         return s_ActiveSession;
@@ -203,6 +208,11 @@ private:
     DecoderAvailability getDecoderAvailability(SDL_Window* window,
                                                StreamingPreferences::VideoDecoderSelection vds,
                                                int videoFormat, int width, int height, int frameRate);
+
+    static
+    DecoderAvailability getDecoderAvailabilityUncached(SDL_Window* window,
+                                                       StreamingPreferences::VideoDecoderSelection vds,
+                                                       int videoFormat, int width, int height, int frameRate);
 
     static
     bool chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
