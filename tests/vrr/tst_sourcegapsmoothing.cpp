@@ -175,6 +175,8 @@ void testNativeAbsorbRejectsFutureProjection()
     for (bool restored : {false, true}) {
         auto policy = vrrTimingParametersForSession(session, true, true);
         policy.playoutSmoothingOwnMovement = restored;
+        // Isolate the historical Absorb behavior from the newer clock-reset correction.
+        policy.playoutReseedNominalTarget = 0;
         VrrTimingController controller(session, true, policy);
         for (const auto& input : inputs) {
             PacedFrame frame(nullptr, input.frame, input.timestamp, true, input.output);
