@@ -39,7 +39,8 @@ public:
     {
         AC_STEREO,
         AC_51_SURROUND,
-        AC_71_SURROUND
+        AC_71_SURROUND,
+        AC_714_SURROUND // Native static bed; retain existing persisted values.
     };
     Q_ENUM(AudioConfig)
 
@@ -198,6 +199,7 @@ public:
     Q_PROPERTY(bool showPerformanceOverlay MEMBER showPerformanceOverlay NOTIFY showPerformanceOverlayChanged)
     Q_PROPERTY(bool showFrametimeGraph MEMBER showFrametimeGraph NOTIFY showFrametimeGraphChanged)
     Q_PROPERTY(AudioConfig audioConfig MEMBER audioConfig NOTIFY audioConfigChanged)
+    Q_PROPERTY(bool spatialAudio MEMBER spatialAudio NOTIFY spatialAudioChanged)
     Q_PROPERTY(VideoCodecConfig videoCodecConfig MEMBER videoCodecConfig NOTIFY videoCodecConfigChanged)
     Q_PROPERTY(bool enableHdr MEMBER enableHdr NOTIFY enableHdrChanged)
     Q_PROPERTY(bool enableYUV444 MEMBER enableYUV444 NOTIFY enableYUV444Changed)
@@ -283,6 +285,7 @@ public:
     int packetSize;
     int pyroWavePaceMbps;
     AudioConfig audioConfig;
+    bool spatialAudio;
     VideoCodecConfig videoCodecConfig;
     bool enableHdr;
     bool enableYUV444;
@@ -333,6 +336,7 @@ signals:
     void absoluteMouseModeChanged();
     void absoluteTouchModeChanged();
     void audioConfigChanged();
+    void spatialAudioChanged();
     void videoCodecConfigChanged();
     void enableHdrChanged();
     void enableYUV444Changed();

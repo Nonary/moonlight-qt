@@ -2193,6 +2193,10 @@ FocusScope {
                     editor: AutoResizingComboBox {
                     // ignore setting the index at first, and actually set it when the component is loaded
                     Component.onCompleted: {
+                        if (Qt.platform.os === "windows") {
+                            audioListModel.append({"text": qsTr("7.1.4 surround sound"),
+                                                   "val": StreamingPreferences.AC_714_SURROUND})
+                        }
                         var saved_audio = StreamingPreferences.audioConfig
                         currentIndex = 0
                         for (var i = 0; i < audioListModel.count; i++) {
@@ -2225,10 +2229,34 @@ FocusScope {
                     // ::onActivated must be used, as it only listens for when the index is changed by a human
                     onActivated : {
                         StreamingPreferences.audioConfig = audioListModel.get(currentIndex).val
+                        if (StreamingPreferences.audioConfig === StreamingPreferences.AC_714_SURROUND)
+                            StreamingPreferences.spatialAudio = true
                     }
                 }
                 }
 
+                CheckBox {
+                    id: spatialAudioCheck
+                    width: parent.width
+                    text: qsTr("Use Windows Spatial Audio")
+                    font.pointSize: 12
+                    visible: Qt.platform.os === "windows"
+                    enabled: StreamingPreferences.audioConfig === StreamingPreferences.AC_51_SURROUND ||
+                             StreamingPreferences.audioConfig === StreamingPreferences.AC_71_SURROUND
+                    // Retain the preference when another channel layout is selected.
+                    checked: StreamingPreferences.audioConfig === StreamingPreferences.AC_714_SURROUND || StreamingPreferences.spatialAudio
+                    onToggled: StreamingPreferences.spatialAudio = checked
+                    hoverEnabled: true
+
+                    Accessible.description: ToolTip.text
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered || activeFocus
+                    ToolTip.text: StreamingPreferences.audioConfig === StreamingPreferences.AC_714_SURROUND ?
+                                  qsTr("Required for native 7.1.4. Enable spatial sound on a compatible Windows HDMI/DisplayPort output. If unavailable, select another audio mode before starting a new stream.") :
+                                  qsTr("For 5.1 and 7.1 surround sound. Requires Spatial Sound to be enabled in Windows for a compatible HDMI/DisplayPort output.") + " " +
+                                  qsTr("Applies to the next stream. Uses regular audio automatically if unavailable.")
+                }
 
                 ConsoleCheckBox {
                     id: audioPcCheck
