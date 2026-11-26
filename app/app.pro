@@ -340,6 +340,7 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/inputbuffer.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/inputgoalbuffer.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/intervalscore.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/phasetrajectory.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \

@@ -1820,6 +1820,19 @@ display evidence for visible smoothness. Fixed-admission replay can
 become saturated where the live worker would shed frames, invalidating its
 latency result. Use matched live A/B evidence for visible behavior.
 
+Incoming smoothness measures the regularity of adjacent host RTP timestamps.
+For each interval, the mean of the two preceding intervals and the mean of
+the two following intervals estimate the local source cadence. The error is
+the distance outside the range of those estimates, allowing a sustained rate
+change or ramp to carry through. At sequence boundaries a single available
+estimate suffices. The newest two intervals can be revised as evidence arrives.
+Errors use the Pacing score's tolerance and severity weighting. Host interval
+duration supplies the weight and the RTP clock ages the configured history.
+Missing frame identities, repeated stamps and gaps of a second or more break
+the cadence fit. A backward clock jump starts a new history. This diagnostic
+reflects game and host capture timestamp variation. Packet arrival, decoding,
+rendering and the requested stream FPS do not enter its calculation.
+
 ## 15. Tests, deployment boundaries, and maintenance
 
 For opt-in Linux bandwidth testing, [moonlight-link-test.py](scripts/moonlight-link-test.py)

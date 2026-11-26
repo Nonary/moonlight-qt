@@ -18,10 +18,6 @@ typedef struct _VIDEO_STATS {
     uint32_t pacerDroppedFrames;
     // Received frames discarded before decoding because they were stale.
     uint32_t decoderSkippedFrames;
-    // Latest 30-frame-time source snapshot, independent of client delivery time.
-    uint64_t incomingTimingSequence;
-    double incomingTimingVarianceTicksSquared;
-    bool incomingTimingValid;
     // Pacer telemetry is merged into decoder-owned windows from coherent
     // cumulative snapshots. These remain zero on non-VRR pacing paths.
     bool vrrTelemetryActive;

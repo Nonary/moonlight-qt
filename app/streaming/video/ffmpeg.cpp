@@ -911,6 +911,10 @@ bool FFmpegVideoDecoder::initializeAVCodecContext(const AVCodec* decoder, enum A
 
 bool FFmpegVideoDecoder::finishRenderInitialization(PDECODER_PARAMETERS params)
 {
+    const int latencyMode = params->vrrLatencyMode >= 0 && params->vrrLatencyMode <= 2 ?
+        params->vrrLatencyMode : 1;
+    m_IncomingFrameTiming = IncomingFrameTiming(params->vrrTimingOptions.resolved(latencyMode));
+
     if ((params->videoFormat & VIDEO_FORMAT_MASK_H264) &&
             !(m_BackendRenderer->getDecoderCapabilities() & CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC)) {
 #ifdef HAVE_H264BITSTREAM
@@ -966,14 +970,6 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.networkDroppedFrames += src.networkDroppedFrames;
     dst.pacerDroppedFrames += src.pacerDroppedFrames;
     dst.decoderSkippedFrames += src.decoderSkippedFrames;
-    // Keep the latest 30-interval snapshot instead of widening its window when
-    // merging the one-second overlay windows or whole-session log statistics.
-    // A newer unavailable snapshot must also replace older valid evidence.
-    if (src.incomingTimingSequence > dst.incomingTimingSequence) {
-        dst.incomingTimingSequence = src.incomingTimingSequence;
-        dst.incomingTimingVarianceTicksSquared = src.incomingTimingVarianceTicksSquared;
-        dst.incomingTimingValid = src.incomingTimingValid;
-    }
     dst.vrrPacingDroppedFrames += src.vrrPacingDroppedFrames;
     dst.vrrEligibleFrames += src.vrrEligibleFrames;
     dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
@@ -1443,24 +1439,20 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         }
     }
 
-    // Host cadence remains useful in the compact overlay as well as the log.
-    {
-        if (stats.incomingTimingValid) {
-            const double smoothPercent = IncomingFrameTiming::smoothnessPercent(
-                stats.incomingTimingVarianceTicksSquared);
-            ret = snprintf(&output[offset], length - offset,
-                           "Incoming smoothness (host): %.2f%%\n", smoothPercent);
-        }
-        else {
-            ret = snprintf(&output[offset], length - offset,
-                           "Incoming smoothness (host): N/A\n");
-        }
-        if (ret < 0 || ret >= length - offset) {
-            SDL_assert(false);
-            return;
-        }
-        offset += ret;
+    // The decoder owns this rolling history across its one-second stats windows.
+    if (const auto incoming = m_IncomingFrameTiming.score()) {
+        ret = snprintf(&output[offset], length - offset,
+                       "Incoming smoothness: %.2f%%\n", *incoming);
     }
+    else {
+        ret = snprintf(&output[offset], length - offset,
+                       "Incoming smoothness: N/A\n");
+    }
+    if (ret < 0 || ret >= length - offset) {
+        SDL_assert(false);
+        return;
+    }
+    offset += ret;
 
     if (stats.vrrTelemetryActive || stats.vrrEligibleFrames != 0 ||
             stats.vrrPacingDroppedFrames != 0 ||
@@ -3125,6 +3117,8 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
             visible ? PyroWavePacketLossWarning::Message : "");
     }
 
+    m_IncomingFrameTiming.observe(static_cast<uint32_t>(du->frameNumber), du->rtpTimestamp);
+
     // The stats text changes once per second; the timing graph scrolls at 10 Hz.
     const uint64_t graphNowUs = LiGetMicroseconds();
     if (m_Pacer && graphNowUs - m_LastTimingGraphUs >= 100000 &&
@@ -3160,14 +3154,6 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
         SDL_zero(m_ActiveWndVideoStats);
         m_ActiveWndVideoStats.measurementStartUs = LiGetMicroseconds();
     }
-
-    // Observe before decoding or pacing can shed a frame. The measurement owns
-    // its 30-interval window independently of the overlay's refresh interval.
-    const auto incoming = m_IncomingFrameTiming.observe(
-        static_cast<uint32_t>(du->frameNumber), du->rtpTimestamp);
-    m_ActiveWndVideoStats.incomingTimingSequence = incoming.sequence;
-    m_ActiveWndVideoStats.incomingTimingVarianceTicksSquared = incoming.varianceTicksSquared;
-    m_ActiveWndVideoStats.incomingTimingValid = incoming.valid;
 
     if (du->frameHostProcessingLatency != 0) {
         if (m_ActiveWndVideoStats.minHostProcessingLatency != 0) {

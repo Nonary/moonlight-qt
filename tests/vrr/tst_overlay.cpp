@@ -960,7 +960,7 @@ int main(int argc, char** argv)
                     "Average network latency: 2 ms (variance: 1 ms)\n"
                     "Average decoding time: 3.85 ms (waiting for the decoder 0.02 ms)\n"
                     + PerformanceStats::formatClientTiming(11503, 8010, 1285, 1) +
-                    "Incoming smoothness (host): 99.50%\n";
+                    "Incoming smoothness: 94.00%\n";
                 PerformanceStats::Snapshot summary;
                 summary.vrr = summary.adaptive = true; summary.bufferUs = 5700;
                 summary.smoothingUs = 1250;
