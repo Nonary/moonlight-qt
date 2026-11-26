@@ -991,10 +991,8 @@ FocusScope {
                     objectName: "bitrateRow"
                     labelItem: ConsoleText { text: qsTr("Video bitrate") }
                     description: qsTr("Lower the bitrate on slower connections. Raise it to increase image quality. Changes apply to the next stream.")
-                    editor: ConsoleSlider {
+                    editor: VideoBitrateSlider {
                         id: slider
-
-                        readonly property bool pyroWave: StreamingPreferences.videoCodecConfig === StreamingPreferences.VCC_FORCE_PYROWAVE
 
                         // PyroWave needs several hundred Mbps, up to multi-gigabit LANs
                         function defaultBitrate() {
@@ -1012,13 +1010,6 @@ FocusScope {
                         }
 
                         value: StreamingPreferences.bitrateKbps
-
-                        stepSize: pyroWave ? 5000 : 500
-                        from : pyroWave ? 5000 : 500
-                        to: pyroWave ? 3000000 : (StreamingPreferences.unlockBitrate ? 500000 : 150000)
-
-                        snapMode: "SnapOnRelease"
-
 
                         onValueChanged: {
                             StreamingPreferences.bitrateKbps = value

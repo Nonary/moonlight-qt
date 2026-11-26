@@ -6,6 +6,7 @@ import "ConsoleStyle.js" as Style
 Slider {
     id: control
     property var settingsRowHost: null
+    property string valueText: qsTr("%1 Mbps").arg(value / 1000)
     signal settingsCommitted(real newValue)
     function openSettingsEditor(row) { row.settingsNavigation.openValueEditor(row, control, true) }
     Keys.onPressed: function(event) { event.accepted = settingsRowHost && settingsRowHost.settingsNavigation ? settingsRowHost.settingsNavigation.handleRowKey(settingsRowHost, event) : false }
@@ -23,6 +24,6 @@ Slider {
         width: Style.px(20, control.Window.window); height: width; radius: width/2; color: control.enabled ? Style.text : Style.disabled
         ConsoleFocus { focused: control.activeFocus; radius: parent.radius }
     }
-    ConsoleText { anchors.fill: parent; visible: !!control.settingsRowHost; text: qsTr("%1 Mbps").arg(control.value / 1000); horizontalAlignment: Text.AlignRight; verticalAlignment: Text.AlignVCenter }
+    ConsoleText { anchors.fill: parent; visible: !!control.settingsRowHost; text: control.valueText; horizontalAlignment: Text.AlignRight; verticalAlignment: Text.AlignVCenter }
     MouseArea { anchors.fill: parent; visible: !!control.settingsRowHost; onClicked: control.openSettingsEditor(control.settingsRowHost) }
 }

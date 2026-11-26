@@ -733,3 +733,63 @@ void StreamingPreferences::recordUiPlay(const QString& hostUuid, int appId)
     QSettings().setValue("ui/recentApps/" + hostUuid, history);
     emit recentUiAppsChanged(hostUuid);
 }
+
+static QString appVideoSettingsKey(const QString& hostUuid, int appId)
+{
+    if (hostUuid.isEmpty() || appId <= 0) return {};
+    return QStringLiteral("stream/appVideo/%1/%2").arg(hostUuid).arg(appId);
+}
+
+static QVariantMap validatedAppVideoOverrides(const QVariantMap& overrides)
+{
+    QVariantMap result;
+    const auto resolution = overrides.value(QStringLiteral("resolution")).toSize();
+    if (resolution.width() >= 256 && resolution.width() <= 8192 &&
+            resolution.height() >= 256 && resolution.height() <= 8192) {
+        result.insert(QStringLiteral("resolution"), resolution);
+    }
+    const int fps = overrides.value(QStringLiteral("fps")).toInt();
+    if (fps >= 10 && fps <= 9999) {
+        result.insert(QStringLiteral("fps"), fps);
+    }
+    const int bitrate = overrides.value(QStringLiteral("bitrateKbps")).toInt();
+    if (bitrate >= 500 && bitrate <= 3000000) {
+        result.insert(QStringLiteral("bitrateKbps"), bitrate);
+    }
+    const auto hdr = overrides.value(QStringLiteral("hdr"));
+    if (hdr.userType() == QMetaType::Bool) {
+        result.insert(QStringLiteral("hdr"), hdr.toBool());
+    }
+    return result;
+}
+
+QVariantMap StreamingPreferences::appVideoOverrides(const QString& hostUuid, int appId) const
+{
+    const QString key = appVideoSettingsKey(hostUuid, appId);
+    if (key.isEmpty()) return {};
+    return validatedAppVideoOverrides(QSettings().value(key).toMap());
+}
+
+void StreamingPreferences::saveAppVideoOverrides(const QString& hostUuid, int appId, const QVariantMap& overrides)
+{
+    const QString key = appVideoSettingsKey(hostUuid, appId);
+    if (key.isEmpty()) return;
+
+    QSettings settings;
+    const auto validated = validatedAppVideoOverrides(overrides);
+    if (validated.isEmpty()) settings.remove(key);
+    else settings.setValue(key, validated);
+    emit appVideoOverridesChanged(hostUuid, appId);
+}
+
+StreamingPreferences::StreamVideoSettings StreamingPreferences::videoSettingsForApp(const QString& hostUuid, int appId) const
+{
+    const auto overrides = appVideoOverrides(hostUuid, appId);
+    return {
+        overrides.value(QStringLiteral("resolution"), QSize(width, height)).toSize(),
+        overrides.value(QStringLiteral("fps"), fps).toInt(),
+        overrides.value(QStringLiteral("bitrateKbps"), bitrateKbps).toInt(),
+        overrides.value(QStringLiteral("hdr"), enableHdr).toBool(),
+        overrides.contains(QStringLiteral("bitrateKbps")),
+    };
+}

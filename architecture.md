@@ -143,8 +143,12 @@ These are defaults, not evidence of the user's current saved settings.
 The FPS picker is advisory and independent of the VRR setting. It offers fixed
 30 and 60 FPS, usable native display rates, and a plain below-refresh choice at
 `floor(refresh - refresh^2 / 3600)` (116 FPS at 120 Hz). A saved custom FPS
-remains selectable. Toggling VRR does not rewrite saved FPS;
-`m_StreamConfig.fps` receives the requested preference.
+remains selectable. Toggling VRR does not rewrite saved FPS.
+
+GUI launches snapshot resolution, frame rate, bitrate, and HDR for the selected
+host and game. Each unset field inherits its global preference. CLI launches
+snapshot the preferences supplied by the command line. `m_StreamConfig.fps`
+receives the resolved frame rate.
 
 `snapshotPresentationSettings()` resolves that request for the session:
 

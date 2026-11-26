@@ -4,6 +4,7 @@
 #include <QRect>
 #include <QQmlEngine>
 #include <QVariantList>
+#include <QVariantMap>
 #include "vrrtimingoptions.h"
 
 class StreamingPreferences : public QObject
@@ -11,6 +12,14 @@ class StreamingPreferences : public QObject
     Q_OBJECT
 
 public:
+    struct StreamVideoSettings {
+        QSize resolution;
+        int fps;
+        int bitrateKbps;
+        bool hdr;
+        bool bitrateOverridden;
+    };
+
     static StreamingPreferences* get(QQmlEngine *qmlEngine = nullptr);
 
     Q_INVOKABLE static int
@@ -212,6 +221,9 @@ public:
     Q_INVOKABLE int selectedUiApp(const QString& hostUuid) const;
     Q_INVOKABLE QVariantList recentUiApps(const QString& hostUuid) const;
     Q_INVOKABLE void recordUiPlay(const QString& hostUuid, int appId);
+    Q_INVOKABLE QVariantMap appVideoOverrides(const QString& hostUuid, int appId) const;
+    Q_INVOKABLE void saveAppVideoOverrides(const QString& hostUuid, int appId, const QVariantMap& overrides);
+    StreamVideoSettings videoSettingsForApp(const QString& hostUuid, int appId) const;
     Q_PROPERTY(UIDisplayMode uiDisplayMode MEMBER uiDisplayMode NOTIFY uiDisplayModeChanged)
     Q_PROPERTY(bool swapMouseButtons MEMBER swapMouseButtons NOTIFY mouseButtonsChanged)
     Q_PROPERTY(bool muteOnFocusLoss MEMBER muteOnFocusLoss NOTIFY muteOnFocusLossChanged)
@@ -341,6 +353,7 @@ signals:
     void uiPreferencesChanged();
     void uiControllerFullscreenChanged();
     void recentUiAppsChanged(QString hostUuid);
+    void appVideoOverridesChanged(const QString& hostUuid, int appId);
     void windowModeChanged();
     void framePacingChanged();
     void connectionWarningsChanged();

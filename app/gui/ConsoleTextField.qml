@@ -14,7 +14,7 @@ TextField {
     font.family: "Inter"
     font.pixelSize: Style.typeSize("body", Window.window)
     property bool controllerEditing: SdlGamepadKeyNavigation.inputMethod === "controller"
-    function openKeyboard() { Keyboard.openFor(field, Window.window, addressInput || (inputMethodHints & Qt.ImhDigitsOnly) !== 0, null) }
+    function openKeyboard() { Keyboard.openFor(field, Window.window, addressInput || (inputMethodHints & (Qt.ImhDigitsOnly | Qt.ImhFormattedNumbersOnly)) !== 0, null) }
     Keys.onPressed: function(event) {
         event.accepted = false
         if (controllerEditing && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space)) {

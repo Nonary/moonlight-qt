@@ -7,6 +7,7 @@ import AppModel 1.0
 import ComputerManager 1.0
 import SdlGamepadKeyNavigation 1.0
 import "ConsoleStyle.js" as Style
+import "PopupFocus.js" as PopupFocus
 
 FocusScope {
     id: appPage
@@ -35,6 +36,10 @@ FocusScope {
     readonly property bool hasGames: appPage.libraryCount > 0
     readonly property bool hasMultipleShelves: appPage.recentCount > 0 && hasGames
     property var selectedApp: ({})
+    readonly property int selectedAppId: selectedApp.appid || 0
+    property var videoOverrides: ({})
+    onSelectedAppIdChanged: refreshVideoOverrides()
+    onHostUuidChanged: refreshVideoOverrides()
     property AppModel appModel: AppModel { includeHostActions: false }
     property RecentAppsModel recentModel: RecentAppsModel { sourceModel: appPage.appModel }
     readonly property real uiScale: Style.windowScale(Window.window)
@@ -42,6 +47,8 @@ FocusScope {
     // Catalogue rows can move independently of the selected Recent shelf item.
     function selectedAppIndex() { return selectedApp.appid ? appModel.indexOfApp(selectedApp.appid) : -1 }
     focus: true
+
+    function refreshVideoOverrides() { videoOverrides = StreamingPreferences.appVideoOverrides(hostUuid, selectedAppId) }
 
     function restoreSelection() {
         shelf.restoreSelection()
@@ -72,7 +79,7 @@ FocusScope {
         if (!selectedApp.appid) return
         detailsExpanded = true
         playButton.forceActiveFocus()
-        Qt.callLater(function() { if (appPage.detailsExpanded) playButton.forceActiveFocus() })
+        Qt.callLater(function() { if (appPage.detailsExpanded && !PopupFocus.hasVisibleModal()) playButton.forceActiveFocus() })
     }
     function collapseDetails() { detailsExpanded = false; focusShelf(recentRowActive) }
     function launchSelected() {
@@ -115,7 +122,7 @@ FocusScope {
     }
     StackView.onActivated: {
         activated = true
-        SdlGamepadKeyNavigation.setUiNavMode(false)
+        if (!PopupFocus.hasVisibleModal()) SdlGamepadKeyNavigation.setUiNavMode(false)
         restoreSelection()
         if (!showGames && !showHiddenGames) {
             showGames = true
@@ -144,6 +151,9 @@ FocusScope {
     }
     Connections {
         target: StreamingPreferences
+        function onAppVideoOverridesChanged(uuid, appId) {
+            if (uuid === appPage.hostUuid && appId === appPage.selectedAppId) appPage.refreshVideoOverrides()
+        }
         function onRecentUiAppsChanged(uuid) {
             if (uuid === appPage.hostUuid) appPage.recentModel.appIds = StreamingPreferences.recentUiApps(uuid)
         }
@@ -316,14 +326,21 @@ FocusScope {
                 id: playButton; objectName: "gamePlayButton"
                 width: parent.width; text: appPage.primaryVerb; textOnly: true; textAlignment: Text.AlignLeft
                 onClicked: appPage.launchSelected()
-                KeyNavigation.down: quitGame.visible ? quitGame : directButton
+                KeyNavigation.down: quitGame.visible ? quitGame : streamProfileButton
                 Keys.onUpPressed: appPage.collapseDetails()
             }
             ConsoleListRow {
                 id: quitGame; width: parent.width; visible: !!appPage.selectedApp.running
                 text: qsTr("Quit game"); textOnly: true; textAlignment: Text.AlignLeft
                 onClicked: appPage.quitSelected()
-                KeyNavigation.up: playButton; KeyNavigation.down: directButton
+                KeyNavigation.up: playButton; KeyNavigation.down: streamProfileButton
+            }
+            ConsoleListRow {
+                id: streamProfileButton; objectName: "gameStreamProfileButton"
+                width: parent.width; text: qsTr("Stream profile")
+                onClicked: streamProfile.openFor(appPage.hostUuid, appPage.selectedAppId, appPage.selectedApp.name, appPage.videoOverrides)
+                KeyNavigation.up: quitGame.visible ? quitGame : playButton
+                KeyNavigation.down: directButton
             }
             ConsoleListRow {
                 id: directButton; width: parent.width
@@ -334,7 +351,7 @@ FocusScope {
                     var row = appPage.selectedAppIndex()
                     if (row >= 0) appPage.appModel.setAppDirectLaunch(row, !appPage.selectedApp.directLaunch)
                 }
-                KeyNavigation.up: quitGame.visible ? quitGame : playButton; KeyNavigation.down: hideButton
+                KeyNavigation.up: streamProfileButton; KeyNavigation.down: hideButton
             }
             ConsoleListRow {
                 id: hideButton; objectName: "hideGameButton"; width: parent.width
@@ -365,16 +382,27 @@ FocusScope {
             Rectangle { width: parent.width; height: 1; color: Style.outline }
             GridLayout {
                 columns: 2; columnSpacing: Style.px(24, appPage.Window.window); rowSpacing: Style.px(8, appPage.Window.window)
+                readonly property var overrides: appPage.videoOverrides
+                readonly property size resolution: overrides.resolution || Qt.size(StreamingPreferences.width, StreamingPreferences.height)
+                readonly property int fps: overrides.fps === undefined ? StreamingPreferences.fps : overrides.fps
+                readonly property int bitrate: overrides.bitrateKbps === undefined ? StreamingPreferences.bitrateKbps : overrides.bitrateKbps
+                readonly property bool hdr: overrides.hdr === undefined ? StreamingPreferences.enableHdr : overrides.hdr
                 ConsoleText { role: "secondary"; text: qsTr("Resolution") }
-                ConsoleText { role: "secondary"; text: qsTr("%1 × %2").arg(StreamingPreferences.width).arg(StreamingPreferences.height) }
+                ConsoleText { role: "secondary"; text: qsTr("%1 × %2").arg(parent.resolution.width).arg(parent.resolution.height) }
                 ConsoleText { role: "secondary"; text: qsTr("Frame rate") }
-                ConsoleText { role: "secondary"; text: qsTr("%1 FPS").arg(StreamingPreferences.fps) }
+                ConsoleText { role: "secondary"; text: qsTr("%1 FPS").arg(parent.fps) }
                 ConsoleText { role: "secondary"; text: qsTr("Bitrate") }
-                ConsoleText { role: "secondary"; text: qsTr("%1 Mbps").arg((StreamingPreferences.bitrateKbps / 1000).toFixed(1)) }
+                ConsoleText { role: "secondary"; text: qsTr("%1 Mbps").arg(parent.bitrate / 1000) }
+                ConsoleText { role: "secondary"; text: qsTr("HDR") }
+                ConsoleText { role: "secondary"; text: parent.hdr ? qsTr("On") : qsTr("Off") }
             }
             ConsoleText { role: "caption"; text: qsTr("Requested settings. The negotiated stream mode may differ."); width: parent.width; wrapMode: Text.Wrap }
         }
         ScrollBar.vertical: ScrollBar { }
+    }
+    GameStreamProfile {
+        id: streamProfile
+        onClosed: if (appPage.activated && appPage.detailsExpanded) streamProfileButton.forceActiveFocus()
     }
     Column {
         x: Style.px(64, appPage.Window.window); y: Style.px(100, appPage.Window.window)

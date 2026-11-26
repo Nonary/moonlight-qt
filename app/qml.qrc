@@ -10,6 +10,7 @@
         <file>gui/ConsoleValueEditor.qml</file>
         <file>gui/ConsoleCheckBox.qml</file>
         <file>gui/ConsoleSlider.qml</file>
+        <file>gui/VideoBitrateSlider.qml</file>
         <file>gui/ConsoleButton.qml</file>
         <file>gui/ConsoleBackdrop.qml</file>
         <file>gui/effects/ConsoleBackdropBlur.qml</file>
@@ -21,6 +22,7 @@
         <file>gui/PcView.qml</file>
         <file>gui/AppView.qml</file>
         <file>gui/GameShelf.qml</file>
+        <file>gui/GameStreamProfile.qml</file>
         <file>gui/SettingsView.qml</file>
         <file>gui/CalibrationButton.qml</file>
         <file>gui/CalibrationHostSelection.qml</file>
