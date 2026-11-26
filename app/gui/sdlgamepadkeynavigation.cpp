@@ -4,6 +4,11 @@
 #include <QGuiApplication>
 #include <QWindow>
 
+#if defined(Q_OS_WIN) && QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+#include <QtCore/qt_windows.h>
+#include <private/qguiapplication_p.h>
+#endif
+
 #include "settings/mappingmanager.h"
 
 #define AXIS_NAVIGATION_REPEAT_DELAY 150
@@ -75,8 +80,8 @@ void SdlGamepadKeyNavigation::enable()
     else { m_InputMethod = "keyboard"; m_ControllerFamily = "xbox"; }
     emit navigationStateChanged();
     m_Enabled = true;
+    m_FirstPoll = true;
 
-    // Start the polling timer if the window is focused
     updateTimerState();
 }
 
@@ -100,11 +105,38 @@ void SdlGamepadKeyNavigation::disable()
     emit navigationStateChanged();
 }
 
-void SdlGamepadKeyNavigation::notifyWindowFocus(bool hasFocus)
+void SdlGamepadKeyNavigation::notifyWindowFocus(bool hasFocus, bool visible)
 {
     if (!hasFocus) releaseControllerKeys();
+    if (hasFocus && !m_HasFocus) m_FirstPoll = true;
     m_HasFocus = hasFocus;
+    m_WindowVisible = visible;
     updateTimerState();
+}
+
+void SdlGamepadKeyNavigation::requestWindowActivation(QWindow* window)
+{
+    if (!window || !window->isVisible() || window->isActive()) {
+        return;
+    }
+
+#if defined(Q_OS_WIN) && QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    using WindowsApplication = QNativeInterface::Private::QWindowsApplication;
+    if (auto* windows = qGuiApp->nativeInterface<WindowsApplication>()) {
+        const auto handle = reinterpret_cast<HWND>(window->winId());
+        if (GetForegroundWindow() && !SetForegroundWindow(handle)) {
+            // Try Qt's Windows fallback when the startup or hotplug request
+            // could not take the foreground through normal activation.
+            const auto previous = windows->windowActivationBehavior();
+            windows->setWindowActivationBehavior(WindowsApplication::AlwaysActivateWindow);
+            window->requestActivate();
+            windows->setWindowActivationBehavior(previous);
+            return;
+        }
+    }
+#endif
+
+    window->requestActivate();
 }
 
 void SdlGamepadKeyNavigation::onPollingTimerFired()
@@ -116,7 +148,7 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
 
     // Discard any pending button events on the first poll to avoid picking up
     // stale input data from the stream session (like the quit combo).
-    if (m_FirstPoll) {
+    if (m_HasFocus && m_FirstPoll) {
         releaseControllerKeys();
         SDL_FlushEvent(SDL_CONTROLLERBUTTONDOWN);
         SDL_FlushEvent(SDL_CONTROLLERBUTTONUP);
@@ -135,6 +167,9 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
         case SDL_CONTROLLERBUTTONDOWN:
         case SDL_CONTROLLERBUTTONUP:
         {
+            if (!m_HasFocus) {
+                break;
+            }
             QEvent::Type type =
                     event.type == SDL_CONTROLLERBUTTONDOWN ?
                         QEvent::Type::KeyPress : QEvent::Type::KeyRelease;
@@ -264,6 +299,7 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
                     m_Gamepads.append(gc);
                     noteController(gc);
                     emit navigationStateChanged();
+                    emit controllerConnected();
                 }
                 else {
                     // We already have this game controller open
@@ -272,6 +308,10 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
             }
             break;
         }
+    }
+
+    if (!m_HasFocus) {
+        return;
     }
 
     // Repeat only directional buttons. Keep the original release route and
@@ -365,13 +405,16 @@ void SdlGamepadKeyNavigation::sendKey(QEvent::Type type, Qt::Key key, Qt::Keyboa
 
 void SdlGamepadKeyNavigation::updateTimerState()
 {
-    if (m_PollingTimer->isActive() && (!m_HasFocus || !m_Enabled)) {
+    bool shouldPoll = m_HasFocus;
+#ifdef Q_OS_WIN
+    // Keep discovering controllers while the Windows launcher is in the
+    // background. Buttons and sticks are still delivered only with focus.
+    shouldPoll |= m_WindowVisible;
+#endif
+    if (!m_Enabled || !shouldPoll) {
         m_PollingTimer->stop();
     }
-    else if (!m_PollingTimer->isActive() && m_HasFocus && m_Enabled) {
-        // Flush events on the first poll
-        m_FirstPoll = true;
-
+    else if (!m_PollingTimer->isActive()) {
         // Poll every 50 ms for a new joystick event
         m_PollingTimer->start(50);
     }

@@ -73,7 +73,8 @@ CenteredGridView {
         if (count === 0 || addingPc) addPcDialog.open()
         else if (currentItem) currentItem.activateHost()
     }
-    function optionsAction() { if (currentItem) currentItem.pcContextMenu.open() }
+    function optionsAction() { if (currentItem && !addingPc) currentItem.openOptions(false) }
+    Keys.onMenuPressed: optionsAction()
     function refreshHost() { selectedHost = computerModel.get(currentIndex) }
     function refreshAfterModelChange() {
         // A reset or reorder can replace the host at an unchanged row number.
@@ -201,7 +202,16 @@ CenteredGridView {
     delegate: NavigableItemDelegate {
         width: pcGrid.cellWidth; height: pcGrid.height
         grid: pcGrid
-        property alias pcContextMenu: pcContextMenuLoader.item
+        id: pcTile
+        function openOptions(atPointer) {
+            pcGrid.startupRestorePending = false
+            pcGrid.currentIndex = index
+            forceActiveFocus()
+            pcContextMenuLoader.active = true
+            var menu = pcContextMenuLoader.item
+            if (atPointer && menu.popup) menu.popup()
+            else menu.open()
+        }
         background: Item { }
         Rectangle {
             x: 0; y: pcGrid.cardY
@@ -225,10 +235,11 @@ CenteredGridView {
         }
         Loader {
             id: pcContextMenuLoader
-            asynchronous: true
+            active: false
+            y: pcGrid.cardY
             sourceComponent: NavigableMenu {
                 id: pcContextMenu
-                initiator: pcContextMenuLoader.parent
+                initiator: pcTile
                 MenuItem {
                     text: qsTr("PC Status: %1").arg(model.online ? qsTr("Online") : qsTr("Offline"))
                     font.bold: true
@@ -280,7 +291,7 @@ CenteredGridView {
             }
         }
 
-        onClicked: { pcGrid.currentIndex = index; pcGrid.forceActiveFocus() }
+        onClicked: { pcGrid.currentIndex = index; forceActiveFocus() }
         onDoubleClicked: activateHost()
         Keys.onReturnPressed: activateHost()
         Keys.onEnterPressed: activateHost()
@@ -311,34 +322,19 @@ CenteredGridView {
             } else if (!model.online) {
                 // Using open() here because it may be activated by keyboard
                 if (model.wakeable) computerModel.wakeComputer(index)
-                else pcContextMenu.open()
+                else openOptions(false)
             }
         }
 
-        onPressAndHold: {
-            // popup() ensures the menu appears under the mouse cursor
-            if (pcContextMenu.popup) {
-                pcContextMenu.popup()
-            }
-            else {
-                // Qt 5.9 doesn't have popup()
-                pcContextMenu.open()
-            }
-        }
+        onPressAndHold: openOptions(true)
 
         MouseArea {
             anchors.fill: parent
-            acceptedButtons: Qt.RightButton;
-            onClicked: {
-                parent.pressAndHold()
-            }
+            acceptedButtons: Qt.RightButton
+            onClicked: pcTile.openOptions(true)
         }
 
-        Keys.onMenuPressed: {
-            // We must use open() here so the menu is positioned on
-            // the ItemDelegate and not where the mouse cursor is
-            pcContextMenu.open()
-        }
+        Keys.onMenuPressed: openOptions(false)
 
         Keys.onDeletePressed: {
             deletePcDialog.pcIndex = index

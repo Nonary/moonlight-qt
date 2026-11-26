@@ -1,6 +1,7 @@
 TEMPLATE = app
 TARGET = tst_controllernavigation
 QT += gui qml quick quickcontrols2 network testlib
+win32:greaterThan(QT_MAJOR_VERSION, 5): QT += gui-private
 CONFIG += console testcase c++17
 CONFIG -= app_bundle
 macx:!disable-prebuilts {
@@ -9,7 +10,7 @@ macx:!disable-prebuilts {
 } else:win32 {
     DEFINES += SDL_MAIN_HANDLED
     INCLUDEPATH += $$PWD/../../libs/windows/include/x64 $$PWD/../../libs/windows/include/x64/SDL2
-    LIBS += -L$$PWD/../../libs/windows/lib/x64 -lSDL2
+    LIBS += -L$$PWD/../../libs/windows/lib/x64 -lSDL2 -luser32
 } else {
     CONFIG += link_pkgconfig
     PKGCONFIG += sdl2

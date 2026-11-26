@@ -15,10 +15,8 @@ import "ConsoleStyle.js" as Style
 ApplicationWindow {
     property bool pollingActive: false
 
-    // Set by SettingsView to force the back operation to pop all
-    // pages except the initial view. This is required when doing
-    // a retranslate() because AppView breaks for some reason.
-    property bool clearOnBack: false
+    // Retranslation requires recreating the library page.
+    property bool libraryNeedsReload: false
 
     id: window
     width: 1280
@@ -26,7 +24,8 @@ ApplicationWindow {
     minimumWidth: 800
     minimumHeight: 500
     color: Style.background
-    readonly property real uiScale: Style.scale(width, height)
+    readonly property bool compactDesktop: SystemProperties.hasDesktopEnvironment && SdlGamepadKeyNavigation.connectedGamepads === 0
+    readonly property real uiScale: Style.windowScale(window)
     font.family: "Inter"
     font.pixelSize: Style.typeSize("body", window)
     Material.theme: Material.Dark
@@ -34,7 +33,7 @@ ApplicationWindow {
     Material.primary: Style.surface
     Material.background: Style.background
     Material.foreground: Style.text
-    readonly property bool toolbarFocused: homeButton.activeFocus || pcsButton.activeFocus || settingsButton.activeFocus || uiFullscreenButton.activeFocus
+    readonly property bool toolbarFocused: homeButton.activeFocus || pcsButton.activeFocus || settingsButton.activeFocus
     readonly property bool controllerInput: SdlGamepadKeyNavigation.inputMethod === "controller"
     property bool uiDisplayReady: false
     property bool controllerFullscreenRequested: false
@@ -78,6 +77,9 @@ ApplicationWindow {
         function onNavigationStateChanged() {
             if (SdlGamepadKeyNavigation.connectedGamepads > 0) window.controllerFullscreenRequested = true
         }
+        function onControllerConnected() {
+            if (Qt.platform.os === "windows") Qt.callLater(window.activateForController)
+        }
     }
     Connections {
         target: StreamingPreferences
@@ -86,6 +88,11 @@ ApplicationWindow {
             window.uiFullscreenOverride = StreamingPreferences.uiDisplayMode === StreamingPreferences.UI_FULLSCREEN ? 1 : 0
             Qt.callLater(window.applyUiDisplayMode)
         }
+    }
+
+    function activateForController() {
+        if (uiDisplayReady && toolBar.visible && SdlGamepadKeyNavigation.connectedGamepads > 0)
+            SdlGamepadKeyNavigation.requestWindowActivation(window)
     }
 
     function focusNavigation() {
@@ -120,7 +127,8 @@ ApplicationWindow {
     function showPcs() { if (toolBar.visible) stackView.pop(null, StackView.Immediate) }
     function showHome() {
         if (!toolBar.visible) return
-        var library = stackView.find(function(item) { return item instanceof AppView })
+        var library = libraryNeedsReload ? null : stackView.find(function(item) { return item instanceof AppView })
+        libraryNeedsReload = false
         if (library) { stackView.pop(library, StackView.Immediate); library.forceActiveFocus() }
         else {
             stackView.pop(null, StackView.Immediate)
@@ -138,11 +146,11 @@ ApplicationWindow {
     }
     function switchSection(direction) {
         if (!toolBar.visible || popupHasFocus()) return
-        var section = stackView.currentItem instanceof SettingsView ? 2 : stackView.currentItem instanceof AppView ? 0 : 1
+        var section = stackView.currentItem instanceof AppView ? 0 : stackView.currentItem instanceof SettingsView ? 1 : 2
         section = (section + direction + 3) % 3
         if (section === 0) showHome()
-        else if (section === 1) showPcs()
-        else settingsButton.clicked()
+        else if (section === 1) settingsButton.clicked()
+        else showPcs()
     }
     function controllerLabel(action) {
         if (!controllerInput) return action === "confirm" ? "Enter" : action === "back" ? "Esc" : action === "options" ? "Menu" : action === "done" ? "Enter" : "PgUp / PgDn"
@@ -174,7 +182,7 @@ ApplicationWindow {
         // Request keyboard focus once the startup window has been shown.
         Qt.callLater(function() {
             if (window.visible && window.visibility !== Window.Minimized && !window.active) {
-                window.requestActivate()
+                SdlGamepadKeyNavigation.requestWindowActivation(window)
             }
         })
 
@@ -224,22 +232,16 @@ ApplicationWindow {
 
     function goBack() {
         if (PopupFocus.rejectTopModal()) return
-        if (stackView.currentItem instanceof SettingsView && !stackView.currentItem.categoryMenuFocused) {
-            stackView.currentItem.backAction()
+        if (stackView.currentItem instanceof SettingsView) {
+            if (stackView.currentItem.categoryMenuFocused) showHome()
+            else stackView.currentItem.backAction()
             return
         }
         if (stackView.currentItem instanceof AppView && stackView.currentItem.detailsExpanded) {
             stackView.currentItem.collapseDetails()
             return
         }
-        if (clearOnBack) {
-            // Pop all items except the first one
-            stackView.pop(null)
-            clearOnBack = false
-        }
-        else {
-            stackView.pop()
-        }
+        stackView.pop()
     }
 
     StackView {
@@ -348,8 +350,7 @@ ApplicationWindow {
 
         if (visible) Qt.callLater(applyUiDisplayMode)
 
-        // Poll for gamepad input only when the window is in focus
-        SdlGamepadKeyNavigation.notifyWindowFocus(visible && active)
+        SdlGamepadKeyNavigation.notifyWindowFocus(visible && active, visible)
     }
 
     onActiveChanged: {
@@ -369,8 +370,7 @@ ApplicationWindow {
             inactivityTimer.restart()
         }
 
-        // Poll for gamepad input only when the window is in focus
-        SdlGamepadKeyNavigation.notifyWindowFocus(visible && active)
+        SdlGamepadKeyNavigation.notifyWindowFocus(visible && active, visible)
     }
 
     function navigateTo(url, objectType)
@@ -401,34 +401,23 @@ ApplicationWindow {
             ConsoleText { text: qsTr("Moonlight"); font.weight: Font.DemiBold; visible: window.width >= 1100; Layout.rightMargin: Style.px(24, window) }
             ConsoleButton {
                 id: homeButton; text: qsTr("Home"); textOnly: true; selected: stackView.currentItem instanceof AppView
-                onClicked: window.showHome(); KeyNavigation.right: pcsButton
-                Keys.onDownPressed: stackView.currentItem.forceActiveFocus()
-            }
-            ConsoleButton {
-                id: pcsButton; text: qsTr("PCs"); textOnly: true; selected: stackView.currentItem instanceof PcView
-                onClicked: window.showPcs(); KeyNavigation.left: homeButton; KeyNavigation.right: settingsButton
+                onClicked: window.showHome(); KeyNavigation.right: settingsButton
                 Keys.onDownPressed: stackView.currentItem.forceActiveFocus()
             }
             ConsoleButton {
                 id: settingsButton; text: qsTr("Settings"); textOnly: true; selected: stackView.currentItem instanceof SettingsView
-                onClicked: window.openSettings(); KeyNavigation.left: pcsButton; KeyNavigation.right: uiFullscreenButton
+                onClicked: window.openSettings(); KeyNavigation.left: homeButton; KeyNavigation.right: pcsButton
                 Keys.onDownPressed: stackView.currentItem.forceActiveFocus()
                 Shortcut { sequences: [StandardKey.Preferences]; onActivated: settingsButton.clicked() }
+            }
+            ConsoleButton {
+                id: pcsButton; text: qsTr("PCs"); textOnly: true; selected: stackView.currentItem instanceof PcView
+                onClicked: window.showPcs(); KeyNavigation.left: settingsButton
+                Keys.onDownPressed: stackView.currentItem.forceActiveFocus()
             }
             Item { Layout.fillWidth: true }
             Rectangle { visible: window.selectedHostName.length > 0 && window.width >= 1100; Layout.preferredWidth: Style.px(8, window); Layout.preferredHeight: Style.px(8, window); radius: width/2; color: Style.ok }
             ConsoleText { text: window.selectedHostName; role: "secondary"; elide: Text.ElideRight; Layout.maximumWidth: window.width * 0.2; visible: window.width >= 1100 }
-            ConsoleButton {
-                id: uiFullscreenButton; objectName: "uiFullscreenButton"
-                visible: SystemProperties.hasDesktopEnvironment
-                text: window.visibility === Window.FullScreen ? qsTr("Exit fullscreen") : qsTr("Fullscreen")
-                textOnly: true
-                onClicked: window.toggleUiFullscreen()
-                KeyNavigation.left: settingsButton
-                Keys.onDownPressed: stackView.currentItem.forceActiveFocus()
-                ToolTip.text: qsTr("F11")
-                ToolTip.visible: hovered
-            }
         }
     }
     footer: Item {

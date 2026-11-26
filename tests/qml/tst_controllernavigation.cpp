@@ -164,6 +164,7 @@ private slots:
         window.show(); window.requestActivate();
         QTRY_COMPARE(QGuiApplication::focusWindow(), &window);
         navigation->notifyWindowFocus(false);
+        navigation->notifyWindowFocus(true);
         QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired");
         prefs->swapFaceButtons = false;
         // Most shell cases verify a specific desktop geometry. Fullscreen's
@@ -216,7 +217,9 @@ private slots:
         engine.load(QUrl("qrc:/gui/main.qml"));
         QVERIFY(!engine.rootObjects().isEmpty());
         auto* root=qobject_cast<QQuickWindow*>(engine.rootObjects().first()); QVERIFY(root);
-        navigation->notifyWindowFocus(false);
+        root->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), root);
+        QVERIFY(QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired"));
         auto label=[root](const char* action) {
             QVariant result;
             QMetaObject::invokeMethod(root,"controllerLabel",Q_RETURN_ARG(QVariant,result),
@@ -353,6 +356,8 @@ private slots:
         QCOMPARE(window.keys[1].modifiers, Qt::KeyboardModifiers(Qt::NoModifier));
         button(SDL_CONTROLLERBUTTONUP, SDL_CONTROLLER_BUTTON_DPAD_UP);
         QCOMPARE(window.keys.size(), 2);
+        navigation->notifyWindowFocus(true);
+        QVERIFY(QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired"));
         button(SDL_CONTROLLERBUTTONDOWN, SDL_CONTROLLER_BUTTON_DPAD_UP);
         button(SDL_CONTROLLERBUTTONUP, SDL_CONTROLLER_BUTTON_DPAD_UP);
         QCOMPARE(window.keys.size(), 4);
@@ -514,6 +519,194 @@ private slots:
         QSettings().remove("ui/recentApps/host-one");
         prefs->uiLastHostUuid.clear();
     }
+    void pcOptionsUseTheSelectedTile() {
+        prefs->uiLastHostUuid.clear();
+        QQmlApplicationEngine engine;
+        engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
+        engine.rootContext()->setContextProperty("initialView", QString("qrc:/gui/PcView.qml"));
+        engine.rootContext()->setContextProperty("runConfigChecks", false);
+        engine.load(QUrl("qrc:/gui/main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* root = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(root);
+        root->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), root);
+        navigation->notifyWindowFocus(true);
+        QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired");
+        auto* pcs = root->findChild<QQuickItem*>("Computers");
+        QVERIFY(pcs);
+        const auto press = [&](Uint8 code) { button(SDL_CONTROLLERBUTTONDOWN, code); button(SDL_CONTROLLERBUTTONUP, code); };
+        auto focusedText = [&]() { return root->activeFocusItem() ? root->activeFocusItem()->property("text").toString() : QString(); };
+        press(SDL_CONTROLLER_BUTTON_X);
+        QTRY_COMPARE(focusedText(), QString("View All Apps"));
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        QTRY_COMPARE(focusedText(), QString("Test Network"));
+        press(SDL_CONTROLLER_BUTTON_B);
+        QTRY_VERIFY(pcs->hasActiveFocus());
+
+        // Right-click the offline PC while the online PC is still selected.
+        auto* tile = pcs->property("currentItem").value<QQuickItem*>();
+        QVERIFY(tile);
+        const QPointF secondTile(pcs->property("cellWidth").toReal() + 35, pcs->property("cardY").toReal() + 20);
+        QTest::mouseClick(root, Qt::RightButton, Qt::NoModifier, tile->mapToScene(secondTile).toPoint());
+        QTRY_COMPARE(pcs->property("currentIndex").toInt(), 1);
+        QTRY_COMPARE(focusedText(), QString("Wake PC"));
+        press(SDL_CONTROLLER_BUTTON_B);
+        QTRY_VERIFY(pcs->hasActiveFocus());
+        auto* options = visualItem(root->contentItem(), "footerHint_options");
+        QVERIFY(options && options->isVisible());
+        QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier, options->mapToScene(options->boundingRect().center()).toPoint());
+        QTRY_COMPARE(focusedText(), QString("Wake PC"));
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        QTRY_COMPARE(focusedText(), QString("Rename PC"));
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(root->activeFocusItem() && root->activeFocusItem()->property("placeholderText").toString() == "Living Room PC");
+        press(SDL_CONTROLLER_BUTTON_B);
+    }
+    void gameVideoOverridesFollowHostAndGameIdentity() {
+        const auto defaults = prefs->videoSettingsForApp({}, 0);
+        const QVariantMap overrides{
+            {"resolution", QSize(2560, 1600)}, {"fps", 116}, {"bitrateKbps", 42500}, {"hdr", !defaults.hdr}
+        };
+        prefs->saveAppVideoOverrides("profile-host", 4, overrides);
+        QSettings().sync();
+        QCOMPARE(prefs->appVideoOverrides("profile-host", 4), overrides);
+
+        const auto requested = prefs->videoSettingsForApp("profile-host", 4);
+        QCOMPARE(requested.resolution, QSize(2560, 1600));
+        QCOMPARE(requested.fps, 116);
+        QCOMPARE(requested.bitrateKbps, 42500);
+        QCOMPARE(requested.hdr, !defaults.hdr);
+        QCOMPARE(prefs->videoSettingsForApp("profile-host", 5).fps, defaults.fps);
+        QCOMPARE(prefs->videoSettingsForApp("other-host", 4).resolution, defaults.resolution);
+        QCOMPARE(prefs->enableHdr, defaults.hdr);
+
+        prefs->saveAppVideoOverrides("profile-host", 4, {{"resolution", QSize(0, 1600)}, {"hdr", false}});
+        const auto partial = prefs->videoSettingsForApp("profile-host", 4);
+        QCOMPARE(partial.resolution, defaults.resolution);
+        QCOMPARE(partial.bitrateKbps, defaults.bitrateKbps);
+        QVERIFY(!partial.hdr);
+        prefs->saveAppVideoOverrides("profile-host", 4, {});
+        QVERIFY(prefs->appVideoOverrides("profile-host", 4).isEmpty());
+    }
+    void gameStreamProfileOpenSaveAndCancel() {
+        const auto lastHost = prefs->uiLastHostUuid;
+        prefs->uiLastHostUuid.clear();
+        QQmlApplicationEngine engine;
+        engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
+        engine.rootContext()->setContextProperty("initialView", QString("qrc:/gui/PcView.qml"));
+        engine.rootContext()->setContextProperty("runConfigChecks", false);
+        engine.load(QUrl("qrc:/gui/main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* root = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(root);
+        root->resize(800, 500);
+        root->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), root);
+        auto* add = root->findChild<QQuickItem*>("addPcTile");
+        QVERIFY(add);
+        add->forceActiveFocus();
+        QTest::keyClick(root, Qt::Key_Left);
+        QTest::keyClick(root, Qt::Key_Return);
+        QQuickItem* shelf = nullptr;
+        QTRY_VERIFY((shelf = root->findChild<QQuickItem*>("gameShelf")) && shelf->isVisible());
+
+        navigation->notifyWindowFocus(true);
+        const auto press = [&](Uint8 code) { button(SDL_CONTROLLERBUTTONDOWN, code); button(SDL_CONTROLLERBUTTONUP, code); };
+        press(SDL_CONTROLLER_BUTTON_X);
+        auto* entry = root->findChild<QQuickItem*>("gameStreamProfileButton");
+        QVERIFY(entry);
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        QTRY_VERIFY(entry->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_A);
+        auto* dialog = root->findChild<QObject*>("gameStreamProfile");
+        QVERIFY(dialog);
+        QTRY_VERIFY(dialog->property("opened").toBool());
+        auto* resolution = dialog->findChild<QQuickItem*>("gameProfileResolution");
+        auto* row = dialog->findChild<QQuickItem*>("gameProfileBitrateRow");
+        auto* bitrate = dialog->findChild<QQuickItem*>("gameProfileBitrate");
+        auto* editor = dialog->findChild<QObject*>("gameProfileBitrateEditor");
+        auto* resetBitrate = dialog->findChild<QQuickItem*>("gameProfileResetBitrate");
+        auto* hdr = dialog->findChild<QQuickItem*>("gameProfileHdr");
+        auto* resetHdr = dialog->findChild<QQuickItem*>("gameProfileResetHdr");
+        auto* save = dialog->findChild<QQuickItem*>("gameProfileSave");
+        QVERIFY(resolution && row && bitrate && editor && resetBitrate && hdr && resetHdr && save);
+        const int globalBitrate = prefs->bitrateKbps;
+        const bool globalHdr = prefs->enableHdr;
+        const auto host = dialog->property("hostUuid").toString();
+        const int appId = dialog->property("appId").toInt();
+        QVERIFY(!resetBitrate->isVisible() && !resetHdr->isVisible());
+        QTRY_VERIFY(resolution->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        QTRY_VERIFY(row->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(editor->property("opened").toBool());
+        const int start = editor->property("pendingValue").toInt();
+        const int step = bitrate->property("stepSize").toInt();
+        press(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+        press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+        const int edited = std::min(start + step * 11, bitrate->property("to").toInt());
+        QCOMPARE(editor->property("pendingValue").toInt(), edited);
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(!editor->property("visible").toBool() && row->hasActiveFocus());
+        QCOMPARE(bitrate->property("value").toInt(), edited);
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        QTRY_VERIFY(resetBitrate->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        QTRY_VERIFY(hdr->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_A);
+        QCOMPARE(hdr->property("checked").toBool(), !globalHdr);
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        QTRY_VERIFY(resetHdr->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        QTRY_VERIFY(save->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(!dialog->property("visible").toBool());
+        QCOMPARE(prefs->appVideoOverrides(host, appId), (QVariantMap{{"bitrateKbps", edited}, {"hdr", !globalHdr}}));
+        QTRY_VERIFY(entry->hasActiveFocus());
+
+        // An old override above the current slider limit must survive opening
+        // and canceling the editor, and saving edits to a different field.
+        prefs->saveAppVideoOverrides(host, appId, {{"bitrateKbps", 725501}, {"hdr", !globalHdr}});
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(dialog->property("opened").toBool());
+        QVERIFY(bitrate->property("valueText").toString().contains("725.501"));
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(editor->property("opened").toBool());
+        press(SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+        press(SDL_CONTROLLER_BUTTON_B);
+        QTRY_VERIFY(!editor->property("visible").toBool() && row->hasActiveFocus());
+        QVERIFY(bitrate->property("valueText").toString().contains("725.501"));
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        QTRY_VERIFY(resetHdr->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(hdr->hasActiveFocus() && !resetHdr->isVisible());
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(!dialog->property("visible").toBool());
+        QCOMPARE(prefs->appVideoOverrides(host, appId), (QVariantMap{{"bitrateKbps", 725501}}));
+
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(dialog->property("opened").toBool());
+        for (int i = 0; i < 3; ++i) press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        QTRY_VERIFY(resetBitrate->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(row->hasActiveFocus() && !resetBitrate->isVisible());
+        QCOMPARE(bitrate->property("value").toInt(), globalBitrate);
+        press(SDL_CONTROLLER_BUTTON_B);
+        QTRY_VERIFY(!dialog->property("visible").toBool());
+        QCOMPARE(prefs->appVideoOverrides(host, appId), (QVariantMap{{"bitrateKbps", 725501}}));
+        QCOMPARE(prefs->bitrateKbps, globalBitrate);
+        QCOMPARE(prefs->enableHdr, globalHdr);
+        prefs->saveAppVideoOverrides(host, appId, {});
+        prefs->uiLastHostUuid = lastHost;
+    }
     void controllerFullscreenPreferenceDefaultsOnAndPersists() {
         QSettings().remove("ui/controllerFullscreen");
         prefs->reload();
@@ -543,8 +736,6 @@ private slots:
         QTRY_COMPARE(QGuiApplication::focusWindow(), root);
         QTRY_VERIFY(navigation->connectedGamepads() > 0);
         QTRY_COMPARE(root->visibility(), QWindow::FullScreen);
-        auto* fullscreenButton = root->findChild<QQuickItem*>("uiFullscreenButton"); QVERIFY(fullscreenButton);
-        QCOMPARE(fullscreenButton->property("text").toString(), QString("Exit fullscreen"));
         QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier, QPoint(5, 5));
         QTest::keyClick(root, Qt::Key_Shift);
         QTest::qWait(30);
@@ -559,8 +750,15 @@ private slots:
         press(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
         QTest::qWait(20);
         QCOMPARE(root->visibility(), QWindow::FullScreen);
-        const auto exitPoint = fullscreenButton->mapToScene(QPointF(fullscreenButton->width()/2, fullscreenButton->height()/2)).toPoint();
-        QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier, exitPoint);
+        press(SDL_CONTROLLER_BUTTON_START);
+        auto* categories = root->findChild<QQuickItem*>("settingsCategories");
+        QTRY_VERIFY(categories && categories->hasActiveFocus());
+        for (int i = 0; i < 4; ++i) press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        press(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+        auto* fullscreenButton = root->findChild<QQuickItem*>("uiFullscreenButton");
+        QTRY_VERIFY(fullscreenButton && fullscreenButton->hasActiveFocus());
+        QCOMPARE(fullscreenButton->property("text").toString(), QString("Exit fullscreen"));
+        press(SDL_CONTROLLER_BUTTON_A);
         const auto desktopVisibility = desktopMode == StreamingPreferences::UI_MAXIMIZED ? QWindow::Maximized : QWindow::Windowed;
         QTRY_COMPARE(root->visibility(), desktopVisibility);
         QCOMPARE(root->property("uiFullscreenOverride").toInt(), 0);
@@ -944,6 +1142,64 @@ private slots:
         QTRY_VERIFY(error->property("opened").toBool());
         if (!capture.isEmpty()) QVERIFY(root->grabWindow().save(capture+"/error.png"));
         QVERIFY(QMetaObject::invokeMethod(error,"reject"));
+    }
+    void settingsBackReturnsToRememberedLibraryFromPcs() {
+        prefs->uiLastHostUuid.clear();
+        QQmlApplicationEngine engine;
+        engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
+        engine.rootContext()->setContextProperty("initialView", QString("qrc:/gui/PcView.qml"));
+        engine.rootContext()->setContextProperty("runConfigChecks", false);
+        engine.load(QUrl("qrc:/gui/main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* root = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(root);
+        root->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), root);
+        navigation->notifyWindowFocus(true);
+        QVERIFY(QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired"));
+        const auto press = [&](Uint8 code) { button(SDL_CONTROLLERBUTTONDOWN, code); button(SDL_CONTROLLERBUTTONUP, code); };
+
+        auto* pcs = root->findChild<QQuickItem*>("Computers");
+        QTRY_VERIFY(pcs && pcs->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_A);
+        QTRY_VERIFY(!root->property("selectedHostName").toString().isEmpty());
+        const QString host = root->property("selectedHostName").toString();
+        const auto libraryFocused = [&] {
+            for (auto* item = root->activeFocusItem(); item; item = item->parentItem()) {
+                if (item->objectName() == host) return true;
+            }
+            return false;
+        };
+        QTRY_VERIFY(libraryFocused());
+
+        QVERIFY(QMetaObject::invokeMethod(root, "focusNavigation"));
+        const auto focusedText = [&] {
+            auto* focused = root->activeFocusItem();
+            return focused ? focused->property("text").toString() : QString();
+        };
+        QCOMPARE(focusedText(), QString("Home"));
+        press(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+        QTRY_COMPARE(focusedText(), QString("Settings"));
+        press(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+        QTRY_COMPARE(focusedText(), QString("PCs"));
+        press(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+        QTRY_VERIFY(libraryFocused());
+
+        const auto settingsFocused = [&] {
+            auto* categories = root->findChild<QQuickItem*>("settingsCategories");
+            return categories && categories->hasActiveFocus();
+        };
+        press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+        QTRY_VERIFY(settingsFocused());
+        press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+        QTRY_VERIFY(pcs->hasActiveFocus());
+        press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+        QTRY_VERIFY(settingsFocused());
+        const QPointer<QQuickItem> categories(root->findChild<QQuickItem*>("settingsCategories"));
+        press(SDL_CONTROLLER_BUTTON_B);
+        QTRY_COMPARE(root->property("selectedHostName").toString(), host);
+        QTRY_VERIFY(libraryFocused());
+        QTRY_VERIFY(!categories || !categories->isVisible());
     }
     void settingsControllerBrowseEditAndReturn() {
         QQmlApplicationEngine engine;
@@ -1412,7 +1668,7 @@ private slots:
         QCOMPARE(navigation->connectedGamepads(), 0);
         QCOMPARE(navigation->inputMethod(), QString("keyboard"));
         QCOMPARE(navigation->controllerFamily(), QString("xbox"));
-        prefs->uiControllerFullscreen = true;
+        prefs->uiControllerFullscreen = false;
         prefs->uiDisplayMode = StreamingPreferences::UI_WINDOWED;
         prefs->uiLastHostUuid.clear();
         QQmlApplicationEngine engine;
@@ -1422,11 +1678,21 @@ private slots:
         engine.load(QUrl("qrc:/gui/main.qml"));
         QVERIFY(!engine.rootObjects().isEmpty());
         auto* root = qobject_cast<QQuickWindow*>(engine.rootObjects().first()); QVERIFY(root);
-        root->requestActivate();
+        // Let the launcher activate itself at startup without a controller.
         QTRY_COMPARE(QGuiApplication::focusWindow(), root);
         QTRY_COMPARE(root->visibility(), QWindow::Windowed);
+        QVERIFY(root->property("compactDesktop").toBool());
+        QCOMPARE(root->property("uiScale").toReal(), 0.75);
         QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier, QPoint(5, 5));
         QCOMPARE(root->visibility(), QWindow::Windowed);
+#ifdef Q_OS_WIN
+        // Leave the launcher visible in the background. Its own timer must
+        // see the hotplug and activate it even with automatic fullscreen off.
+        window.requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), &window);
+        QVERIFY(!navigation->m_HasFocus);
+        QVERIFY(navigation->m_PollingTimer->isActive());
+#endif
         for (int i = 0; i < 2; ++i) {
             const int index = SDL_JoystickAttachVirtual(SDL_JOYSTICK_TYPE_GAMECONTROLLER,
                 SDL_CONTROLLER_AXIS_MAX, SDL_CONTROLLER_BUTTON_MAX, 0);
@@ -1434,9 +1700,27 @@ private slots:
             auto* joystick = SDL_JoystickOpen(index); QVERIFY(joystick);
             virtualControllers.append(joystick);
         }
+#ifdef Q_OS_WIN
+        QTRY_COMPARE(QGuiApplication::focusWindow(), root);
+        QCOMPARE(root->visibility(), QWindow::Windowed);
+#else
         QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired");
+#endif
         QTRY_COMPARE(navigation->connectedGamepads(), 2);
+#ifdef Q_OS_WIN
+        window.requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), &window);
+        button(SDL_CONTROLLERBUTTONDOWN, SDL_CONTROLLER_BUTTON_A);
+        button(SDL_CONTROLLERBUTTONUP, SDL_CONTROLLER_BUTTON_A);
+        QVERIFY(window.keys.isEmpty());
+        QCOMPARE(QGuiApplication::focusWindow(), &window);
+        root->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), root);
+#endif
+        prefs->uiControllerFullscreen = true;
+        emit prefs->uiControllerFullscreenChanged();
         QTRY_COMPARE(root->visibility(), QWindow::FullScreen);
+        QVERIFY(!root->property("compactDesktop").toBool());
         QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier, QPoint(5, 5));
         QTest::qWait(20);
         QCOMPARE(root->visibility(), QWindow::FullScreen);
@@ -1449,5 +1733,6 @@ private slots:
         SDL_Quit();
     }
 };
+
 QTEST_MAIN(ControllerNavigationTest)
 #include "tst_controllernavigation.moc"

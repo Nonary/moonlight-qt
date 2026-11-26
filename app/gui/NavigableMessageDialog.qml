@@ -19,13 +19,7 @@ NavigableDialog {
     property string rejectText: ""
     property int initialFocusButton: Dialog.NoButton
 
-    onOpened: {
-        // Button ordering varies by platform, so select an explicit button
-        // when the dialog has a preferred action.
-        var focusButton = initialFocusButton !== Dialog.NoButton ?
-                    dialogButtonBox.standardButton(initialFocusButton) : null
-        if (!focusButton && (standardButtons & Dialog.No)) focusButton = dialogButtonBox.standardButton(Dialog.No)
-        if (!focusButton && (standardButtons & Dialog.Cancel)) focusButton = dialogButtonBox.standardButton(Dialog.Cancel)
+    onAboutToShow: {
         if (acceptText.length) {
             var accept = dialogButtonBox.standardButton(Dialog.Yes) || dialogButtonBox.standardButton(Dialog.Ok)
             if (accept) accept.text = acceptText
@@ -34,6 +28,15 @@ NavigableDialog {
             var reject = dialogButtonBox.standardButton(Dialog.No) || dialogButtonBox.standardButton(Dialog.Cancel)
             if (reject) reject.text = rejectText
         }
+    }
+
+    onOpened: {
+        // Button ordering varies by platform, so select an explicit button
+        // when the dialog has a preferred action.
+        var focusButton = initialFocusButton !== Dialog.NoButton ?
+                    dialogButtonBox.standardButton(initialFocusButton) : null
+        if (!focusButton && (standardButtons & Dialog.No)) focusButton = dialogButtonBox.standardButton(Dialog.No)
+        if (!focusButton && (standardButtons & Dialog.Cancel)) focusButton = dialogButtonBox.standardButton(Dialog.Cancel)
         if (!focusButton && dialogButtonBox.count > 0) {
             focusButton = dialogButtonBox.itemAt(dialogButtonBox.count - 1)
         }

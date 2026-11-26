@@ -6,8 +6,7 @@
 #include <QSet>
 #include <QPair>
 #include <QPointer>
-
-class QWindow;
+#include <QWindow>
 
 #include "SDL_compat.h"
 
@@ -33,7 +32,9 @@ public:
 
     Q_INVOKABLE void disable();
 
-    Q_INVOKABLE void notifyWindowFocus(bool hasFocus);
+    Q_INVOKABLE void notifyWindowFocus(bool hasFocus, bool visible = false);
+
+    Q_INVOKABLE static void requestWindowActivation(QWindow* window);
 
     Q_INVOKABLE void setUiNavMode(bool settingsMode);
 
@@ -41,6 +42,7 @@ public:
 
 signals:
     void navigationStateChanged();
+    void controllerConnected();
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -70,6 +72,7 @@ private:
     bool m_UiNavMode;
     bool m_FirstPoll;
     bool m_HasFocus;
+    bool m_WindowVisible = false;
     Uint32 m_LastAxisNavigationEventTime;
     // Popups can change navigation mode during a button press. Its release
     // must still match the key and modifiers sent for that same press.

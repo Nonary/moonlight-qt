@@ -1,4 +1,5 @@
 QT += core quick network quickcontrols2 svg
+win32:greaterThan(QT_MAJOR_VERSION, 5): QT += gui-private
 CONFIG += c++17
 
 unix:!macx {

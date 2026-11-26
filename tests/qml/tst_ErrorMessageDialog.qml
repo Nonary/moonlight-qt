@@ -65,6 +65,9 @@ TestCase {
         text: "Are you sure?"
         imageSrc: ""
         standardButtons: Dialog.Yes | Dialog.No
+        acceptText: "Quit game"
+        rejectText: "Keep playing"
+        enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: 100 } }
         property int acceptedCount: 0
         property bool navigateOnAccept: false
         onAccepted: {
@@ -173,6 +176,14 @@ TestCase {
         keyClick(Qt.Key_Escape) // Controller B.
         tryCompare(errorDialog, "visible", false)
         compare(errorDialog.closedCount, 1)
+    }
+
+    function test_confirmation_labels_during_opening() {
+        confirmationDialog.open()
+        verify(confirmationDialog.visible)
+        verify(!confirmationDialog.opened)
+        compare(confirmationDialog.standardButton(Dialog.Yes).text, "Quit game")
+        compare(confirmationDialog.standardButton(Dialog.No).text, "Keep playing")
     }
 
     function test_back_rejects_top_dialog_before_navigation() {

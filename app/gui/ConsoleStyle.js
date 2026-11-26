@@ -16,9 +16,9 @@ var error = "#F0616D"
 var typeSizes = { display: 40, title: 28, heading: 22, body: 20, secondary: 18, caption: 16 }
 
 function scale(width, height) { return Math.max(0.75, Math.min(3, Math.min(width / 1280, height / 720))) }
-function windowScale(window) { return window ? scale(window.width, window.height) : 1 }
+function windowScale(window) { return window && window.compactDesktop ? 0.75 : window ? scale(window.width, window.height) : 1 }
 function px(value, window) { return Math.round(value * windowScale(window)) }
-function typePx(value, window) { return Math.round(value * Math.max(0.875, windowScale(window))) }
+function typePx(value, window) { return Math.round(value * (window && window.compactDesktop ? 0.8 : Math.max(0.875, windowScale(window)))) }
 function typeSize(role, window) { return typePx(typeSizes[role] || 20, window) }
 function placeholder(source) { return !source || source.toString().indexOf("no_app_image.png") >= 0 }
 

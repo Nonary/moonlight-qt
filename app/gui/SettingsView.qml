@@ -2309,6 +2309,14 @@ FocusScope {
                 anchors.fill: parent
                 spacing: 0
 
+                ConsoleButton {
+                    objectName: "uiFullscreenButton"
+                    visible: SystemProperties.hasDesktopEnvironment
+                    text: settingsShell.Window.window && settingsShell.Window.window.visibility === Window.FullScreen ? qsTr("Exit fullscreen") : qsTr("Enter fullscreen")
+                    textAlignment: Text.AlignLeft
+                    onClicked: settingsShell.Window.window.toggleUiFullscreen()
+                }
+
                 ConsoleCheckBox {
                     width: parent.width
                     text: qsTr("Reduce interface motion")
@@ -2484,9 +2492,7 @@ FocusScope {
                                 ToolTip.show(qsTr("You must restart Moonlight for this change to take effect"), 5000)
                             }
                             else {
-                                // Force the back operation to pop any AppView pages that exist.
-                                // The AppView stops working after retranslate() for some reason.
-                                window.clearOnBack = true
+                                window.libraryNeedsReload = true
 
                                 // Signal other controls to adjust their text
                                 languageChanged()
