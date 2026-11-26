@@ -528,6 +528,40 @@ void testMissesWithinAllowanceBuyNoDelay()
     }
 }
 
+void testCeilingDirectGrowthUsesPacingGoal()
+{
+    if (!t_CanLatch) return;
+    const auto name = scenarioName("ceiling-direct-growth-budget");
+    auto session = vrrProductionSession(2, 120, 120, false);
+    session.timingOptions = {1000, 9500, 60, 500};
+    Stream stream(session, 0);
+    constexpr uint32_t ticks = 750;
+    for (size_t i = 0; i < 1200; ++i) stream.step(ticks);
+
+    const auto first = stream.size();
+    size_t measuredMisses = 0;
+    size_t belowGoal = 0;
+    for (size_t i = 0; i < 3600; ++i) {
+        stream.step(ticks, {i % 14 == 0 ? 3000u : 0u});
+        const auto stats = stream.interval();
+        measuredMisses += stats.update.stretchedBeyondTolerance;
+        belowGoal += stats.qualityPercent() < 95.0;
+    }
+    const auto peak = maximum(stream.frames(), first, stream.size(), applied);
+    check(measuredMisses > 100 && !belowGoal && peak <= stream.toleranceUs(), name,
+          "delivery misses within the pacing budget do not buy a standing reserve",
+          "%zu measured misses, %zu below-goal frames, peak %" PRIu64 " us",
+          measuredMisses, belowGoal, peak);
+
+    const auto sustained = stream.size();
+    for (size_t i = 0; i < 7200; ++i)
+        stream.step(ticks, {i % 3 == 0 ? 3000u : 0u});
+    const auto recovered = maximum(stream.frames(), sustained, stream.size(), applied);
+    check(recovered >= 2000 && stream.interval().qualityPercent() >= 95.0, name,
+          "sustained delivery loss can still earn protection and restore the goal",
+          "peak %" PRIu64 " us, ending score %.3f%%", recovered, stream.interval().qualityPercent());
+}
+
 // 2b. Loss no permitted buffer can remove, and a late frame that cannot yet
 // establish a rate, must not buy latency either; and a release must wait out
 // its hold. Regression: the goal solver merged in c822745f. It weighted a lost
@@ -2237,6 +2271,7 @@ int main(int argc, char** argv)
     const Scenario scenarios[] = {
         {"start-release", testStartingDelayReleasesOnCleanInput},
         {"within-allowance", testMissesWithinAllowanceBuyNoDelay},
+        {"ceiling-direct-growth-budget", testCeilingDirectGrowthUsesPacingGoal},
         {"unabsorbable-loss", testUnabsorbableLossBuysNoDelay},
         {"interval-pressure", testIntervalPressureAndRelease},
         {"sparse-delivery", testSparseDeliveryPressure},

@@ -31,6 +31,7 @@ constexpr uint64_t Vrr18CeilingReleaseHistory = 16;
 constexpr uint64_t Vrr18ProgressiveCeilingRelease = 17;
 constexpr uint64_t Vrr18CeilingForecastBudget = 18;
 constexpr uint64_t Vrr18FrameHitchForecast = 19;
+constexpr uint64_t Vrr18CeilingDirectGrowthBudget = 20;
 
 namespace Vrr13 {
 // Score each adjacent interval against its intended spacing. Historical VRR18
@@ -267,6 +268,7 @@ public:
              canCoverInterval(s, previous, error - toleranceUs, maximum));
         const auto benefit = requireRecoverableInterval && !goalFeedback ?
             intervalBenefit(delayed, other, error, toleranceUs, maximum) : Benefit{};
+        const double loss = intervalLossFraction(error, intended, toleranceUs);
         const auto tick = s.submitted / ShortBucketUs;
         m_Window.advance(tick, ShortWindowBuckets);
         auto& bucket = m_Window.current();
@@ -274,6 +276,7 @@ public:
         bucket.total += error;
         bucket.marginalUs += benefit.nearbyUs;
         bucket.recoverableLossUs += actual * std::min(1.0, double(benefit.excessUs) / intended);
+        if (releaseRevision >= Vrr18CeilingDirectGrowthBudget) bucket.scoredLossUs += actual * loss;
         if (clientInterval) {
             ++bucket.clientSamples;
             bucket.clientErrorUs += error;
@@ -309,7 +312,6 @@ public:
         score.evaluated += actual;
         if (error > toleranceUs) score.failed += actual;
         const double excessUs = error > toleranceUs ? double(error - toleranceUs) : 0.0;
-        const double loss = intervalLossFraction(error, intended, toleranceUs);
         if (severityWeighted) score.weightedLoss += actual * loss;
         if (clientInterval) {
             score.clientEvaluatedUs += actual;
@@ -477,7 +479,14 @@ public:
             }
         }
         else m_ReleaseCosts = {};
-        const bool sustainedPressure = goalFeedback ? readinessTarget > m_Target && !budgetCoversReserve :
+        // While the rolling score meets its goal, isolated misses can spend
+        // the spare allowance. A deficit in the last second can still justify
+        // a bounded direct increase on a fresh, corroborated miss.
+        const bool budgetDirectGrowth = releaseRevision >= Vrr18CeilingDirectGrowthBudget &&
+            latchedCeiling && !belowTarget;
+        const bool canGrowDirectly = !budgetDirectGrowth || window.scoredLossUs > allowedRecoveryLossUs;
+        const bool sustainedPressure = goalFeedback ?
+            canGrowDirectly && readinessTarget > m_Target && !budgetCoversReserve :
             useDeliveryEvidence ? deliveryPressure : (severityWeighted ? bufferLoss > allowedLoss : pressure);
         const bool targetAllowsHold = !severityWeighted || belowTarget;
         const bool pressureHolds = (vrr18Feedback || targetAllowsHold) && sustainedPressure &&
@@ -514,13 +523,14 @@ public:
         update.holdRemainingUs = std::max(
             remaining(m_CleanEvidenceUs, hold),
             m_LastPressure ? remaining(s.submitted - m_LastPressure, hold) : 0);
-        update.cooldownRemainingUs = !goalFeedback && m_LastAttack ?
-            remaining(s.submitted - m_LastAttack, 250000) : 0;
+        constexpr uint64_t attackCooldownUs = 250000;
+        const bool limitAttackRate = !goalFeedback || budgetDirectGrowth;
+        update.cooldownRemainingUs = limitAttackRate && m_LastAttack ?
+            remaining(s.submitted - m_LastAttack, attackCooldownUs) : 0;
         update.action = pressureHolds || goalHold ? Action::CurrentPressure :
             (targetAllowsHold && historyHolds) ? Action::HistoryHold : Action::RecoveryHold;
         const bool grow = sustainedPressure && (goalFeedback || !severityWeighted || belowTarget);
-        if (grow && freshError && delayedAbsorbable && lateness &&
-                (goalFeedback || !m_LastAttack || s.submitted - m_LastAttack >= 250000)) {
+        if (grow && freshError && delayedAbsorbable && lateness && !update.cooldownRemainingUs) {
             const auto excess = useDeliveryEvidence ?
                 (window.marginalUs + window.samples - 1) / window.samples :
                 severityWeighted ?
@@ -529,16 +539,20 @@ public:
             const auto freshExcess = useDeliveryEvidence ? benefit.excessUs :
                 severityWeighted ? error - toleranceUs : error;
             const auto base = std::min(delayed.buffer, maximum);
+            const auto growthLimitUs = budgetDirectGrowth ?
+                boundedUs + std::min(toleranceUs, maximum - boundedUs) : maximum;
             const auto increase = goalFeedback ?
                 std::min(readinessTarget - std::min(readinessTarget, base), lateness) :
                 std::min({uint64_t(250), excess, lateness, severityWeighted ? freshExcess : uint64_t(250)});
-            update.attemptedIncreaseUs = increase;
-            update.clippedIncreaseUs = increase - std::min(increase, maximum - base);
+            const auto attempt = budgetDirectGrowth ?
+                std::min(increase, growthLimitUs - std::min(growthLimitUs, base)) : increase;
+            update.attemptedIncreaseUs = attempt;
+            update.clippedIncreaseUs = attempt - std::min(attempt, maximum - base);
             if (update.clippedIncreaseUs) {
                 m_Stats.lastClippedAtUs = s.submitted;
                 m_Stats.lastClippedUs = update.clippedIncreaseUs;
             }
-            m_Target = std::max(m_Target, base + std::min(increase, maximum - base));
+            m_Target = std::max(m_Target, std::min(growthLimitUs, base + std::min(attempt, maximum - base)));
             update.action = update.clippedIncreaseUs ? Action::Capped :
                 m_Target > boundedUs ? Action::Grow : Action::CurrentPressure;
             if (m_Target > boundedUs) {
@@ -1175,7 +1189,7 @@ private:
         uint64_t samples = 0, total = 0;
         uint64_t service = 0, decoderQueue = 0, intended = 0, sourceErrorUs = 0;
         uint64_t clientSamples = 0, clientErrorUs = 0, evaluatedUs = 0, marginalUs = 0;
-        double recoverableLossUs = 0;
+        double recoverableLossUs = 0, scoredLossUs = 0;
         void add(const Bucket& b) {
             samples += b.samples; total += b.total;
             service += b.service; decoderQueue += b.decoderQueue;
@@ -1183,6 +1197,7 @@ private:
             clientSamples += b.clientSamples; clientErrorUs += b.clientErrorUs;
             evaluatedUs += b.evaluatedUs; marginalUs += b.marginalUs;
             recoverableLossUs += b.recoverableLossUs;
+            scoredLossUs += b.scoredLossUs;
         }
     };
     struct ScoreBucket {

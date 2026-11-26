@@ -351,7 +351,7 @@ void VrrReplayConfigTest::productionPolicyValidation()
             session.timingOptions.targetHundredths = target;
             const auto current = vrrTimingParametersForSession(
                 vrrProductionSessionConfig(session), scheduled, scheduled);
-            QCOMPARE(current.playoutVrr18IntervalFeedback, Vrr18FrameHitchForecast);
+            QCOMPARE(current.playoutVrr18IntervalFeedback, Vrr18CeilingDirectGrowthBudget);
             QVERIFY2(validateVrrCurrentPolicy(current, error), qPrintable(error));
             for (uint64_t revision = Vrr18AveragedIntervalFeedback; revision < current.playoutVrr18IntervalFeedback; ++revision) {
                 auto historical = current;
@@ -367,7 +367,7 @@ void VrrReplayConfigTest::productionPolicyValidation()
                 QVERIFY(vrrCalibrationPolicy(current) != vrrCalibrationPolicy(restored));
             }
             auto future = current;
-            future.playoutVrr18IntervalFeedback = Vrr18FrameHitchForecast + 1;
+            future.playoutVrr18IntervalFeedback = Vrr18CeilingDirectGrowthBudget + 1;
             QVERIFY(!validateVrrTimingParameters(future, error));
             auto retired = current;
             retired.playoutPredictionOnly = 0;

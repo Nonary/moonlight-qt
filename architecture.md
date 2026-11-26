@@ -1,7 +1,7 @@
 # Streaming and VRR architecture
 
 Source baseline: `master` based on `v6.2.0-daily.202` with VRR18 interval
-feedback revision 19 and worker Reduce judder mode 9, built on the full-refresh buffer policy in `b88a77ff`.
+feedback revision 20 and worker Reduce judder mode 9, built on the full-refresh buffer policy in `b88a77ff`.
 Buffer growth uses delivery and decode readiness at both ends of an interval.
 The custom profile exposes the frame allowance, timing target, score history,
 and interval tolerance. The earlier platform changes include the decode-buffer accounting
@@ -914,6 +914,15 @@ the measured Pacing score. The direct readiness response also checks remaining
 buffer headroom and requires this interval evidence during source variation.
 At a steady source rate, corroborated delivery misses can still qualify
 through the existing readiness model. Exact replay retains revision 18.
+
+Revision 20 budgets direct readiness growth at the latch-capable display
+ceiling. While the rolling Pacing score meets the goal, a direct increase
+requires the last second of scored intervals to exceed the same loss
+allowance and a fresh, corroborated readiness miss. Each such increase is
+limited to one interval tolerance, with at least 250 ms between attempts.
+The loss-budgeted forecast continues evaluating sustained pressure. A
+rolling score deficit and source cadence below the ceiling retain the
+ordinary direct response. Exact replay can still restore revision 19.
 
 For an uncalibrated latch-capable session requesting the display's refresh
 rate, the initial reserve spends the selected goal's one-second loss allowance
