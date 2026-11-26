@@ -1,144 +1,83 @@
 # How VRR improves game streaming
 
-The main benefit of variable refresh rate (VRR) is that a display can adapt its refresh timing to the frames it receives. This helps maintain smooth motion when a game’s frame rate changes and can reduce presentation latency even when the game is running at a steady frame rate.
+Variable refresh rate (VRR) combined with adaptive frame pacing can **significantly reduce latency and improve motion smoothness at the same time**, even when the game itself already has perfect frame pacing.
 
-[Moonlight](https://moonlight-stream.org/) is an open-source game streaming client developed by the community. I forked Moonlight and adapted its frame pacing and presentation pipeline to make better use of VRR. The implementation combines an adaptive timing buffer with software-based adaptive V-Sync to preserve smooth motion while minimizing unnecessary buffering and synchronization delays.
+At 120 FPS, keeping an additional frame in reserve to absorb streaming jitter adds 8.33 milliseconds (ms) of latency. With VRR and adaptive frame pacing, the client can use a smaller timing buffer instead of waiting for an entire additional frame. If only 2 ms of buffering is needed, it can present frames **6.33 ms sooner, reducing buffering latency by 76%** while maintaining smooth motion.
 
-Even if the game produces every frame on time, some frames take a little longer to cross the network or finish decoding. One way to absorb that jitter is to keep an extra frame queued in advance. At 120 FPS, that adds 8.33 milliseconds of delay to every frame. The adaptive buffer in my fork adjusts the wait to the amount of jitter the stream actually has. If 2 milliseconds is enough, the client can show each frame 6.33 milliseconds sooner than with a full frame of additional buffering. That’s **76% less buffering delay** than keeping a full frame in reserve.
+[Moonlight](https://moonlight-stream.org/) is a community-developed, open-source game streaming client that already supported VRR. I forked Moonlight to optimize its frame pacing and presentation pipeline for VRR through adaptive buffering and software-based adaptive V-Sync.
 
-## Understanding fixed refresh and judder
+## Fixed refresh versus VRR
 
-Judder is the uneven motion you can see when some frames stay on screen longer than others. The game may take longer to render one frame, or a frame may take longer to cross the network or finish decoding. A fixed-refresh display can also introduce judder when the game is running steadily.
+A display draws each image progressively from top to bottom, a process called **scanout**. A fixed-refresh display starts a new scanout at regular intervals. At 120 Hz, this happens every 8.33 ms.
 
-A fixed-refresh display starts drawing a new image at regular intervals. With V-Sync enabled, if the next frame is still being prepared when a refresh starts, the display draws the previous frame again. That image stays on screen for two refresh intervals. During a smooth camera pan, the extra time on one image can look like a brief pause.
+**Judder** is the uneven motion caused by frames remaining on screen for different lengths of time. During a steady camera pan, a frame that remains visible longer than its neighbors can make the motion appear to hesitate.
 
-## How variable refresh rate helps
+With V-Sync enabled, if a new frame is not ready before the next fixed refresh, the display repeats the previous image. At 120 Hz, that image remains visible for 16.67 ms instead of 8.33 ms. This can happen because of inconsistent game frame pacing or streaming jitter.
 
-VRR also helps when a game settles at a frame rate below the display’s maximum. At a steady 100 frames per second (FPS), the game produces a new image every 10 milliseconds (ms). A fixed 120 Hz screen refreshes 120 times a second, so those frames don’t line up with every refresh. Some images stay on screen twice as long as others. A VRR screen can show each image for the same 10 ms, which makes a slow pan look smoother.
+Judder can occur even when the game produces frames at perfectly regular intervals. For example, a game running at 100 FPS produces a new frame every 10 ms, which does not align with the refresh intervals of a fixed 120 Hz display. Some frames remain visible for 8.33 ms and others for 16.67 ms, even though the game itself is perfectly consistent.
 
-### How VRR changes the relationship between rendering and scanout
+VRR allows the display to extend the gap between scanouts until the next frame is ready, within its supported refresh range. At a steady 100 FPS with evenly paced presentation, a compatible VRR display can show each image for 10 ms, eliminating this source of judder.
 
-A display draws an image progressively from top to bottom. This process is called **scanout**. With fixed refresh, a new scanout begins at predetermined intervals. Traditional blocking V-Sync can make an application wait for one of those intervals before presenting a completed frame, which can also delay the preparation of subsequent frames.
+### Reducing presentation latency
 
-VRR gives the application more flexibility over when the next refresh begins. Once the previous scanout has finished, the display can extend its blanking interval and wait for the next frame rather than immediately beginning another refresh on a fixed schedule.
+With traditional blocking V-Sync, waiting for a refresh can delay the application's next rendering operation. VRR, combined with an appropriately designed presentation pipeline, lets software prepare frames while the previous image is still being scanned out and submit them when the display is ready. This reduces unnecessary synchronization delays without requiring the GPU itself to render faster.
 
-With an appropriately designed rendering and presentation pipeline, the application can prepare the next frame while the display is still scanning out the previous one. It can then present the completed frame as soon as the display is ready to accept it safely. This can avoid unnecessary blocking and allow more of the rendering work to overlap with scanout.
+For example, if a frame becomes ready at 8.50 ms, just after a fixed 120 Hz display begins another refresh at 8.33 ms, it must wait until 16.67 ms to be shown. A VRR display that has extended its blanking interval can begin refreshing at 8.50 ms instead, saving approximately **8 ms of presentation latency** in this example.
 
-VRR does not make the GPU render faster or allow the display to exceed its maximum refresh rate. It gives software more control over presentation timing. **Frame pacing is what allows software to take advantage of that flexibility without introducing uneven motion or tearing.**
+See the [VESA Adaptive-Sync white paper, Figure 3 (PDF)](https://www.vesa.org/wp-content/uploads/2014/07/VESA-Adaptive-Sync-Whitepaper-140620.pdf#page=3).
 
-### Why VRR can reduce latency even near the maximum frame rate
+### Streaming near the maximum refresh rate
 
-Even if the game produces every frame on time and the network delivers them perfectly evenly, those frames can still be ready between refreshes. With V-Sync enabled, a fixed-refresh screen has to wait for its next refresh. A compatible VRR screen can start refreshing when the frame is ready, provided the previous scanout has finished and the display is still within its VRR timing window. That can make the controls feel more responsive even when motion already looks smooth.
+VRR cannot start a new refresh before the display is ready. As the frame rate approaches the display's maximum refresh rate, there is progressively less room to accommodate inconsistent frame delivery.
 
-For example, suppose the screen starts repeating the old image at 8.33 ms and the new one is ready at 8.50 ms. The fixed screen can show it at 16.67 ms. A VRR screen that’s still waiting can show it at 8.50 ms. Missing the refresh by a fraction of a millisecond means **VRR can show that frame about 8 ms sooner**. [VESA Adaptive-Sync white paper, Figure 3 (PDF)](https://www.vesa.org/wp-content/uploads/2014/07/VESA-Adaptive-Sync-Whitepaper-140620.pdf#page=3)
+| Frame rate on a 120 Hz display | Frame interval | Timing headroom above minimum refresh interval |
+| ---: | ---: | ---: |
+| 60 FPS | 16.67 ms | 8.33 ms |
+| 100 FPS | 10.00 ms | 1.67 ms |
+| 119.9 FPS | 8.34 ms | 7 µs |
+| 120 FPS | 8.33 ms | 0 ms |
 
-## Why streaming needs adaptive frame pacing
+In the original Moonlight client, the effect was especially noticeable when streaming near the display's maximum refresh rate. On some 120 Hz TVs, even a steady 90–100 FPS scene could cause the refresh counter to repeatedly jump to around 118 Hz as delayed frames were followed closely by subsequent frames.
 
-Moonlight already supported VRR before I forked it. When frames reached the display at the same steady pace the game produced them, a compatible display could follow that pace. The weakness showed up when one frame took longer to cross the network or finish decoding. One image could stay on screen too long, leaving too little time to show the next one on schedule.
+A refresh counter can reveal irregular presentation intervals, although determining whether V-Sync was used for an individual frame requires a client timing trace.
 
-### Local gaming versus game streaming
+## Why game streaming needs frame pacing
 
-When playing locally, a completed frame can be handed directly to the local presentation pipeline. Under favorable conditions, the variation introduced by that handoff can be measured in microseconds. This does not mean rendering or scanning out an entire frame takes only microseconds; those operations can still take several milliseconds.
+When playing locally, the handoff of a completed frame into the presentation pipeline can have microsecond-scale timing variation under favorable conditions. With game streaming, the host must capture and encode frames, and the client must receive, decode and prepare them. Variation across these stages can introduce several milliseconds of jitter.
 
-Game streaming introduces additional stages between the game and the display. The host must capture and encode each frame, transmit it over the network, and the client must reassemble and decode it before it can be presented. Variations in these stages can cause frames to become ready several milliseconds earlier or later than expected, even when the game itself produces frames at a perfectly steady rate.
+Even with a fixed target bitrate, individual encoded frames vary in size depending on how much the scene changes. A fast camera turn may produce a larger frame than a stationary image. Network congestion can also delay packets or cause packets belonging to a later frame to arrive before an earlier frame has been fully received.
 
-For example, a game running at 120 FPS produces a frame every 8.33 ms. A 2 ms variation in delivery is nearly a quarter of that frame interval. If the client simply presents every frame as soon as it becomes ready, VRR can reproduce that irregular timing on the display. The display has no way of knowing that the game originally produced those frames at equal intervals.
+VRR follows the timing of the frames presented to it. Without frame pacing, irregular delivery can become visible as irregular motion, even when the game itself is running smoothly.
 
-This is why frame pacing is particularly important for streaming. The client needs to reconstruct the game's intended frame timing and reserve enough time to absorb fluctuations in delivery. A small timing buffer gives early frames somewhere to wait and late frames an opportunity to arrive before their scheduled presentation.
+### Reconstructing the game's frame timing
 
-### Why the buffer needs to be adaptive
+The pacing implementation uses host frame timestamps to reconstruct the original frame intervals. In this example, a game produces frames 10 ms apart, but the second frame experiences an additional 2 ms of network delay.
 
-A traditional fixed frame queue can absorb jitter, but it adds the same amount of latency whether the connection needs it or not. My fork instead uses a dynamically adjusted timing buffer that aims to reserve only as much time as the stream needs.
+| Time between frames | Frame 1 to 2 | Frame 2 to 3 |
+| --- | ---: | ---: |
+| Original game timing | 10 ms | 10 ms |
+| Arrival timing | 12 ms | 8 ms |
+| Paced presentation | 10 ms | 10 ms |
 
-At 120 FPS, queuing one extra frame adds 8.33 ms to every frame you see. Saving just 4 ms cuts that buffering delay by **48%**. Suppose the network and decoder together need only 2 ms of leeway to keep frames ready on time. The adaptive buffer can use those 2 ms and show each frame 6.33 ms sooner than with a full additional frame queued. If frames start taking longer to arrive or decode, the buffer can grow again.
+A small timing buffer lets early frames wait until their scheduled presentation time and gives late frames an opportunity to arrive in time. With sufficient buffering, the client can reproduce the game's original motion.
+
+### Why adaptive buffering reduces latency
+
+A fixed frame queue absorbs jitter by keeping an additional frame in reserve. However, the delay remains even when the stream does not need that much buffering.
+
+My adaptive buffer adjusts the delay according to observed timing variation. At 120 FPS, if only 2 ms of buffering is needed, the difference is substantial:
 
 | Buffering approach | Additional latency |
 | --- | ---: |
 | One additional frame | 8.33 ms |
 | Adaptive timing buffer | 2.00 ms |
-| **Buffering delay saved in this example** | **6.33 ms (76%)** |
+| **Buffering delay saved** | **6.33 ms (76%)** |
 
-### Keeping the game’s original timing
+This percentage refers to buffering delay, rather than total end-to-end streaming latency.
 
-The adaptive pacing implementation uses host frame timestamps to reconstruct when the gaming PC produced each frame. Suppose the game produces three frames 10 ms apart. The second takes an extra 2 ms to cross the network and the third arrives on time.
+## How the VRR optimizations work
 
-| Time between frames | First to second | Second to third |
-| --- | ---: | ---: |
-| On the gaming PC | 10 ms | 10 ms |
-| When they arrive | 12 ms | 8 ms |
-| With adaptive frame pacing | 10 ms | 10 ms |
-
-With enough time in the buffer, the client can use those timestamps to show the frames at their original pace. You see the same steady pan you would have seen on the gaming PC.
-
-### What happens when a frame is late
-
-Sometimes a frame takes longer to arrive or decode than the buffer can cover. It misses its scheduled time on screen. That’s a hitch. During a camera pan, you might see the picture hesitate. Dropping the late frame would skip a step in the pan, and showing the next two frames too close together can make the motion look like it suddenly speeds up.
-
-I adapted Moonlight’s frame recovery behavior to show the late frame and, when it makes motion smoother, let it stay on screen a little longer before showing the next one. That’s similar to how V-Sync would space those frames. I prefer that small, temporary delay to a visible skip. If the stream falls far enough behind and a newer frame is ready, the client can still skip ahead to catch up. This recovery also works with **Reduce judder** turned off.
-
-## How my VRR optimizations for Moonlight work
-
-### Software-based adaptive V-Sync
-
-The presentation mechanism in my fork is effectively a form of **software-based adaptive V-Sync**. The concept is similar to [Special K’s Latent Sync](https://wiki.special-k.info/advanced/video), which uses software-controlled presentation timing to reduce the latency associated with conventional V-Sync. My implementation applies a similar timing principle to a different problem: presenting remotely rendered frames on a VRR display despite fluctuations in their delivery.
-
-On the supported Windows DXGI presentation path, the client schedules frames in software and attempts to present them without blocking on conventional V-Sync when the display timing permits. It uses V-Sync as a fallback when it cannot safely present a frame without synchronization.
-
-This allows the decoder and renderer to prepare frames ahead of their intended presentation times, while the pacing logic controls when they are submitted to the display. The adaptive buffer handles delivery jitter, and the presentation logic handles the physical timing constraints of the display. Together, they allow the client to take better advantage of VRR while minimizing unnecessary waiting.
-
-### Streaming near the display’s maximum refresh rate
-
-The effect of a late frame in the original Moonlight was especially noticeable when streaming at **90–100% of the display’s maximum refresh rate**. A 120 Hz TV needs at least 8.33 ms between refresh starts. At 60 FPS, frames are normally 16.67 ms apart, leaving 8.33 ms of leeway. At 119.9 FPS, that leeway shrinks to about **7 microseconds**. VRR can wait for a late frame, but once the TV starts drawing it, the following frame still has to wait its turn. With V-Sync enabled, a frame that misses its intended time this way waits for the next refresh the TV can start.
-
-You could see this in the TV’s on-screen refresh counter. During a scene running at **90–100 FPS**, the readout on some 120 Hz TVs would repeatedly swing from **90–100 Hz up to about 118 Hz** and back. The game could be running steadily the whole time. A delayed frame followed closely by an on-time frame can produce that swing as the TV briefly refreshes near its ceiling. Confirming that a particular frame used V-Sync requires a client timing trace.
-
-The adaptive pacing implementation in my fork uses host frame timestamps and a timing buffer to preserve the original spacing through small network or decoding delays. On the same scene, you can look for fewer jumps to 118 Hz and more even motion during a slow camera pan. Some players who already found the original client smooth described the difference as night and day. **You can still stream at the full 120 FPS** with VRR and the fork’s V-Sync setting enabled on a supported renderer.
-
-<details>
-<summary>Refresh intervals at common display rates</summary>
-
-| Display refresh rate | Normal refresh interval | Frame duration after one missed refresh |
-| ---: | ---: | ---: |
-| 60 Hz | 16.67 ms | 33.33 ms |
-| 90 Hz | 11.11 ms | 22.22 ms |
-| 120 Hz | 8.33 ms | 16.67 ms |
-| 144 Hz | 6.94 ms | 13.89 ms |
-| 240 Hz | 4.17 ms | 8.33 ms |
-
-</details>
-
-### Why frames arrive at inconsistent intervals
-
-Even when the stream has a fixed target bitrate, the amount of encoded data in each frame can vary. A still scene may take very little data to send. A fast camera turn can produce a larger frame that takes longer to reach the player.
-
-A busy network can delay parts of a frame or deliver them out of order. Packets belonging to a later frame can arrive before all the packets belonging to an earlier frame. The client has to reassemble frames and respect decoding dependencies before presenting them in the appropriate order. This is how a game running at a steady pace can still reach the player unevenly.
-
-### Adaptive buffering
-
-The adaptive pacing implementation uses host frame timestamps to schedule frames on the player’s device. It keeps that schedule aligned even if the clocks on the two devices gradually drift apart. If frames often miss their scheduled time by a little, the buffer can grow. As conditions improve, it can gradually shrink again.
-
-```mermaid
-flowchart TD
-    frame["Renderer presents a frame"] --> deadline{"Will this presentation miss<br/>the tolerance deadline?"}
-    deadline -->|No| ontime["Count the frame as within tolerance"]
-    deadline -->|Yes: hitch| recoverable{"Could the allowed buffer<br/>have covered the delay?"}
-    recoverable -->|Yes| score["Record how far the frame missed"]
-    recoverable -->|No| stall["Accept the hitch without<br/>adding buffer for it"]
-    ontime --> history{"Does recent timing meet<br/>the smoothness target?"}
-    score --> history
-    history -->|No| grow["Increase the buffer for future frames<br/>up to the configured limit"]
-    history -->|Yes| ease["Keep the current buffer or trim it<br/>gradually as conditions improve"]
-```
-
-*The tolerance deadline is the frame’s scheduled presentation time plus the allowed lateness. The controller counts a miss as a hitch even when it is too small for the player to notice. The buffer decision affects whether a similar delay will cause a hitch on a later frame.*
-
-A **lower smoothness target** lets the controller accept more timing misses and keep less delay in reserve. Some players prefer that responsiveness and barely notice an occasional late frame. A higher target gives more frames time to arrive on schedule.
-
-For example, with a 2 ms timing buffer, a frame that takes an additional 1 ms to travel across the network can still be presented on schedule, provided decoding and preparation also finish before the deadline.
-
-If a delay exceeds the current buffer, the renderer may still miss this frame’s target. Increasing the buffer helps only when the extra time can protect future frames.
-
-### Network jitter versus decoding jitter
+### Frame processing pipeline
 
 ```mermaid
 flowchart TD
@@ -149,17 +88,47 @@ flowchart TD
     E --> F[VRR display]
 ```
 
-As long as a frame completes decoding and preparation before its scheduled presentation deadline, variations earlier in the pipeline can be absorbed by the available timing buffer.
+Both network and decoding jitter can be absorbed as long as frame processing finishes before the scheduled presentation deadline. GPU delays can be more complicated because slow decoding may also delay subsequent frames or compete with rendering for GPU resources.
 
-Decoding jitter can also be absorbed, but GPU processing introduces additional complications. A slow decode may delay subsequent frames or compete with rendering and presentation for GPU resources.
+Where supported, the implementation tracks actual GPU decode readiness rather than assuming a frame is ready as soon as the decoder returns it. Preparing frames in advance allows GPU processing to overlap with the pacing delay.
 
-Where supported, the implementation tracks actual GPU decode readiness instead of assuming a frame is ready simply because the decoder has returned it. Frames are also prepared ahead of their presentation deadlines whenever possible, allowing GPU processing to overlap with the intentional pacing delay.
+### Adaptive buffer controller
 
-Once the frame is ready, the client still has to show it safely. On the Windows DXGI path, the fork’s presentation logic spaces unsynchronized submissions by at least one refresh interval plus a small safety margin. If the screen is still drawing the previous frame, or the client can’t confirm that the gap between refreshes is still open, it uses **V-Sync for that frame** and lets Windows handle the spacing. A long delay can trigger the same protection because the display may already be repeating the previous frame.
+The controller maintains a presentation schedule based on host timestamps while accounting for clock drift between the host and client. It evaluates recent presentation timing against a configurable smoothness target to determine how much buffering is necessary.
 
-## VRR timing settings in my Moonlight fork
+```mermaid
+flowchart TD
+    frame[Renderer presents a frame] --> deadline{Did presentation miss the tolerance deadline?}
+    deadline -->|No| ontime[Record an on-time presentation]
+    deadline -->|Yes| recoverable{Could the allowed buffer have covered the delay?}
+    recoverable -->|Yes| miss[Record the timing miss]
+    recoverable -->|No| stall[Accept the hitch without adding buffer for it]
+    ontime --> controller[Update adaptive buffer controller]
+    miss --> controller
+    controller --> target{Does recent timing meet the smoothness target?}
+    target -->|No| grow[Increase buffer within configured limit]
+    target -->|Yes| hold[Maintain or gradually reduce buffer]
+```
 
-**Low Latency** keeps less time in reserve for late frames. **Smooth** allows a longer wait to keep motion steady when frames arrive unevenly. **Balanced** falls between the two.
+The tolerance deadline is the scheduled presentation time plus the configured lateness tolerance. A miss counts against timing performance even if it is too small for the player to notice. Buffer adjustments affect future frames; they cannot recover time already lost to a late frame.
+
+### Software-based adaptive V-Sync
+
+The presentation mechanism is conceptually similar to [Special K's Latent Sync](https://wiki.special-k.info/advanced/video). It uses software-controlled timing to minimize reliance on conventional V-Sync while respecting the display's refresh constraints.
+
+The client schedules presentations in software and submits frames without waiting for conventional V-Sync whenever the display timing permits. When it cannot safely present a frame this way, it can fall back to **OS-scheduled V-Sync for that frame**. This fallback is used across platforms and lets the operating system handle synchronization when needed.
+
+This approach allows streaming at the full 120 FPS on a compatible 120 Hz display with VRR and the client's V-Sync setting enabled, while avoiding unnecessary synchronization waits whenever possible.
+
+### Recovering from late frames
+
+When a frame arrives too late for the current buffer to absorb, a visible hitch may occur. Immediately dropping the frame or presenting the following frame too quickly can make motion appear to skip or suddenly accelerate.
+
+In most cases, preserving a late frame and using OS-scheduled V-Sync when necessary produces smoother motion than immediately dropping it. The recovery logic can also adjust subsequent presentation timing to avoid showing frames too close together. If the stream falls far enough behind and a newer frame is available, the client can still skip ahead to catch up. This behavior also works with **Reduce judder** disabled.
+
+## VRR timing settings
+
+The presets control the trade-off between responsiveness and timing consistency.
 
 | Preset | Maximum buffer allowance | Timing target | History | Tolerance |
 | --- | ---: | ---: | ---: | ---: |
@@ -167,11 +136,17 @@ Once the frame is ready, the client still has to show it safely. On the Windows 
 | **Balanced** | 2 source frames | 99.5% | 120 seconds | 0.5 ms |
 | **Smooth** | 4 source frames | 99.99% | 300 seconds | 0.2 ms |
 
-The **maximum buffer allowance** is how long the buffer is allowed to wait. On a good connection, the actual wait can be much shorter.
+- **Maximum buffer allowance:** The upper limit on intentional buffering, rather than a fixed amount of delay.
+- **Timing target:** The desired timing performance. A lower target accepts more timing variation in exchange for potentially lower latency.
+- **History:** How far back the controller looks when adjusting the buffer.
+- **Tolerance:** How late a frame may be before it counts as a timing miss. Larger misses beyond the tolerance weigh more heavily against the timing target.
 
-The following table shows how much delay one source frame represents at each stream frame rate.
+These settings can also be customized.
 
-| Stream frame rate | Latency from one additional buffered frame |
+<details>
+<summary>Buffering delay by stream frame rate</summary>
+
+| Stream frame rate | Delay from one additional buffered frame |
 | ---: | ---: |
 | 30 FPS | 33.33 ms |
 | 60 FPS | 16.67 ms |
@@ -180,20 +155,14 @@ The following table shows how much delay one source frame represents at each str
 | 144 FPS | 6.94 ms |
 | 240 FPS | 4.17 ms |
 
-The **tolerance** sets how late a frame can be and still count as on time. Beyond that, larger misses count more heavily against the **timing target**. A higher target encourages the buffer to keep more time in reserve. **History** is how far back the adaptive controller looks when making that adjustment.
-
-Users can also customize these settings to achieve their preferred balance between smoothness and responsiveness.
+</details>
 
 ### Reduce judder
 
-**Reduce judder** adjusts when frames appear so the time between them is more even. During a steady camera pan, for example, the game might produce one frame after 9 ms and the next after 11 ms. Showing the middle frame 1 ms later would make both gaps 10 ms. The pan can look smoother, and only the middle frame needs to wait.
+This optional setting smooths irregularities in the game's original frame pacing, beyond the correction of delivery jitter.
 
-The trade-off is that a frame whose timing needs adjusting may appear a little later. If the game already produces evenly spaced frames, there’s no unevenness for this setting to correct. At the screen’s maximum refresh rate, the way the client schedules frames can also affect latency.
+For example, if the game produces consecutive frame intervals of 9 ms and 11 ms, delaying the middle frame by 1 ms produces two even 10 ms intervals. This can improve motion smoothness at the cost of slightly delaying frames whose timing needs correction. If the game's original frame pacing is already consistent, there is no unevenness for this setting to correct.
 
 ## Limitations
 
-VRR and adaptive frame pacing cannot eliminate every form of stuttering. Significant packet loss, sustained GPU overload, large host-side frame stalls and display limitations can still produce visible disruptions.
-
-Increasing the buffer indefinitely would also make the stream increasingly unresponsive. For this reason, I designed the controller to distinguish recoverable timing fluctuations from problems that additional buffering cannot meaningfully resolve.
-
-The ultimate goal of my Moonlight fork’s VRR optimizations is to make streaming feel as close as possible to playing directly on the host. By combining adaptive buffering with software-controlled presentation timing, the client can preserve smooth motion without introducing more latency than necessary.
+Adaptive frame pacing cannot eliminate every form of stuttering. Significant packet loss, sustained GPU overload, large host-side stalls and the physical limitations of the display can still cause visible disruptions. The controller avoids increasing the buffer to compensate for delays that cannot reasonably be absorbed within its configured limits.
