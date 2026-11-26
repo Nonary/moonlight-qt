@@ -3493,7 +3493,9 @@ void testLatchedHandoffCreditsOnlyEnforcedSpacing()
                               Vrr18PredictiveIntervalFeedback, Vrr18CostAwareIntervalFeedback,
                               Vrr18AnticipatoryIntervalFeedback, Vrr18TargetAwareRelease,
                               Vrr18ScoreQualifiedRelease, Vrr18ProfileReleaseBudget, Vrr18SelectedGoalRelease,
-                              Vrr18ZeroReserve, Vrr18FrameBudget, Vrr18CeilingBuffer}) {
+                              Vrr18ZeroReserve, Vrr18FrameBudget, Vrr18CeilingBuffer, Vrr18CeilingReleaseHistory,
+                              Vrr18ProgressiveCeilingRelease, Vrr18CeilingForecastBudget,
+                              Vrr18FrameHitchForecast}) {
         auto session = config(120, 120);
         session.smoothFrameTiming = false;
         auto policy = vrrTimingParametersForSession(session, true, false);

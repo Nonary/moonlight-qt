@@ -3652,7 +3652,7 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
            "captured calibration must restore prior history without inventing fresh successes");
     expect(fields.value(columns.indexOf("param_playout_prediction_only")) == "1" &&
                !columns.contains("param_playout_responsive_buffer") &&
-               fields.value(columns.indexOf("param_smoothing_mode")) == "2" &&
+               fields.value(columns.indexOf("param_smoothing_mode")).toULongLong() == VrrSmoothingWorkerSourcePhase &&
                fields.value(columns.indexOf("param_playout_smoothing_own_movement")) == "1" &&
                fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "0",
            "capture must identify production interval-quality adaptation for exact replay");
@@ -4070,7 +4070,7 @@ void testExperimentalInputPercentileActivationTrace()
             ++rows;
             expect(fields.size() == columns.size() &&
                        fields.value(columns.indexOf("param_playout_vrr18_interval_feedback")).toULongLong() ==
-                           Vrr18CeilingBuffer &&
+                           Vrr18FrameHitchForecast &&
                        fields.value(columns.indexOf("param_playout_input_percentile_enabled")) == "0" &&
                        fields.value(columns.indexOf("param_playout_on_time_target_per_million")).toULongLong() == expected &&
                        fields.value(columns.indexOf("param_playout_readiness_window_us")).toULongLong() == expectedWindow,

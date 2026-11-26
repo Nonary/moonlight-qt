@@ -1695,11 +1695,13 @@ struct CaptureRun {
 
 // ceilingPolicy 0 runs the live policy; otherwise it selects a ceiling policy.
 template<size_t N>
-CaptureRun runCapture(const CaptureArrival (&span)[N], uint64_t ceilingPolicy = 0)
+CaptureRun runCapture(const CaptureArrival (&span)[N], uint64_t ceilingPolicy = 0,
+                      std::optional<VrrSmoothingMode> smoothing = std::nullopt)
 {
     const auto session = vrrProductionSession(1, 120, 120, true);
     auto parameters = vrrTimingParametersForSession(session);
     if (ceilingPolicy) parameters.playoutCeilingPhaseReplacement = ceilingPolicy;
+    if (smoothing) parameters.smoothingMode = *smoothing;
     VrrTimingController controller(session, t_CanLatch, parameters);
     const auto ready = [&](size_t i) {
         return kOriginUs + (span[i].syncWait == 0 ? span[i].output : std::max(span[i].output, span[i].complete));
@@ -1787,9 +1789,18 @@ Disturbances ceilingDisturbances(const std::vector<Frame>& f)
 // shows 56).
 void testVersusFixedRefreshCaptures()
 {
-    const auto compare = [](const char* spanName, const CaptureRun& run, const CaptureRun& policy1) {
+    const auto compare = [](const char* spanName, const auto& span) {
+        const auto run = runCapture(span);
+        const auto policy1 = runCapture(span, 1);
         const std::string name = scenarioName("versus-fixed-refresh-captures") + "/" + spanName;
         const auto vrr = ceilingDisturbances(run.frames);
+        const auto intervalRun = runCapture(span, 0, VrrSmoothingWorkerInterval);
+        const auto intervalEvents = ceilingDisturbances(intervalRun.frames).events;
+        check(vrr.events <= intervalEvents && run.replacements <= intervalRun.replacements,
+            scenarioName("reduce-judder-at-ceiling") + "/" + spanName,
+            "Reduce judder preserves ceiling pacing on the same input and buffer policy",
+            "%zu events and %zu replacements; interval smoothing %zu and %zu",
+            vrr.events, run.replacements, intervalEvents, intervalRun.replacements);
         double fixedEvents = 0, fixedLatency = 0;
         constexpr int kPhases = 16;
         for (int phase = 0; phase < kPhases; ++phase) {
@@ -1811,8 +1822,8 @@ void testVersusFixedRefreshCaptures()
         check(double(vrr.meanLatencyUs) < fixedLatency, name, "less latency than fixed refresh on a recorded capture span",
             "mean latency %" PRIu64 " us; fixed refresh %.0f us", vrr.meanLatencyUs, fixedLatency);
     };
-    compare("0358-sustained-120", runCapture(kCapture0358), runCapture(kCapture0358, 1));
-    compare("0420-lossy", runCapture(kCapture0420), runCapture(kCapture0420, 1));
+    compare("0358-sustained-120", kCapture0358);
+    compare("0420-lossy", kCapture0420);
 }
 
 // 6. An abrupt rate drop that moves the source mapping later must not leave

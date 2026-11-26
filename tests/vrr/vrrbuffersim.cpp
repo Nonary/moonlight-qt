@@ -75,6 +75,8 @@ QJsonObject metricsJson(const RunMetrics& m)
         {"unavailable_us", number(m.unavailableUs)}, {"at_target_us", number(m.atTargetUs)},
         {"below_target_us", number(m.belowTargetUs)}, {"longest_below_target_us", number(m.longestBelowTargetUs)},
         {"mean_buffer_us", m.meanBufferUs}, {"p95_buffer_us", number(m.bufferP95Us)},
+        {"mean_extra_delay_us", m.meanExtraDelayUs}, {"extra_delay_cycles", number(m.extraDelayCycles)},
+        {"sustained_extra_delay_cycles", number(m.sustainedExtraDelayCycles)},
         {"p99_buffer_us", number(m.bufferP99Us)}, {"peak_buffer_us", number(m.peakBufferUs)},
         {"final_buffer_us", number(m.finalBufferUs)}, {"final_minimum_buffer_us", number(m.finalMinBufferUs)},
         {"steady_mean_buffer_us", m.steadyMeanBufferUs}, {"steady_buffer_range_us", number(m.steadyBufferRangeUs)},
@@ -114,6 +116,20 @@ QJsonObject oracleJson(const OracleResult& oracle)
     return {{"minimum_tested_us", oracle.found ? number(oracle.minimumUs) : QJsonValue()}, {"points", points}};
 }
 
+QJsonObject forecastJson(const ForecastComparison& comparison)
+{
+    const auto window = [](const ForecastWindow& w) {
+        return QJsonObject{{"frames", number(w.frames)}, {"scored_us", number(w.sampledUs)},
+                           {"at_goal_us", number(w.atGoalUs)}, {"minimum_score_pct", w.minimumScore},
+                           {"mean_buffer_us", w.meanBufferUs}, {"mean_ready_to_submit_us", w.meanReadyToSubmitUs},
+                           {"mean_ready_to_display_us", w.meanReadyToDisplayUs}, {"display_jerk_p99_us", number(w.displayJerkP99Us)}};
+    };
+    return {{"decision_frame", number(comparison.frame)}, {"score_at_decision_pct", comparison.scoreAtDecision},
+            {"trial_maximum_us", number(comparison.capUs)},
+            {"brief_adaptive", window(comparison.brief)}, {"brief_capped", window(comparison.cappedBrief)},
+            {"sustained_adaptive", window(comparison.sustained)}, {"sustained_capped", window(comparison.cappedSustained)}};
+}
+
 // Compare only matching virtual experiments. Every phase and option is included
 // in the input object, while the controller implementation is free to change.
 QJsonObject compareMetrics(const QJsonObject& before, const QJsonObject& after)
@@ -121,6 +137,9 @@ QJsonObject compareMetrics(const QJsonObject& before, const QJsonObject& after)
     QJsonObject changes;
     for (auto field = after.begin(); field != after.end(); ++field) {
         const auto previous = before.value(field.key());
+        if (previous.isUndefined() && (field.key() == "mean_extra_delay_us" ||
+                field.key() == "extra_delay_cycles" || field.key() == "sustained_extra_delay_cycles"))
+            continue; // Older reports did not record planned smoothing and recovery delay.
         require(!previous.isUndefined(), "Baseline is missing metric " + field.key());
         if (previous.isDouble() && field.value().isDouble())
             changes.insert(field.key(), field.value().toDouble() - previous.toDouble());
@@ -145,6 +164,11 @@ QJsonObject phaseJson(const Phase& p, bool includeAllKeys = false)
     for (auto field : phaseTimes) {
         if (includeAllKeys || !field.omitZero || p.*field.member)
             phase.insert(field.key, number(p.*field.member));
+    }
+    if (includeAllKeys || !p.sourceIntervalsUs.empty()) {
+        QJsonArray gaps;
+        for (const auto gap : p.sourceIntervalsUs) gaps.append(number(gap));
+        phase.insert("source_intervals_us", gaps);
     }
     return phase;
 }
@@ -210,6 +234,15 @@ Workload readWorkload(const QString& path)
             p.*field.member = uint64_t(integer(obj, field.key, qint64(p.*field.member), 0, dayUs));
         require(p.durationUs > 0, "Each phase needs a positive duration_us");
         require((p.alternatingFirstUs == 0) == (p.alternatingSecondUs == 0), "Set both alternating intervals");
+        if (obj.contains("source_intervals_us")) {
+            require(obj.value("source_intervals_us").isArray() && !p.alternatingFirstUs,
+                    "source_intervals_us needs an array and cannot be combined with alternating intervals");
+            for (const auto gap : obj.value("source_intervals_us").toArray()) {
+                const qint64 us = gap.toInteger(-1);
+                require(us > 0 && us <= dayUs, "Source intervals must be positive integer microseconds within one day");
+                p.sourceIntervalsUs.push_back(uint64_t(us));
+            }
+        }
         totalUs += p.durationUs;
         require(totalUs <= dayUs, "Maximum virtual workload duration is one day");
         s.phases.push_back(p);
@@ -315,14 +348,28 @@ std::vector<Experiment> selectExperiments(const QCommandLineParser& cli, const s
         if (cli.isSet("seed")) w.scenario.seed = uint32_t(cliInteger(cli, "seed", 0, UINT32_MAX));
         // Preserve the catalog assertions when a user spells out a default
         // or loads an exported, unmodified workload.
-        const auto input = inputs(w, options);
+        Options runOptions = options;
+        if (w.scenario.name == "rate-drop-hitches") runOptions.smooth = false;
+        const bool lowLatencyWorkload = w.scenario.name == "ceiling-forecast" ||
+            w.scenario.name == "variable-source-judder";
+        if (lowLatencyWorkload && !cli.isSet("preset")) runOptions.latencyMode = 2;
+        const auto input = inputs(w, runOptions);
         const bool catalogChecks = defaults || std::any_of(catalog.begin(), catalog.end(), [&](const Workload& entry) {
             if (entry.scenario.name != w.scenario.name) return false;
+            if (w.scenario.name == "rate-drop-hitches") {
+                Options recorded;
+                recorded.smooth = false;
+                return inputs(entry, recorded) == input;
+            }
+            if (lowLatencyWorkload)
+                return workloadJson(entry) == workloadJson(w) && runOptions.latencyMode == 2 &&
+                       (!runOptions.targetHundredths || runOptions.targetHundredths == 9900) &&
+                       runOptions.fixedBufferUs < 0 && runOptions.canLatch && runOptions.smooth;
             if (w.scenario.name == "surplus-drain" && options.fixedBufferUs < 0 && options.canLatch && options.smooth)
                 return workloadJson(entry) == input.value("workload").toObject();
             return inputs(entry, {}) == input;
         });
-        experiments.push_back({w, options, catalogChecks});
+        experiments.push_back({w, runOptions, catalogChecks});
         if (w.scenario.name == "surplus-drain" && catalogChecks && options.fixedBufferUs < 0 &&
             !cli.isSet("preset") && !cli.isSet("target") && !cli.isSet("export")) {
             // Balanced already covers 99.50%. Include the reported Low Latency
@@ -456,6 +503,11 @@ int run(const QCommandLineParser& cli)
         const auto m = measure(w, o, qualifyingReserveUs);
         const double ms = elapsedMs(start);
         auto failures = checkWorkload(w, o, m, experiment.catalogChecks);
+        std::optional<ForecastComparison> forecast;
+        if (experiment.catalogChecks && w.scenario.name == "ceiling-forecast") {
+            forecast = compareCeilingForecast(w.scenario, o);
+            failures.insert(failures.end(), forecast->failures.begin(), forecast->failures.end());
+        }
         if (drainReference) {
             const auto drainFailures = checkSurplusDrain(m, *drainReference);
             failures.insert(failures.end(), drainFailures.begin(), drainFailures.end());
@@ -493,6 +545,7 @@ int run(const QCommandLineParser& cli)
         }
         QJsonObject row{{"input", input}, {"metrics", metrics}, {"catalog_checks", experiment.catalogChecks}, {"failures", errors}};
         if (drainReference) row.insert("steady_drain_reference", oracleJson(*drainReference));
+        if (forecast) row.insert("forecast_comparison", forecastJson(*forecast));
         const auto atGoal = metrics.value("time_at_target_pct");
         const auto goalText = atGoal.isDouble() ? QString::number(atGoal.toDouble(), 'f', 2) : QStringLiteral("n/a");
         std::printf("%-22s %4d %11s %11.2f %12.0f %12llu %8llu %9.2f  %s\n", w.scenario.name.c_str(),

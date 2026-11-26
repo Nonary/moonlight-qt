@@ -79,7 +79,7 @@ void testProductionSelection()
         session = vrrProductionSessionConfig(session);
         const auto ordinary = vrrTimingParametersForSession(session, native, native);
         expect(ordinary.playoutIntervalToleranceUs == uint64_t(tolerance), "production uses the selected tolerance");
-        expect(ordinary.smoothingMode == (native ? 4u : 2u),
+        expect(ordinary.smoothingMode == (native ? VrrSmoothingNativeToleranceBounded : VrrSmoothingWorkerSourcePhase),
                "production selects the native or worker smoothing path");
         expect(ordinary.playoutSmoothingOwnMovement == (native ? 0u : 1u),
                "worker smoothing owns its movement and native scheduling keeps its gate");

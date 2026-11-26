@@ -263,6 +263,8 @@ enum VrrSmoothingMode : uint64_t {
     VrrSmoothingWorkerPhaseLocked = 2,
     VrrSmoothingNativeToleranceBounded = 4,
     VrrSmoothingAbsorb = 7,
+    VrrSmoothingWorkerInterval = 8,
+    VrrSmoothingWorkerSourcePhase = 9,
 };
 
 // Every value that changes VRR policy remains replaceable by replay without
@@ -389,7 +391,9 @@ struct VrrTimingDecision {
     bool rebased = false;
 };
 
+namespace VrrSim { struct BufferCapTrial; }
 class VrrTimingController {
+    friend struct VrrSim::BufferCapTrial;
 public:
     // A blocking wait measures producer work only when collection started
     // promptly after decoder output. A late poll includes our own queue time.
@@ -696,6 +700,7 @@ private:
     // moves the smoothed schedule later by the recent shortfall that exceeds
     // the tolerated lateness; it is zero unless its parameters enable it.
     bool smoothingReserveEnabled() const;
+    bool hasVariableSourceCadence() const;
     int64_t bufferedSmoothingUs(int64_t smoothingUs) const;
     void observeSmoothingReserve(bool engaged, int64_t shortfallUs,
                                  uint64_t nowUs);
@@ -915,6 +920,7 @@ private:
     int64_t m_SmoothedPeriodFeedbackRemainder = 0;
     // Whether this frame's slot came from the smoother rather than a reset.
     bool m_SmoothingEngaged = false;
+    bool m_VariableSourceSmoothing = false;
     // Retiming (excluding the reserve) given to the last scheduled frame; a
     // cadence reset eases from here when playoutSmoothingResetSlewUs is set.
     int64_t m_LastSmoothingRetimingUs = 0;

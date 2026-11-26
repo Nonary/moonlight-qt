@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <vector>
 
 namespace {
@@ -162,7 +163,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         config.latencyMode : 1;
     const auto options = config.timingOptions.resolved(latencyMode);
     const bool vrr18 = config.vrr18IntervalFeedback;
-    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18CeilingBuffer : 0;
+    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18FrameHitchForecast : 0;
     parameters.playoutIntervalToleranceUs = options.toleranceUs;
     // Presets change only the four user-visible values. Admission, release,
     // and late-frame recovery use the same policy for every combination.
@@ -347,10 +348,9 @@ VrrTimingParameters vrrTimingParametersForSession(
         parameters.playoutSmoothingResetSlewUs = 0;
     }
     else if (config.smoothFrameTiming) {
-        // Restore the worker-paced VRR18 phase-locked smoother. Its 6 ms lag,
-        // learned reserve and reset law already bound retiming. Applying the
-        // adaptive buffer's T/second movement budget as well reduced a 500 us
-        // tolerance to roughly 4 us per frame and passed source jitter through.
+        if (vrr18) {
+            parameters.smoothingMode = VrrSmoothingWorkerSourcePhase;
+        }
         parameters.playoutSmoothingOwnMovement = 1;
         parameters.playoutSmoothingReadinessBound = vrr18;
     }
@@ -576,6 +576,7 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_CeilingShedding = false;
     m_CeilingFramesSinceShed = SIZE_MAX / 2;
     m_SmoothingEngaged = false;
+    m_VariableSourceSmoothing = false;
     m_LastSmoothingRetimingUs = 0;
     m_HaveLastDecodeComplete = false;
     m_LastDecodeCompleteUs = 0;
@@ -808,6 +809,14 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         }
     }
 
+    const bool variableCadence = (m_Parameters.smoothingMode == VrrSmoothingWorkerInterval ||
+        m_Parameters.smoothingMode == VrrSmoothingWorkerSourcePhase) &&
+        hasVariableSourceCadence();
+    if (m_VariableSourceSmoothing && !variableCadence) {
+        resetCadenceSmoothing();
+        m_SmoothedPeriodUs = 0;
+    }
+    m_VariableSourceSmoothing = variableCadence;
     updateLatencyFixState();
 
     const bool timestampPlayout = timestampPlayoutEnabled() &&
@@ -819,6 +828,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     int64_t smoothingUs = 0;
     uint64_t smoothingReserveUs = 0;
     int64_t desiredRetimingUs = 0;
+    const int64_t previousRetimingUs = m_LastSmoothingRetimingUs;
     uint64_t smoothingReadyPushUs = 0;
     uint64_t delayBeforeUs = 0;
     const bool readinessBoundedSmoothing = timestampPlayout &&
@@ -882,7 +892,9 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                     saturatingAdd(delayBeforeUs, smoothingReserveUs)));
             }
             desiredRetimingUs = retimingUs;
-            if (readinessBoundedSmoothing && (m_Parameters.smoothingMode == VrrSmoothingWorkerPhaseLocked ||
+            if (readinessBoundedSmoothing && (m_Parameters.smoothingMode == VrrSmoothingWorkerSourcePhase ||
+                    m_Parameters.smoothingMode == VrrSmoothingWorkerInterval ||
+                    m_Parameters.smoothingMode == VrrSmoothingWorkerPhaseLocked ||
                     m_Parameters.smoothingMode == VrrSmoothingAbsorb)) {
                 // Decode readiness is already known. Spend only the time left
                 // before the raw slot, retaining its typical render allowance.
@@ -1108,12 +1120,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         cadence.eligible = false;
     }
     if (timestampPlayout && smoothingReserveEnabled()) {
-        // This frame has already arrived, so its own readiness against the
-        // raw slot is known. Charge the reserve only for lateness the smoother
-        // caused by moving the frame before that slot. Delivery that misses
-        // the raw slot is the playout buffer's evidence. Worker backlog is not
-        // measured here: it follows the previous (already reserved) target,
-        // shifts with the reserve, and would otherwise feed it back into itself.
+        // Readiness is measured independently of the previous reserved target.
+        // Including worker backlog here would feed our own wait back into the reserve.
         const int64_t rawLatenessUs = readyOffsetUs -
             static_cast<int64_t>(playoutDelayUs);
         // Learn from the requested retiming, before its readiness bound. The
@@ -1121,8 +1129,18 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         // asking the independent interval buffer to grow or hold for them.
         const int64_t retimingUs = readinessBoundedSmoothing ? desiredRetimingUs :
             smoothingUs - static_cast<int64_t>(smoothingReserveUs);
+        int64_t advanceUs = std::min<int64_t>(rawLatenessUs, 0) - retimingUs;
+        if (m_VariableSourceSmoothing) {
+            // A compressed interval can spend the available delivery slack.
+            // Buy protection only for meaningful compression. A raw-late
+            // endpoint has already consumed part of the pair's tolerance.
+            const int64_t compressionUs = previousRetimingUs - retimingUs;
+            const int64_t toleranceUs = int64_t(intervalQualityToleranceUs(m_Parameters));
+            const int64_t usedToleranceUs = std::clamp(rawLatenessUs, int64_t(0), toleranceUs / 2);
+            advanceUs = compressionUs > toleranceUs ? rawLatenessUs + compressionUs + usedToleranceUs : 0;
+        }
         observeSmoothingReserve(m_SmoothingEngaged && !reseedPhase,
-                                std::min<int64_t>(rawLatenessUs, 0) - retimingUs,
+                                advanceUs,
                                 nowUs);
     }
 
@@ -1744,6 +1762,29 @@ void VrrTimingController::resetCadenceSmoothing()
     m_LastSmoothedBasisUs = 0;
 }
 
+bool VrrTimingController::hasVariableSourceCadence() const
+{
+    const uint64_t toleranceUs = intervalQualityToleranceUs(m_Parameters);
+    if (m_SourcePeriodUs <= saturatingAdd(m_DisplayPeriodUs, toleranceUs) ||
+            m_CadenceSamples.size() < m_Parameters.minimumCadenceSamples) return false;
+
+    // Fixed host sampling grids and compensating short/long pairs can describe
+    // a regular game cadence. Test the RTP grid and two-frame averages before
+    // letting variable-source retiming replace the fitted clock.
+    const uint64_t toleranceTicks = toleranceUs * kRtpClockRate / kMicrosecondsPerSecond;
+    uint64_t quantumTicks = 0, shortestPair = UINT64_MAX, longestPair = 0;
+    for (size_t i = 1; i < m_CadenceSamples.size(); ++i) {
+        const auto& current = m_CadenceSamples[i];
+        quantumTicks = std::gcd(quantumTicks, current.rtpTicks - m_CadenceSamples[i - 1].rtpTicks);
+        if (i < 2 || current.frameOrdinal - m_CadenceSamples[i - 2].frameOrdinal != 2) continue;
+        const uint64_t pairTicks = current.rtpTicks - m_CadenceSamples[i - 2].rtpTicks;
+        shortestPair = std::min(shortestPair, pairTicks);
+        longestPair = std::max(longestPair, pairTicks);
+        if (quantumTicks && quantumTicks <= toleranceTicks && longestPair - shortestPair > 2 * toleranceTicks)
+            return true;
+    }
+    return false;
+}
 
 
 
@@ -1878,6 +1919,39 @@ int64_t VrrTimingController::cadenceSmoothingAdjustUs(
         return 0;
     }
     const uint64_t intervalUs = cadence.intervalUs;
+    if (m_VariableSourceSmoothing) {
+        const size_t oldest = m_SmoothingCadenceIndex;
+        const auto& gapsUs = m_SmoothingCadenceIntervals;
+        const int64_t olderPairUs = int64_t(gapsUs[oldest]) +
+            int64_t(gapsUs[(oldest + 1) % gapsUs.size()]);
+        const int64_t rawGain = int64_t(1000 - gainPerMille);
+        const int64_t pairDifferenceUs = olderPairUs - 2 * int64_t(intervalUs);
+        int64_t correctionUs = pairDifferenceUs * rawGain / 4000;
+        const uint64_t toleranceUs = intervalQualityToleranceUs(m_Parameters);
+        const auto minimumGapTicks = saturatingAdd(m_DisplayPeriodUs, toleranceUs) * kRtpClockRate /
+            kMicrosecondsPerSecond;
+        const bool sourceHasHeadroom = m_Parameters.smoothingMode == VrrSmoothingWorkerSourcePhase &&
+            std::adjacent_find(m_CadenceSamples.begin(), m_CadenceSamples.end(),
+                [minimumGapTicks](const CadenceSample& earlier, const CadenceSample& later) {
+                    return later.rtpTicks - earlier.rtpTicks <=
+                        minimumGapTicks * (later.frameOrdinal - earlier.frameOrdinal);
+                }) == m_CadenceSamples.end();
+        if (sourceHasHeadroom) {
+            // The older pair follows local FPS, but an unusually long gap in
+            // that pair can echo into a later target. Give equal weight to an
+            // independent estimate from the fitted period and the last two RTP
+            // gaps when the fitted source history leaves room above the display floor.
+            const int64_t periodUs = int64_t(m_SourcePeriodUs);
+            const int64_t previousGapUs = int64_t(gapsUs[(oldest + 2) % gapsUs.size()]);
+            const int64_t priorErrorUs = std::clamp(periodUs - previousGapUs, -int64_t(toleranceUs), int64_t(toleranceUs));
+            const int64_t phaseShiftUs = (2 * (periodUs - int64_t(intervalUs)) + priorErrorUs) / 3;
+            correctionUs = (pairDifferenceUs / 4 + phaseShiftUs) * rawGain / 2000;
+        }
+        m_SmoothingEngaged = true;
+        return std::clamp(correctionUs, -int64_t(saturatingAdd(playoutDelayUs, reserveUs)),
+            int64_t(m_Parameters.playoutSmoothingMaxLagUs -
+                    std::min(m_Parameters.playoutSmoothingMaxLagUs, reserveUs)));
+    }
     const uint64_t fittedPeriodUs = std::max<uint64_t>(1,
         localPeriodUs != 0 ? localPeriodUs : m_SourcePeriodUs);
     const bool localPeriodChanged = localPeriodUs != 0 &&
@@ -2576,7 +2650,15 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         // At the refresh ceiling a previous flip can conceal the cost of
         // removing reserve. Qualify both the current and released flip phase.
         const bool belowCeiling = m_SourcePeriodUs > saturatingAdd(m_DisplayPeriodUs, m_DisplayPeriodUs / 1000);
-        const bool latchedCeiling = !belowCeiling && m_CanLatchPresentation &&
+        // Endpoint jitter can move the fit across the ceiling on alternate
+        // frames. Keep pricing the constrained flip until the observed span
+        // has gained a whole display slot relative to a full-refresh stream.
+        const uint64_t fittedFrames = m_CadenceSamples.size() >= m_Parameters.minimumCadenceSamples &&
+            !m_CadenceSamples.empty() ? m_CadenceSamples.back().frameOrdinal - m_CadenceSamples.front().frameOrdinal : 0;
+        const bool withinCeilingAdjustment = m_Parameters.playoutVrr18IntervalFeedback >= Vrr18CeilingReleaseHistory &&
+            m_Config.streamRateHz == m_Config.displayRefreshHz && fittedFrames &&
+            m_SourcePeriodUs <= saturatingAdd(m_DisplayPeriodUs, std::min(toleranceUs, m_DisplayPeriodUs / fittedFrames));
+        const bool latchedCeiling = (!belowCeiling || withinCeilingAdjustment) && m_CanLatchPresentation &&
             m_Parameters.playoutVrr18IntervalFeedback >= Vrr18CeilingBuffer;
         const bool taperRelease = m_Parameters.playoutIntervalReleaseTauUs && belowCeiling;
         const uint64_t intervalHoldUs = taperRelease && m_Parameters.playoutIntervalTaperHoldUs ?
@@ -2608,7 +2690,7 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18AnticipatoryIntervalFeedback,
                 belowCeiling && m_Parameters.playoutVrr18IntervalFeedback >= Vrr18TargetAwareRelease,
                 m_Parameters.playoutVrr18IntervalFeedback, m_CanLatchPresentation && (belowCeiling || latchedCeiling),
-                latchedCeiling);
+                latchedCeiling, m_VariableSourceSmoothing);
             // A cancelled final present supplies no new measurement. Keep
             // the last submitted outcome until a new submission or rebase.
             if (submitted && !cancelled) {

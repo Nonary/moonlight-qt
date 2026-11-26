@@ -298,11 +298,13 @@ bool validateVrrCurrentPolicy(const VrrTimingParameters& value, QString& error)
     const bool scheduled = value.nativeScheduledPresentation != 0;
     const bool smoothing = value.playoutSmoothingGainPerMille != 0;
     const auto smoothingMode = value.smoothingMode;
-    const bool currentSmoothing = smoothingMode == VrrSmoothingAbsorb ? smoothing :
+    const bool currentSmoothing = (smoothingMode == VrrSmoothingWorkerInterval ||
+        smoothingMode == VrrSmoothingWorkerSourcePhase) ? smoothing && !scheduled :
+        smoothingMode == VrrSmoothingAbsorb ? smoothing :
         smoothingMode == (!smoothing ? VrrSmoothingOff : scheduled ?
             VrrSmoothingNativeToleranceBounded : VrrSmoothingWorkerPhaseLocked);
     const bool intervalFeedback = value.playoutVrr18IntervalFeedback >= Vrr18AveragedIntervalFeedback &&
-        value.playoutVrr18IntervalFeedback <= Vrr18CeilingBuffer;
+        value.playoutVrr18IntervalFeedback <= Vrr18FrameHitchForecast;
     if (intervalFeedback && !value.playoutInputPercentileEnabled &&
             value.boundedCatchupEnabled && value.playoutPredictionOnly &&
             value.latchedFloorDisabled == (scheduled ? 1U : 3U) && currentSmoothing) {
@@ -397,8 +399,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
         return fail("latched_floor_disabled revision must be 0..3");
     if (value.preparationPredictionLead > 1)
         return fail("preparation prediction lead must be 0 or 1");
-    if (value.playoutVrr18IntervalFeedback > Vrr18CeilingBuffer)
-        return fail("playout_vrr18_interval_feedback revision must be 0..15");
+    if (value.playoutVrr18IntervalFeedback > Vrr18FrameHitchForecast)
+        return fail("playout_vrr18_interval_feedback revision must be 0..19");
     if (value.playoutDelayStartSeedValid > 1)
         return fail("playout_delay_start_seed_valid must be 0 or 1");
     if (value.playoutIntervalReleaseTauUs > 60000000 ||
@@ -598,6 +600,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
         return fail("playout_late_recovery must be 0 or 1 and requires nonzero catchup");
     }
     if (value.smoothingMode != VrrSmoothingOff &&
+        value.smoothingMode != VrrSmoothingWorkerInterval &&
+        value.smoothingMode != VrrSmoothingWorkerSourcePhase &&
         value.smoothingMode != VrrSmoothingWorkerPhaseLocked &&
         value.smoothingMode != VrrSmoothingNativeToleranceBounded &&
         value.smoothingMode != VrrSmoothingAbsorb) {

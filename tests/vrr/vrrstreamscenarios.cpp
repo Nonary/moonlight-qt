@@ -5,6 +5,7 @@
 #include "vrrreplaymetrics.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -47,6 +48,21 @@ uint64_t difference(uint64_t a, uint64_t b)
     return a > b ? a - b : b - a;
 }
 
+struct DelayCycle {
+    bool sawLow = false, sawHigh = false;
+
+    bool observe(uint64_t us) {
+        if (us <= 500) {
+            const bool complete = sawHigh;
+            sawLow = true;
+            sawHigh = false;
+            return complete;
+        }
+        if (sawLow && us >= 2000) sawHigh = true;
+        return false;
+    }
+};
+
 class Accumulator {
 public:
     Accumulator(const Workload& workload, const Options& options,
@@ -84,6 +100,20 @@ public:
             else m_Result.maxReconnectStartBufferUs = std::max(m_Result.maxReconnectStartBufferUs, frame.bufferUs);
             m_PreviousDirection = 0;
             m_HaveShownInterval = false;
+        }
+        if (!sameSession || frame.frame != m_Previous.frame + 1) {
+            m_ExtraCycle = {};
+            m_SustainedExtraCycle = {};
+            m_ExtraCount = m_ExtraIndex = 0;
+        }
+        m_Result.extraDelayCycles += m_ExtraCycle.observe(frame.extraDelayUs);
+        m_ExtraWindow[m_ExtraIndex] = frame.extraDelayUs;
+        m_ExtraIndex = (m_ExtraIndex + 1) % m_ExtraWindow.size();
+        m_ExtraCount = std::min(m_ExtraCount + 1, m_ExtraWindow.size());
+        if (m_ExtraCount == m_ExtraWindow.size()) {
+            uint64_t totalUs = 0;
+            for (const auto delayUs : m_ExtraWindow) totalUs += delayUs;
+            m_Result.sustainedExtraDelayCycles += m_SustainedExtraCycle.observe(totalUs / m_ExtraCount);
         }
 
         // The score visible between two feedback events is the score at the
@@ -139,6 +169,7 @@ public:
         if (sameSession && ordered) {
             m_Result.bufferObservedUs += dt;
             m_BufferIntegral += double(m_Previous.bufferUs) * double(dt);
+            m_ExtraIntegral += double(m_Previous.extraDelayUs) * double(dt);
             if (endUs > steadyStart) {
                 const uint64_t spanUs = endUs - steadyStart;
                 m_SteadyDurationUs += spanUs;
@@ -228,6 +259,7 @@ public:
         m_Result.peakBufferUs = m_Buffer.maximum;
         if (m_Result.bufferObservedUs) {
             m_Result.meanBufferUs = m_BufferIntegral / m_Result.bufferObservedUs;
+            m_Result.meanExtraDelayUs = m_ExtraIntegral / m_Result.bufferObservedUs;
             m_Result.bufferGrowthUsPerMinute = MinuteUs * m_NetGrowthUs / m_Result.bufferObservedUs;
             m_Result.bufferReversalsPerMinute = MinuteUs * m_Result.bufferReversals / m_Result.bufferObservedUs;
         }
@@ -256,10 +288,13 @@ private:
     RunMetrics m_Result{};
     Observation m_Previous{};
     bool m_HavePrevious = false, m_HaveShownInterval = false;
+    DelayCycle m_ExtraCycle, m_SustainedExtraCycle;
+    std::array<uint64_t, 4> m_ExtraWindow{};
+    size_t m_ExtraCount = 0, m_ExtraIndex = 0;
     int m_PreviousDirection = 0;
     uint64_t m_RecoveryStartUs, m_ToleranceUs = 0, m_BelowRunUs = 0, m_RecoveryRunUs = 0;
     uint64_t m_ShownIntervalUs = 0, m_JerkOver2Ms = 0;
-    double m_NetGrowthUs = 0, m_BufferIntegral = 0;
+    double m_NetGrowthUs = 0, m_BufferIntegral = 0, m_ExtraIntegral = 0;
     uint64_t m_SteadyDurationUs = 0, m_SteadyMin = UINT64_MAX, m_SteadyMax = 0;
     double m_SteadyIntegral = 0;
     uint64_t m_ReadyToDisplayTotalUs = 0, m_ReadyToDisplaySamples = 0;
@@ -335,6 +370,73 @@ std::vector<Workload> streamWorkloads()
     auto ceiling = workload("display-ceiling", {phase(30, 144)});
     ceiling.scenario.streamHz = ceiling.scenario.displayHz = 144;
 
+    auto startup = phase(12);
+    startup.jitterUs = 4000;
+    startup.networkSpikeUs = 1800;
+    startup.disturbancePeriodUs = 11 * 8333;
+    auto settled = phase(78);
+    settled.jitterUs = 3200;
+    auto cluster = settled;
+    cluster.durationUs = 3 * Second;
+    cluster.networkSpikeUs = 2500;
+    cluster.disturbancePeriodUs = 9 * 8333;
+    auto quieter = settled;
+    quieter.durationUs = 14750000;
+    auto persistent = cluster;
+    persistent.durationUs = 40 * Second;
+    auto forecast = workload("ceiling-forecast", {startup, settled, cluster, quieter, persistent});
+    forecast.scenario.displayHz = 120;
+    forecast.scenario.dxgiWaitable = true;
+
+    // Consecutive host RTP gaps from the reported variable-rate stream.
+    // Replay only the source cadence; delivery and display run independently.
+    auto varying = phase(18, 68);
+    varying.jitterUs = 1000;
+    varying.sourceIntervalsUs = {
+        13800, 14933, 15322, 14189, 15045, 21200, 13666, 19580, 15972, 18693,
+        16700, 13089, 16989, 13178, 16944, 14700, 16067, 14222, 15956, 15578,
+        14744, 14322, 16023, 14777, 15834, 15055, 16578, 14822, 16434, 15077,
+        16523, 16466, 15434, 16022, 16844, 14000, 16567, 14389, 17322, 14300,
+        15256, 14377, 16111, 13634, 16078, 13722, 16066, 14912, 14355, 14922,
+        15334, 14255, 15422, 14312, 15800, 12866, 15445, 14333, 16100, 12278,
+        16100, 13111, 15067, 13511, 15911, 13200, 14066, 13378, 14278, 14400,
+        15078, 15189, 14089, 14311, 14911, 12878, 14955, 14856, 12644, 14111,
+    };
+    auto judder = workload("variable-source-judder", {varying});
+    judder.scenario.displayHz = 120;
+
+    // Consecutive RTP gaps into frames 5360-5439 of the 70 FPS gameplay capture.
+    // Transport jitter uses the simulator's clock independently of the source.
+    auto game = phase(18, 70);
+    game.jitterUs = 1800;
+    game.sourceIntervalsUs = {
+        14556, 13033, 15767, 13522, 11533, 15611, 13444, 14600, 15278, 14378,
+        13900, 13389, 14689, 14878, 12911, 12044, 14233, 13411, 11800, 13422,
+        12400, 13422, 15589, 14233, 13489, 12611, 13122, 12778, 14411, 13867,
+        13922, 13311, 14644, 11944, 15522, 11267, 14978, 17100, 11233, 19389,
+        18322, 14978, 13656, 14989, 16444, 12356, 13256, 16400, 12678, 12756,
+        14000, 13089, 14489, 11744, 13367, 12767, 17389, 13822, 24000, 11722,
+        13178, 14811, 13967, 10733, 16211, 13144, 12056, 13044, 14756, 14667,
+        12933, 12889, 14667, 11989, 16911, 11244, 13856, 14900, 12633, 12944,
+    };
+    auto unevenGame = workload("uneven-game-cadence", {game});
+    unevenGame.scenario.displayHz = 120;
+
+    // Frame 14208 onward in the 120 -> 60 FPS capture. The source moves
+    // independently of the injected transport jitter in the five-second burst.
+    auto uneven = phase(5, 60);
+    uneven.sourceIntervalsUs = {
+        17134, 17166, 17178, 17045, 17122, 16500, 17367, 17333, 17355, 17612,
+        17388, 16945, 17155, 22356, 12567, 17155, 16911, 17878, 17067, 17433,
+        17000, 17645, 16977, 17856, 17033, 17156, 17466, 16912, 17133, 18333,
+        16367, 17100, 16822, 18133, 20256, 12844, 20578, 13345, 20566, 12811,
+    };
+    uneven.jitterUs = 2500;
+    uneven.networkSpikeUs = 3000;
+    uneven.disturbancePeriodUs = 200000;
+    auto rateDrop = workload("rate-drop-hitches", {phase(40), phase(30, 60), uneven, phase(30, 60)});
+    rateDrop.scenario.displayHz = 120;
+
     // Exercise ten mixed virtual minutes on every fast run.
     auto mixedSpike = phase(30);
     mixedSpike.networkSpikeUs = 8000;
@@ -360,6 +462,10 @@ std::vector<Workload> streamWorkloads()
         workload("long-stable", {phase(1800)}, 0, true),
         workload("reconnect", {phase(110), reconnect, reconnect}),
         ceiling,
+        forecast,
+        judder,
+        unevenGame,
+        rateDrop,
         workload("mixed", {phase(30), mixedFreeze, mixedSpike, phase(30, 60),
             phase(30), alternating, phase(60), mixedJitter, phase(300)}, 300)
     };
@@ -477,6 +583,74 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
     }
     if (!checkDefaults) return failures;
     const auto& name = workload.scenario.name;
+    if (name == "rate-drop-hitches") {
+        require(m.bufferP95Us <= 2000 && m.timeAtTargetPercent() >= 99 && m.coveragePercent() >= 98,
+                "the 120 to 60 FPS transition and irregular source intervals bought excess reserve or lost pacing coverage");
+
+        // Give the same settled stream 2 ms of available reserve. Vary only
+        // the size of the late delivery. A short successor is not another hitch.
+        struct Outcomes {
+            uint64_t peak = 0, hitches = 0, previousSubmitUs = 0, previousFrame = 0;
+        };
+        const auto trial = [&](uint64_t spikeUs) {
+            auto scenario = workload.scenario;
+            scenario.phases.resize(3);
+            auto& late = scenario.phases.back();
+            late = phase(18, 60);
+            late.networkSpikeUs = spikeUs;
+            late.disturbancePeriodUs = 125000;
+            const BufferCapTrial cap{1, 2000};
+            Outcomes outcome;
+            const auto observe = [](void* context, const Observation& f) {
+                auto& o = *static_cast<Outcomes*>(context);
+                if (f.sourceUs >= 70 * Second) {
+                    o.peak = std::max(o.peak, std::max(f.requestedBufferUs, f.bufferUs));
+                    if (f.eligibleInterval && f.frame == o.previousFrame + 1 &&
+                        f.submittedUs > o.previousSubmitUs + f.intendedIntervalUs + 500)
+                        ++o.hitches;
+                }
+                o.previousFrame = f.frame;
+                o.previousSubmitUs = f.submittedUs;
+            };
+            auto strict = options;
+            strict.targetHundredths = 9999;
+            simulate(scenario, strict, observe, &outcome, &cap);
+            return outcome;
+        };
+        const auto six = trial(6000), ten = trial(10000), fixable = trial(1800);
+        require(six.hitches > 100 && six.hitches == ten.hitches && !six.peak && !ten.peak,
+                "two over-cap delivery sizes must count the same late frames and buy zero reserve");
+        if (!fixable.peak || fixable.peak > 2000 || fixable.hitches >= six.hitches) {
+            std::ostringstream msg;
+            msg << "recoverable delivery reached " << fixable.peak << " us, with " << fixable.hitches
+                << " late frames compared with " << six.hitches << " beyond the allowance";
+            failures.push_back(msg.str());
+        }
+        return failures;
+    }
+    if (name == "uneven-game-cadence") {
+        require(m.displayJerkOver2MsPercent <= 9.5 && m.displayJerkP99Us <= 6200 && !drops,
+                "irregular host gaps caused excessive changes in presented intervals");
+        require(m.sustainedExtraDelayCycles == 0 && m.meanBufferUs <= 3100 &&
+                m.meanReadyToDisplayUs <= 3100 && m.timeAtTargetPercent() >= 99,
+                "smoothing oscillated or exceeded its buffer, latency or pacing bounds");
+    }
+    if (name == "variable-source-judder") {
+        const auto patternSize = workload.scenario.phases.front().sourceIntervalsUs.size();
+        if (options.latencyMode == 2 && options.smooth && options.canLatch &&
+                options.fixedBufferUs < 0 && (!options.targetHundredths || options.targetHundredths == 9900) && patternSize) {
+            const auto repetitions = (m.counts.produced + patternSize - 1) / patternSize;
+            require(m.sustainedExtraDelayCycles == 0 && m.extraDelayCycles <= repetitions,
+                    "smoothing repeatedly built and drained delay across the variable source intervals");
+            require(m.displayJerkOver2MsPercent <= 5.5 && !drops &&
+                    m.coveragePercent() >= 99 && m.timeAtTargetPercent() >= 99,
+                    "variable cadence exceeded 5.5% presented interval changes over 2 ms or lost scoring coverage");
+            require(m.meanBufferUs <= 1250 && m.meanBufferUs + m.meanExtraDelayUs <= 2500 &&
+                    m.meanReadyToDisplayUs <= 2200,
+                    "smoothing hid the oscillation by retaining input buffer, extra delay or display wait");
+        }
+        return failures;
+    }
     if (name == "mixed") {
         require(m.coveragePercent() >= 90 && m.recovered && m.finalScoreAvailable &&
                 m.finalScorePercent >= m.targetPercent && m.steadyMeanBufferUs <= m.finalMinBufferUs + 250 &&
@@ -769,8 +943,174 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
                     run.coveragePercent() >= 99 && run.timeAtTargetPercent() >= 99 && run.finalScorePercent >= 99,
                     "120 FPS at 120 Hz must lower display wait while sustaining the 99% goal without skips or oscillation");
         }
+        // A full-rate source can alternate intervals while its fitted frame
+        // allowance moves by only a few microseconds. After a delivery burst,
+        // eight slower source intervals give the flip queue room to catch up.
+        auto spikes = phase(25);
+        spikes.networkSpikeUs = 5000;
+        spikes.disturbancePeriodUs = 11 * 8333;
+        auto recovered = phase(16);
+        recovered.alternatingFirstUs = 8333 - 650;
+        recovered.alternatingSecondUs = 8334 + 650;
+        recovered.jitterUs = 750;
+        auto dip = phase(1, 100);
+        dip.durationUs = 80000;
+        auto relocked = recovered;
+        relocked.durationUs = 30 * Second;
+        matched.scenario.phases = {spikes, recovered, dip, relocked};
+        const auto drained = measure(matched, low);
+        require(drained.peakBufferUs >= 3500 && drained.steadyMeanBufferUs <= 250 &&
+                drained.steadyMeanReadyToDisplayUs < 1500 && drained.steadyTimeAtTargetPercent() >= 99 &&
+                drained.steadyCoveragePercent() >= 99 && drained.displayJerkP99Us <= 250 &&
+                drained.bufferReversalsPerMinute <= 10 && !dropped(drained.counts),
+                "full-refresh recovery must reclaim multi-millisecond reserve and flip latency when delivery improves");
+
+        auto early = matched;
+        recovered.durationUs = 5 * Second;
+        early.recoveryStartUs = spikes.durationUs;
+        early.scenario.phases = {spikes, recovered};
+        const auto releasing = measure(early, low);
+        require(releasing.bufferAtRecoveryStartUs >= 3500 && releasing.finalBufferUs <= 1000 &&
+                releasing.finalScorePercent >= 99 && releasing.bufferReversals <= 3 && !dropped(releasing.counts),
+                "a settled high reserve must drain within five seconds of improved full-refresh delivery");
+        matched.scenario.phases = {spikes, recovered, dip, relocked};
+        const auto earlyRelock = measure(matched, low);
+        require(earlyRelock.steadyMeanReadyToDisplayUs < 1500 && earlyRelock.steadyTimeAtTargetPercent() >= 99 &&
+                earlyRelock.displayJerkP99Us <= 250 && !dropped(earlyRelock.counts),
+                "early release must let a brief source-rate dip repay standing display latency");
+        auto reconnect = recovered;
+        reconnect.durationUs = Second;
+        reconnect.reconnect = true;
+        early.scenario.phases.push_back(reconnect);
+        const auto provisional = measure(early, low);
+        require(provisional.sessionsObserved == 2 && provisional.maxReconnectStartBufferUs == provisional.firstBufferUs,
+                "a provisional ceiling release must earn full confirmation before it seeds a reconnect");
+
+        auto alternating = matched;
+        auto burst = spikes;
+        burst.durationUs = recovered.durationUs = 8 * Second;
+        alternating.scenario.phases.clear();
+        for (int cycle = 0; cycle < 10; ++cycle) {
+            alternating.scenario.phases.push_back(burst);
+            alternating.scenario.phases.push_back(recovered);
+        }
+        const auto recurring = measure(alternating, low);
+        require(recurring.bufferReversalsPerMinute <= 8 && recurring.totalBufferMovementUs <= 55000 &&
+                recurring.finalScorePercent >= 99 && recurring.displayJerkP99Us <= 250 && !dropped(recurring.counts),
+                "repeating eight-second bursts must not cause excess reserve oscillation or dropped frames");
+
+        recovered.durationUs = 60 * Second;
+        recovered.jitterUs = 4000;
+        matched.scenario.phases = {recovered};
+        const auto sustained = measure(matched, low);
+        const auto reference = fixedBufferOracle(matched, low, {2500, 2750, 3000}, 99, OracleWindow::FinalQuarter);
+        require(reference.found && sustained.steadyMeanBufferUs <= reference.minimumUs + DrainStepUs &&
+                sustained.steadyTimeAtTargetPercent() >= 99 && sustained.steadyCoveragePercent() >= 99 &&
+                sustained.bufferReversalsPerMinute <= 10 && !dropped(sustained.counts),
+                "sustained full-refresh jitter must stay within one trial step of a fixed reserve that meets goal");
     }
     return failures;
+}
+
+namespace {
+ForecastWindow forecastWindow(const std::vector<Observation>& frames, uint64_t startUs, uint64_t endUs,
+                              double goal)
+{
+    ForecastWindow window;
+    VrrReplayMetrics::Distribution jerk;
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const auto& f = frames[i];
+        if (f.sourceUs < startUs || f.sourceUs >= endUs) continue;
+        // Both branches use the same source identities and source-time window.
+        // Submission occupancy and flip spacing are allowed to diverge.
+        const auto nextUs = i + 1 < frames.size() ? frames[i + 1].sourceUs : endUs;
+        const auto span = std::min(endUs, nextUs) - f.sourceUs;
+        if (f.scoreAvailable && f.eligibleInterval) {
+            window.sampledUs += span;
+            if (f.scorePercent >= goal) window.atGoalUs += span;
+            window.minimumScore = std::min(window.minimumScore, f.scorePercent);
+        }
+        ++window.frames;
+        window.meanBufferUs += f.bufferUs;
+        window.meanReadyToSubmitUs += f.submittedUs - f.readyUs;
+        window.meanReadyToDisplayUs += f.shownUs - f.readyUs;
+        if (i >= 2 && frames[i - 2].sourceUs >= startUs)
+            jerk.add(difference(f.shownUs - frames[i - 1].shownUs, frames[i - 1].shownUs - frames[i - 2].shownUs));
+    }
+    if (window.frames) {
+        window.meanBufferUs /= window.frames;
+        window.meanReadyToSubmitUs /= window.frames;
+        window.meanReadyToDisplayUs /= window.frames;
+    }
+    window.displayJerkP99Us = jerk.percentile(99);
+    return window;
+}
+}
+
+ForecastComparison compareCeilingForecast(const Scenario& scenario, const Options& options)
+{
+    ForecastComparison result;
+    const auto policy = VrrTimingOptions{}.resolved(options.latencyMode);
+    const double goal = (options.targetHundredths ? options.targetHundredths : policy.targetHundredths) / 100.0;
+    const auto& phases = scenario.phases;
+    const auto burstStart = phases.at(0).durationUs + phases.at(1).durationUs;
+    const auto burstEnd = burstStart + phases.at(2).durationUs;
+    const auto sustainedStart = burstEnd + phases.at(3).durationUs;
+    const auto end = sustainedStart + phases.at(4).durationUs;
+    std::vector<Observation> adaptive, capped;
+    const auto collect = [](void* out, const Observation& f) { static_cast<std::vector<Observation>*>(out)->push_back(f); };
+    const auto counts = simulate(scenario, options, collect, &adaptive);
+    const auto first = std::find_if(adaptive.begin(), adaptive.end(), [&](const auto& f) { return f.sourceUs >= burstStart; });
+    if (first == adaptive.end() || !first->scoreAvailable || first->scorePercent < goal || first->bufferUs > result.capUs) {
+        result.failures.emplace_back("short burst must begin at goal with a reserve within the trial cap");
+        return result;
+    }
+    const auto purchase = std::find_if(first, adaptive.end(), [&](const auto& f) {
+        return f.sourceUs < burstEnd && f.scoreAvailable && f.scorePercent >= goal &&
+               f.bufferUs <= result.capUs && f.requestedBufferUs > result.capUs;
+    });
+    // A future controller can avoid the purchase entirely. It must still meet
+    // goal in the burst and respond when the same pressure becomes sustained.
+    const auto& decision = purchase == adaptive.end() ? *first : *purchase;
+    result.frame = decision.frame;
+    result.scoreAtDecision = decision.scorePercent;
+    const BufferCapTrial trial{decision.frame, result.capUs};
+    const auto alternate = simulate(scenario, options, collect, &capped, &trial);
+    if (dropped(counts) || dropped(alternate) || adaptive.size() != capped.size()) {
+        result.failures.emplace_back("both branches must present every source frame");
+        return result;
+    }
+    for (size_t i = 0; i < adaptive.size(); ++i) {
+        const auto& a = adaptive[i];
+        const auto& b = capped[i];
+        if (a.frame != b.frame || a.sourceUs != b.sourceUs || a.readyUs != b.readyUs ||
+            (a.frame <= trial.frame && (a.submittedUs != b.submittedUs || a.shownUs != b.shownUs || a.bufferUs != b.bufferUs)) ||
+            (a.frame < trial.frame && (a.requestedBufferUs != b.requestedBufferUs || a.scorePercent != b.scorePercent)) ||
+            (a.frame > trial.frame && b.bufferUs > trial.maximumUs)) {
+            result.failures.emplace_back("producer, pre-purchase history, or adaptive trial limit diverged");
+            return result;
+        }
+    }
+    result.brief = forecastWindow(adaptive, decision.sourceUs, sustainedStart, goal);
+    result.cappedBrief = forecastWindow(capped, decision.sourceUs, sustainedStart, goal);
+    result.sustained = forecastWindow(adaptive, sustainedStart, end, goal);
+    result.cappedSustained = forecastWindow(capped, sustainedStart, end, goal);
+    const auto& live = result.brief;
+    const auto& lower = result.cappedBrief;
+    if (live.sampledUs != sustainedStart - decision.sourceUs || lower.sampledUs != live.sampledUs ||
+        result.sustained.sampledUs != end - sustainedStart || result.cappedSustained.sampledUs != result.sustained.sampledUs)
+        result.failures.emplace_back("the brief and sustained comparisons require complete pacing-score coverage");
+    if (live.atGoalUs != live.sampledUs || result.sustained.atGoalUs != result.sustained.sampledUs ||
+        result.cappedSustained.atGoalUs == result.cappedSustained.sampledUs)
+        result.failures.emplace_back("adaptive pacing must meet goal and the smaller reserve must expose sustained pressure");
+
+    const double excess = live.meanBufferUs - lower.meanBufferUs;
+    if (lower.atGoalUs == lower.sampledUs && excess > policy.toleranceUs &&
+        lower.displayJerkP99Us <= live.displayJerkP99Us + policy.toleranceUs &&
+        lower.meanReadyToDisplayUs <= live.meanReadyToDisplayUs + policy.toleranceUs) {
+        result.failures.emplace_back("above-goal purchase spent excess reserve while the smaller branch met goal");
+    }
+    return result;
 }
 
 std::vector<std::string> checkGapRecoveryReference()
@@ -805,6 +1145,26 @@ std::vector<std::string> checkGapRecoveryReference()
 std::vector<std::string> checkMetricAccounting()
 {
     std::vector<std::string> failures;
+    {
+        Accumulator cycles(workload("extra-delay-counter", {phase(1)}), {});
+        Observation frame{};
+        const auto presentExtra = [&](uint64_t extraUs) {
+            ++frame.frame;
+            frame.sourceUs = frame.submittedUs = frame.shownUs = frame.frame * 10000;
+            frame.extraDelayUs = extraUs;
+            cycles.present(frame);
+        };
+        for (const uint64_t level : {500, 2000, 500, 2000}) {
+            for (int i = 0; i < 4; ++i) presentExtra(level);
+        }
+        ++frame.frame; // The return to low delay belongs to a new sequence.
+        for (int i = 0; i < 4; ++i) presentExtra(500);
+        presentExtra(2000);
+        presentExtra(500);
+        const auto result = cycles.finish({});
+        if (result.extraDelayCycles != 2 || result.sustainedExtraDelayCycles != 1)
+            failures.emplace_back("extra-delay counters lost a completed cycle or bridged a frame gap");
+    }
     // Irregular observation periods distinguish elapsed-time accounting from
     // counting frames. One dropped pair breaks the qualified score run.
     auto fixture = workload("metric-fixture", {phase(3)});

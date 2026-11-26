@@ -12,6 +12,13 @@
 #include <utility>
 
 namespace VrrSim {
+
+void BufferCapTrial::apply(VrrTimingController& controller) const
+{
+    controller.m_Parameters.playoutDelayMaximumUs = maximumUs;
+    controller.m_Parameters.playoutDelayMaximumPeriodPerMille = 0;
+}
+
 namespace {
 
 using Time = uint64_t;
@@ -73,9 +80,9 @@ struct Replacement {
 class Simulation {
 public:
     Simulation(const Scenario& scenario, const Options& options, PresentObserver observer, void* context,
-               std::vector<Replacement>* replacements = nullptr) :
+               std::vector<Replacement>* replacements = nullptr, const BufferCapTrial* trial = nullptr) :
         scenario(scenario), options(options), observer(observer), context(context),
-        replacements(replacements),
+        replacements(replacements), capTrial(trial),
         waitableDxgi(scenario.dxgiWaitable && options.canLatch), rng(scenario.seed),
         config(vrrProductionSession(options.latencyMode, scenario.streamHz, scenario.displayHz, options.smooth))
     {
@@ -140,6 +147,7 @@ private:
     PresentObserver observer;
     void* context;
     std::vector<Replacement>* replacements;
+    const BufferCapTrial* capTrial;
     const bool waitableDxgi;
     uint32_t rng;
     VrrSessionConfig config;
@@ -162,10 +170,16 @@ private:
     size_t phaseIndex = 0;
     const Phase* phase = nullptr;
     Time periodRemainder = 0, rtpRemainder = 0, framesInPhase = 0;
+    size_t sourceIntervalIndex = 0;
     uint32_t rtp = 0xFFF00000u;
     bool spikePending = false;
 
     Time nextPeriod() {
+        if (!phase->sourceIntervalsUs.empty()) {
+            const auto intervalUs = phase->sourceIntervalsUs[sourceIntervalIndex];
+            sourceIntervalIndex = (sourceIntervalIndex + 1) % phase->sourceIntervalsUs.size();
+            return intervalUs;
+        }
         if (phase->alternatingFirstUs)
             return framesInPhase % 2 ? phase->alternatingFirstUs : phase->alternatingSecondUs;
         const Time numerator = 1000000 + periodRemainder;
@@ -182,12 +196,14 @@ private:
         const bool wasRunning = phase != nullptr;
         const bool cadenceChanged = wasRunning &&
             (phase->hostHz != incoming.hostHz || phase->alternatingFirstUs != incoming.alternatingFirstUs ||
-             phase->alternatingSecondUs != incoming.alternatingSecondUs);
+             phase->alternatingSecondUs != incoming.alternatingSecondUs ||
+             phase->sourceIntervalsUs != incoming.sourceIntervalsUs);
         phase = &incoming;
         phaseEnd = now + phase->durationUs;
         disturbance = now;
         spikePending = false;
         framesInPhase = 0;
+        sourceIntervalIndex = 0;
         if (phase->reconnect && wasRunning) reconnect();
         if (!lastSource) nextHost = now;
         else if (cadenceChanged) {
@@ -449,6 +465,8 @@ private:
             !decision.latchedPresentation && lastShown && now < lastShown + controller->displayPeriodUs();
         if (nativeLatch) controller->noteNativeFlipProtection(0);
         const bool latched = decision.latchedPresentation || nativeLatch;
+        if (capTrial && uint64_t(active.number) == capTrial->frame)
+            capTrial->apply(*controller);
         controller->noteSubmission(true, false, now, now);
         Vrr13::PresentationObservation feedback;
         feedback.smoothness = controller->smoothnessSample(decision);
@@ -480,6 +498,8 @@ private:
         ob.shownUs = shown - Origin;
         ob.preparationStartedUs = preparationStarted - Origin;
         ob.bufferUs = decision.playoutDelayUs;
+        ob.extraDelayUs = decision.plannedExtraDelayUs();
+        ob.requestedBufferUs = stats.update.requestedUs;
         ob.minimumBufferUs = stats.update.minimumUs;
         ob.intendedIntervalUs = stats.update.intendedIntervalUs;
         ob.intervalErrorUs = stats.update.intervalErrorUs;
@@ -581,10 +601,11 @@ bool preservesJerk(Time before, Time gap, Time after, Time period)
 
 } // namespace
 
-Counts simulate(const Scenario& scenario, const Options& options, PresentObserver observer, void* context)
+Counts simulate(const Scenario& scenario, const Options& options, PresentObserver observer, void* context,
+                const BufferCapTrial* trial)
 {
     validate(scenario, options);
-    return Simulation(scenario, options, observer, context).run();
+    return Simulation(scenario, options, observer, context, nullptr, trial).run();
 }
 
 GapRecoveryReference measureGapRecoveryReference(const Scenario& scenario, const Options& options)

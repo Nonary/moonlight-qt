@@ -30,6 +30,8 @@ struct RunMetrics {
     uint64_t firstBufferUs = 0, maxReconnectStartBufferUs = 0;
     uint64_t totalBufferMovementUs = 0, bufferReversals = 0;
     double meanBufferUs = 0, bufferGrowthUsPerMinute = 0, bufferReversalsPerMinute = 0;
+    uint64_t extraDelayCycles = 0, sustainedExtraDelayCycles = 0;
+    double meanExtraDelayUs = 0;
     // Elapsed-time mean and full reserve range over the final quarter.
     double steadyMeanBufferUs = 0;
     uint64_t steadyBufferRangeUs = 0;
@@ -68,6 +70,19 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
                                        const RunMetrics& metrics, bool checkDefaults = true);
 std::vector<std::string> checkMetricAccounting();
 std::vector<std::string> checkGapRecoveryReference();
+
+struct ForecastWindow {
+    uint64_t sampledUs = 0, atGoalUs = 0, frames = 0;
+    double minimumScore = 100, meanBufferUs = 0, meanReadyToSubmitUs = 0, meanReadyToDisplayUs = 0;
+    uint64_t displayJerkP99Us = 0;
+};
+struct ForecastComparison {
+    uint64_t frame = 0, capUs = 2750;
+    double scoreAtDecision = 0;
+    ForecastWindow brief, cappedBrief, sustained, cappedSustained;
+    std::vector<std::string> failures;
+};
+ForecastComparison compareCeilingForecast(const Scenario& scenario, const Options& options);
 
 struct OraclePoint {
     uint64_t bufferUs = 0, dropped = 0;

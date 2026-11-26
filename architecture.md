@@ -1,7 +1,7 @@
 # Streaming and VRR architecture
 
 Source baseline: `master` based on `v6.2.0-daily.202` with VRR18 interval
-feedback revision 15, built on the zero-reserve policy in `815ce5af`.
+feedback revision 19 and worker Reduce judder mode 9, built on the full-refresh buffer policy in `b88a77ff`.
 Buffer growth uses delivery and decode readiness at both ends of an interval.
 The custom profile exposes the frame allowance, timing target, score history,
 and interval tolerance. The earlier platform changes include the decode-buffer accounting
@@ -20,7 +20,7 @@ capabilities; existing keys are not reused. Schema-6 capture and schema-2
 replay configs support this current policy. Old compressed captures can still
 be decoded, but older controller revisions require a fresh capture for replay.
 The three former experimental environment switches are ignored with a warning.
-Live smoothing is off, worker phase-locked, or native tolerance-bounded.
+Live smoothing is off, worker cadence-dependent, or native tolerance-bounded.
 Exact replay can restore the retired Absorb mode and the earlier averaged
 VRR18 control score from recorded parameters. Metronome state is absent
 from the current capture and replay parameter contract. The follow-up
@@ -633,8 +633,22 @@ rate. The normalized producer mapping uses prompt GPU completion observations;
 a delayed collection can include queue residence and is not treated as GPU
 service. Real readiness still constrains the submitted frame.
 
-Worker-paced Reduce judder uses bounded phase-locked smoothing and limits
-advances to the time left after decode readiness. Native future-target
+Worker-paced Reduce judder (mode 9) uses the fitted clock for
+display-limited, regular and coarsely quantized source cadence. With display
+headroom, variation in two-frame RTP averages beyond the selected tolerance
+on a finer timestamp grid selects a local correction. When the fitted source intervals
+clear the display minimum by the selected tolerance, it blends two estimates
+from four consecutive RTP gaps. The older pair provides the local rate. The
+fitted period provides an independent estimate from the two most recent gaps,
+with the preceding gap contributing at most one tolerance of phase error.
+Mode 8 retains the older-pair correction for exact replay. These decisions never
+integrate prior corrected deadlines. The worker learns smoothing reserve
+from meaningful interval shortening and independent decode readiness,
+and limits advances to the time available after decode. Its input-buffer
+release trials price both endpoints of the actual intended interval and
+retain evidence across small changes in the fitted FPS when their tested
+buffer levels still agree. Mode 2 retains the recorded phase-locked policy
+for exact replay. Native future-target
 Reduce judder uses the tolerance-bounded source-gap path.
 Existing installations keep their saved Reduce judder choice when the retired
 Absorb Microstutter setting is removed. Session-policy replay uses the same
@@ -857,6 +871,49 @@ spike. Crossing the ceiling boundary starts fresh release evidence. The
 applied reserve still moves by at most one tolerance per eligible frame.
 Physical refresh spacing can retain some delay until source cadence gives
 the display room or the worker can replace a frame with a ready successor.
+
+Revision 16 keeps the accumulated interval costs at full refresh when the
+fitted source period nudges the frame allowance and the trial reserves still
+align. The applied reserve always obeys the latest allowance. Coarse trials
+use multiples of 250 µs so small capacity changes usually preserve their
+spacing. A change of minimum, trial spacing, or ceiling model starts fresh
+evidence. A matched-rate session continues pricing constrained flips while
+headroom fits one tolerance and the fitted RTP span has gained less than a
+display interval. Each eligible pair uses its own intended interval, including
+alternating source intervals. Missing readiness, discontinuities and service
+overload still invalidate the corresponding release evidence.
+
+Revision 17 starts draining a stable full-refresh reserve during the next
+observation window. Two earlier windows must have approved the same high
+reserve, and the latest completed window must support a reduction larger than
+one frame's tolerance. Each lower trial must have incurred zero additional
+projected loss in the current window. Its accrued score budget must also cover
+the observed loss and both interval edges of a late frame returning at that
+reserve. Every step is priced from the original high reserve. The per-frame
+movement limit still applies. A provisional release can affect live pacing,
+while a reconnect seed requires approval in both completed windows.
+
+Revision 18 prices forecast growth at a latch-capable display ceiling against
+the user's unspent rolling pacing-score budget. Each cost block can spend the
+share of that budget represented by its duration over the two release windows
+needed to confirm a lower reserve. Brief delivery spikes can use that surplus.
+As sustained errors consume it, more reserve qualifies on fresh evidence,
+including before the rolling score falls below goal. A corroborated forecast
+that needs only the first 250 µs trial step can buy it at the ordinary loss
+allowance. The applied reserve retains its per-frame tolerance limit.
+
+Revision 19 forecasts growth only from intervals that the permitted reserve
+could bring within tolerance. It projects the additional wait at both
+handoffs at the maximum reserve and repeats the comparison using independent
+readiness. When a long host interval and its compensating short interval
+explain the whole error, an already fast handoff supplies no forecast pressure.
+The returning short handoff inherits the earlier late frame's eligibility.
+If the incoming stretch was hidden, the observer can price the compressed
+handoff against the same earlier frame. Unavoidable misses contribute to
+the measured Pacing score. The direct readiness response also checks remaining
+buffer headroom and requires this interval evidence during source variation.
+At a steady source rate, corroborated delivery misses can still qualify
+through the existing readiness model. Exact replay retains revision 18.
 
 For an uncalibrated latch-capable session requesting the display's refresh
 rate, the initial reserve spends the selected goal's one-second loss allowance
@@ -1865,7 +1922,11 @@ workloads. Its optional gap recovery reference uses the measured next flip to
 find a spare display slot for a replaced frame at matched stream and display
 rates. It preserves the baseline timeline and requires available preparation
 time and presentation capacity. This is an offline comparison for the jitter
-cases. See the [scenario guide](tests/vrr/README.md#virtual-buffer-simulator)
+cases. The `ceiling-forecast` workload compares an above-goal reserve purchase
+with a smaller adaptive maximum from the same submission and prior history.
+It measures the brief and sustained disturbance separately, including reserve,
+time at goal, handoff latency, and modeled display latency and jerk.
+See the [scenario guide](tests/vrr/README.md#virtual-buffer-simulator)
 for editing a workload, running the fast gate and comparing a controller change.
 The extended buffer contracts and exact replay retain recorded regression and
 worker lifecycle coverage.

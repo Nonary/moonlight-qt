@@ -127,9 +127,18 @@ void VrrReplayConfigTest::windowedSmoothingPolicyRoundTrip()
     QCOMPARE(restored.playoutSmoothingOwnMovement, uint64_t(0));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_smoothing_own_movement", 2}}, restored, error));
     QVERIFY(!applyVrrReplayControllerSnapshot(
-        {{"smoothing_mode", 8}}, parameters, error));
+        {{"smoothing_mode", 10}}, parameters, error));
     QCOMPARE(parameters.smoothingMode, uint64_t(2));
     VrrSessionConfig absorbing;
+    const auto worker = vrrTimingParametersForSession(vrrProductionSessionConfig(VrrSessionConfig{}));
+    QCOMPARE(worker.smoothingMode, uint64_t(VrrSmoothingWorkerSourcePhase));
+    VrrTimingParameters restoredWorker;
+    QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(worker), restoredWorker, error), qPrintable(error));
+    QVERIFY2(validateVrrCurrentPolicy(restoredWorker, error), qPrintable(error));
+    auto intervalSnapshot = vrrTimingParametersToJson(worker);
+    intervalSnapshot["smoothing_mode"] = int(VrrSmoothingWorkerInterval);
+    QVERIFY2(applyVrrReplayControllerSnapshot(intervalSnapshot, restoredWorker, error), qPrintable(error));
+    QVERIFY2(validateVrrCurrentPolicy(restoredWorker, error), qPrintable(error));
     absorbing.absorbMicrostutter = true;
     absorbing.timingOptions.toleranceUs = 500;
     QCOMPARE(vrrTimingParametersForSession(absorbing).playoutSmoothingOwnMovement, uint64_t(1));
@@ -342,7 +351,7 @@ void VrrReplayConfigTest::productionPolicyValidation()
             session.timingOptions.targetHundredths = target;
             const auto current = vrrTimingParametersForSession(
                 vrrProductionSessionConfig(session), scheduled, scheduled);
-            QCOMPARE(current.playoutVrr18IntervalFeedback, Vrr18CeilingBuffer);
+            QCOMPARE(current.playoutVrr18IntervalFeedback, Vrr18FrameHitchForecast);
             QVERIFY2(validateVrrCurrentPolicy(current, error), qPrintable(error));
             for (uint64_t revision = Vrr18AveragedIntervalFeedback; revision < current.playoutVrr18IntervalFeedback; ++revision) {
                 auto historical = current;
@@ -358,7 +367,7 @@ void VrrReplayConfigTest::productionPolicyValidation()
                 QVERIFY(vrrCalibrationPolicy(current) != vrrCalibrationPolicy(restored));
             }
             auto future = current;
-            future.playoutVrr18IntervalFeedback = Vrr18CeilingBuffer + 1;
+            future.playoutVrr18IntervalFeedback = Vrr18FrameHitchForecast + 1;
             QVERIFY(!validateVrrTimingParameters(future, error));
             auto retired = current;
             retired.playoutPredictionOnly = 0;

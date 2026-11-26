@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+class VrrTimingController;
 namespace VrrSim {
 
 // A phase supplies its own workload for this span of virtual time. A periodic
@@ -19,6 +20,7 @@ struct Phase {
     int clockDriftPpm = 0;
     int64_t rtpJumpUs = 0;
     bool reconnect = false;
+    std::vector<uint64_t> sourceIntervalsUs;
 };
 
 struct Scenario {
@@ -48,7 +50,8 @@ public:
 struct Observation {
     uint64_t frame = 0, session = 0, sourceUs = 0, readyUs = 0, outputUs = 0, dequeuedUs = 0;
     uint64_t submittedUs = 0, shownUs = 0, bufferUs = 0, minimumBufferUs = 0;
-    uint64_t preparationStartedUs = 0;
+    uint64_t preparationStartedUs = 0, requestedBufferUs = 0;
+    uint64_t extraDelayUs = 0;
     uint64_t intendedIntervalUs = 0, intervalErrorUs = 0;
     double scorePercent = 0, clientScorePercent = 0;
     bool calibrated = false, scoreAvailable = false, clientScoreAvailable = false;
@@ -63,8 +66,15 @@ struct Counts {
 };
 
 using PresentObserver = void (*)(void*, const Observation&);
+
+// Change only the adaptive maximum, immediately before this submission feeds
+// the controller. Preserve the prefix, including the current handoff and queues.
+struct BufferCapTrial {
+    uint64_t frame, maximumUs;
+    void apply(VrrTimingController& controller) const;
+};
 Counts simulate(const Scenario& scenario, const Options& options,
-                PresentObserver onPresent, void* context);
+                PresentObserver onPresent, void* context, const BufferCapTrial* trial = nullptr);
 
 struct GapMetrics {
     uint64_t worstGapUs = 0, jerkP99Us = 0, worstJerkUs = 0, jerkOver2Ms = 0;

@@ -91,6 +91,25 @@ reserve, early stretches, and decode-to-handoff latency. The noisy-input check
 counts material reversals of at least two configured tolerances. The timing
 controller suite separately checks both directions of the per-frame budget.
 
+Run `scripts\test-vrr-buffer.cmd ceiling-forecast` to check above-goal buffer
+growth at 120 FPS / 120 Hz. This synthetic Low Latency workload starts under
+delivery pressure. After pacing recovers to 99%, delivery spikes return for
+three seconds, clear, and later persist for 40 seconds. At the first above-goal
+request crossing 2.75 ms in the short burst, the simulator reruns the same
+history and limits the adaptive maximum just before that frame's submission
+feedback. Both branches continue through the ordinary queues, scheduler and
+modeled display. If the controller avoids that purchase, the comparison begins
+at the burst onset.
+
+The `forecast_comparison` JSON reports time at goal, minimum score, mean
+reserve, decode-ready-to-submit and decode-ready-to-display time, and p99
+display interval jerk for each branch and span. The gate requires complete
+score coverage and zero drops. It fails if the smaller reserve sustains the
+goal throughout the brief comparison, saves more than one tolerance of mean
+reserve, and keeps display latency and p99 jerk within one tolerance of the
+adaptive branch. The sustained phase checks that extra reserve can be necessary
+when the disturbance continues.
+
 The `display-ceiling` simulator gate includes 60 seconds of actual 120 FPS
 at 120 Hz on the waitable DXGI model, both clean and with 1 ms delivery
 spikes every 125 ms. It checks decode-ready-to-display latency, the 99%
@@ -284,14 +303,41 @@ worker captures for the corrected controller's replay and stress gates.
 Never waive an exact mismatch or introduce a second production policy merely
 to reproduce the old bug.
 
+`variable-source-judder` runs the 99% Low Latency profile on a 120 Hz display.
+Its 18-second producer repeats 80 consecutive host RTP intervals from the
+reported variable-rate session. Delivery, decoding and presentation use the
+simulator's own clocks. The optional phase field `source_intervals_us` holds
+a repeating sequence of positive gaps and replaces the fixed host period.
+
+`extra_delay_cycles` counts complete trips from at most 0.5 ms of planned
+extra delay to at least 2 ms and back. `sustained_extra_delay_cycles` counts
+the same trips on a four-frame moving average to distinguish retained delay
+from individual short/long frame corrections. Both measurements restart
+across dropped frames and reconnects. The regression also checks presented
+interval changes above 2 ms, score coverage, input buffer, time-weighted
+extra delay and decode-ready-to-display latency.
+
+`uneven-game-cadence` uses 80 consecutive RTP gaps from a roughly 70 FPS game
+on a 120 Hz display with independent transport jitter. The Balanced gate checks
+the frequency and 99th percentile of presented interval changes, sustained
+extra-delay cycles, input buffer, decode-ready-to-display latency and pacing.
+
+`rate-drop-hitches` steps from 120 to 60 FPS on a 120 Hz display with Reduce
+Judder off. It replays 40 consecutive host intervals from the slow segment
+with independent delivery jitter, then returns to steady 60 FPS. The gate
+checks the input buffer's 95th percentile and time at the pacing goal.
+Separate runs give the settled stream a 2 ms maximum. Recurring 6 ms and
+10 ms deliveries must count the same number of late frames and purchase zero
+reserve. Recurring 1.8 ms deliveries must earn protection and miss fewer frames.
+
 ## Current-policy scenarios
 
 Replay configurations use `config_schema: 2` and `base: "session"` to derive
 the current production policy from the capture's settings and presenter. The
 recorded baseline retains its captured current parameters. Revision-specific
 historical policies and schema-1 configs are unsupported. `smoothing_mode`
-selects the current off (0), worker phase-locked (2), native tolerance-bounded (4)
-or Absorb (7) mode; other values and retired revision selectors are rejected.
+selects off (0), recorded worker phase-locked (2), native tolerance-bounded (4),
+Absorb (7), recorded worker interval smoothing (8), or worker source-phase smoothing (9).
 The production and interval policy baseline targets preserve 54 deterministic
 pre-cleanup output fingerprints each. List available fields
 with `vrrreplay --list-parameters`; `tests/vrr/replay-scenarios.example.json`

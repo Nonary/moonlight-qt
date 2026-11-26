@@ -9,6 +9,7 @@
 #include "presenttiming.h"
 #include "inputbuffer.h"
 #include "cadencedetection.h"
+#include "intervalscore.h"
 
 // Recorded values of playout_vrr18_interval_feedback.
 constexpr uint64_t Vrr18AveragedIntervalFeedback = 1;
@@ -26,6 +27,10 @@ constexpr uint64_t Vrr18SelectedGoalRelease = 12;
 constexpr uint64_t Vrr18ZeroReserve = 13;
 constexpr uint64_t Vrr18FrameBudget = 14;
 constexpr uint64_t Vrr18CeilingBuffer = 15;
+constexpr uint64_t Vrr18CeilingReleaseHistory = 16;
+constexpr uint64_t Vrr18ProgressiveCeilingRelease = 17;
+constexpr uint64_t Vrr18CeilingForecastBudget = 18;
+constexpr uint64_t Vrr18FrameHitchForecast = 19;
 
 namespace Vrr13 {
 // Score each adjacent interval against its intended spacing. Historical VRR18
@@ -35,7 +40,7 @@ public:
     static constexpr uint64_t ToleranceUs = 500;
     static constexpr uint64_t ShortWindowUs = 1000000;
     static constexpr uint64_t ShortBucketUs = 10000;
-    static constexpr uint64_t ScoreBucketUs = 100000;
+    static constexpr uint64_t ScoreBucketUs = IntervalScoreBucketUs;
     static constexpr size_t MaximumScoreBuckets = 3000; // five minutes
     struct Sample {
         uint64_t frame = 0, intended = 0, submitted = 0, deadline = 0, ready = 0, buffer = 0;
@@ -52,6 +57,9 @@ public:
         bool floorFollowsPrevious = false;
         uint64_t scanoutFloor = 0;
         uint64_t predecessorBufferUs = 0, predecessorAdvanceUs = 0;
+        bool recoverableHitch = false;
+        bool incomingStretch = false;
+        uint64_t sourceIntervalUs = 0;
 
         uint64_t independentLatenessUs() const {
             const auto unbufferedUs = deadline - std::min(deadline, buffer);
@@ -150,7 +158,7 @@ public:
                  bool goalFeedback = false, bool predictiveFeedback = false,
                  bool costAwareFeedback = false, bool anticipatoryFeedback = false,
                  bool targetAwareRelease = false, uint64_t releaseRevision = 0, bool canQualifyRelease = true,
-                 bool latchedCeiling = false) {
+                 bool latchedCeiling = false, bool priceVariableCadence = false) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -234,6 +242,29 @@ public:
         }
         const auto& delayed = actual >= intended ? m_Previous : previous;
         const auto& other = actual >= intended ? previous : m_Previous;
+        const bool requireHitch = releaseRevision >= Vrr18FrameHitchForecast;
+        if (requireHitch && s.smoothedRtpSlotUs > previous.smoothedRtpSlotUs)
+            m_Previous.sourceIntervalUs = s.smoothedRtpSlotUs - previous.smoothedRtpSlotUs;
+        if (requireHitch && update.stretchedBeyondTolerance) {
+            m_Previous.incomingStretch = true;
+            // A long sender gap followed by a compensating short one can look
+            // like late delivery on the short slot. If that source movement
+            // explains the entire excess and the handoff was already as fast
+            // as the fitted cadence, chasing the short slot recreates the gap.
+            const auto excess = error - toleranceUs;
+            const auto period = s.sourcePeriodUs;
+            const bool sourceCatchup = m_Previous.sourceIntervalUs && period > m_Previous.sourceIntervalUs &&
+                period - m_Previous.sourceIntervalUs >= excess &&
+                previous.sourceIntervalUs > period && previous.sourceIntervalUs - period >= excess &&
+                actual - std::min(actual, period) <= toleranceUs;
+            m_Previous.recoverableHitch = !sourceCatchup && canCoverInterval(previous, s, excess, maximum);
+        }
+        // A spacing floor can conceal the incoming stretch. In that case the
+        // compressed successor can still measure the cost of the earlier late
+        // frame, but cannot corroborate another incoming hitch.
+        const bool recoverableHitch = !requireHitch || delayed.recoverableHitch ||
+            (actual < intended && error > toleranceUs && !previous.incomingStretch &&
+             canCoverInterval(s, previous, error - toleranceUs, maximum));
         const auto benefit = requireRecoverableInterval && !goalFeedback ?
             intervalBenefit(delayed, other, error, toleranceUs, maximum) : Benefit{};
         const auto tick = s.submitted / ShortBucketUs;
@@ -278,7 +309,7 @@ public:
         score.evaluated += actual;
         if (error > toleranceUs) score.failed += actual;
         const double excessUs = error > toleranceUs ? double(error - toleranceUs) : 0.0;
-        const double loss = std::min(1.0, excessUs / intended);
+        const double loss = intervalLossFraction(error, intended, toleranceUs);
         if (severityWeighted) score.weightedLoss += actual * loss;
         if (clientInterval) {
             score.clientEvaluatedUs += actual;
@@ -350,7 +381,9 @@ public:
                 forecastUs = m_ReserveCosts.observe(delayed, other, actual, intended,
                     error, toleranceUs, maximum, allowedLoss, steadySource, cadenceBounded,
                     anticipatoryFeedback && !belowTarget, releaseRevision >= Vrr18FrameBudget,
-                    std::max(0.0, allowedLoss * m_Stats.evaluatedUs - m_Stats.weightedLossUs));
+                    std::max(0.0, allowedLoss * m_Stats.evaluatedUs - m_Stats.weightedLossUs),
+                    latchedCeiling && releaseRevision >= Vrr18CeilingForecastBudget,
+                    recoverableHitch);
             }
             else m_ReserveCosts = {};
         }
@@ -372,7 +405,12 @@ public:
             lateness - std::min(lateness, toleranceUs) <= headroom;
         const auto freshBenefitUs = goalFeedback ?
             freshReadinessBenefit(delayed, other, error, toleranceUs, maximum, intended) : 0;
-        const bool corroborated = freshBenefitUs && delayed.absorbable &&
+        // A direct readiness response already prices both endpoints within the
+        // cap. An interval that exceeds even the full remaining movement cannot
+        // corroborate that estimate or renew its pressure hold.
+        const bool fitsAllowance = !requireHitch ||
+            (error - std::min(error, toleranceUs) <= headroom && (steadySource || recoverableHitch));
+        const bool corroborated = fitsAllowance && freshBenefitUs && delayed.absorbable &&
             m_Reserve.corroborates(s.submitted, delayed.frame);
         const bool delayedAbsorbable = delayed.absorbable && windowAbsorbable && withinBudget &&
             (goalFeedback ? corroborated :
@@ -391,7 +429,12 @@ public:
         };
         const bool cleanSoftwareInput = releaseRevision >= Vrr18FrameBudget && targetAwareRelease &&
             !canQualifyRelease && readyAtMinimum(previous) && readyAtMinimum(s);
-        if ((canQualifyRelease || cleanSoftwareInput) && releaseRevision >= Vrr18ScoreQualifiedRelease && minimum < maximum && steadySource && windowAbsorbable &&
+        // A variable-rate pair can qualify a release against its own intended
+        // interval. Price both constrained handoffs and independent readiness,
+        // as at the ceiling, before spending the measured score allowance.
+        const bool priceSourceInterval = steadySource || priceVariableCadence ||
+            (latchedCeiling && releaseRevision >= Vrr18CeilingReleaseHistory);
+        if ((canQualifyRelease || cleanSoftwareInput) && releaseRevision >= Vrr18ScoreQualifiedRelease && minimum < maximum && priceSourceInterval && windowAbsorbable &&
                 s.absorbable && previous.absorbable && s.independentReadyUs && previous.independentReadyUs &&
                 allowedLoss > 0 && (!belowTarget || releaseRevision >= Vrr18SelectedGoalRelease)) {
             // Historical revisions projected release against a fraction of a preset budget.
@@ -405,11 +448,13 @@ public:
                 allowedLoss * (1.0 - double(ScoreBucketUs) / double(std::max(scoreWindowUs, ScoreBucketUs))) :
                 0.9 * std::min(allowedLoss, historicalCap);
             const auto qualifiedReserve = m_ReleaseCosts.observe(previous, m_Previous, actual, intended,
-                error, toleranceUs, minimum, maximum, releaseAllowance, selectedGoal, releaseRevision, latchedCeiling);
+                error, toleranceUs, minimum, maximum, releaseAllowance, selectedGoal, releaseRevision,
+                latchedCeiling, priceVariableCadence);
             // A startup seed must have actually run at the approved level.
             // Early partial-window release can move the actuator, but only
             // agreement across completed cost windows can seed a reconnect.
             update.qualifiedStartDelay = selectedGoal && !belowTarget && m_ReleaseCosts.hasHistory() &&
+                (releaseRevision < Vrr18ProgressiveCeilingRelease || qualifiedReserve >= m_ReleaseCosts.confirmedReserve()) &&
                 qualifiedReserve < maximum && qualifiedReserve == s.buffer && previous.buffer == s.buffer;
             const bool appliedQualifies = qualifiedReserve <= std::min(s.buffer, previous.buffer);
             const bool honorApproval = selectedGoal || (releaseRevision >= Vrr18ProfileReleaseBudget && allowedLoss > 0.005);
@@ -438,7 +483,7 @@ public:
         const bool pressureHolds = (vrr18Feedback || targetAllowsHold) && sustainedPressure &&
             (freshError && delayedAbsorbable && lateness);
         const bool uncertainRelease = goalFeedback && belowTarget && windowAbsorbable &&
-            freshError && delayed.absorbable && delayed.independentReadyUs > deadline &&
+            fitsAllowance && freshError && delayed.absorbable && delayed.independentReadyUs > deadline &&
             lateness > toleranceUs && bufferLoss > allowedLoss;
         const bool goalHold = goalFeedback && m_Target <= releaseTarget;
         const bool holdProtection = goalHold || uncertainRelease || pressureHolds ||
@@ -612,6 +657,26 @@ public:
     }
     void reset() { *this = IntervalBuffer{}; }
 private:
+    // Adding the same standing reserve moves both deadlines later. Compare the
+    // wait it would add at each endpoint, including any delay already supplied
+    // by readiness, the previous flip or the scheduler. Only independently late
+    // input can earn the improvement in the measured handoff interval.
+    static bool canCoverInterval(const Sample& onTime, const Sample& late,
+                                 uint64_t excessUs, uint64_t maximumUs) {
+        if (!late.absorbable || !onTime.absorbable ||
+            !late.independentReadyUs || !onTime.independentReadyUs) return false;
+        const auto readiness = [](const Sample& s) { return std::min(s.ready, s.independentReadyUs); };
+        const auto addedWait = [maximumUs](const Sample& s, uint64_t boundary) {
+            const uint64_t increase = maximumUs - std::min(maximumUs, s.buffer);
+            const auto remaining = boundary - std::min(boundary, s.deadline);
+            return increase - std::min(increase, remaining);
+        };
+        const auto fits = [excessUs](uint64_t before, uint64_t after) {
+            return before >= after && before - after >= excessUs;
+        };
+        return fits(addedWait(onTime, onTime.submitted), addedWait(late, late.submitted)) &&
+               fits(addedWait(onTime, readiness(onTime)), addedWait(late, readiness(late)));
+    }
     struct Benefit {
         uint64_t excessUs = 0;  // Error outside tolerance that the remaining buffer can cover.
         uint64_t nearbyUs = 0;  // Part of that error covered by one tolerance of extra buffer.
@@ -703,7 +768,8 @@ private:
         uint64_t observe(const Sample& delayed, const Sample& other, uint64_t actualUs,
                          uint64_t intendedUs, uint64_t errorUs, uint64_t toleranceUs,
                          uint64_t maximumUs, double allowedLoss, bool steadySource, bool cadenceBounded,
-                         bool beforeGoalCrossing, bool frameBudget, double remainingGoalBudgetUs) {
+                         bool beforeGoalCrossing, bool frameBudget, double remainingGoalBudgetUs,
+                         bool spendScoreSurplus, bool recoverableHitch) {
             const uint64_t appliedUs = std::max(delayed.buffer, other.buffer);
             if (!elapsedUs) anchorUs = std::min(appliedUs, maximumUs);
             elapsedUs += actualUs;
@@ -712,18 +778,33 @@ private:
                 return std::clamp(error - toleranceUs, 0.0, double(intendedUs));
             };
             const double observedLoss = excess(double(errorUs));
-            observedLossUs += weight * observedLoss;
+            // An unavoidable miss remains in the reported score. Including its
+            // deficit here would make unrelated, recoverable misses buy more delay.
+            if (recoverableHitch) observedLossUs += weight * observedLoss;
             const uint64_t headroomUs = maximumUs - std::min(maximumUs, appliedUs);
             const uint64_t lateAtCapUs = coveredReadiness(delayed, headroomUs);
             const uint64_t earlyAtCapUs = coveredReadiness(other, headroomUs);
             uint64_t confirmedUs = 0;
+            // A larger ceiling reserve can persist through two release windows.
+            // Spread the unspent rolling loss budget over that same span when
+            // pricing the purchase. As new losses use it up, the forecast can
+            // buy more before the rolling score crosses its target.
+            const double forecastAllowance = allowedLoss + (beforeGoalCrossing && spendScoreSurplus ?
+                remainingGoalBudgetUs / (2 * ReleaseCosts::WindowUs) : 0.0);
+            const auto pricedProposal = [&](uint64_t spanUs) {
+                const auto full = proposal(maximumUs, allowedLoss * spanUs);
+                // A corroborated correction that needs only the first trial
+                // level can finish covering a recurring spike immediately.
+                if (forecastAllowance == allowedLoss || full <= candidate(1, maximumUs)) return full;
+                return proposal(maximumUs, forecastAllowance * spanUs);
+            };
             if (lateAtCapUs || earlyAtCapUs) {
                 // When the source rate varies, require independent input lateness
                 // to explain the observed interval error to within tolerance.
                 const double inputErrorUs = double(lateAtCapUs) - double(earlyAtCapUs);
                 const bool explained = steadySource ||
                     (cadenceBounded && inputErrorUs > 0 && std::abs(errorUs - inputErrorUs) <= toleranceUs);
-                const bool recoverable = explained &&
+                const bool recoverable = recoverableHitch && explained &&
                     intervalBenefit(delayed, other, errorUs, toleranceUs, maximumUs).excessUs != 0;
                 bool improvesStretch = false;
                 for (size_t i = 0; i < Levels; ++i) {
@@ -748,7 +829,7 @@ private:
                     if (frameBudget && recurringStretch(delayed, toleranceUs, beforeGoalCrossing,
                                                        remainingGoalBudgetUs) && steadySource && previousProposalUs) {
                         // Charge a full block's allowance before acting on a partial block.
-                        const auto supportedUs = proposal(maximumUs, allowedLoss * WindowUs);
+                        const auto supportedUs = pricedProposal(WindowUs);
                         confirmedUs = std::max(confirmedUs, std::min(previousProposalUs, supportedUs));
                     }
                     pendingProposalUs = 0;
@@ -756,7 +837,7 @@ private:
             }
             if (elapsedUs < WindowUs) return confirmedUs;
 
-            const uint64_t proposalUs = proposal(maximumUs, elapsedUs * allowedLoss);
+            const uint64_t proposalUs = pricedProposal(elapsedUs);
             // A burst straddling a block boundary is still a single episode.
             const bool recurring = previousFirstStretchUs && lastStretchUs >= previousFirstStretchUs &&
                 lastStretchUs - previousFirstStretchUs >= WindowUs;
@@ -929,24 +1010,35 @@ private:
         static constexpr size_t Levels = FineLevels + SubMillisecondSteps + OuterSteps;
 
         bool hasHistory() const { return confirmedLevel <= levelCount; }
+        uint64_t confirmedReserve() const { return candidate(std::max(previousLevel, confirmedLevel)); }
         uint64_t nextReserveAfterApproval() const { return candidate(std::min(confirmedLevel, previousLevel) + 1); }
 
         uint64_t observe(const Sample& previous, const Sample& current, uint64_t actualUs,
                          uint64_t intendedUs, uint64_t errorUs, uint64_t toleranceUs,
                          uint64_t minimumUs, uint64_t maximumUs, double allowedLoss, bool selectedGoal,
-                         uint64_t revision, bool latchedCeiling) {
+                         uint64_t revision, bool latchedCeiling, bool priceVariableCadence) {
             if (minimumUs != minimum || maximumUs != maximum || latchedCeiling != measuredAtCeiling) {
-                *this = {};
+                // Extend the fine grid downward while preserving its coverage of
+                // reserves up to 4 ms and the recorded grids of earlier policies.
+                const size_t fineCount = FineLevels + (revision >= Vrr18ZeroReserve ? SubMillisecondSteps : 0);
+                const uint64_t range = maximumUs - minimumUs;
+                const uint64_t outerRange = range - std::min(range, StepUs * (fineCount - 1));
+                uint64_t stride = std::max<uint64_t>(StepUs, outerRange / OuterSteps + (outerRange % OuterSteps != 0));
+                const bool stableGrid = priceVariableCadence || (latchedCeiling && revision >= Vrr18CeilingReleaseHistory);
+                if (stableGrid) stride = ((stride + StepUs - 1) / StepUs) * StepUs;
+                // A fitted period moves the frame allowance by microseconds.
+                // Trials keep their accumulated costs while their reserve values
+                // agree. Levels above the current capacity are priced at that
+                // interval's cap, including when one endpoint still carries
+                // the preceding frame's larger reserve.
+                if (!stableGrid || minimum != minimumUs || measuredAtCeiling != latchedCeiling || outerStepUs != stride)
+                    *this = {};
                 minimum = minimumUs;
                 maximum = maximumUs;
                 measuredAtCeiling = latchedCeiling;
-                // Extend the fine grid downward while preserving its coverage of
-                // reserves up to 4 ms and the recorded grids of earlier policies.
-                fineLevels = FineLevels + (revision >= Vrr18ZeroReserve ? SubMillisecondSteps : 0);
+                fineLevels = fineCount;
                 levelCount = fineLevels + (selectedGoal ? OuterSteps : 0);
-                const uint64_t range = maximum - minimum;
-                const uint64_t outerRange = range - std::min(range, StepUs * (fineLevels - 1));
-                outerStepUs = std::max<uint64_t>(StepUs, outerRange / OuterSteps + (outerRange % OuterSteps != 0));
+                outerStepUs = stride;
             }
             elapsedUs += actualUs;
             const auto loss = [&](double duration, double error) {
@@ -974,9 +1066,9 @@ private:
                     if (reserve >= std::max(previous.buffer, current.buffer)) break;
                     double cost = projectedLoss(double(actualUs) + double(advance(previous, reserve)) -
                                                 double(advance(current, reserve)));
-                    if (latchedCeiling) {
-                        // The preceding flip can mask late input until the display
-                        // sheds phase. Price the release at that earlier phase too.
+                    if (latchedCeiling || priceVariableCadence) {
+                        // A display floor or retimed slot can mask late input.
+                        // Price both ends at their independent readiness as well.
                         cost = std::max(cost, projectedLoss(double(actualUs) + double(inputAdvance(previous, reserve)) -
                                                             double(inputAdvance(current, reserve))));
                     }
@@ -1009,6 +1101,7 @@ private:
                     if (!affordable(i - 1)) break;
                     nextLevel = i - 1;
                 }
+                olderLevel = confirmedLevel;
                 confirmedLevel = previousLevel;
                 previousLevel = nextLevel;
                 elapsedUs = 0;
@@ -1036,6 +1129,25 @@ private:
             // Revoke levels that exhaust this window's budget. Revision 12
             // can still use a higher level approved in both completed windows.
             const size_t floor = std::max(previousLevel, confirmedLevel);
+            if (latchedCeiling && revision >= Vrr18ProgressiveCeilingRelease &&
+                    olderLevel == confirmedLevel && confirmedLevel < levelCount && previousLevel < confirmedLevel &&
+                    candidate(confirmedLevel) - candidate(previousLevel) > toleranceUs) {
+                // Two older windows agreed on the high reserve and the latest one
+                // measured a decline larger than one frame's adjustment. Advance
+                // only through trials with no added loss in the current window.
+                // Pay for both edges of a returning late frame from the original
+                // high reserve so consecutive reductions cannot reuse the budget.
+                const auto confirmedUs = candidate(confirmedLevel);
+                const double earnedBudgetUs = allowedLoss * elapsedUs;
+                size_t trial = confirmedLevel;
+                while (trial > previousLevel) {
+                    const auto lower = trial - 1;
+                    const auto exposedUs = confirmedUs - candidate(lower);
+                    if (extraLossUs[lower] > 0 || observedLossUs + 2.0 * double(exposedUs) > earnedBudgetUs) break;
+                    trial = lower;
+                }
+                if (trial < confirmedLevel) return candidate(trial);
+            }
             for (size_t i = floor; i < levelCount; ++i) {
                 if (affordable(i)) return candidate(i);
                 if (!selectedGoal) break;
@@ -1053,6 +1165,7 @@ private:
         uint64_t minimum = 0, maximum = 0, elapsedUs = 0, peakAppliedUs = 0;
         uint64_t outerStepUs = StepUs;
         size_t fineLevels = FineLevels, levelCount = FineLevels, previousLevel = Levels + 1, confirmedLevel = Levels + 1;
+        size_t olderLevel = Levels + 1;
         double observedLossUs = 0;
         std::array<double, Levels> extraLossUs{};
         bool measuredAtCeiling = false;
