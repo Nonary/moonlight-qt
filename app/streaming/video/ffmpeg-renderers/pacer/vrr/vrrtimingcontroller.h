@@ -266,6 +266,7 @@ enum VrrSmoothingMode : uint64_t {
     VrrSmoothingAbsorb = 7,
     VrrSmoothingWorkerInterval = 8,
     VrrSmoothingWorkerSourcePhase = 9,
+    VrrSmoothingWorkerCeilingBounded = 10,
 };
 
 // Every value that changes VRR policy remains replaceable by replay without
@@ -275,6 +276,11 @@ struct VrrTimingParameters {
     type memberName = defaultValue;
     VRR_TIMING_PARAMETER_FIELDS(VRR_DECLARE_TIMING_PARAMETER)
 #undef VRR_DECLARE_TIMING_PARAMETER
+
+    bool usesWorkerSourcePhase() const
+    {
+        return smoothingMode == VrrSmoothingWorkerSourcePhase || smoothingMode == VrrSmoothingWorkerCeilingBounded;
+    }
 
     bool nativeScheduledAbsorb() const
     {

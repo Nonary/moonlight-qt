@@ -2,7 +2,7 @@
 
 Source baseline: `master` at `90399ebe` plus the Ultra Low Latency buffer
 correction, with VRR18 interval feedback revision 21 and worker Reduce judder
-mode 9, built on the full-refresh buffer policy in `b88a77ff`.
+mode 10, built on the full-refresh buffer policy in `b88a77ff`.
 Buffer growth uses delivery and decode readiness at both ends of an interval.
 Windows uses DXGI at full refresh. Ultra Low Latency VRR uses qualified
 Windows Composition, SteamOS Gaming Mode, or desktop Wayland presentation and retains the
@@ -673,7 +673,7 @@ rate. The normalized producer mapping uses prompt GPU completion observations;
 a delayed collection can include queue residence and is not treated as GPU
 service. Real readiness still constrains the submitted frame.
 
-Worker-paced Reduce judder (mode 9) uses the fitted clock for
+Worker-paced Reduce judder (mode 10) uses the fitted clock for
 display-limited, regular and coarsely quantized source cadence. With display
 headroom, variation in two-frame RTP averages beyond the selected tolerance
 on a finer timestamp grid selects a local correction. When the fitted source intervals
@@ -681,7 +681,11 @@ clear the display minimum by the selected tolerance, it blends two estimates
 from four consecutive RTP gaps. The older pair provides the local rate. The
 fitted period provides an independent estimate from the two most recent gaps,
 with the preceding gap contributing at most one tolerance of phase error.
-Mode 8 retains the older-pair correction for exact replay. These decisions never
+When a variable source returns to a one-refresh interval outside the fitted
+cadence’s 25% stability band, a latching presenter limits the increase in
+retiming to one tolerance. This avoids prolonging that interval after a slower run.
+Mode 9 retains the previous source-phase behavior for exact replay. Mode 8
+retains the older-pair correction for exact replay. These decisions never
 integrate prior corrected deadlines. The worker learns smoothing reserve
 from meaningful interval shortening and independent decode readiness,
 and limits advances to the time available after decode. Its input-buffer

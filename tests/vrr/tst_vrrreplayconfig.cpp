@@ -127,15 +127,19 @@ void VrrReplayConfigTest::windowedSmoothingPolicyRoundTrip()
     QCOMPARE(restored.playoutSmoothingOwnMovement, uint64_t(0));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_smoothing_own_movement", 2}}, restored, error));
     QVERIFY(!applyVrrReplayControllerSnapshot(
-        {{"smoothing_mode", 10}}, parameters, error));
+        {{"smoothing_mode", 11}}, parameters, error));
     QCOMPARE(parameters.smoothingMode, uint64_t(2));
     VrrSessionConfig absorbing;
     const auto worker = vrrTimingParametersForSession(vrrProductionSessionConfig(VrrSessionConfig{}));
-    QCOMPARE(worker.smoothingMode, uint64_t(VrrSmoothingWorkerSourcePhase));
+    QCOMPARE(worker.smoothingMode, uint64_t(VrrSmoothingWorkerCeilingBounded));
     VrrTimingParameters restoredWorker;
     QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(worker), restoredWorker, error), qPrintable(error));
     QVERIFY2(validateVrrCurrentPolicy(restoredWorker, error), qPrintable(error));
     auto intervalSnapshot = vrrTimingParametersToJson(worker);
+    intervalSnapshot["smoothing_mode"] = int(VrrSmoothingWorkerSourcePhase);
+    QVERIFY2(applyVrrReplayControllerSnapshot(intervalSnapshot, restoredWorker, error), qPrintable(error));
+    QCOMPARE(restoredWorker.smoothingMode, uint64_t(VrrSmoothingWorkerSourcePhase));
+    QVERIFY2(validateVrrCurrentPolicy(restoredWorker, error), qPrintable(error));
     intervalSnapshot["smoothing_mode"] = int(VrrSmoothingWorkerInterval);
     QVERIFY2(applyVrrReplayControllerSnapshot(intervalSnapshot, restoredWorker, error), qPrintable(error));
     QVERIFY2(validateVrrCurrentPolicy(restoredWorker, error), qPrintable(error));

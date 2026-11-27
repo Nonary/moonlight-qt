@@ -354,7 +354,9 @@ the current production policy from the capture's settings and presenter. The
 recorded baseline retains its captured current parameters. Revision-specific
 historical policies and schema-1 configs are unsupported. `smoothing_mode`
 selects off (0), recorded worker phase-locked (2), native tolerance-bounded (4),
-Absorb (7), recorded worker interval smoothing (8), or worker source-phase smoothing (9).
+Absorb (7), recorded worker interval smoothing (8), recorded worker source-phase
+smoothing (9), or worker source-phase smoothing with bounded retiming at the
+display ceiling (10).
 The production and interval policy baseline targets preserve 54 deterministic
 pre-cleanup output fingerprints each. List available fields
 with `vrrreplay --list-parameters`; `tests/vrr/replay-scenarios.example.json`

@@ -325,7 +325,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     }
     else if (config.smoothFrameTiming) {
         if (vrr18) {
-            parameters.smoothingMode = VrrSmoothingWorkerSourcePhase;
+            parameters.smoothingMode = VrrSmoothingWorkerCeilingBounded;
         }
         parameters.playoutSmoothingOwnMovement = 1;
         parameters.playoutSmoothingReadinessBound = vrr18;
@@ -795,7 +795,7 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     }
 
     const bool variableCadence = (m_Parameters.smoothingMode == VrrSmoothingWorkerInterval ||
-        m_Parameters.smoothingMode == VrrSmoothingWorkerSourcePhase) &&
+        m_Parameters.usesWorkerSourcePhase()) &&
         hasVariableSourceCadence();
     if (m_VariableSourceSmoothing && !variableCadence) {
         resetCadenceSmoothing();
@@ -876,8 +876,23 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                 retimingUs = std::max(retimingUs, -static_cast<int64_t>(
                     saturatingAdd(delayBeforeUs, smoothingReserveUs)));
             }
+            // A variable source can return to a one-refresh interval while
+            // its fitted period still reflects earlier, slower frames. A
+            // latching presenter can already space this pair. Bound the
+            // extra hold introduced by smoothing to the user's tolerance.
+            const auto toleranceUs = intervalQualityToleranceUs(m_Parameters);
+            if (m_Parameters.smoothingMode == VrrSmoothingWorkerCeilingBounded &&
+                    m_CanLatchPresentation && m_VariableSourceSmoothing &&
+                    !rebased && cadence.usedRtpTimestamp && cadence.frameDelta == 1 &&
+                    !withinPercent(cadence.intervalUs, m_SourcePeriodUs, 25) &&
+                    cadence.intervalUs + toleranceUs >= m_DisplayPeriodUs &&
+                    cadence.intervalUs <= m_DisplayPeriodUs + toleranceUs) {
+                const int64_t earliestUs = -int64_t(saturatingAdd(delayBeforeUs, smoothingReserveUs));
+                const int64_t limitUs = std::max(earliestUs, previousRetimingUs + int64_t(toleranceUs));
+                retimingUs = std::min(retimingUs, limitUs);
+            }
             desiredRetimingUs = retimingUs;
-            if (readinessBoundedSmoothing && (m_Parameters.smoothingMode == VrrSmoothingWorkerSourcePhase ||
+            if (readinessBoundedSmoothing && (m_Parameters.usesWorkerSourcePhase() ||
                     m_Parameters.smoothingMode == VrrSmoothingWorkerInterval ||
                     m_Parameters.smoothingMode == VrrSmoothingWorkerPhaseLocked ||
                     m_Parameters.smoothingMode == VrrSmoothingAbsorb)) {
@@ -1917,7 +1932,7 @@ int64_t VrrTimingController::cadenceSmoothingAdjustUs(
         const uint64_t toleranceUs = intervalQualityToleranceUs(m_Parameters);
         const auto minimumGapTicks = saturatingAdd(m_DisplayPeriodUs, toleranceUs) * kRtpClockRate /
             kMicrosecondsPerSecond;
-        const bool sourceHasHeadroom = m_Parameters.smoothingMode == VrrSmoothingWorkerSourcePhase &&
+        const bool sourceHasHeadroom = m_Parameters.usesWorkerSourcePhase() &&
             std::adjacent_find(m_CadenceSamples.begin(), m_CadenceSamples.end(),
                 [minimumGapTicks](const CadenceSample& earlier, const CadenceSample& later) {
                     return later.rtpTicks - earlier.rtpTicks <=

@@ -299,7 +299,7 @@ bool validateVrrCurrentPolicy(const VrrTimingParameters& value, QString& error)
     const bool smoothing = value.playoutSmoothingGainPerMille != 0;
     const auto smoothingMode = value.smoothingMode;
     const bool currentSmoothing = (smoothingMode == VrrSmoothingWorkerInterval ||
-        smoothingMode == VrrSmoothingWorkerSourcePhase) ? smoothing && !scheduled :
+        value.usesWorkerSourcePhase()) ? smoothing && !scheduled :
         smoothingMode == VrrSmoothingAbsorb ? smoothing :
         smoothingMode == (!smoothing ? VrrSmoothingOff : scheduled ?
             VrrSmoothingNativeToleranceBounded : VrrSmoothingWorkerPhaseLocked);
@@ -601,7 +601,7 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.smoothingMode != VrrSmoothingOff &&
         value.smoothingMode != VrrSmoothingWorkerInterval &&
-        value.smoothingMode != VrrSmoothingWorkerSourcePhase &&
+        !value.usesWorkerSourcePhase() &&
         value.smoothingMode != VrrSmoothingWorkerPhaseLocked &&
         value.smoothingMode != VrrSmoothingNativeToleranceBounded &&
         value.smoothingMode != VrrSmoothingAbsorb) {
