@@ -1436,6 +1436,56 @@ private:
     std::vector<Enqueue> m_Enqueues;
 };
 
+void testGapRefreshOnFrameStart()
+{
+    class Presenter : public NativeScheduledPresenter {
+    public:
+        bool supportsGapRefresh() const override { return true; }
+        void refreshDisplayedFrame(uint64_t id, uint64_t slot, uint64_t period) override
+        {
+            priorId = id;
+            nextSlot = slot;
+            periodUs = period;
+            ++refreshes;
+        }
+        std::atomic_uint refreshes{0};
+        std::atomic_uint64_t priorId{0}, nextSlot{0}, periodUs{0};
+    } backend;
+    resetFakeClock();
+    PacerTelemetry telemetry;
+    std::array<TrackedFrameLifetime, 9> lifetimes;
+    auto config = enabledConfig();
+    config.displayRefreshHz = config.streamRateHz = 120;
+    {
+        VrrPacingWorker worker(&backend, config, &telemetry);
+        expect(worker.start(), "gap refresh worker must start");
+        for (unsigned i = 0; i < 8; ++i) {
+            worker.submit(makeTrackedPacedFrame(i + 1, i * 750, LiGetMicroseconds(), lifetimes[i]));
+            expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == i + 1; }),
+                   "source presentations must complete normally");
+        }
+        constexpr uint32_t nextRtp = 7 * 750 + 1402;
+        VrrPacingWorker::notifyFrameStart(10, nextRtp);
+        VrrPacingWorker::notifyFrameStart(9, 8 * 750);
+        expect(waitFor([&] {
+            VrrPacingWorker::notifyFrameStart(9, nextRtp);
+            return backend.refreshes.load() != 0;
+        }), "first packet of a long adjacent interval wakes the idle worker");
+        const auto accepted = backend.enqueues();
+        expect(accepted.size() == 8 && backend.priorId == 8 && backend.periodUs == 8333 &&
+               backend.nextSlot == accepted.back().targetUs + 15577,
+               "the repeat uses the last real present and the next RTP slot");
+        VrrPacingWorker::notifyFrameStart(9, nextRtp);
+        worker.submit(makeTrackedPacedFrame(9, nextRtp, LiGetMicroseconds(), lifetimes[8]));
+        expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == 9; }),
+               "the next game frame presents normally");
+    }
+    VrrPacingWorker::notifyFrameStart(10, 8054);
+    expect(backend.refreshes == 1 && backend.enqueues().size() == 9 &&
+           telemetryStats(telemetry).vrrPacingDroppedFrames == 0,
+           "repeated notices and late teardown callbacks do not add or drop content");
+}
+
 void testNativeScheduledEnqueueCadenceAndLifecycle()
 {
     for (const char* variant : {"accepted", "late", "failed", "absorb"}) {
@@ -3037,11 +3087,16 @@ public:
     D3D11ReadinessPresenter(FrozenTestClock& clock,
                            TrackedFrameLifetime& lifetime,
                            bool completeDuringPreparation,
-                           uint64_t gpuWorkUs) :
+                           uint64_t gpuWorkUs, bool enqueueBeforeReady) :
         m_Clock(clock), m_Lifetime(lifetime),
         m_CompleteDuringPreparation(completeDuringPreparation),
-        m_GpuWorkUs(gpuWorkUs)
-    {}
+        m_GpuWorkUs(gpuWorkUs), m_EnqueueBeforeReady(enqueueBeforeReady)
+    {
+        if (m_EnqueueBeforeReady) setCanLatch(true);
+    }
+
+    bool alwaysSynchronizesAdaptivePresent() const override { return m_EnqueueBeforeReady; }
+    bool supportsScheduledPresentation() const override { return m_EnqueueBeforeReady; }
 
     VrrPrepareResult prepareFrame(AVFrame* frame, uint64_t boundary) override
     {
@@ -3070,9 +3125,11 @@ public:
     VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
     {
         sourceReleasedBeforePresent = m_Lifetime.releases.load() == 1;
-        if (!m_CompleteDuringPreparation) completeFence();
+        if (!m_CompleteDuringPreparation && !m_EnqueueBeforeReady) completeFence();
         auto feedback = FakeVrrFramePresenter::presentAdaptive(request);
         const auto submission = feedback;
+        const uint64_t nativeEndUs = LiGetMicroseconds();
+        if (m_EnqueueBeforeReady) completeFence();
         feedback = m_Readiness;
         feedback.presented = submission.presented;
         feedback.cancelled = submission.cancelled;
@@ -3086,7 +3143,9 @@ public:
         feedback.nativePresentResultValid = true;
         feedback.nativePresentTimingValid = true;
         feedback.nativePresentStartUs = feedback.submissionTimeUs;
-        feedback.nativePresentEndUs = LiGetMicroseconds();
+        feedback.nativePresentEndUs = nativeEndUs;
+        feedback.nativeTargetValid = m_EnqueueBeforeReady;
+        feedback.nativeTargetUs = m_EnqueueBeforeReady ? request.displayTargetUs : 0;
         feedback.submissionIdValid = feedback.presented;
         feedback.submissionId = 1;
         return feedback;
@@ -3112,12 +3171,15 @@ private:
     TrackedFrameLifetime& m_Lifetime;
     const bool m_CompleteDuringPreparation;
     const uint64_t m_GpuWorkUs;
+    const bool m_EnqueueBeforeReady;
     VrrPresentFeedback m_Readiness;
 };
 
 void testD3D11ReadinessBeforeTarget()
 {
-    for (const bool completeInPrepare : {false, true}) {
+    for (const auto placement : {0, 1, 2}) {
+        const bool completeInPrepare = placement == 1;
+        const bool enqueueBeforeReady = placement == 2;
         for (const uint64_t gpuWorkUs : {uint64_t(1000), uint64_t(30000)}) {
             resetFakeClock();
             QTemporaryDir directory;
@@ -3126,7 +3188,8 @@ void testD3D11ReadinessBeforeTarget()
             qputenv("MOONLIGHT_VRR_DEEP_TRACE", "1");
             FrozenTestClock clock;
             TrackedFrameLifetime lifetime;
-            D3D11ReadinessPresenter backend(clock, lifetime, completeInPrepare, gpuWorkUs);
+            D3D11ReadinessPresenter backend(clock, lifetime, completeInPrepare, gpuWorkUs,
+                                           enqueueBeforeReady);
             PacerTelemetry telemetry;
             {
                 VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
@@ -3152,7 +3215,7 @@ void testD3D11ReadinessBeforeTarget()
                        value("gpu_ready_wait_result_valid") == 1 &&
                        value("gpu_ready_wait_result") == 0 &&
                        value("gpu_ready_wait_us") >= gpuWorkUs &&
-                       value("submission_boundary_us") >= value("target_us"),
+                       value("scheduling_boundary_us") >= value("target_us"),
                    "successful GPU completion must retain readiness evidence and respect the cadence target");
             if (completeInPrepare) {
                 expect(value("gpu_ready_time_us") <= value("prepare_end_us") &&
@@ -3167,6 +3230,12 @@ void testD3D11ReadinessBeforeTarget()
                 expect(telemetryStats(telemetry).vrrGpuReadyWaitUs == value("gpu_ready_wait_us"),
                        "prepare-time GPU service must be counted once even when final feedback repeats the completion");
             }
+            else if (enqueueBeforeReady) {
+                expect(value("native_target_us") == value("target_us") &&
+                           value("submission_boundary_us") < value("target_us") &&
+                           value("gpu_ready_wait_start_us") >= value("native_present_end_us"),
+                       "Composition must enqueue the unchanged target before draining render work");
+            }
             else {
                 expect(value("gpu_ready_wait_start_us") >= value("prepare_end_us") &&
                            value("gpu_ready_wait_start_us") >= value("present_start_us"),
@@ -3175,7 +3244,7 @@ void testD3D11ReadinessBeforeTarget()
             if (const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_D3D11_READINESS_TRACE")) {
                 if (*exportPath) {
                     const QString destination = QString::fromLocal8Bit(exportPath) +
-                        (completeInPrepare ? ".prepare" : ".deferred") +
+                        (enqueueBeforeReady ? ".queued" : completeInPrepare ? ".prepare" : ".deferred") +
                         (gpuWorkUs == 1000 ? ".ready.vrrtrace" : ".late.vrrtrace");
                     QFile::remove(destination);
                     expect(QFile::copy(tracePath, destination),
@@ -4509,6 +4578,7 @@ int main()
     runNamed("testDecodeWaitDoesNotExpireReadyFrame()", [&] { testDecodeWaitDoesNotExpireReadyFrame(); });
     runNamed("testRepeatedDecodeContentionKeepsPresenting()", [&] { testRepeatedDecodeContentionKeepsPresenting(); });
     runNamed("testFirstFrameDecodeReadinessTrace()", [&] { testFirstFrameDecodeReadinessTrace(); });
+    runNamed("testGapRefreshOnFrameStart()", [&] { testGapRefreshOnFrameStart(); });
     runNamed("testShortAndAlreadyCompleteDecodeReadiness()", [&] { testShortAndAlreadyCompleteDecodeReadiness(); });
     runNamed("testTimestampedDecodeCompletion()", [&] { testTimestampedDecodeCompletion(); });
     runNamed("testNativeScheduledEnqueueCadenceAndLifecycle()", [&] { testNativeScheduledEnqueueCadenceAndLifecycle(); });

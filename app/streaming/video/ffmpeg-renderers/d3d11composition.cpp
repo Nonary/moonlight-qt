@@ -109,6 +109,8 @@ void D3D11CompositionPresenter::reset()
     m_NextBuffer = 0;
     m_LastDisplayedId = 0;
     m_LastObservedDisplayId = m_RetiringPresentId = 0;
+    m_LastObservedDisplayTime100ns = m_LastContentId = m_GapRefreshId = m_DisplayedGapRefreshes = 0;
+    m_LastContentBuffer = m_Buffers.size();
     m_ComposedFrames = m_IndependentFrames = 0;
     m_RejectedDisplayFrames = 0;
     m_QueuedFrames = m_SkippedFrames = m_CanceledFrames = 0;
@@ -253,6 +255,8 @@ HRESULT D3D11CompositionPresenter::acquire(ID3D11RenderTargetView** view)
 HRESULT D3D11CompositionPresenter::clearQueuedPresents()
 {
     cancel();
+    m_LastContentId = 0;
+    m_LastContentBuffer = m_Buffers.size();
     if (!m_Manager) return S_OK;
     drainStatistics();
     const HRESULT hr = m_Manager->CancelPresentsFrom(1);
@@ -285,6 +289,38 @@ HRESULT D3D11CompositionPresenter::setColorSpace(DXGI_COLOR_SPACE_TYPE colorSpac
     return m_Surface ? m_Surface->SetColorSpace(colorSpace) : E_UNEXPECTED;
 }
 
+HRESULT D3D11CompositionPresenter::refreshDisplayedFrame(uint64_t priorId, uint64_t nextSlotUs,
+                                                         uint64_t periodUs, uint64_t (*clockUs)(),
+                                                         uint64_t& refreshId)
+{
+    refreshId = 0;
+    if (!m_Manager || !clockUs || !priorId || priorId != m_LastContentId ||
+            m_LastContentBuffer == m_Buffers.size() || m_Acquired != m_Buffers.size() ||
+            m_GapRefreshId > priorId) return S_FALSE;
+    drainStatistics();
+    if (m_LastObservedDisplayId != priorId) return S_FALSE;
+    const auto beforeUs = clockUs();
+    const auto reference = presentationTime100ns();
+    const auto nowUs = clockUs();
+    const auto displayed = PresentationClockSample::translate(m_LastObservedDisplayTime100ns,
+                                                              reference, beforeUs, nowUs);
+    if (!CompositionGapRefresh::hasSpareScan(displayed.timeUs, nowUs, nextSlotUs, periodUs))
+        return S_FALSE;
+
+    // Re-submit the displayed texture without writing it. The next decoded
+    // image still sets its own target and takes its normal GPU dependencies.
+    HRESULT hr = m_Manager->SetTargetTime({0});
+    if (SUCCEEDED(hr)) hr = m_Surface->SetBuffer(m_Buffers[m_LastContentBuffer].presentation.Get());
+    if (FAILED(hr)) return hr;
+    const auto id = m_Manager->GetNextPresentId();
+    hr = m_Manager->Present();
+    if (hr == S_OK) {
+        m_GapRefreshId = refreshId = id;
+        m_Ownership.repeat(m_LastContentBuffer, id);
+    }
+    return hr;
+}
+
 HRESULT D3D11CompositionPresenter::present(uint64_t& id)
 {
     return present(0, nullptr, id);
@@ -300,6 +336,11 @@ HRESULT D3D11CompositionPresenter::present(uint64_t targetUs, uint64_t (*clockUs
     drainStatistics();
     HRESULT hr = refreshOwnership();
     if (FAILED(hr)) return hr;
+    if (m_LastContentId && m_GapRefreshId > m_LastContentId && m_LastObservedDisplayId < m_GapRefreshId) {
+        // Only the optional repeat can be pending after this ID. Give new
+        // content precedence if Windows has not shown the repeat yet.
+        m_Manager->CancelPresentsFrom(m_GapRefreshId);
+    }
     PresentResult observation;
     observation.requestedTargetUs = targetUs;
     if (targetUs) {
@@ -352,6 +393,8 @@ HRESULT D3D11CompositionPresenter::present(uint64_t targetUs, uint64_t (*clockUs
     cancel();
     if (hr == S_OK) {
         id = nextId;
+        m_LastContentId = nextId;
+        m_LastContentBuffer = acquired;
         m_Ownership.accept(acquired, nextId);
         observation.outstandingPresents = m_Ownership.outstanding();
         if (result) *result = observation;
@@ -374,6 +417,11 @@ void D3D11CompositionPresenter::drainStatistics()
             ComPtr<IPresentStatusPresentStatistics> status;
             if (FAILED(statistics.As(&status))) continue;
             const PresentStatusFrame frame = {status->GetPresentId(), status->GetPresentStatus()};
+            if (frame.id == m_GapRefreshId) {
+                if (frame.status == PresentStatus_Skipped || frame.status == PresentStatus_Canceled)
+                    m_Ownership.terminal(frame.id);
+                continue;
+            }
             switch (frame.status) {
             case PresentStatus_Queued:
                 ++m_QueuedFrames;
@@ -410,8 +458,13 @@ void D3D11CompositionPresenter::drainStatistics()
                 displayed->GetContentTag() != reinterpret_cast<UINT_PTR>(this) ||
                 displayed->GetPresentId() <= m_LastObservedDisplayId) continue;
         m_LastObservedDisplayId = displayed->GetPresentId();
+        m_LastObservedDisplayTime100ns = displayed->GetDisplayedTime().value;
+        if (m_LastObservedDisplayId == m_GapRefreshId) {
+            ++m_DisplayedGapRefreshes;
+            continue;
+        }
         m_DisplayedFrames.push_back({displayed->GetPresentId(),
-            displayed->GetDisplayedTime().value, displayed->GetPresentDuration().value});
+            m_LastObservedDisplayTime100ns, displayed->GetPresentDuration().value});
     }
 }
 

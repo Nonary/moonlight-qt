@@ -41,12 +41,15 @@ public:
     bool alwaysSynchronizesAdaptivePresent() const override { return m_CompositionPresenter.active(); }
     bool supportsScheduledPresentation() const override { return m_CompositionPresenter.active(); }
     bool supportsUltraLowLatencyVrr() const override { return m_CompositionPresenter.active(); }
+    bool supportsGapRefresh() const override { return m_CompositionGapRefresh; }
+    void refreshDisplayedFrame(uint64_t priorId, uint64_t nextSlotUs, uint64_t periodUs) override;
     void clearScheduledPresentation() override;
     void interruptFrameWait(bool stopping) override { m_DxgiAdmission.interrupt(stopping); }
     virtual VrrFallbackReason checkSupport() const override;
     virtual uint64_t captureDecodeBoundary() override;
     uint64_t waitForDecode(AVFrame* frame, uint64_t decodeBoundary) override;
     VrrDecodeReadiness observeDecodeReadiness(AVFrame* frame, uint64_t decodeBoundary) override;
+    void prepareBeforeDecodeReady(AVFrame* frame) override;
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
                                           uint64_t decodeBoundary) override;
     virtual VrrPresentFeedback presentAdaptive(
@@ -78,6 +81,13 @@ private:
 
     bool setupRenderingResources();
     bool m_CompositionRequested = false;
+    bool m_CompositionQueueBeforeReady = false;
+    bool m_CompositionOverlapRenderSetup = false;
+    bool m_CompositionGapRefresh = false;
+    uint64_t m_AcceptedGapRefreshes = 0;
+    uint64_t m_PyroWaveSetupFence = 0;
+    uint64_t m_OverlappedRenderSetups = 0;
+    uint64_t m_OverlappedRenderSetupUs = 0;
     Microsoft::WRL::Wrappers::HandleT<Microsoft::WRL::Wrappers::HandleTraits::HANDLENullTraits> m_DxgiFrameLatencyHandle;
     DxgiWaitable::Admission m_DxgiAdmission;
     bool m_DxgiWaitableActive = false;
@@ -116,6 +126,7 @@ private:
     void bindVideoVertexBuffer(bool frameChanged, AVFrame* frame);
     bool renderVideo(AVFrame* frame, uint64_t decodeBoundary = 0);
     bool renderPyroWaveVideo(AVFrame* frame, PyroWaveFrameRef* ref);
+    void bindPyroWaveRenderState(AVFrame* frame);
     VrrDecodeReadiness waitForPyroWaveDecode(const PyroWaveFrameRef* ref);
     bool isPyroWave() const { return (m_DecoderParams.videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) != 0; }
     bool checkDecoderSupport(IDXGIAdapter* adapter);

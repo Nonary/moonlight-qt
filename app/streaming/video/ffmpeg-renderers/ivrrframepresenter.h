@@ -404,6 +404,12 @@ public:
     virtual bool supportsScheduledPresentation() const { return false; }
     virtual bool supportsUltraLowLatencyVrr() const { return false; }
 
+    virtual bool supportsGapRefresh() const { return false; }
+    // Called by the idle pacing worker. Reuse only previously displayed
+    // content, and leave decoded-frame admission and display targets alone.
+    virtual void refreshDisplayedFrame(uint64_t /*priorId*/, uint64_t /*nextSlotUs*/,
+                                       uint64_t /*periodUs*/) {}
+
     // Invalidate native queued deadlines on suspension or a display epoch.
     // This must not submit a replacement image.
     virtual void clearScheduledPresentation() {}
@@ -435,6 +441,10 @@ public:
         const auto waitUs = waitForDecode(frame, boundary);
         return {waitUs, waitUs != 0, false};
     }
+
+    // Optional renderer setup independent of decode completion. The worker can
+    // still discard this frame, so this must neither acquire an image nor read it.
+    virtual void prepareBeforeDecodeReady(AVFrame*) {}
 
     // May acquire a swapchain image and submit rendering work, but must not
     // intentionally pace or wait for the worker's presentation target.

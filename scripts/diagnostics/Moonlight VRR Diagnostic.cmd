@@ -1,8 +1,9 @@
 @echo off
 rem Schema 6 records lost_packets; use the matching replay to preserve loss eligibility.
 rem Schema 6 replay capture with passive Windows GPU sidecars.
-rem Windows D3D11 VRR defaults to waitable DXGI queue admission.
-rem Set MOONLIGHT_VRR_COMPOSITION=1 before launch for composition display-event timing.
+rem Windows D3D11 VRR uses DXGI at full refresh and prefers Composition below refresh on Windows 11.
+rem MOONLIGHT_VRR_COMPOSITION=0 forces DXGI; =1 requests Composition.
+rem --composition-gap-refresh adds an early refresh of the displayed image on eligible long intervals.
 rem Use Moonlight VRR Full Diagnostic.cmd for correlated OS graphics and scheduler events.
 rem Trace diagnostics do not change smoothing settings or prove physical tear-free scanout.
 setlocal EnableExtensions DisableDelayedExpansion
@@ -26,6 +27,38 @@ set "PREFIX=Moonlight-vrr"
 set "MOONLIGHT_VRR_ALIGN="
 if "%~1"=="--align" (
     set "PREFIX=Moonlight-vrr-aligned"
+    set "MOONLIGHT_VRR_ALIGN=1"
+)
+if "%~1"=="--composition-baseline" (
+    set "MOONLIGHT_VRR_COMPOSITION_GAP_REFRESH=0"
+    set "PREFIX=Moonlight-vrr-composition-baseline"
+    set "MOONLIGHT_VRR_COMPOSITION=1"
+    set "MOONLIGHT_VRR_COMPOSITION_EARLY_ENQUEUE=0"
+    set "MOONLIGHT_VRR_COMPOSITION_OVERLAP_SETUP=0"
+)
+if "%~1"=="--composition-early" (
+    set "MOONLIGHT_VRR_COMPOSITION_GAP_REFRESH=0"
+    set "PREFIX=Moonlight-vrr-composition-early"
+    set "MOONLIGHT_VRR_COMPOSITION=1"
+    set "MOONLIGHT_VRR_COMPOSITION_EARLY_ENQUEUE=1"
+    set "MOONLIGHT_VRR_COMPOSITION_OVERLAP_SETUP=0"
+)
+if "%~1"=="--composition-overlap" (
+    set "MOONLIGHT_VRR_COMPOSITION_GAP_REFRESH=0"
+    set "PREFIX=Moonlight-vrr-composition-overlap"
+    set "MOONLIGHT_VRR_COMPOSITION=1"
+    set "MOONLIGHT_VRR_COMPOSITION_EARLY_ENQUEUE=1"
+    set "MOONLIGHT_VRR_COMPOSITION_OVERLAP_SETUP=1"
+)
+if "%~1"=="--composition-gap-refresh" (
+    set "PREFIX=Moonlight-vrr-composition-gap-refresh"
+    set "MOONLIGHT_VRR_COMPOSITION=1"
+    set "MOONLIGHT_VRR_COMPOSITION_EARLY_ENQUEUE=1"
+    set "MOONLIGHT_VRR_COMPOSITION_OVERLAP_SETUP=1"
+    set "MOONLIGHT_VRR_COMPOSITION_GAP_REFRESH=1"
+)
+if "%~2"=="--align" (
+    set "PREFIX=%PREFIX%-aligned"
     set "MOONLIGHT_VRR_ALIGN=1"
 )
 set "MOONLIGHT_VRR_CAPTURE="

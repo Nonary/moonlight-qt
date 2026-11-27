@@ -267,6 +267,17 @@ D3D11VARenderer::~D3D11VARenderer()
 {
     DwmEnableMMCSS(FALSE);
 
+    if (m_CompositionGapRefresh)
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Composition gap refresh: %llu accepted, %llu observed",
+                    static_cast<unsigned long long>(m_AcceptedGapRefreshes),
+                    static_cast<unsigned long long>(m_CompositionPresenter.displayedGapRefreshes()));
+    if (m_CompositionOverlapRenderSetup) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Composition decode overlap: %llu setup stages while decode was pending (%llu us total)",
+                    static_cast<unsigned long long>(m_OverlappedRenderSetups),
+                    static_cast<unsigned long long>(m_OverlappedRenderSetupUs));
+    }
+
     // The VRR worker may be cancelled after preparation but before Present.
     // Release the retained presentation lock before destroying it or any
     // back-buffer objects.
@@ -912,7 +923,29 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
                     compositionResult);
     }
 
+    if (m_CompositionPresenter.active() &&
+            qgetenv("MOONLIGHT_VRR_COMPOSITION_EARLY_ENQUEUE") == "1") {
+        // The post-enqueue drain holds the presentation lock. Keep it off
+        // shared-device FFmpeg decode, which also takes this lock. PyroWave
+        // decodes on an independent Vulkan queue. Its D3D11 device alias
+        // does not share FFmpeg's immediate-context lock with the decoder.
+        m_CompositionQueueBeforeReady = isPyroWave() || m_DecodeDevice != m_RenderDevice;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Composition early enqueue: %s",
+                    m_CompositionQueueBeforeReady ? "enabled" : "disabled for shared-device D3D11VA");
+    }
+    if (qgetenv("MOONLIGHT_VRR_COMPOSITION_OVERLAP_SETUP") == "1") {
+        m_CompositionOverlapRenderSetup = m_CompositionQueueBeforeReady && isPyroWave() &&
+            params->frameRate == 120 && params->vrrDisplayRefreshHz == 120;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Composition decode overlap: %s",
+                    m_CompositionOverlapRenderSetup ? "enabled" :
+                        "requires early enqueue with PyroWave at 120 FPS on a 120 Hz display");
+    }
+
     m_DxgiWaitableActive = DxgiWaitable::useAdmission(createWaitable, m_CompositionPresenter.active());
+    m_CompositionGapRefresh = m_CompositionOverlapRenderSetup &&
+                              qgetenv("MOONLIGHT_VRR_COMPOSITION_GAP_REFRESH") == "1";
+    if (m_CompositionGapRefresh)
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Composition gap refresh enabled");
     if (m_DecoderParams.enableVrr && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
         if (!m_CompositionPresenter.active()) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1419,8 +1452,40 @@ void D3D11VARenderer::stopDecodeCompletionWatch()
     m_DecodeCompletionLog.clear();
 }
 
+void D3D11VARenderer::bindPyroWaveRenderState(AVFrame* frame)
+{
+    const bool frameChanged = hasFrameFormatChanged(frame);
+    bindVideoVertexBuffer(frameChanged, frame);
+    bindColorConversion(frameChanged, frame);
+}
+
+void D3D11VARenderer::prepareBeforeDecodeReady(AVFrame* frame)
+{
+    if (!m_CompositionOverlapRenderSetup) return;
+    const auto* ref = PyroWaveFrameRef::fromFrame(frame);
+    if (!ref || !ref->decodeFenceValue) return;
+
+    lockPresentation();
+    m_PyroWaveSetupFence = 0;
+    auto* fence = m_PyroWaveSurfaces ? m_PyroWaveSurfaces->decodeFence() : nullptr;
+    if (!m_VrrSuspended && m_CompositionPresenter.active() && fence &&
+            fence->GetCompletedValue() < ref->decodeFenceValue) {
+        const uint64_t startUs = LiGetMicroseconds();
+        // Bind geometry, shader and color constants only. The draw and its
+        // imported decode-fence wait stay with the usual frame preparation.
+        bindPyroWaveRenderState(frame);
+        m_PyroWaveSetupFence = ref->decodeFenceValue;
+        ++m_OverlappedRenderSetups;
+        m_OverlappedRenderSetupUs += LiGetMicroseconds() - startUs;
+    }
+    unlockPresentation();
+}
+
 bool D3D11VARenderer::renderPyroWaveVideo(AVFrame* frame, PyroWaveFrameRef* ref)
 {
+    const bool renderStateBound = m_PyroWaveSetupFence != 0 &&
+        m_PyroWaveSetupFence == ref->decodeFenceValue && m_VideoVertexBuffer;
+    m_PyroWaveSetupFence = 0;
     const auto* views = m_PyroWaveSurfaces ? m_PyroWaveSurfaces->planeViews(ref->surface) : nullptr;
     if (views == nullptr) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -1439,9 +1504,7 @@ bool D3D11VARenderer::renderPyroWaveVideo(AVFrame* frame, PyroWaveFrameRef* ref)
         return false;
     }
 
-    bool frameChanged = hasFrameFormatChanged(frame);
-    bindVideoVertexBuffer(frameChanged, frame);
-    bindColorConversion(frameChanged, frame);
+    if (!renderStateBound) bindPyroWaveRenderState(frame);
 
     ID3D11ShaderResourceView* frameSrvs[] = { (*views)[0].Get(), (*views)[1].Get(), (*views)[2].Get() };
     m_RenderDeviceContext->PSSetShaderResources(0, 3, frameSrvs);
@@ -1876,6 +1939,7 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         m_DisplayHeight = stateInfo->height;
 
         // Release the video vertex buffer so we will upload a new one after resize
+        m_PyroWaveSetupFence = 0;
         m_VideoVertexBuffer.Reset();
 
         // Create new vertex buffers for active overlays
@@ -2455,6 +2519,7 @@ VrrFallbackReason D3D11VARenderer::evaluateVrrEligibility(
 
 void D3D11VARenderer::releasePreparedVrrFrame()
 {
+    m_PyroWaveSetupFence = 0;
     m_CompositionPresenter.cancel();
     // Present() unbinds the render target itself.  A cancellation does not,
     // so explicitly remove the context's reference to the back buffer before
@@ -3004,9 +3069,18 @@ VrrPrepareResult D3D11VARenderer::prepareFrame(AVFrame* frame,
     }
 
     // Publish the in-flight marker before releasing the presentation mutex so
-    // resize/cancellation can retire its GPU writes. Complete rendering here,
-    // before the worker's cadence hold, rather than waiting at its deadline.
+    // resize/cancellation can retire its GPU writes.
     m_VrrFramePrepared = true;
+    if (m_CompositionQueueBeforeReady && m_CompositionPresenter.active()) {
+        // Composition orders display after drawing issued to its device.
+        // Keep the decoder frame owned by the worker until our render marker
+        // is verified after the native enqueue.
+        result.prepared = true;
+        populateVrrGpuReadyFeedback(result.feedback);
+        m_VrrPresentationLocked = false;
+        unlockPresentation();
+        return result;
+    }
     if (!finishVrrPresentReady(true)) {
         const bool frameCancelled = !m_VrrFramePrepared || m_VrrSuspended;
         if (!frameCancelled) {
@@ -3071,10 +3145,10 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         return cancelFrame();
     }
 
-    // prepareFrame() already verified this exact marker. Completion cannot
-    // move backwards; keep the deadline boundary free of another GPU wait.
-    // Cancellation clears that proof and may never admit a replacement marker.
-    if (!m_VrrPreparedCompletion.ready(m_VrrGpuReadyFenceValue)) {
+    const bool deferRenderCompletion = m_CompositionQueueBeforeReady &&
+        m_CompositionPresenter.active();
+    if (!deferRenderCompletion &&
+            !m_VrrPreparedCompletion.ready(m_VrrGpuReadyFenceValue)) {
         m_VrrFallbackReason =
             VrrFallbackReason::AdaptivePresentationUnavailable;
         populateVrrGpuReadyFeedback(feedback);
@@ -3087,6 +3161,7 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
     // A window transition can run during the worker's cadence hold. Revalidate
     // the retained image before touching native state at the target boundary.
     if (m_VrrSuspended || checkSupport() != VrrFallbackReason::NoFallback) {
+        if (deferRenderCompletion) return cancelFrame();
         populateVrrGpuReadyFeedback(feedback);
         feedback.cancelled = true;
         releasePreparedVrrFrame();
@@ -3098,6 +3173,10 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "D3D11 VRR presentation detected device loss: %x",
                      deviceReason);
+        if (deferRenderCompletion) {
+            queueRenderDeviceReset();
+            return cancelFrame();
+        }
         populateVrrGpuReadyFeedback(feedback);
         feedback.cancelled = true;
         releasePreparedVrrFrame();
@@ -3138,6 +3217,13 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
                                            m_CompositionPresentId, &nativeTarget) :
             m_CompositionPresenter.present(m_CompositionPresentId);
         feedback.nativePresentEndUs = LiGetMicroseconds();
+        // Preserve the enqueue boundary even if rendering is still in flight.
+        // Drain on failure too: a rejected present does not cancel GPU reads.
+        const bool completionFailed = deferRenderCompletion && !finishVrrPresentReady(false);
+        if (deferRenderCompletion) populateVrrGpuReadyFeedback(feedback);
+        if (completionFailed) {
+            m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+        }
         feedback.nativePresentResultValid = true;
         feedback.nativePresentResult = static_cast<int64_t>(hr);
         feedback.presented = hr == S_OK;
@@ -3186,7 +3272,7 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
             m_CompositionModeLogged = true;
         }
         releasePreparedVrrFrame();
-        if (FAILED(hr)) queueRenderDeviceReset();
+        if (FAILED(hr) || completionFailed) queueRenderDeviceReset();
         return feedback;
     }
 
@@ -3561,6 +3647,21 @@ void D3D11VARenderer::setSuspended(bool suspended)
         // diagnostic sample after a window/mode transition.
         m_VrrPriorPresentCountValid = false;
         m_VrrPriorFrameStatsValid = false;
+    }
+}
+
+void D3D11VARenderer::refreshDisplayedFrame(uint64_t priorId, uint64_t nextSlotUs, uint64_t periodUs)
+{
+    uint64_t refreshId = 0;
+    lockPresentation();
+    if (m_CompositionGapRefresh && !m_VrrSuspended && !m_VrrFramePrepared)
+        m_CompositionPresenter.refreshDisplayedFrame(priorId, nextSlotUs, periodUs,
+                                                      LiGetMicroseconds, refreshId);
+    unlockPresentation();
+    if (refreshId) {
+        ++m_AcceptedGapRefreshes;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Composition gap refresh present %llu repeats %llu",
+                     static_cast<unsigned long long>(refreshId), static_cast<unsigned long long>(priorId));
     }
 }
 

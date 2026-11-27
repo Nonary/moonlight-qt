@@ -1955,6 +1955,13 @@ void VrrReplayConfigTest::gpuReadyStageTimingAudit()
         700, 701, 701, 805, 300, 790, 900, true, 860));
     QVERIFY(!isVrrDeferredGpuReadyOrderValid(
         800, 801, 802, 805, 300, 790, 900, true, 860));
+    // Composition may accept a present before the CPU confirms retirement.
+    QVERIFY(isVrrDeferredGpuReadyOrderValid(
+        870, 871, 871, 885, 300, 790, 900, true, 810, 860));
+    QVERIFY(!isVrrDeferredGpuReadyOrderValid(
+        850, 851, 851, 885, 300, 790, 900, true, 810, 860));
+    QVERIFY(!isVrrDeferredGpuReadyOrderValid(
+        870, 871, 871, 905, 300, 790, 900, true, 810, 860));
 
     // The retained poll may be the preparation or final check. Both
     // relationships cover pending cancellation and timeout rows.

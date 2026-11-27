@@ -14294,6 +14294,11 @@ int main(int argc, char* argv[])
                     deviceRemovalSentinelAllowed) ? 0 : 1;
         }
         if (gpuReadyWaitOperationObserved) {
+            // Scheduled Composition can verify the render fence after the
+            // native call. Historical deferred waits completed before it.
+            const uint64_t compositionEnqueueEndUs =
+                nativeScheduledLifecycle && nativeBackendDeclared &&
+                nativeBackend == kNativeBackendComposition ? nativePresentEndUs : 0;
             bool gpuReadyOrderValid =
                 gpuReadyWaitStartUs != 0 &&
                 gpuReadyTimeUs >= gpuReadyWaitStartUs &&
@@ -14310,7 +14315,8 @@ int main(int argc, char* argv[])
                          nativePresentTimingDeclared &&
                              metrics.presentTimingIntegrityTelemetryAvailable &&
                              nativePresentStartUs != 0,
-                         nativePresentStartUs) :
+                         nativePresentStartUs,
+                         compositionEnqueueEndUs) :
                      gpuReadyTimeUs <= recordedPreparationEndUs);
             if (metrics.gpuReadyBoundsTelemetryAvailable &&
                     !gpuReadyNativeCompletion) {

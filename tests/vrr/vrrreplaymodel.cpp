@@ -1061,7 +1061,8 @@ bool isVrrDeferredGpuReadyOrderValid(
     uint64_t preparationEndUs,
     uint64_t presentStartUs, uint64_t presentEndUs,
     bool nativePresentTimingValid,
-    uint64_t nativePresentStartUs)
+    uint64_t nativePresentStartUs,
+    uint64_t compositionEnqueueEndUs)
 {
     // The current D3D11 final poll runs inside Present/cancellation and its
     // end is the start of the residual wait. Older preparation polls retain
@@ -1078,7 +1079,10 @@ bool isVrrDeferredGpuReadyOrderValid(
         waitReturnUs <= presentEndUs &&
         (!nativePresentTimingValid ||
          (nativePresentStartUs != 0 &&
-         waitReturnUs <= nativePresentStartUs));
+          (compositionEnqueueEndUs != 0 ?
+               nativePresentStartUs <= compositionEnqueueEndUs &&
+                   compositionEnqueueEndUs <= pollStartUs :
+               waitReturnUs <= nativePresentStartUs)));
 }
 
 bool isVrrGpuFencePollRelationshipValid(

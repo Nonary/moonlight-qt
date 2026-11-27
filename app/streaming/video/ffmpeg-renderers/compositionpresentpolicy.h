@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +38,33 @@ struct CompositionPresentTarget {
     }
 };
 
+// A long interval within near-ceiling gameplay can cross the panel's repeat
+// point. Refresh existing content only near the two-scan boundary between
+// its observed flip and the extrapolated RTP slot.
+struct CompositionGapRefresh {
+    static uint64_t nextSlot(uint32_t priorFrame, uint32_t priorRtp, uint64_t priorTargetUs,
+                             uint32_t frame, uint32_t rtp, uint64_t periodUs)
+    {
+        if (!priorTargetUs || !periodUs || frame - priorFrame != 1) return 0;
+        const uint64_t gapUs = uint64_t(rtp - priorRtp) * 1000 / 90;
+        if (gapUs < periodUs * 7 / 4 || gapUs >= periodUs * 2 ||
+                gapUs > (std::numeric_limits<uint64_t>::max)() - priorTargetUs) return 0;
+        return priorTargetUs + gapUs;
+    }
+
+    static bool hasSpareScan(uint64_t displayedUs, uint64_t nowUs,
+                             uint64_t nextSlotUs, uint64_t periodUs)
+    {
+        // The predecessor of frame 2997 crossed the exact two-scan cutoff
+        // by tens to hundreds of microseconds in repeated hardware trials.
+        // Bound that phase allowance well below the refresh we can save.
+        const uint64_t slotToleranceUs = (std::min)(periodUs / 16, uint64_t(500));
+        return periodUs && displayedUs && displayedUs <= nowUs && nowUs < nextSlotUs &&
+               nextSlotUs - displayedUs >= 2 * periodUs - slotToleranceUs &&
+               nextSlotUs - nowUs >= periodUs - periodUs / 8;
+    }
+};
+
 // Each accepted present owns one of the existing displayable buffers. The
 // native availability/fence/status evidence releases this accounting; a CPU
 // deadline or a Queued notification alone does not prove display or retirement.
@@ -58,6 +86,13 @@ public:
     void available(size_t slot)
     {
         if (slot < Capacity) m_Ids[slot] = 0;
+    }
+
+    void repeat(size_t slot, uint64_t id)
+    {
+        // The same texture stays in use. Earlier retirement notifications
+        // must not release its latest use.
+        m_Ids.at(slot) = id;
     }
 
     void terminal(uint64_t id)

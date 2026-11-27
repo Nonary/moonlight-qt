@@ -1,6 +1,7 @@
 #include "vrr/profile.h"
 #include "vrr/profilecodec.h"
 #include "vrrpacingworker.h"
+#include "../compositionpresentpolicy.h"
 #include "../../videothreadpriority.h"
 #include "../../timinggraph.h"
 
@@ -17,10 +18,14 @@ extern "C" {
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
 #include <thread>
 #include <utility>
 
 namespace {
+
+std::mutex gapWorkerMutex;
+VrrPacingWorker* gapWorker = nullptr;
 
 VrrSessionConfig prepareProductionConfig(VrrSessionConfig config)
 {
@@ -146,6 +151,10 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
 VrrPacingWorker::~VrrPacingWorker()
 {
     {
+        std::lock_guard<std::mutex> lock(gapWorkerMutex);
+        if (gapWorker == this) gapWorker = nullptr;
+    }
+    {
         QMutexLocker lock(&m_FrameQueueLock);
         m_Stopping.store(true);
         m_FrameQueueNotEmpty.wakeAll();
@@ -224,11 +233,29 @@ bool VrrPacingWorker::start()
     }
 
     m_WorkerStarted = true;
+    if (m_Presenter->supportsGapRefresh()) {
+        std::lock_guard<std::mutex> lock(gapWorkerMutex);
+        gapWorker = this;
+    }
     if (m_Telemetry != nullptr) {
         m_Telemetry->beginVrrSession();
     }
 
     return true;
+}
+
+void VrrPacingWorker::notifyFrameStart(uint32_t frame, uint32_t rtp)
+{
+    // Do not hold packet delivery behind either rendering or queue admission.
+    std::unique_lock<std::mutex> registration(gapWorkerMutex, std::try_to_lock);
+    if (!registration || !gapWorker) return;
+    auto& worker = *gapWorker;
+    std::unique_lock<QMutex> lock(worker.m_FrameQueueLock, std::try_to_lock);
+    if (!lock) return;
+    worker.m_GapNextSlotUs = CompositionGapRefresh::nextSlot(worker.m_GapAnchorFrame,
+        worker.m_GapAnchorRtp, worker.m_GapAnchorTargetUs, frame, rtp,
+        worker.m_Config.displayRefreshHz > 0 ? 1000000u / worker.m_Config.displayRefreshHz : 0);
+    if (worker.m_GapNextSlotUs) worker.m_FrameQueueNotEmpty.wakeOne();
 }
 
 void VrrPacingWorker::submit(PacedFrame&& frame)
@@ -403,6 +430,9 @@ int VrrPacingWorker::run()
                                TraceDisposition::SuspensionDiscard, false);
             noteDrop();
             continue;
+        }
+        if (!preparedAhead && !queuedFrame.reservedReadinessValid) {
+            m_Presenter->prepareBeforeDecodeReady(frame.frame());
         }
         auto decodeReadiness = preparedAhead ? VrrDecodeReadiness{} :
             queuedFrame.reservedReadinessValid ? queuedFrame.reservedReadiness :
@@ -914,6 +944,17 @@ int VrrPacingWorker::run()
             m_Presenter->presentAdaptive(presentRequest);
         telemetry.presentEndUs = LiGetMicroseconds();
         // Our Present is queued ahead of any decode submitted from now on.
+        if (m_Presenter->supportsGapRefresh()) {
+            QMutexLocker lock(&m_FrameQueueLock);
+            m_GapNextSlotUs = 0;
+            m_GapAnchorTargetUs = feedback.presented && !feedback.cancelled &&
+                feedback.submissionIdValid && decision.cadenceEligible && decision.usedRtpTimestamp &&
+                !decision.phaseDiscontinuity && decision.sourcePeriodUs <= m_TimingController->displayPeriodUs() * 6 / 5 ?
+                decision.targetUs : 0;
+            m_GapAnchorFrame = static_cast<uint32_t>(decision.frameNumber);
+            m_GapAnchorRtp = frame.rtpTimestamp();
+            m_GapAnchorPresentId = feedback.submissionId;
+        }
         VrrReceiveDeadline::clearPresentWindow();
         m_PresentCallCost.observe(telemetry.presentStartUs, telemetry.presentEndUs);
         telemetry.presentDurationUs =
@@ -1123,8 +1164,21 @@ bool VrrPacingWorker::dequeueFrame(QueuedFrame& frame,
     QMutexLocker lock(&m_FrameQueueLock);
     while (!isStopping() && !m_Suspended.load() &&
             m_PendingWindowStateFlags.load() == 0 && m_FrameQueue.empty()) {
+        const auto nextSlotUs = std::exchange(m_GapNextSlotUs, uint64_t(0));
+        if (nextSlotUs) {
+            const auto priorId = m_GapAnchorPresentId;
+            m_GapAnchorTargetUs = 0;
+            lock.unlock();
+            if (!m_FrameQueueDepth.load() && !isStopping() && !m_Suspended.load() &&
+                    !m_PendingWindowStateFlags.load())
+                m_Presenter->refreshDisplayedFrame(priorId, nextSlotUs, m_TimingController->displayPeriodUs());
+            lock.relock();
+            continue;
+        }
         m_FrameQueueNotEmpty.wait(&m_FrameQueueLock);
     }
+    m_GapNextSlotUs = 0;
+    m_GapAnchorTargetUs = 0;
 
     if (isStopping()) {
         return false;

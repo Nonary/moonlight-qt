@@ -6,6 +6,8 @@ Buffer growth uses delivery and decode readiness at both ends of an interval.
 Windows uses DXGI at full refresh. Ultra Low Latency VRR is an opt-in
 zero-frame adaptive buffer for qualified Windows Composition and SteamOS
 Gaming Mode presentation.
+The opt-in Windows Composition gap refresh uses first-packet RTP timing and
+verified independent-flip feedback as described in section 10.4.
 The custom profile exposes the frame allowance, timing target, score history,
 and interval tolerance. The earlier platform changes include the decode-buffer accounting
 correction on 2026-10-30,
@@ -1398,6 +1400,42 @@ accepted predecessors and translates the worker's future display deadline into
 QPC-derived 100 ns presentation time using a fresh clock bracket. Elapsed
 deadlines request immediate presentation, without adding a period to hide
 lateness. The legacy immediate overload remains available for probes.
+`MOONLIGHT_VRR_COMPOSITION_EARLY_ENQUEUE=1` enables the A/B experiment on
+the Composition path with Vulkan PyroWave decoding or separate D3D11VA
+decode and render devices. PyroWave's decode and surface-reuse fences cross
+the Vulkan/D3D11 boundary even though the D3D11 handles alias. The experiment
+keeps the controller's target calculation and the decode-to-render dependency.
+The renderer signals and flushes the output fence, sends the same controller
+target to the presentation manager, then verifies completion before releasing
+its ownership of the decoder input. The native call timestamps exclude that
+post-enqueue wait. Resize and cancellation still drain pending rendering.
+The ChaseShare Composition A/B launcher forces Composition for all options
+and tags the capture names by mode. The default waits for the fence before
+enqueue. Use the fresh capture's matched display intervals and latency to
+evaluate whether moving this wait helps live playback.
+The launcher's third option keeps early enqueue and sets
+`MOONLIGHT_VRR_COMPOSITION_OVERLAP_SETUP=1`. With PyroWave at 120 FPS on a
+120 Hz display, the pacing worker binds video geometry, shader and color
+conversion state while the decode fence is pending. The renderer holds its
+presentation mutex only during setup. It keys the bindings to the frame's
+decode fence and invalidates them after use, resize or cancellation. Buffer
+acquisition, the GPU-side fence wait, texture reads, CPU decode observation,
+target calculation and frame-drop rules stay in their existing order.
+The session log counts setup stages that started before decode completed.
+
+Option 4 adds `MOONLIGHT_VRR_COMPOSITION_GAP_REFRESH=1` to Option 3. The
+first accepted packet of the first FEC block supplies the next frame number
+and RTP timestamp. During near-ceiling playback an adjacent source interval
+between 1.75 and 2 display periods can wake the idle pacing worker. It checks
+the last game frame's independent-flip ID and time on this output. If two
+scans fit within 0.5 ms of the extrapolated RTP slot and roughly a period is still left,
+it re-presents the displayed buffer with an immediate target. This puts a
+refresh of the old image in the spare slot before the new image is ready.
+Decoded frames take priority and receive their usual controller deadlines.
+The renderer requests cancellation of an outstanding repeat before submitting
+new content. Native present IDs include accepted repeats. The session log
+identifies each repeat and its predecessor, and only flips of game content
+enter the pacer's display feedback.
 Clock correlation is retried a bounded number of times when preemption makes
 the bracket unreliable; persistent uncertainty drops that frame with `S_FALSE`
 instead of treating a scheduling interruption as device loss.
@@ -1710,9 +1748,10 @@ that the compositor dropped the other frames. The installed Gamescope 3.16.23.5
 source supplies its scheduled vblank target as `actualPresentTime`; these records
 must not be treated as an independent physical scanout measurement.
 
-The worker presents only newly received frames and waits for queue activity
-when empty. It no longer retains and re-presents the last image to fill gaps.
-Display-side low-frame-rate compensation remains the display's responsibility.
+On Vulkan the worker presents newly received frames and waits for queue activity
+when empty. The display handles low-frame-rate compensation. The Windows
+Composition experiment in section 10.4 can explicitly refresh the displayed
+image during an eligible near-ceiling interval.
 Historical `gap_fills_before` and `gap_fill_last_us` CSV columns remain reserved
 and zero-valued to preserve trace compatibility.
 

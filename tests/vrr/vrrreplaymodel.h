@@ -498,7 +498,8 @@ bool isVrrDeferredGpuReadyOrderValid(
     uint64_t preparationEndUs,
     uint64_t presentStartUs, uint64_t presentEndUs,
     bool nativePresentTimingValid,
-    uint64_t nativePresentStartUs);
+    uint64_t nativePresentStartUs,
+    uint64_t compositionEnqueueEndUs = 0);
 
 bool isVrrGpuFencePollRelationshipValid(
     uint64_t fenceValue,

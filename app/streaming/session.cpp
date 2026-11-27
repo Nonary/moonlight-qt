@@ -21,6 +21,9 @@
 #ifdef HAVE_FFMPEG
 #include "video/ffmpeg.h"
 #include "video/ffmpeg-renderers/pacer/vrr/receivedeadline.h"
+#ifdef Q_OS_WIN
+#include "video/ffmpeg-renderers/pacer/vrrpacingworker.h"
+#endif
 #endif
 
 #ifdef HAVE_SLVIDEO
@@ -1978,6 +1981,10 @@ bool Session::startConnectionAsync()
     // Nothing is published unless the VRR pacer runs timestamp playout.
 #ifdef HAVE_FFMPEG
     VrrReceiveDeadline::clear();
+#ifdef Q_OS_WIN
+    LiSetVideoFrameStartCallback(qgetenv("MOONLIGHT_VRR_COMPOSITION_GAP_REFRESH") == "1" ?
+                                    VrrPacingWorker::notifyFrameStart : nullptr);
+#endif
     LiSetVideoReassemblyDeadlineCallback([](uint32_t rtpTimestamp) {
         return VrrReceiveDeadline::deadlineUs(rtpTimestamp, LiGetMicroseconds());
     });

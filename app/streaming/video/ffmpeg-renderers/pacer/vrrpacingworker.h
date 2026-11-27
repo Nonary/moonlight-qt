@@ -40,6 +40,7 @@ public:
     bool start();
 
     void submit(PacedFrame&& frame);
+    static void notifyFrameStart(uint32_t frame, uint32_t rtp);
 
     // Calls from the UI/main thread only manipulate worker-owned state. All
     // backend notifications are delivered by the worker itself.
@@ -262,6 +263,9 @@ private:
 
     QMutex m_FrameQueueLock;
     QWaitCondition m_FrameQueueNotEmpty;
+    // Protected by m_FrameQueueLock. Only the worker calls the presenter.
+    uint32_t m_GapAnchorFrame = 0, m_GapAnchorRtp = 0;
+    uint64_t m_GapAnchorTargetUs = 0, m_GapAnchorPresentId = 0, m_GapNextSlotUs = 0;
     // Keep enough decoded successors to absorb the short gap-then-burst
     // delivery pattern seen near the panel ceiling. Capacity stays bounded and
     // evicts the oldest queued successor under sustained pressure, so it cannot
@@ -271,7 +275,6 @@ private:
     std::deque<QueuedFrame> m_FrameQueue;
     std::atomic_size_t m_FrameQueueDepth { 0 };
     PacedFrame m_DeferredFrame;
-    // The last presented image, re-presented inside a host gap.
     SDL_Thread* m_WorkerThread = nullptr;
     std::atomic_bool m_Stopping { false };
     std::atomic_bool m_Suspended { false };

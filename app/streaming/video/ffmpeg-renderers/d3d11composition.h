@@ -51,6 +51,8 @@ public:
     HRESULT acquire(ID3D11RenderTargetView** view);
     void cancel() { m_Acquired = m_Buffers.size(); }
     HRESULT clearQueuedPresents();
+    HRESULT refreshDisplayedFrame(uint64_t priorId, uint64_t nextSlotUs, uint64_t periodUs,
+                                  uint64_t (*clockUs)(), uint64_t& refreshId);
     HRESULT setColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace);
     HRESULT present(uint64_t& id);
     HRESULT present(uint64_t targetUs, uint64_t (*clockUs)(), uint64_t& id,
@@ -64,6 +66,7 @@ public:
     uint64_t skippedFrames() const { return m_SkippedFrames; }
     uint64_t canceledFrames() const { return m_CanceledFrames; }
     uint64_t droppedStatusFrames() const { return m_DroppedStatusFrames; }
+    uint64_t displayedGapRefreshes() const { return m_DisplayedGapRefreshes; }
     uint64_t retiringPresentId() const { return m_RetiringPresentId; }
     unsigned outstandingPresents() const { return m_Ownership.outstanding(); }
 
@@ -102,6 +105,9 @@ private:
     UINT m_SourceId = 0;
     uint64_t m_LastDisplayedId = 0;
     uint64_t m_LastObservedDisplayId = 0;
+    uint64_t m_LastObservedDisplayTime100ns = 0;
+    size_t m_LastContentBuffer = m_Buffers.size();
+    uint64_t m_LastContentId = 0, m_GapRefreshId = 0, m_DisplayedGapRefreshes = 0;
     uint64_t m_RetiringPresentId = 0;
     uint64_t m_ComposedFrames = 0;
     uint64_t m_IndependentFrames = 0;

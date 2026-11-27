@@ -12,6 +12,33 @@ int main()
             ++failures;
         }
     };
+    constexpr uint64_t period = 8333;
+    const auto first = CompositionGapRefresh::nextSlot(2489, 0xffffff00, 23419296,
+                                                       2490, 0x4bf, period);
+    check(first == 23435640 && CompositionGapRefresh::hasSpareScan(23417963, 23425876, first, period),
+          "frame 2490 has two available scans across RTP wrap");
+    const auto second = CompositionGapRefresh::nextSlot(2996, 0, 27775962, 2997, 1402, period);
+    check(second == 27791539 && CompositionGapRefresh::hasSpareScan(27774860, 27783480, second, period),
+          "frame 2997 has room at first packet arrival");
+    check(CompositionGapRefresh::hasSpareScan(second - 2 * period + 500, 27783480, second, period) &&
+          !CompositionGapRefresh::hasSpareScan(second - 2 * period + 501, 27783480, second, period),
+          "sub-millisecond variation of the preceding flip has a bounded allowance");
+    check(!CompositionGapRefresh::nextSlot(1, 0, 10000, 2, 750, period) &&
+          !CompositionGapRefresh::nextSlot(1, 0, 10000, 2, 1500, period) &&
+          !CompositionGapRefresh::nextSlot(1, 0, 10000, 3, 1402, period) &&
+          !CompositionGapRefresh::nextSlot(1, 0, 0, 2, 1402, period),
+          "normal 120 FPS, 60 FPS, missing predecessors and invalid anchors skip the extra scan");
+    check(!CompositionGapRefresh::hasSpareScan(27775500, 27783480, second, period) &&
+          !CompositionGapRefresh::hasSpareScan(27774860, 27785480, second, period) &&
+          !CompositionGapRefresh::hasSpareScan(0, 27783480, second, period),
+          "a late preceding flip, late receipt or missing display evidence veto a repeat");
+    CompositionPresentOwnership<2> repeated;
+    repeated.accept(0, 8);
+    repeated.repeat(0, 9);
+    repeated.retireThrough(8);
+    check(repeated.outstanding() == 1, "original retirement preserves the repeat's buffer ownership");
+    repeated.terminal(9);
+    check(repeated.outstanding() == 0, "canceling the repeat releases its accounting");
     const auto target = CompositionPresentTarget::translate(3000, 100000, 1000, 1020);
     check(target.time100ns == 119900 && target.uncertaintyUs == 11,
           "future display deadline crosses clock domains without losing its lead");
