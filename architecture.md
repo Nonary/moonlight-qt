@@ -98,6 +98,12 @@ Keep these separate: intended source slot, scheduled CPU submission, GPU
 readiness, actual native call, OS presentation feedback, and physical scanout.
 They are related observations, not interchangeable timestamps.
 
+The VRR stats can also report the age of the same frame from host capture to
+an OS display event. The host negotiates separate capture-start metadata and
+the client maps the host monotonic clock into the presentation clock using
+periodic four-timestamp probes. The HUD reports a labeled capture-to-submit
+estimate when display events are unavailable. Neither measurement drives pacing.
+
 ## 2. Source map and reading order
 
 Paths are relative to the repository. The repeated `moonlight-common-c` directory

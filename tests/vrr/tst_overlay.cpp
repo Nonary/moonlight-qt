@@ -2,6 +2,8 @@
 #include "assertions.h"
 #include "overlaymanager.h"
 #include "performancestats.h"
+#include "ffmpeg-renderers/pacer/capturelatency.h"
+#include "CaptureClock.h"
 #include "../../app/streaming/video/clientpacingwarning.h"
 #include "../../app/streaming/video/pyrowave/pyrowavepacketlosswarning.h"
 #include <QCoreApplication>
@@ -638,8 +640,57 @@ static void testConfirmedDisplayRefresh()
     }
 }
 
+namespace {
+void testCaptureLatency()
+{
+    CAPTURE_CLOCK_SAMPLE clock{};
+    assert(captureClockSample(1000, 5200, 5210, 1410, 1000000, &clock));
+    assert(clock.offsetUs == -4000 && clock.delayUs == 400);
+    assert(!captureClockSample(1000, 5200, 5700, 1410, 1000000, &clock));
+    assert(!captureClockSample(1000, 5200, 5210, 1001000, 1000000, &clock));
+
+    CaptureLatency latency;
+    TimingGraphInput submission;
+    submission.backend = 1;
+    submission.submitted = true;
+    submission.idValid = true;
+    submission.submissionId = 1;
+    submission.submissionUs = 1000000;
+    latency.record(submission, 985000, 1000, 200, 0);
+    submission.submissionId = 2;
+    submission.submissionUs = 1010000;
+    latency.record(submission, 991000, 1000, 200, 0);
+
+    const auto estimate = latency.stats(1020000);
+    assert(estimate.valid && !estimate.display && estimate.medianUs == 14000);
+    assert(estimate.p95Us == 18000 && estimate.eligible == 2);
+
+    TimingGraphInput display;
+    display.backend = 1;
+    display.displayValid = true;
+    display.displayId = 2;
+    display.displayUs = 1017000;
+    latency.record(display, 0, 0, 0, 50);
+    display.displayId = 1;
+    display.displayUs = 1011000;
+    latency.record(display, 0, 0, 0, 70);
+    latency.record(display, 0, 0, 0, 70);
+
+    const auto presented = latency.stats(1020000);
+    assert(presented.valid && presented.display && presented.displayed == 2);
+    assert(presented.medianUs == 25000 && presented.p95Us == 25000);
+    assert(presented.uncertaintyUs == 270);
+    assert(!latency.stats(4000000).display);
+    assert(!latency.stats(7000000).valid);
+    latency.clear();
+    latency.record(display, 0, 0, 0, 0);
+    assert(!latency.stats(1020000).valid);
+}
+} // namespace
+
 int main(int argc, char** argv)
 {
+    testCaptureLatency();
     testLaneIntervals();
     testConfirmedDisplayRefresh();
     testBufferCoverage();

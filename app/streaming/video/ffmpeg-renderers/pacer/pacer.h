@@ -5,6 +5,7 @@
 #include "pacertelemetry.h"
 #include "vrr/vrrtypes.h"
 
+#include <QHash>
 #include <QQueue>
 #include <QMutex>
 #include <QWaitCondition>
@@ -51,7 +52,10 @@ public:
     // Only the active VRR worker consumes the decoder-facing pacing metadata.
     void submitFrame(PacedFrame&& frame);
 
-    void submitFrame(AVFrame* frame);
+    void submitFrame(AVFrame* frame, uint64_t captureStartHostUs = 0);
+
+    bool captureLatencyRequested() const { return m_CaptureLatencyRequested; }
+    CaptureLatencyStats captureLatencyStats() const;
 
     bool isVrrActive() const;
 
@@ -82,6 +86,8 @@ private:
 
     void dropFrameForEnqueue(QQueue<AVFrame*>& queue);
 
+    // Owned by the same lock as the legacy frame queues.
+    QHash<AVFrame*, uint64_t> m_LegacyCaptureStarts;
     QQueue<AVFrame*> m_RenderQueue;
     QQueue<AVFrame*> m_PacingQueue;
     QQueue<int> m_PacingQueueHistory;
@@ -101,6 +107,7 @@ private:
     int m_MaxVideoFps;
     int m_DisplayFps;
     int m_RendererAttributes;
+    bool m_CaptureLatencyRequested = false;
     PacerTelemetry m_Telemetry;
     std::unique_ptr<VrrPacingWorker> m_VrrWorker;
 };

@@ -4,7 +4,8 @@ QT = core
 CONFIG += console c++17
 CONFIG -= app_bundle
 DEFINES += SDL_MAIN_HANDLED
-INCLUDEPATH += $$PWD/../../app $$PWD/../../app/streaming/video
+INCLUDEPATH += $$PWD/../../app $$PWD/../../app/streaming/video \
+    $$PWD/../../moonlight-common-c/moonlight-common-c/src
 SOURCES += $$PWD/tst_overlay.cpp $$PWD/../../app/streaming/video/overlaymanager.cpp $$PWD/../../app/path.cpp
 HEADERS += $$PWD/../../app/streaming/video/timinggraph.h
 win32 {

@@ -1455,6 +1455,23 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
     }
     offset += ret;
 
+    if (m_Pacer && m_Pacer->captureLatencyRequested()) {
+        const auto capture = m_Pacer->captureLatencyStats();
+        if (capture.valid) {
+            ret = snprintf(&output[offset], length - offset,
+                           "%s: %.1f / %.1f ms (median / p95, ±%.1f ms, display %.0f%%)\n",
+                           capture.display ? "Capture → display" : "Capture → submit (estimate)",
+                           capture.medianUs / 1000.0, capture.p95Us / 1000.0,
+                           capture.uncertaintyUs / 1000.0,
+                           100.0 * capture.displayed / capture.eligible);
+        }
+        else {
+            ret = snprintf(&output[offset], length - offset, "Capture → display: unavailable\n");
+        }
+        if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
+        offset += ret;
+    }
+
     if (stats.vrrTelemetryActive || stats.vrrEligibleFrames != 0 ||
             stats.vrrPacingDroppedFrames != 0 ||
             stats.vrrPresentFailedFrames != 0 ||
@@ -2863,6 +2880,8 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     uint64_t receiveUs = 0;
                     uint64_t reassembledUs = 0;
                     uint64_t decodeSubmitUs = 0;
+                    const uint64_t captureStartHostUs = m_FrameInfoQueue.isEmpty() ?
+                        0 : m_FrameInfoQueue.head().captureStartHostUs;
 
                     if (vrrActive) {
                         // Capture timing while the matching DECODE_UNIT is
@@ -3002,6 +3021,7 @@ void FFmpegVideoDecoder::decoderThreadProc()
                         pacedFrame.setDeliveryTimeline(receiveUs,
                                                        reassembledUs,
                                                        decodeSubmitUs);
+                        pacedFrame.setCaptureStartHostUs(captureStartHostUs);
                         pacedFrame.setDecodeHoldUs(decodeHoldUs);
                         pacedFrame.setLostPackets(frameLostPackets);
 #ifdef HAVE_PYROWAVE
@@ -3018,7 +3038,7 @@ void FFmpegVideoDecoder::decoderThreadProc()
                             decoderOutputUs, handoffBeginUs, LiGetMicroseconds(), 0, frameNumber});
                     }
                     else {
-                        m_Pacer->submitFrame(frame);
+                        m_Pacer->submitFrame(frame, captureStartHostUs);
                     }
                 }
                 else if (err == AVERROR(EAGAIN)) {

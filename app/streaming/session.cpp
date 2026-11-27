@@ -2386,6 +2386,7 @@ void Session::exec()
             break;
 
         case SDL_APP_DIDENTERFOREGROUND:
+            LiResetCaptureClock();
             notifyDecoderWindowState(WINDOW_STATE_CHANGE_RESTORED);
             break;
 
@@ -2444,6 +2445,8 @@ void Session::exec()
                 notifyDecoderWindowState(WINDOW_STATE_CHANGE_MINIMIZED);
                 break;
             case SDL_WINDOWEVENT_RESTORED:
+                LiResetCaptureClock();
+                [[fallthrough]];
             case SDL_WINDOWEVENT_SHOWN:
                 notifyDecoderWindowState(WINDOW_STATE_CHANGE_RESTORED);
                 break;

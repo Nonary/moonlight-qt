@@ -207,7 +207,8 @@ private:
     bool isStopping() const;
     void waitForSubmissionFloor(const VrrTimingDecision& decision,
                                 FrameTelemetry& telemetry);
-    void recordSubmission(const VrrTimingDecision& decision,
+    void recordSubmission(const PacedFrame& frame,
+                          const VrrTimingDecision& decision,
                           const VrrPresentFeedback& feedback,
                           uint64_t operationStartUs,
                           uint64_t operationEndUs,

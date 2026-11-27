@@ -640,7 +640,7 @@ int VrrPacingWorker::run()
                 telemetry.presentEndUs >= telemetry.presentStartUs ?
                     telemetry.presentEndUs - telemetry.presentStartUs : 0;
             feedback.cancelled = true;
-            recordSubmission(decision, feedback, telemetry.presentStartUs,
+            recordSubmission(frame, decision, feedback, telemetry.presentStartUs,
                              telemetry.presentEndUs,
                              telemetry);
             if (m_Telemetry != nullptr) {
@@ -753,7 +753,7 @@ int VrrPacingWorker::run()
                 }
             }
             feedback.cancelled = true;
-            recordSubmission(decision, feedback, submissionOperationStartUs,
+            recordSubmission(frame, decision, feedback, submissionOperationStartUs,
                              submissionOperationEndUs,
                              telemetry);
             if (m_Telemetry != nullptr) {
@@ -830,7 +830,7 @@ int VrrPacingWorker::run()
                 telemetry.presentEndUs >= telemetry.presentStartUs ?
                     telemetry.presentEndUs - telemetry.presentStartUs : 0;
             feedback.cancelled = true;
-            recordSubmission(decision, feedback, telemetry.presentStartUs,
+            recordSubmission(frame, decision, feedback, telemetry.presentStartUs,
                              telemetry.presentEndUs,
                              telemetry);
             if (m_Telemetry != nullptr) {
@@ -941,7 +941,7 @@ int VrrPacingWorker::run()
                 telemetry.presentEndUs >= telemetry.presentStartUs ?
                     telemetry.presentEndUs - telemetry.presentStartUs : 0;
             feedback.cancelled = true;
-            recordSubmission(decision, feedback, telemetry.presentStartUs,
+            recordSubmission(frame, decision, feedback, telemetry.presentStartUs,
                              telemetry.presentEndUs,
                              telemetry);
             if (m_Telemetry != nullptr) {
@@ -1020,7 +1020,7 @@ int VrrPacingWorker::run()
                 telemetry.renderWaitOvershootUs,
                 targetWait.schedulerDelayUs, targetWait.schedulerDelayValid);
         }
-        recordSubmission(decision, feedback, telemetry.presentStartUs,
+        recordSubmission(frame, decision, feedback, telemetry.presentStartUs,
                          telemetry.presentEndUs,
                          telemetry);
         if (m_Telemetry != nullptr) {
@@ -1339,6 +1339,7 @@ uint32_t VrrPacingWorker::consumeWindowStateNotifications()
         suspended = latestSuspended;
     }
 
+    if (m_Telemetry) m_Telemetry->resetCaptureLatency();
     if (suspended != m_PresenterSuspended) {
         m_Presenter->setSuspended(suspended);
         m_PresenterSuspended = suspended;
@@ -1427,6 +1428,7 @@ void VrrPacingWorker::waitForSubmissionFloor(
 }
 
 void VrrPacingWorker::recordSubmission(
+    const PacedFrame& frame,
     const VrrTimingDecision& decision,
     const VrrPresentFeedback& feedback,
     uint64_t operationStartUs,
@@ -1498,6 +1500,21 @@ void VrrPacingWorker::recordSubmission(
         feedback.latchQpcCorrelationSpanTicks * 1000000 / feedback.latchRawSyncQpcFrequency :
         feedback.presentationUncertaintyUs;
     m_TimingController->notePresentation(observation);
+
+    if (m_Telemetry != nullptr) {
+        Overlay::TimingGraphInput event;
+        event.backend = feedback.nativeBackendValid ? uint32_t(feedback.nativeBackend) : 0;
+        event.submitted = observation.submitted;
+        event.idValid = observation.idValid;
+        event.submissionId = observation.id;
+        event.submissionUs = observation.submission;
+        event.displayValid = observation.sampleValid &&
+            observation.sampleTime <= observation.observed &&
+            observation.timeKind == Vrr13::PresentationTimeKind::DisplayEvent;
+        event.displayId = observation.sampleId;
+        event.displayUs = observation.sampleTime;
+        m_Telemetry->recordCapturePresentation(event, frame.captureStartHostUs(), observation.uncertainty);
+    }
 }
 
 void VrrPacingWorker::deferFrame(PacedFrame&& frame)

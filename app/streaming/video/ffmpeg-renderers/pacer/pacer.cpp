@@ -45,7 +45,8 @@ Pacer::Pacer(IFFmpegRenderer* renderer) :
     m_VsyncSource(nullptr),
     m_VsyncRenderer(renderer),
     m_MaxVideoFps(0),
-    m_DisplayFps(0)
+    m_DisplayFps(0),
+    m_Telemetry(LiGetCaptureClockOffset)
 {
 
 }
@@ -108,6 +109,11 @@ void Pacer::shutdown()
 PacerTelemetrySnapshot Pacer::telemetrySnapshot() const
 {
     return m_Telemetry.snapshot();
+}
+
+CaptureLatencyStats Pacer::captureLatencyStats() const
+{
+    return m_Telemetry.captureLatencyStats(LiGetMicroseconds());
 }
 
 Overlay::TimingGraphSnapshot Pacer::timingGraphSnapshot() const
@@ -263,6 +269,7 @@ void Pacer::handleVsync(int timeUntilNextVsyncMillis)
     // Catch up if we're several frames ahead
     while (m_PacingQueue.count() > frameDropTarget) {
         AVFrame* frame = m_PacingQueue.dequeue();
+        m_LegacyCaptureStarts.remove(frame);
 
         // Drop the lock while we call av_frame_free()
         m_FrameQueueLock.unlock();
@@ -296,6 +303,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                        int vrrLatencyMode, VrrTimingOptions vrrTimingOptions, bool ultraLowLatencyVrr)
 {
     m_MaxVideoFps = maxVideoFps;
+    m_CaptureLatencyRequested = enableVrr;
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
 
     // VRR is deliberately a third pacing mode. It is selected once, before
@@ -467,6 +475,14 @@ void Pacer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
         return;
     }
 
+    if (info && (info->stateChangeFlags & (WINDOW_STATE_CHANGE_DISPLAY |
+            WINDOW_STATE_CHANGE_SIZE | WINDOW_STATE_CHANGE_SUSPENDED |
+            WINDOW_STATE_CHANGE_RESTORED))) {
+        QMutexLocker lock(&m_FrameQueueLock);
+        m_LegacyCaptureStarts.clear();
+        m_Telemetry.resetCaptureLatency();
+    }
+
     // Legacy pacing has no additional window-state work. The VRR worker
     // overrides this path to discard stale work on suspension/minimize.
 }
@@ -479,6 +495,18 @@ void Pacer::renderFrame(AVFrame* frame)
     // Render it
     m_VsyncRenderer->renderFrame(frame);
     const uint64_t afterRender = LiGetMicroseconds();
+
+    if (m_CaptureLatencyRequested) {
+        uint64_t captureStartHostUs;
+        {
+            QMutexLocker lock(&m_FrameQueueLock);
+            captureStartHostUs = m_LegacyCaptureStarts.take(frame);
+        }
+        Overlay::TimingGraphInput submission;
+        submission.submitted = true;
+        submission.submissionUs = afterRender;
+        m_Telemetry.recordCapturePresentation(submission, captureStartHostUs, 0);
+    }
 
     m_Telemetry.recordLegacyFrame(
         afterRender >= decoderOutputUs ?
@@ -523,6 +551,7 @@ void Pacer::renderFrame(AVFrame* frame)
     // Catch up if we're several frames ahead
     while (m_RenderQueue.count() > frameDropTarget) {
         AVFrame* frame = m_RenderQueue.dequeue();
+        m_LegacyCaptureStarts.remove(frame);
 
         // Drop the lock while we call av_frame_free()
         m_FrameQueueLock.unlock();
@@ -539,17 +568,21 @@ void Pacer::dropFrameForEnqueue(QQueue<AVFrame*>& queue)
     SDL_assert(queue.size() <= MAX_QUEUED_FRAMES);
     if (queue.size() == MAX_QUEUED_FRAMES) {
         AVFrame* frame = queue.dequeue();
+        m_LegacyCaptureStarts.remove(frame);
         av_frame_free(&frame);
     }
 }
 
-void Pacer::submitFrame(AVFrame* frame)
+void Pacer::submitFrame(AVFrame* frame, uint64_t captureStartHostUs)
 {
     // Make sure initialize() has been called
     SDL_assert(m_MaxVideoFps != 0);
 
     // Queue the frame and possibly wake up the render thread
     m_FrameQueueLock.lock();
+    if (m_CaptureLatencyRequested && captureStartHostUs) {
+        m_LegacyCaptureStarts.insert(frame, captureStartHostUs);
+    }
     if (m_VsyncSource != nullptr) {
         dropFrameForEnqueue(m_PacingQueue);
         m_PacingQueue.enqueue(frame);
@@ -568,7 +601,8 @@ void Pacer::submitFrame(PacedFrame&& frame)
         return;
     }
 
-    submitFrame(frame.release());
+    const auto captureStartHostUs = frame.captureStartHostUs();
+    submitFrame(frame.release(), captureStartHostUs);
 }
 
 bool Pacer::isVrrActive() const

@@ -186,6 +186,9 @@ public:
         m_DecodeSubmitUs = decodeSubmitUs;
     }
 
+    void setCaptureStartHostUs(uint64_t startUs) { m_CaptureStartHostUs = startUs; }
+    uint64_t captureStartHostUs() const { return m_CaptureStartHostUs; }
+
     uint64_t receiveUs() const
     {
         return m_ReceiveUs;
@@ -264,6 +267,7 @@ private:
     uint64_t m_DecodeCompleteUs = 0;
     uint64_t m_DecodeSyncWaitUs = 0;
     uint64_t m_ReceiveUs = 0;
+    uint64_t m_CaptureStartHostUs = 0;
     uint64_t m_ReassembledUs = 0;
     uint64_t m_DecodeSubmitUs = 0;
     uint64_t m_DecodeHoldUs = 0;

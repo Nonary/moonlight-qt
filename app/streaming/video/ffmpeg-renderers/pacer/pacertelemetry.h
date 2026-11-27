@@ -6,6 +6,8 @@
 #include <cstdint>
 
 #include <QMutex>
+
+#include "capturelatency.h"
 #include "vrr/readinesswindow.h"
 #include "../../timinggraph.h"
 
@@ -116,6 +118,10 @@ struct VrrTelemetrySample {
 
 class PacerTelemetry {
 public:
+    using CaptureClockReader = bool (*)(int64_t*, uint64_t*);
+    explicit PacerTelemetry(CaptureClockReader clock = nullptr)
+        : m_ReadCaptureClock(clock) {}
+
     Overlay::TimingGraphSnapshot timingGraphSnapshot(uint64_t atUs = 0) const
     {
         Overlay::TimingGraphSnapshot points;
@@ -131,6 +137,37 @@ public:
         populatePrepareLatenessPercentilesLocked(snapshot);
         populateSubmitErrorPercentilesLocked(snapshot);
         return snapshot;
+    }
+
+    CaptureLatencyStats captureLatencyStats(uint64_t nowUs) const
+    {
+        QMutexLocker lock(&m_Lock);
+        int64_t offsetUs;
+        uint64_t uncertaintyUs;
+        return m_ReadCaptureClock && m_ReadCaptureClock(&offsetUs, &uncertaintyUs) ?
+            m_CaptureLatency.stats(nowUs) : CaptureLatencyStats{};
+    }
+
+    void resetCaptureLatency()
+    {
+        QMutexLocker lock(&m_Lock);
+        m_CaptureLatency.clear();
+    }
+
+    void recordCapturePresentation(const Overlay::TimingGraphInput& event,
+                                   uint64_t captureStartHostUs, uint64_t displayUncertaintyUs)
+    {
+        if (!m_ReadCaptureClock || (!captureStartHostUs && !event.displayValid)) {
+            return;
+        }
+
+        int64_t offsetUs = 0;
+        uint64_t uncertaintyUs = 0;
+        if (captureStartHostUs && !m_ReadCaptureClock(&offsetUs, &uncertaintyUs)) {
+            captureStartHostUs = 0;
+        }
+        QMutexLocker lock(&m_Lock);
+        m_CaptureLatency.record(event, captureStartHostUs, offsetUs, uncertaintyUs, displayUncertaintyUs);
     }
 
     void beginVrrSession()
@@ -371,6 +408,8 @@ private:
     mutable QMutex m_Lock;
     PacerTelemetrySnapshot m_Snapshot;
     Overlay::TimingGraphHistory m_TimingGraph;
+    const CaptureClockReader m_ReadCaptureClock;
+    CaptureLatency m_CaptureLatency;
     uint64_t m_LastMotionSubmissionUs = 0;
     uint64_t m_LastMotionIntervalUs = 0;
     std::array<uint64_t, kPrepareLatenessSampleCount> m_PrepareLatenessSamples {};
