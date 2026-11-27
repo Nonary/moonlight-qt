@@ -248,6 +248,7 @@
     X(uint64_t, playout_delay_decrease_slew_us, playoutDelayDecreaseSlewUs, 0) \
     X(uint64_t, playout_epoch_confirm_us, playoutEpochConfirmUs, 0) \
     X(uint64_t, playout_smoothing_readiness_bound, playoutSmoothingReadinessBound, 0) \
+    X(uint64_t, bound_unlatched_source_correction, boundUnlatchedSourceCorrection, 0) \
     /* Native future deadlines use the logical display clock, not CPU enqueue. */ \
     X(uint64_t, native_scheduled_presentation, nativeScheduledPresentation, 0) \
     /* Worker-paced smoothing uses its own bounded retiming law, not T/second. */ \

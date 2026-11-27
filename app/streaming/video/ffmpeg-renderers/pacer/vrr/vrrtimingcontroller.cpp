@@ -327,6 +327,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     else if (config.smoothFrameTiming) {
         if (vrr18) {
             parameters.smoothingMode = VrrSmoothingWorkerCeilingBounded;
+            parameters.boundUnlatchedSourceCorrection = 1;
         }
         parameters.playoutSmoothingOwnMovement = 1;
         parameters.playoutSmoothingReadinessBound = vrr18;
@@ -1956,6 +1957,14 @@ int64_t VrrTimingController::cadenceSmoothingAdjustUs(
             const int64_t priorErrorUs = std::clamp(periodUs - previousGapUs, -int64_t(toleranceUs), int64_t(toleranceUs));
             const int64_t phaseShiftUs = (2 * (periodUs - int64_t(intervalUs)) + priorErrorUs) / 3;
             correctionUs = (pairDifferenceUs / 4 + phaseShiftUs) * rawGain / 2000;
+        }
+        else if (!m_CanLatchPresentation && m_Parameters.boundUnlatchedSourceCorrection &&
+                 m_Parameters.smoothingMode == VrrSmoothingWorkerCeilingBounded &&
+                 !withinPercent(m_DisplayPeriodUs, m_SourcePeriodUs, 25)) {
+            // Recent RTP intervals reached the display floor while the fit
+            // still reflects slower frames. A software-spaced presenter
+            // cannot recover a large phase swing on the next full-rate frame.
+            correctionUs = std::clamp(correctionUs, -int64_t(toleranceUs), int64_t(toleranceUs));
         }
         m_SmoothingEngaged = true;
         return std::clamp(correctionUs, -int64_t(saturatingAdd(playoutDelayUs, reserveUs)),

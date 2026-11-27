@@ -344,6 +344,7 @@ QJsonObject vrrDefaultReplayConfigurationJson()
 bool vrrCaptureDefaultsControllerFieldToZero(const QString& name)
 {
     return name == QStringLiteral("unlatched_guard_uses_source_slack") ||
+           name == QStringLiteral("bound_unlatched_source_correction") ||
            name == QStringLiteral("playout_vrr18_interval_feedback") ||
            name == QStringLiteral("playout_interval_release_tau_us") ||
            name == QStringLiteral("playout_interval_taper_hold_us") ||
@@ -472,6 +473,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.unlatchedGuardUsesSourceSlack > 1) {
         return fail("unlatched_guard_uses_source_slack must be 0 or 1");
+    }
+    if (value.boundUnlatchedSourceCorrection > 1) {
+        return fail("bound_unlatched_source_correction must be 0 or 1");
     }
     if (value.guardDecayFrames == 0 || value.schedulerLearningSamples == 0 ||
             value.readinessLearningSamples == 0 ||

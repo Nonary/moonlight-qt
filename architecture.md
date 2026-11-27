@@ -687,6 +687,12 @@ with the preceding gap contributing at most one tolerance of phase error.
 When a variable source returns to a one-refresh interval outside the fitted
 cadence’s 25% stability band, a latching presenter limits the increase in
 retiming to one tolerance. This avoids prolonging that interval after a slower run.
+On a presenter that enforces spacing in software, one late submission delays
+the next at full refresh. If recent RTP gaps reach the display period within
+one tolerance and that period lies outside the fitted cadence’s 25% band,
+the worker bounds the variable-source correction to one tolerance in either
+direction. Captures without `bound_unlatched_source_correction` replay with
+their original correction.
 Mode 9 retains the previous source-phase behavior for exact replay. Mode 8
 retains the older-pair correction for exact replay. These decisions never
 integrate prior corrected deadlines. The worker learns smoothing reserve
