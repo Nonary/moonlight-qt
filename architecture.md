@@ -662,6 +662,11 @@ submission deadline from the new clock mapping. Phase recovery and the render
 wait use that deadline and still respect readiness and display spacing.
 The recorded `playout_reseed_nominal_target` parameter lets exact replay
 restore the earlier deadline behavior for captures made before this change.
+Revision 2 applies to native scheduled presentation. While a large forward
+projection still needs confirmation, the controller builds a deadline from
+local frame readiness and the ordinary display-spacing floor. This allows the
+worker to reach the frames that can confirm the new mapping. The original
+mapping and confirmation threshold stay in effect until that confirmation.
 
 ## 9. Adaptive input buffer and calibration
 

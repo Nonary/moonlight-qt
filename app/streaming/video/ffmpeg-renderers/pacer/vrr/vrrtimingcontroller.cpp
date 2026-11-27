@@ -366,7 +366,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         options.bufferPerMille;
     parameters.playoutSmoothingSnapPerMille = kPlayoutSmoothingSnapPerMille;
     parameters.playoutOffsetReseedFrames = kPlayoutOffsetReseedFrames;
-    parameters.playoutReseedNominalTarget = 1;
+    parameters.playoutReseedNominalTarget = nativeScheduledPresentation ? 2 : 1;
     parameters.playoutDelaySlewAcrossBands = 1;
     // Spend the existing playout interval on preparation on both platforms.
     // Vulkan can hand off a pending GPU render using its present semaphore;
@@ -1109,9 +1109,11 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             originalTargetUs = targetUs;
         }
     }
-    else if (futureProjection && nativeAbsorb) {
+    else if (futureProjection && (nativeAbsorb ||
+            (m_Parameters.nativeScheduledPresentation && m_Parameters.playoutReseedNominalTarget >= 2))) {
         // Keep the native queue available for the next observation instead
-        // of reserving a distant deadline from an unconfirmed clock jump.
+        // of waiting on a distant deadline while the confirmation frames queue
+        // behind this one. The ordinary spacing floor still applies below.
         const uint64_t fallbackUs = saturatingAdd(addSigned(sourceMappingUs(frame), smoothingUs),
                                                   saturatingAdd(playoutDelayUs, leadUs));
         originalTargetUs = std::min(originalTargetUs, fallbackUs);

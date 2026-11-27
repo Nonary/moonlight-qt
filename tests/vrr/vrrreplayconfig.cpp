@@ -490,8 +490,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutOffsetCadenceGate > 1) {
         return fail("playout_offset_cadence_gate must be 0 or 1");
     }
-    if (value.playoutReseedNominalTarget > 1) {
-        return fail("playout_reseed_nominal_target must be 0 or 1");
+    if (value.playoutReseedNominalTarget > 2) {
+        return fail("playout_reseed_nominal_target must be in 0..2");
     }
     if (value.playoutOffsetSourceClock > 1) {
         return fail("playout_offset_source_clock must be 0 or 1");

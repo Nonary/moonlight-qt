@@ -329,6 +329,8 @@ void VrrReplayConfigTest::reseedNominalTargetPolicy()
 
     const auto current = vrrTimingParametersForSession(VrrSessionConfig{}, false, false);
     QCOMPARE(current.playoutReseedNominalTarget, uint64_t(1));
+    const auto native = vrrTimingParametersForSession(VrrSessionConfig{}, true, true);
+    QCOMPARE(native.playoutReseedNominalTarget, uint64_t(2));
     QString error;
     auto snapshot = vrrTimingParametersToJson(current);
     snapshot.remove("playout_reseed_nominal_target");
@@ -337,7 +339,10 @@ void VrrReplayConfigTest::reseedNominalTargetPolicy()
     QVERIFY2(applyVrrReplayControllerSnapshot({{"playout_reseed_nominal_target", 1}}, historical, error),
              qPrintable(error));
     QCOMPARE(historical.playoutReseedNominalTarget, uint64_t(1));
-    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_reseed_nominal_target", 2}}, historical, error));
+    QVERIFY2(applyVrrReplayControllerSnapshot({{"playout_reseed_nominal_target", 2}}, historical, error),
+             qPrintable(error));
+    QCOMPARE(historical.playoutReseedNominalTarget, uint64_t(2));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_reseed_nominal_target", 3}}, historical, error));
 }
 
 void VrrReplayConfigTest::productionPolicyValidation()

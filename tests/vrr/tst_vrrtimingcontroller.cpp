@@ -1016,6 +1016,43 @@ void testConfirmedClockReseedReplacesNominalDeadline()
     }
 }
 
+void testNativeClockJumpKeepsQueueMovingDuringConfirmation()
+{
+    const auto session = vrrProductionSession(1, 120, 120, false, true);
+    auto policy = vrrTimingParametersForSession(session, true, true);
+    VrrTimingController current(session, true, policy);
+    policy.playoutReseedNominalTarget = 1;
+    VrrTimingController historical(session, true, policy);
+    uint64_t nowUs = 1000000;
+    uint32_t stamp = 18655;
+    uint64_t previousTarget = 0;
+    for (int i = 1; i <= 12; ++i) {
+        nowUs += 8333;
+        stamp += i == 6 ? 78055 : 750; // Timestamp jumps; decoded frames keep arriving every refresh.
+        const auto input = frame(i, stamp, true, nowUs);
+        const auto decision = current.schedule(input, nowUs);
+        const auto old = historical.schedule(input, nowUs);
+        expect(decision.targetUs < nowUs + 2 * 8333,
+               "native presentation must keep making progress during source-clock jump confirmation");
+        expect(!previousTarget || decision.targetUs >= previousTarget + 8333,
+               "the provisional deadline must still preserve scheduled display spacing");
+        if (i == 6 || i == 7) {
+            expect(decision.phaseDiscontinuity && decision.sourceTimeUs > nowUs + 800000,
+                   "provisional native deadlines must not commit an unconfirmed clock mapping");
+            expect(old.targetUs > nowUs + 800000,
+                   "recorded revision one must retain its unconfirmed future deadline");
+        }
+        if (i == 8) {
+            expect(decision.phaseDiscontinuity && decision.sourceTimeUs == nowUs,
+                   "the normal confirmation threshold must commit the corrected mapping");
+        }
+        current.noteSubmission(true, false, decision.targetUs);
+        if (i < 6) historical.noteSubmission(true, false, old.targetUs);
+        else historical.noteSubmission(false, false, 0);
+        previousTarget = decision.targetUs;
+    }
+}
+
 void testDecodeTailAdaptation()
 {
     VrrTimingController controller(config());
@@ -4785,6 +4822,7 @@ int main()
     testCadenceGapAndRateChange();
     testFutureSourceProjectionReseedsPhase();
     testConfirmedClockReseedReplacesNominalDeadline();
+    testNativeClockJumpKeepsQueueMovingDuringConfirmation();
     testDecodeTailAdaptation();
     testRateChangeReseedsReadinessBudget();
     testFractionalQuantizedCadenceLearning();
