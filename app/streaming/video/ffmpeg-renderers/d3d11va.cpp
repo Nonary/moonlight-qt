@@ -464,7 +464,7 @@ Exit:
 bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapterNotFound)
 {
     const D3D_FEATURE_LEVEL supportedFeatureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
-    const bool tryComposition = m_CompositionRequested && D3D11CompositionPresenter::runtimeSupported();
+    const bool tryComposition = m_CompositionRequested;
     bool success = false;
     ComPtr<IDXGIAdapter1> adapter;
     DXGI_ADAPTER_DESC1 adapterDesc;
@@ -702,12 +702,10 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     HRESULT hr;
 
     m_DecoderParams = *params;
-    // Qualified VRR playback uses waitable DXGI queue admission by default.
-    // Composition is an explicit environment override, captured at setup.
     m_CompositionRequested = DxgiWaitable::compositionRequested(
-        params->enableVrr, qgetenv("MOONLIGHT_VRR_COMPOSITION").constData());
-    const bool waitableRequested = DxgiWaitable::requested(
-        params->enableVrr, params->enableVsync, params->testOnly, m_CompositionRequested);
+        params->enableVrr, params->frameRate, params->vrrDisplayRefreshHz,
+        qgetenv("MOONLIGHT_VRR_COMPOSITION").constData()) &&
+        D3D11CompositionPresenter::runtimeSupported();
 
     if (qgetenv("D3D11VA_ENABLED") == "0") {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -842,12 +840,12 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
 
     // Always use windowed or borderless windowed mode.. SDL does mode-setting for us in
     // full-screen exclusive mode (SDL_WINDOW_FULLSCREEN), so this actually works out okay.
-    // Waitable creation is confined to qualified VRR playback; probes, fixed
-    // pacing and the explicit composition path retain an ordinary swapchain.
-    m_DxgiWaitableActive = waitableRequested &&
-        m_VrrFallbackReason == VrrFallbackReason::NoFallback;
+    // Composition qualification needs the created HWND chain's actual output.
+    // Provision its DXGI fallback here, then choose admission after setup.
+    bool createWaitable = DxgiWaitable::eligible(params->enableVrr, params->enableVsync, params->testOnly) &&
+                          m_VrrFallbackReason == VrrFallbackReason::NoFallback;
     for (;;) {
-        if (m_DxgiWaitableActive)
+        if (createWaitable)
             swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
         else
             swapChainDesc.Flags &= ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -855,7 +853,7 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
         hr = m_Factory->CreateSwapChainForHwnd(m_RenderDevice.Get(),
             info.info.win.window, &swapChainDesc, nullptr, nullptr, &swapChain);
         if (SUCCEEDED(hr)) hr = swapChain.As(&m_SwapChain);
-        if (SUCCEEDED(hr) && m_DxgiWaitableActive) {
+        if (SUCCEEDED(hr) && createWaitable) {
             hr = m_SwapChain->SetMaximumFrameLatency(DxgiWaitable::MaximumFrameLatency);
             if (SUCCEEDED(hr)) {
                 m_DxgiFrameLatencyHandle.Attach(m_SwapChain->GetFrameLatencyWaitableObject());
@@ -863,24 +861,19 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
             }
         }
         if (SUCCEEDED(hr)) break;
-        if (!m_DxgiWaitableActive) {
+        if (!createWaitable) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "DXGI swapchain initialization failed: %x", hr);
             return false;
         }
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
             "DXGI waitable pacing unavailable (%x); using normal DXGI pacing", hr);
-        m_DxgiWaitableActive = false;
+        createWaitable = false;
         m_DxgiFrameLatencyHandle.Close();
         m_SwapChain.Reset();
         swapChain.Reset();
         // No swapchain-dependent resources exist yet. Flush deferred D3D11
         // destruction before creating another flip chain for the same HWND.
         m_RenderDeviceContext->Flush();
-    }
-    if (waitableRequested) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-            "DXGI selected: waitable=%d, maximum frame latency=%u (queue admission, not display timing)",
-            m_DxgiWaitableActive, m_DxgiWaitableActive ? DxgiWaitable::MaximumFrameLatency : 0);
     }
 
     // Disable Alt+Enter, PrintScreen, and window message snooping. This makes
@@ -898,11 +891,11 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     // descriptor. Driver/runtime normalization and fullscreen state are part
     // of the capability evidence and must be settled before VRR starts.
     refreshVrrDisplayState();
-    if (m_DxgiWaitableActive && m_VrrFallbackReason != VrrFallbackReason::NoFallback) {
+    if (createWaitable && m_VrrFallbackReason != VrrFallbackReason::NoFallback) {
         // The actual descriptor/output can reject VRR after creation. Preserve
         // fixed-path queue behavior even though the creation flag is immutable.
         if (FAILED(m_SwapChain->SetMaximumFrameLatency(3))) return false;
-        m_DxgiWaitableActive = false;
+        createWaitable = false;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "DXGI waitable pacing disabled: output did not qualify for VRR");
     }
 
@@ -920,7 +913,13 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
                     compositionResult);
     }
 
+    m_DxgiWaitableActive = DxgiWaitable::useAdmission(createWaitable, m_CompositionPresenter.active());
     if (m_DecoderParams.enableVrr && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
+        if (!m_CompositionPresenter.active()) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "DXGI selected: waitable=%d, maximum frame latency=%u",
+                        m_DxgiWaitableActive, m_DxgiWaitableActive ? DxgiWaitable::MaximumFrameLatency : 0);
+        }
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "D3D11 VRR backend enabled: refresh=%d Hz, presentation=%s",
                     m_DecoderParams.vrrDisplayRefreshHz,
@@ -3543,7 +3542,7 @@ bool D3D11VARenderer::restoreFixedPresentation(VrrFallbackReason reason)
     // A failed worker startup falls back to the legacy Present-throttled path.
     // The creation flag must survive ResizeBuffers; simply stop CPU admission
     // waits and restore the ordinary queue limit on this still-valid chain.
-    if (m_DxgiWaitableActive) {
+    if (m_DxgiFrameLatencyHandle.IsValid()) {
         if (FAILED(m_SwapChain->SetMaximumFrameLatency(3))) return false;
         m_DxgiWaitableActive = false;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "DXGI waitable pacing disabled for fixed presentation fallback");

@@ -1239,6 +1239,12 @@ telemetry and `presentPreparedFrame()`, which forwards it to DXGI:
 - Adaptive: `Present(0, DXGI_PRESENT_ALLOW_TEARING)`.
 - Legacy: interval zero with the existing `legacyPresentFlags()` value.
 
+Windows selects DXGI at full refresh. DXGI uses its native scanout guard
+and queue admission regardless of the adaptive buffer cap. Composition
+always synchronizes natively. The resolved controller snapshot identifies
+the timing policy for replay and calibration, including historical captures
+made with unprotected software pacing.
+
 The controller can omit its software spacing floor for a latched decision;
 passing interval one to DXGI is therefore part of the renderer contract.
 `tst_dxgipresent` exercises the actual shared call boundary using a fake
@@ -1344,6 +1350,11 @@ and requires `IsPresentationSupportedWithIndependentFlip()`. OS version alone
 is insufficient. The render device uses BGRA support and disables internal
 threading optimizations as required by this API; an unsupported device retries
 with the original DXGI device flags. Setup failure retains the DXGI path.
+Qualified playback provisions the HWND swapchain for waitable DXGI fallback.
+Only active DXGI playback acquires its queue permit. Composition submits the
+ready image for the controller's deadline, then the worker holds the next
+dequeue until that deadline. This permits one future target at a time without
+adding a refresh to the current frame.
 System-relative presentation time is QPC scaled to 100 ns with the actual QPC
 frequency. It no longer depends on resolving an interrupt-clock export or assumes
 that the interrupt-clock epoch equals the presentation clock's epoch.

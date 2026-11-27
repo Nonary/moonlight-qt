@@ -146,7 +146,7 @@ std::string vrrCalibrationPolicy(const VrrTimingParameters& parameters)
 
 VrrTimingParameters vrrTimingParametersForSession(
     const VrrSessionConfig& config, bool nativeSynchronizedPresentation,
-    bool nativeScheduledPresentation)
+    bool nativeScheduledPresentation, bool allowUnlatchedTearing)
 {
     // Present on a tracked source cadence plus a learned delay. The readiness
     // reserve, its per-frame slewing, and every phase re-anchor are off on this
@@ -409,6 +409,15 @@ VrrTimingParameters vrrTimingParametersForSession(
     // presenter latch that present from live frame statistics instead; the
     // flip queue then shows it at the earliest untorn refresh.
     parameters.nativeFlipProtection = 1;
+    if (allowUnlatchedTearing && !nativeSynchronizedPresentation) {
+        parameters.playoutAdaptiveOnly = 1;
+        parameters.nativeFlipProtection = 0;
+        // Keep a full display period between submissions. Extra guard time
+        // would make that floor slower than the source at the refresh ceiling.
+        parameters.minimumGuardUs = 0;
+        parameters.maximumBaseGuardUs = 0;
+        parameters.maximumAdaptiveGuardUs = 0;
+    }
     if (!config.smoothFrameTiming) {
         parameters.smoothingMode = VrrSmoothingOff;
         parameters.playoutSmoothingGainPerMille = 0;

@@ -1943,6 +1943,36 @@ void testNativeFlipProtectionPreventsScanoutTears()
            "production must enable native flip protection");
 }
 
+void testSoftwarePacedTearingAtRefreshCeiling()
+{
+    const auto session = config(120, 120);
+    const auto protectedPolicy = vrrTimingParametersForSession(session);
+    const auto tearingPolicy = vrrTimingParametersForSession(session, false, false, true);
+    const auto synchronizedPolicy = vrrTimingParametersForSession(session, true, true, true);
+    expect(protectedPolicy.playoutAdaptiveOnly == 0 && protectedPolicy.nativeFlipProtection == 1,
+           "default DXGI policy must still protect scanout");
+    expect(synchronizedPolicy.playoutAdaptiveOnly == 0 &&
+               synchronizedPolicy.nativeSynchronizedPresentation == 1,
+           "native synchronized presentation must retain its own timing policy");
+    expect(tearingPolicy.playoutAdaptiveOnly == 1 && tearingPolicy.nativeFlipProtection == 0,
+           "software-paced tearing must bypass both synchronized present decisions");
+
+    VrrTimingController controller(session, true, tearingPolicy);
+    uint64_t previousSubmission = 0;
+    for (int i = 0; i < 360; ++i) {
+        const uint64_t readyUs = 1000000 + uint64_t(i) * 25000 / 3 + (i == 90 ? 2500 : 0);
+        const auto decision = controller.schedule(frame(i + 1, uint32_t(i * 750), true, readyUs), readyUs);
+        const uint64_t expectedFloor = previousSubmission ?
+            previousSubmission + controller.displayPeriodUs() : 0;
+        expect(!decision.latchedPresentation && decision.guardUs == 0 &&
+                   controller.earliestSubmissionUs() == expectedFloor &&
+                   decision.targetUs >= expectedFloor,
+               "at 120 Hz an unlatched present must keep exactly one refresh of software spacing, even after a late frame");
+        previousSubmission = decision.targetUs;
+        controller.noteSubmission(true, false, previousSubmission);
+    }
+}
+
 void testBalancedReadinessFloorFollowsLoad()
 {
     // Captures that recorded a readiness floor replay it: the delay is
@@ -4710,6 +4740,7 @@ int main()
         return failures ? 1 : 0;
     }
     testWithinToleranceCannotCreateQueuedRecovery();
+    testSoftwarePacedTearingAtRefreshCeiling();
     testPresentTiming();
     testSourceRelativeCadenceDetection();
     testNativeScheduledRetimingBounds();

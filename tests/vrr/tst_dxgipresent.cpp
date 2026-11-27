@@ -39,22 +39,29 @@ int main()
     };
     {
         using namespace DxgiWaitable;
-        for (int bits = 0; bits < 16; ++bits)
-            check(requested(bits & 1, bits & 2, bits & 4, bits & 8) == (bits == 3),
-                  "default waitable pacing requires VRR, V-sync, real playback, and no composition override");
-        const struct { const char* value; bool composition; } overrides[] = {
-            {nullptr, false}, {"", false}, {"0", false}, {"1", true},
-            {"2", false}, {"true", false}, {"01", false}
+        for (int bits = 0; bits < 8; ++bits)
+            check(eligible(bits & 1, bits & 2, bits & 4) == (bits == 3),
+                  "waitable DXGI fallback requires VRR, V-sync and real playback");
+        const struct { const char* value; bool belowRefresh; bool fullRefresh; } overrides[] = {
+            {nullptr, true, false}, {"", true, false}, {"0", false, false}, {"1", true, true},
+            {"2", true, false}, {"true", true, false}, {"01", true, false}
         };
         for (const auto& override : overrides) {
-            const bool composition = compositionRequested(true, override.value);
-            check(composition == override.composition,
-                  "only MOONLIGHT_VRR_COMPOSITION=1 may request composition");
-            check(requested(true, true, false, composition) == !composition,
-                  "unset or non-enabling composition overrides must retain default waitable DXGI");
-            check(!compositionRequested(false, override.value),
-                  "the composition override must not activate composition outside VRR");
+            check(compositionRequested(true, 116, 120, override.value) == override.belowRefresh &&
+                      compositionRequested(true, 100, 120, override.value) == override.belowRefresh,
+                  "below-refresh VRR prefers composition unless DXGI is forced");
+            check(compositionRequested(true, 120, 120, override.value) == override.fullRefresh &&
+                      compositionRequested(true, 288, 288, override.value) == override.fullRefresh,
+                  "VRR at native refresh uses DXGI unless composition is forced for diagnostics");
+            check(!compositionRequested(false, 116, 120, override.value),
+                  "composition selection requires VRR");
         }
+        check(!compositionRequested(true, 120, 0, nullptr) &&
+                  !compositionRequested(true, 0, 120, nullptr),
+              "automatic composition selection requires valid stream and display rates");
+        check(useAdmission(true, false), "DXGI fallback uses its configured waitable chain");
+        check(!useAdmission(true, true), "composition must never acquire an idle DXGI chain permit");
+        check(!useAdmission(false, false), "ordinary DXGI must not wait on an unavailable permit");
         Admission admission;
         uint64_t now = 0;
         unsigned calls = 0;

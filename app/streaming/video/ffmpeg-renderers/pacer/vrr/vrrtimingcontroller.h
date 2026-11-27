@@ -289,7 +289,7 @@ std::string vrrCalibrationPolicy(const VrrTimingParameters& parameters);
 // the replay baseline. Candidate replay configs may still override any field.
 VrrTimingParameters vrrTimingParametersForSession(
     const VrrSessionConfig& config, bool nativeSynchronizedPresentation = false,
-    bool nativeScheduledPresentation = false);
+    bool nativeScheduledPresentation = false, bool allowUnlatchedTearing = false);
 
 struct VrrTimingDiagnostics {
     int64_t readinessPhaseUs = 0;

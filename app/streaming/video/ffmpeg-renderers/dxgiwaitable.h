@@ -9,13 +9,20 @@
 namespace DxgiWaitable {
 constexpr unsigned MaximumFrameLatency = 2;
 constexpr uint64_t AdmissionTimeoutUs = 50000;
-inline bool compositionRequested(bool vrr, const char* overrideValue)
+inline bool compositionRequested(bool vrr, int streamFps, int displayHz, const char* overrideValue)
 {
-    return vrr && overrideValue && std::strcmp(overrideValue, "1") == 0;
+    if (!vrr) return false;
+    if (overrideValue && std::strcmp(overrideValue, "0") == 0) return false;
+    if (overrideValue && std::strcmp(overrideValue, "1") == 0) return true;
+    return streamFps > 0 && streamFps < displayHz;
 }
-constexpr bool requested(bool vrr, bool vsync, bool testOnly, bool composition)
+constexpr bool eligible(bool vrr, bool vsync, bool testOnly)
 {
-    return vrr && vsync && !testOnly && !composition;
+    return vrr && vsync && !testOnly;
+}
+constexpr bool useAdmission(bool waitableCreated, bool compositionActive)
+{
+    return waitableCreated && !compositionActive;
 }
 enum class Status { Admitted, Interrupted, Timeout, Failed };
 enum class Wake { Signalled, Timeout, Failed };
