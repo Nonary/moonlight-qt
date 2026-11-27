@@ -3256,30 +3256,39 @@ void testLatencyFixBufferlessLateFrameSafety()
     }
 }
 
-void testWindowsZeroFramePresets()
+void testNativePresentationBufferPolicy()
 {
     for (int fps : {100, 116}) {
         auto session = vrrProductionSession(0, fps, 120);
-        session.zeroFrameBuffer = true;
+        session.timingOptions.bufferPerMille = 750;
         for (bool scheduled : {false, true}) {
             auto policy = vrrTimingParametersForSession(session, scheduled, scheduled);
             expect(policy.nativeFlipProtection == 1 && policy.playoutAdaptiveOnly == 0,
-                   "zero-frame presets must retain native scanout protection");
+                   "reduced-rate VRR must retain native scanout protection");
             policy.playoutDelayStartSeedValid = 1;
             policy.playoutDelayStartSeedUs = 15000;
-            VrrTimingController controller(session, true, policy);
+            VrrTimingController live(session, true, policy);
+            const auto first = live.schedule(frame(0, 0, true, 1000000), 1000000);
+            expect(policy.playoutDelayCapSourcePeriodPerMille == 750 &&
+                       first.playoutDelayUs > 0 && first.playoutDelayUs <= first.playoutPresetCapUs,
+                   "native scheduling and fallback must keep the configured adaptive buffer");
+
+            // Exact replay still takes both cap values from the recorded policy.
+            policy.latencyFixDelayPeriodPerMille = 0;
+            policy.playoutDelayCapSourcePeriodPerMille = 0;
+            VrrTimingController recorded(session, true, policy);
             for (int i = 0; i < 480; ++i) {
-                if (i == 240) controller.rebase();
+                if (i == 240) recorded.rebase();
                 const auto rtp = uint32_t(i * 90000 / fps);
                 const auto decoded = decodedTimeForRtp(1000000, rtp) + (i % 43 == 0 ? 6500 : 0);
-                const auto now = std::max(decoded, controller.lastSubmissionUs());
-                const auto decision = controller.schedule(frame(i, rtp, i != 241, decoded), now);
+                const auto now = std::max(decoded, recorded.lastSubmissionUs());
+                const auto decision = recorded.schedule(frame(i, rtp, i != 241, decoded), now);
                 expect(decision.playoutDelayMaximumUs == 0 && decision.playoutDelayUs == 0,
-                       "Windows reduced-rate presets must keep a zero buffer through startup, jitter and rebase");
-                expect(decision.targetUs >= now && decision.targetUs >= controller.earliestSubmissionUs(),
-                       "zero-frame presets must still respect readiness and submission limits");
-                controller.notePreparationDuration(1000);
-                controller.noteSubmission(true, false, decision.targetUs);
+                       "recorded zero-buffer policies must keep a zero buffer through startup, jitter and rebase");
+                expect(decision.targetUs >= now && decision.targetUs >= recorded.earliestSubmissionUs(),
+                       "recorded zero-buffer policies must respect readiness and submission limits");
+                recorded.notePreparationDuration(1000);
+                recorded.noteSubmission(true, false, decision.targetUs);
             }
         }
     }
@@ -4831,7 +4840,7 @@ int main()
     testLatchedHandoffCreditsOnlyEnforcedSpacing();
     testPresetReadinessTargets();
     testLatencyFixBufferlessLateFrameSafety();
-    testWindowsZeroFramePresets();
+    testNativePresentationBufferPolicy();
     testLatencyPresetsAcrossSourceAndDisplayRates();
     testLatencyPresetsBoundHitchesThroughCadenceChanges();
     testLostPacketFramesDoNotGrowBuffer();

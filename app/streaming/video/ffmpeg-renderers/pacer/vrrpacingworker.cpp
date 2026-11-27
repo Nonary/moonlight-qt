@@ -40,7 +40,7 @@ VrrSessionConfig prepareProductionConfig(VrrSessionConfig config)
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
         "Adaptive buffer: VRR18 interval feedback, %.2f%% timing target, %.2f ms tolerance, %d s history, %.2f source-frame allowance",
         options.targetHundredths / 100.0, options.toleranceUs / 1000.0,
-        options.historySeconds, config.zeroFrameBuffer ? 0.0 : options.bufferPerMille / 1000.0);
+        options.historySeconds, options.bufferPerMille / 1000.0);
     return config;
 }
 

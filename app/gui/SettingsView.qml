@@ -2051,7 +2051,7 @@ FocusScope {
                         ToolTip.delay: 1000
                         ToolTip.timeout: 10000
                         ToolTip.visible: hovered
-                        ToolTip.text: qsTr("Renders the stream with 0 frames buffered on supported Windows 11 systems and SteamOS 3.10 or later in Gaming Mode. This can save 1 to 2 frames of latency.") + "\n\n" +
+                        ToolTip.text: qsTr("Uses low-latency presentation on supported Windows 11 systems and SteamOS 3.10 or later in Gaming Mode. Your VRR timing profile still controls Moonlight's adaptive buffer.") + "\n\n" +
                                       qsTr("Caps a 120 Hz display at 116 FPS when supported. Other setups use five-sixths of the refresh rate and keep their configured buffer.") +
                                       (fpsComboBox.fpsLimit > 0 ? "\n\n" + qsTr("Current frame rate limit: %1 FPS").arg(fpsComboBox.fpsLimit) : "")
                     }

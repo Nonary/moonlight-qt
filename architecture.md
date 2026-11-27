@@ -1,11 +1,12 @@
 # Streaming and VRR architecture
 
-Source baseline: `master` based on `v6.2.0-daily.202` with VRR18 interval
-feedback revision 21 and worker Reduce judder mode 9, built on the full-refresh buffer policy in `b88a77ff`.
+Source baseline: `master` at `90399ebe` plus the Ultra Low Latency buffer
+correction, with VRR18 interval feedback revision 21 and worker Reduce judder
+mode 9, built on the full-refresh buffer policy in `b88a77ff`.
 Buffer growth uses delivery and decode readiness at both ends of an interval.
-Windows uses DXGI at full refresh. Ultra Low Latency VRR is an opt-in
-zero-frame adaptive buffer for qualified Windows Composition and SteamOS
-Gaming Mode presentation.
+Windows uses DXGI at full refresh. Ultra Low Latency VRR uses qualified
+Windows Composition or SteamOS Gaming Mode presentation and retains the
+adaptive buffer configured in the VRR timing profile.
 The opt-in Windows Composition gap refresh uses first-packet RTP timing and
 verified independent-flip feedback as described in section 10.4.
 The custom profile exposes the frame allowance, timing target, score history,
@@ -154,15 +155,14 @@ buffer under the selected VRR timing profile.
 Ultra Low Latency VRR limits the request to the near-refresh rate on supported
 Windows 11 Composition and SteamOS 3.10 or later Gaming Mode surfaces. At
 120, 144, and 288 Hz the native limits are 116, 138, and 264 FPS. Unsupported
-setups use the five-sixths limits (100, 120, and 240 FPS) and the configured
-adaptive buffer. The picker shows a ceiling across available outputs. Session
+setups use the five-sixths limits (100, 120, and 240 FPS). The picker shows a
+ceiling across available outputs. Session
 startup probes the actual streaming display before negotiation and applies
 its limit after resolving global and per-game FPS. Turning the option off
-restores access to the saved requested FPS. The final renderer must still
-qualify before the worker sets the adaptive buffer to zero. If the live
-presenter falls back after negotiation, the agreed FPS is retained and the
-configured buffer applies. Preparation and native presentation keep their
-own timing constraints.
+restores access to the saved requested FPS. If the live presenter falls back
+after negotiation, the agreed FPS is retained. The selected timing profile
+sets Moonlight's adaptive buffer allowance on both paths. Exact replay can
+still restore the former zero-buffer policy from captured parameters.
 
 Toggling VRR in Windows Settings swaps the global FPS between the fastest
 display's native rate and its near-refresh preset, when the current selection

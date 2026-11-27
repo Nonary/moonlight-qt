@@ -988,7 +988,7 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
         return isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, candidate);
     };
     // Explicit Mailbox prevents Gamescope WSI's FIFO compatibility path from
-    // keeping an extra frame downstream of our zero-buffer worker.
+    // keeping an extra frame downstream of the VRR worker.
     const auto mode = selectPlVkVrrPresentMode(surface, gamescopeWsi, params->gamescopeMailbox,
         supportsMode, params->ultraLowLatencyVrr);
     m_UltraLowLatencyVrr = params->ultraLowLatencyVrr && gamescopeWsi &&

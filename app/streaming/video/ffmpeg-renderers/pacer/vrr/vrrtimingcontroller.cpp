@@ -169,10 +169,8 @@ VrrTimingParameters vrrTimingParametersForSession(
     // and late-frame recovery use the same policy for every combination.
     parameters.latencyFixEnabled = 1;
     parameters.latencyFixAllRates = 1;
-    // A zero source-period cap selects the display-relative limiter. That
-    // limiter is active at every rate and can express an exact zero cap.
-    parameters.latencyFixDelayPeriodPerMille = config.zeroFrameBuffer ? 0 : 500;
-    parameters.playoutDelayCapSourcePeriodPerMille = config.zeroFrameBuffer ? 0 : options.bufferPerMille;
+    parameters.latencyFixDelayPeriodPerMille = 500;
+    parameters.playoutDelayCapSourcePeriodPerMille = options.bufferPerMille;
     // The nominal 116 Hz period was shorter than the measured ~99 Hz source
     // in the deep capture, so it clipped the queue exactly when GPU stalls
     // needed more room. New live sessions use the fitted source period;
@@ -3806,8 +3804,8 @@ uint64_t VrrTimingController::playoutDelayCapUs() const
             capPeriodUs,
             m_Parameters.playoutDelayCapSourcePeriodPerMille);
     }
-    // The zero-buffer preset uses a zero display-relative limit. Older
-    // captures also restore their recorded display-relative limit here.
+    // Older captures restore their recorded display-relative limit here,
+    // including the former zero-buffer Ultra Low Latency policy.
     return m_LatencyFixActive ? latencyFixDelayLimitUs() :
         std::numeric_limits<uint64_t>::max();
 }
