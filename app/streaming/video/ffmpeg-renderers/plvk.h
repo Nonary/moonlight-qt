@@ -74,6 +74,7 @@ public:
     bool alwaysSynchronizesAdaptivePresent() const override { return supportsScheduledPresentation(); }
     bool supportsScheduledPresentation() const override;
     bool usesCompositorCadence() const override;
+    bool waitForFrameAdmission() override;
     bool keepsNewestQueuedFrame() const override { return supportsScheduledPresentation(); }
     virtual uint64_t waitForDecode(AVFrame* frame) override;
     std::shared_ptr<VrrPreparedFrame> queueFramePreparation(AVFrame*, uint64_t) override;
@@ -123,6 +124,7 @@ private:
     void selectLegacyPresentMode(PDECODER_PARAMETERS params);
     bool acquirePendingSwapchainFrame(const char* earlyRenderFailureMessage);
     bool acquireVrrSwapchainFrame();
+    bool waitForScheduledPresentSlot();
     void recoverFromScheduledPresentationFailure(const char* reason);
     bool submitPendingSwapchainFrame();
     bool submitSwapchainFrame();
@@ -216,6 +218,7 @@ private:
     // residency list, so the next decode can delay its flip.
     bool m_DeferredAcquireEnabled = false;
     bool m_WaylandFullRefreshPresent = false;
+    bool m_GamescopeFullRefreshPresent = false;
     bool m_DeferredTemplateValid = false;
     pl_swapchain_frame m_DeferredTemplate = {};
     pl_tex_params m_DeferredTextureParams = {};

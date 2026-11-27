@@ -1436,6 +1436,51 @@ private:
     std::vector<Enqueue> m_Enqueues;
 };
 
+void testCompositorAdmissionKeepsDecodedFrameReplaceable()
+{
+    resetFakeClock();
+    class Backend : public NativeScheduledPresenter {
+    public:
+        std::atomic_bool slotOpen { true };
+        std::atomic_bool waitingForSlot { false };
+
+        bool usesCompositorCadence() const override { return true; }
+        bool keepsNewestQueuedFrame() const override { return true; }
+        bool waitForFrameAdmission() override
+        {
+            if (slotOpen.load()) return true;
+            waitingForSlot.store(true);
+            SDL_Delay(1);
+            return false;
+        }
+        VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+        {
+            slotOpen.store(false);
+            return NativeScheduledPresenter::presentAdaptive(request);
+        }
+    } backend;
+    PacerTelemetry telemetry;
+    std::array<TrackedFrameLifetime, 3> lifetimes;
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "compositor-paced worker must start");
+        worker.submit(frame(1, lifetimes[0]));
+        expect(backend.waitForPresentCount(1), "first frame must take the open slot");
+        expect(waitFor([&] { return backend.waitingForSlot.load(); }),
+               "worker must wait for admission before picking another frame");
+        worker.submit(frame(2, lifetimes[1]));
+        worker.submit(frame(3, lifetimes[2]));
+        expect(lifetimes[1].releases.load() == 1,
+               "newer decoder output must replace the frame waiting for admission");
+        backend.slotOpen.store(true);
+        expect(backend.waitForPresentCount(2), "opening the slot must resume playback");
+    }
+    expect(backend.presentedFrames() == std::vector<int>({1, 3}),
+           "compositor should receive only the latest decoder output at admission");
+    for (const auto& lifetime : lifetimes)
+        expect(lifetime.releases.load() == 1, "worker must release each decoded frame exactly once");
+}
+
 void testNativeScheduledEnqueueCadenceAndLifecycle()
 {
     for (const char* variant : {"accepted", "late", "failed", "absorb"}) {
@@ -4512,6 +4557,7 @@ int main()
     runNamed("testShortAndAlreadyCompleteDecodeReadiness()", [&] { testShortAndAlreadyCompleteDecodeReadiness(); });
     runNamed("testTimestampedDecodeCompletion()", [&] { testTimestampedDecodeCompletion(); });
     runNamed("testNativeScheduledEnqueueCadenceAndLifecycle()", [&] { testNativeScheduledEnqueueCadenceAndLifecycle(); });
+    runNamed("testCompositorAdmissionKeepsDecodedFrameReplaceable()", testCompositorAdmissionKeepsDecodedFrameReplaceable);
     runNamed("testTelemetrySnapshotsRemainCumulative()", [&] { testTelemetrySnapshotsRemainCumulative(); });
     runNamed("testSuspendDiscardAndFreshFrame()", [&] { testSuspendDiscardAndFreshFrame(); });
     runNamed("testCancelledPreparedFenceTrace()", [&] { testCancelledPreparedFenceTrace(); });

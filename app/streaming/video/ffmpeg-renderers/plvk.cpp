@@ -1021,6 +1021,7 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
     m_VrrRenderTimingActive = false;
 #ifdef Q_OS_LINUX
     m_WaylandFullRefreshPresent = false;
+    m_GamescopeFullRefreshPresent = false;
 #endif
 
     if (!m_VrrRequested) {
@@ -1085,8 +1086,9 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
         m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
         m_VrrFallbackReason = VrrFallbackReason::NoFallback;
         m_DeferredAcquireEnabled = true;
-        m_WaylandFullRefreshPresent = surface == PlVkVrrSurface::Wayland &&
-            params->frameRate >= params->vrrDisplayRefreshHz;
+        const bool fullRefresh = params->frameRate >= params->vrrDisplayRefreshHz;
+        m_WaylandFullRefreshPresent = surface == PlVkVrrSurface::Wayland && fullRefresh;
+        m_GamescopeFullRefreshPresent = gamescopeWsi && fullRefresh;
         return;
     }
     const auto mode = selectPlVkVrrPresentMode(surface, gamescopeWsi, params->gamescopeMailbox,
@@ -1193,11 +1195,20 @@ bool PlVkRenderer::supportsScheduledPresentation() const
 
 bool PlVkRenderer::usesCompositorCadence() const
 {
+#ifdef Q_OS_LINUX
+    if (m_GamescopeFullRefreshPresent) return true;
+#endif
 #if defined(Q_OS_LINUX) && defined(HAS_WAYLAND)
     return m_WaylandFullRefreshPresent && m_PresentationFeedback != nullptr;
 #else
     return false;
 #endif
+}
+
+bool PlVkRenderer::waitForFrameAdmission()
+{
+    return m_VrrFallbackReason != VrrFallbackReason::NoFallback ||
+        m_VrrWindowChangePending.load() || waitForScheduledPresentSlot();
 }
 
 bool PlVkRenderer::prepareDecoderContext(AVCodecContext *context, AVDictionary **)
@@ -1515,33 +1526,7 @@ bool PlVkRenderer::acquireVrrSwapchainFrame()
         cancelVrrFrame();
     }
 
-#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
-    if (supportsScheduledPresentation()) {
-        const uint64_t startUs = LiGetMicroseconds();
-        // The requested target is a display deadline. A present that is still
-        // retiring at that deadline can free the slot for the next refresh.
-        const uint64_t giveUpUs = startUs + 8000;
-        for (;;) {
-            uint64_t paintedId = 0;
-#ifdef HAS_WAYLAND
-            Vrr13::Ns observed = 0;
-            if (m_PresentationFeedback && m_PresentationFeedback->pollPainted(paintedId, observed) && m_GpuTrace) {
-                const auto timeUs = uint64_t(observed / 1000);
-                m_GpuTrace->record({"wayland_frame_done", -1, 0, timeUs, timeUs, paintedId});
-            }
-#endif
-            if (m_VulkanTiming->slotAvailable(paintedId)) break;
-            const uint64_t nowUs = LiGetMicroseconds();
-            const uint64_t pendingSinceUs = m_VulkanTiming->pendingSinceUs();
-            if (pendingSinceUs && nowUs >= pendingSinceUs && nowUs - pendingSinceUs > 250000) {
-                recoverFromScheduledPresentationFailure("timed present did not retire");
-                return false;
-            }
-            if (nowUs >= giveUpUs || m_VrrWindowChangePending.load()) return false;
-            SDL_Delay(1);
-        }
-    }
-#endif
+    if (!waitForScheduledPresentSlot()) return false;
     const bool acquired = acquirePendingSwapchainFrame(
         "pl_render_image() failed during Vulkan VRR render wait");
 #if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
@@ -1550,6 +1535,36 @@ bool PlVkRenderer::acquireVrrSwapchainFrame()
         recoverFromScheduledPresentationFailure("timed swapchain stopped accepting frames");
 #endif
     return acquired;
+}
+
+bool PlVkRenderer::waitForScheduledPresentSlot()
+{
+#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
+    if (!supportsScheduledPresentation()) return true;
+
+    const uint64_t giveUpUs = LiGetMicroseconds() + 8000;
+    for (;;) {
+        uint64_t paintedId = 0;
+#ifdef HAS_WAYLAND
+        Vrr13::Ns observed = 0;
+        if (m_PresentationFeedback && m_PresentationFeedback->pollPainted(paintedId, observed) && m_GpuTrace) {
+            const auto timeUs = uint64_t(observed / 1000);
+            m_GpuTrace->record({"wayland_frame_done", -1, 0, timeUs, timeUs, paintedId});
+        }
+#endif
+        if (m_VulkanTiming->slotAvailable(paintedId)) return true;
+        const uint64_t nowUs = LiGetMicroseconds();
+        const uint64_t pendingSinceUs = m_VulkanTiming->pendingSinceUs();
+        if (pendingSinceUs && nowUs >= pendingSinceUs && nowUs - pendingSinceUs > 250000) {
+            recoverFromScheduledPresentationFailure("timed present did not retire");
+            return false;
+        }
+        if (nowUs >= giveUpUs || m_VrrWindowChangePending.load()) return false;
+        SDL_Delay(1);
+    }
+#else
+    return true;
+#endif
 }
 
 bool PlVkRenderer::acquirePendingSwapchainFrame(
@@ -2533,8 +2548,8 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& reques
     m_VrrFramePrepared = false;
     const uint64_t presentationId = ++m_PresentationId;
 #ifdef Q_OS_LINUX
-    // At full refresh the FIFO barrier orders commits. An additional clock
-    // target can make a frame miss the compositor's next repaint.
+    // At full refresh the compositor's FIFO orders commits. An additional
+    // clock target can make a frame miss the next repaint.
     if (m_VulkanTiming) m_VulkanTiming->begin(presentationId,
         usesCompositorCadence() ? 0 : request.displayTargetUs);
 #endif
@@ -3273,7 +3288,13 @@ QString PlVkRenderer::getCalibrationIdentity()
                                           VK_UUID_SIZE).toHex()))
         .arg(static_cast<int>(m_VkPresentMode));
     if (supportsScheduledPresentation()) {
-        identity += usesCompositorCadence() ? "|scheduled=wayland-refresh" : "|scheduled=timed";
+        const bool gamescope = isGamescopeWsiPresentation(SDL_GetCurrentVideoDriver());
+        if (usesCompositorCadence()) {
+            identity += gamescope ? "|scheduled=gamescope-refresh" : "|scheduled=wayland-refresh";
+        }
+        else {
+            identity += "|scheduled=timed";
+        }
     }
     return identity;
 }

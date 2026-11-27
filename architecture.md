@@ -1573,16 +1573,22 @@ feedback. Admission allows one commit waiting for paint. Three timing records
 cover that commit and two already painted frames in KWin's display pipeline.
 Completed and discarded records retire by present ID in a single batch. The
 Gamescope path admits one present until its matching terminal timing record.
+SteamOS 3.10.1 reports the commit latch and predicted scanout in that record.
 
-At full refresh on Wayland, FIFO sets the cadence and commits are eligible for
-the next repaint. The worker skips its software render and presentation waits.
+At full refresh on Wayland and Gamescope, FIFO sets the cadence and commits are
+eligible for the next repaint. The worker skips its software render and
+presentation waits and does not drop frames to correct software target phase.
+It waits for the compositor's admission signal before claiming the newest
+decoded frame, so a frame can be replaced while the slot is occupied.
+Gamescope uses a zero target and still tracks the present ID. Mesa Wayland uses
+an immediately eligible timestamp because a zero target would make Mesa
+extrapolate the refresh timing.
 Below refresh, the worker still assigns explicit display deadlines. A late
-Wayland frame requests an immediately eligible timestamp. A zero native Vulkan
-target would make Mesa extrapolate the refresh timing instead. Both paths keep
-the newest unclaimed decoded frame in a one-frame handoff. Timed acquisition has
-a bounded wait. Losing completion feedback requests a renderer reset to
-worker-paced mode for that window. Calibration distinguishes refresh-paced and
-deadline-paced playback.
+Wayland frame also requests an immediately eligible timestamp. Both paths
+keep the newest unclaimed decoded frame in a one-frame handoff. Timed
+acquisition has a bounded wait. Losing completion feedback requests a renderer
+reset to worker-paced mode for that window. Calibration distinguishes
+Gamescope refresh pacing, Wayland refresh pacing, and deadline-paced playback.
 
 The startup decoder probe that asks the host for a color range must use that
 same Linux Vulkan preference without activating VRR presentation.

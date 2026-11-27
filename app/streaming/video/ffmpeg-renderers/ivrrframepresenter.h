@@ -406,6 +406,10 @@ public:
     // A refresh-paced compositor provides both admission and display cadence.
     virtual bool usesCompositorCadence() const { return false; }
 
+    // Called on the pacing thread before claiming a decoded frame. A bounded
+    // wait lets fresher decoder output replace the queued frame in the meantime.
+    virtual bool waitForFrameAdmission() { return true; }
+
     // Retain only the newest decoded frame that the pacing worker has not claimed.
     virtual bool keepsNewestQueuedFrame() const { return false; }
 

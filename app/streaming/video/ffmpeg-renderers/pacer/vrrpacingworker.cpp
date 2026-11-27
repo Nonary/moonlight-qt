@@ -338,6 +338,11 @@ int VrrPacingWorker::run()
     while (!isStopping()) {
         consumeWindowStateNotifications();
 
+        if (m_NativeCompositorCadence && !presentationSuspended() &&
+                !m_Presenter->waitForFrameAdmission()) {
+            continue;
+        }
+
         QueuedFrame queuedFrame;
         bool queueDiscontinuity = false;
         if (reservedFrame) {
@@ -492,7 +497,9 @@ int VrrPacingWorker::run()
                 telemetry.inputNetworkBufferMiss, telemetry.inputDecodeBufferMiss);
         }
 
-        if (decision.trajectory.resyncRecommended) {
+        // Compositor-paced FIFO does not use the software target. Dropping a
+        // frame to reset its phase would leave an otherwise usable repaint empty.
+        if (!m_NativeCompositorCadence && decision.trajectory.resyncRecommended) {
             const uint64_t waitUs = decision.replacementWaitUs != 0 ? decision.replacementWaitUs :
                 m_TimingController->parameters().playoutCeilingPhaseReplacement != 0 ?
                     std::min<uint64_t>(20000, decision.sourcePeriodUs * 2) : 0;
