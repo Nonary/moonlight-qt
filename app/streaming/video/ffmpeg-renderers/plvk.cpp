@@ -26,6 +26,7 @@ extern "C" {
 #endif
 }
 
+#include <chrono>
 #include <vector>
 #include <set>
 #include <thread>
@@ -276,10 +277,10 @@ PlVkRenderer::~PlVkRenderer()
     m_GamescopeRepaint.reset();
 #endif
 #ifdef Q_OS_LINUX
-    if (m_GamescopeTiming && m_GamescopeTiming->statistics().submissions) {
-        const auto& stats = m_GamescopeTiming->statistics();
+    if (m_VulkanTiming && m_VulkanTiming->statistics().submissions) {
+        const auto& stats = m_VulkanTiming->statistics();
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Gamescope timing summary: submissions=%llu returned=%llu emitted=%llu "
+                    "Vulkan timing summary: submissions=%llu returned=%llu emitted=%llu "
                     "unmatched=%llu before_submission=%llu future=%llu stale=%llu "
                     "invalid=%llu clock_rejected=%llu warmup_skipped=%llu "
                     "empty_queries=%llu query_errors=%llu",
@@ -296,7 +297,7 @@ PlVkRenderer::~PlVkRenderer()
                     static_cast<unsigned long long>(stats.emptyQueries),
                     static_cast<unsigned long long>(stats.queryErrors));
     }
-    m_GamescopeTiming.reset();
+    m_VulkanTiming.reset();
 #endif
 
 #ifdef HAS_WAYLAND
@@ -540,12 +541,40 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
         av_free((void*)vkParams.opt_extensions);
 #endif
 #ifdef Q_OS_LINUX
-    const bool gamescopeTiming = decoderParams->enableVrr && isGamescopeWsiPresentation(SDL_GetCurrentVideoDriver()) &&
+    const char* videoDriver = SDL_GetCurrentVideoDriver();
+    const bool gamescopeWsi = isGamescopeWsiPresentation(videoDriver);
+    const bool gamescopeTiming = decoderParams->enableVrr && gamescopeWsi &&
         isExtensionSupportedByPhysicalDevice(device, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
-    if (gamescopeTiming) {
-        optionalExtensions.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
-        vkParams.get_proc_addr = VulkanTiming::bridge(vkParams.get_proc_addr);
+    if (gamescopeTiming) optionalExtensions.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+#ifdef VK_EXT_present_timing
+    const bool schedulingRequested = plVkRequestsScheduledPresentation(
+        decoderParams->enableVrr, decoderParams->ultraLowLatencyVrr, decoderParams->testOnly,
+        qgetenv("MOONLIGHT_VRR_VULKAN_SCHEDULED") == "1") &&
+        (isWaylandPresentation(videoDriver) || (gamescopeWsi && videoDriver &&
+                                               !strcmp(videoDriver, "x11"))) &&
+        !SDL_GetWindowData(m_Window, "moonlight.vulkan-scheduled-failed");
+    const bool schedulingSupported = schedulingRequested &&
+        isExtensionSupportedByPhysicalDevice(device, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) &&
+        VulkanTiming::supportsScheduling(vkParams.get_proc_addr, vkParams.instance, device, m_VkSurface) &&
+        isPresentModeSupportedByPhysicalDevice(device, VK_PRESENT_MODE_FIFO_KHR);
+    VkPhysicalDevicePresentTimingFeaturesEXT timingFeatures{};
+    VkPhysicalDevicePresentId2FeaturesKHR presentIdFeatures{};
+    VkPhysicalDeviceFeatures2 features{};
+    const size_t normalExtensionCount = optionalExtensions.size();
+    if (schedulingSupported) {
+        for (const char* name : {VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
+                                VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
+                                VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME}) {
+            if (std::none_of(optionalExtensions.begin(), optionalExtensions.end(),
+                    [name](const char* enabled) { return !strcmp(name, enabled); }))
+                optionalExtensions.push_back(name);
+        }
     }
+    if (schedulingSupported || gamescopeTiming)
+#else
+    if (gamescopeTiming)
+#endif
+        vkParams.get_proc_addr = VulkanTiming::bridge(vkParams.get_proc_addr);
 #endif
     vkParams.opt_extensions = optionalExtensions.data();
     vkParams.num_opt_extensions = int(optionalExtensions.size());
@@ -556,11 +585,37 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
     }
 #endif
 
+#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
+    const auto* normalFeatures = vkParams.features;
+    if (schedulingSupported) {
+        if (vkParams.features) features = *vkParams.features;
+        features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        timingFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT;
+        timingFeatures.presentTiming = VK_TRUE;
+        timingFeatures.presentAtAbsoluteTime = VK_TRUE;
+        timingFeatures.pNext = features.pNext;
+        presentIdFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR;
+        presentIdFeatures.presentId2 = VK_TRUE;
+        presentIdFeatures.pNext = &timingFeatures;
+        features.pNext = &presentIdFeatures;
+        vkParams.features = &features;
+    }
+#endif
+
     {
         // Don't let Qt take DRM master from us during pl_vulkan_create()
         DrmMasterLocker locker;
 
         m_Vulkan = pl_vulkan_create(m_Log, &vkParams);
+#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
+        if (!m_Vulkan && schedulingSupported) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Vulkan VRR: retrying device creation without scheduled presentation");
+            vkParams.features = normalFeatures;
+            vkParams.num_opt_extensions = int(normalExtensionCount);
+            m_Vulkan = pl_vulkan_create(m_Log, &vkParams);
+        }
+#endif
     }
 
     if (m_Vulkan == nullptr) {
@@ -584,13 +639,42 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
 #endif
 
 #ifdef Q_OS_LINUX
-    if (gamescopeTiming) {
-        bool enabled = false;
+    const auto deviceExtensionEnabled = [this](const char* name) {
         for (int i = 0; i < m_Vulkan->num_extensions; ++i)
-            enabled |= !SDL_strcmp(m_Vulkan->extensions[i], VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+            if (!SDL_strcmp(m_Vulkan->extensions[i], name)) return true;
+        return false;
+    };
+#ifdef VK_EXT_present_timing
+    if (schedulingSupported && deviceExtensionEnabled(VK_EXT_PRESENT_TIMING_EXTENSION_NAME) &&
+            deviceExtensionEnabled(VK_KHR_PRESENT_ID_2_EXTENSION_NAME) &&
+            deviceExtensionEnabled(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+        bool timed = false;
+        bool id = false;
+        for (auto p = reinterpret_cast<const VkBaseInStructure*>(m_Vulkan->features);
+             p; p = p->pNext) {
+            if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
+                continue;
+            if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT) {
+                const auto& enabled = *reinterpret_cast<const VkPhysicalDevicePresentTimingFeaturesEXT*>(p);
+                timed = enabled.presentTiming && enabled.presentAtAbsoluteTime;
+            }
+            if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR)
+                id = reinterpret_cast<const VkPhysicalDevicePresentId2FeaturesKHR*>(p)->presentId2;
+        }
         auto timing = std::make_unique<VulkanTiming>();
-        if (enabled && timing->initialize(m_Vulkan->device)) {
-            m_GamescopeTiming = std::move(timing);
+        if (timed && id && timing->initializeScheduled(m_Vulkan->device, isWaylandPresentation(videoDriver)))
+            m_VulkanTiming = std::move(timing);
+    }
+    if (schedulingRequested && !m_VulkanTiming) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Vulkan VRR: absolute present timing unavailable for this surface or device");
+    }
+#endif
+    if (!m_VulkanTiming && gamescopeTiming) {
+        auto timing = std::make_unique<VulkanTiming>();
+        if (deviceExtensionEnabled(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) &&
+                timing->initialize(m_Vulkan->device)) {
+            m_VulkanTiming = std::move(timing);
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Vulkan VRR: Gamescope WSI presentation timing enabled for diagnostics");
         }
@@ -678,6 +762,17 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     vkInstParams.get_proc_addr = (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
     vkInstParams.extensions = instanceExtensions.data();
     vkInstParams.num_extensions = (int)instanceExtensions.size();
+#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
+    const char* timingInstanceExtension = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME;
+    if (plVkRequestsScheduledPresentation(params->enableVrr, params->ultraLowLatencyVrr, params->testOnly,
+            qgetenv("MOONLIGHT_VRR_VULKAN_SCHEDULED") == "1") &&
+        std::none_of(instanceExtensions.begin(), instanceExtensions.end(), [](const char* name) {
+            return !strcmp(name, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+        })) {
+        vkInstParams.opt_extensions = &timingInstanceExtension;
+        vkInstParams.num_opt_extensions = 1;
+    }
+#endif
     m_PlVkInstance = pl_vk_inst_create(m_Log, &vkInstParams);
     if (m_PlVkInstance == nullptr) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -734,7 +829,29 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     // and queued images. At rates close to the panel ceiling, a double-buffered
     // swapchain can otherwise block preparation until after the presentation
     // target has passed.
-    if (!createSwapchain(2)) {
+    bool swapchainCreated = createSwapchain(2);
+#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
+    if (supportsScheduledPresentation()) {
+        int width, height;
+        SDL_Vulkan_GetDrawableSize(m_Window, &width, &height);
+        if (swapchainCreated && pl_swapchain_resize(m_Swapchain, &width, &height) &&
+                m_VulkanTiming->swapchainTimed()) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Vulkan VRR: scheduled FIFO (%s)",
+                        isWaylandPresentation(SDL_GetCurrentVideoDriver()) ?
+                            "one commit waiting for compositor paint" : "one pending present");
+        }
+        else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Vulkan VRR: timed swapchain unavailable, using worker pacing");
+            pl_swapchain_destroy(&m_Swapchain);
+            m_VulkanTiming.reset();
+            selectPresentationMode(params);
+            m_VrrAdaptivePresentMode = m_VkPresentMode;
+            swapchainCreated = createSwapchain(2);
+        }
+    }
+#endif
+    if (!swapchainCreated) {
         return false;
     }
 
@@ -767,7 +884,7 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     if (m_VrrRequested && m_VrrFallbackReason == VrrFallbackReason::NoFallback) {
         auto feedback = std::make_unique<Vrr13::WaylandFeedback>();
 #ifdef Q_OS_LINUX
-        if (m_GamescopeTiming) feedback.reset();
+        if (m_VulkanTiming && !supportsScheduledPresentation()) feedback.reset();
 #endif
         if (feedback && feedback->initialize(m_Window)) {
             m_PresentationFeedback = std::move(feedback);
@@ -919,12 +1036,18 @@ void PlVkRenderer::selectLegacyPresentMode(PDECODER_PARAMETERS params)
 void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
 {
     m_VrrRequested = params->enableVrr;
+    m_UltraLowLatencyVrr = false;
     m_VrrSuspended = false;
     m_VrrWindowChangePending.store(false);
     m_VrrFramePrepared = false;
     m_VrrPreparingFrame = false;
     m_VrrRenderSucceeded = false;
     m_VrrRenderTimingActive = false;
+#ifdef Q_OS_LINUX
+    m_WaylandFullRefreshPresent = false;
+    m_GamescopeRefreshPeriodUs = 0;
+    m_LastGamescopeRetirementUs = 0;
+#endif
 
     if (!m_VrrRequested) {
 #ifdef Q_OS_WIN32
@@ -984,15 +1107,24 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
     else if (isImmediatePresentation(videoDriver)) {
         surface = PlVkVrrSurface::Immediate;
     }
+#ifdef Q_OS_LINUX
+    if (supportsScheduledPresentation()) {
+        m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+        m_VrrFallbackReason = VrrFallbackReason::NoFallback;
+        m_DeferredAcquireEnabled = true;
+        const bool fullRefresh = params->frameRate >= params->vrrDisplayRefreshHz;
+        m_WaylandFullRefreshPresent = surface == PlVkVrrSurface::Wayland && fullRefresh;
+        m_UltraLowLatencyVrr = gamescopeWsi && params->ultraLowLatencyVrr;
+        if (gamescopeWsi && (fullRefresh || m_UltraLowLatencyVrr))
+            m_GamescopeRefreshPeriodUs = 1000000 / params->vrrDisplayRefreshHz;
+        return;
+    }
+#endif
     const auto supportsMode = [this](VkPresentModeKHR candidate) {
         return isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, candidate);
     };
-    // Explicit Mailbox prevents Gamescope WSI's FIFO compatibility path from
-    // keeping an extra frame downstream of the VRR worker.
     const auto mode = selectPlVkVrrPresentMode(surface, gamescopeWsi, params->gamescopeMailbox,
-        supportsMode, params->ultraLowLatencyVrr);
-    m_UltraLowLatencyVrr = params->ultraLowLatencyVrr && gamescopeWsi &&
-                         mode == VK_PRESENT_MODE_MAILBOX_KHR;
+        supportsMode);
     if (mode) {
         m_VkPresentMode = *mode;
         m_VrrFallbackReason = VrrFallbackReason::NoFallback;
@@ -1022,7 +1154,7 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
 bool PlVkRenderer::createSwapchain(int depth)
 {
 #ifdef Q_OS_LINUX
-    if (m_GamescopeTiming) m_GamescopeTiming->reset();
+    if (m_VulkanTiming) m_VulkanTiming->reset();
 #endif
 #ifdef HAS_WAYLAND
     if (m_PresentationFeedback) m_PresentationFeedback->clear();
@@ -1075,10 +1207,38 @@ bool PlVkRenderer::canLatchAdaptivePresent() const
 {
 #ifdef Q_OS_LINUX
     return m_VrrRequested && m_VrrFallbackReason == VrrFallbackReason::NoFallback &&
-        plVkPersistentPresentModeProvidesLatchProtection(m_VrrAdaptivePresentMode);
+        (supportsScheduledPresentation() ||
+         plVkPersistentPresentModeProvidesLatchProtection(m_VrrAdaptivePresentMode));
 #else
     return false;
 #endif
+}
+
+bool PlVkRenderer::supportsScheduledPresentation() const
+{
+#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
+    return m_VrrRequested && m_VulkanTiming && m_VulkanTiming->scheduled();
+#else
+    return false;
+#endif
+}
+
+VrrCompositorCadence PlVkRenderer::compositorCadence() const
+{
+#ifdef Q_OS_LINUX
+    if (m_GamescopeRefreshPeriodUs) return VrrCompositorCadence::GamescopeFifo;
+#ifdef HAS_WAYLAND
+    if (m_WaylandFullRefreshPresent && m_PresentationFeedback)
+        return VrrCompositorCadence::WaylandFrameCallback;
+#endif
+#endif
+    return VrrCompositorCadence::Disabled;
+}
+
+bool PlVkRenderer::waitForFrameAdmission()
+{
+    return m_VrrFallbackReason != VrrFallbackReason::NoFallback ||
+        m_VrrWindowChangePending.load() || waitForScheduledPresentSlot();
 }
 
 bool PlVkRenderer::prepareDecoderContext(AVCodecContext *context, AVDictionary **)
@@ -1330,6 +1490,16 @@ void PlVkRenderer::queueRenderDeviceReset()
     SDL_PushEvent(&event);
 }
 
+void PlVkRenderer::recoverFromScheduledPresentationFailure(const char* reason)
+{
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Vulkan VRR: %s; restoring worker pacing", reason);
+    // The renderer will be constructed again for this window, so remember
+    // the failure until the stream window is destroyed.
+    SDL_SetWindowData(m_Window, "moonlight.vulkan-scheduled-failed", m_Window);
+    m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+    queueRenderDeviceReset();
+}
+
 void PlVkRenderer::finishVrrRenderTiming()
 {
     if (!m_VrrRenderTimingActive) {
@@ -1386,8 +1556,56 @@ bool PlVkRenderer::acquireVrrSwapchainFrame()
         cancelVrrFrame();
     }
 
-    return acquirePendingSwapchainFrame(
+    if (!waitForScheduledPresentSlot()) return false;
+    const bool acquired = acquirePendingSwapchainFrame(
         "pl_render_image() failed during Vulkan VRR render wait");
+#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
+    if (!acquired && supportsScheduledPresentation() && !m_VulkanTiming->swapchainTimed() &&
+            !m_VrrWindowChangePending.load() && !m_VrrSuspended)
+        recoverFromScheduledPresentationFailure("timed swapchain stopped accepting frames");
+#endif
+    return acquired;
+}
+
+bool PlVkRenderer::waitForScheduledPresentSlot()
+{
+#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
+    if (!supportsScheduledPresentation()) return true;
+
+    const uint64_t giveUpUs = LiGetMicroseconds() + 8000;
+    for (;;) {
+        uint64_t paintedId = 0;
+#ifdef HAS_WAYLAND
+        Vrr13::Ns observed = 0;
+        if (m_PresentationFeedback && m_PresentationFeedback->pollPainted(paintedId, observed) && m_GpuTrace) {
+            const auto timeUs = uint64_t(observed / 1000);
+            m_GpuTrace->record({"wayland_frame_done", -1, 0, timeUs, timeUs, paintedId});
+        }
+#endif
+        const uint64_t pendingSinceUs = m_VulkanTiming->pendingSinceUs();
+        if (m_VulkanTiming->slotAvailable(paintedId)) {
+            if (m_GamescopeRefreshPeriodUs && pendingSinceUs)
+                m_LastGamescopeRetirementUs = LiGetMicroseconds();
+            return true;
+        }
+        const uint64_t nowUs = LiGetMicroseconds();
+        if (pendingSinceUs && nowUs >= pendingSinceUs && nowUs - pendingSinceUs > 250000) {
+            recoverFromScheduledPresentationFailure("timed present did not retire");
+            return false;
+        }
+        if (nowUs >= giveUpUs || m_VrrWindowChangePending.load()) return false;
+        if (m_GamescopeRefreshPeriodUs) {
+            const uint64_t sleepUs = gamescopeRetirementPollUs(nowUs,
+                m_LastGamescopeRetirementUs, m_GamescopeRefreshPeriodUs);
+            std::this_thread::sleep_for(std::chrono::microseconds(std::min(sleepUs, giveUpUs - nowUs)));
+        }
+        else {
+            SDL_Delay(1);
+        }
+    }
+#else
+    return true;
+#endif
 }
 
 bool PlVkRenderer::acquirePendingSwapchainFrame(
@@ -1486,7 +1704,8 @@ IVrrFramePresenter* PlVkRenderer::getVrrFramePresenter()
 VrrFallbackReason PlVkRenderer::checkSupport() const
 {
     const char* videoDriver = SDL_GetCurrentVideoDriver();
-    const bool adaptiveMode = m_VrrAdaptivePresentMode == VK_PRESENT_MODE_MAILBOX_KHR ||
+    const bool adaptiveMode = supportsScheduledPresentation() ||
+                              m_VrrAdaptivePresentMode == VK_PRESENT_MODE_MAILBOX_KHR ||
                               m_VrrAdaptivePresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ||
                               (m_VrrAdaptivePresentMode == VK_PRESENT_MODE_FIFO_KHR &&
                                isGamescopeWsiPresentation(videoDriver));
@@ -2053,11 +2272,10 @@ void PlVkRenderer::stopFramePreparation()
 
 VrrPrepareResult PlVkRenderer::activatePreparedFrame(
     const std::shared_ptr<VrrPreparedFrame>& prepared, AVFrame* frame,
-    uint64_t decodeBoundary, const VrrPresentRequest& request)
+    uint64_t decodeBoundary, [[maybe_unused]] const VrrPresentRequest& request)
 {
 #ifdef Q_OS_LINUX
     (void) decodeBoundary;
-    (void) request;
     const auto image = std::static_pointer_cast<PreparedImage>(prepared);
     VrrPrepareResult result;
     if (image->cancelled() || m_VrrSuspended ||
@@ -2070,7 +2288,7 @@ VrrPrepareResult PlVkRenderer::activatePreparedFrame(
         pl_swapchain_colorspace_hint(m_Swapchain, &m_LastColorspace);
     }
     const bool windowChanged = m_VrrWindowChangePending.exchange(false);
-    if (windowChanged && m_GamescopeTiming) m_GamescopeTiming->reset();
+    if (windowChanged && m_VulkanTiming) m_VulkanTiming->reset();
 #ifdef HAS_WAYLAND
     if (windowChanged && m_PresentationFeedback) m_PresentationFeedback->clear();
 #endif
@@ -2138,10 +2356,9 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
 
 VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
                                             uint64_t decodeBoundary,
-                                            const VrrPresentRequest& request)
+                                            const VrrPresentRequest&)
 {
     (void) decodeBoundary;
-    (void) request;
     VrrPrepareResult result;
     if (frame == nullptr || checkSupport() != VrrFallbackReason::NoFallback ||
             m_VrrSuspended) {
@@ -2180,7 +2397,7 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
     // and makes presentFrame() safely abandon this image.
     const bool windowChanged = m_VrrWindowChangePending.exchange(false);
 #ifdef Q_OS_LINUX
-    if (windowChanged && m_GamescopeTiming) m_GamescopeTiming->reset();
+    if (windowChanged && m_VulkanTiming) m_VulkanTiming->reset();
 #endif
 #ifdef HAS_WAYLAND
     if (windowChanged && m_PresentationFeedback) m_PresentationFeedback->clear();
@@ -2322,7 +2539,9 @@ VrrPrepareResult PlVkRenderer::prepareFrame(AVFrame* frame,
 
 VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& request)
 {
+#ifndef Q_OS_LINUX
     (void) request;
+#endif
 #ifdef Q_OS_LINUX
     const pl_tex deferredTexture = m_DeferredPreparedTexture;
     m_DeferredPreparedTexture = nullptr;
@@ -2370,12 +2589,15 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& reques
     m_VrrFramePrepared = false;
     const uint64_t presentationId = ++m_PresentationId;
 #ifdef Q_OS_LINUX
-    if (m_GamescopeTiming) m_GamescopeTiming->begin(presentationId);
+    // At full refresh the compositor's FIFO orders commits. An additional
+    // clock target can make a frame miss the next repaint.
+    if (m_VulkanTiming) m_VulkanTiming->begin(presentationId,
+        compositorCadence() != VrrCompositorCadence::Disabled ? 0 : request.displayTargetUs);
 #endif
 #ifdef HAS_WAYLAND
     // Attach the request to the next native surface commit, never an empty
     // commit or a CPU completion event. Only this worker presents this surface.
-    if (m_PresentationFeedback) m_PresentationFeedback->request(presentationId);
+    if (m_PresentationFeedback) m_PresentationFeedback->request(presentationId, supportsScheduledPresentation());
 #endif
     if (m_GpuTrace && m_SwapchainFrame.fbo) {
         const auto begin = LiGetMicroseconds();
@@ -2402,6 +2624,9 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& reques
     // libplacebo exposes a boolean submit result here rather than VkResult.
     feedback.nativePresentResult = submitted ? 0 : -1;
     if (!submitted) {
+#ifdef Q_OS_LINUX
+        if (m_VulkanTiming) m_VulkanTiming->finish(feedback);
+#endif
 #ifdef HAS_WAYLAND
         if (m_PresentationFeedback) m_PresentationFeedback->clear();
 #endif
@@ -2419,8 +2644,12 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& reques
     feedback.submissionTimeValid = true;
     feedback.submissionTimeUs = submissionTimeUs;
 #ifdef Q_OS_LINUX
-    if (m_GamescopeTiming) {
-        m_GamescopeTiming->finish(feedback);
+    if (m_VulkanTiming) {
+        m_VulkanTiming->finish(feedback);
+        if (supportsScheduledPresentation() && !feedback.presented) {
+            feedback.submissionTimeValid = false;
+            feedback.cancelled = true;
+        }
         if (feedback.latchSampleValid && !m_LoggedPresentationFeedback) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Vulkan VRR: received Gamescope WSI presentation timestamp (clock uncertainty %llu us)",
@@ -2547,7 +2776,7 @@ VrrPresentFeedback PlVkRenderer::cancelFrame()
 void PlVkRenderer::setSuspended(bool suspended)
 {
 #ifdef Q_OS_LINUX
-    if (m_GamescopeTiming) m_GamescopeTiming->reset();
+    if (m_VulkanTiming) m_VulkanTiming->reset();
 #endif
 #ifdef HAS_WAYLAND
     if (m_PresentationFeedback) m_PresentationFeedback->clear();
@@ -2567,6 +2796,12 @@ bool PlVkRenderer::restoreFixedPresentation(VrrFallbackReason reason)
     // fixed FIFO renderer rather than retaining the adaptive VRR swapchain.
     cancelVrrFrame();
     m_VrrRequested = false;
+#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
+    if (m_VulkanTiming && m_VulkanTiming->scheduled()) {
+        pl_swapchain_destroy(&m_Swapchain);
+        m_VulkanTiming.reset();
+    }
+#endif
     m_VrrSuspended = false;
     m_VrrWindowChangePending.store(false);
     m_VrrFallbackReason = reason == VrrFallbackReason::NoFallback ?
@@ -3088,9 +3323,19 @@ QString PlVkRenderer::getCalibrationIdentity()
     fn_vkGetPhysicalDeviceProperties(m_Vulkan->phys_device, &properties);
     // Persistent presentation mode changes acquisition/native service, so
     // Immediate and nontearing Mailbox must not seed each other's readiness.
-    return QString("Vulkan|%1|%2|%3|%4|present-mode=%5")
+    QString identity = QString("Vulkan|%1|%2|%3|%4|present-mode=%5")
         .arg(properties.vendorID).arg(properties.deviceID).arg(properties.driverVersion)
         .arg(QString::fromLatin1(QByteArray(reinterpret_cast<const char*>(properties.pipelineCacheUUID),
                                           VK_UUID_SIZE).toHex()))
         .arg(static_cast<int>(m_VkPresentMode));
+    if (supportsScheduledPresentation()) {
+        const bool gamescope = isGamescopeWsiPresentation(SDL_GetCurrentVideoDriver());
+        if (compositorCadence() != VrrCompositorCadence::Disabled) {
+            identity += gamescope ? "|scheduled=gamescope-source-paced" : "|scheduled=wayland-refresh";
+        }
+        else {
+            identity += "|scheduled=timed";
+        }
+    }
+    return identity;
 }

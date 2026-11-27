@@ -1682,9 +1682,53 @@ X11/KMSDRM, and Immediate on Gamescope. Gamescope additionally tries Mailbox
 when the dormant SteamOS experiment is enabled, according to exposed surface
 capabilities.
 Ultra Low Latency VRR requires SteamOS 3.10 or later in Gaming Mode and
-probes the actual Gamescope WSI surface. It requests Mailbox ahead of Immediate
-when the surface exposes it. Missing WSI or Mailbox selects the five-sixths
-rate cap and ordinary renderer policy.
+probes a timed FIFO swapchain on the actual Gamescope WSI surface before rate
+negotiation. Playback enables scheduled Vulkan presentation when that probe
+succeeds. An unavailable timed swapchain selects the five-sixths rate cap and
+ordinary renderer policy during negotiation.
+
+The same timed FIFO presenter can be requested independently for experiments
+with `MOONLIGHT_VRR_VULKAN_SCHEDULED=1`. It requires headers with `VK_EXT_present_timing`, enabled device
+features, and absolute timing and pixel-out feedback on the streaming surface.
+The shipped SteamOS 3.10.1 Gamescope layer exposes these on its Xwayland-bypass
+route. Plasma Wayland with Mesa requires the FIFO and commit-timing protocols.
+KWin 6.8.2 requires `KWIN_WAYLAND_SUPPORT_COMMIT_TIMING_V1=1` in the compositor
+environment. The extension and surface features are queried at runtime.
+
+The Vulkan dispatch bridge adds present IDs and absolute targets to libplacebo's
+existing swapchain operations and keeps its render-complete semaphore. The
+Wayland path attaches a frame callback and presentation feedback to the same
+surface commit. KWin sends the callback when it paints that commit, allowing the
+next frame to reach FIFO before the previous frame's hardware presentation
+feedback. Admission allows one commit waiting for paint. Three timing records
+cover that commit and two already painted frames in KWin's display pipeline.
+Completed and discarded records retire by present ID in a single batch. The
+Gamescope path admits one present until its matching terminal timing record.
+SteamOS 3.10.1 reports the commit latch and predicted scanout in that record.
+Gamescope in Ultra Low Latency mode or at full refresh bounds its completion polling to 125 µs sleeps around
+the expected return, based on the previous retirement and the display period.
+Outside that window it can sleep up to 1 ms. Only a matching record opens the slot.
+
+At full refresh on Wayland and Gamescope, and at the Ultra Low Latency rate
+cap on Gamescope, FIFO sets the cadence and commits are
+eligible for the next repaint. The worker prepares immediately and keeps frames
+through software phase corrections. On Gamescope, after the first submission,
+a prepared frame with continuous RTP timing can wait for its buffered source
+deadline. The worker deducts the previous call's time to enqueue. The controller's
+buffer remains effective when the source slows below the display refresh rate.
+Late frames proceed immediately.
+Wayland's frame-callback path submits as soon as the image is ready.
+It waits for the compositor's admission signal before claiming the newest
+decoded frame, so a frame can be replaced while the slot is occupied.
+Gamescope uses a zero target and still tracks the present ID. Mesa Wayland uses
+an immediately eligible timestamp because a zero target would make Mesa
+extrapolate the refresh timing.
+In below-refresh experiments with Ultra Low Latency disabled, the worker assigns explicit display deadlines. A late
+Wayland frame also requests an immediately eligible timestamp. Both paths
+keep the newest unclaimed decoded frame in a one-frame handoff. Timed
+acquisition has a bounded wait. Losing completion feedback requests a renderer
+reset to worker-paced mode for that window. Calibration distinguishes
+Gamescope refresh pacing, Wayland refresh pacing, and deadline-paced playback.
 
 The startup decoder probe that asks the host for a color range must use that
 same Linux Vulkan preference without activating VRR presentation.

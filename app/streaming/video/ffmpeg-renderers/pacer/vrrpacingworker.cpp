@@ -122,10 +122,16 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
         presenter->alwaysSynchronizesAdaptivePresent()),
     m_NativeScheduledPresentation(m_NativeSynchronizedPresentation &&
         presenter->supportsScheduledPresentation()),
+    m_CompositorCadence(m_NativeScheduledPresentation ? presenter->compositorCadence() : VrrCompositorCadence::Disabled),
     m_TimingController(std::make_unique<VrrTimingController>(
-        m_Config, m_CanLatchPresentation,
-        vrrTimingParametersForSession(m_Config, m_NativeSynchronizedPresentation,
-                                     m_NativeScheduledPresentation)))
+        m_Config, m_CanLatchPresentation, [&] {
+            auto parameters = vrrTimingParametersForSession(m_Config,
+                m_NativeSynchronizedPresentation, m_NativeScheduledPresentation);
+            if (m_NativeScheduledPresentation && presenter->keepsNewestQueuedFrame()) {
+                parameters.playoutQueueFrames = 1;
+            }
+            return parameters;
+        }()))
 {
     if (!m_Config.calibrationKey.empty()) {
         m_Config.calibrationKey = Vrr13::calibrationKey(
@@ -354,10 +360,17 @@ int VrrPacingWorker::run()
 {
     const VideoThreadPriority priority("VRRPacer", VideoThreadPriority::Role::Deadline);
 
+    const bool compositorPaced = m_CompositorCadence != VrrCompositorCadence::Disabled;
+    uint64_t previousPresentEntryUs = 0;
     QueuedFrame reservedFrame;
     bool reservedDiscontinuity = false;
     while (!isStopping()) {
         consumeWindowStateNotifications();
+
+        if (compositorPaced && !presentationSuspended() &&
+                !m_Presenter->waitForFrameAdmission()) {
+            continue;
+        }
 
         QueuedFrame queuedFrame;
         bool queueDiscontinuity = false;
@@ -516,7 +529,9 @@ int VrrPacingWorker::run()
                 telemetry.inputNetworkBufferMiss, telemetry.inputDecodeBufferMiss);
         }
 
-        if (decision.trajectory.resyncRecommended) {
+        // Compositor-paced FIFO does not use the software target. Dropping a
+        // frame to reset its phase would leave an otherwise usable repaint empty.
+        if (!compositorPaced && decision.trajectory.resyncRecommended) {
             const uint64_t waitUs = decision.replacementWaitUs != 0 ? decision.replacementWaitUs :
                 m_TimingController->parameters().playoutCeilingPhaseReplacement != 0 ?
                     std::min<uint64_t>(20000, decision.sourcePeriodUs * 2) : 0;
@@ -594,8 +609,9 @@ int VrrPacingWorker::run()
         }
 
         telemetry.renderWaitEntryUs = LiGetMicroseconds();
-        const VrrTargetWaitResult renderWait =
-            m_TargetWaiter->waitUntil(decision.renderStartUs);
+        VrrTargetWaitResult renderWait;
+        if (compositorPaced) renderWait.finalNowUs = telemetry.renderWaitEntryUs;
+        else renderWait = m_TargetWaiter->waitUntil(decision.renderStartUs);
         telemetry.renderWait = renderWait;
         telemetry.renderWaitFinalUs = renderWait.finalNowUs;
         telemetry.renderSchedulerDelayUs = renderWait.schedulerDelayUs;
@@ -605,7 +621,7 @@ int VrrPacingWorker::run()
         // A deadline that was already in the past is not an OS wake delay.
         // This matters when a decoded frame arrives after its projected render
         // start: readiness/render telemetry owns that lateness instead.
-        telemetry.renderWaitOvershootUs = renderWait.deadlineAlreadyElapsed ?
+        telemetry.renderWaitOvershootUs = compositorPaced || renderWait.deadlineAlreadyElapsed ?
             0 : positiveDifference(renderWait.finalNowUs,
                                    decision.renderStartUs);
         uint32_t midframeWindowStateFlags =
@@ -661,6 +677,7 @@ int VrrPacingWorker::run()
         VrrPresentRequest presentRequest;
         presentRequest.latchedPresentation = decision.latchedPresentation;
         presentRequest.collectDiagnostics = m_DeepTraceEnabled;
+        if (m_NativeScheduledPresentation) presentRequest.displayTargetUs = decision.targetUs;
 
         telemetry.preparationStartUs = LiGetMicroseconds();
         const VrrPrepareResult preparation = preparedAhead ?
@@ -761,25 +778,38 @@ int VrrPacingWorker::run()
 
         telemetry.nativeScheduledPresentation = m_NativeScheduledPresentation;
         VrrTargetWaitResult targetWait;
-        const auto holdCadence = [&]() {
+        const auto holdCadence = [&](uint64_t deadlineUs) {
             do {
                 telemetry.targetWaitEntryUs = LiGetMicroseconds();
-                targetWait = m_TargetWaiter->waitUntil(decision.targetUs,
+                targetWait = m_TargetWaiter->waitUntil(deadlineUs,
                                                       decision.targetWakeLeadUs);
                 // Keep the last complete wait observation intact. Combining
                 // one attempt's raw fields with a later clock sample corrupts
                 // exact replay, especially for an already-elapsed deadline.
-            } while (m_NativeScheduledPresentation &&
-                     targetWait.finalNowUs < decision.targetUs);
+            } while (m_NativeScheduledPresentation && !compositorPaced &&
+                     targetWait.finalNowUs < deadlineUs);
             telemetry.targetWait = targetWait;
             telemetry.targetWaitFinalUs = targetWait.finalNowUs;
             telemetry.targetWaitOvershootUs = targetWait.deadlineAlreadyElapsed ?
-                0 : positiveDifference(targetWait.finalNowUs, decision.targetUs);
+                0 : positiveDifference(targetWait.finalNowUs, deadlineUs);
             telemetry.targetSchedulerDelayUs = targetWait.schedulerDelayUs;
             telemetry.targetSchedulerDelayValid = targetWait.schedulerDelayValid;
             telemetry.targetDeadlineAlreadyElapsed = targetWait.deadlineAlreadyElapsed;
         };
-        if (!m_NativeScheduledPresentation) holdCadence();
+        if (!m_NativeScheduledPresentation) {
+            holdCadence(decision.targetUs);
+        }
+        else if (m_CompositorCadence == VrrCompositorCadence::GamescopeFifo &&
+                 previousPresentEntryUs && m_TimingController->hasLastSubmission() &&
+                 decision.usedRtpTimestamp && !decision.rebased && !decision.phaseDiscontinuity &&
+                 !externalRebaseApplied) {
+            // The controller already budgets how much input jitter to absorb.
+            // With a 60 FPS source on a 120 Hz display, even an early frame
+            // arrives after the previous call's next refresh. Pace from the
+            // buffered source timestamp and account for the work inside Present.
+            const uint64_t enqueueLeadUs = positiveDifference(m_LastActualSubmissionUs, previousPresentEntryUs);
+            holdCadence(positiveDifference(decision.originalTargetUs, enqueueLeadUs));
+        }
         midframeWindowStateFlags =
             consumeWindowStateNotifications();
         telemetry.midframeWindowStateFlags |=
@@ -887,7 +917,6 @@ int VrrPacingWorker::run()
             telemetry.spacingRecheckUs = telemetry.spacingCheckUs;
             // The controller reserved display spacing. CPU enqueue is
             // intentionally early and must not be checked against a flip floor.
-            presentRequest.displayTargetUs = decision.targetUs;
         }
 
         // The mathematical floor and its correction can add another
@@ -960,6 +989,7 @@ int VrrPacingWorker::run()
         telemetry.presentDurationUs =
             telemetry.presentEndUs >= telemetry.presentStartUs ?
                 telemetry.presentEndUs - telemetry.presentStartUs : 0;
+        previousPresentEntryUs = feedback.presented && !feedback.cancelled ? telemetry.presentStartUs : 0;
         if (!gpuReadyCompleted) {
             const bool deferredGpuReadyCompleted =
                 feedback.gpuReadyTimingValid &&
@@ -981,11 +1011,11 @@ int VrrPacingWorker::run()
                     !feedback.gpuReadyCompletedBeforeWait);
             }
         }
-        if (m_NativeScheduledPresentation) {
+        if (m_NativeScheduledPresentation && !compositorPaced) {
             // Submission and retirement are now owned by the native queue.
             // Hold only this worker's next dequeue until the logical deadline,
             // avoiding a speculative extra queue of future frames.
-            holdCadence();
+            holdCadence(decision.targetUs);
             m_TimingController->noteSchedulerDelays(
                 telemetry.renderWaitOvershootUs,
                 targetWait.schedulerDelayUs, targetWait.schedulerDelayValid);

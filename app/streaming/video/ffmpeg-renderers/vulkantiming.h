@@ -5,9 +5,7 @@
 #include <array>
 #include <deque>
 
-// Observe the Gamescope WSI swapchain through VK_GOOGLE_display_timing.
-// The proc-address bridge lets libplacebo keep ownership of the swapchain.
-// It only appends a timing ID; desiredPresentTime remains zero.
+// Add timing to libplacebo's existing swapchain and queue operations.
 class VulkanTiming {
 public:
     struct Statistics {
@@ -19,10 +17,19 @@ public:
     ~VulkanTiming();
     static PFN_vkGetInstanceProcAddr bridge(PFN_vkGetInstanceProcAddr loader);
     bool initialize(VkDevice device);
-    void begin(uint64_t id) { m_ArmedId = id; m_AcceptedId = 0; }
+    void begin(uint64_t id, uint64_t targetUs = 0);
     void finish(VrrPresentFeedback& feedback);
     void reset();
     const Statistics& statistics() const { return m_Statistics; }
+#ifdef VK_EXT_present_timing
+    static bool supportsScheduling(PFN_vkGetInstanceProcAddr, VkInstance,
+                                   VkPhysicalDevice, VkSurfaceKHR);
+    bool initializeScheduled(VkDevice device, bool waylandFramePacing = false);
+    bool scheduled() const { return m_GetScheduledTimings != nullptr; }
+    bool swapchainTimed() const { return m_Swapchain != VK_NULL_HANDLE && m_TimingConfigured; }
+    bool slotAvailable(uint64_t paintedId = 0);
+    uint64_t pendingSinceUs() const { return m_ScheduledPresents.empty() ? 0 : m_ScheduledPresents.front().submitted; }
+#endif
 private:
     // Cumulative across swapchain resets; observation only, never pacing input.
     Statistics m_Statistics;
@@ -34,9 +41,34 @@ private:
     static VKAPI_ATTR void VKAPI_CALL getQueue2(VkDevice, const VkDeviceQueueInfo2*, VkQueue*);
     static VKAPI_ATTR void VKAPI_CALL destroyDevice(VkDevice, const VkAllocationCallbacks*);
     static VKAPI_ATTR VkResult VKAPI_CALL present(VkQueue, const VkPresentInfoKHR*);
+#ifdef VK_EXT_present_timing
+    static VKAPI_ATTR VkResult VKAPI_CALL createSwapchain(
+        VkDevice, const VkSwapchainCreateInfoKHR*, const VkAllocationCallbacks*, VkSwapchainKHR*);
+    static VKAPI_ATTR void VKAPI_CALL destroySwapchain(
+        VkDevice, VkSwapchainKHR, const VkAllocationCallbacks*);
+    bool configureSwapchain(VkSwapchainKHR);
+    bool canSubmitScheduled() const;
+    static constexpr uint32_t kWaylandTimingCapacity = 3;
+    VkResult presentScheduled(PFN_vkQueuePresentKHR, VkQueue, const VkPresentInfoKHR*,
+                              uint64_t id);
+    PFN_vkSetSwapchainPresentTimingQueueSizeEXT m_SetTimingQueueSize = nullptr;
+    PFN_vkGetSwapchainTimeDomainPropertiesEXT m_GetTimeDomains = nullptr;
+    PFN_vkGetPastPresentationTimingEXT m_GetScheduledTimings = nullptr;
+    PFN_vkGetCalibratedTimestampsKHR m_GetCalibratedTimestamps = nullptr;
+    uint64_t m_TimeDomainId = 0;
+    VkTimeDomainKHR m_TimeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
+    uint64_t targetInSwapchainClock(uint64_t);
+    struct ScheduledPresent { uint64_t token, id, submitted; };
+    std::deque<ScheduledPresent> m_ScheduledPresents;
+    bool m_TimingConfigured = false, m_WaylandFramePacing = false;
+    uint64_t m_ScheduledToken = 0, m_WaylandPaintedId = 0;
+    uint64_t m_RequestedTargetUs = 0, m_AcceptedTargetUs = 0;
+    VkResult m_LastPresentResult = VK_SUCCESS;
+#endif
     static PFN_vkVoidFunction intercept(const char*, PFN_vkVoidFunction);
     VkResult presentFrame(PFN_vkQueuePresentKHR, VkQueue, const VkPresentInfoKHR*);
     void collect();
+    bool registerDevice(VkDevice);
     VkDevice m_Device = VK_NULL_HANDLE;
     VkSwapchainKHR m_Swapchain = VK_NULL_HANDLE;
     PFN_vkGetPastPresentationTimingGOOGLE m_GetTimings = nullptr;

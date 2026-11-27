@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 #include <time.h>
 
 namespace {
@@ -15,6 +17,16 @@ std::mutex dispatchLock;
 std::unordered_map<VkQueue, VkDevice> queueDevices;
 std::unordered_map<VkDevice, VulkanTiming*> observers;
 bool accepted(VkResult r) { return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR; }
+
+#ifdef VK_EXT_present_timing
+VulkanTiming* timingForDevice(VkDevice device)
+{
+    std::lock_guard<std::mutex> lock(dispatchLock);
+    const auto observer = observers.find(device);
+    return observer != observers.end() ? observer->second : nullptr;
+}
+
+#endif
 }
 
 PFN_vkGetInstanceProcAddr VulkanTiming::bridge(PFN_vkGetInstanceProcAddr source)
@@ -33,6 +45,10 @@ PFN_vkVoidFunction VulkanTiming::intercept(const char* name, PFN_vkVoidFunction 
     HOOK("vkGetDeviceQueue2", getQueue2);
     HOOK("vkQueuePresentKHR", present);
     HOOK("vkDestroyDevice", destroyDevice);
+#ifdef VK_EXT_present_timing
+    HOOK("vkCreateSwapchainKHR", createSwapchain);
+    HOOK("vkDestroySwapchainKHR", destroySwapchain);
+#endif
 #undef HOOK
     return next;
 }
@@ -85,10 +101,28 @@ bool VulkanTiming::initialize(VkDevice device)
     if (!source) return false;
     m_GetTimings = reinterpret_cast<PFN_vkGetPastPresentationTimingGOOGLE>(source(device, "vkGetPastPresentationTimingGOOGLE"));
     if (!m_GetTimings) return false;
+    return registerDevice(device);
+}
+
+bool VulkanTiming::registerDevice(VkDevice device)
+{
     m_Device = device;
     std::lock_guard<std::mutex> lock(dispatchLock);
     observers[device] = this;
     return true;
+}
+
+void VulkanTiming::begin(uint64_t id, uint64_t targetUs)
+{
+    m_ArmedId = id;
+    m_AcceptedId = 0;
+#ifdef VK_EXT_present_timing
+    m_RequestedTargetUs = targetUs;
+    m_AcceptedTargetUs = 0;
+    m_LastPresentResult = VK_ERROR_INITIALIZATION_FAILED;
+#else
+    (void) targetUs;
+#endif
 }
 
 VulkanTiming::~VulkanTiming()
@@ -117,6 +151,14 @@ VKAPI_ATTR VkResult VKAPI_CALL VulkanTiming::present(VkQueue queue, const VkPres
 
 void VulkanTiming::reset()
 {
+#ifdef VK_EXT_present_timing
+    // A pause or output epoch does not retire a Vulkan present. The next
+    // acquire must still observe completion, or destroy the old swapchain.
+    if (scheduled()) {
+        m_WaylandPaintedId = 0;
+        return;
+    }
+#endif
     m_Pending = {};
     m_Completed.clear();
     m_Swapchain = VK_NULL_HANDLE;
@@ -128,6 +170,9 @@ VkResult VulkanTiming::presentFrame(PFN_vkQueuePresentKHR next, VkQueue queue, c
 {
     const uint64_t id = m_ArmedId;
     m_ArmedId = 0;
+#ifdef VK_EXT_present_timing
+    if (scheduled()) return presentScheduled(next, queue, info, id);
+#endif
     if (!id || info->swapchainCount != 1) return next(queue, info);
     // Preserve extensions already owned by libplacebo or another caller.
     for (auto* p = static_cast<const VkBaseInStructure*>(info->pNext); p; p = p->pNext)
@@ -213,6 +258,20 @@ void VulkanTiming::collect()
 void VulkanTiming::finish(VrrPresentFeedback& feedback)
 {
     m_ArmedId = 0;
+#ifdef VK_EXT_present_timing
+    m_RequestedTargetUs = 0;
+    if (scheduled()) {
+        feedback.nativePresentResult = m_LastPresentResult;
+        feedback.presented = m_AcceptedId != 0;
+        feedback.submissionIdValid = feedback.presented;
+        feedback.submissionId = m_AcceptedId;
+        feedback.nativeTargetValid = feedback.presented && m_AcceptedTargetUs != 0;
+        feedback.nativeTargetUs = m_AcceptedTargetUs;
+        feedback.nativeOutstandingPresents = m_ScheduledPresents.size();
+        m_AcceptedId = 0;
+        return;
+    }
+#endif
     if (m_AcceptedId && feedback.presented && !feedback.cancelled) {
         feedback.submissionIdValid = true;
         feedback.submissionId = m_AcceptedId;
@@ -229,3 +288,229 @@ void VulkanTiming::finish(VrrPresentFeedback& feedback)
     feedback.latchTimeUs = sample.time;
     feedback.presentationUncertaintyUs = sample.uncertainty;
 }
+
+#ifdef VK_EXT_present_timing
+bool VulkanTiming::supportsScheduling(PFN_vkGetInstanceProcAddr proc, VkInstance instance,
+                                     VkPhysicalDevice device, VkSurfaceKHR surface)
+{
+    auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>(
+        proc(instance, "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
+    if (!query) return false;
+    VkPresentTimingSurfaceCapabilitiesEXT timing{};
+    timing.sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT;
+    VkSurfaceCapabilities2KHR caps{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR, &timing, {}};
+    const VkPhysicalDeviceSurfaceInfo2KHR info{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, nullptr, surface};
+    return query(device, &info, &caps) == VK_SUCCESS &&
+        timing.presentTimingSupported && timing.presentAtAbsoluteTimeSupported &&
+        (timing.presentStageQueries & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT);
+}
+
+bool VulkanTiming::initializeScheduled(VkDevice device, bool waylandFramePacing)
+{
+    auto source = deviceLoader.load();
+    if (!source) return false;
+    m_GetTimeDomains = reinterpret_cast<PFN_vkGetSwapchainTimeDomainPropertiesEXT>(
+        source(device, "vkGetSwapchainTimeDomainPropertiesEXT"));
+    m_SetTimingQueueSize = reinterpret_cast<PFN_vkSetSwapchainPresentTimingQueueSizeEXT>(
+        source(device, "vkSetSwapchainPresentTimingQueueSizeEXT"));
+    m_GetScheduledTimings = reinterpret_cast<PFN_vkGetPastPresentationTimingEXT>(
+        source(device, "vkGetPastPresentationTimingEXT"));
+    m_GetCalibratedTimestamps = reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(
+        source(device, "vkGetCalibratedTimestampsKHR"));
+    m_WaylandFramePacing = waylandFramePacing;
+    return m_GetTimeDomains && m_SetTimingQueueSize && m_GetScheduledTimings &&
+        registerDevice(device);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL VulkanTiming::createSwapchain(
+    VkDevice device, const VkSwapchainCreateInfoKHR* info,
+    const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
+{
+    auto create = reinterpret_cast<PFN_vkCreateSwapchainKHR>(
+        deviceLoader.load()(device, "vkCreateSwapchainKHR"));
+    auto observer = timingForDevice(device);
+    if (!observer || !observer->scheduled()) return create(device, info, allocator, swapchain);
+
+    VkSwapchainCreateInfoKHR copy = *info;
+    copy.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT |
+                  VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
+    const auto result = create(device, &copy, allocator, swapchain);
+    if (result != VK_SUCCESS) return result;
+    if (!observer->configureSwapchain(*swapchain)) {
+        auto destroy = reinterpret_cast<PFN_vkDestroySwapchainKHR>(
+            deviceLoader.load()(device, "vkDestroySwapchainKHR"));
+        destroy(device, *swapchain, allocator);
+        *swapchain = VK_NULL_HANDLE;
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    observer->m_Swapchain = *swapchain;
+    observer->m_ScheduledPresents.clear();
+    observer->m_WaylandPaintedId = 0;
+    observer->m_TimingConfigured = true;
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL VulkanTiming::destroySwapchain(
+    VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* allocator)
+{
+    if (auto observer = timingForDevice(device);
+        observer && observer->scheduled() && observer->m_Swapchain == swapchain) {
+        observer->m_Swapchain = VK_NULL_HANDLE;
+        observer->m_ScheduledPresents.clear();
+        observer->m_WaylandPaintedId = 0;
+        observer->m_TimingConfigured = false;
+    }
+    auto destroy = reinterpret_cast<PFN_vkDestroySwapchainKHR>(
+        deviceLoader.load()(device, "vkDestroySwapchainKHR"));
+    destroy(device, swapchain, allocator);
+}
+
+bool VulkanTiming::configureSwapchain(VkSwapchainKHR swapchain)
+{
+    VkSwapchainTimeDomainPropertiesEXT properties{};
+    properties.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT;
+    uint64_t counter = 0;
+    if (m_GetTimeDomains(m_Device, swapchain, &properties, &counter) != VK_SUCCESS ||
+        !properties.timeDomainCount || properties.timeDomainCount > 32) return false;
+    std::array<VkTimeDomainKHR, 32> clocks{};
+    std::array<uint64_t, 32> ids{};
+    properties.pTimeDomains = clocks.data();
+    properties.pTimeDomainIds = ids.data();
+    if (m_GetTimeDomains(m_Device, swapchain, &properties, &counter) != VK_SUCCESS) return false;
+    for (uint32_t i = 0; i < properties.timeDomainCount; ++i) {
+        if (clocks[i] != VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR &&
+            clocks[i] != VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR &&
+            !(clocks[i] == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT && m_GetCalibratedTimestamps))
+            continue;
+        m_TimeDomainId = ids[i];
+        m_TimeDomain = clocks[i];
+        return m_SetTimingQueueSize(m_Device, swapchain, m_WaylandFramePacing ? kWaylandTimingCapacity : 1) == VK_SUCCESS;
+    }
+    return false;
+}
+
+uint64_t VulkanTiming::targetInSwapchainClock(uint64_t targetUs)
+{
+    const uint64_t beforeUs = LiGetMicroseconds();
+    const bool stageLocal = m_TimeDomain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT;
+    if (!m_WaylandFramePacing && targetUs <= beforeUs) return 0;
+
+    uint64_t nativeNs;
+    if (stageLocal) {
+        // Gamescope exposes a stage-local domain, even though its current
+        // implementation uses CLOCK_MONOTONIC for all of the stages.
+        const VkSwapchainCalibratedTimestampInfoEXT swapchainClock{
+            VK_STRUCTURE_TYPE_SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr,
+            m_Swapchain, VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT, m_TimeDomainId};
+        const VkCalibratedTimestampInfoKHR clock{
+            VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, &swapchainClock, m_TimeDomain};
+        uint64_t deviationNs = 0;
+        if (m_GetCalibratedTimestamps(m_Device, 1, &clock, &nativeNs, &deviationNs) != VK_SUCCESS ||
+                deviationNs > 500000) return 0;
+    }
+    else {
+        const auto clockId = m_TimeDomain == VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR ?
+            CLOCK_MONOTONIC : CLOCK_MONOTONIC_RAW;
+        timespec clock{};
+        if (clock_gettime(clockId, &clock) != 0) return 0;
+        nativeNs = uint64_t(clock.tv_sec) * 1000000000 + clock.tv_nsec;
+    }
+
+    const uint64_t afterUs = LiGetMicroseconds();
+    if (afterUs < beforeUs || afterUs - beforeUs > 500 ||
+            (!m_WaylandFramePacing && targetUs <= afterUs)) return 0;
+    const uint64_t midpointUs = beforeUs + (afterUs - beforeUs) / 2;
+    // On Mesa Wayland, a zero target selects WSI's automatic phase prediction.
+    // A late frame should be eligible for the next repaint immediately.
+    if (targetUs <= midpointUs) return nativeNs;
+    return nativeNs + (targetUs - midpointUs) * 1000;
+}
+
+bool VulkanTiming::canSubmitScheduled() const
+{
+    // The frame callback arrives after KWin has consumed the commit for a
+    // repaint. Let the next commit reach FIFO while that repaint is scanning
+    // out. KWin can have two painted frames in flight, but only one commit
+    // can be waiting to be picked up for a repaint.
+    return m_ScheduledPresents.empty() ||
+        (m_WaylandFramePacing && m_ScheduledPresents.size() < kWaylandTimingCapacity &&
+         m_WaylandPaintedId != 0 && m_ScheduledPresents.back().id == m_WaylandPaintedId);
+}
+
+bool VulkanTiming::slotAvailable(uint64_t paintedId)
+{
+    if (paintedId) m_WaylandPaintedId = paintedId;
+    if (m_ScheduledPresents.empty()) return true;
+
+    // Read all possible completions in one call. Mesa can consume completed
+    // entries even when the supplied result array is too small to return them.
+    std::array<VkPresentStageTimeEXT, kWaylandTimingCapacity> stages{};
+    std::array<VkPastPresentationTimingEXT, kWaylandTimingCapacity> timings{};
+    for (size_t i = 0; i < m_ScheduledPresents.size(); ++i) {
+        timings[i].sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
+        timings[i].presentStageCount = 1;
+        timings[i].pPresentStages = &stages[i];
+    }
+    VkPastPresentationTimingPropertiesEXT properties{};
+    properties.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT;
+    properties.presentationTimingCount = static_cast<uint32_t>(m_ScheduledPresents.size());
+    properties.pPresentationTimings = timings.data();
+    const VkPastPresentationTimingInfoEXT info{
+        VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT, nullptr, 0, m_Swapchain};
+    const auto result = m_GetScheduledTimings(m_Device, &info, &properties);
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+        ++m_Statistics.queryErrors;
+        return canSubmitScheduled();
+    }
+    for (size_t i = 0; i < std::min<size_t>(properties.presentationTimingCount, timings.size()); ++i) {
+        const auto& timing = timings[i];
+        // A completed zero timestamp can be a discard. A Gamescope timestamp
+        // can be a prediction. Only the matching terminal ID retires a record.
+        if (!timing.reportComplete) continue;
+        const auto completed = std::find_if(m_ScheduledPresents.begin(), m_ScheduledPresents.end(),
+            [&](const ScheduledPresent& pending) { return pending.token == timing.presentId; });
+        if (completed != m_ScheduledPresents.end()) {
+            m_ScheduledPresents.erase(completed);
+            ++m_Statistics.returned;
+        }
+    }
+    return canSubmitScheduled();
+}
+
+VkResult VulkanTiming::presentScheduled(PFN_vkQueuePresentKHR next, VkQueue queue,
+                                        const VkPresentInfoKHR* info, uint64_t id)
+{
+    const auto targetUs = std::exchange(m_RequestedTargetUs, 0);
+    if (info->swapchainCount != 1 || info->pSwapchains[0] != m_Swapchain ||
+        !m_TimingConfigured || !canSubmitScheduled()) {
+        if (info->pResults && info->swapchainCount == 1)
+            info->pResults[0] = VK_ERROR_OUT_OF_DATE_KHR;
+        return m_LastPresentResult = VK_ERROR_OUT_OF_DATE_KHR;
+    }
+    const uint64_t token = ++m_ScheduledToken;
+    const VkPresentId2KHR presentId{VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR, info->pNext, 1, &token};
+    const uint64_t targetNs = targetInSwapchainClock(targetUs);
+    const auto targetStage = m_TimeDomain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT ?
+        VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT : VkPresentStageFlagBitsEXT{};
+    const VkPresentTimingInfoEXT timing{VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT, nullptr,
+        !m_WaylandFramePacing || targetStage ? VkPresentTimingInfoFlagsEXT{} :
+            VkPresentTimingInfoFlagsEXT{VK_PRESENT_TIMING_INFO_PRESENT_AT_NEAREST_REFRESH_CYCLE_BIT_EXT},
+        targetNs, m_TimeDomainId, VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT,
+        static_cast<VkPresentStageFlagsEXT>(targetStage)};
+    const VkPresentTimingsInfoEXT timings{
+        VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT, &presentId, 1, &timing};
+    VkPresentInfoKHR copy = *info;
+    copy.pNext = &timings;
+    const uint64_t submittedUs = LiGetMicroseconds();
+    const VkResult result = next(queue, &copy);
+    m_LastPresentResult = accepted(result) && info->pResults ? info->pResults[0] : result;
+    if (accepted(m_LastPresentResult)) {
+        ++m_Statistics.submissions;
+        m_ScheduledPresents.push_back({token, id, submittedUs});
+        m_AcceptedId = id;
+        m_AcceptedTargetUs = targetNs ? targetUs : 0;
+    }
+    return result;
+}
+#endif

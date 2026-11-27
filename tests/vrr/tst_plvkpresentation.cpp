@@ -10,12 +10,12 @@ int failures = 0;
 void check(PlVkVrrSurface surface, bool wsi,
            std::initializer_list<VkPresentModeKHR> available,
            std::optional<VkPresentModeKHR> expected, const char* description,
-           bool gamescopeMailbox = true, bool ultraLowLatency = false)
+           bool gamescopeMailbox = true)
 {
     const auto selected = selectPlVkVrrPresentMode(surface, wsi, gamescopeMailbox,
         [&](VkPresentModeKHR mode) {
             return std::find(available.begin(), available.end(), mode) != available.end();
-        }, ultraLowLatency);
+        });
     if (selected != expected || (selected &&
             std::find(available.begin(), available.end(), *selected) == available.end())) {
         std::fprintf(stderr, "FAIL: %s\n", description);
@@ -26,6 +26,19 @@ void check(PlVkVrrSurface surface, bool wsi,
 
 int main()
 {
+    constexpr uint64_t last = 10000, refresh = 8333;
+    static_assert(gamescopeRetirementPollUs(last, 0, refresh) == 1000);
+    static_assert(gamescopeRetirementPollUs(last - 1, last, refresh) == 1000);
+    static_assert(gamescopeRetirementPollUs(last + 6000, last, refresh) == 1000);
+    static_assert(gamescopeRetirementPollUs(last + 7000, last, refresh) == 333);
+    static_assert(gamescopeRetirementPollUs(last + refresh, last, refresh) == 125);
+    static_assert(gamescopeRetirementPollUs(last + 9500, last, refresh) == 1000);
+    static_assert(plVkRequestsScheduledPresentation(true, true, false, false));
+    static_assert(plVkRequestsScheduledPresentation(true, true, true, false));
+    static_assert(!plVkRequestsScheduledPresentation(true, false, false, false));
+    static_assert(!plVkRequestsScheduledPresentation(false, true, false, true));
+    static_assert(plVkRequestsScheduledPresentation(true, false, false, true));
+    static_assert(!plVkRequestsScheduledPresentation(true, false, true, true));
     using Surface = PlVkVrrSurface;
     constexpr auto fifo = VK_PRESENT_MODE_FIFO_KHR;
     constexpr auto mailbox = VK_PRESENT_MODE_MAILBOX_KHR;
@@ -52,13 +65,6 @@ int main()
           "FIFO-only Gamescope WSI must retain adaptive-worker compatibility");
     check(Surface::Gamescope, false, {fifo}, std::nullopt,
           "Gamescope FIFO without WSI must fall back to fixed pacing");
-    check(Surface::Gamescope, true, {fifo, mailbox, immediate}, mailbox,
-          "Ultra Low Latency must request Mailbox on the Gamescope WSI surface", false, true);
-    check(Surface::Gamescope, true, {fifo, immediate}, immediate,
-          "Ultra Low Latency must retain normal presentation when Mailbox is unavailable", false, true);
-    check(Surface::Gamescope, false, {fifo, mailbox, immediate}, immediate,
-          "Ultra Low Latency must preserve ordinary Gamescope mode selection without WSI", false, true);
-
     check(Surface::Wayland, false, {fifo, mailbox, immediate}, mailbox,
           "ordinary Wayland must retain Mailbox priority");
     check(Surface::Wayland, false, {fifo, immediate}, std::nullopt,
