@@ -22,6 +22,7 @@ extern "C" uint64_t LiGetMicroseconds()
 struct Server {
     wl_display* display = wl_display_create();
     std::vector<wl_resource*> pending;
+    std::vector<wl_resource*> frameCallbacks;
     std::atomic<bool> discard{false};
     std::atomic<unsigned> commits{0};
     std::atomic<uint32_t> clock{CLOCK_MONOTONIC};
@@ -29,6 +30,11 @@ struct Server {
     static void commit(wl_client*, wl_resource* surface) {
         auto& s = *static_cast<Server*>(wl_resource_get_user_data(surface));
         ++s.commits;
+        for (auto* callback : s.frameCallbacks) {
+            wl_callback_send_done(callback, unsigned(s.commits));
+            wl_resource_destroy(callback);
+        }
+        s.frameCallbacks.clear();
         const uint64_t ns = (LiGetMicroseconds() - 1000) * 1000;
         for (auto* r : s.pending) {
             if (s.discard) wl_resource_post_event(r, 2); // discarded
@@ -44,6 +50,10 @@ struct Server {
         static const struct wl_surface_interface impl = [] {
             struct wl_surface_interface v{};
             v.destroy = destroy;
+            v.frame = [](wl_client* c, wl_resource* surface, uint32_t id) {
+                auto& s = *static_cast<Server*>(wl_resource_get_user_data(surface));
+                s.frameCallbacks.push_back(wl_resource_create(c, &wl_callback_interface, 1, id));
+            };
             v.commit = commit;
             return v;
         }();
@@ -117,11 +127,17 @@ int main()
             assert(false && "feedback never arrived");
             return result;
         };
-        collector.request(41);
+        collector.request(41, true);
+        uint64_t paintedId;
+        Vrr13::Ns paintObserved;
         Vrr13::Feedback result;
         assert(!collector.poll(result) && server.commits == 0);
+        assert(!collector.pollPainted(paintedId, paintObserved));
         wl_surface_commit(surface);
         result = receive();
+        assert(collector.pollPainted(paintedId, paintObserved) && paintedId == 41);
+        assert(paintObserved > 0 && paintObserved <= result.observed);
+        assert(!collector.pollPainted(paintedId, paintObserved));
         assert(result.id == 41 && result.outcome == Vrr13::Outcome::Presented);
         assert(result.refresh == 0 && result.presented <= result.observed);
         assert(result.observed - result.presented < 100000000);
@@ -132,11 +148,12 @@ int main()
         result = receive();
         assert(result.id == 42 && result.outcome == Vrr13::Outcome::Discarded);
         server.discard = false;
-        collector.request(43);
+        collector.request(43, true);
         collector.clear();
         wl_surface_commit(surface);
         assert(wl_display_roundtrip(display) >= 0);
         assert(!collector.poll(result));
+        assert(!collector.pollPainted(paintedId, paintObserved));
         collector.request(44);
         wl_surface_commit(surface);
         result = receive();

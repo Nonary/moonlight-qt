@@ -1556,6 +1556,34 @@ X11/KMSDRM, and Immediate on Gamescope. Gamescope additionally tries Mailbox
 when the dormant SteamOS experiment is enabled, according to exposed surface
 capabilities.
 
+`MOONLIGHT_VRR_VULKAN_SCHEDULED=1` requests an experimental timed FIFO
+presenter. It requires headers with `VK_EXT_present_timing`, enabled device
+features, and absolute timing and pixel-out feedback on the streaming surface.
+The shipped SteamOS 3.10.1 Gamescope layer exposes these on its Xwayland-bypass
+route. Plasma Wayland with Mesa requires the FIFO and commit-timing protocols.
+KWin 6.8.2 requires `KWIN_WAYLAND_SUPPORT_COMMIT_TIMING_V1=1` in the compositor
+environment. The extension and surface features are queried at runtime.
+
+The Vulkan dispatch bridge adds present IDs and absolute targets to libplacebo's
+existing swapchain operations and keeps its render-complete semaphore. The
+Wayland path attaches a frame callback and presentation feedback to the same
+surface commit. KWin sends the callback when it paints that commit, allowing the
+next frame to reach FIFO before the previous frame's hardware presentation
+feedback. Admission allows one commit waiting for paint. Three timing records
+cover that commit and two already painted frames in KWin's display pipeline.
+Completed and discarded records retire by present ID in a single batch. The
+Gamescope path admits one present until its matching terminal timing record.
+
+At full refresh on Wayland, FIFO sets the cadence and commits are eligible for
+the next repaint. The worker skips its software render and presentation waits.
+Below refresh, the worker still assigns explicit display deadlines. A late
+Wayland frame requests an immediately eligible timestamp. A zero native Vulkan
+target would make Mesa extrapolate the refresh timing instead. Both paths keep
+the newest unclaimed decoded frame in a one-frame handoff. Timed acquisition has
+a bounded wait. Losing completion feedback requests a renderer reset to
+worker-paced mode for that window. Calibration distinguishes refresh-paced and
+deadline-paced playback.
+
 The startup decoder probe that asks the host for a color range must use that
 same Linux Vulkan preference without activating VRR presentation.
 `chooseDecoder()` still forbids `enableVrr` in test-only mode; the probe passes

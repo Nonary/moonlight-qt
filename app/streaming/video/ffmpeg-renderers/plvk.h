@@ -71,6 +71,10 @@ public:
     virtual IVrrFramePresenter* getVrrFramePresenter() override;
     virtual VrrFallbackReason checkSupport() const override;
     virtual bool canLatchAdaptivePresent() const override;
+    bool alwaysSynchronizesAdaptivePresent() const override { return supportsScheduledPresentation(); }
+    bool supportsScheduledPresentation() const override;
+    bool usesCompositorCadence() const override;
+    bool keepsNewestQueuedFrame() const override { return supportsScheduledPresentation(); }
     virtual uint64_t waitForDecode(AVFrame* frame) override;
     std::shared_ptr<VrrPreparedFrame> queueFramePreparation(AVFrame*, uint64_t) override;
     VrrPrepareResult activatePreparedFrame(const std::shared_ptr<VrrPreparedFrame>&,
@@ -119,6 +123,7 @@ private:
     void selectLegacyPresentMode(PDECODER_PARAMETERS params);
     bool acquirePendingSwapchainFrame(const char* earlyRenderFailureMessage);
     bool acquireVrrSwapchainFrame();
+    void recoverFromScheduledPresentationFailure(const char* reason);
     bool submitPendingSwapchainFrame();
     bool submitSwapchainFrame();
     void finishVrrRenderTiming();
@@ -210,6 +215,7 @@ private:
     // the target. A held swapchain image keeps its buffer on the GPU's
     // residency list, so the next decode can delay its flip.
     bool m_DeferredAcquireEnabled = false;
+    bool m_WaylandFullRefreshPresent = false;
     bool m_DeferredTemplateValid = false;
     pl_swapchain_frame m_DeferredTemplate = {};
     pl_tex_params m_DeferredTextureParams = {};
@@ -276,7 +282,7 @@ private:
     uint64_t m_PresentationId = 0;
     bool m_LoggedPresentationFeedback = false;
 #ifdef Q_OS_LINUX
-    std::unique_ptr<VulkanTiming> m_GamescopeTiming;
+    std::unique_ptr<VulkanTiming> m_VulkanTiming;
 #endif
 #ifdef HAS_WAYLAND
     std::unique_ptr<Vrr13::WaylandFeedback> m_PresentationFeedback;

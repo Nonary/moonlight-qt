@@ -8,15 +8,20 @@
 namespace Vrr13 {
 void WaylandFeedback::clear()
 {
-    for (auto& p : m_Pending) wp_presentation_feedback_destroy(p.proxy);
+    for (auto& p : m_Pending) {
+        if (p.frame) wl_callback_destroy(p.frame);
+        wp_presentation_feedback_destroy(p.proxy);
+    }
     m_Pending.clear();
     m_Completed.clear();
     m_LastOutput = 0;
+    m_PaintedId = 0;
 }
 
 WaylandFeedback::~WaylandFeedback()
 {
     clear();
+    if (m_SurfaceWrapper) wl_proxy_wrapper_destroy(m_SurfaceWrapper);
     if (m_Presentation) wp_presentation_destroy(m_Presentation);
     if (m_Registry) wl_registry_destroy(m_Registry);
     if (m_Queue) wl_event_queue_destroy(m_Queue);
@@ -44,6 +49,9 @@ bool WaylandFeedback::initialize(wl_display* display, wl_surface* surface)
     if (!display || !surface) return false;
     m_Queue = wl_display_create_queue(m_Display);
     if (!m_Queue) return false;
+    m_SurfaceWrapper = static_cast<wl_surface*>(wl_proxy_create_wrapper(m_Surface));
+    if (!m_SurfaceWrapper) return false;
+    wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(m_SurfaceWrapper), m_Queue);
     // A wrapper assigns the child proxy to our queue before any other thread
     // can read an event for it. Setting the queue after construction races SDL.
     auto wrapper = static_cast<wl_display*>(wl_proxy_create_wrapper(m_Display));
@@ -90,7 +98,7 @@ void WaylandFeedback::clockId(void* data, wp_presentation*, uint32_t id)
     static_cast<WaylandFeedback*>(data)->m_Clock = int(id);
 }
 
-void WaylandFeedback::request(uint64_t id)
+void WaylandFeedback::request(uint64_t id, bool trackPaint)
 {
     pump();
     // Bound protocol objects even when a hidden window never receives feedback.
@@ -104,7 +112,23 @@ void WaylandFeedback::request(uint64_t id)
     m_Pending.push_back({this, proxy, id, now(), 0});
     static const wp_presentation_feedback_listener listener{syncOutput, presented, discarded};
     wp_presentation_feedback_add_listener(proxy, &listener, &m_Pending.back());
+    if (trackPaint) {
+        auto& pending = m_Pending.back();
+        pending.frame = wl_surface_frame(m_SurfaceWrapper);
+        static const wl_callback_listener frameListener{frameDone};
+        if (pending.frame) wl_callback_add_listener(pending.frame, &frameListener, &pending);
+    }
     // No empty wl_surface_commit here: the following native swap owns it.
+}
+
+void WaylandFeedback::frameDone(void* data, wl_callback* callback, uint32_t)
+{
+    auto* pending = static_cast<Pending*>(data);
+    auto* owner = pending->owner;
+    owner->m_PaintedId = pending->id;
+    owner->m_PaintObserved = now();
+    wl_callback_destroy(callback);
+    pending->frame = nullptr;
 }
 
 void WaylandFeedback::syncOutput(void* data, struct wp_presentation_feedback*, wl_output* output)
@@ -157,6 +181,7 @@ void WaylandFeedback::discarded(void* data, struct wp_presentation_feedback*)
 void WaylandFeedback::finish(Pending* p, Feedback f)
 {
     f.id = p->id;
+    if (p->frame) wl_callback_destroy(p->frame);
     wp_presentation_feedback_destroy(p->proxy);
     if (m_Completed.size() == 64) m_Completed.pop_front();
     m_Completed.push_back(f);
@@ -188,6 +213,16 @@ bool WaylandFeedback::poll(Feedback& result)
     pump();
     if (m_Completed.empty()) return false;
     result = m_Completed.front(); m_Completed.pop_front();
+    return true;
+}
+
+bool WaylandFeedback::pollPainted(uint64_t& id, Ns& observed)
+{
+    pump();
+    if (!m_PaintedId) return false;
+    id = m_PaintedId;
+    observed = m_PaintObserved;
+    m_PaintedId = 0;
     return true;
 }
 }

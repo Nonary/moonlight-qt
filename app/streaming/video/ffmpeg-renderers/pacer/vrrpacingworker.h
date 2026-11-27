@@ -236,6 +236,7 @@ private:
     bool m_CanLatchPresentation = false;
     const bool m_NativeSynchronizedPresentation;
     const bool m_NativeScheduledPresentation;
+    const bool m_NativeCompositorCadence;
     uint64_t m_LastActualSubmissionUs = 0;
     bool m_WorkerStarted = false;
     std::atomic_bool m_CalibrationInvalidated { false };

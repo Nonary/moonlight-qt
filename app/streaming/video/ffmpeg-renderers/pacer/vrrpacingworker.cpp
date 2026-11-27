@@ -117,10 +117,16 @@ VrrPacingWorker::VrrPacingWorker(IVrrFramePresenter* presenter,
         presenter->alwaysSynchronizesAdaptivePresent()),
     m_NativeScheduledPresentation(m_NativeSynchronizedPresentation &&
         presenter->supportsScheduledPresentation()),
+    m_NativeCompositorCadence(m_NativeScheduledPresentation && presenter->usesCompositorCadence()),
     m_TimingController(std::make_unique<VrrTimingController>(
-        m_Config, m_CanLatchPresentation,
-        vrrTimingParametersForSession(m_Config, m_NativeSynchronizedPresentation,
-                                     m_NativeScheduledPresentation)))
+        m_Config, m_CanLatchPresentation, [&] {
+            auto parameters = vrrTimingParametersForSession(m_Config,
+                m_NativeSynchronizedPresentation, m_NativeScheduledPresentation);
+            if (m_NativeScheduledPresentation && presenter->keepsNewestQueuedFrame()) {
+                parameters.playoutQueueFrames = 1;
+            }
+            return parameters;
+        }()))
 {
     if (!m_Config.calibrationKey.empty()) {
         m_Config.calibrationKey = Vrr13::calibrationKey(
@@ -564,8 +570,9 @@ int VrrPacingWorker::run()
         }
 
         telemetry.renderWaitEntryUs = LiGetMicroseconds();
-        const VrrTargetWaitResult renderWait =
-            m_TargetWaiter->waitUntil(decision.renderStartUs);
+        VrrTargetWaitResult renderWait;
+        if (m_NativeCompositorCadence) renderWait.finalNowUs = telemetry.renderWaitEntryUs;
+        else renderWait = m_TargetWaiter->waitUntil(decision.renderStartUs);
         telemetry.renderWait = renderWait;
         telemetry.renderWaitFinalUs = renderWait.finalNowUs;
         telemetry.renderSchedulerDelayUs = renderWait.schedulerDelayUs;
@@ -575,7 +582,7 @@ int VrrPacingWorker::run()
         // A deadline that was already in the past is not an OS wake delay.
         // This matters when a decoded frame arrives after its projected render
         // start: readiness/render telemetry owns that lateness instead.
-        telemetry.renderWaitOvershootUs = renderWait.deadlineAlreadyElapsed ?
+        telemetry.renderWaitOvershootUs = m_NativeCompositorCadence || renderWait.deadlineAlreadyElapsed ?
             0 : positiveDifference(renderWait.finalNowUs,
                                    decision.renderStartUs);
         uint32_t midframeWindowStateFlags =
@@ -631,6 +638,7 @@ int VrrPacingWorker::run()
         VrrPresentRequest presentRequest;
         presentRequest.latchedPresentation = decision.latchedPresentation;
         presentRequest.collectDiagnostics = m_DeepTraceEnabled;
+        if (m_NativeScheduledPresentation) presentRequest.displayTargetUs = decision.targetUs;
 
         telemetry.preparationStartUs = LiGetMicroseconds();
         const VrrPrepareResult preparation = preparedAhead ?
@@ -857,7 +865,6 @@ int VrrPacingWorker::run()
             telemetry.spacingRecheckUs = telemetry.spacingCheckUs;
             // The controller reserved display spacing. CPU enqueue is
             // intentionally early and must not be checked against a flip floor.
-            presentRequest.displayTargetUs = decision.targetUs;
         }
 
         // The mathematical floor and its correction can add another
@@ -940,7 +947,7 @@ int VrrPacingWorker::run()
                     !feedback.gpuReadyCompletedBeforeWait);
             }
         }
-        if (m_NativeScheduledPresentation) {
+        if (m_NativeScheduledPresentation && !m_NativeCompositorCadence) {
             // Submission and retirement are now owned by the native queue.
             // Hold only this worker's next dequeue until the logical deadline,
             // avoiding a speculative extra queue of future frames.

@@ -29,11 +29,19 @@ public:
     ~WaylandFeedback();
     bool initialize(SDL_Window* window);
     bool initialize(wl_display* display, wl_surface* surface);
-    void request(uint64_t id);
+    void request(uint64_t id, bool trackPaint = false);
     void clear();
     bool poll(Feedback& result);
+    bool pollPainted(uint64_t& id, Ns& observed);
 private:
-    struct Pending { WaylandFeedback* owner; struct wp_presentation_feedback* proxy; uint64_t id; Ns requested; uint64_t output = 0; };
+    struct Pending {
+        WaylandFeedback* owner;
+        struct wp_presentation_feedback* proxy;
+        uint64_t id;
+        Ns requested;
+        uint64_t output = 0;
+        wl_callback* frame = nullptr;
+    };
     static void global(void*, wl_registry*, uint32_t, const char*, uint32_t);
     static void removed(void*, wl_registry*, uint32_t);
     static void clockId(void*, wp_presentation*, uint32_t);
@@ -41,10 +49,12 @@ private:
     static void presented(void*, struct wp_presentation_feedback*, uint32_t, uint32_t, uint32_t,
                           uint32_t, uint32_t, uint32_t, uint32_t);
     static void discarded(void*, struct wp_presentation_feedback*);
+    static void frameDone(void*, wl_callback*, uint32_t);
     void finish(Pending* pending, Feedback result);
     void pump();
     wl_display* m_Display = nullptr;
     wl_surface* m_Surface = nullptr;
+    wl_surface* m_SurfaceWrapper = nullptr;
     wl_event_queue* m_Queue = nullptr;
     wp_presentation* m_Presentation = nullptr;
     wl_registry* m_Registry = nullptr;
@@ -53,6 +63,8 @@ private:
     uint64_t m_LastOutput = 0;
     Ns m_Offset = 0;
     bool m_HaveOffset = false;
+    uint64_t m_PaintedId = 0;
+    Ns m_PaintObserved = 0;
     std::list<Pending> m_Pending;
     std::deque<Feedback> m_Completed;
 };

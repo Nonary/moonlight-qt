@@ -403,6 +403,12 @@ public:
 
     virtual bool supportsScheduledPresentation() const { return false; }
 
+    // A refresh-paced compositor provides both admission and display cadence.
+    virtual bool usesCompositorCadence() const { return false; }
+
+    // Retain only the newest decoded frame that the pacing worker has not claimed.
+    virtual bool keepsNewestQueuedFrame() const { return false; }
+
     // Invalidate native queued deadlines on suspension or a display epoch.
     // This must not submit a replacement image.
     virtual void clearScheduledPresentation() {}
