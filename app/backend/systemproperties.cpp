@@ -6,6 +6,7 @@
 
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
+#include "streaming/vrrratepolicy.h"
 
 #ifdef Q_OS_DARWIN
 #include "streaming/video/ffmpeg-renderers/macdisplaytiming.h"
@@ -174,6 +175,34 @@ int SystemProperties::getRefreshRate(int displayIndex)
     return monitorRefreshRates.value(displayIndex);
 }
 
+int SystemProperties::getUltraLowLatencyVrrFpsLimit()
+{
+    if (ultraLowLatencyVrrFpsLimit >= 0) return ultraLowLatencyVrrFpsLimit;
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) return 0;
+
+    int limit = 0;
+    SDL_Window* probe = StreamUtils::ultraLowLatencyVrrPlatformSupported() ?
+        StreamUtils::createTestWindow() : nullptr;
+    for (int index = 0; index < SDL_GetNumVideoDisplays(); ++index) {
+        SDL_DisplayMode desktopMode = {};
+        if (SDL_GetDesktopDisplayMode(index, &desktopMode) != 0) continue;
+        int refreshHz = desktopMode.refresh_rate;
+#ifdef Q_OS_DARWIN
+        const auto nativeTiming = queryMacDisplayTimingForDisplay(index);
+        if (nativeTiming.hasValidTiming()) refreshHz = nativeTiming.maximumFramesPerSecond;
+#endif
+        if (probe) {
+            SDL_SetWindowPosition(probe, SDL_WINDOWPOS_CENTERED_DISPLAY(index), SDL_WINDOWPOS_CENTERED_DISPLAY(index));
+        }
+        const bool supported = probe && SDL_GetWindowDisplayIndex(probe) == index &&
+            StreamUtils::supportsUltraLowLatencyVrr(probe, refreshHz);
+        limit = qMax(limit, VrrRatePolicy::ultraLowLatencyMaxFps(refreshHz, supported));
+    }
+    if (probe) SDL_DestroyWindow(probe);
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    return ultraLowLatencyVrrFpsLimit = limit;
+}
+
 void SystemProperties::startAsyncLoad()
 {
     if (systemPropertyQueryThread) {
@@ -238,6 +267,7 @@ void SystemProperties::refreshDisplays()
     monitorNativeResolutions.clear();
     monitorSafeAreaResolutions.clear();
     monitorRefreshRates.clear();
+    ultraLowLatencyVrrFpsLimit = -1;
 
     SDL_DisplayMode bestMode;
     for (int displayIndex = 0; displayIndex < SDL_GetNumVideoDisplays(); displayIndex++) {

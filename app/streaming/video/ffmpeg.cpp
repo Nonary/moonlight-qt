@@ -674,7 +674,8 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
                                      .arg(params->width).arg(params->height).arg(params->videoFormat)
                                      .arg(m_FrontendRenderer->getCalibrationIdentity())
                                      .arg(decoder != nullptr ? decoder->name : "pyrowave"),
-                                 params->vrrLatencyMode, params->vrrTimingOptions)) {
+                                 params->vrrLatencyMode, params->vrrTimingOptions,
+                                 params->ultraLowLatencyVrr)) {
             return false;
         }
     }

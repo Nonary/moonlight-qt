@@ -1,4 +1,5 @@
 #include "d3d11composition.h"
+#include <dxgi1_2.h>
 
 using Microsoft::WRL::ComPtr;
 
@@ -51,6 +52,26 @@ bool D3D11CompositionPresenter::deviceSupported(ID3D11Device* device)
     }
     FreeLibrary(module);
     return supported;
+}
+
+bool D3D11CompositionPresenter::windowSupported(HWND window, int adapterIndex, bool hdr)
+{
+    ComPtr<IDXGIFactory1> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    ComPtr<ID3D11Device> device;
+    constexpr D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->EnumAdapters1(adapterIndex, &adapter)) ||
+        FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+            DeviceFlags | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, levels, ARRAYSIZE(levels),
+            D3D11_SDK_VERSION, &device, nullptr, nullptr))) {
+        return false;
+    }
+    // A hidden probe window does not display anything. Exercise the actual
+    // presentation manager and resource binding before committing a stream rate.
+    D3D11CompositionPresenter presenter;
+    return SUCCEEDED(presenter.initialize(device.Get(), window, 64, 64,
+        hdr ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM, {}, 0));
 }
 
 D3D11CompositionPresenter::~D3D11CompositionPresenter()

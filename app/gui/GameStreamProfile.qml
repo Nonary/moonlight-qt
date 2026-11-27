@@ -20,6 +20,7 @@ NavigableDialog {
     property string appName
     property var resolutionChoices: []
     property var fpsChoices: []
+    property int fpsLimit: 0
     property var bitrateOverride
     property var hdrOverride
     readonly property int effectiveBitrate: bitrateOverride === undefined ? StreamingPreferences.bitrateKbps : bitrateOverride
@@ -57,19 +58,32 @@ NavigableDialog {
             if (!refresh) break
             refreshRates.push(refresh)
         }
+        fpsLimit = global.enableVrr && global.enableVsync && global.ultraLowLatencyVrr ?
+                       SystemProperties.getUltraLowLatencyVrrFpsLimit() : 0
+        var globalFps = fpsLimit > 0 ? Math.min(global.fps, fpsLimit) : global.fps
         var rates = [0]
-        global.getFpsChoices(refreshRates).forEach(function(choice) {
-            if (!choice.is_custom) rates.push(Number(choice.video_fps))
+        var rateLabels = [qsTr("Global · %1 FPS").arg(globalFps)]
+        global.getFpsChoices(refreshRates, fpsLimit).forEach(function(choice) {
+            if (choice.is_custom) return
+            rates.push(Number(choice.video_fps))
+            if (choice.kind === "low-latency-vrr") {
+                rateLabels.push(qsTr("%1 FPS (Low-latency VRR)").arg(choice.video_fps))
+            } else {
+                rateLabels.push(qsTr("%1 FPS").arg(choice.video_fps))
+            }
         })
+        if (fpsLimit > 0 && saved.fps > fpsLimit) {
+            rates.push(saved.fps)
+            rateLabels.push(qsTr("%1 FPS (capped at %2)").arg(saved.fps).arg(fpsLimit))
+        }
         rates.push(0)
+        rateLabels.push(qsTr("Custom"))
         fpsChoices = rates
-        frameRate.model = rates.map(function(rate, index) {
-            if (index === 0) return qsTr("Global · %1 FPS").arg(global.fps)
-            return rate ? qsTr("%1 FPS").arg(rate) : qsTr("Custom")
-        })
+        frameRate.model = rateLabels
         match = saved.fps === undefined ? 0 : rates.indexOf(saved.fps)
         frameRate.currentIndex = match < 0 ? rates.length - 1 : match
-        customRate.text = String(saved.fps === undefined ? global.fps : saved.fps)
+        customRate.text = String(saved.fps === undefined ? globalFps :
+                                    (fpsLimit > 0 ? Math.min(saved.fps, fpsLimit) : saved.fps))
         bitrateOverride = saved.bitrateKbps
         hdrOverride = saved.hdr
         viewport.contentY = 0
@@ -189,7 +203,7 @@ NavigableDialog {
                     topPadding: profile.fieldPadding; bottomPadding: profile.fieldPadding
                     visible: profile.customFps; Accessible.name: qsTr("Custom frame rate")
                     inputMethodHints: Qt.ImhDigitsOnly
-                    validator: IntValidator { locale: "C"; bottom: 10; top: 9999 }
+                    validator: IntValidator { locale: "C"; bottom: 10; top: profile.fpsLimit >= 10 ? profile.fpsLimit : 9999 }
                 }
             }
             ConsoleSettingRow {

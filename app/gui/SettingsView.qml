@@ -671,6 +671,7 @@ FocusScope {
                         labelItem: ConsoleText { text: qsTr("Frame rate") }
                         editor: AutoResizingComboBox {
                         property int lastIndexValue
+                        property int fpsLimit: 0
 
                         function updateBitrateForSelection() {
                             var selectedFps = parseInt(model.get(fpsComboBox.currentIndex).video_fps)
@@ -757,8 +758,9 @@ FocusScope {
                                         id: fpsField
                                         maximumLength: 4
                                         inputMethodHints: Qt.ImhDigitsOnly
-                                        placeholderText: fpsListModel.get(fpsComboBox.currentIndex).video_fps
-                                        validator: IntValidator{bottom:10; top:9999}
+                                        placeholderText: fpsComboBox.currentIndex >= 0 && fpsComboBox.currentIndex < fpsListModel.count ?
+                                                             fpsListModel.get(fpsComboBox.currentIndex).video_fps : ""
+                                        validator: IntValidator{bottom:10; top:fpsComboBox.fpsLimit >= 10 ? fpsComboBox.fpsLimit : 9999}
                                         focus: true
 
                                         onTextChanged: {
@@ -798,6 +800,8 @@ FocusScope {
 
                         function choiceText(choice) {
                             switch (choice.kind) {
+                            case "low-latency-vrr":
+                                return qsTr("%1 FPS (Low-latency VRR)").arg(choice.video_fps)
                             case "custom":
                                 return qsTr("Custom (%1 FPS)").arg(choice.video_fps)
                             default:
@@ -805,8 +809,24 @@ FocusScope {
                             }
                         }
 
+                        function swapVrrRate(enabled) {
+                            var fastestRefresh = Math.max.apply(null, getRefreshRates())
+                            if (!isFinite(fastestRefresh)) return
+
+                            var targetFps = StreamingPreferences.fpsAfterVrrToggle(fastestRefresh, enabled)
+                            if (targetFps === StreamingPreferences.fps) return
+
+                            StreamingPreferences.fps = targetFps
+                            if (StreamingPreferences.autoAdjustBitrate) {
+                                StreamingPreferences.bitrateKbps = slider.defaultBitrate()
+                            }
+                            reinitialize()
+                        }
+
                         function reinitialize() {
-                            var choices = StreamingPreferences.getFpsChoices(getRefreshRates())
+                            fpsLimit = StreamingPreferences.enableVrr && StreamingPreferences.enableVsync &&
+                                       StreamingPreferences.ultraLowLatencyVrr ? SystemProperties.getUltraLowLatencyVrrFpsLimit() : 0
+                            var choices = StreamingPreferences.getFpsChoices(getRefreshRates(), fpsLimit)
                             model.clear()
                             var hasCustomChoice = false
 
@@ -821,6 +841,7 @@ FocusScope {
                             }
 
                             var saved_fps = StreamingPreferences.fps
+                            if (fpsLimit > 0) saved_fps = Math.min(saved_fps, fpsLimit)
                             var found = false
                             for (var i = 0; i < model.count; i++) {
                                 var el_fps = parseInt(model.get(i).video_fps);
@@ -855,6 +876,9 @@ FocusScope {
                         Component.onCompleted: {
                             reinitialize()
                             languageChanged.connect(reinitialize)
+                            StreamingPreferences.enableVsyncChanged.connect(reinitialize)
+                            StreamingPreferences.enableVrrChanged.connect(reinitialize)
+                            StreamingPreferences.ultraLowLatencyVrrChanged.connect(reinitialize)
                         }
 
                         model: ListModel {
@@ -1999,17 +2023,37 @@ FocusScope {
                         font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
                         enabled: StreamingPreferences.enableVsync
                         checked: StreamingPreferences.enableVrr
-                        onCheckedChanged: {
+                        onToggled: {
                             StreamingPreferences.enableVrr = checked
+                            if (Qt.platform.os === "windows") {
+                                fpsComboBox.swapVrrRate(checked)
+                            }
                         }
 
                         ToolTip.delay: 1000
                         ToolTip.timeout: 5000
                         ToolTip.visible: hovered
                         ToolTip.text: enabled ?
-                                          qsTr("VRR uses adaptive presentation in borderless fullscreen. Choose your display's full refresh rate, or a lower VRR option for more headroom or lower latency.")
-                                        :
+                                          qsTr("VRR uses adaptive presentation in borderless fullscreen.") :
                                           qsTr("VRR requires V-Sync. Enable V-Sync to change this setting.")
+                    }
+
+                    ConsoleCheckBox {
+                        width: parent.width
+                        objectName: "ultraLowLatencyVrr"
+                        hoverEnabled: true
+                        text: qsTr("Ultra Low Latency VRR")
+                        visible: StreamingPreferences.enableVrr
+                        enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                        checked: StreamingPreferences.ultraLowLatencyVrr
+                        onToggled: StreamingPreferences.ultraLowLatencyVrr = checked
+
+                        ToolTip.delay: 1000
+                        ToolTip.timeout: 10000
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("Renders the stream with 0 frames buffered on supported Windows 11 systems and SteamOS 3.10 or later in Gaming Mode. This can save 1 to 2 frames of latency.") + "\n\n" +
+                                      qsTr("Caps a 120 Hz display at 116 FPS when supported. Other setups use five-sixths of the refresh rate and keep their configured buffer.") +
+                                      (fpsComboBox.fpsLimit > 0 ? "\n\n" + qsTr("Current frame rate limit: %1 FPS").arg(fpsComboBox.fpsLimit) : "")
                     }
                 }
 

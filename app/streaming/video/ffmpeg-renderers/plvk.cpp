@@ -627,6 +627,26 @@ bool PlVkRenderer::isExtensionSupportedByPhysicalDevice(VkPhysicalDevice device,
         return false; \
     }
 
+#ifdef Q_OS_LINUX
+bool PlVkRenderer::supportsUltraLowLatencyOnWindow(SDL_Window* window, int refreshHz, bool hdr)
+{
+    if (!isGamescopeWsiPresentation(SDL_GetCurrentVideoDriver())) return false;
+
+    DECODER_PARAMETERS params = {};
+    params.window = window;
+    SDL_GetWindowSize(window, &params.width, &params.height);
+    params.frameRate = refreshHz;
+    params.videoFormat = hdr ? VIDEO_FORMAT_H265_MAIN10 : VIDEO_FORMAT_H264;
+    params.testOnly = true;
+    params.enableVsync = true;
+    params.enableVrr = true;
+    params.ultraLowLatencyVrr = true;
+    params.vrrDisplayRefreshHz = refreshHz;
+    PlVkRenderer probe;
+    return probe.initialize(&params) && probe.supportsUltraLowLatencyVrr();
+}
+#endif
+
 bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
 {
     m_Window = params->window;
@@ -964,10 +984,15 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
     else if (isImmediatePresentation(videoDriver)) {
         surface = PlVkVrrSurface::Immediate;
     }
+    const auto supportsMode = [this](VkPresentModeKHR candidate) {
+        return isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, candidate);
+    };
+    // Explicit Mailbox prevents Gamescope WSI's FIFO compatibility path from
+    // keeping an extra frame downstream of our zero-buffer worker.
     const auto mode = selectPlVkVrrPresentMode(surface, gamescopeWsi, params->gamescopeMailbox,
-        [this](VkPresentModeKHR candidate) {
-            return isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, candidate);
-        });
+        supportsMode, params->ultraLowLatencyVrr);
+    m_UltraLowLatencyVrr = params->ultraLowLatencyVrr && gamescopeWsi &&
+                         mode == VK_PRESENT_MODE_MAILBOX_KHR;
     if (mode) {
         m_VkPresentMode = *mode;
         m_VrrFallbackReason = VrrFallbackReason::NoFallback;

@@ -293,7 +293,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                        bool enablePacing, bool enableVsync,
                        bool enableVrr, int vrrDisplayRefreshHz,
                        bool smoothVrrFrameTiming, const QString& calibrationKey,
-                       int vrrLatencyMode, VrrTimingOptions vrrTimingOptions)
+                       int vrrLatencyMode, VrrTimingOptions vrrTimingOptions, bool ultraLowLatencyVrr)
 {
     m_MaxVideoFps = maxVideoFps;
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
@@ -349,6 +349,11 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
             else {
                 fallbackReason = presenter->checkSupport();
                 if (fallbackReason == VrrFallbackReason::NoFallback) {
+                    config.zeroFrameBuffer = ultraLowLatencyVrr && presenter->supportsUltraLowLatencyVrr();
+                    if (ultraLowLatencyVrr && !config.zeroFrameBuffer) {
+                        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                    "Ultra Low Latency VRR: playback presenter unavailable; using the configured buffer");
+                    }
                     m_VrrWorker = std::make_unique<VrrPacingWorker>(
                         presenter, config, &m_Telemetry);
                     if (m_VrrWorker->start()) {
@@ -357,7 +362,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                                     "VRR pacing: target %d Hz with %d FPS stream (adaptive timestamp playout, frame timing %s, buffer %.2f frames, target %.2f%%, history %d s, tolerance %.2f ms)",
                                     m_DisplayFps, m_MaxVideoFps,
                                     config.smoothFrameTiming ? "smoothed" : "follows host timestamps",
-                                    config.timingOptions.bufferPerMille / 1000.0,
+                                    config.zeroFrameBuffer ? 0.0 : config.timingOptions.bufferPerMille / 1000.0,
                                     config.timingOptions.targetHundredths / 100.0,
                                     config.timingOptions.historySeconds,
                                     config.timingOptions.toleranceUs / 1000.0);

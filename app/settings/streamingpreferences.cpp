@@ -161,11 +161,13 @@ void StreamingPreferences::reload()
     autoAdjustBitrate = settings.value(SER_AUTOADJUSTBITRATE, true).toBool();
     enableVsync = settings.value(SER_VSYNC, true).toBool();
     enableVrr = settings.value(SER_ENABLEVRR, false).toBool();
-    // Waitable DXGI is the Windows VRR default, independent of the retired opt-in.
+    ultraLowLatencyVrr = settings.value("ultralowlatencyvrr", false).toBool();
+    // DXGI queue admission is automatic when the fallback chain supports it.
     settings.remove(QStringLiteral("experimentaldxgiwaitable"));
     // VRR adaptive presentation always requires tearing permission. Remove
     // the retired override so stale profiles cannot disable native VRR.
     settings.remove(QStringLiteral("allowvrrtearing"));
+    settings.remove(QStringLiteral("vrrallowtearing"));
     vrrLatencyMode = VLM_BALANCED;
     bool haveSavedVrrLatencyMode = false;
     if (settings.contains(SER_VRRLATENCYMODE)) {
@@ -448,6 +450,7 @@ void StreamingPreferences::save()
     settings.setValue(SER_AUTOADJUSTBITRATE, autoAdjustBitrate);
     settings.setValue(SER_VSYNC, enableVsync);
     settings.setValue(SER_ENABLEVRR, enableVrr);
+    settings.setValue("ultralowlatencyvrr", ultraLowLatencyVrr);
     settings.setValue(SER_VRRLATENCYMODE, vrrLatencyMode);
     settings.setValue(SER_VRRTIMINGPRESETREVISION, CURRENT_VRR_TIMING_PRESET_REVISION);
     settings.setValue("vrrbufferpermille", vrrBufferPerMille());
@@ -553,7 +556,7 @@ void StreamingPreferences::exportLatestDiagnostics()
     thread->start();
 }
 
-QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRates) const
+QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRates, int fpsLimit) const
 {
     std::vector<int> rates;
     rates.reserve(refreshRates.size());
@@ -565,8 +568,13 @@ QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRate
         }
     }
 
-    const std::vector<VrrFpsChoice> choices = VrrRatePolicy::buildChoices(
-        rates, fps);
+#ifdef Q_OS_WIN
+    const bool windowsVrrEnabled = enableVsync && enableVrr;
+#else
+    const bool windowsVrrEnabled = false;
+#endif
+    const std::vector<VrrFpsChoice> choices =
+        VrrRatePolicy::buildChoices(rates, fps, windowsVrrEnabled, fpsLimit);
     QVariantList result;
     for (const VrrFpsChoice& choice : choices) {
         QVariantMap item;
@@ -577,6 +585,9 @@ QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRate
         case VrrFpsChoiceKind::Fixed:
             item.insert("kind", "fixed");
             break;
+        case VrrFpsChoiceKind::LowLatencyVrr:
+            item.insert("kind", "low-latency-vrr");
+            break;
         case VrrFpsChoiceKind::Custom:
             item.insert("kind", "custom");
             break;
@@ -586,6 +597,11 @@ QVariantList StreamingPreferences::getFpsChoices(const QVariantList& refreshRate
     }
 
     return result;
+}
+
+int StreamingPreferences::fpsAfterVrrToggle(int refreshHz, bool enabled) const
+{
+    return VrrRatePolicy::rateAfterVrrToggle(fps, refreshHz, enabled);
 }
 
 int StreamingPreferences::getDefaultBitrate(int width, int height, int fps, bool yuv444)

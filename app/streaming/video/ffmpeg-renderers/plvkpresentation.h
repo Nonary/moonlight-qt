@@ -17,8 +17,12 @@ enum class PlVkVrrSurface
 template<typename SupportsMode>
 std::optional<VkPresentModeKHR> selectPlVkVrrPresentMode(
     PlVkVrrSurface surface, bool gamescopeWsi, bool gamescopeMailbox,
-    SupportsMode supportsMode)
+    SupportsMode supportsMode, bool ultraLowLatency = false)
 {
+    if (surface == PlVkVrrSurface::Gamescope && gamescopeWsi && ultraLowLatency &&
+        supportsMode(VK_PRESENT_MODE_MAILBOX_KHR)) {
+        return VK_PRESENT_MODE_MAILBOX_KHR;
+    }
     if (surface == PlVkVrrSurface::Wayland) {
         if (supportsMode(VK_PRESENT_MODE_MAILBOX_KHR)) {
             return VK_PRESENT_MODE_MAILBOX_KHR;

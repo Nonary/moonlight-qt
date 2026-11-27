@@ -32,6 +32,9 @@ public:
     static
     bool tryGetDisplayRefreshRate(SDL_Window* window, int& outHz);
 
+    static bool ultraLowLatencyVrrPlatformSupported();
+    static bool supportsUltraLowLatencyVrr(SDL_Window* window, int refreshHz, bool hdr = false);
+
     static
     bool hasFastAes();
 

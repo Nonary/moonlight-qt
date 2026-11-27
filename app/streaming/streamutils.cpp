@@ -3,6 +3,16 @@
 #include <Qt>
 #include <QDir>
 
+#if defined(Q_OS_WIN) && !defined(Q_OS_WINRT) && defined(HAVE_FFMPEG)
+#include "video/ffmpeg-renderers/d3d11composition.h"
+#include <SDL_syswm.h>
+#elif defined(Q_OS_LINUX) && defined(HAVE_LIBPLACEBO_VULKAN)
+#include <QFileInfo>
+#include <QSettings>
+#include <QVersionNumber>
+#include "video/ffmpeg-renderers/plvk.h"
+#endif
+
 #ifdef Q_OS_DARWIN
 #include <ApplicationServices/ApplicationServices.h>
 #include "video/ffmpeg-renderers/macdisplaytiming.h"
@@ -83,6 +93,44 @@ Uint32 StreamUtils::getPlatformWindowFlags()
     return SDL_WINDOW_METAL;
 #else
     return 0;
+#endif
+}
+
+bool StreamUtils::ultraLowLatencyVrrPlatformSupported()
+{
+#if defined(Q_OS_WIN) && !defined(Q_OS_WINRT) && defined(HAVE_FFMPEG)
+    return qgetenv("MOONLIGHT_VRR_COMPOSITION") != "0" && qgetenv("D3D11VA_ENABLED") != "0" &&
+           D3D11CompositionPresenter::runtimeSupported();
+#elif defined(Q_OS_LINUX) && defined(HAVE_LIBPLACEBO_VULKAN)
+    if (!qgetenv("XDG_CURRENT_DESKTOP").toLower().split(':').contains("gamescope")) return false;
+
+    // Flatpak's /etc describes its runtime. Prefer the host OS identification.
+    const QString hostRelease = QStringLiteral("/run/host/os-release");
+    const QSettings os(QFileInfo::exists(hostRelease) ? hostRelease : QStringLiteral("/etc/os-release"),
+                       QSettings::IniFormat);
+    return os.value("ID").toString() == "steamos" &&
+           QVersionNumber::fromString(os.value("VERSION_ID").toString()) >= QVersionNumber(3, 10);
+#else
+    return false;
+#endif
+}
+
+bool StreamUtils::supportsUltraLowLatencyVrr(SDL_Window* window, int refreshHz, bool hdr)
+{
+    if (!window || refreshHz <= 1 || !ultraLowLatencyVrrPlatformSupported()) return false;
+
+#if defined(Q_OS_WIN) && !defined(Q_OS_WINRT) && defined(HAVE_FFMPEG)
+    SDL_SysWMinfo info = {};
+    SDL_VERSION(&info.version);
+    int adapterIndex = 0, outputIndex = 0;
+    return SDL_GetWindowWMInfo(window, &info) && info.subsystem == SDL_SYSWM_WINDOWS &&
+           SDL_DXGIGetOutputInfo(SDL_GetWindowDisplayIndex(window), &adapterIndex, &outputIndex) &&
+           D3D11CompositionPresenter::windowSupported(info.info.win.window, adapterIndex, hdr);
+#elif defined(Q_OS_LINUX) && defined(HAVE_LIBPLACEBO_VULKAN)
+    return PlVkRenderer::supportsUltraLowLatencyOnWindow(window, refreshHz, hdr);
+#else
+    Q_UNUSED(hdr);
+    return false;
 #endif
 }
 

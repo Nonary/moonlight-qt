@@ -3,6 +3,7 @@ import QtQuick.Controls 2.5
 import QtQuick.Layouts 1.3
 import QtQuick.Window 2.2
 import StreamingPreferences 1.0
+import SystemProperties 1.0
 import AppModel 1.0
 import ComputerManager 1.0
 import SdlGamepadKeyNavigation 1.0
@@ -384,7 +385,10 @@ FocusScope {
                 columns: 2; columnSpacing: Style.px(24, appPage.Window.window); rowSpacing: Style.px(8, appPage.Window.window)
                 readonly property var overrides: appPage.videoOverrides
                 readonly property size resolution: overrides.resolution || Qt.size(StreamingPreferences.width, StreamingPreferences.height)
-                readonly property int fps: overrides.fps === undefined ? StreamingPreferences.fps : overrides.fps
+                readonly property int requestedFps: overrides.fps === undefined ? StreamingPreferences.fps : overrides.fps
+                readonly property int fpsLimit: StreamingPreferences.enableVrr && StreamingPreferences.enableVsync &&
+                                                StreamingPreferences.ultraLowLatencyVrr ? SystemProperties.getUltraLowLatencyVrrFpsLimit() : 0
+                readonly property int fps: fpsLimit > 0 ? Math.min(requestedFps, fpsLimit) : requestedFps
                 readonly property int bitrate: overrides.bitrateKbps === undefined ? StreamingPreferences.bitrateKbps : overrides.bitrateKbps
                 readonly property bool hdr: overrides.hdr === undefined ? StreamingPreferences.enableHdr : overrides.hdr
                 ConsoleText { role: "secondary"; text: qsTr("Resolution") }

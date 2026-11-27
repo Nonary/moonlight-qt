@@ -27,7 +27,7 @@ struct VrrSessionConfig {
     int displayRefreshHz = 0;
     int streamRateHz = 0;
     // A session preference resolved into the recorded controller parameters.
-    // All presets retain jitter buffering and display-spacing protection.
+    // Display-spacing protection is independent of the adaptive buffer cap.
     bool smoothFrameTiming = true;
     // Historical policy fixtures only. Live sessions use smoothFrameTiming.
     // Exact replay restores the recorded smoothing mode from its snapshot.
@@ -36,12 +36,13 @@ struct VrrSessionConfig {
     // The IDs are persisted and therefore remain stable across label changes.
     int latencyMode = 0;
     VrrTimingOptions timingOptions;
+    bool zeroFrameBuffer = false;
     // Experimental activation marker; zero keeps normal policy. The effective
     // profile smoothness target supplies probability (never this marker value).
     bool experimentalBoundedCatchup = false;
     uint64_t experimentalInputPercentilePpm = 0;
     bool vrr18IntervalFeedback = false;
-    // Session-native A/B choice, recorded separately from controller timing.
+    // Native tearing permission retained in the trace for historical replay.
     bool allowTearing = true;
     std::string calibrationKey;
     std::string calibrationPath;

@@ -514,8 +514,7 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
                            D3D_DRIVER_TYPE_UNKNOWN,
                            nullptr,
                            D3D11_CREATE_DEVICE_VIDEO_SUPPORT
-                               | (tryComposition ? D3D11_CREATE_DEVICE_BGRA_SUPPORT |
-                                  D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS : 0)
+                               | (tryComposition ? D3D11CompositionPresenter::DeviceFlags : 0)
                                | (m_DebugLayer ? D3D11_CREATE_DEVICE_DEBUG : 0),
                            supportedFeatureLevels,
                            ARRAYSIZE(supportedFeatureLevels),

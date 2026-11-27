@@ -290,7 +290,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             bool enableVrr, bool preferVrrRenderer, int vrrDisplayRefreshHz,
                             [[maybe_unused]] bool* effectiveVrr, bool smoothVrrFrameTiming,
                             bool gamescopeMailbox, int vrrLatencyMode, bool gamescopeRepaint,
-                            VrrTimingOptions vrrTimingOptions)
+                            VrrTimingOptions vrrTimingOptions, bool ultraLowLatencyVrr)
 {
     DECODER_PARAMETERS params = {};
 
@@ -308,6 +308,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.enableVsync = enableVsync;
     params.enableFramePacing = enableFramePacing;
     params.enableVrr = enableVrr;
+    params.ultraLowLatencyVrr = ultraLowLatencyVrr;
     // Playback already sets enableVrr; the probe uses preferVrrRenderer alone so
     // it can match that renderer/color policy without starting VRR presentation.
     params.preferVrrRenderer = preferVrrRenderer || enableVrr;
@@ -663,6 +664,21 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
     int strictRefreshRate = 0;
     const bool hasStrictRefreshRate = StreamUtils::tryGetDisplayRefreshRate(window, strictRefreshRate);
     m_PresentationSettings.refreshRate = hasStrictRefreshRate ? strictRefreshRate : 0;
+    m_PresentationSettings.ultraLowLatencyVrr = false;
+    if (requestedVrr && m_Preferences->enableVsync && m_Preferences->ultraLowLatencyVrr &&
+            hasStrictRefreshRate) {
+        m_PresentationSettings.ultraLowLatencyVrr =
+            StreamUtils::supportsUltraLowLatencyVrr(window, strictRefreshRate, m_RequestedVideo.hdr);
+        const int limit = VrrRatePolicy::ultraLowLatencyMaxFps(
+            strictRefreshRate, m_PresentationSettings.ultraLowLatencyVrr);
+        if (limit > 0) {
+            m_StreamConfig.fps = std::min(m_StreamConfig.fps, limit);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Ultra Low Latency VRR: %s, requested %d FPS, cap %d FPS, streaming at %d FPS",
+                        m_PresentationSettings.ultraLowLatencyVrr ? "native presenter qualified" : "five-sixths fallback",
+                        m_RequestedVideo.fps, limit, m_StreamConfig.fps);
+        }
+    }
 
     // Retain the legacy V-sync behavior when display information is incomplete,
     // but do not use its 60 Hz fallback to qualify VRR.
@@ -2632,7 +2648,8 @@ void Session::exec()
                                m_PresentationSettings.gamescopeMailbox,
                                m_PresentationSettings.vrrLatencyMode,
                                m_PresentationSettings.gamescopeRepaint,
-                               m_PresentationSettings.vrrTimingOptions)) {
+                               m_PresentationSettings.vrrTimingOptions,
+                               m_PresentationSettings.enableVrr && m_PresentationSettings.ultraLowLatencyVrr)) {
                 SDL_UnlockMutex(m_DecoderLock);
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "Failed to recreate decoder after reset");

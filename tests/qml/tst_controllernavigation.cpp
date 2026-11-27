@@ -1480,6 +1480,52 @@ private slots:
         QCOMPARE(snapshot(), disabledSnapshot);
         press(SDL_CONTROLLER_BUTTON_DPAD_UP); QCOMPARE(root->activeFocusItem(),vsyncRow);
         press(SDL_CONTROLLER_BUTTON_A); QVERIFY(prefs->enableVsync);
+#ifdef Q_OS_WIN
+        QQuickItem* vrrSetting = nullptr;
+        for (auto* item : root->findChildren<QQuickItem*>()) {
+            if (item->isVisible() && item->property("settingsLabel").toString() == "VRR") {
+                vrrSetting = item;
+                break;
+            }
+        }
+        QVERIFY(vrrSetting);
+        auto* frameRateRow = root->findChild<QQuickItem*>("frameRateRow");
+        QVERIFY(frameRateRow);
+        auto* frameRate = frameRateRow->property("editor").value<QObject*>();
+        QVERIFY(frameRate);
+        const int savedFps = prefs->fps;
+        const int savedBitrate = prefs->bitrateKbps;
+        prefs->setProperty("fps", 116);
+        vrrSetting->forceActiveFocus();
+        press(SDL_CONTROLLER_BUTTON_A);
+        QVERIFY(!prefs->enableVrr);
+        QCOMPARE(prefs->fps, 120);
+        QCOMPARE(frameRate->property("currentText").toString(), QString("120 FPS"));
+        press(SDL_CONTROLLER_BUTTON_A);
+        QVERIFY(prefs->enableVrr);
+        QCOMPARE(prefs->fps, 116);
+        QCOMPARE(frameRate->property("currentText").toString(), QString("116 FPS"));
+        prefs->setProperty("fps", 100);
+        press(SDL_CONTROLLER_BUTTON_A);
+        QCOMPARE(prefs->fps, 100);
+        press(SDL_CONTROLLER_BUTTON_A);
+        QCOMPARE(frameRate->property("currentText").toString(), QString("100 FPS (Low-latency VRR)"));
+        prefs->setProperty("fps", 120);
+        auto* ultraLowLatency = root->findChild<QQuickItem*>("ultraLowLatencyVrr");
+        QVERIFY(ultraLowLatency);
+        ultraLowLatency->forceActiveFocus();
+        press(SDL_CONTROLLER_BUTTON_A);
+        QVERIFY(prefs->ultraLowLatencyVrr);
+        QCOMPARE(frameRate->property("fpsLimit").toInt(), 116);
+        QCOMPARE(frameRate->property("currentText").toString(), QString("116 FPS"));
+        QCOMPARE(prefs->fps, 120);
+        press(SDL_CONTROLLER_BUTTON_A);
+        QVERIFY(!prefs->ultraLowLatencyVrr);
+        QCOMPARE(frameRate->property("fpsLimit").toInt(), 0);
+        QCOMPARE(frameRate->property("currentText").toString(), QString("120 FPS"));
+        prefs->setProperty("fps", savedFps);
+        prefs->setProperty("bitrateKbps", savedBitrate);
+#endif
         page->setProperty("category",4); rail->forceActiveFocus(); QTest::qWait(30);
         auto* motion=root->findChild<QQuickItem*>("reduceMotionRow"); QVERIFY(motion && motion->isVisible());
         const bool previousMotion=prefs->uiReducedMotion;

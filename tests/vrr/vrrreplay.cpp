@@ -12003,6 +12003,11 @@ int main(int argc, char* argv[])
             if (parser.isSet(streamOption)) {
                 simulatedConfig.streamRateHz = streamOverrideFps;
             }
+            // The recorded policy captures native presenter qualification.
+            // The replay cannot renegotiate FPS or probe the capture's device.
+            simulatedConfig.zeroFrameBuffer = capturedParameters.latencyFixAllRates &&
+                capturedParameters.playoutDelayCapSourcePeriodPerMille == 0 &&
+                capturedParameters.latencyFixDelayPeriodPerMille == 0;
             simulatedCanLatch = capturedCanLatch && !parser.isSet(latchOption);
             if (parser.isSet(exactOption)) {
                 // The exact gate verifies the policy that produced the trace.

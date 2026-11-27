@@ -71,6 +71,10 @@ public:
     virtual IVrrFramePresenter* getVrrFramePresenter() override;
     virtual VrrFallbackReason checkSupport() const override;
     virtual bool canLatchAdaptivePresent() const override;
+    bool supportsUltraLowLatencyVrr() const override { return m_UltraLowLatencyVrr; }
+#ifdef Q_OS_LINUX
+    static bool supportsUltraLowLatencyOnWindow(SDL_Window* window, int refreshHz, bool hdr);
+#endif
     virtual uint64_t waitForDecode(AVFrame* frame) override;
     std::shared_ptr<VrrPreparedFrame> queueFramePreparation(AVFrame*, uint64_t) override;
     VrrPrepareResult activatePreparedFrame(const std::shared_ptr<VrrPreparedFrame>&,
@@ -237,6 +241,7 @@ private:
     // the main thread only mark the atomic resize flag; the worker then safely
     // abandons a prepared image before resizing the swapchain.
     bool m_VrrRequested = false;
+    bool m_UltraLowLatencyVrr = false;
     bool m_VrrSuspended = false;
     std::atomic<VrrFallbackReason> m_VrrFallbackReason { VrrFallbackReason::InitializationFailed };
     std::atomic<bool> m_VrrWindowChangePending { false };

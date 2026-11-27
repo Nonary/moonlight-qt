@@ -12,6 +12,7 @@ private slots:
     void protectedRates();
     void adaptiveHeadroomQualification();
     void choicesIncludeDisplayRates();
+    void windowsVrrPresetsAndToggle();
     void savedChoicesRemainSelectable();
 };
 
@@ -79,6 +80,42 @@ void VrrRatePolicyTest::savedChoicesRemainSelectable()
         }
         QCOMPARE(matches, 1);
     }
+}
+
+void VrrRatePolicyTest::windowsVrrPresetsAndToggle()
+{
+    struct Rates { int display; int near; int low; };
+    for (const auto rates : {Rates{120, 116, 100}, Rates{144, 138, 120}, Rates{288, 264, 240}}) {
+        QCOMPARE(VrrRatePolicy::lowLatencyRateForRefresh(rates.display), rates.low);
+        QCOMPARE(VrrRatePolicy::ultraLowLatencyMaxFps(rates.display, true), rates.near);
+        QCOMPARE(VrrRatePolicy::ultraLowLatencyMaxFps(rates.display, false), rates.low);
+
+        const auto choices = VrrRatePolicy::buildChoices({rates.display}, rates.display, true);
+        QCOMPARE(choices.size(), size_t(5));
+        QCOMPARE(choices[2].fps, rates.low);
+        QCOMPARE(choices[2].kind, VrrFpsChoiceKind::LowLatencyVrr);
+        QCOMPARE(choices[3].fps, rates.near);
+        QCOMPARE(choices[3].kind, VrrFpsChoiceKind::Fixed);
+        QCOMPARE(choices[4].fps, rates.display);
+        QCOMPARE(choices[4].kind, VrrFpsChoiceKind::Fixed);
+        for (int cap : {rates.near, rates.low}) {
+            // A saved FPS above the cap must not reappear as a custom choice.
+            const auto limited = VrrRatePolicy::buildChoices({rates.display}, 999, true, cap);
+            QCOMPARE(limited.back().fps, cap);
+            QVERIFY(limited.back().kind != VrrFpsChoiceKind::Custom);
+        }
+
+        QCOMPARE(VrrRatePolicy::rateAfterVrrToggle(rates.display, rates.display, true), rates.near);
+        QCOMPARE(VrrRatePolicy::rateAfterVrrToggle(rates.near, rates.display, false), rates.display);
+        QCOMPARE(VrrRatePolicy::rateAfterVrrToggle(rates.low, rates.display, false), rates.low);
+        QCOMPARE(VrrRatePolicy::rateAfterVrrToggle(90, rates.display, true), 90);
+    }
+
+    const auto mixed = VrrRatePolicy::buildChoices({120, 144}, 120, true);
+    QCOMPARE(mixed[4].fps, 120);
+    QCOMPARE(mixed[4].kind, VrrFpsChoiceKind::Fixed);
+    QCOMPARE(VrrRatePolicy::rateAfterVrrToggle(120, 0, true), 120);
+    QCOMPARE(VrrRatePolicy::ultraLowLatencyMaxFps(0, true), 0);
 }
 
 QTEST_APPLESS_MAIN(VrrRatePolicyTest)

@@ -3256,6 +3256,35 @@ void testLatencyFixBufferlessLateFrameSafety()
     }
 }
 
+void testWindowsZeroFramePresets()
+{
+    for (int fps : {100, 116}) {
+        auto session = vrrProductionSession(0, fps, 120);
+        session.zeroFrameBuffer = true;
+        for (bool scheduled : {false, true}) {
+            auto policy = vrrTimingParametersForSession(session, scheduled, scheduled);
+            expect(policy.nativeFlipProtection == 1 && policy.playoutAdaptiveOnly == 0,
+                   "zero-frame presets must retain native scanout protection");
+            policy.playoutDelayStartSeedValid = 1;
+            policy.playoutDelayStartSeedUs = 15000;
+            VrrTimingController controller(session, true, policy);
+            for (int i = 0; i < 480; ++i) {
+                if (i == 240) controller.rebase();
+                const auto rtp = uint32_t(i * 90000 / fps);
+                const auto decoded = decodedTimeForRtp(1000000, rtp) + (i % 43 == 0 ? 6500 : 0);
+                const auto now = std::max(decoded, controller.lastSubmissionUs());
+                const auto decision = controller.schedule(frame(i, rtp, i != 241, decoded), now);
+                expect(decision.playoutDelayMaximumUs == 0 && decision.playoutDelayUs == 0,
+                       "Windows reduced-rate presets must keep a zero buffer through startup, jitter and rebase");
+                expect(decision.targetUs >= now && decision.targetUs >= controller.earliestSubmissionUs(),
+                       "zero-frame presets must still respect readiness and submission limits");
+                controller.notePreparationDuration(1000);
+                controller.noteSubmission(true, false, decision.targetUs);
+            }
+        }
+    }
+}
+
 void testLatencyPresetsAcrossSourceAndDisplayRates()
 {
     expect(VrrSessionConfig{}.latencyMode == 0 &&
@@ -4802,6 +4831,7 @@ int main()
     testLatchedHandoffCreditsOnlyEnforcedSpacing();
     testPresetReadinessTargets();
     testLatencyFixBufferlessLateFrameSafety();
+    testWindowsZeroFramePresets();
     testLatencyPresetsAcrossSourceAndDisplayRates();
     testLatencyPresetsBoundHitchesThroughCadenceChanges();
     testLostPacketFramesDoNotGrowBuffer();

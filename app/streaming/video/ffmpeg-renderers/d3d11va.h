@@ -40,6 +40,7 @@ public:
     virtual bool canLatchAdaptivePresent() const override { return true; }
     bool alwaysSynchronizesAdaptivePresent() const override { return m_CompositionPresenter.active(); }
     bool supportsScheduledPresentation() const override { return m_CompositionPresenter.active(); }
+    bool supportsUltraLowLatencyVrr() const override { return m_CompositionPresenter.active(); }
     void clearScheduledPresentation() override;
     void interruptFrameWait(bool stopping) override { m_DxgiAdmission.interrupt(stopping); }
     virtual VrrFallbackReason checkSupport() const override;

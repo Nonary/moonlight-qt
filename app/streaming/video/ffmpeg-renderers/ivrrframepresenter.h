@@ -402,6 +402,7 @@ public:
     }
 
     virtual bool supportsScheduledPresentation() const { return false; }
+    virtual bool supportsUltraLowLatencyVrr() const { return false; }
 
     // Invalidate native queued deadlines on suspension or a display epoch.
     // This must not submit a replacement image.

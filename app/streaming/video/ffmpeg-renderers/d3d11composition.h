@@ -40,6 +40,9 @@ public:
     ~D3D11CompositionPresenter();
     static bool runtimeSupported();
     static bool deviceSupported(ID3D11Device* device);
+    static bool windowSupported(HWND window, int adapterIndex, bool hdr);
+    static constexpr UINT DeviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                                        D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS;
     HRESULT initialize(ID3D11Device* device, HWND window, UINT width, UINT height,
                        DXGI_FORMAT format, LUID adapter, UINT sourceId);
     void reset();

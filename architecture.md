@@ -3,6 +3,9 @@
 Source baseline: `master` based on `v6.2.0-daily.202` with VRR18 interval
 feedback revision 21 and worker Reduce judder mode 9, built on the full-refresh buffer policy in `b88a77ff`.
 Buffer growth uses delivery and decode readiness at both ends of an interval.
+Windows uses DXGI at full refresh. Ultra Low Latency VRR is an opt-in
+zero-frame adaptive buffer for qualified Windows Composition and SteamOS
+Gaming Mode presentation.
 The custom profile exposes the frame allowance, timing target, score history,
 and interval tolerance. The earlier platform changes include the decode-buffer accounting
 correction on 2026-10-30,
@@ -140,10 +143,30 @@ migration described above. Reduce judder defaults on, preserves the saved
 Legacy frame pacing defaults off. The default requested stream is 720p60.
 These are defaults, not evidence of the user's current saved settings.
 
-The FPS picker is advisory and independent of the VRR setting. It offers fixed
-30 and 60 FPS, usable native display rates, and a plain below-refresh choice at
-`floor(refresh - refresh^2 / 3600)` (116 FPS at 120 Hz). A saved custom FPS
-remains selectable. Toggling VRR does not rewrite saved FPS.
+The FPS picker offers fixed 30 and 60 FPS, usable native display rates, and a
+below-refresh choice at `floor(refresh - refresh^2 / 3600)`. Windows with
+VRR and V-sync enabled also offers a low-latency FPS preset at
+`5 * floor(refresh / 6)`. The choice of FPS alone leaves the adaptive
+buffer under the selected VRR timing profile.
+
+Ultra Low Latency VRR limits the request to the near-refresh rate on supported
+Windows 11 Composition and SteamOS 3.10 or later Gaming Mode surfaces. At
+120, 144, and 288 Hz the native limits are 116, 138, and 264 FPS. Unsupported
+setups use the five-sixths limits (100, 120, and 240 FPS) and the configured
+adaptive buffer. The picker shows a ceiling across available outputs. Session
+startup probes the actual streaming display before negotiation and applies
+its limit after resolving global and per-game FPS. Turning the option off
+restores access to the saved requested FPS. The final renderer must still
+qualify before the worker sets the adaptive buffer to zero. If the live
+presenter falls back after negotiation, the agreed FPS is retained and the
+configured buffer applies. Preparation and native presentation keep their
+own timing constraints.
+
+Toggling VRR in Windows Settings swaps the global FPS between the fastest
+display's native rate and its near-refresh preset, when the current selection
+matches the rate for the previous mode. It also updates the suggested bitrate
+when automatic bitrate adjustment is enabled. Other saved rates and per-game
+overrides remain selectable. The native rate can still be picked with VRR on.
 
 GUI launches snapshot resolution, frame rate, bitrate, and HDR for the selected
 host and game. Each unset field inherits its global preference. CLI launches
@@ -181,8 +204,8 @@ driver startup. The Metal presenter additionally requires that the Cocoa window
 actually entered native fullscreen; the hint alone does not qualify playback.
 
 The renderer must subsequently support the mode. The Pacer constructs
-`VrrSessionConfig`, fixes `allowAdditionalQueuedFrame=false`, passes smoothing
-settings, checks presenter support, and starts the worker.
+`VrrSessionConfig`, checks the presenter, resolves the buffer and smoothing
+settings, and starts the worker.
 Unsupported presentation or failed worker initialization falls back to the
 legacy path. A UI checkbox alone cannot establish DXGI capability, active
 adaptive presentation, or that the physical panel is varying refresh.
@@ -1337,12 +1360,17 @@ for that claim.
 
 ### 10.4 Composition presentation and display timing
 
-Windows VRR sessions use waitable DXGI by default. The composition presenter
-is requested only with `MOONLIGHT_VRR_COMPOSITION=1` on supported devices.
-The value is captured during renderer initialization,
-so a stream reconnect is required. Startup logs identify the actual presenter,
-including setup fallback. Hardware support permits independent flip but does
-not prove that every live present uses it.
+Windows D3D11 VRR sessions use DXGI at full refresh and prefer Composition
+below refresh on supported Windows 11 devices. Windows 10 uses DXGI.
+Ultra Low Latency VRR probes a hidden window on the selected output's D3D11
+adapter before negotiating FPS. It creates a real Composition presentation
+manager, including displayable resources, and checks independent flip.
+`MOONLIGHT_VRR_COMPOSITION=0` forces DXGI and `=1` requests Composition
+at any qualified rate for diagnostics. Composition still requires runtime
+and device support. Other values use the rate-based policy. Reconnect to
+apply a change. Startup logs identify the actual presenter and any setup
+fallback. Hardware support permits independent flip, with the actual
+presentation mode reported by native statistics.
 
 The renderer checks the actual OS version using `RtlGetVersion` (including
 revision 194 on build 22000), loads `CreatePresentationFactory` dynamically,
@@ -1589,6 +1617,10 @@ selected for the surface at startup: Mailbox on ordinary Wayland, Immediate on
 X11/KMSDRM, and Immediate on Gamescope. Gamescope additionally tries Mailbox
 when the dormant SteamOS experiment is enabled, according to exposed surface
 capabilities.
+Ultra Low Latency VRR requires SteamOS 3.10 or later in Gaming Mode and
+probes the actual Gamescope WSI surface. It requests Mailbox ahead of Immediate
+when the surface exposes it. Missing WSI or Mailbox selects the five-sixths
+rate cap and ordinary renderer policy.
 
 The startup decoder probe that asks the host for a color range must use that
 same Linux Vulkan preference without activating VRR presentation.

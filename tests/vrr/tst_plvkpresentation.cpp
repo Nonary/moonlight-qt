@@ -10,12 +10,12 @@ int failures = 0;
 void check(PlVkVrrSurface surface, bool wsi,
            std::initializer_list<VkPresentModeKHR> available,
            std::optional<VkPresentModeKHR> expected, const char* description,
-           bool gamescopeMailbox = true)
+           bool gamescopeMailbox = true, bool ultraLowLatency = false)
 {
     const auto selected = selectPlVkVrrPresentMode(surface, wsi, gamescopeMailbox,
         [&](VkPresentModeKHR mode) {
             return std::find(available.begin(), available.end(), mode) != available.end();
-        });
+        }, ultraLowLatency);
     if (selected != expected || (selected &&
             std::find(available.begin(), available.end(), *selected) == available.end())) {
         std::fprintf(stderr, "FAIL: %s\n", description);
@@ -52,6 +52,12 @@ int main()
           "FIFO-only Gamescope WSI must retain adaptive-worker compatibility");
     check(Surface::Gamescope, false, {fifo}, std::nullopt,
           "Gamescope FIFO without WSI must fall back to fixed pacing");
+    check(Surface::Gamescope, true, {fifo, mailbox, immediate}, mailbox,
+          "Ultra Low Latency must request Mailbox on the Gamescope WSI surface", false, true);
+    check(Surface::Gamescope, true, {fifo, immediate}, immediate,
+          "Ultra Low Latency must retain normal presentation when Mailbox is unavailable", false, true);
+    check(Surface::Gamescope, false, {fifo, mailbox, immediate}, immediate,
+          "Ultra Low Latency must preserve ordinary Gamescope mode selection without WSI", false, true);
 
     check(Surface::Wayland, false, {fifo, mailbox, immediate}, mailbox,
           "ordinary Wayland must retain Mailbox priority");

@@ -35,6 +35,23 @@ int VrrRatePolicy::vrrRateForRefresh(int refreshHz)
     return protectedRateForRefresh(refreshHz);
 }
 
+int VrrRatePolicy::ultraLowLatencyMaxFps(int refreshHz, bool nativeSupport)
+{
+    const int nearRefresh = nativeSupport ? vrrRateForRefresh(refreshHz) : 0;
+    return nearRefresh > 0 ? nearRefresh : lowLatencyRateForRefresh(refreshHz);
+}
+
+int VrrRatePolicy::rateAfterVrrToggle(int selectedFps, int refreshHz, bool enabled)
+{
+    const int vrrFps = vrrRateForRefresh(refreshHz);
+    if (refreshHz < 60 || vrrFps == 0) {
+        return selectedFps;
+    }
+    const int from = enabled ? refreshHz : vrrFps;
+    const int to = enabled ? vrrFps : refreshHz;
+    return selectedFps == from ? to : selectedFps;
+}
+
 bool VrrRatePolicy::hasAdaptiveHeadroom(int streamRateHz, int displayRefreshHz)
 {
     if (streamRateHz <= 0 || displayRefreshHz <= 0) {
@@ -45,7 +62,9 @@ bool VrrRatePolicy::hasAdaptiveHeadroom(int streamRateHz, int displayRefreshHz)
 }
 
 std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& refreshRates,
-                                                       int savedFps)
+                                                    int savedFps,
+                                                    bool windowsVrrEnabled,
+                                                    int fpsLimit)
 {
     std::map<int, VrrFpsChoiceKind> choices;
 
@@ -70,7 +89,19 @@ std::vector<VrrFpsChoice> VrrRatePolicy::buildChoices(const std::vector<int>& re
         addChoice(choices, vrrRateForRefresh(refreshHz), VrrFpsChoiceKind::Fixed);
     }
 
-    // Preserve manually saved values outside the built-in choices.
+    if (windowsVrrEnabled) {
+        for (const int refreshHz : refreshRates) {
+            addChoice(choices, lowLatencyRateForRefresh(refreshHz), VrrFpsChoiceKind::LowLatencyVrr);
+        }
+    }
+
+    if (fpsLimit > 0) {
+        choices.erase(choices.upper_bound(fpsLimit), choices.end());
+        addChoice(choices, fpsLimit, VrrFpsChoiceKind::Fixed);
+        savedFps = std::min(savedFps, fpsLimit);
+    }
+
+    // Preserve manually saved values within the available range.
     if (savedFps > 0) {
         addChoice(choices, savedFps, VrrFpsChoiceKind::Custom);
     }
