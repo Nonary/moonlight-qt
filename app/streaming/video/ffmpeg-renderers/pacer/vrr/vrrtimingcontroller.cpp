@@ -163,7 +163,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         config.latencyMode : 1;
     const auto options = config.timingOptions.resolved(latencyMode);
     const bool vrr18 = config.vrr18IntervalFeedback;
-    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18CeilingDirectGrowthBudget : 0;
+    parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18LatchedDirectGrowthBudget : 0;
     parameters.playoutIntervalToleranceUs = options.toleranceUs;
     // Presets change only the four user-visible values. Admission, release,
     // and late-frame recovery use the same policy for every combination.
@@ -2660,6 +2660,9 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
             m_SourcePeriodUs <= saturatingAdd(m_DisplayPeriodUs, std::min(toleranceUs, m_DisplayPeriodUs / fittedFrames));
         const bool latchedCeiling = (!belowCeiling || withinCeilingAdjustment) && m_CanLatchPresentation &&
             m_Parameters.playoutVrr18IntervalFeedback >= Vrr18CeilingBuffer;
+        const bool nearLatchedCeiling = m_CanLatchPresentation &&
+            m_Config.streamRateHz == m_Config.displayRefreshHz &&
+            m_SourcePeriodUs <= saturatingAdd(m_DisplayPeriodUs, toleranceUs);
         const bool taperRelease = m_Parameters.playoutIntervalReleaseTauUs && belowCeiling;
         const uint64_t intervalHoldUs = taperRelease && m_Parameters.playoutIntervalTaperHoldUs ?
             m_Parameters.playoutIntervalTaperHoldUs : m_Parameters.playoutMeanMissHoldUs;
@@ -2690,7 +2693,7 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutVrr18IntervalFeedback >= Vrr18AnticipatoryIntervalFeedback,
                 belowCeiling && m_Parameters.playoutVrr18IntervalFeedback >= Vrr18TargetAwareRelease,
                 m_Parameters.playoutVrr18IntervalFeedback, m_CanLatchPresentation && (belowCeiling || latchedCeiling),
-                latchedCeiling, m_VariableSourceSmoothing);
+                latchedCeiling, m_VariableSourceSmoothing, nearLatchedCeiling);
             // A cancelled final present supplies no new measurement. Keep
             // the last submitted outcome until a new submission or rebase.
             if (submitted && !cancelled) {

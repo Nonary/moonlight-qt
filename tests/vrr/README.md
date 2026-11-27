@@ -134,6 +134,9 @@ Run the surplus-drain regression for the reported 99% Low Latency configuration 
 The default fast and stress gates run this workload at 95%, 99%, 99.50%
 and 99.90%. The host delivers 118 FPS on a 120 Hz display, with 3 ms of
 extra transport delay once per second throughout the 120-second session.
+The 95% run starts at zero reserve and checks that these misses earn no
+additional reserve while the pacing score stays at goal. The 99.90% run
+bounds total and continuous time below goal, including before it settles.
 Each adaptive run and its fixed-reserve trials receive identical source frames
 and delivery costs. The gate scores the final 30 seconds, after startup has
 settled. The smallest tested fixed reserve with zero drops, at least 99%

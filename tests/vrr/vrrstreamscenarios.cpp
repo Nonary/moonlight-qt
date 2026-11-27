@@ -724,6 +724,13 @@ std::vector<std::string> checkWorkload(const Workload& workload, const Options& 
     if (name == "surplus-drain") {
         // The stream requests 120 FPS. The 118 FPS source leaves enough
         // display headroom for releasing reserve to advance actual flips.
+        if (options.targetHundredths == 9500)
+            require(m.peakBufferUs == 0 && m.timeAtTargetPercent() == 100 && m.coveragePercent() >= 99 && !drops,
+                    "within-budget delivery spikes must keep the 95% session at zero reserve");
+        if (options.targetHundredths == 9990)
+            require(m.timeAtTargetPercent() >= 99 && m.longestBelowTargetUs <= 2 * Second,
+                    "the 99.90% session must recover promptly when delivery spikes exhaust its budget");
+
         auto heavier = workload;
         auto& sparse = heavier.scenario.phases.front();
         sparse.durationUs = 240 * Second;

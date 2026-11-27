@@ -32,6 +32,7 @@ constexpr uint64_t Vrr18ProgressiveCeilingRelease = 17;
 constexpr uint64_t Vrr18CeilingForecastBudget = 18;
 constexpr uint64_t Vrr18FrameHitchForecast = 19;
 constexpr uint64_t Vrr18CeilingDirectGrowthBudget = 20;
+constexpr uint64_t Vrr18LatchedDirectGrowthBudget = 21;
 
 namespace Vrr13 {
 // Score each adjacent interval against its intended spacing. Historical VRR18
@@ -159,7 +160,8 @@ public:
                  bool goalFeedback = false, bool predictiveFeedback = false,
                  bool costAwareFeedback = false, bool anticipatoryFeedback = false,
                  bool targetAwareRelease = false, uint64_t releaseRevision = 0, bool canQualifyRelease = true,
-                 bool latchedCeiling = false, bool priceVariableCadence = false) {
+                 bool latchedCeiling = false, bool priceVariableCadence = false,
+                 bool nearLatchedCeiling = false) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -484,7 +486,13 @@ public:
         // a bounded direct increase on a fresh, corroborated miss.
         const bool budgetDirectGrowth = releaseRevision >= Vrr18CeilingDirectGrowthBudget &&
             latchedCeiling && !belowTarget;
-        const bool canGrowDirectly = !budgetDirectGrowth || window.scoredLossUs > allowedRecoveryLossUs;
+        // Just below the ceiling, let recent history pay for another interval
+        // of this size before buying reserve. Keep the existing ceiling limit.
+        const bool budgetBelowCeilingGrowth = releaseRevision >= Vrr18LatchedDirectGrowthBudget &&
+            nearLatchedCeiling && !latchedCeiling && !belowTarget;
+        const double projectedLossUs = window.scoredLossUs + (budgetBelowCeilingGrowth ? actual * loss : 0.0);
+        const bool canGrowDirectly = !(budgetDirectGrowth || budgetBelowCeilingGrowth) ||
+            projectedLossUs > allowedRecoveryLossUs;
         const bool sustainedPressure = goalFeedback ?
             canGrowDirectly && readinessTarget > m_Target && !budgetCoversReserve :
             useDeliveryEvidence ? deliveryPressure : (severityWeighted ? bufferLoss > allowedLoss : pressure);
