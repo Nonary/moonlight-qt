@@ -139,6 +139,7 @@ VrrTimingParameters vrrTimingParametersForSession(
         config.latencyMode : 1;
     const auto options = config.timingOptions.resolved(latencyMode);
     const bool vrr18 = config.vrr18IntervalFeedback;
+    parameters.unlatchedGuardUsesSourceSlack = vrr18;
     parameters.playoutVrr18IntervalFeedback = vrr18 ? Vrr18LatchedDirectGrowthBudget : 0;
     parameters.playoutIntervalToleranceUs = options.toleranceUs;
     // Presets change only the four user-visible values. Admission, release,
@@ -434,7 +435,7 @@ void VrrTimingController::reset()
         m_Config.streamRateHz, m_DisplayPeriodUs * kQ16One);
     m_ConfiguredStreamPeriodUs = std::max<uint64_t>(
         1, roundedQ16(m_ConfiguredStreamPeriodQ16));
-    m_BaseGuardUs = clampUnsigned(
+    m_ConfiguredBaseGuardUs = clampUnsigned(
         m_DisplayPeriodUs / m_Parameters.baseGuardDivisor,
         m_Parameters.minimumGuardUs,
         m_Parameters.maximumBaseGuardUs);
@@ -471,6 +472,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     const uint64_t previousTargetWakeLeadUs = m_TargetWakeLeadUs;
     const uint64_t previousGpuReadinessLeadUs = m_GpuReadinessLeadUs;
     const uint64_t previousGuardUs = m_GuardUs;
+    m_BaseGuardUs = m_ConfiguredBaseGuardUs;
+    m_UnlatchedGuardDebtUs = 0;
 
     m_SourcePeriodUsQ16 = m_ConfiguredStreamPeriodQ16;
     m_SourcePeriodUs = std::max<uint64_t>(
@@ -794,6 +797,9 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         }
     }
 
+    if (!m_CanLatchPresentation && m_Parameters.unlatchedGuardUsesSourceSlack) {
+        updateUnlatchedGuard(cadence);
+    }
     const bool variableCadence = (m_Parameters.smoothingMode == VrrSmoothingWorkerInterval ||
         m_Parameters.usesWorkerSourcePhase()) &&
         hasVariableSourceCadence();
@@ -4447,12 +4453,38 @@ uint64_t VrrTimingController::readinessCeilingUs() const
     return std::min(m_Parameters.readinessCeilingUs, m_SourcePeriodUs);
 }
 
+void VrrTimingController::updateUnlatchedGuard(const CadenceObservation& cadence)
+{
+    // Count only delay the base guard would add to consecutive source frames.
+    // A short source interval cannot charge more than the guard itself. A
+    // longer interval repays the excess, and a broken RTP sequence starts over.
+    const uint64_t paddedPeriodUs = saturatingAdd(m_DisplayPeriodUs, m_ConfiguredBaseGuardUs);
+    if (!cadence.usedRtpTimestamp || !cadence.eligible || cadence.phaseDiscontinuity || cadence.frameDelta != 1) {
+        m_UnlatchedGuardDebtUs = 0;
+    }
+    else if (cadence.intervalUs < paddedPeriodUs) {
+        const uint64_t addedUs = std::min(m_ConfiguredBaseGuardUs, paddedPeriodUs - cadence.intervalUs);
+        m_UnlatchedGuardDebtUs = std::min(m_DisplayPeriodUs, saturatingAdd(m_UnlatchedGuardDebtUs, addedUs));
+    }
+    else {
+        m_UnlatchedGuardDebtUs -= std::min(m_UnlatchedGuardDebtUs, cadence.intervalUs - paddedPeriodUs);
+    }
+
+    // Once padding alone would displace a whole frame, spend only the spare
+    // time in the fitted cadence. Keep any guard raised by an actual deficit.
+    const uint64_t slackUs = m_SourcePeriodUs - std::min(m_SourcePeriodUs, m_DisplayPeriodUs);
+    const uint64_t baseUs = m_UnlatchedGuardDebtUs == m_DisplayPeriodUs ?
+        std::min(m_ConfiguredBaseGuardUs, slackUs) : m_ConfiguredBaseGuardUs;
+    m_GuardUs = m_GuardUs > m_BaseGuardUs ? std::max(m_GuardUs, baseUs) : baseUs;
+    m_BaseGuardUs = baseUs;
+}
+
 uint64_t VrrTimingController::guardCeilingUs() const
 {
     const uint64_t sourceSlackUs = m_SourcePeriodUs > m_DisplayPeriodUs ?
         m_SourcePeriodUs - m_DisplayPeriodUs : 0;
     return std::max(
-        m_BaseGuardUs,
+        m_ConfiguredBaseGuardUs,
         std::min(m_Parameters.maximumAdaptiveGuardUs, sourceSlackUs));
 }
 

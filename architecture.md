@@ -1808,8 +1808,13 @@ The selected adaptive mode remains immutable for the lifetime of one persistent
 swapchain. Per-frame controller requests never destroy or recreate that chain.
 Persistent Mailbox provides synchronized, stale-image-replacing presentation,
 so it advertises protected latch support without a native mode change or the
-controller's redundant software spacing floor. Immediate retains the
-display-period-plus-guard floor because it may tear. Explicit historical
+controller's redundant software spacing floor. Immediate and the FIFO fallback
+space submissions by at least one display period. VRR18 tracks how much delay
+the extra base guard would accumulate between consecutive RTP frames. Longer
+source intervals repay that delay. Once it reaches one display period, the
+controller limits the base guard to the spare time in the fitted source cadence.
+A measured spacing deficit can still raise the guard. Older captures replay with
+their original base guard. Explicit historical
 revision 2 adds a 225 us entry margin to that floor; current revision 1 does not.
 That historical extra spacing can reduce sustainable throughput near native refresh;
 worker stale-frame replacement remains responsible for bounded backlog.

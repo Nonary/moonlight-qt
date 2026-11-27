@@ -198,6 +198,7 @@
     X(uint64_t, maximum_render_wake_lead_us, maximumRenderWakeLeadUs, 2000) \
     X(uint64_t, maximum_target_wake_lead_us, maximumTargetWakeLeadUs, 500) \
     X(uint64_t, minimum_guard_us, minimumGuardUs, 100) \
+    X(uint64_t, unlatched_guard_uses_source_slack, unlatchedGuardUsesSourceSlack, 0) \
     X(uint64_t, latch_enter_headroom_us, latchedPresentationHeadroomUs, 225) \
     X(uint64_t, latch_exit_headroom_us, latchedPresentationExitHeadroomUs, 400) \
     X(size_t, cadence_stability_latch_frames, cadenceStabilityLatchFrames, 64) \
@@ -756,6 +757,7 @@ private:
     uint64_t renderLeadFloorUs() const;
     uint64_t renderLeadCeilingUs() const;
     uint64_t readinessCeilingUs() const;
+    void updateUnlatchedGuard(const CadenceObservation& cadence);
     uint64_t guardCeilingUs() const;
     uint64_t latchedPresentationHeadroomUs() const;
     bool rateProtectedPresentation() const;
@@ -776,6 +778,8 @@ private:
     uint64_t m_ConfiguredStreamPeriodUs = 0;
     uint64_t m_ConfiguredStreamPeriodQ16 = 0;
     uint64_t m_DisplayPeriodUs = 0;
+    uint64_t m_ConfiguredBaseGuardUs = 0;
+    uint64_t m_UnlatchedGuardDebtUs = 0;
     uint64_t m_BaseGuardUs = 0;
     uint64_t m_GuardUs = 0;
 

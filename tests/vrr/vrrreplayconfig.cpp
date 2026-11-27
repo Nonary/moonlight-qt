@@ -343,7 +343,8 @@ QJsonObject vrrDefaultReplayConfigurationJson()
 
 bool vrrCaptureDefaultsControllerFieldToZero(const QString& name)
 {
-    return name == QStringLiteral("playout_vrr18_interval_feedback") ||
+    return name == QStringLiteral("unlatched_guard_uses_source_slack") ||
+           name == QStringLiteral("playout_vrr18_interval_feedback") ||
            name == QStringLiteral("playout_interval_release_tau_us") ||
            name == QStringLiteral("playout_interval_taper_hold_us") ||
            name == QStringLiteral("playout_reseed_nominal_target") ||
@@ -468,6 +469,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                         value.latchedPresentationExitHeadroomPeriodDenominator) ||
             value.looseCadenceWindowUs > value.tightCadenceWindowUs) {
         return fail("parameter floors, ceilings, or hysteresis are inverted");
+    }
+    if (value.unlatchedGuardUsesSourceSlack > 1) {
+        return fail("unlatched_guard_uses_source_slack must be 0 or 1");
     }
     if (value.guardDecayFrames == 0 || value.schedulerLearningSamples == 0 ||
             value.readinessLearningSamples == 0 ||
