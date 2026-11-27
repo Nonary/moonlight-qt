@@ -73,7 +73,7 @@ public:
     virtual bool canLatchAdaptivePresent() const override;
     bool alwaysSynchronizesAdaptivePresent() const override { return supportsScheduledPresentation(); }
     bool supportsScheduledPresentation() const override;
-    bool usesCompositorCadence() const override;
+    VrrCompositorCadence compositorCadence() const override;
     bool waitForFrameAdmission() override;
     bool keepsNewestQueuedFrame() const override { return supportsScheduledPresentation(); }
     virtual uint64_t waitForDecode(AVFrame* frame) override;
@@ -218,7 +218,8 @@ private:
     // residency list, so the next decode can delay its flip.
     bool m_DeferredAcquireEnabled = false;
     bool m_WaylandFullRefreshPresent = false;
-    bool m_GamescopeFullRefreshPresent = false;
+    uint64_t m_GamescopeRefreshPeriodUs = 0;
+    uint64_t m_LastGamescopeRetirementUs = 0;
     bool m_DeferredTemplateValid = false;
     pl_swapchain_frame m_DeferredTemplate = {};
     pl_tex_params m_DeferredTextureParams = {};

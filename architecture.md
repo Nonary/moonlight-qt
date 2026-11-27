@@ -1574,10 +1574,18 @@ cover that commit and two already painted frames in KWin's display pipeline.
 Completed and discarded records retire by present ID in a single batch. The
 Gamescope path admits one present until its matching terminal timing record.
 SteamOS 3.10.1 reports the commit latch and predicted scanout in that record.
+Full-refresh Gamescope bounds its completion polling to 125 µs sleeps around
+the expected return, based on the previous retirement and the display period.
+Outside that window it can sleep up to 1 ms. Only a matching record opens the slot.
 
 At full refresh on Wayland and Gamescope, FIFO sets the cadence and commits are
-eligible for the next repaint. The worker skips its software render and
-presentation waits and does not drop frames to correct software target phase.
+eligible for the next repaint. The worker prepares immediately and keeps frames
+through software phase corrections. On Gamescope, after the first submission,
+a prepared frame with continuous RTP timing can wait for its buffered source
+deadline. The worker deducts the previous call's time to enqueue. The controller's
+buffer remains effective when the source slows below the display refresh rate.
+Late frames proceed immediately.
+Wayland's frame-callback path submits as soon as the image is ready.
 It waits for the compositor's admission signal before claiming the newest
 decoded frame, so a frame can be replaced while the slot is occupied.
 Gamescope uses a zero target and still tracks the present ID. Mesa Wayland uses

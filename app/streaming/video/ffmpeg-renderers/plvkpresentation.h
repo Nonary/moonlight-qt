@@ -2,7 +2,28 @@
 
 #include <vulkan/vulkan_core.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <optional>
+
+// A Gamescope FIFO completion usually arrives one refresh after the previous
+// one. Its observation can be late by a coarse poll. Sleep in shorter steps
+// across that uncertainty window and revert to coarse polling if a repaint
+// is delayed. A prediction only controls when we ask for the terminal ID.
+constexpr uint64_t gamescopeRetirementPollUs(uint64_t nowUs, uint64_t lastRetiredUs,
+                                            uint64_t refreshPeriodUs)
+{
+    constexpr uint64_t coarseUs = 1000;
+    constexpr uint64_t fineUs = 125;
+    if (!lastRetiredUs || !refreshPeriodUs || nowUs < lastRetiredUs) return coarseUs;
+
+    const uint64_t elapsedUs = nowUs - lastRetiredUs;
+    if (elapsedUs >= refreshPeriodUs && elapsedUs - refreshPeriodUs >= coarseUs) return coarseUs;
+    if (elapsedUs < refreshPeriodUs && refreshPeriodUs - elapsedUs > coarseUs + fineUs) {
+        return std::min(coarseUs, refreshPeriodUs - elapsedUs - coarseUs);
+    }
+    return fineUs;
+}
 
 enum class PlVkVrrSurface
 {

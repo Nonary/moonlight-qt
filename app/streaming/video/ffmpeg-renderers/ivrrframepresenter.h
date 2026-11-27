@@ -357,6 +357,8 @@ struct VrrPrepareResult {
     VrrPresentFeedback feedback;
 };
 
+enum class VrrCompositorCadence { Disabled, WaylandFrameCallback, GamescopeFifo };
+
 class IVrrFramePresenter {
 public:
     virtual ~IVrrFramePresenter() = default;
@@ -404,7 +406,7 @@ public:
     virtual bool supportsScheduledPresentation() const { return false; }
 
     // A refresh-paced compositor provides both admission and display cadence.
-    virtual bool usesCompositorCadence() const { return false; }
+    virtual VrrCompositorCadence compositorCadence() const { return VrrCompositorCadence::Disabled; }
 
     // Called on the pacing thread before claiming a decoded frame. A bounded
     // wait lets fresher decoder output replace the queued frame in the meantime.

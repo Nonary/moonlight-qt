@@ -26,6 +26,13 @@ void check(PlVkVrrSurface surface, bool wsi,
 
 int main()
 {
+    constexpr uint64_t last = 10000, refresh = 8333;
+    static_assert(gamescopeRetirementPollUs(last, 0, refresh) == 1000);
+    static_assert(gamescopeRetirementPollUs(last - 1, last, refresh) == 1000);
+    static_assert(gamescopeRetirementPollUs(last + 6000, last, refresh) == 1000);
+    static_assert(gamescopeRetirementPollUs(last + 7000, last, refresh) == 333);
+    static_assert(gamescopeRetirementPollUs(last + refresh, last, refresh) == 125);
+    static_assert(gamescopeRetirementPollUs(last + 9500, last, refresh) == 1000);
     using Surface = PlVkVrrSurface;
     constexpr auto fifo = VK_PRESENT_MODE_FIFO_KHR;
     constexpr auto mailbox = VK_PRESENT_MODE_MAILBOX_KHR;

@@ -1444,7 +1444,7 @@ void testCompositorAdmissionKeepsDecodedFrameReplaceable()
         std::atomic_bool slotOpen { true };
         std::atomic_bool waitingForSlot { false };
 
-        bool usesCompositorCadence() const override { return true; }
+        VrrCompositorCadence compositorCadence() const override { return VrrCompositorCadence::GamescopeFifo; }
         bool keepsNewestQueuedFrame() const override { return true; }
         bool waitForFrameAdmission() override
         {
@@ -1479,6 +1479,78 @@ void testCompositorAdmissionKeepsDecodedFrameReplaceable()
            "compositor should receive only the latest decoder output at admission");
     for (const auto& lifetime : lifetimes)
         expect(lifetime.releases.load() == 1, "worker must release each decoded frame exactly once");
+}
+
+void testGamescopePacesEarlySubmissions()
+{
+    class Backend : public NativeScheduledPresenter {
+    public:
+        VrrCompositorCadence compositorCadence() const override { return VrrCompositorCadence::GamescopeFifo; }
+        VrrPresentFeedback presentAdaptive(const VrrPresentRequest&) override
+        {
+            // Gamescope accepts these frames for its next repaint.
+            return NativeScheduledPresenter::presentAdaptive({});
+        }
+    } backend;
+    resetFakeClock();
+    g_SteppedTestClockUs.store(1000000);
+    QTemporaryDir directory;
+    const QString path = directory.filePath("gamescope.vrrtrace");
+    const QByteArray priorTrace = qgetenv("MOONLIGHT_VRR_TRACE");
+    const QByteArray priorDeep = qgetenv("MOONLIGHT_VRR_DEEP_TRACE");
+    qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(path));
+    qputenv("MOONLIGHT_VRR_DEEP_TRACE", "1");
+    PacerTelemetry telemetry;
+    std::array<TrackedFrameLifetime, 12> lifetimes;
+    auto config = enabledConfig();
+    config.streamRateHz = 120;
+    {
+        VrrPacingWorker worker(&backend, config, &telemetry);
+        expect(worker.start(), "Gamescope timing worker must start");
+        unsigned ticks = 0;
+        for (unsigned i = 0; i < lifetimes.size(); ++i) {
+            // Alternate delivery jitter while the source moves from 120 to 60 FPS.
+            if (i) ticks += i < 5 ? 750 : 1500;
+            const auto arrival = 1000000 + ticks * 100 / 9 + (i % 2 == 0 ? 3500 : 0);
+            g_SteppedTestClockUs.store(std::max<uint64_t>(g_SteppedTestClockUs.load(), arrival));
+            worker.submit(makeTrackedPacedFrame(i + 1, ticks, LiGetMicroseconds(), lifetimes[i]));
+            expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == i + 1; }),
+                   "Gamescope must submit each input before receiving the next one");
+        }
+    }
+    g_SteppedTestClockUs.store(0);
+    qputenv("MOONLIGHT_VRR_TRACE", priorTrace);
+    qputenv("MOONLIGHT_VRR_DEEP_TRACE", priorDeep);
+    const auto lines = readExpandedTrace(path).split('\n');
+    const auto columns = lines.value(0).split(',');
+    uint64_t previousEntry = 0, previousEnqueue = 0;
+    unsigned rows = 0, held = 0, heldBeyondRefresh = 0;
+    for (const auto& line : lines.mid(1)) {
+        const auto fields = line.split(',');
+        if (fields.size() != columns.size()) continue;
+        const auto value = [&](const char* key) { return fields.value(columns.indexOf(key)).toULongLong(); };
+        const uint64_t entry = value("target_wait_initial_us");
+        const uint64_t end = value("target_wait_final_us");
+        if (entry) {
+            const uint64_t deadline = value("original_target_us") - (previousEnqueue - previousEntry);
+            // The fixture advances 100 us per clock read.
+            expect(end >= deadline && end <= std::max(deadline, entry) + 200,
+                   "Gamescope wait must honor the controller's buffered source deadline");
+            held += end > entry;
+            heldBeyondRefresh += value("playout_delay_us") > 0 && end > entry &&
+                deadline > previousEntry + value("display_period_us");
+        }
+        else if (rows == 0) {
+            expect(end == 0, "the first compositor frame has no submission phase to preserve");
+        }
+        expect(end <= value("present_start_us") && value("native_target_us") == 0,
+               "Gamescope pacing must precede the actual untargeted FIFO submit");
+        previousEntry = value("present_start_us");
+        previousEnqueue = value("submission_boundary_us");
+        ++rows;
+    }
+    expect(rows == lifetimes.size() && held > 0 && heldBeyondRefresh > 0,
+           "Gamescope must apply buffer even after the preceding frame's next refresh");
 }
 
 void testNativeScheduledEnqueueCadenceAndLifecycle()
@@ -4557,6 +4629,7 @@ int main()
     runNamed("testShortAndAlreadyCompleteDecodeReadiness()", [&] { testShortAndAlreadyCompleteDecodeReadiness(); });
     runNamed("testTimestampedDecodeCompletion()", [&] { testTimestampedDecodeCompletion(); });
     runNamed("testNativeScheduledEnqueueCadenceAndLifecycle()", [&] { testNativeScheduledEnqueueCadenceAndLifecycle(); });
+    runNamed("testGamescopePacesEarlySubmissions()", testGamescopePacesEarlySubmissions);
     runNamed("testCompositorAdmissionKeepsDecodedFrameReplaceable()", testCompositorAdmissionKeepsDecodedFrameReplaceable);
     runNamed("testTelemetrySnapshotsRemainCumulative()", [&] { testTelemetrySnapshotsRemainCumulative(); });
     runNamed("testSuspendDiscardAndFreshFrame()", [&] { testSuspendDiscardAndFreshFrame(); });

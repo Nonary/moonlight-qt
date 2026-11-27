@@ -26,6 +26,7 @@ extern "C" {
 #endif
 }
 
+#include <chrono>
 #include <vector>
 #include <set>
 #include <thread>
@@ -1021,7 +1022,8 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
     m_VrrRenderTimingActive = false;
 #ifdef Q_OS_LINUX
     m_WaylandFullRefreshPresent = false;
-    m_GamescopeFullRefreshPresent = false;
+    m_GamescopeRefreshPeriodUs = 0;
+    m_LastGamescopeRetirementUs = 0;
 #endif
 
     if (!m_VrrRequested) {
@@ -1088,7 +1090,8 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
         m_DeferredAcquireEnabled = true;
         const bool fullRefresh = params->frameRate >= params->vrrDisplayRefreshHz;
         m_WaylandFullRefreshPresent = surface == PlVkVrrSurface::Wayland && fullRefresh;
-        m_GamescopeFullRefreshPresent = gamescopeWsi && fullRefresh;
+        if (gamescopeWsi && fullRefresh)
+            m_GamescopeRefreshPeriodUs = 1000000 / params->vrrDisplayRefreshHz;
         return;
     }
     const auto mode = selectPlVkVrrPresentMode(surface, gamescopeWsi, params->gamescopeMailbox,
@@ -1193,16 +1196,16 @@ bool PlVkRenderer::supportsScheduledPresentation() const
 #endif
 }
 
-bool PlVkRenderer::usesCompositorCadence() const
+VrrCompositorCadence PlVkRenderer::compositorCadence() const
 {
 #ifdef Q_OS_LINUX
-    if (m_GamescopeFullRefreshPresent) return true;
+    if (m_GamescopeRefreshPeriodUs) return VrrCompositorCadence::GamescopeFifo;
+#ifdef HAS_WAYLAND
+    if (m_WaylandFullRefreshPresent && m_PresentationFeedback)
+        return VrrCompositorCadence::WaylandFrameCallback;
 #endif
-#if defined(Q_OS_LINUX) && defined(HAS_WAYLAND)
-    return m_WaylandFullRefreshPresent && m_PresentationFeedback != nullptr;
-#else
-    return false;
 #endif
+    return VrrCompositorCadence::Disabled;
 }
 
 bool PlVkRenderer::waitForFrameAdmission()
@@ -1552,15 +1555,26 @@ bool PlVkRenderer::waitForScheduledPresentSlot()
             m_GpuTrace->record({"wayland_frame_done", -1, 0, timeUs, timeUs, paintedId});
         }
 #endif
-        if (m_VulkanTiming->slotAvailable(paintedId)) return true;
-        const uint64_t nowUs = LiGetMicroseconds();
         const uint64_t pendingSinceUs = m_VulkanTiming->pendingSinceUs();
+        if (m_VulkanTiming->slotAvailable(paintedId)) {
+            if (m_GamescopeRefreshPeriodUs && pendingSinceUs)
+                m_LastGamescopeRetirementUs = LiGetMicroseconds();
+            return true;
+        }
+        const uint64_t nowUs = LiGetMicroseconds();
         if (pendingSinceUs && nowUs >= pendingSinceUs && nowUs - pendingSinceUs > 250000) {
             recoverFromScheduledPresentationFailure("timed present did not retire");
             return false;
         }
         if (nowUs >= giveUpUs || m_VrrWindowChangePending.load()) return false;
-        SDL_Delay(1);
+        if (m_GamescopeRefreshPeriodUs) {
+            const uint64_t sleepUs = gamescopeRetirementPollUs(nowUs,
+                m_LastGamescopeRetirementUs, m_GamescopeRefreshPeriodUs);
+            std::this_thread::sleep_for(std::chrono::microseconds(std::min(sleepUs, giveUpUs - nowUs)));
+        }
+        else {
+            SDL_Delay(1);
+        }
     }
 #else
     return true;
@@ -2551,7 +2565,7 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& reques
     // At full refresh the compositor's FIFO orders commits. An additional
     // clock target can make a frame miss the next repaint.
     if (m_VulkanTiming) m_VulkanTiming->begin(presentationId,
-        usesCompositorCadence() ? 0 : request.displayTargetUs);
+        compositorCadence() != VrrCompositorCadence::Disabled ? 0 : request.displayTargetUs);
 #endif
 #ifdef HAS_WAYLAND
     // Attach the request to the next native surface commit, never an empty
@@ -3289,8 +3303,8 @@ QString PlVkRenderer::getCalibrationIdentity()
         .arg(static_cast<int>(m_VkPresentMode));
     if (supportsScheduledPresentation()) {
         const bool gamescope = isGamescopeWsiPresentation(SDL_GetCurrentVideoDriver());
-        if (usesCompositorCadence()) {
-            identity += gamescope ? "|scheduled=gamescope-refresh" : "|scheduled=wayland-refresh";
+        if (compositorCadence() != VrrCompositorCadence::Disabled) {
+            identity += gamescope ? "|scheduled=gamescope-source-paced" : "|scheduled=wayland-refresh";
         }
         else {
             identity += "|scheduled=timed";
