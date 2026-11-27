@@ -301,10 +301,15 @@ void VrrReplayConfigTest::intrinsicProducerClockRoundTrip()
     QCOMPARE(restored.normalizedSourceIntrinsicDecodeGpu, uint64_t(0));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"normalized_source_intrinsic_decode_gpu", 2}}, restored, error));
     QCOMPARE(restored.normalizedSourceIntrinsicDecodeGpu, uint64_t(0));
-    QCOMPARE(production.playoutCeilingPhaseReplacement, uint64_t(3));
+    QCOMPARE(production.playoutCeilingPhaseReplacement, uint64_t(4));
     QCOMPARE(production.playoutOffsetSendSpanNormalization, uint64_t(1));
     QCOMPARE(production.preparationInitialSampleExcluded, uint64_t(2));
-    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_ceiling_phase_replacement", 4}}, restored, error));
+    for (int revision : {3, 4}) {
+        QVERIFY2(applyVrrReplayControllerSnapshot({{"playout_ceiling_phase_replacement", revision}}, restored, error),
+                 qPrintable(error));
+        QCOMPARE(restored.playoutCeilingPhaseReplacement, uint64_t(revision));
+    }
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_ceiling_phase_replacement", 5}}, restored, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_offset_send_span_normalization", 2}}, restored, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"preparation_initial_sample_excluded", 3}}, restored, error));
 }

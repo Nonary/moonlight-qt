@@ -39,7 +39,10 @@ The startup preparation predictor retains the later master safeguard: it uses
 the bounded lead until eight samples exist and caps the learned prediction at
 one source/display period. At the display ceiling, the current controller may
 request replacement to shed standing phase; the worker reserves a proven-ready
-successor first and preserves its observed decode boundary and wait. Replay
+successor first and preserves its observed decode boundary and wait.
+On a latch-capable presenter, ceiling replacement policy 4 measures a sudden
+delay from the frame’s intended smoothed slot. The longer-term replacement
+check still includes smoothing when measuring persistent delay. Replay
 joins a recorded reservation to that successor's lifecycle. These are software
 contracts, not proof of optical display timing.
 See [historical streaming notes](docs/streaming-history.md)

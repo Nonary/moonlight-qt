@@ -158,7 +158,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.boundedCatchupEnabled = config.experimentalBoundedCatchup;
     parameters.normalizedSourceMapping = parameters.boundedCatchupEnabled;
     parameters.normalizedSourceIntrinsicDecodeGpu = parameters.boundedCatchupEnabled;
-    parameters.playoutCeilingPhaseReplacement = 3;
+    parameters.playoutCeilingPhaseReplacement = 4;
     parameters.playoutOffsetSendSpanNormalization = 1;
     if (parameters.boundedCatchupEnabled) {
         parameters.playoutCatchupCarryLimitUs = kCatchupCarryLimitUs;
@@ -1472,35 +1472,33 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             !decision.phaseDiscontinuity && !decision.sourceRateChanged &&
             m_CadenceSamples.size() >= m_Parameters.minimumCadenceSamples &&
             m_SourcePeriodUs <= saturatingAdd(m_DisplayPeriodUs, m_DisplayPeriodUs / 1000)) {
-        uint64_t standingUs = decision.plannedExtraDelayUs();
         // Ongoing source displacement at the ceiling also leaves on-screen
         // phase that no replacement can cure; allow 1 ms of it, as the
         // disturbance contracts do, so jitter never sheds frames steadily.
         constexpr uint64_t kSourceDisplacementUs = 1000;
-        uint64_t physicalUs = 0, removableUs = 0;
-        if (m_Parameters.playoutCeilingPhaseReplacement != 0) {
-            // Smoothing revisions cap the planned recovery to their budget, but
-            // a synchronized flip still waits a refresh after the previous one:
-            // the capped plan hid 4-6 ms of on-screen phase. Measure the frame
-            // where it can actually appear, relative to its own smoothed slot.
-            uint64_t shownUs = decision.targetUs;
-            if (decision.latchedPresentation && m_HaveLastSubmission)
-                shownUs = std::max(shownUs, saturatingAdd(spacingAnchorUs(), m_DisplayPeriodUs));
-            const uint64_t smoothingUs = uint64_t(std::max<int64_t>(0, decision.cadenceSmoothingUs));
-            physicalUs = (shownUs - std::min(shownUs, decision.originalTargetUs)) + smoothingUs;
-            // Only phase beyond the frame's own readiness can be shed: input
-            // that stays late (a latency step) arrives as late after any
-            // replacement, so it is not removable and costs no replacement.
-            // The target exceeds the requested phase only by readiness.
-            const uint64_t readyUs = decision.targetUs > decision.requestedPhaseTargetUs ? decision.targetUs : 0;
-            const uint64_t heldFromUs = std::max(readyUs, decision.originalTargetUs);
-            removableUs = (shownUs - std::min(shownUs, heldFromUs)) + smoothingUs;
-            // Policy 2 grants the plan the on-screen allowance too: shedding
-            // 0.55 ms of post-miss recovery cost Smooth one skip per late frame.
-            standingUs = m_Parameters.playoutCeilingPhaseReplacement >= 2 ?
-                removableUs - std::min(removableUs, kSourceDisplacementUs) :
-                std::max(standingUs, physicalUs - std::min(physicalUs, kSourceDisplacementUs));
-        }
+        const uint64_t smoothingUs = uint64_t(std::max<int64_t>(0, decision.cadenceSmoothingUs));
+        // Smoothing revisions cap the planned recovery to their budget, but
+        // a synchronized flip still waits a refresh after the previous one:
+        // the capped plan hid 4-6 ms of on-screen phase. Measure the frame
+        // where it can actually appear, relative to its own smoothed slot.
+        uint64_t shownUs = decision.targetUs;
+        if (decision.latchedPresentation && m_HaveLastSubmission)
+            shownUs = std::max(shownUs, saturatingAdd(spacingAnchorUs(), m_DisplayPeriodUs));
+        const uint64_t slotDelayUs = shownUs - std::min(shownUs, decision.originalTargetUs);
+        const uint64_t physicalUs = saturatingAdd(slotDelayUs, smoothingUs);
+        // Only phase beyond the frame's own readiness can be shed: input
+        // that stays late (a latency step) arrives as late after any
+        // replacement, so it is not removable and costs no replacement.
+        // The target exceeds the requested phase only by readiness.
+        const uint64_t readyUs = decision.targetUs > decision.requestedPhaseTargetUs ? decision.targetUs : 0;
+        const uint64_t heldFromUs = std::max(readyUs, decision.originalTargetUs);
+        const uint64_t removableSlotDelayUs = shownUs - std::min(shownUs, heldFromUs);
+        const uint64_t removableUs = saturatingAdd(removableSlotDelayUs, smoothingUs);
+        // Policy 2 grants the plan the on-screen allowance too: shedding
+        // 0.55 ms of post-miss recovery cost Smooth one skip per late frame.
+        const uint64_t standingUs = m_Parameters.playoutCeilingPhaseReplacement >= 2 ?
+            removableUs - std::min(removableUs, kSourceDisplacementUs) :
+            std::max(decision.plannedExtraDelayUs(), physicalUs - std::min(physicalUs, kSourceDisplacementUs));
         m_FullRatePhase[m_FullRatePhaseNext] = standingUs;
         m_FullRatePhaseNext = (m_FullRatePhaseNext + 1) % m_FullRatePhase.size();
         m_FullRatePhaseCount = std::min(m_FullRatePhaseCount + 1, m_FullRatePhase.size());
@@ -1557,29 +1555,34 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             // stays with the 32-frame rule. (Time since decoder output would
             // also count the frame's wait behind the previous present.)
             const uint64_t decodeSideUs = frame.decodeSyncWaitUs();
-            // Shedding continues while each replacement sheds, and would shed,
-            // at least half a refresh.
+            // A latch-capable presenter can use the intended smoothing delay.
+            // Measure a sudden step from the smoothed slot, and keep counting
+            // all delay in the standing-phase check above.
+            const bool useSmoothedSlot = m_Parameters.playoutCeilingPhaseReplacement >= 4 && m_CanLatchPresentation;
+            const uint64_t stepPhaseUs = useSmoothedSlot ? slotDelayUs : physicalUs;
+            const uint64_t stepRemovableUs = useSmoothedSlot ? removableSlotDelayUs : removableUs;
+            // Continue shedding only while each replacement repays at least half a refresh.
             const bool continuing = m_CeilingShedding;
-            const bool removableStep = stepped(removableUs, m_CeilingLastRemovableUs);
+            const bool removableStep = stepped(stepRemovableUs, m_CeilingLastRemovableUs);
             // A new shed starts at most once per 32-frame window, the 32-frame
             // rule's own cadence: in a lossy, chaotic span (a 2026-10-20
             // capture) phase stepped past a refresh every few frames, and
             // shedding each step cost 50 replacements where policy 1 took 14.
             const bool replace = continuing ?
-                physicalUs > m_DisplayPeriodUs / 2 &&
-                    saturatingAdd(physicalUs, m_DisplayPeriodUs / 2) <= m_CeilingShedFromUs :
+                stepPhaseUs > m_DisplayPeriodUs / 2 &&
+                    saturatingAdd(stepPhaseUs, m_DisplayPeriodUs / 2) <= m_CeilingShedFromUs :
                 m_CeilingFramesSinceShed >= m_FullRatePhase.size() &&
-                    (removableStep || stepped(physicalUs, m_CeilingLastPhaseUs)) &&
-                    physicalUs > saturatingAdd(shedThresholdUs, decodeSideUs);
+                    (removableStep || stepped(stepPhaseUs, m_CeilingLastPhaseUs)) &&
+                    stepPhaseUs > saturatingAdd(shedThresholdUs, decodeSideUs);
             m_CeilingShedding = replace;
             m_CeilingFramesSinceShed = replace ? 0 : m_CeilingFramesSinceShed + 1;
             if (replace) {
-                m_CeilingShedFromUs = physicalUs;
+                m_CeilingShedFromUs = stepPhaseUs;
                 decision.trajectory.resyncRecommended = true;
                 // A frame more than a refresh late itself would already have
                 // an on-time successor decoded: one that is not ready within a
                 // quarter refresh is as late, and replacing it sheds nothing.
-                if (physicalUs - removableUs > m_DisplayPeriodUs)
+                if (slotDelayUs - removableSlotDelayUs > m_DisplayPeriodUs)
                     decision.replacementWaitUs = std::max<uint64_t>(1, m_DisplayPeriodUs / 4);
             }
             // A step in phase on one frame that its own late readiness caused
@@ -1589,14 +1592,13 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             // scheduled presentation hold 6.8 ms under 1 ms stamp jitter.
             // Revision 14 qualifies/renews from that proven late readiness
             // even if cold-start or previously earned phase is already higher.
-            else if (m_CeilingLastPhaseValid && physicalUs - removableUs > kSourceDisplacementUs &&
-                    physicalUs - removableUs > kSourceDisplacementUs) {
+            else if (m_CeilingLastPhaseValid && slotDelayUs - removableSlotDelayUs > kSourceDisplacementUs) {
                 m_CeilingEarnedPhaseUs = std::max(m_CeilingEarnedPhaseUs, std::min(physicalUs, m_DisplayPeriodUs));
                 m_CeilingEarnedPeakUs = m_CeilingEarnedPhaseUs;
                 m_CeilingEarnedAtUs = nowUs;
             }
-            m_CeilingLastPhaseUs = physicalUs;
-            m_CeilingLastRemovableUs = removableUs;
+            m_CeilingLastPhaseUs = stepPhaseUs;
+            m_CeilingLastRemovableUs = stepRemovableUs;
             m_CeilingLastPhaseValid = true;
             keptUs = std::max(keptUs, m_CeilingEarnedPhaseUs);
         }

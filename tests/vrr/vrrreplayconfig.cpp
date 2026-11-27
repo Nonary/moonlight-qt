@@ -639,8 +639,8 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.normalizedSourceIntrinsicDecodeGpu > 1) {
         return fail("normalized_source_intrinsic_decode_gpu must be 0 or 1");
     }
-    if (value.playoutCeilingPhaseReplacement > 3) {
-        return fail("playout_ceiling_phase_replacement must be in 0..3");
+    if (value.playoutCeilingPhaseReplacement > 4) {
+        return fail("playout_ceiling_phase_replacement must be in 0..4");
     }
     if (value.playoutOffsetSendSpanNormalization > 1) {
         return fail("playout_offset_send_span_normalization must be 0 or 1");
