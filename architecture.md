@@ -1386,8 +1386,10 @@ ready image for the controller's deadline, then the worker holds the next
 dequeue until that deadline. This permits one future target at a time without
 adding a refresh to the current frame.
 System-relative presentation time is QPC scaled to 100 ns with the actual QPC
-frequency. It no longer depends on resolving an interrupt-clock export or assumes
-that the interrupt-clock epoch equals the presentation clock's epoch.
+frequency, a conversion documented in Microsoft's [Composition Swapchain timing guidance](https://learn.microsoft.com/en-us/windows/win32/comp_swapchain/comp-swapchain-examples#present-queue-and-timing).
+The presenter uses the same reference clock to interpret independent-flip
+feedback. Commit `a5500a26` adopted this reference after interrupt time
+produced estimated-only timing on the client.
 
 `D3D11CompositionPresenter` owns five displayable textures, a presentation
 manager/surface, and a DirectComposition visual bound to the streaming window.
@@ -1476,8 +1478,32 @@ Resize replaces
 buffers; display changes recreate the renderer and its output identity.
 
 `compositionprobe --run` is an optional fullscreen Windows hardware diagnostic
-for independent-flip coverage and submission-to-display latency. It does not
-prove optical VRR, tear freedom, or end-to-end latency. The 2026-10-04 native
+for independent-flip coverage and submission-to-display latency. Its immediate
+mode uses the original one-refresh service check. Passing `--lead-us N` uses
+the production scheduled call and reports actual CPU enqueue lead, OS-reported
+target error, and adjacent display interval jerk. Scheduled runs use the
+matched independent-flip coverage check as their exit gate, since
+submission-to-display latency includes the intentionally queued lead. Compare
+different leads at the same synthetic cadence, with the skip, cancellation,
+and composition statistics counts beside the target and interval metrics.
+The probe's `--decode-setup serial` and `--decode-setup overlap` modes use
+the same fixed target schedule and a second D3D11 device that fills a shared
+texture on a timed producer thread. The serial arm waits on the CPU before
+acquiring the render target and recording commands. The overlap arm records
+and flushes those commands while the producer fence can still be pending.
+Both queue a GPU wait before copying the shared source, and the consumer fence
+must retire the copy before the producer may reuse the texture. The probe
+reports signed CPU enqueue lead and how often a render batch was flushed with
+decode still pending. This isolates the overlap opportunity using a synthetic
+source and a copy in place of the live video decoder and shaders.
+`--decode-setup queued` also submits the scheduled present before the CPU
+waits on the consumer fence. Microsoft's [present lifecycle documentation](https://learn.microsoft.com/en-us/windows/win32/comp_swapchain/comp-swapchain#lifecycle-of-a-present)
+states that drawing issued before the present must finish before that
+present becomes eligible for display. The probe checks whether the call
+returned successfully while its render fence was pending, then waits
+before recycling the shared source. This arm exercises that native
+contract independently of live worker scheduling and source ownership.
+These measurements describe OS behavior. The 2026-10-04 native
 ALLYTWO probe confirmed independent-flip coverage with no rejected timestamps
 or unavailable buffers. At 116 FPS/120 Hz, steady-state coverage was 464/465,
 submission-to-display p50 was 7.057 ms and p99 was 15.968 ms. Its strict
