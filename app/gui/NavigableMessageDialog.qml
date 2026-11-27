@@ -45,7 +45,7 @@ NavigableDialog {
         }
     }
 
-    RowLayout {
+    contentItem: RowLayout {
         spacing: Style.px(24, dialog.hostWindow)
 
         BusyIndicator {
@@ -69,9 +69,16 @@ NavigableDialog {
 
         ScrollView {
             id: messageScroll
+            objectName: "messageScroll"
+            Layout.fillWidth: true
             Layout.preferredWidth: Math.max(240, Math.min(Style.px(496, dialog.hostWindow), (Overlay.overlay ? Overlay.overlay.width : 800) - 2 * dialog.padding))
-            Layout.preferredHeight: Math.min(dialogLabel.implicitHeight, Math.max(120, (Overlay.overlay ? Overlay.overlay.height : 720) - Style.px(240, dialog.hostWindow)))
+            Layout.preferredHeight: Math.min(dialogLabel.implicitHeight, Math.max(0,
+                (Overlay.overlay ? Overlay.overlay.height : 720) - Style.px(48, dialog.hostWindow) -
+                dialog.implicitHeaderHeight - dialog.implicitFooterHeight - dialog.topPadding - dialog.bottomPadding))
             clip: true
+            contentWidth: availableWidth
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
             ConsoleText {
                 property string dialogText
                 id: dialogLabel
@@ -98,6 +105,8 @@ NavigableDialog {
 
             Keys.onRightPressed: nextItemInFocusChain(true).forceActiveFocus(Qt.TabFocus)
             Keys.onLeftPressed: nextItemInFocusChain(false).forceActiveFocus(Qt.TabFocus)
+            Keys.onUpPressed: messageScroll.ScrollBar.vertical.decrease()
+            Keys.onDownPressed: messageScroll.ScrollBar.vertical.increase()
         }
 
         onHelpRequested: {

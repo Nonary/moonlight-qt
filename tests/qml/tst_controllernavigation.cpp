@@ -1434,11 +1434,30 @@ private slots:
         QTest::keyClick(root,Qt::Key_Escape);
         QTRY_VERIFY(!edit->property("visible").toBool());
         QTRY_COMPARE(root->activeFocusItem(),numberRow);
-        press(SDL_CONTROLLER_BUTTON_X);
-        auto* help=root->findChild<QObject*>("settingsHelpDialog"); QVERIFY(help);
-        QTRY_VERIFY(help->property("visible").toBool());
-        press(SDL_CONTROLLER_BUTTON_B); QTRY_VERIFY(!help->property("visible").toBool());
-        QTRY_COMPARE(root->activeFocusItem(),numberRow);
+        auto* latencyRow = root->findChild<QQuickItem*>("ultraLowLatencyVrr");
+        auto* help = root->findChild<QObject*>("settingsHelpDialog");
+        QVERIFY(latencyRow && help);
+        for (const QSize size : {QSize(800, 500), QSize(1280, 720)}) {
+            root->resize(size);
+            settleLayout(engine, root);
+            latencyRow->forceActiveFocus();
+            press(SDL_CONTROLLER_BUTTON_X);
+            QTRY_VERIFY(help->property("opened").toBool());
+            QVERIFY(help->property("text").toString().contains("2 frames of presentation latency on average"));
+
+            auto* background = help->property("background").value<QQuickItem*>();
+            auto* message = visualItem(root->contentItem(), "messageScroll");
+            QVERIFY(background && message);
+            const QPointF center = background->mapToScene(QPointF(background->width() / 2, background->height() / 2));
+            QVERIFY(QLineF(center, QPointF(size.width() / 2, size.height() / 2)).length() <= 1);
+            QVERIFY(background->height() < size.height());
+            QVERIFY(qAbs(message->width() - help->property("availableWidth").toReal()) <= 1);
+            captureState(QString("latency-more-help-%1").arg(size.width()));
+
+            press(SDL_CONTROLLER_BUTTON_B);
+            QTRY_VERIFY(!help->property("visible").toBool());
+            QTRY_COMPARE(root->activeFocusItem(), latencyRow);
+        }
         QVERIFY(!navigation->currentUiNavMode());
         auto* resetRow=root->findChild<QQuickItem*>("resetBitrateRow"); QVERIFY(resetRow && resetRow->isVisible());
         resetRow->forceActiveFocus(); press(SDL_CONTROLLER_BUTTON_A);

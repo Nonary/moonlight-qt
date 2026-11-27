@@ -205,7 +205,7 @@ FocusScope {
         title: settingsShell.activeRow ? settingsShell.activeRow.settingsLabel : ""
         text: settingsShell.activeRow ? settingsShell.activeRow.settingsHelp : ""
         standardButtons: Dialog.Close
-        width: Math.min(Style.px(720, settingsShell.Window.window), settingsShell.width - Style.px(48, settingsShell.Window.window))
+        width: Math.min(Style.px(560, hostWindow), hostWindow ? hostWindow.width - Style.px(48, hostWindow) : 560)
         onClosed: Qt.callLater(function() { if (settingsShell.activeRow) settingsShell.activeRow.forceActiveFocus() })
     }
     ConsoleBackdrop { anchors.fill: parent }
@@ -2051,7 +2051,8 @@ FocusScope {
                         ToolTip.delay: 1000
                         ToolTip.timeout: 10000
                         ToolTip.visible: hovered
-                        ToolTip.text: qsTr("Uses low-latency presentation on supported Windows 11 systems and SteamOS 3.10 or later in Gaming Mode. Your VRR timing profile still controls Moonlight's adaptive buffer.") + "\n\n" +
+                        ToolTip.text: qsTr("On supported systems, saves about 2 frames of presentation latency on average compared with standard VRR.") + "\n\n" +
+                                      qsTr("Uses low-latency presentation on supported Windows 11 systems and SteamOS 3.10 or later in Gaming Mode. Your VRR timing profile still controls Moonlight's adaptive buffer.") + "\n\n" +
                                       qsTr("Caps a 120 Hz display at 116 FPS when supported. Other setups use five-sixths of the refresh rate and keep their configured buffer.") +
                                       (fpsComboBox.fpsLimit > 0 ? "\n\n" + qsTr("Current frame rate limit: %1 FPS").arg(fpsComboBox.fpsLimit) : "")
                     }
