@@ -10,6 +10,7 @@
 #include <QPointer>
 #include <QQuickWindow>
 #include <QQuickItem>
+#include <QQuickStyle>
 #include <QDir>
 #include <QKeyEvent>
 #include <QTemporaryDir>
@@ -106,6 +107,7 @@ class ControllerNavigationTest : public QObject {
     }
 private slots:
     void initTestCase() {
+        QQuickStyle::setStyle("Material");
         QFontDatabase::addApplicationFont(":/fonts/Inter.ttf");
         QGuiApplication::setFont(QFont("Inter"));
         qmlRegisterType<MutableConsoleHostModel>("ComputerModel",1,0,"ComputerModel");
@@ -478,6 +480,32 @@ private slots:
         model->reverseHosts();
         QTRY_COMPARE(grid->property("selectedHost").toMap().value("name").toString(), QString("Gaming PC"));
         prefs->uiLastHostUuid.clear();
+    }
+    void pcOptionsMenuOpensWithUsableWidth() {
+        prefs->uiLastHostUuid.clear();
+        QQmlApplicationEngine engine;
+        engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
+        engine.rootContext()->setContextProperty("initialView", QString("qrc:/gui/PcView.qml"));
+        engine.rootContext()->setContextProperty("runConfigChecks", false);
+        engine.load(QUrl("qrc:/gui/main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* root = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(root);
+        auto* grid = root->findChild<QQuickItem*>("Computers");
+        QVERIFY(grid);
+
+        QQuickItem* host = nullptr;
+        QTRY_VERIFY((host = grid->property("currentItem").value<QQuickItem*>()));
+        QObject* menu = nullptr;
+        QTRY_VERIFY((menu = host->property("pcContextMenu").value<QObject*>()));
+        QVERIFY(!menu->property("visible").toBool());
+
+        QVERIFY(QMetaObject::invokeMethod(root, "activateOptions"));
+        QTRY_VERIFY(menu->property("opened").toBool());
+        QVERIFY(menu->property("width").toReal() > 100);
+        auto* content = menu->property("contentItem").value<QQuickItem*>();
+        QVERIFY(content);
+        QVERIFY(content->width() > 100);
     }
     void recentGameActionsFollowIdentityAfterCatalogueRowsMove() {
         QSettings().remove("ui/selectedApps/host-one");

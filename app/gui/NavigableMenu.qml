@@ -5,7 +5,12 @@ import "ConsoleStyle.js" as Style
 
 Menu {
     readonly property var hostWindow: parent ? parent.Window.window : null
-    background: Rectangle { color: Style.raised; radius: Style.px(10, hostWindow); border.color: Style.outline }
+    background: Rectangle {
+        implicitWidth: Style.px(280, hostWindow)
+        color: Style.raised
+        radius: Style.px(10, hostWindow)
+        border.color: Style.outline
+    }
     font.family: "Inter"
     font.pixelSize: Style.typeSize("body", hostWindow)
     property var initiator
