@@ -13,6 +13,9 @@ T.Button {
     readonly property bool settingsAction: true
     readonly property string settingsLabel: text
     readonly property string settingsHelp: ToolTip.text
+    readonly property bool inlineHelp: !!settingsNavigation && settingsNavigation.desktopPreferences === true && (!!settingsHelp || !enabled)
+    readonly property Item desktopHelpLink: actionHint.helpButton
+    Accessible.description: settingsHelp
     function activateSetting() { clicked() }
     Keys.onPressed: function(event) { event.accepted = settingsNavigation ? settingsNavigation.handleRowKey(control, event) : false }
     property bool primary: false
@@ -21,12 +24,12 @@ T.Button {
     property bool rail: false
     property int textAlignment: Text.AlignHCenter
     readonly property bool focusVisible: activeFocus && SdlGamepadKeyNavigation.inputMethod !== "mouse" && SdlGamepadKeyNavigation.inputMethod !== "touch"
-    implicitHeight: Style.px(48, Window.window)
+    implicitHeight: inlineHelp ? Math.max(48, contentItem.implicitHeight + bottomPadding + 10) : Style.px(48, Window.window)
     implicitWidth: contentItem.implicitWidth + leftPadding + rightPadding
     leftPadding: Style.px(16, Window.window)
     rightPadding: leftPadding
     topPadding: 0
-    bottomPadding: 0
+    bottomPadding: inlineHelp ? actionHint.implicitHeight + 8 : 0
     topInset: 0; bottomInset: 0; leftInset: 0; rightInset: 0
     font.family: "Inter"
     font.pixelSize: Style.typeSize("body", Window.window)
@@ -40,6 +43,14 @@ T.Button {
         color: !control.enabled ? Style.disabled : control.focusVisible || control.selected ? Style.text : Style.muted
         horizontalAlignment: control.textAlignment
         verticalAlignment: Text.AlignVCenter
+    }
+    DesktopSettingHint {
+        id: actionHint
+        visible: control.inlineHelp
+        row: control
+        x: control.leftPadding; width: control.availableWidth
+        y: control.height - control.bottomPadding
+        height: implicitHeight
     }
     background: Rectangle {
         radius: Style.px(6, control.Window.window)

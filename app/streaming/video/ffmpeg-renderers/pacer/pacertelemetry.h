@@ -155,7 +155,8 @@ public:
     }
 
     void recordCapturePresentation(const Overlay::TimingGraphInput& event,
-                                   uint64_t captureStartHostUs, uint64_t displayUncertaintyUs)
+                                   uint64_t captureStartHostUs, uint64_t displayUncertaintyUs,
+                                   Vrr13::PresentationTimeKind displayKind = Vrr13::PresentationTimeKind::Unavailable)
     {
         if (!m_ReadCaptureClock || (!captureStartHostUs && !event.displayValid)) {
             return;
@@ -167,7 +168,8 @@ public:
             captureStartHostUs = 0;
         }
         QMutexLocker lock(&m_Lock);
-        m_CaptureLatency.record(event, captureStartHostUs, offsetUs, uncertaintyUs, displayUncertaintyUs);
+        m_CaptureLatency.record(event, captureStartHostUs, offsetUs, uncertaintyUs,
+                                displayUncertaintyUs, displayKind);
     }
 
     void beginVrrSession()

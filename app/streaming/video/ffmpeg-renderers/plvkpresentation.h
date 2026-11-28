@@ -40,6 +40,12 @@ constexpr bool plVkRequestsScheduledPresentation(bool enableVrr, bool ultraLowLa
     return enableVrr && (ultraLowLatency || (!testOnly && timingExperiment));
 }
 
+constexpr bool plVkQualifiesUltraLowLatency(bool timedSwapchain, bool gamescopeWsi,
+                                            bool desktopWaylandFeedback)
+{
+    return timedSwapchain && (gamescopeWsi || desktopWaylandFeedback);
+}
+
 // Called only after the session and renderer have qualified for VRR. The
 // predicate must query the actual Vulkan surface, including any WSI layer.
 template<typename SupportsMode>

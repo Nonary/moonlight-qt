@@ -82,7 +82,8 @@ public:
         // Preserve submissions for delayed display events, but never promote
         // a refresh reference to a display instant in the live policy. The
         // legacy path is explicit and exists only to reproduce old captures.
-        if ((requireDisplayEvents && o.timeKind != PresentationTimeKind::DisplayEvent) ||
+        if (o.timeKind == PresentationTimeKind::DisplayEstimate ||
+            (requireDisplayEvents && o.timeKind != PresentationTimeKind::DisplayEvent) ||
             !o.sampleValid || !o.sampleTime || o.sampleTime > o.observed ||
             o.observed - o.sampleTime > 100000 || o.uncertainty > 500) return;
         const bool useRefreshReference = o.dxgi &&

@@ -662,7 +662,9 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
                 id = reinterpret_cast<const VkPhysicalDevicePresentId2FeaturesKHR*>(p)->presentId2;
         }
         auto timing = std::make_unique<VulkanTiming>();
-        if (timed && id && timing->initializeScheduled(m_Vulkan->device, isWaylandPresentation(videoDriver)))
+        if (timed && id && timing->initializeScheduled(m_Vulkan->device,
+                isWaylandPresentation(videoDriver), LiIsCaptureTimingEnabled() &&
+                    gamescopeWsi && videoDriver && !strcmp(videoDriver, "x11")))
             m_VulkanTiming = std::move(timing);
     }
     if (schedulingRequested && !m_VulkanTiming) {
@@ -714,7 +716,8 @@ bool PlVkRenderer::isExtensionSupportedByPhysicalDevice(VkPhysicalDevice device,
 #ifdef Q_OS_LINUX
 bool PlVkRenderer::supportsUltraLowLatencyOnWindow(SDL_Window* window, int refreshHz, bool hdr)
 {
-    if (!isGamescopeWsiPresentation(SDL_GetCurrentVideoDriver())) return false;
+    const char* driver = SDL_GetCurrentVideoDriver();
+    if (!isGamescopeWsiPresentation(driver) && !isWaylandPresentation(driver)) return false;
 
     DECODER_PARAMETERS params = {};
     params.window = window;
@@ -901,6 +904,25 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
+#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
+    const char* driver = SDL_GetCurrentVideoDriver();
+    bool desktopWaylandFeedback = false;
+#ifdef HAS_WAYLAND
+    desktopWaylandFeedback = isWaylandPresentation(driver) && m_PresentationFeedback != nullptr;
+#endif
+    // Qualify the initialized swapchain. Mailbox also supplies Wayland
+    // feedback, so feedback alone does not establish scheduled presentation.
+    const bool gamescopeWsi = isGamescopeWsiPresentation(driver);
+    m_UltraLowLatencyVrr = params->ultraLowLatencyVrr && plVkQualifiesUltraLowLatency(
+        supportsScheduledPresentation() && m_VulkanTiming->swapchainTimed(),
+        gamescopeWsi, desktopWaylandFeedback);
+#ifdef HAVE_PYROWAVE
+    m_PrepareDuringGamescopePresent = gamescopeWsi && m_UltraLowLatencyVrr && m_PyroWavePool &&
+        params->smoothVrrFrameTiming && params->frameRate > 0 &&
+        params->frameRate < params->vrrDisplayRefreshHz;
+#endif
+#endif
+
 #ifdef PLVK_USE_EARLY_RENDER_TO_WAIT
     SDL_Surface *emptySurface = SDL_CreateRGBSurfaceWithFormat(0, 1, 1, 0, SDL_PIXELFORMAT_ARGB8888);
     if (emptySurface == nullptr) {
@@ -1046,6 +1068,7 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
 #ifdef Q_OS_LINUX
     m_WaylandFullRefreshPresent = false;
     m_GamescopeRefreshPeriodUs = 0;
+    m_PrepareDuringGamescopePresent = false;
     m_LastGamescopeRetirementUs = 0;
 #endif
 
@@ -1114,8 +1137,7 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
         m_DeferredAcquireEnabled = true;
         const bool fullRefresh = params->frameRate >= params->vrrDisplayRefreshHz;
         m_WaylandFullRefreshPresent = surface == PlVkVrrSurface::Wayland && fullRefresh;
-        m_UltraLowLatencyVrr = gamescopeWsi && params->ultraLowLatencyVrr;
-        if (gamescopeWsi && (fullRefresh || m_UltraLowLatencyVrr))
+        if (gamescopeWsi && (fullRefresh || params->ultraLowLatencyVrr))
             m_GamescopeRefreshPeriodUs = 1000000 / params->vrrDisplayRefreshHz;
         return;
     }
@@ -1233,6 +1255,16 @@ VrrCompositorCadence PlVkRenderer::compositorCadence() const
 #endif
 #endif
     return VrrCompositorCadence::Disabled;
+}
+
+bool PlVkRenderer::canPrepareBeforeFrameAdmission() const
+{
+#ifdef Q_OS_LINUX
+    return m_PrepareDuringGamescopePresent && m_DeferredTemplateValid &&
+        !m_VrrWindowChangePending.load();
+#else
+    return false;
+#endif
 }
 
 bool PlVkRenderer::waitForFrameAdmission()
@@ -1565,6 +1597,24 @@ bool PlVkRenderer::acquireVrrSwapchainFrame()
         recoverFromScheduledPresentationFailure("timed swapchain stopped accepting frames");
 #endif
     return acquired;
+}
+
+void PlVkRenderer::collectCaptureEstimate(VrrPresentFeedback& feedback)
+{
+#if defined(Q_OS_LINUX) && defined(VK_EXT_present_timing)
+    if (m_VulkanTiming && m_VulkanTiming->scheduled()) {
+        m_VulkanTiming->collectScheduledEstimate(feedback);
+        if (feedback.latchTimeKind == Vrr13::PresentationTimeKind::DisplayEstimate &&
+                !m_LoggedPresentationFeedback) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Vulkan VRR: received Gamescope scheduled scanout prediction (clock uncertainty %llu us)",
+                        static_cast<unsigned long long>(feedback.presentationUncertaintyUs));
+            m_LoggedPresentationFeedback = true;
+        }
+    }
+#else
+    (void) feedback;
+#endif
 }
 
 bool PlVkRenderer::waitForScheduledPresentSlot()
@@ -2652,7 +2702,7 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& reques
         }
         if (feedback.latchSampleValid && !m_LoggedPresentationFeedback) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Vulkan VRR: received Gamescope WSI presentation timestamp (clock uncertainty %llu us)",
+                        "Vulkan VRR: received Gamescope WSI presentation estimate (clock uncertainty %llu us)",
                         static_cast<unsigned long long>(feedback.presentationUncertaintyUs));
             m_LoggedPresentationFeedback = true;
         }

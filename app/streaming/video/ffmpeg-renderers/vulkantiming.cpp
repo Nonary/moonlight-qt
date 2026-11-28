@@ -156,6 +156,8 @@ void VulkanTiming::reset()
     // acquire must still observe completion, or destroy the old swapchain.
     if (scheduled()) {
         m_WaylandPaintedId = 0;
+        m_ScheduledEstimate = {};
+        m_EstimateAfterToken = m_ScheduledToken;
         return;
     }
 #endif
@@ -283,7 +285,9 @@ void VulkanTiming::finish(VrrPresentFeedback& feedback)
     m_Completed.pop_front();
     ++m_Statistics.emitted;
     feedback.latchSampleValid = true;
-    feedback.latchTimeKind = Vrr13::PresentationTimeKind::DisplayEvent;
+    // Gamescope's GOOGLE report puts its predicted refresh in actualPresentTime.
+    // Keep the matched estimate in the trace without scoring a display event.
+    feedback.latchTimeKind = Vrr13::PresentationTimeKind::DisplayEstimate;
     feedback.latchSubmissionId = sample.id;
     feedback.latchTimeUs = sample.time;
     feedback.presentationUncertaintyUs = sample.uncertainty;
@@ -306,7 +310,8 @@ bool VulkanTiming::supportsScheduling(PFN_vkGetInstanceProcAddr proc, VkInstance
         (timing.presentStageQueries & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT);
 }
 
-bool VulkanTiming::initializeScheduled(VkDevice device, bool waylandFramePacing)
+bool VulkanTiming::initializeScheduled(VkDevice device, bool waylandFramePacing,
+                                       bool gamescopePrediction)
 {
     auto source = deviceLoader.load();
     if (!source) return false;
@@ -319,6 +324,7 @@ bool VulkanTiming::initializeScheduled(VkDevice device, bool waylandFramePacing)
     m_GetCalibratedTimestamps = reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(
         source(device, "vkGetCalibratedTimestampsKHR"));
     m_WaylandFramePacing = waylandFramePacing;
+    m_GamescopePrediction = gamescopePrediction && !waylandFramePacing;
     return m_GetTimeDomains && m_SetTimingQueueSize && m_GetScheduledTimings &&
         registerDevice(device);
 }
@@ -346,6 +352,7 @@ VKAPI_ATTR VkResult VKAPI_CALL VulkanTiming::createSwapchain(
     }
     observer->m_Swapchain = *swapchain;
     observer->m_ScheduledPresents.clear();
+    observer->m_ScheduledEstimate = {};
     observer->m_WaylandPaintedId = 0;
     observer->m_TimingConfigured = true;
     return result;
@@ -358,6 +365,7 @@ VKAPI_ATTR void VKAPI_CALL VulkanTiming::destroySwapchain(
         observer && observer->scheduled() && observer->m_Swapchain == swapchain) {
         observer->m_Swapchain = VK_NULL_HANDLE;
         observer->m_ScheduledPresents.clear();
+        observer->m_ScheduledEstimate = {};
         observer->m_WaylandPaintedId = 0;
         observer->m_TimingConfigured = false;
     }
@@ -385,9 +393,56 @@ bool VulkanTiming::configureSwapchain(VkSwapchainKHR swapchain)
             continue;
         m_TimeDomainId = ids[i];
         m_TimeDomain = clocks[i];
+        m_TimeDomainsCounter = counter;
         return m_SetTimingQueueSize(m_Device, swapchain, m_WaylandFramePacing ? kWaylandTimingCapacity : 1) == VK_SUCCESS;
     }
     return false;
+}
+
+bool VulkanTiming::sampleStageClock(uint64_t& nativeNs, uint64_t& deviationNs) const
+{
+    const VkSwapchainCalibratedTimestampInfoEXT swapchainClock{
+        VK_STRUCTURE_TYPE_SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr,
+        m_Swapchain, VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT, m_TimeDomainId};
+    const VkCalibratedTimestampInfoKHR clock{
+        VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, &swapchainClock, m_TimeDomain};
+    return m_GetCalibratedTimestamps(m_Device, 1, &clock, &nativeNs, &deviationNs) == VK_SUCCESS &&
+        deviationNs <= 500000;
+}
+
+void VulkanTiming::collectScheduledEstimate(VrrPresentFeedback& feedback)
+{
+    const auto estimate = std::exchange(m_ScheduledEstimate, {});
+    if (!estimate.pixelOutNs) return;
+
+    // The matching report opened admission already. Correlate its clock after
+    // the next submit, without adding a query or wait to the retirement loop.
+    const uint64_t beforeUs = LiGetMicroseconds();
+    uint64_t nativeNs = 0, deviationNs = 0;
+    if (!sampleStageClock(nativeNs, deviationNs) || !nativeNs) return;
+    const uint64_t afterUs = LiGetMicroseconds();
+    if (afterUs < beforeUs || afterUs - beforeUs > 500) return;
+
+    constexpr uint64_t maxAgeUs = 100000;
+    const uint64_t nativeUs = nativeNs / 1000;
+    const uint64_t pixelOutUs = estimate.pixelOutNs / 1000;
+    const uint64_t localUs = beforeUs + (afterUs - beforeUs) / 2;
+    const uint64_t distanceUs = std::max(nativeUs, pixelOutUs) - std::min(nativeUs, pixelOutUs);
+    if (distanceUs > maxAgeUs || (pixelOutUs < nativeUs && distanceUs >= localUs)) return;
+
+    const uint64_t predictedUs = pixelOutUs >= nativeUs ? localUs + distanceUs : localUs - distanceUs;
+    if (predictedUs < estimate.submittedUs || predictedUs - estimate.submittedUs > maxAgeUs) return;
+
+    const uint64_t uncertaintyUs = (afterUs - beforeUs + 1) / 2 +
+        (deviationNs + 999) / 1000 + 1;
+    if (uncertaintyUs > 500) return;
+
+    feedback.latchSampleValid = true;
+    feedback.latchTimeKind = Vrr13::PresentationTimeKind::DisplayEstimate;
+    feedback.latchSubmissionId = estimate.id;
+    feedback.latchTimeUs = predictedUs;
+    feedback.presentationUncertaintyUs = uncertaintyUs;
+    ++m_Statistics.emitted;
 }
 
 uint64_t VulkanTiming::targetInSwapchainClock(uint64_t targetUs)
@@ -400,14 +455,8 @@ uint64_t VulkanTiming::targetInSwapchainClock(uint64_t targetUs)
     if (stageLocal) {
         // Gamescope exposes a stage-local domain, even though its current
         // implementation uses CLOCK_MONOTONIC for all of the stages.
-        const VkSwapchainCalibratedTimestampInfoEXT swapchainClock{
-            VK_STRUCTURE_TYPE_SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr,
-            m_Swapchain, VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT, m_TimeDomainId};
-        const VkCalibratedTimestampInfoKHR clock{
-            VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, &swapchainClock, m_TimeDomain};
         uint64_t deviationNs = 0;
-        if (m_GetCalibratedTimestamps(m_Device, 1, &clock, &nativeNs, &deviationNs) != VK_SUCCESS ||
-                deviationNs > 500000) return 0;
+        if (!sampleStageClock(nativeNs, deviationNs)) return 0;
     }
     else {
         const auto clockId = m_TimeDomain == VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR ?
@@ -471,6 +520,14 @@ bool VulkanTiming::slotAvailable(uint64_t paintedId)
         const auto completed = std::find_if(m_ScheduledPresents.begin(), m_ScheduledPresents.end(),
             [&](const ScheduledPresent& pending) { return pending.token == timing.presentId; });
         if (completed != m_ScheduledPresents.end()) {
+            if (m_GamescopePrediction && completed->token > m_EstimateAfterToken &&
+                    m_TimeDomain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT &&
+                    properties.timeDomainsCounter == m_TimeDomainsCounter &&
+                    timing.timeDomain == m_TimeDomain && timing.timeDomainId == m_TimeDomainId &&
+                    timing.presentStageCount == 1 &&
+                    stages[i].stage == VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT && stages[i].time) {
+                m_ScheduledEstimate = {completed->id, completed->submitted, stages[i].time};
+            }
             m_ScheduledPresents.erase(completed);
             ++m_Statistics.returned;
         }

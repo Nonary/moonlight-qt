@@ -10,6 +10,7 @@ enum class PresentationTimeKind : uint8_t {
     Unavailable = 0,
     RefreshReference = 1,
     DisplayEvent = 2,
+    DisplayEstimate = 3,
 };
 
 }

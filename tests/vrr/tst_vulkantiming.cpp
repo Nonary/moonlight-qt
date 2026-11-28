@@ -31,6 +31,10 @@ uint64_t nativeTarget = 0;
 bool nativeComplete = false;
 bool nativeSurfaceSupported = true;
 bool stageLocal = false;
+uint64_t nativePixelOut = 0;
+uint64_t stageDeviationNs = 0;
+uint64_t reportDomainId = 42;
+uint64_t reportDomainCounter = 1;
 unsigned nativeSubmissions = 0;
 uint32_t nativeCapacity = 1;
 
@@ -83,7 +87,7 @@ VKAPI_ATTR VkResult VKAPI_CALL calibrate(VkDevice, uint32_t count,
     const auto* clock = static_cast<const VkSwapchainCalibratedTimestampInfoEXT*>(info->pNext);
     assert(clock->swapchain == swapchain && clock->timeDomainId == 42);
     assert(clock->presentStage == VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT);
-    *deviation = 0;
+    *deviation = stageDeviationNs;
     *output = monotonicNs();
     return VK_SUCCESS;
 }
@@ -99,13 +103,17 @@ VKAPI_ATTR VkResult VKAPI_CALL scheduledPast(VkDevice, const VkPastPresentationT
 {
     assert(info->swapchain == swapchain && props->presentationTimingCount == pendingTokens.size());
     props->presentationTimingCount = nativeComplete ? pendingTokens.size() : 0;
+    props->timeDomainsCounter = reportDomainCounter;
     if (nativeComplete) {
         for (size_t i = 0; i < pendingTokens.size(); ++i) {
             auto& timing = props->pPresentationTimings[i];
             assert(timing.presentStageCount == 1 && timing.pPresentStages);
             timing.presentId = pendingTokens[i];
             timing.reportComplete = VK_TRUE;
-            timing.pPresentStages[0] = {VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT, 0};
+            timing.timeDomain = stageLocal ? VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT :
+                VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+            timing.timeDomainId = reportDomainId;
+            timing.pPresentStages[0] = {VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT, nativePixelOut};
         }
         pendingTokens.clear();
         nativeComplete = false;
@@ -228,7 +236,7 @@ int main()
     assert(first.submissionIdValid && first.submissionId == 10 && !first.latchSampleValid);
     auto second = frame(20);
     assert(second.latchSampleValid && second.latchSubmissionId == 20);
-    assert(second.latchTimeKind == Vrr13::PresentationTimeKind::DisplayEvent);
+    assert(second.latchTimeKind == Vrr13::PresentationTimeKind::DisplayEstimate);
     assert(second.latchTimeUs <= LiGetMicroseconds() && LiGetMicroseconds() - second.latchTimeUs < 10000);
     assert(second.presentationUncertaintyUs <= 500);
     // Existing extensions and semaphore waits must survive the timing tag.
@@ -277,7 +285,7 @@ int main()
     nativeSurfaceSupported = false;
     assert(!VulkanTiming::supportsScheduling(instanceProc, instance, VK_NULL_HANDLE, VK_NULL_HANDLE));
     VulkanTiming scheduled;
-    assert(scheduled.initializeScheduled(device));
+    assert(scheduled.initializeScheduled(device, false, true));
     auto create = reinterpret_cast<PFN_vkCreateSwapchainKHR>(getDevice(device, "vkCreateSwapchainKHR"));
     auto destroyChain = reinterpret_cast<PFN_vkDestroySwapchainKHR>(getDevice(device, "vkDestroySwapchainKHR"));
     VkSwapchainCreateInfoKHR createInfo{};
@@ -334,6 +342,53 @@ int main()
     assert(nativeTarget <= (gamescopeTarget + 100000) * 1000 + 500000);
     scheduled.finish(native);
     assert(native.presented && native.nativeTargetUs == gamescopeTarget);
+    const auto predictionNs = monotonicNs() + 4000000;
+    nativePixelOut = predictionNs;
+    nativeComplete = true;
+    assert(scheduled.slotAvailable() && scheduled.statistics().returned == 2);
+    assert(!native.latchSampleValid);
+    scheduled.begin(410);
+    assert(submit(queue, &info) == VK_SUCCESS);
+    VrrPresentFeedback retired;
+    scheduled.finish(retired);
+    assert(retired.nativeOutstandingPresents == 1 && !retired.latchSampleValid);
+    scheduled.collectScheduledEstimate(retired);
+    assert(retired.latchSampleValid && retired.latchTimeKind == Vrr13::PresentationTimeKind::DisplayEstimate);
+    assert(retired.latchSubmissionId == 405 && retired.submissionId == 410);
+    const uint64_t predictionUs = predictionNs / 1000 - 100000;
+    assert(retired.latchTimeUs + 500 >= predictionUs && retired.latchTimeUs <= predictionUs + 500);
+    retired = {};
+    scheduled.collectScheduledEstimate(retired);
+    assert(!retired.latchSampleValid);
+
+    auto complete = [&](uint64_t timestamp, bool keepPending = false) {
+        nativePixelOut = timestamp;
+        nativeComplete = true;
+        assert(scheduled.slotAvailable()); // Invalid display data still retires the present.
+        VrrPresentFeedback discarded;
+        scheduled.collectScheduledEstimate(discarded);
+        assert(!discarded.latchSampleValid);
+        if (!keepPending) return;
+        scheduled.begin(411);
+        assert(submit(queue, &info) == VK_SUCCESS);
+        VrrPresentFeedback next;
+        scheduled.finish(next);
+        assert(next.nativeOutstandingPresents == 1);
+    };
+    complete(0, true);
+    reportDomainId = 43;
+    complete(monotonicNs() + 1000000, true);
+    reportDomainId = 42;
+    reportDomainCounter = 2;
+    complete(monotonicNs() + 1000000, true);
+    reportDomainCounter = 1;
+    stageDeviationNs = 500001;
+    complete(monotonicNs() + 1000000, true);
+    stageDeviationNs = 0;
+    scheduled.reset();
+    assert(!scheduled.slotAvailable());
+    complete(monotonicNs() + 1000000);
+    nativePixelOut = 0;
     destroyChain(device, handle, nullptr);
 
     stageLocal = false;

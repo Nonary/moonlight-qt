@@ -39,6 +39,12 @@ int main()
     static_assert(!plVkRequestsScheduledPresentation(false, true, false, true));
     static_assert(plVkRequestsScheduledPresentation(true, false, false, true));
     static_assert(!plVkRequestsScheduledPresentation(true, false, true, true));
+    static_assert(plVkQualifiesUltraLowLatency(true, false, true)); // Timed desktop Wayland
+    static_assert(!plVkQualifiesUltraLowLatency(false, false, true)); // Mailbox with feedback
+    static_assert(!plVkQualifiesUltraLowLatency(true, false, false)); // No compositor feedback
+    static_assert(plVkQualifiesUltraLowLatency(true, true, false)); // Timed Gamescope WSI
+    static_assert(!plVkQualifiesUltraLowLatency(false, true, false)); // Ordinary Gamescope FIFO
+    static_assert(!plVkQualifiesUltraLowLatency(false, false, false)); // Other backends
     using Surface = PlVkVrrSurface;
     constexpr auto fifo = VK_PRESENT_MODE_FIFO_KHR;
     constexpr auto mailbox = VK_PRESENT_MODE_MAILBOX_KHR;

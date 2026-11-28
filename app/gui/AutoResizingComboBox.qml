@@ -9,18 +9,19 @@ import SdlGamepadKeyNavigation 1.0
 ComboBox {
     id: control
     property var settingsRowHost: null
+    readonly property bool desktop: !!settingsRowHost && settingsRowHost.desktop === true
     property bool previousNavigationMode: false
     function openSettingsEditor(row) { forceActiveFocus(); popup.open() }
     readonly property bool rowHosted: parent && parent.parent && typeof parent.parent.labelItem !== "undefined"
-    implicitHeight: Style.px(48, Window.window)
+    implicitHeight: desktop ? 38 : Style.px(48, Window.window)
     displayText: settingsRowHost ? currentText.replace(/\s*\(Recommended\)/, "") : currentText
     leftPadding: Style.px(16, Window.window)
     rightPadding: Style.px(40, Window.window)
     topPadding: 0; bottomPadding: 0
     font.family: "Inter"
     font.pixelSize: Style.typeSize("body", Window.window)
-    background: Rectangle { color: control.activeFocus ? Style.raised : "transparent"; radius: Style.px(6, control.Window.window); ConsoleFocus { focused: control.activeFocus && !control.rowHosted; radius: parent.radius } }
-    contentItem: ConsoleText { text: control.displayText; horizontalAlignment: control.settingsRowHost ? Text.AlignRight : Text.AlignLeft; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight; color: control.enabled ? Style.text : Style.disabled }
+    background: Rectangle { border.color: control.desktop ? "#4a5361" : "transparent"; color: control.desktop ? "#282d35" : control.activeFocus ? Style.raised : "transparent"; radius: Style.px(6, control.Window.window); ConsoleFocus { focused: control.activeFocus && !control.rowHosted; radius: parent.radius } }
+    contentItem: ConsoleText { font.pixelSize: control.desktop ? 15 : Style.typeSize("body", control.Window.window); text: control.displayText; horizontalAlignment: control.settingsRowHost && !control.desktop ? Text.AlignRight : Text.AlignLeft; verticalAlignment: Text.AlignVCenter; leftPadding: control.desktop ? 4 : 0; elide: Text.ElideRight; color: control.enabled ? Style.text : Style.disabled }
     indicator: Canvas {
         x: control.width - width - Style.px(16, control.Window.window); y: (control.height-height)/2
         width: Style.px(12, control.Window.window); height: Style.px(8, control.Window.window)

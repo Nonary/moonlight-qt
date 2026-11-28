@@ -661,13 +661,30 @@ void testCaptureLatency()
     submission.submissionUs = 1010000;
     latency.record(submission, 991000, 1000, 200, 0);
 
+    using Vrr13::PresentationTimeKind;
     const auto estimate = latency.stats(1020000);
-    assert(estimate.valid && !estimate.display && estimate.medianUs == 14000);
+    assert(estimate.valid && estimate.displayKind == PresentationTimeKind::Unavailable && estimate.medianUs == 14000);
     assert(estimate.p95Us == 18000 && estimate.eligible == 2);
 
     TimingGraphInput display;
     display.backend = 1;
     display.displayValid = true;
+    display.displayId = 3;
+    display.displayUs = 1007000;
+    latency.record(display, 0, 0, 0, 50, PresentationTimeKind::DisplayEstimate);
+    display.displayId = 2;
+    display.displayUs = 1009000;
+    latency.record(display, 0, 0, 0, 50, PresentationTimeKind::DisplayEstimate);
+    assert(latency.stats(1020000).displayKind == PresentationTimeKind::Unavailable);
+    display.displayUs = 1024000;
+    latency.record(display, 0, 0, 0, 50, PresentationTimeKind::DisplayEstimate);
+    assert(latency.stats(1020000).displayKind == PresentationTimeKind::Unavailable);
+    const auto prediction = latency.stats(1025000);
+    assert(prediction.valid && prediction.displayKind == PresentationTimeKind::DisplayEstimate);
+    assert(prediction.displayed == 1 && prediction.eligible == 2);
+    assert(prediction.medianUs == 32000 && prediction.p95Us == 32000);
+    assert(prediction.uncertaintyUs == 250);
+
     display.displayId = 2;
     display.displayUs = 1017000;
     latency.record(display, 0, 0, 0, 50);
@@ -676,11 +693,12 @@ void testCaptureLatency()
     latency.record(display, 0, 0, 0, 70);
     latency.record(display, 0, 0, 0, 70);
 
-    const auto presented = latency.stats(1020000);
-    assert(presented.valid && presented.display && presented.displayed == 2);
+    const auto presented = latency.stats(1025000);
+    assert(presented.valid && presented.displayKind == PresentationTimeKind::DisplayEvent &&
+           presented.displayed == 2);
     assert(presented.medianUs == 25000 && presented.p95Us == 25000);
     assert(presented.uncertaintyUs == 270);
-    assert(!latency.stats(4000000).display);
+    assert(latency.stats(4000000).displayKind == PresentationTimeKind::Unavailable);
     assert(!latency.stats(7000000).valid);
     latency.clear();
     latency.record(display, 0, 0, 0, 0);

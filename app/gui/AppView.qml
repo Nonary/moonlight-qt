@@ -423,6 +423,7 @@ FocusScope {
     }
     NavigableMessageDialog {
         id: quitAppDialog
+        objectName: "quitRunningGameDialog"
         acceptText: qsTr("Quit game")
         rejectText: qsTr("Keep playing")
         property string appName : ""
@@ -437,11 +438,12 @@ FocusScope {
             var component = Qt.createComponent("QuitSegue.qml")
             var params = {"appName": appName, "quitRunningAppFn": function() { appModel.quitRunningApp() }}
             if (segueToStream) {
-                // Store the session and app name if we're going to stream after
+                // Store the launch details if we're going to stream after
                 // successfully quitting the old app.
                 params.nextAppName = nextAppName
                 var nextIndex = appModel.indexOfApp(nextAppId)
                 if (nextIndex < 0) return
+                params.nextAppArtwork = appModel.get(nextIndex).boxart
                 params.nextSession = appModel.createSessionForApp(nextIndex)
             }
             else {

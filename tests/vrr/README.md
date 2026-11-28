@@ -29,6 +29,20 @@ python3 ../../tests/vrr/check_fresh_trace_schema.py ./vrrreplay fresh.vrrtrace
 Use the actual paths to the worker and replay binaries in your build tree.
 The fixture is synthetic and does not establish live smoothness or scanout.
 
+The Linux Deck overlay fixture links the production release formatter and
+injects a capture clock. Run it from the qmake release build's `app`
+directory after building Moonlight:
+
+```sh
+tests_vrr=/absolute/path/to/moonlight-qt/tests/vrr
+make -f Makefile.Release -f "$tests_vrr/endtoend-overlay-test.mk" \
+  DEFAULT_TIMING_TEST_DIRECTORY="$tests_vrr" endtoend-overlay-test
+./endtoend-overlay-test
+```
+
+It checks the final row in compact and detailed stats, including the three
+endpoints, opt-out, and temporarily unavailable data.
+
 `tst_phasetrajectory` covers the policy-1 decode-buffer feedback regression:
 late blocking/nonblocking completion checks, cold and warm GPU estimates,
 retained startup protection, prompt real GPU stalls, actual readiness floors,

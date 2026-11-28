@@ -2477,6 +2477,21 @@ void testRefreshReferencesAreNotDisplayEvents()
     prediction.observe(second);
     expect(prediction.measured() == 1, "duplicate display events cannot inflate coverage");
 
+    // A timestamped Gamescope estimate is trace evidence only, including
+    // when replay permits historical refresh references.
+    PresentationPrediction gamescope;
+    auto estimate = second;
+    estimate.submitted = true;
+    estimate.dxgi = false;
+    estimate.timeKind = PresentationTimeKind::DisplayEstimate;
+    gamescope.observe(estimate, false);
+    expect(gamescope.measured() == 0 && gamescope.lead(estimate.observed) == 0,
+           "a Gamescope scanout estimate must never contribute measured presentation");
+    estimate.submitted = false;
+    estimate.timeKind = PresentationTimeKind::DisplayEvent;
+    gamescope.observe(estimate);
+    expect(gamescope.measured() == 1, "a real delayed event must still match its original submission");
+
     const auto session = config(100, 120);
     const auto policy = vrrTimingParametersForSession(session);
     expect(policy.playoutRequireDisplayEvents == 1,

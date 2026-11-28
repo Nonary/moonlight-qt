@@ -12,6 +12,7 @@ QtObject {
     property string unmappedGamepads: ""
     property string versionString: "Test build"
     function startAsyncLoad() {}
+    function waitForAsyncLoad() {}
 
     property bool hasDesktopEnvironment: true
     property bool hasDiscordIntegration: true
@@ -25,5 +26,6 @@ QtObject {
     function getNativeResolution(index) { return index === 0 ? Qt.rect(0, 0, 1920, 1080) : Qt.rect(0, 0, 0, 0) }
     function getSafeAreaResolution(index) { return getNativeResolution(index) }
     function getRefreshRate(index) { return index === 0 ? 120 : 0 }
-    function getUltraLowLatencyVrrFpsLimit() { return 116 }
+    property int mockUltraLowLatencyVrrFpsLimit: 116
+    function getUltraLowLatencyVrrFpsLimit() { return mockUltraLowLatencyVrrFpsLimit }
 }

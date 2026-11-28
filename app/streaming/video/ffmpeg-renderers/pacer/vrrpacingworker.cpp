@@ -367,7 +367,9 @@ int VrrPacingWorker::run()
     while (!isStopping()) {
         consumeWindowStateNotifications();
 
-        if (compositorPaced && !presentationSuspended() &&
+        const bool prepareBeforeAdmission = compositorPaced &&
+            m_Presenter->canPrepareBeforeFrameAdmission();
+        if (compositorPaced && !prepareBeforeAdmission && !presentationSuspended() &&
                 !m_Presenter->waitForFrameAdmission()) {
             continue;
         }
@@ -776,8 +778,16 @@ int VrrPacingWorker::run()
             av_frame_free(&reusableFrame);
         }
 
+        // The image can render offscreen while the previous present retires.
+        // Collect admission here so that retirement time never enters the
+        // next frame's estimate of the cost of calling Present.
+        if (prepareBeforeAdmission) {
+            while (!isStopping() && !presentationSuspended() &&
+                    !m_PendingWindowStateFlags.load() && !m_Presenter->waitForFrameAdmission()) {}
+        }
         telemetry.nativeScheduledPresentation = m_NativeScheduledPresentation;
         VrrTargetWaitResult targetWait;
+        uint64_t plannedTargetUs = decision.targetUs;
         const auto holdCadence = [&](uint64_t deadlineUs) {
             do {
                 telemetry.targetWaitEntryUs = LiGetMicroseconds();
@@ -803,12 +813,17 @@ int VrrPacingWorker::run()
                  previousPresentEntryUs && m_TimingController->hasLastSubmission() &&
                  decision.usedRtpTimestamp && !decision.rebased && !decision.phaseDiscontinuity &&
                  !externalRebaseApplied) {
-            // The controller already budgets how much input jitter to absorb.
-            // With a 60 FPS source on a 120 Hz display, even an early frame
-            // arrives after the previous call's next refresh. Pace from the
-            // buffered source timestamp and account for the work inside Present.
+            // At full refresh, let FIFO place the next ready image without
+            // carrying a missed repaint into its successors. A below-refresh
+            // Reduce judder stream can instead repay that phase over several
+            // frames. Wait for the requested recovery without adding a render
+            // readiness estimate after the image has already been prepared.
+            const bool canRecoverPhase = m_Config.smoothFrameTiming &&
+                m_Config.streamRateHz < m_Config.displayRefreshHz && decision.headroomUs != 0 &&
+                decision.trajectory.continuity;
+            plannedTargetUs = canRecoverPhase ? decision.requestedPhaseTargetUs : decision.originalTargetUs;
             const uint64_t enqueueLeadUs = positiveDifference(m_LastActualSubmissionUs, previousPresentEntryUs);
-            holdCadence(positiveDifference(decision.originalTargetUs, enqueueLeadUs));
+            holdCadence(positiveDifference(plannedTargetUs, enqueueLeadUs));
         }
         midframeWindowStateFlags =
             consumeWindowStateNotifications();
@@ -1020,6 +1035,7 @@ int VrrPacingWorker::run()
                 telemetry.renderWaitOvershootUs,
                 targetWait.schedulerDelayUs, targetWait.schedulerDelayValid);
         }
+        if (m_Telemetry) m_Presenter->collectCaptureEstimate(feedback);
         recordSubmission(frame, decision, feedback, telemetry.presentStartUs,
                          telemetry.presentEndUs,
                          telemetry);
@@ -1027,7 +1043,7 @@ int VrrPacingWorker::run()
             VrrTelemetrySample sample;
             sample.graph.submitted = feedback.presented && !feedback.cancelled;
             sample.graph.submissionUs = telemetry.submissionBoundaryUs;
-            sample.graph.targetUs = decision.targetUs;
+            sample.graph.targetUs = plannedTargetUs;
             sample.graph.sourcePeriodUs = decision.sourcePeriodUs;
             sample.graph.bufferUs = decision.playoutDelayUs;
             sample.graph.extraDelayUs = decision.plannedExtraDelayUs();
@@ -1508,12 +1524,16 @@ void VrrPacingWorker::recordSubmission(
         event.idValid = observation.idValid;
         event.submissionId = observation.id;
         event.submissionUs = observation.submission;
+        // This input goes only to the capture HUD. Predictions can be a little
+        // ahead of the poll; the HUD waits until the estimated time has passed.
         event.displayValid = observation.sampleValid &&
-            observation.sampleTime <= observation.observed &&
-            observation.timeKind == Vrr13::PresentationTimeKind::DisplayEvent;
+            (observation.timeKind == Vrr13::PresentationTimeKind::DisplayEstimate ||
+             (observation.timeKind == Vrr13::PresentationTimeKind::DisplayEvent &&
+              observation.sampleTime <= observation.observed));
         event.displayId = observation.sampleId;
         event.displayUs = observation.sampleTime;
-        m_Telemetry->recordCapturePresentation(event, frame.captureStartHostUs(), observation.uncertainty);
+        m_Telemetry->recordCapturePresentation(event, frame.captureStartHostUs(), observation.uncertainty,
+                                               observation.timeKind);
     }
 }
 

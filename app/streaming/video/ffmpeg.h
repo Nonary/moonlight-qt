@@ -64,6 +64,7 @@ private:
     bool finishRenderInitialization(PDECODER_PARAMETERS params);
 
     void stringifyVideoStats(VIDEO_STATS& stats, char* output, int length, bool detailed = false);
+    void stringifyVideoStatsBody(VIDEO_STATS& stats, char* output, int length, bool detailed);
 
     void logVideoStats(VIDEO_STATS& stats, const char* title);
 

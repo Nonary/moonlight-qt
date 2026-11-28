@@ -8,12 +8,17 @@ import "ConsoleKeyboardService.js" as Keyboard
 SpinBox {
     id: control
     property var settingsRowHost: null
+    readonly property bool desktopControl: !!settingsRowHost && settingsRowHost.desktop === true
+    readonly property bool desktopEditing: desktopControl && (activeFocus || contentItem.activeFocus)
+    // The VRR spin boxes install controller arrows on both the outer item and
+    // its text input. Leave cursor motion and stepping to Qt in the desktop form.
+    Keys.enabled: !desktopControl
     signal settingsCommitted(real newValue)
     function openSettingsEditor(row) { row.settingsNavigation.openValueEditor(row, control, false) }
     implicitHeight: Style.px(48, Window.window)
     font.family: "Inter"
     font.pixelSize: Style.typeSize("body", Window.window)
-    readonly property bool rowBrowsing: !!settingsRowHost && !!settingsRowHost.settingsNavigation
+    readonly property bool rowBrowsing: !!settingsRowHost && !!settingsRowHost.settingsNavigation && !settingsRowHost.desktop
     up.indicator.opacity: rowBrowsing ? 0 : 1
     down.indicator.opacity: rowBrowsing ? 0 : 1
     background: Rectangle { color: control.rowBrowsing ? "transparent" : Style.control; radius: Style.px(6, control.Window.window) }
@@ -38,6 +43,7 @@ SpinBox {
     Component.onCompleted: {
         contentItem.opacity = Qt.binding(function() { return control.rowBrowsing ? 0 : 1 })
         contentItem.enabled = Qt.binding(function() { return !control.rowBrowsing })
+        contentItem.Keys.enabled = Qt.binding(function() { return !control.desktopControl })
         contentItem.Keys.priority = Keys.BeforeItem
         contentItem.Keys.pressed.connect(controllerEntry)
     }

@@ -102,7 +102,10 @@ bool StreamUtils::ultraLowLatencyVrrPlatformSupported()
     return qgetenv("MOONLIGHT_VRR_COMPOSITION") != "0" && qgetenv("D3D11VA_ENABLED") != "0" &&
            D3D11CompositionPresenter::runtimeSupported();
 #elif defined(Q_OS_LINUX) && defined(HAVE_LIBPLACEBO_VULKAN)
-    if (!qgetenv("XDG_CURRENT_DESKTOP").toLower().split(':').contains("gamescope")) return false;
+    if (!qgetenv("XDG_CURRENT_DESKTOP").toLower().split(':').contains("gamescope")) {
+        const char* driver = SDL_GetCurrentVideoDriver();
+        return driver && SDL_strcmp(driver, "wayland") == 0;
+    }
 
     // Flatpak's /etc describes its runtime. Prefer the host OS identification.
     const QString hostRelease = QStringLiteral("/run/host/os-release");

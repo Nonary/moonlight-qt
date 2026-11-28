@@ -5,7 +5,7 @@ correction, with VRR18 interval feedback revision 21 and worker Reduce judder
 mode 9, built on the full-refresh buffer policy in `b88a77ff`.
 Buffer growth uses delivery and decode readiness at both ends of an interval.
 Windows uses DXGI at full refresh. Ultra Low Latency VRR uses qualified
-Windows Composition or SteamOS Gaming Mode presentation and retains the
+Windows Composition, SteamOS Gaming Mode, or desktop Wayland presentation and retains the
 adaptive buffer configured in the VRR timing profile.
 The opt-in Windows Composition gap refresh uses first-packet RTP timing and
 verified independent-flip feedback as described in section 10.4.
@@ -101,8 +101,14 @@ They are related observations, not interchangeable timestamps.
 The VRR stats can also report the age of the same frame from host capture to
 an OS display event. The host negotiates separate capture-start metadata and
 the client maps the host monotonic clock into the presentation clock using
-periodic four-timestamp probes. The HUD reports a labeled capture-to-submit
-estimate when display events are unavailable. Neither measurement drives pacing.
+periodic four-timestamp probes. Capture timing is requested by default
+when the host advertises v1 and uses encrypted ENet control.
+`MOONLIGHT_CAPTURE_TIMING=0` opts a launch out. The final **End-to-End Latency
+(estimate)** row identifies its endpoint. It prioritizes measured scanout,
+followed by frame-matched and clock-correlated Gamescope predicted scanout,
+and then submission. The clock
+uncertainty field measures alignment. Pacing uses its own readiness and
+submission observations.
 
 ## 2. Source map and reading order
 
@@ -159,7 +165,8 @@ VRR and V-sync enabled also offers a low-latency FPS preset at
 buffer under the selected VRR timing profile.
 
 Ultra Low Latency VRR limits the request to the near-refresh rate on supported
-Windows 11 Composition and SteamOS 3.10 or later Gaming Mode surfaces. At
+Windows 11 Composition, SteamOS 3.10 or later Gaming Mode, and desktop Wayland
+surfaces. At
 120, 144, and 288 Hz the native limits are 116, 138, and 264 FPS. Unsupported
 setups use the five-sixths limits (100, 120, and 240 FPS). The picker shows a
 ceiling across available outputs. Session
@@ -1689,11 +1696,12 @@ selected for the surface at startup: Mailbox on ordinary Wayland, Immediate on
 X11/KMSDRM, and Immediate on Gamescope. Gamescope additionally tries Mailbox
 when the dormant SteamOS experiment is enabled, according to exposed surface
 capabilities.
-Ultra Low Latency VRR requires SteamOS 3.10 or later in Gaming Mode and
-probes a timed FIFO swapchain on the actual Gamescope WSI surface before rate
-negotiation. Playback enables scheduled Vulkan presentation when that probe
-succeeds. An unavailable timed swapchain selects the five-sixths rate cap and
-ordinary renderer policy during negotiation.
+On Linux, Ultra Low Latency VRR probes a timed Vulkan FIFO swapchain before
+rate negotiation on SteamOS 3.10 or later Gamescope WSI or on desktop Wayland.
+Desktop Wayland also requires per-surface compositor feedback for frame
+admission. Playback enables scheduled Vulkan presentation when the probe
+succeeds. If qualification fails, negotiation uses the five-sixths cap and
+ordinary renderer policy.
 
 The same timed FIFO presenter can be requested independently for experiments
 with `MOONLIGHT_VRR_VULKAN_SCHEDULED=1`. It requires headers with `VK_EXT_present_timing`, enabled device
@@ -1713,6 +1721,9 @@ cover that commit and two already painted frames in KWin's display pipeline.
 Completed and discarded records retire by present ID in a single batch. The
 Gamescope path admits one present until its matching terminal timing record.
 SteamOS 3.10.1 reports the commit latch and predicted scanout in that record.
+The capture HUD can use the pixel-out estimate after matching the native
+present ID and correlating the stage-local clock. The timing graph and
+display interval score accept measured events only.
 Gamescope in Ultra Low Latency mode or at full refresh bounds its completion polling to 125 µs sleeps around
 the expected return, based on the previous retirement and the display period.
 Outside that window it can sleep up to 1 ms. Only a matching record opens the slot.

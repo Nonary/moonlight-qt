@@ -79,6 +79,8 @@ public:
     bool supportsScheduledPresentation() const override;
     VrrCompositorCadence compositorCadence() const override;
     bool waitForFrameAdmission() override;
+    void collectCaptureEstimate(VrrPresentFeedback& feedback) override;
+    bool canPrepareBeforeFrameAdmission() const override;
     bool keepsNewestQueuedFrame() const override { return supportsScheduledPresentation(); }
     virtual uint64_t waitForDecode(AVFrame* frame) override;
     std::shared_ptr<VrrPreparedFrame> queueFramePreparation(AVFrame*, uint64_t) override;
@@ -223,6 +225,7 @@ private:
     bool m_DeferredAcquireEnabled = false;
     bool m_WaylandFullRefreshPresent = false;
     uint64_t m_GamescopeRefreshPeriodUs = 0;
+    bool m_PrepareDuringGamescopePresent = false;
     uint64_t m_LastGamescopeRetirementUs = 0;
     bool m_DeferredTemplateValid = false;
     pl_swapchain_frame m_DeferredTemplate = {};

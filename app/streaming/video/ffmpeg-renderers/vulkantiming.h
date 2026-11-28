@@ -24,10 +24,12 @@ public:
 #ifdef VK_EXT_present_timing
     static bool supportsScheduling(PFN_vkGetInstanceProcAddr, VkInstance,
                                    VkPhysicalDevice, VkSurfaceKHR);
-    bool initializeScheduled(VkDevice device, bool waylandFramePacing = false);
+    bool initializeScheduled(VkDevice device, bool waylandFramePacing = false,
+                             bool gamescopePrediction = false);
     bool scheduled() const { return m_GetScheduledTimings != nullptr; }
     bool swapchainTimed() const { return m_Swapchain != VK_NULL_HANDLE && m_TimingConfigured; }
     bool slotAvailable(uint64_t paintedId = 0);
+    void collectScheduledEstimate(VrrPresentFeedback& feedback);
     uint64_t pendingSinceUs() const { return m_ScheduledPresents.empty() ? 0 : m_ScheduledPresents.front().submitted; }
 #endif
 private:
@@ -57,7 +59,13 @@ private:
     PFN_vkGetCalibratedTimestampsKHR m_GetCalibratedTimestamps = nullptr;
     uint64_t m_TimeDomainId = 0;
     VkTimeDomainKHR m_TimeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
+    bool sampleStageClock(uint64_t& nativeNs, uint64_t& deviationNs) const;
     uint64_t targetInSwapchainClock(uint64_t);
+    struct ScheduledEstimate { uint64_t id, submittedUs, pixelOutNs; };
+    ScheduledEstimate m_ScheduledEstimate{};
+    uint64_t m_TimeDomainsCounter = 0;
+    uint64_t m_EstimateAfterToken = 0;
+    bool m_GamescopePrediction = false;
     struct ScheduledPresent { uint64_t token, id, submitted; };
     std::deque<ScheduledPresent> m_ScheduledPresents;
     bool m_TimingConfigured = false, m_WaylandFramePacing = false;

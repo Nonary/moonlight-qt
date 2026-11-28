@@ -1,3 +1,4 @@
+#include <CaptureClock.h>
 #include <Limelight.h>
 #include "ffmpeg.h"
 #include "performancestats.h"
@@ -1225,6 +1226,50 @@ void FFmpegVideoDecoder::finalizeActiveVideoStats()
 
 void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, int length, bool detailed)
 {
+    if (length <= 0) return;
+    if (!m_Pacer || !m_Pacer->captureLatencyRequested()) {
+        stringifyVideoStatsBody(stats, output, length, detailed);
+        return;
+    }
+
+    constexpr auto label = "End-to-End Latency (estimate)";
+    char footer[256];
+    int footerLength;
+    if (!captureTimingRequested()) {
+        footerLength = snprintf(footer, sizeof(footer), "%s: disabled\n", label);
+    }
+    else {
+        const auto capture = m_Pacer->captureLatencyStats();
+        if (!capture.valid) {
+            footerLength = snprintf(footer, sizeof(footer), "%s: unavailable\n", label);
+        }
+        else {
+            using Vrr13::PresentationTimeKind;
+            const char* endpoint = "submit only";
+            if (capture.displayKind == PresentationTimeKind::DisplayEvent) endpoint = "measured scanout";
+            if (capture.displayKind == PresentationTimeKind::DisplayEstimate) endpoint = "Gamescope predicted scanout";
+            footerLength = snprintf(footer, sizeof(footer),
+                "%s: %.1f / %.1f ms (%s, median / p95, clock ±%.1f ms, coverage %.0f%%)\n",
+                label, capture.medianUs / 1000.0, capture.p95Us / 1000.0, endpoint,
+                capture.uncertaintyUs / 1000.0, 100.0 * capture.displayed / capture.eligible);
+        }
+    }
+
+    if (footerLength < 0 || footerLength >= int(sizeof(footer)) || footerLength >= length) {
+        stringifyVideoStatsBody(stats, output, length, detailed);
+        return;
+    }
+
+    // Reserve the complete final row even for the detailed stats. A partial
+    // body line from truncation must never run into the latency row.
+    stringifyVideoStatsBody(stats, output, length - footerLength, detailed);
+    const char* newline = strrchr(output, '\n');
+    char* end = newline ? output + (newline - output) + 1 : output;
+    memcpy(end, footer, footerLength + 1);
+}
+
+void FFmpegVideoDecoder::stringifyVideoStatsBody(VIDEO_STATS& stats, char* output, int length, bool detailed)
+{
     int offset = 0;
     const char* codecString;
     int ret;
@@ -1454,23 +1499,6 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         return;
     }
     offset += ret;
-
-    if (m_Pacer && m_Pacer->captureLatencyRequested()) {
-        const auto capture = m_Pacer->captureLatencyStats();
-        if (capture.valid) {
-            ret = snprintf(&output[offset], length - offset,
-                           "%s: %.1f / %.1f ms (median / p95, ±%.1f ms, display %.0f%%)\n",
-                           capture.display ? "Capture → display" : "Capture → submit (estimate)",
-                           capture.medianUs / 1000.0, capture.p95Us / 1000.0,
-                           capture.uncertaintyUs / 1000.0,
-                           100.0 * capture.displayed / capture.eligible);
-        }
-        else {
-            ret = snprintf(&output[offset], length - offset, "Capture → display: unavailable\n");
-        }
-        if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
-        offset += ret;
-    }
 
     if (stats.vrrTelemetryActive || stats.vrrEligibleFrames != 0 ||
             stats.vrrPacingDroppedFrames != 0 ||

@@ -680,6 +680,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
     if (requestedVrr && m_Preferences->enableVsync && m_Preferences->ultraLowLatencyVrr &&
             hasStrictRefreshRate) {
         m_PresentationSettings.ultraLowLatencyVrr =
+            !m_DockVrrUnavailable &&
             StreamUtils::supportsUltraLowLatencyVrr(window, strictRefreshRate, m_RequestedVideo.hdr);
         const int limit = VrrRatePolicy::ultraLowLatencyMaxFps(
             strictRefreshRate, m_PresentationSettings.ultraLowLatencyVrr);

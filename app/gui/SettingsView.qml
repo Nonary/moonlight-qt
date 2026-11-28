@@ -1,4 +1,4 @@
-import QtQuick 2.9
+import QtQuick 2.12
 import QtQuick.Controls 2.2
 import QtQuick.Layouts 1.3
 import QtQuick.Window 2.2
@@ -22,9 +22,58 @@ FocusScope {
     readonly property bool categoryMenuFocused: categoryList.activeFocus
     readonly property string primaryVerb: categoryMenuFocused ? qsTr("Open") : activeRow && activeRow.disabledSettingProxy === true ? qsTr("Help") : activeRow && activeRow.settingsAction === true ? qsTr("Select") : qsTr("Change")
     readonly property bool optionsAvailable: !categoryMenuFocused && !!activeRow && !!activeRow.settingsHelp
+    readonly property bool helpDialogOnly: optionsAvailable && activeRow.helpDialogOnly === true
     property var activeRow: null
     property var rememberedRows: ({})
     property var categoryRows: []
+    // Select an input presentation on entry. Opening a dropdown or moving a
+    // pointer across a controller session must not rearrange the focused form.
+    property bool desktopPreferences: false
+    readonly property int formMargin: width < 1000 ? 12 : 24
+    readonly property bool searching: desktopPreferences && searchField.text.trim().length > 0
+    property bool indexing: false
+    property var catalog: []
+    property var categoryNames: [qsTr("Video"), qsTr("Audio"), qsTr("Input & Controllers"), qsTr("Host"), qsTr("Interface"), qsTr("Diagnostics"), qsTr("Advanced"), qsTr("About")]
+    property Item hoverRow
+    function choosePresentation() {
+        desktopPreferences = SystemProperties.hasDesktopEnvironment &&
+                (SdlGamepadKeyNavigation.connectedGamepads === 0 ||
+                 (SdlGamepadKeyNavigation.inputMethod !== "controller" && SdlGamepadKeyNavigation.inputMethod !== "touch"))
+    }
+    function buildSearchCatalog() {
+        // Sample the live controls in one pass before painting. Category is
+        // unchanged; conditional sections still obey device and codec availability.
+        indexing = true
+        var rows = settingsFocusItems()
+        var result = []
+        for (var i = 0; i < rows.length; ++i) {
+            var row = rows[i].disabledSettingProxy === true ? rows[i].target : rows[i]
+            var group = row
+            while (group && group.settingsCategory === undefined) group = group.parent
+            if (group) result.push({ row: row, label: row.settingsLabel, help: row.settingsHelp,
+                                     category: group.settingsCategory, group: categoryNames[group.settingsCategory] })
+        }
+        indexing = false
+        catalog = result
+    }
+    function jumpTo(entry) {
+        searchField.clear()
+        category = entry.category
+        Qt.callLater(function() {
+            var rows = settingsFocusItems()
+            var target = rows.indexOf(entry.row) >= 0 ? entry.row : entry.row.disabledSettingsProxy
+            if (rows.indexOf(target) >= 0) {
+                focusRow(target)
+                Qt.callLater(reflowAndReveal)
+            } else focusContent()
+        })
+    }
+    function searchFocus() { searchField.forceActiveFocus(Qt.ShortcutFocusReason); searchField.selectAll() }
+    function showHelp(row) {
+        if (!row || !row.settingsHelp) return
+        helpDialog.subject = row
+        helpDialog.open()
+    }
     Material.theme: Material.Dark
     Material.accent: Style.accent
     Material.background: Style.surface
@@ -88,6 +137,7 @@ FocusScope {
         if (activeRow && (activeRow.activeFocus || activeRow.rowFocused === true)) ensureRowVisible(activeRow)
     }
     function rowFocused(row) {
+        hoverRow = null
         activeRow = row
         rememberedRows[category] = row
         ensureRowVisible(row)
@@ -133,8 +183,32 @@ FocusScope {
         })
     }
     function openValueEditor(row, control, range) { valueEditor.openFor(row, control, range) }
-    function optionsAction() { if (optionsAvailable) helpDialog.open() }
+    function optionsAction() { if (optionsAvailable) showHelp(activeRow) }
+    function tabInForm(current, backwards) {
+        var stops = []
+        var rows = settingsFocusItems()
+        for (var i = 0; i < rows.length; ++i) {
+            stops.push(rows[i])
+            if (rows[i].desktopHelpLink) stops.push(rows[i].desktopHelpLink)
+        }
+        var next = stops.indexOf(current) + (backwards ? -1 : 1)
+        if (next < 0) focusCategories()
+        else if (next >= stops.length) doneButton.forceActiveFocus(Qt.TabFocusReason)
+        else stops[next].forceActiveFocus(backwards ? Qt.BacktabFocusReason : Qt.TabFocusReason)
+    }
     function handleRowKey(row, event) {
+        if (desktopPreferences) {
+            // Inline spin editors own text and arrow keys while editing.
+            if (row.editor && row.editor.desktopEditing === true && event.key !== Qt.Key_Tab && event.key !== Qt.Key_Backtab)
+                return false
+            if (event.key === Qt.Key_F1) { showHelp(row); return true }
+            if (event.key === Qt.Key_Backtab || event.key === Qt.Key_Tab) {
+                tabInForm(row, event.key === Qt.Key_Backtab || !!(event.modifiers & Qt.ShiftModifier))
+                return true
+            } else if (event.key === Qt.Key_Escape && typeof window !== "undefined" && window.showHome) {
+                window.showHome(); return true
+            }
+        }
         switch (event.key) {
         case Qt.Key_Up: case Qt.Key_Backtab: return navigateSettings(-1)
         case Qt.Key_Down: return navigateSettings(1)
@@ -164,29 +238,36 @@ FocusScope {
         return true
     }
     StackView.onActivated: {
+        choosePresentation()
         focusCategories()
     }
     StackView.onDeactivating: {
         SdlGamepadKeyNavigation.setUiNavMode(false)
         StreamingPreferences.save()
     }
-    onCategoryChanged: { settingsPage.contentY = 0; categoryList.currentIndex = category; activeRow = null; Qt.callLater(settingsFocusItems) }
+    onCategoryChanged: { settingsPage.contentY = 0; categoryList.currentIndex = category; hoverRow = null; activeRow = null; Qt.callLater(settingsFocusItems) }
     Component.onCompleted: Qt.callLater(settingsFocusItems)
     // A sibling focus target keeps disabled controls inert while making their
     // explanation reachable. It sits outside Columns so it adds no layout gap.
     Component {
         id: unavailableRow
         Item {
+            id: unavailableEntry
             property Item target
             readonly property bool disabledSettingProxy: true
             readonly property bool settingsEntry: true
             readonly property string settingsLabel: target ? target.settingsLabel : ""
+            readonly property bool helpDialogOnly: !!target && target.helpDialogOnly === true
             readonly property string settingsHelp: qsTr("Unavailable with the current settings or device.") +
                 (target && target.settingsHelp ? "\n" + target.settingsHelp : "")
             visible: !!target && target.visible && (!target.editor || target.editor.visible) && (!target.enabled || !!target.editor && !target.editor.enabled)
-            activeFocusOnTab: visible
+            activeFocusOnTab: true
             onVisibleChanged: if (visible && target) Qt.callLater(syncGeometry)
             z: 2
+            Accessible.role: Accessible.Button
+            Accessible.name: settingsLabel
+            Accessible.description: settingsHelp
+            Accessible.onPressAction: settingsShell.showHelp(unavailableEntry)
             function syncGeometry() {
                 if (!target) return
                 var point = target.mapToItem(parent, 0, 0)
@@ -202,35 +283,116 @@ FocusScope {
     NavigableMessageDialog {
         id: helpDialog
         objectName: "settingsHelpDialog"
-        title: settingsShell.activeRow ? settingsShell.activeRow.settingsLabel : ""
-        text: settingsShell.activeRow ? settingsShell.activeRow.settingsHelp : ""
+        property Item subject
+        title: subject ? subject.settingsLabel : ""
+        text: subject ? subject.settingsHelp : ""
         standardButtons: Dialog.Close
         width: Math.min(Style.px(560, hostWindow), hostWindow ? hostWindow.width - Style.px(48, hostWindow) : 560)
-        onClosed: Qt.callLater(function() { if (settingsShell.activeRow) settingsShell.activeRow.forceActiveFocus() })
+        onClosed: Qt.callLater(function() { var rows = settingsShell.settingsFocusItems(); if (rows.indexOf(subject) >= 0) settingsShell.focusRow(subject); else settingsShell.focusContent() })
     }
     ConsoleBackdrop { anchors.fill: parent }
+    Rectangle {
+        id: form
+        visible: settingsShell.desktopPreferences
+        x: (parent.width - width) / 2
+        y: parent.height >= 650 ? 16 : 4
+        width: Math.min(1320, parent.width - 2 * settingsShell.formMargin)
+        height: parent.height - 2 * y
+        radius: 10
+        color: "#191c22"
+        border.color: "#383d47"
+    }
+    Item {
+        id: formHeader
+        visible: settingsShell.desktopPreferences
+        x: form.x + 1; y: form.y + 1
+        width: form.width - 2; height: settingsShell.height >= 650 ? 74 : 58
+        Label {
+            anchors.left: parent.left; anchors.leftMargin: 24; anchors.verticalCenter: parent.verticalCenter
+            text: qsTr("Settings"); font.pixelSize: 25; font.weight: Font.DemiBold
+        }
+        TextField {
+            id: searchField
+            objectName: "desktopSettingsSearch"
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.right: doneButton.left; anchors.rightMargin: 14
+            width: Math.min(320, parent.width * 0.35); height: 38
+            leftPadding: 12; rightPadding: 40
+            font.pixelSize: 15; verticalAlignment: Text.AlignVCenter
+            Label {
+                visible: !searchField.text
+                anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                text: qsTr("Find a setting…"); color: "#b4becb"; font.pixelSize: 15
+            }
+            Accessible.name: qsTr("Find a setting")
+            background: Rectangle { radius: 5; color: "#101319"; border.color: searchField.activeFocus ? "#9bcfff" : "#4a515c" }
+            Label {
+                anchors.right: parent.right; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter
+                visible: !searchField.text && !searchField.activeFocus
+                text: Qt.platform.os === "osx" ? "⌘F" : "Ctrl+F"; color: "#9ba4af"; font.pixelSize: 12
+            }
+            onTextChanged: {
+                if (text.trim() && !settingsShell.catalog.length) settingsShell.buildSearchCatalog()
+                else if (!text.trim()) settingsShell.catalog = []
+            }
+            Keys.onDownPressed: if (settingsShell.searching) results.step(1); else settingsShell.focusCategories()
+            Keys.onUpPressed: if (settingsShell.searching) results.step(-1)
+            Keys.onReturnPressed: if (settingsShell.searching) results.choose(); else settingsShell.focusContent()
+            Keys.onEnterPressed: if (settingsShell.searching) results.choose(); else settingsShell.focusContent()
+            Keys.onEscapePressed: { if (text.length) clear(); else settingsShell.focusCategories() }
+            Keys.onTabPressed: { if (settingsShell.searching) results.forceActiveFocus(Qt.TabFocusReason); else settingsShell.focusCategories() }
+        }
+        Button {
+            id: doneButton
+            objectName: "desktopSettingsDone"
+            anchors.right: parent.right; anchors.rightMargin: 20; anchors.verticalCenter: parent.verticalCenter
+            height: 38; width: Math.max(76, implicitWidth); text: qsTr("Done"); font.pixelSize: 15
+            background: Rectangle {
+                radius: 5; color: doneButton.down ? "#364253" : doneButton.hovered ? "#34404e" : "#292f38"
+                border.color: doneButton.visualFocus ? "#9bcfff" : "#4a515c"
+            }
+            onClicked: if (settingsShell.Window.window && settingsShell.Window.window.showHome) settingsShell.Window.window.showHome()
+            Keys.onTabPressed: settingsShell.searchFocus()
+            Keys.onBacktabPressed: if (settingsShell.searching) results.forceActiveFocus(Qt.BacktabFocusReason); else if (settingsShell.activeRow) settingsShell.focusRow(settingsShell.activeRow); else settingsShell.focusContent()
+        }
+        Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: "#383d47" }
+    }
+    Shortcut {
+        sequences: [StandardKey.Find]
+        enabled: settingsShell.visible && settingsShell.desktopPreferences && (!settingsShell.Window.window.popupHasFocus || !settingsShell.Window.window.popupHasFocus())
+        onActivated: settingsShell.searchFocus()
+    }
+    Rectangle {
+        visible: settingsShell.desktopPreferences
+        x: form.x + 1; y: formHeader.y + formHeader.height
+        width: categoryList.width + 20; height: form.y + form.height - y - 1
+        color: "#20242b"
+        Rectangle { anchors.right: parent.right; height: parent.height; width: 1; color: "#343942" }
+    }
     ListView {
         id: categoryList
         objectName: "settingsCategories"
-        anchors.left: parent.left; anchors.leftMargin: Style.px(64, settingsShell.Window.window)
-        anchors.top: parent.top; anchors.topMargin: Style.px(24, settingsShell.Window.window)
-        anchors.bottom: parent.bottom; anchors.bottomMargin: 16
-        width: Style.px(260, settingsShell.Window.window)
+        anchors.left: parent.left; anchors.leftMargin: settingsShell.desktopPreferences ? form.x + 10 : Style.px(64, settingsShell.Window.window)
+        anchors.top: parent.top; anchors.topMargin: settingsShell.desktopPreferences ? formHeader.y + formHeader.height + 14 : Style.px(24, settingsShell.Window.window)
+        anchors.bottom: parent.bottom; anchors.bottomMargin: settingsShell.desktopPreferences ? form.y + 10 : 16
+        width: settingsShell.desktopPreferences ? (settingsShell.width < 960 ? 164 : 202) : Style.px(260, settingsShell.Window.window)
         spacing: Style.px(4, settingsShell.Window.window); clip: true; focus: true
-        model: [qsTr("Video"), qsTr("Audio"), qsTr("Input & Controllers"), qsTr("Host"), qsTr("Interface"), qsTr("Diagnostics"), qsTr("Advanced"), qsTr("About")]
+        model: settingsShell.categoryNames
         currentIndex: settingsShell.category
         delegate: ConsoleListRow {
-            width: categoryList.width; height: Style.px(48, settingsShell.Window.window)
-            text: modelData; selected: settingsShell.category === index; textOnly: true; rail: true; textAlignment: Text.AlignLeft
-            Keys.onTabPressed: function(event) { categoryList.moveCategory(event.modifiers & Qt.ShiftModifier ? -1 : 1) }
-            Keys.onBacktabPressed: categoryList.moveCategory(-1)
+            width: categoryList.width
+            height: settingsShell.desktopPreferences ? 40 : Style.px(48, settingsShell.Window.window)
+            font.pixelSize: settingsShell.desktopPreferences ? 15 : Style.typeSize("body", settingsShell.Window.window)
+            text: modelData; selected: !settingsShell.searching && settingsShell.category === index; textOnly: true; rail: true; textAlignment: Text.AlignLeft
+            Keys.onTabPressed: function(event) { if (settingsShell.desktopPreferences) settingsShell.focusContent(); else categoryList.moveCategory(event.modifiers & Qt.ShiftModifier ? -1 : 1) }
+            Keys.onBacktabPressed: if (settingsShell.desktopPreferences) settingsShell.searchFocus(); else categoryList.moveCategory(-1)
             Keys.onUpPressed: categoryList.moveCategory(-1)
             Keys.onDownPressed: categoryList.moveCategory(1)
             Keys.onRightPressed: settingsShell.focusContent()
             Keys.onReturnPressed: settingsShell.focusContent()
             Keys.onEnterPressed: settingsShell.focusContent()
             Keys.onSpacePressed: settingsShell.focusContent()
-            onClicked: { settingsShell.category = index; categoryList.currentIndex = index; settingsShell.focusCategories() }
+            onClicked: { searchField.clear(); settingsShell.category = index; categoryList.currentIndex = index; settingsShell.focusCategories() }
         }
         function moveCategory(delta) {
             settingsShell.category = Math.max(0, Math.min(count - 1, settingsShell.category + delta))
@@ -239,8 +401,8 @@ FocusScope {
         }
         Keys.onUpPressed: moveCategory(-1)
         Keys.onDownPressed: moveCategory(1)
-        Keys.onBacktabPressed: moveCategory(-1)
-        Keys.onTabPressed: function(event) { moveCategory(event.modifiers & Qt.ShiftModifier ? -1 : 1) }
+        Keys.onBacktabPressed: if (settingsShell.desktopPreferences) settingsShell.searchFocus(); else moveCategory(-1)
+        Keys.onTabPressed: function(event) { if (settingsShell.desktopPreferences) settingsShell.focusContent(); else moveCategory(event.modifiers & Qt.ShiftModifier ? -1 : 1) }
         Keys.onRightPressed: settingsShell.focusContent()
         Keys.onReturnPressed: settingsShell.focusContent()
         Keys.onEnterPressed: settingsShell.focusContent()
@@ -248,13 +410,30 @@ FocusScope {
     }
     Flickable {
     id: settingsPage
+    visible: !settingsShell.searching || settingsShell.indexing
+    HoverHandler {
+        parent: settingsPage
+        onPointChanged: {
+            if (!hovered || helpDialog.visible) return
+            for (var i = 0; i < settingsShell.categoryRows.length; ++i) {
+                var row = settingsShell.categoryRows[i]
+                if (row.visible && row.contains(settingsPage.mapToItem(row, point.position.x, point.position.y))) {
+                    settingsShell.hoverRow = row
+                    return
+                }
+            }
+            settingsShell.hoverRow = null
+        }
+        onHoveredChanged: if (!hovered) settingsShell.hoverRow = null
+    }
     onWidthChanged: Qt.callLater(settingsShell.reflowAndReveal)
     onHeightChanged: Qt.callLater(settingsShell.reflowAndReveal)
-    onContentHeightChanged: Qt.callLater(settingsShell.reflowRows)
-    anchors.left: categoryList.right; anchors.leftMargin: Style.px(40, settingsShell.Window.window)
-    width: Math.min(Style.px(760, settingsShell.Window.window), settingsShell.width - x - Style.px(64, settingsShell.Window.window))
-    anchors.top: parent.top; anchors.topMargin: Style.px(24, settingsShell.Window.window)
-    anchors.bottom: helpPanel.top
+    onContentHeightChanged: Qt.callLater(settingsShell.desktopPreferences ? settingsShell.reflowAndReveal : settingsShell.reflowRows)
+    anchors.left: categoryList.right; anchors.leftMargin: settingsShell.desktopPreferences ? 28 : Style.px(40, settingsShell.Window.window)
+    width: settingsShell.desktopPreferences ? form.x + form.width - x - 20 : Math.min(Style.px(760, settingsShell.Window.window), settingsShell.width - x - Style.px(64, settingsShell.Window.window))
+    anchors.top: parent.top; anchors.topMargin: settingsShell.desktopPreferences ? formHeader.y + formHeader.height + 18 : Style.px(24, settingsShell.Window.window)
+    anchors.bottom: settingsShell.desktopPreferences ? parent.bottom : helpPanel.top
+    anchors.bottomMargin: settingsShell.desktopPreferences ? form.y + 12 : 0
     clip: true
     Keys.onTabPressed: function(event) { event.accepted = settingsShell.navigateSettings(event.modifiers & Qt.ShiftModifier ? -1 : 1) }
     Keys.onBacktabPressed: function(event) { event.accepted = settingsShell.navigateSettings(-1) }
@@ -333,7 +512,8 @@ FocusScope {
 
         ConsoleSettingsSection {
             id: basicSettingsGroupBox
-            visible: settingsShell.category === 0
+            readonly property int settingsCategory: 0
+            visible: settingsShell.indexing || settingsShell.category === settingsCategory
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
             padding: Style.px(0, settingsShell.Window.window)
             title: qsTr("Video")
@@ -351,7 +531,8 @@ FocusScope {
                     ConsoleSettingRow {
                         width: parent.width
                         objectName: "resolutionRow"
-                        description: qsTr("Setting values too high for your PC or network connection may cause lag, stuttering, or errors.")
+                        description: (settingsShell.desktopPreferences ? qsTr("Choose the image size requested from the host.") + "\n\n" : "") +
+                                     qsTr("Setting values too high for your PC or network connection may cause lag, stuttering, or errors.")
                         labelItem: ConsoleText { text: qsTr("Resolution") }
                         editor: AutoResizingComboBox {
                         property int lastIndexValue
@@ -668,6 +849,7 @@ FocusScope {
                     ConsoleSettingRow {
                         width: parent.width
                         objectName: "frameRateRow"
+                        description: settingsShell.desktopPreferences ? qsTr("Choose how many frames per second the host should send.") : ""
                         labelItem: ConsoleText { text: qsTr("Frame rate") }
                         editor: AutoResizingComboBox {
                         property int lastIndexValue
@@ -903,6 +1085,8 @@ FocusScope {
 
                 ConsoleSettingRow {
                     width: parent.width
+                    description: settingsShell.desktopPreferences ?
+                        qsTr("Automatic selects a compatible codec for the host and client.") + "\n\n" + codecComboBox.ToolTip.text : ""
                     labelItem: ConsoleText {
                     width: parent.width
                     id: resVCCTitle
@@ -978,7 +1162,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 8000
-                    ToolTip.visible: hovered && slider.pyroWave
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered && slider.pyroWave
                     ToolTip.text: qsTr("PyroWave is a GPU wavelet codec. It needs a wired connection with hundreds of Mbps to spare and a host with PyroWave support; other hosts fall back to H.264. On Linux, GPU readback and upload may limit frame rate.")
                 }
                 }
@@ -1003,7 +1187,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: enabled ?
                                       qsTr("Good for streaming desktop and text-heavy games, but not recommended for fast-paced games.")
                                     :
@@ -1101,7 +1285,7 @@ FocusScope {
 
                             ToolTip.delay: 1000
                             ToolTip.timeout: 10000
-                            ToolTip.visible: hovered
+                            ToolTip.visible: !settingsShell.desktopPreferences && hovered
                             ToolTip.text: NetworkBuffers.fixDescription
                         }
 
@@ -1875,6 +2059,12 @@ FocusScope {
                     }
                 }
 
+                Label {
+                    visible: settingsShell.desktopPreferences
+                    text: qsTr("Display & pacing")
+                    font.pixelSize: 19; font.weight: Font.DemiBold
+                    leftPadding: 12; topPadding: 22; bottomPadding: 10
+                }
                 ConsoleSettingRow {
                     visible: SystemProperties.hasDesktopEnvironment
                     width: parent.width
@@ -1969,7 +2159,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: vrrForced ?
                                       qsTr("Borderless windowed mode is required for active VRR streaming. Your saved display mode will be restored for non-VRR sessions.")
                                     :
@@ -1994,7 +2184,7 @@ FocusScope {
 
                         ToolTip.delay: 1000
                         ToolTip.timeout: 5000
-                        ToolTip.visible: hovered
+                        ToolTip.visible: !settingsShell.desktopPreferences && hovered
                         ToolTip.text: qsTr("Disabling V-Sync allows sub-frame rendering latency, but it can display visible tearing")
                     }
 
@@ -2012,8 +2202,8 @@ FocusScope {
                         }
                         ToolTip.delay: 1000
                         ToolTip.timeout: 5000
-                        ToolTip.visible: hovered
-                        ToolTip.text: qsTr("Frame pacing reduces micro-stutter by delaying frames that come in too early")
+                        ToolTip.visible: !settingsShell.desktopPreferences && hovered
+                        ToolTip.text: !enabled && settingsShell.desktopPreferences ? qsTr("Enable V-Sync to change frame pacing.") : qsTr("Frame pacing reduces micro-stutter by delaying frames that come in too early")
                     }
 
                     ConsoleCheckBox {
@@ -2032,7 +2222,7 @@ FocusScope {
 
                         ToolTip.delay: 1000
                         ToolTip.timeout: 5000
-                        ToolTip.visible: hovered
+                        ToolTip.visible: !settingsShell.desktopPreferences && hovered
                         ToolTip.text: enabled ?
                                           qsTr("VRR uses adaptive presentation in borderless fullscreen.") :
                                           qsTr("VRR requires V-Sync. Enable V-Sync to change this setting.")
@@ -2049,8 +2239,8 @@ FocusScope {
                     }
 
                     ConsoleCheckBox {
-                        id: gr10RestartCheck
                         objectName: "benqGr10VrrRestart"
+                        readonly property bool helpDialogOnly: true
                         width: parent.width
                         visible: gr10Detector.dockState !== SystemProperties.Gr10Absent
                         enabled: StreamingPreferences.enableVrr && StreamingPreferences.enableVsync
@@ -2058,18 +2248,9 @@ FocusScope {
                         font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
                         checked: StreamingPreferences.benqGr10VrrRestart
                         onToggled: StreamingPreferences.benqGr10VrrRestart = checked
-                        ToolTip.text: gr10RestartHelp.text
-                    }
-
-                    Label {
-                        id: gr10RestartHelp
-                        visible: gr10RestartCheck.visible
-                        width: parent.width
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: Style.typeSize("caption", settingsShell.Window.window)
-                        text: qsTr("The BenQ GR10 can lose VRR after a display mode switch. If this happens, Moonlight restarts the dock before streaming. USB and Ethernet briefly disconnect.") +
-                              (gr10Detector.dockState === SystemProperties.Gr10NeedsHelper ?
-                                   " " + qsTr("Install the SteamOS GR10 recovery helper to use this setting.") : "")
+                        description: qsTr("The BenQ GR10 can lose VRR after a display mode switch. If this happens, Moonlight restarts the dock before streaming. USB and Ethernet briefly disconnect.") +
+                                     (gr10Detector.dockState === SystemProperties.Gr10NeedsHelper ?
+                                          "\n\n" + qsTr("Install the SteamOS GR10 recovery helper to use this setting.") : "")
                     }
 
                     ConsoleCheckBox {
@@ -2084,9 +2265,9 @@ FocusScope {
 
                         ToolTip.delay: 1000
                         ToolTip.timeout: 10000
-                        ToolTip.visible: hovered
+                        ToolTip.visible: !settingsShell.desktopPreferences && hovered
                         ToolTip.text: qsTr("On supported systems, saves about 2 frames of presentation latency on average compared with standard VRR.") + "\n\n" +
-                                      qsTr("Uses low-latency presentation on supported Windows 11 systems and SteamOS 3.10 or later in Gaming Mode. Your VRR timing profile still controls Moonlight's adaptive buffer.") + "\n\n" +
+                                      qsTr("Uses low-latency presentation on supported Windows 11 systems, SteamOS 3.10 or later in Gaming Mode, and Linux Wayland displays that support scheduled Vulkan presentation. Your VRR timing profile still controls Moonlight's adaptive buffer.") + "\n\n" +
                                       qsTr("Caps a 120 Hz display at 116 FPS when supported. Other setups use five-sixths of the refresh rate and keep their configured buffer.") +
                                       (fpsComboBox.fpsLimit > 0 ? "\n\n" + qsTr("Current frame rate limit: %1 FPS").arg(fpsComboBox.fpsLimit) : "")
                     }
@@ -2118,7 +2299,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Adjusts when frames are shown to smooth small variations in frame timing. This can add a small amount of delay.") + "\n\n" +
                                   qsTr("Reconnect the stream after changing this setting.")
                 }
@@ -2133,7 +2314,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Holds an AMD GPU at its high-performance clocks for the whole stream so it cannot drop its clocks between frames, which can delay when the display shows a frame that was ready on time. Uses more power and reduces battery life. Has no effect if GPU clocks are already set manually.") + "\n\n" +
                                   qsTr("Takes effect at the start of the next stream.")
                 }
@@ -2161,7 +2342,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: enabled ?
                                       qsTr("The stream will be HDR-capable, but some games may require an HDR monitor on your host PC to enable HDR mode.")
                                     :
@@ -2173,7 +2354,8 @@ FocusScope {
         ConsoleSettingsSection {
             width: parent.width - (parent.leftPadding + parent.rightPadding)
             padding: Style.px(0, settingsShell.Window.window)
-            visible: settingsShell.category === 5
+            readonly property int settingsCategory: 5
+            visible: settingsShell.indexing || settingsShell.category === settingsCategory
             title: qsTr("VRR diagnostics")
             font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
 
@@ -2242,7 +2424,8 @@ FocusScope {
         ConsoleSettingsSection {
 
             id: audioSettingsGroupBox
-            visible: settingsShell.category === 1
+            readonly property int settingsCategory: 1
+            visible: settingsShell.indexing || settingsShell.category === settingsCategory
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
             padding: Style.px(0, settingsShell.Window.window)
             title: qsTr("Audio")
@@ -2312,7 +2495,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("You must restart any game currently in progress for this setting to take effect")
                 }
 
@@ -2329,7 +2512,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Mutes Moonlight's audio when you Alt+Tab out of the stream or click on a different window.")
                 }
             }
@@ -2337,7 +2520,8 @@ FocusScope {
 
         ConsoleSettingsSection {
             id: hostSettingsGroupBox
-            visible: settingsShell.category === 3
+            readonly property int settingsCategory: 3
+            visible: settingsShell.indexing || settingsShell.category === settingsCategory
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
             padding: Style.px(0, settingsShell.Window.window)
             title: qsTr("Host")
@@ -2370,7 +2554,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("This will close the app or game you are streaming when you end your stream. You will lose any unsaved progress!")
                 }
             }
@@ -2378,7 +2562,8 @@ FocusScope {
 
         ConsoleSettingsSection {
             id: uiSettingsGroupBox
-            visible: settingsShell.category === 4
+            readonly property int settingsCategory: 4
+            visible: settingsShell.indexing || settingsShell.category === settingsCategory
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
             padding: Style.px(0, settingsShell.Window.window)
             title: qsTr("Interface")
@@ -2694,7 +2879,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Updates your Discord status to display the name of the game you're streaming.")
                 }
 
@@ -2710,7 +2895,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Prevents the screensaver from starting or the display from going to sleep while streaming.")
                 }
             }
@@ -2727,7 +2912,8 @@ FocusScope {
 
         ConsoleSettingsSection {
             id: inputSettingsGroupBox
-            visible: settingsShell.category === 2
+            readonly property int settingsCategory: 2
+            visible: settingsShell.indexing || settingsShell.category === settingsCategory
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
             padding: Style.px(0, settingsShell.Window.window)
             title: qsTr("Mouse & keyboard")
@@ -2750,7 +2936,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("This enables seamless mouse control without capturing the client's mouse cursor. It is ideal for remote desktop usage but will not work in most games.") + " " +
                                   qsTr("You can toggle this while streaming using Ctrl+Alt+Shift+M.") + "\n\n" +
                                   qsTr("NOTE: Due to a bug in GeForce Experience, this option may not work properly if your host PC has multiple monitors.")
@@ -2793,7 +2979,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("When checked, the touchscreen acts like a trackpad. When unchecked, the touchscreen will directly control the mouse pointer.")
                 }
 
@@ -2825,7 +3011,8 @@ FocusScope {
 
         ConsoleSettingsSection {
             id: gamepadSettingsGroupBox
-            visible: settingsShell.category === 2
+            readonly property int settingsCategory: 2
+            visible: settingsShell.indexing || settingsShell.category === settingsCategory
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
             padding: Style.px(0, settingsShell.Window.window)
             title: qsTr("Controllers")
@@ -2847,7 +3034,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("This switches gamepads into a Nintendo-style button layout")
                 }
 
@@ -2863,7 +3050,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Forces a single gamepad to always stay connected to the host, even if no gamepads are actually connected to this PC.") + " " +
                                   qsTr("Only enable this option when streaming a game that doesn't support gamepads being connected after startup.")
                 }
@@ -2893,7 +3080,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Allows Moonlight to capture gamepad inputs even if it's not the current window in focus")
                 }
 
@@ -2910,7 +3097,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Announces a Steam Controller (2026) on a USB cable or the wireless puck to the host as a Steam Controller with both trackpads, gyro, grip sensors, battery and Steam haptics, and relays its firmware attributes.") + " " +
                                   qsTr("A client PC running Steam owns the controller first; close Steam or stop Steam Input for it.") + "\n\n" +
                                   qsTr("NEVER start a controller firmware update from Steam while streaming. The update would target the virtual controller on the host, not the real controller; it cannot succeed and may leave Steam confused. Update firmware with the controller connected directly to a PC running Steam.")
@@ -2930,7 +3117,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Asks the firmware for the raw IMU and advertises motion to the host; the host decides when it wants the reports.")
                 }
 
@@ -2948,7 +3135,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Sends the left pad as finger 0 in the left half and the right pad as finger 1 in the right half of one touchpad, which a DualShock 4 emulation splits back.") + " " +
                                   qsTr("Turn it off only for a host that understands two touchpads.")
                 }
@@ -3058,7 +3245,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("A rumble from the host is refreshed on the controller every 40 ms until this time passes, then the motors stop; choose Unlimited only when the host reliably sends a stop.")
                 }
                 }
@@ -3077,7 +3264,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Divides each stick axis by the largest deflection seen this session and clamps to the unit circle. Off by default: Steam's own calibration expects the controller's native range.")
                 }
 
@@ -3132,7 +3319,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Bluetooth LE only: added to the gain of Steam's trackpad tick and click commands, clamped to the firmware's +6 dB ceiling. USB and puck links are not affected.")
                 }
                 }
@@ -3188,7 +3375,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Bluetooth LE only: Steam's slide texture is 400 us pulses with no gain field, so this lengthens their on-time instead. Stops are untouched.")
                 }
                 }
@@ -3240,7 +3427,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Bluetooth LE only: written as the firmware's haptic master gain setting (76) with the link's own settings and cleared at stream end. Steam never writes it; if the firmware honours it, everything gets stronger and the two knobs above are unnecessary.")
                 }
                 }
@@ -3249,7 +3436,8 @@ FocusScope {
 
         ConsoleSettingsSection {
             id: advancedSettingsGroupBox
-            visible: settingsShell.category === 6
+            readonly property int settingsCategory: 6
+            visible: settingsShell.indexing || settingsShell.category === settingsCategory
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
             padding: Style.px(0, settingsShell.Window.window)
             title: qsTr("Advanced")
@@ -3381,7 +3569,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("This unlocks extremely high video bitrates for use with Sunshine hosts. It should only be used when streaming over an Ethernet LAN connection.")
                 }
 
@@ -3391,7 +3579,7 @@ FocusScope {
                     font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
                     checked: AutoUpdateChecker.notifyPrereleases
                     onClicked: AutoUpdateChecker.notifyPrereleases = checked
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Enabled by default. Turn off to receive only stable update notifications. Updates are never installed automatically.")
                 }
 
@@ -3439,7 +3627,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Display real-time stream performance information while streaming.") + "\n\n" +
                                   qsTr("You can toggle it at any time while streaming using Ctrl+Alt+Shift+S or Select+L1+R1+X.") + "\n\n" +
                                   qsTr("The performance overlay is not supported on Steam Link or Raspberry Pi.")
@@ -3457,7 +3645,7 @@ FocusScope {
 
                     ToolTip.delay: 1000
                     ToolTip.timeout: 10000
-                    ToolTip.visible: hovered
+                    ToolTip.visible: !settingsShell.desktopPreferences && hovered
                     ToolTip.text: qsTr("Shows planned, submitted and displayed frame intervals in separate lanes during VRR streaming, so you can see where a stutter starts. Variation under 1 ms is drawn flat.") + "\n\n" +
                                   qsTr("You can toggle it at any time while streaming using Ctrl+Alt+Shift+F or Select+L1+R1+Y (Triangle).")
                 }
@@ -3465,7 +3653,8 @@ FocusScope {
         }
     Column {
         id: aboutColumn
-        visible: settingsShell.category === 7
+        readonly property int settingsCategory: 7
+        visible: settingsShell.indexing || settingsShell.category === settingsCategory
         width: settingsPage.width; spacing: Style.px(16, settingsShell.Window.window)
         ConsoleText { role: "heading"; text: qsTr("About Moonlight") }
         ConsoleText { role: "secondary"; text: qsTr("Version %1").arg(SystemProperties.versionString) }
@@ -3485,8 +3674,32 @@ FocusScope {
     }
     }
 }
+    DesktopSettingsResults {
+        id: results
+        objectName: "desktopSettingsResults"
+        x: settingsPage.x; y: settingsPage.y; width: settingsPage.width; height: settingsPage.height
+        visible: settingsShell.searching
+        catalog: settingsShell.catalog
+        query: searchField.text
+        onPicked: function(entry) { settingsShell.jumpTo(entry) }
+        Keys.onUpPressed: step(-1)
+        Keys.onDownPressed: step(1)
+        Keys.onReturnPressed: choose()
+        Keys.onEnterPressed: choose()
+        Keys.onEscapePressed: { searchField.clear(); settingsShell.searchFocus() }
+        Keys.onBacktabPressed: settingsShell.searchFocus()
+        Keys.onTabPressed: doneButton.forceActiveFocus(Qt.TabFocusReason)
+    }
+    Binding {
+        target: helpText
+        property: "text"
+        when: !settingsShell.desktopPreferences && !!settingsShell.hoverRow && !!settingsShell.hoverRow.settingsHelp &&
+              settingsShell.hoverRow.helpDialogOnly !== true && (!settingsShell.hoverRow.target || settingsShell.hoverRow.target.helpDialogOnly !== true)
+        value: settingsShell.hoverRow ? settingsShell.hoverRow.settingsHelp : ""
+    }
     Rectangle {
         id: helpPanel
+        visible: !settingsShell.desktopPreferences
         x: settingsPage.x; width: settingsPage.width
         height: Style.px(112, settingsShell.Window.window)
         anchors.bottom: parent.bottom
@@ -3500,6 +3713,7 @@ FocusScope {
             ConsoleText {
                 id: helpText; width: parent.width - Style.px(16, settingsShell.Window.window); role: "secondary"; wrapMode: Text.Wrap
                 text: settingsShell.categoryMenuFocused ? qsTr("Choose a category. Press Right or Confirm to open its settings.") :
+                      settingsShell.helpDialogOnly ? "" :
                       settingsShell.activeRow && settingsShell.activeRow.settingsHelp ? settingsShell.activeRow.settingsHelp : settingsShell.activeRow && settingsShell.activeRow.settingsAction === true ? qsTr("Confirm to select this action. Press Left to return to categories.") : qsTr("Confirm to change this setting. Press Left to return to categories.")
             }
         }
@@ -3508,7 +3722,7 @@ FocusScope {
             width: overflowLabel.implicitWidth + Style.px(16, settingsShell.Window.window)
             height: overflowLabel.implicitHeight + Style.px(8, settingsShell.Window.window)
             color: Style.control; radius: Style.px(4, settingsShell.Window.window)
-            visible: settingsShell.optionsAvailable && helpText.implicitHeight > helpViewport.height
+            visible: settingsShell.optionsAvailable && (settingsShell.helpDialogOnly || helpText.implicitHeight > helpViewport.height)
             ConsoleText { id: overflowLabel; anchors.centerIn: parent; role: "caption"; text: qsTr("More help…") }
             MouseArea { anchors.fill: parent; onClicked: settingsShell.optionsAction() }
         }

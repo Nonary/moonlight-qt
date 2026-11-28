@@ -421,7 +421,7 @@ ApplicationWindow {
         }
     }
     footer: Item {
-        height: toolBar.visible ? Style.px(56, window) : 0; visible: toolBar.visible
+        height: visible ? Style.px(56, window) : 0; visible: toolBar.visible && !(stackView.currentItem instanceof SettingsView && stackView.currentItem.desktopPreferences)
         RowLayout {
             visible: !window.popupHasFocus()
             anchors.fill: parent; anchors.leftMargin: Style.px(64, window); anchors.rightMargin: Style.px(64, window)
@@ -471,7 +471,13 @@ ApplicationWindow {
     }
     Connections { target: AutoUpdateChecker; function onNotifyPrereleasesChanged() { updateButton.available = false; AutoUpdateChecker.start() } }
     Shortcut { sequences: [StandardKey.New]; onActivated: addPcDialog.open() }
-    Shortcut { sequences: [StandardKey.HelpContents]; enabled: SystemProperties.hasBrowser; onActivated: Qt.openUrlExternally("https://github.com/moonlight-stream/moonlight-docs/wiki/Setup-Guide") }
+    Shortcut {
+        sequences: [StandardKey.HelpContents]
+        readonly property var page: stackView.currentItem
+        readonly property bool contextual: page instanceof SettingsView && page.desktopPreferences
+        enabled: contextual ? page.optionsAvailable && !page.searching && !window.popupHasFocus() : SystemProperties.hasBrowser
+        onActivated: { if (contextual) page.optionsAction(); else Qt.openUrlExternally("https://github.com/moonlight-stream/moonlight-docs/wiki/Setup-Guide") }
+    }
 
     ErrorMessageDialog {
         id: noHwDecoderDialog

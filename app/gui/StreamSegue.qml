@@ -8,14 +8,19 @@ import Session 1.0
 import SystemProperties 1.0
 
 Item {
+    id: segue
     property url artwork: ""
-    ConsoleBackdrop { anchors.fill: parent; artwork: parent.artwork }
     property Session session
     property string appName
-    property string stageText : isResume ? qsTr("Resuming %1...").arg(appName) :
-                                           qsTr("Starting %1...").arg(appName)
+    property string stageText: ""
     property bool isResume : false
     property bool quitAfter : false
+    readonly property bool fullscreenLaunch: window.visibility === Window.FullScreen
+    property bool launchUiVisible: true
+    property bool spinnerReady: false
+    property string disconnectHint: ""
+
+    ConsoleBackdrop { anchors.fill: parent; artwork: segue.artwork }
 
     function stageStarting(stage)
     {
@@ -37,9 +42,7 @@ Item {
     {
         // Hide the UI contents so the user doesn't
         // see them briefly when we pop off the StackView
-        stageSpinner.visible = false
-        stageLabel.visible = false
-        hintText.visible = false
+        launchUiVisible = false
 
         // Hide the window now that streaming has begun
         window.visible = false
@@ -169,7 +172,7 @@ Item {
         // middle of the animation on Windows, which looks very
         // obviously broken.
         interval: 100
-        onTriggered: stageSpinner.visible = true
+        onTriggered: segue.spinnerReady = true
     }
 
     Timer {
@@ -192,10 +195,10 @@ Item {
 
         onLoaded: {
             // Set the hint text. We do this here rather than
-            // in the hintText control itself to synchronize
+            // in the presentation itself to synchronize
             // with Session.exec() which requires no concurrent
             // gamepad usage.
-            hintText.text = qsTr("Tip:") + " " + qsTr("Press %1 to disconnect your session").arg(SdlGamepadKeyNavigation.getConnectedGamepads() > 0 ?
+            segue.disconnectHint = qsTr("Tip:") + " " + qsTr("Press %1 to disconnect your session").arg(SdlGamepadKeyNavigation.getConnectedGamepads() > 0 ?
                                                   qsTr("Start+Select+L1+R1") : qsTr("Ctrl+Alt+Shift+Q"))
 
             // Stop GUI gamepad usage now
@@ -238,42 +241,60 @@ Item {
         sourceComponent: Item {}
     }
 
-    Column {
-        anchors.centerIn: parent; width: parent.width * 0.75
-        Image { anchors.horizontalCenter: parent.horizontalCenter; source: artwork; width: Style.px(130, Window.window); height: Style.px(175, Window.window); fillMode: Image.PreserveAspectFit }
-        Label { text: appName; width: parent.width; horizontalAlignment: Text.AlignHCenter; font.pixelSize: Style.typeSize("title", Window.window); wrapMode: Text.Wrap }
+    Loader {
+        anchors.fill: parent
+        active: segue.fullscreenLaunch && segue.launchUiVisible
+        sourceComponent: FullscreenLaunchView {
+            title: segue.appName
+            artwork: segue.artwork
+            status: segue.stageText || (segue.isResume ? qsTr("Resuming…") : qsTr("Starting…"))
+            disconnectHint: segue.disconnectHint
+            showSpinner: segue.spinnerReady
+        }
     }
-    Row {
-        anchors.horizontalCenter: parent.horizontalCenter; y: parent.height * 0.70
-        spacing: 5
 
-        BusyIndicator {
-            id: stageSpinner
-            running: visible
-            visible: false
+    Item {
+        objectName: "compactLaunchView"
+        anchors.fill: parent
+        visible: !segue.fullscreenLaunch && segue.launchUiVisible
+
+        Column {
+            anchors.centerIn: parent; width: parent.width * 0.75
+            Image { anchors.horizontalCenter: parent.horizontalCenter; source: segue.artwork; width: Style.px(130, Window.window); height: Style.px(175, Window.window); fillMode: Image.PreserveAspectFit }
+            Label { text: segue.appName; width: parent.width; horizontalAlignment: Text.AlignHCenter; font.pixelSize: Style.typeSize("title", Window.window); wrapMode: Text.Wrap }
+        }
+        Row {
+            anchors.horizontalCenter: parent.horizontalCenter; y: parent.height * 0.70
+            spacing: 5
+
+            BusyIndicator {
+                id: stageSpinner
+                running: visible
+                visible: segue.spinnerReady
+            }
+
+            Label {
+                height: stageSpinner.height
+                text: segue.stageText || (segue.isResume ? qsTr("Resuming %1...").arg(segue.appName) :
+                                                          qsTr("Starting %1...").arg(segue.appName))
+                font.pixelSize: Style.typeSize("body", Window.window)
+                verticalAlignment: Text.AlignVCenter
+
+                wrapMode: Text.Wrap
+            }
         }
 
         Label {
-            id: stageLabel
-            height: stageSpinner.height
-            text: stageText
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: Style.px(48, Window.window)
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: parent.width * 0.85
+            horizontalAlignment: Text.AlignHCenter
             font.pixelSize: Style.typeSize("body", Window.window)
             verticalAlignment: Text.AlignVCenter
+            text: segue.disconnectHint
 
             wrapMode: Text.Wrap
         }
-    }
-
-    Label {
-        id: hintText
-        anchors.bottom: parent.bottom
-        anchors.bottomMargin: Style.px(48, Window.window)
-        anchors.horizontalCenter: parent.horizontalCenter
-        width: parent.width * 0.85
-        horizontalAlignment: Text.AlignHCenter
-        font.pixelSize: Style.typeSize("body", Window.window)
-        verticalAlignment: Text.AlignVCenter
-
-        wrapMode: Text.Wrap
     }
 }

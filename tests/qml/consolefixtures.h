@@ -4,6 +4,27 @@
 
 // Deterministic host/app boundaries for exercising the production QML shell.
 // These fixtures never perform network, power, pairing, or streaming operations.
+class ConsoleSession : public QObject {
+    Q_OBJECT
+    Q_PROPERTY(QStringList launchWarnings MEMBER launchWarnings CONSTANT)
+public:
+    using QObject::QObject;
+    QStringList launchWarnings;
+    bool started = false;
+    Q_INVOKABLE bool recoverDockVrr(QObject*) { return false; }
+    Q_INVOKABLE bool initialize(QObject*) { return true; }
+    Q_INVOKABLE void start() { started = true; }
+signals:
+    void stageStarting(const QString& stage);
+    void stageFailed(const QString& stage, int errorCode, const QString& failingPorts);
+    void connectionStarted();
+    void displayLaunchError(const QString& text);
+    void quitStarting();
+    void sessionFinished(int portTestResult);
+    void readyForDeletion();
+    void dockVrrChecked(bool recovered, bool waitingForNetwork);
+};
+
 class ConsoleHostModel : public QAbstractListModel {
     Q_OBJECT
     Q_PROPERTY(QVariantList onlineHosts READ onlineHosts CONSTANT)
@@ -53,6 +74,8 @@ public:
     bool appListUnavailable=false;
     QList<int> ids = {1, 2, 3, 4, 5};
     QSet<int> hiddenIds;
+    ConsoleSession* launchSession = nullptr;
+    int runningAppId = 0;
     bool sleepAvailable() const { return false; }
     int rowCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : ids.size(); }
     QHash<int,QByteArray> roleNames() const override {
@@ -73,9 +96,9 @@ public:
     Q_INVOKABLE void initialize(QObject*,int,bool) {}
     Q_INVOKABLE int indexOfApp(int id) const { return ids.indexOf(id); }
     Q_INVOKABLE int getDirectLaunchAppIndex() const { return -1; }
-    Q_INVOKABLE int getRunningAppId() const { return 0; }
-    Q_INVOKABLE QString getRunningAppName() const { return {}; }
-    Q_INVOKABLE QObject* createSessionForApp(int) { return nullptr; }
+    Q_INVOKABLE int getRunningAppId() const { return runningAppId; }
+    Q_INVOKABLE QString getRunningAppName() const { return get(indexOfApp(runningAppId)).value("name").toString(); }
+    Q_INVOKABLE ConsoleSession* createSessionForApp(int) { return launchSession; }
     Q_INVOKABLE void requestHostSleep() {}
     Q_INVOKABLE void setAppHidden(int row,bool hidden) {
         if (row < 0 || row >= ids.size()) return;

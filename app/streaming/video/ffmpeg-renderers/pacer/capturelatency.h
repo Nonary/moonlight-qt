@@ -7,10 +7,11 @@
 #include <limits>
 
 #include "../../timinggraph.h"
+#include "vrr/presentationtiming.h"
 
 struct CaptureLatencyStats {
     bool valid = false;
-    bool display = false;
+    Vrr13::PresentationTimeKind displayKind = Vrr13::PresentationTimeKind::Unavailable;
     uint64_t medianUs = 0;
     uint64_t p95Us = 0;
     uint64_t uncertaintyUs = 0;
@@ -30,8 +31,10 @@ public:
     }
 
     void record(const Overlay::TimingGraphInput& event, uint64_t hostStartUs,
-                int64_t offsetUs, uint64_t uncertaintyUs, uint64_t displayUncertaintyUs)
+                int64_t offsetUs, uint64_t uncertaintyUs, uint64_t displayUncertaintyUs,
+                Vrr13::PresentationTimeKind displayKind = Vrr13::PresentationTimeKind::DisplayEvent)
     {
+        using Vrr13::PresentationTimeKind;
         if (event.backend && event.backend != m_Backend) {
             clear();
             m_Backend = event.backend;
@@ -50,13 +53,16 @@ public:
             if (mapCaptureTime(hostStartUs, offsetUs, captureUs) &&
                     captureUs <= event.submissionUs) {
                 m_Samples[m_Next] = {event.submissionUs, event.submissionId,
-                                     captureUs, uncertaintyUs, 0, 0, event.idValid};
+                                     captureUs, uncertaintyUs, 0, 0, event.idValid,
+                                     PresentationTimeKind::Unavailable};
                 m_Next = (m_Next + 1) % m_Samples.size();
                 m_Size = (std::min)(m_Size + 1, m_Samples.size());
             }
         }
 
-        if (!event.displayValid || !event.displayUs) {
+        if (!event.displayValid || !event.displayUs ||
+                (displayKind != PresentationTimeKind::DisplayEvent &&
+                 displayKind != PresentationTimeKind::DisplayEstimate)) {
             return;
         }
 
@@ -66,10 +72,13 @@ public:
                 break;
             }
             if (sample.idValid && sample.id == event.displayId &&
-                    !sample.displayUs && event.displayUs >= sample.submissionUs &&
+                    (!sample.displayUs || (displayKind == PresentationTimeKind::DisplayEvent &&
+                     sample.displayKind == PresentationTimeKind::DisplayEstimate)) &&
+                    event.displayUs >= sample.submissionUs &&
                     event.displayUs - sample.submissionUs < DisplayFreshnessUs) {
                 sample.displayUs = event.displayUs;
                 sample.displayUncertaintyUs = displayUncertaintyUs;
+                sample.displayKind = displayKind;
                 break;
             }
         }
@@ -77,14 +86,16 @@ public:
 
     CaptureLatencyStats stats(uint64_t nowUs) const
     {
+        using Vrr13::PresentationTimeKind;
         CaptureLatencyStats stats;
         for (size_t i = 0; i < m_Size; ++i) {
             const auto& sample = m_Samples[i];
-            if (inWindow(nowUs, sample.displayUs, DisplayFreshnessUs)) {
-                stats.display = true;
-                break;
-            }
+            if (!inWindow(nowUs, sample.displayUs, DisplayFreshnessUs)) continue;
+            stats.displayKind = sample.displayKind;
+            if (sample.displayKind == PresentationTimeKind::DisplayEvent) break;
         }
+        const bool useDisplay = stats.displayKind != PresentationTimeKind::Unavailable;
+        const auto coverageKind = useDisplay ? stats.displayKind : PresentationTimeKind::DisplayEvent;
 
         std::array<uint64_t, Capacity> sorted;
         size_t count = 0;
@@ -94,16 +105,15 @@ public:
                 continue;
             }
             ++stats.eligible;
-            const bool displayed = inWindow(nowUs, sample.displayUs, WindowUs);
+            const bool displayed = sample.displayKind == coverageKind &&
+                inWindow(nowUs, sample.displayUs, WindowUs);
             stats.displayed += displayed;
-            if (stats.display && !displayed) {
-                continue;
-            }
+            if (useDisplay && !displayed) continue;
 
-            const uint64_t endUs = stats.display ? sample.displayUs : sample.submissionUs;
+            const uint64_t endUs = useDisplay ? sample.displayUs : sample.submissionUs;
             sorted[count++] = endUs - sample.captureUs;
             stats.uncertaintyUs = (std::max)(stats.uncertaintyUs, sample.clockUncertaintyUs +
-                (stats.display ? sample.displayUncertaintyUs : 0));
+                (useDisplay ? sample.displayUncertaintyUs : 0));
         }
 
         if (count) {
@@ -148,6 +158,7 @@ private:
         uint64_t submissionUs, id, captureUs, clockUncertaintyUs;
         uint64_t displayUs, displayUncertaintyUs;
         bool idValid;
+        Vrr13::PresentationTimeKind displayKind;
     };
 
     std::array<Sample, Capacity> m_Samples;

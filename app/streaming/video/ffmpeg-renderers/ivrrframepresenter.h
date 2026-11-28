@@ -415,9 +415,16 @@ public:
     // A refresh-paced compositor provides both admission and display cadence.
     virtual VrrCompositorCadence compositorCadence() const { return VrrCompositorCadence::Disabled; }
 
-    // Called on the pacing thread before claiming a decoded frame. A bounded
-    // wait lets fresher decoder output replace the queued frame in the meantime.
+    // A presenter with an offscreen target can prepare the next frame during
+    // the preceding native present. The worker still waits for admission
+    // before entering the next presentation call.
+    virtual bool canPrepareBeforeFrameAdmission() const { return false; }
+
+    // Bounded so the worker can service shutdown and display changes.
     virtual bool waitForFrameAdmission() { return true; }
+
+    // Optional capture-overlay estimate, collected outside the measured Present call.
+    virtual void collectCaptureEstimate(VrrPresentFeedback&) {}
 
     // Retain only the newest decoded frame that the pacing worker has not claimed.
     virtual bool keepsNewestQueuedFrame() const { return false; }

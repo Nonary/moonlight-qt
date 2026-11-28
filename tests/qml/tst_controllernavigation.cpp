@@ -2,12 +2,14 @@
 #include "consolefixtures.h"
 #include "gui/recentappsmodel.h"
 #include "settings/mappingmanager.h"
+#include <QAccessible>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlComponent>
 #include <QQmlContext>
 #include <QQmlIncubator>
 #include <QPointer>
+#include <QScopedValueRollback>
 #include <QQuickWindow>
 #include <QQuickItem>
 #include <QDir>
@@ -111,6 +113,7 @@ private slots:
         qmlRegisterType<MutableConsoleHostModel>("ComputerModel",1,0,"ComputerModel");
         qmlRegisterType<ConsoleAppModel>("AppModel",1,0,"AppModel");
         qmlRegisterType<RecentAppsModel>("AppModel",1,0,"RecentAppsModel");
+        qmlRegisterUncreatableType<ConsoleSession>("Session", 1, 0, "Session", "Created by the fixture app model");
         QVERIFY(config.isValid());
         QCoreApplication::setOrganizationName("MoonlightControllerNavigationTest");
         QCoreApplication::setApplicationName("IsolatedPreferences");
@@ -208,6 +211,158 @@ private slots:
         QTRY_VERIFY(backdrop->property("settledArtwork").toUrl().isEmpty());
         QVERIFY(!blur());
     }
+    void launchPresentation_data() {
+        QTest::addColumn<QSize>("size");
+        QTest::addColumn<int>("displayMode");
+        QTest::addColumn<bool>("controllerFullscreen");
+        QTest::addColumn<int>("appId");
+        QTest::addColumn<int>("runningAppId");
+        QTest::newRow("deck") << QSize(1280, 800) << int(StreamingPreferences::UI_WINDOWED) << true << 1 << 0;
+        QTest::newRow("docked-resume") << QSize(1920, 1080) << int(StreamingPreferences::UI_FULLSCREEN) << false << 2 << 2;
+        QTest::newRow("no-artwork") << QSize(1280, 800) << int(StreamingPreferences::UI_FULLSCREEN) << false << 5 << 0;
+        QTest::newRow("switch-game") << QSize(1280, 800) << int(StreamingPreferences::UI_FULLSCREEN) << false << 3 << 1;
+        QTest::newRow("windowed") << QSize(960, 600) << int(StreamingPreferences::UI_WINDOWED) << false << 1 << 0;
+        QTest::newRow("maximized") << QSize(1280, 800) << int(StreamingPreferences::UI_MAXIMIZED) << false << 1 << 0;
+    }
+
+    void launchPresentation() {
+        QFETCH(QSize, size);
+        QFETCH(int, displayMode);
+        QFETCH(bool, controllerFullscreen);
+        QFETCH(int, appId);
+        QFETCH(int, runningAppId);
+        prefs->uiDisplayMode = static_cast<StreamingPreferences::UIDisplayMode>(displayMode);
+        prefs->uiControllerFullscreen = controllerFullscreen;
+        prefs->uiLastHostUuid.clear();
+        prefs->rememberUiSelection("host-one", appId);
+
+        QQmlApplicationEngine engine;
+        engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
+        engine.rootContext()->setContextProperty("initialView", QString("qrc:/gui/PcView.qml"));
+        engine.rootContext()->setContextProperty("runConfigChecks", false);
+        engine.load(QUrl("qrc:/gui/main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* root = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(root);
+        const bool fullscreen = controllerFullscreen || displayMode == StreamingPreferences::UI_FULLSCREEN;
+        const auto visibility = fullscreen ? QWindow::FullScreen :
+            displayMode == StreamingPreferences::UI_MAXIMIZED ? QWindow::Maximized : QWindow::Windowed;
+        QTRY_COMPARE(root->visibility(), visibility);
+        root->resize(size);
+        root->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), root);
+        navigation->notifyWindowFocus(true);
+        QVERIFY(QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired"));
+        const auto press = [&](Uint8 code) {
+            button(SDL_CONTROLLERBUTTONDOWN, code);
+            button(SDL_CONTROLLERBUTTONUP, code);
+        };
+
+        auto* add = root->findChild<QQuickItem*>("addPcTile");
+        QVERIFY(add);
+        add->forceActiveFocus();
+        press(SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+        press(SDL_CONTROLLER_BUTTON_A);
+        auto* shelf = root->findChild<QQuickItem*>("gameShelf");
+        QTRY_VERIFY(shelf && shelf->isVisible());
+        auto* page = shelf->parentItem();
+        while (page && !page->property("appModel").isValid()) page = page->parentItem();
+        QVERIFY(page);
+        auto* model = qobject_cast<ConsoleAppModel*>(page->property("appModel").value<QObject*>());
+        QVERIFY(model);
+        auto* session = new ConsoleSession(model);
+        model->launchSession = session;
+        model->runningAppId = runningAppId;
+        shelf->forceActiveFocus();
+        shelf->setProperty("currentIndex", model->indexOfApp(appId));
+        QTRY_COMPARE(page->property("selectedApp").toMap().value("appid").toInt(), appId);
+        press(SDL_CONTROLLER_BUTTON_A);
+
+        if (runningAppId && runningAppId != appId) {
+            auto* modal = root->findChild<QObject*>("quitRunningGameDialog");
+            QTRY_VERIFY(modal && modal->property("opened").toBool());
+            QVERIFY(QMetaObject::invokeMethod(modal, "accept"));
+            auto* manager = engine.singletonInstance<QObject*>("ComputerManager", "ComputerManager");
+            QVERIFY(manager);
+            QTest::qWait(150);
+            QVERIFY(QMetaObject::invokeMethod(manager, "quitAppCompleted", Q_ARG(QVariant, QVariant())));
+        }
+        QTRY_VERIFY(session->started);
+        QCOMPARE(root->visibility(), visibility);
+        auto* compact = visualItem(root->contentItem(), "compactLaunchView");
+        QVERIFY(compact);
+        QCOMPARE(compact->isVisible(), !fullscreen);
+        auto* view = visualItem(root->contentItem(), "fullscreenLaunchView");
+        QCOMPARE(view != nullptr, fullscreen);
+
+        if (fullscreen) {
+            auto* artwork = visualItem(view, "launchArtwork");
+            auto* title = visualItem(view, "launchTitle");
+            auto* status = visualItem(view, "launchStatus");
+            auto* progress = visualItem(view, "launchProgress");
+            auto* hint = visualItem(view, "launchDisconnectHint");
+            QVERIFY(artwork && title && status && progress && hint);
+            QTRY_VERIFY(progress->property("running").toBool());
+            QTRY_COMPARE(artwork->isVisible(), appId != 5);
+            if (artwork->isVisible()) {
+                const auto artHeight = artwork->property("paintedHeight").toReal();
+                QVERIFY2(artHeight > qMin(view->height() * 0.5, view->width() * 0.35),
+                         qPrintable(QString("Rendered artwork height %1 in launch view %2x%3")
+                             .arg(artHeight).arg(view->width()).arg(view->height())));
+                QVERIFY(artwork->mapToScene(QPointF(artwork->width(), 0)).x() < title->mapToScene({}).x());
+            } else {
+                QCOMPARE(title->mapToScene(QPointF(title->width() / 2, 0)).x(), view->width() / 2);
+            }
+            QCOMPARE(title->property("text").toString(), model->get(model->indexOfApp(appId)).value("name").toString());
+            QCOMPARE(status->property("text").toString(), runningAppId == appId ? QStringLiteral("Resuming…") : QStringLiteral("Starting…"));
+            QVERIFY(hint->property("text").toString().contains("Start+Select+L1+R1"));
+            auto* accessibleTitle = QAccessible::queryAccessibleInterface(title);
+            QVERIFY(accessibleTitle);
+            QCOMPARE(accessibleTitle->role(), QAccessible::Heading);
+            const QString capture = qEnvironmentVariable("MOONLIGHT_LAUNCH_CAPTURE_DIR");
+            if (!capture.isEmpty()) {
+                QCOMPARE(root->size(), size);
+                QTest::qWait(250);
+                QVERIFY(root->grabWindow().save(capture + "/moonlight-launch-" + QTest::currentDataTag() + ".png"));
+            }
+            emit session->stageStarting("RTSP handshake");
+            QCOMPARE(status->property("text").toString(), QString("Starting RTSP handshake..."));
+            auto* accessibleStatus = QAccessible::queryAccessibleInterface(status);
+            QVERIFY(accessibleStatus);
+            QCOMPARE(accessibleStatus->text(QAccessible::Name), status->property("text").toString());
+            title->setProperty("text", QString(220, QChar('W')));
+            emit session->stageStarting(QString("Negotiating a very long translated stage ").repeated(12));
+            settleLayout(engine, root);
+            QVERIFY(title->mapToScene(QPointF(0, title->height())).y() < status->mapToScene({}).y());
+            QVERIFY(status->mapToScene(QPointF(0, status->height())).y() < hint->mapToScene({}).y());
+        }
+
+        if (appId == 1 && fullscreen) {
+            emit session->stageFailed("RTSP handshake", 7, "TCP 48010");
+            emit session->sessionFinished(0);
+            emit session->readyForDeletion();
+            auto* error = root->findChild<QObject*>("streamError");
+            QTRY_VERIFY(error && error->property("opened").toBool());
+            QVERIFY(error->property("text").toString().contains("TCP 48010"));
+            root->requestActivate();
+            QTRY_COMPARE(QGuiApplication::focusWindow(), root);
+            navigation->notifyWindowFocus(true);
+            QVERIFY(QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired"));
+            press(SDL_CONTROLLER_BUTTON_B);
+            QTRY_VERIFY(!error->property("visible").toBool());
+        } else {
+            emit session->connectionStarted();
+            QTRY_VERIFY(!root->isVisible());
+            QVERIFY(!visualItem(root->contentItem(), "fullscreenLaunchView"));
+            QVERIFY(!compact->isVisible());
+            emit session->sessionFinished(0);
+            emit session->readyForDeletion();
+            QTRY_VERIFY(root->isVisible());
+        }
+        QTRY_VERIFY(shelf->hasActiveFocus());
+        prefs->uiDisplayMode = StreamingPreferences::UI_WINDOWED;
+    }
+
     void controllerFamiliesAndPrompts() {
 #if SDL_VERSION_ATLEAST(2, 0, 14)
         QQmlApplicationEngine engine;
@@ -945,6 +1100,309 @@ private slots:
         QVERIFY(all->hasActiveFocus()); QVERIFY(!page->property("detailsExpanded").toBool());
         QSettings().remove("ui/recentApps/host-one");
     }
+    void ultraLowLatencyFrameRateSetting_data() {
+        QTest::addColumn<int>("limit");
+        QTest::addColumn<int>("requestedFps");
+        QTest::addColumn<int>("shownFps");
+        QTest::newRow("qualified") << 116 << 120 << 116;
+        QTest::newRow("fallback") << 100 << 120 << 100;
+        QTest::newRow("explicit 116") << 116 << 116 << 116;
+        QTest::newRow("explicit 100") << 116 << 100 << 100;
+        QTest::newRow("explicit below fallback") << 100 << 90 << 90;
+    }
+    void ultraLowLatencyFrameRateSetting() {
+        QFETCH(int, limit);
+        QFETCH(int, requestedFps);
+        QFETCH(int, shownFps);
+        const int savedFps = prefs->fps;
+        const bool savedVrr = prefs->enableVrr;
+        const bool savedVsync = prefs->enableVsync;
+        const bool savedUltraLowLatency = prefs->ultraLowLatencyVrr;
+        prefs->setProperty("enableVsync", true);
+        prefs->setProperty("enableVrr", true);
+        prefs->setProperty("ultraLowLatencyVrr", false);
+        prefs->setProperty("fps", requestedFps);
+
+        QQmlApplicationEngine engine;
+        engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
+        const auto directory = QUrl::fromLocalFile(QStringLiteral(CONSOLE_GUI_PATH) + "/");
+        const QByteArray wrapper = R"(
+import QtQuick 2.9
+import QtQuick.Controls 2.5
+import SystemProperties 1.0
+import "." as Views
+ApplicationWindow {
+    width: 1280
+    height: 600
+    property bool pollingActive: false
+    property int probeLimit: 116
+    Component.onCompleted: SystemProperties.mockUltraLowLatencyVrrFpsLimit = probeLimit
+    onProbeLimitChanged: SystemProperties.mockUltraLowLatencyVrrFpsLimit = probeLimit
+    Item { id: stackView; property bool focusViewAfterDialog: false }
+    Views.SettingsView { anchors.fill: parent }
+}
+)";
+        engine.loadData(wrapper, directory.resolved(QUrl("FrameRateTest.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* root = engine.rootObjects().first();
+        QVERIFY(root->setProperty("probeLimit", limit));
+        auto* row = root->findChild<QObject*>("frameRateRow");
+        auto* toggle = root->findChild<QObject*>("ultraLowLatencyVrr");
+        QVERIFY(row && toggle);
+        auto* editor = row->property("editor").value<QObject*>();
+        QVERIFY(editor);
+
+        QVERIFY(QMetaObject::invokeMethod(toggle, "activateSetting"));
+        QVERIFY(prefs->ultraLowLatencyVrr);
+        QCOMPARE(editor->property("fpsLimit").toInt(), limit);
+        QVERIFY(editor->property("currentText").toString().contains(QString("%1 FPS").arg(shownFps)));
+        QCOMPARE(prefs->fps, requestedFps);
+
+        QVERIFY(QMetaObject::invokeMethod(toggle, "activateSetting"));
+        QVERIFY(!prefs->ultraLowLatencyVrr);
+        QCOMPARE(editor->property("fpsLimit").toInt(), 0);
+        QVERIFY(editor->property("currentText").toString().contains(QString("%1 FPS").arg(requestedFps)));
+        QCOMPARE(prefs->fps, requestedFps);
+
+        prefs->setProperty("fps", savedFps);
+        prefs->setProperty("enableVrr", savedVrr);
+        prefs->setProperty("enableVsync", savedVsync);
+        prefs->setProperty("ultraLowLatencyVrr", savedUltraLowLatency);
+    }
+    void settingsPresentation_data() {
+        QTest::addColumn<bool>("fullscreen");
+        QTest::addColumn<bool>("controller");
+        QTest::newRow("desktop-windowed") << false << false;
+        QTest::newRow("desktop-fullscreen") << true << false;
+        QTest::newRow("controller-fullscreen") << true << true;
+    }
+    void settingsPresentation() {
+        QFETCH(bool, fullscreen);
+        QFETCH(bool, controller);
+        QQmlApplicationEngine engine;
+        engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
+        QScopedValueRollback<QString> host(prefs->uiLastHostUuid, {});
+        QScopedValueRollback<StreamingPreferences::UIDisplayMode> mode(prefs->uiDisplayMode, fullscreen ? StreamingPreferences::UI_FULLSCREEN : StreamingPreferences::UI_WINDOWED);
+        engine.rootContext()->setContextProperty("initialView", QString("qrc:/gui/PcView.qml"));
+        engine.rootContext()->setContextProperty("runConfigChecks", false);
+        engine.load(QUrl("qrc:/gui/main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* root = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        QVERIFY(root);
+        QTRY_COMPARE(root->visibility(), fullscreen ? QWindow::FullScreen : QWindow::Windowed);
+        root->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), root);
+        auto center = [](QQuickItem* item) { return item->mapToScene(item->boundingRect().center()).toPoint(); };
+        QQuickItem* settingsButton = nullptr;
+        for (auto* item : root->findChildren<QQuickItem*>()) {
+            if (item->property("text").toString() == "Settings" &&
+                    item->metaObject()->indexOfSignal("clicked()") >= 0) {
+                settingsButton = item;
+                break;
+            }
+        }
+        QVERIFY(settingsButton);
+        auto press = [&](Uint8 code) {
+            button(SDL_CONTROLLERBUTTONDOWN, code); button(SDL_CONTROLLERBUTTONUP, code);
+            settleLayout(engine, root);
+        };
+        if (controller) {
+            navigation->notifyWindowFocus(true);
+            QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired");
+            press(SDL_CONTROLLER_BUTTON_START);
+        } else QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier, center(settingsButton));
+        auto* rail = root->findChild<QQuickItem*>("settingsCategories");
+        QTRY_VERIFY(rail && rail->hasActiveFocus());
+        settleLayout(engine, root);
+        auto* resolution = root->findChild<QQuickItem*>("resolutionRow");
+        QVERIFY(resolution);
+        auto* pane = root->findChild<QQuickItem*>("settingsContent");
+        QVERIFY(pane);
+        const auto capture = [&](const QString& state) {
+            const QString dir = qEnvironmentVariable("CONSOLE_UI_CAPTURE_DIR");
+            if (dir.isEmpty()) return;
+            QTest::qWait(250);
+            const auto shot = root->grabWindow();
+            QVERIFY(!shot.isNull());
+            QVERIFY(shot.save(dir + QString("/%1-%2-%3.png").arg(fullscreen ? "fullscreen" : "windowed").arg(root->width()).arg(state)));
+        };
+        auto* page = rail->parentItem();
+        QCOMPARE(page->property("desktopPreferences").toBool(), !controller);
+        if (controller) {
+            press(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+            QTRY_COMPARE(root->activeFocusItem(), resolution);
+            capture("controller");
+            press(SDL_CONTROLLER_BUTTON_X);
+            auto* help = root->findChild<QObject*>("settingsHelpDialog");
+            QTRY_VERIFY(help && help->property("visible").toBool());
+            press(SDL_CONTROLLER_BUTTON_B);
+            QTRY_COMPARE(root->activeFocusItem(), resolution);
+            return;
+        }
+        auto* frameRate = root->findChild<QQuickItem*>("frameRateRow");
+        auto* search = root->findChild<QQuickItem*>("desktopSettingsSearch");
+        auto* results = root->findChild<QQuickItem*>("desktopSettingsResults");
+        auto* dialog = root->findChild<QObject*>("settingsHelpDialog");
+        QVERIFY(frameRate && search && results && dialog);
+        const int savedWidth = prefs->width;
+        QTest::mouseMove(root, resolution->mapToScene(QPointF(35, 15)).toPoint());
+        QTRY_COMPARE(page->property("hoverRow").value<QQuickItem*>(), resolution);
+        auto* summary = visualItem(resolution, "inlineSettingSummary");
+        QVERIFY(summary && summary->isVisible());
+        QVERIFY(!summary->property("text").toString().isEmpty());
+        capture("hover");
+        auto* combo = resolution->property("editor").value<QQuickItem*>();
+        auto* choices = combo ? combo->property("popup").value<QObject*>() : nullptr;
+        QVERIFY(choices);
+        QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier, center(combo));
+        QTRY_VERIFY(choices->property("visible").toBool());
+        QTest::keyClick(root, Qt::Key_Escape);
+        QTRY_VERIFY(!choices->property("visible").toBool());
+        QTRY_COMPARE(root->activeFocusItem(), resolution);
+        QCOMPARE(prefs->width, savedWidth);
+        QTest::keyClick(root, Qt::Key_Left);
+        QTRY_VERIFY(rail->hasActiveFocus());
+        QTest::keyClick(root, Qt::Key_Tab);
+        QTRY_COMPARE(root->activeFocusItem(), resolution);
+        QTest::keyClick(root, Qt::Key_Down);
+        QTRY_COMPARE(root->activeFocusItem(), frameRate);
+        capture("focus");
+        QTest::keyClick(root, Qt::Key_Tab, Qt::ShiftModifier);
+        QTRY_COMPARE(root->activeFocusItem()->objectName(), QString("inlineMoreHelp"));
+        QTest::keyClick(root, Qt::Key_Tab);
+        QTRY_COMPARE(root->activeFocusItem(), frameRate);
+        auto* more = visualItem(resolution, "inlineMoreHelp");
+        QVERIFY(more && more->isVisible());
+        QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier, center(more));
+        QTRY_VERIFY(dialog->property("visible").toBool());
+        QCOMPARE(dialog->property("text").toString(), resolution->property("settingsHelp").toString());
+        capture("help");
+        QTest::keyClick(root, Qt::Key_Escape);
+        QTRY_COMPARE(root->activeFocusItem(), resolution);
+        QTest::keyClick(root, Qt::Key_F1);
+        QTRY_VERIFY(dialog->property("visible").toBool());
+        QTest::keyClick(root, Qt::Key_Escape);
+        QTRY_COMPARE(root->activeFocusItem(), resolution);
+
+        auto* bitrateRow = root->findChild<QQuickItem*>("bitrateRow");
+        QVERIFY(bitrateRow);
+        for (int i = 0; i < 5 && root->activeFocusItem() != bitrateRow; ++i)
+            QTest::keyClick(root, Qt::Key_Down);
+        QTRY_COMPARE(root->activeFocusItem(), bitrateRow);
+        auto* slider = bitrateRow->property("editor").value<QQuickItem*>();
+        QVERIFY(slider && slider->property("desktop").toBool());
+        const int bitrateBefore = prefs->bitrateKbps;
+        const bool automaticBefore = prefs->autoAdjustBitrate;
+        QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier,
+                          slider->mapToScene(QPointF(slider->width() * 0.7, slider->height() * 0.75)).toPoint());
+        QTRY_VERIFY(prefs->bitrateKbps != bitrateBefore);
+        QVERIFY(!prefs->autoAdjustBitrate);
+        prefs->setProperty("bitrateKbps", bitrateBefore);
+        prefs->setProperty("autoAdjustBitrate", automaticBefore);
+
+        QTest::keyClick(root, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(search->hasActiveFocus());
+        auto type = [&](const QByteArray& text) {
+            for (char ch : text) QTest::keyClick(root, static_cast<Qt::Key>(ch == ' ' ? Qt::Key_Space : Qt::Key_A + ch - 'a'));
+        };
+        type("frametime");
+        QTRY_VERIFY(results->isVisible() && results->property("count").toInt() > 0);
+        capture("search");
+        QTest::keyClick(root, Qt::Key_Return);
+        QTRY_COMPARE(page->property("category").toInt(), 6);
+        QTRY_COMPARE(root->activeFocusItem()->property("settingsLabel").toString(), QString("Show frametime graph while streaming"));
+        QTest::keyClick(root, Qt::Key_F1);
+        QTRY_VERIFY(dialog->property("visible").toBool());
+        QVERIFY(dialog->property("text").toString().contains("Ctrl+Alt+Shift+F"));
+        capture("full-help");
+        QTest::keyClick(root, Qt::Key_Escape);
+        QTRY_VERIFY(!dialog->property("visible").toBool());
+        QCOMPARE(prefs->width, savedWidth);
+        QTest::keyClick(root, Qt::Key_F, Qt::ControlModifier);
+        type("zzzzzz");
+        QTRY_COMPARE(results->property("count").toInt(), 0);
+        QTest::keyClick(root, Qt::Key_Escape);
+        QVERIFY(!results->isVisible());
+        QVERIFY(search->hasActiveFocus());
+        const bool vrrBefore = prefs->enableVrr;
+        prefs->setProperty("enableVrr", true);
+        type("buffer allowance");
+        QTRY_VERIFY(results->property("count").toInt() > 0);
+        QTest::keyClick(root, Qt::Key_Return);
+        auto* spin = root->findChild<QQuickItem*>("vrrBuffer");
+        QTRY_VERIFY(spin && spin->isVisible() && spin->property("desktopControl").toBool());
+        QTRY_COMPARE(root->activeFocusItem(), spin->property("settingsRowHost").value<QQuickItem*>());
+        settleLayout(engine, root);
+        auto* input = spin->property("contentItem").value<QQuickItem*>();
+        QVERIFY(input);
+        QTRY_VERIFY(pane->contains(input->mapToItem(pane, input->boundingRect().center())));
+        QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier, center(input));
+        QTRY_VERIFY(input->hasActiveFocus() || spin->hasActiveFocus());
+        const int bufferValue = spin->property("value").toInt();
+        QTest::keyClick(root, Qt::Key_Left);
+        QTest::keyClick(root, Qt::Key_Right);
+        QCOMPARE(spin->property("value").toInt(), bufferValue);
+        QTest::keyClick(root, Qt::Key_F, Qt::ControlModifier);
+        QTRY_VERIFY(search->hasActiveFocus());
+        prefs->setProperty("enableVrr", vrrBefore);
+        // Selecting a search result must show the live disabled proxy and its
+        // explanation. Merely browsing it must leave the preference untouched.
+        const bool vsyncBefore = prefs->enableVsync;
+        prefs->setProperty("enableVsync", false);
+        type("frame pacing");
+        QTRY_VERIFY(results->property("count").toInt() > 0);
+        QTest::keyClick(root, Qt::Key_Return);
+        QTRY_VERIFY(root->activeFocusItem()->property("disabledSettingProxy").toBool());
+        QVERIFY(root->activeFocusItem()->property("settingsHelp").toString().contains("V-Sync"));
+        QTest::keyClick(root, Qt::Key_Return);
+        QTRY_VERIFY(dialog->property("visible").toBool());
+        QVERIFY(!prefs->enableVsync);
+        QTest::keyClick(root, Qt::Key_Escape);
+        QTRY_VERIFY(!dialog->property("visible").toBool());
+        QTRY_VERIFY(root->activeFocusItem()->property("disabledSettingProxy").toBool());
+        prefs->setProperty("enableVsync", vsyncBefore);
+        auto* done = root->findChild<QQuickItem*>("desktopSettingsDone");
+        QVERIFY(done);
+        QTest::mouseClick(root, Qt::LeftButton, Qt::NoModifier, center(done));
+        QTRY_VERIFY(!root->findChild<QQuickItem*>("settingsCategories") || !root->findChild<QQuickItem*>("settingsCategories")->isVisible());
+    }
+
+    void benqDockUsesMoreHelp() {
+        QScopedValueRollback<bool> enabledVrr(prefs->enableVrr, true);
+        QScopedValueRollback<bool> enabledVsync(prefs->enableVsync, true);
+        QQmlApplicationEngine engine;
+        engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
+        const auto directory = QUrl::fromLocalFile(QStringLiteral(CONSOLE_GUI_PATH) + "/");
+        const QByteArray wrapper = R"(
+import QtQuick 2.9
+import QtQuick.Controls 2.5
+import SystemProperties 1.0
+import "." as Views
+ApplicationWindow {
+    visible: true; width: 1280; height: 800
+    property bool pollingActive: false
+    Component.onCompleted: SystemProperties.mockGr10State = SystemProperties.Gr10NeedsHelper
+    Item { id: stackView; property bool focusViewAfterDialog: false }
+    Views.SettingsView { objectName: "dockSettings"; anchors.fill: parent }
+}
+)";
+        engine.loadData(wrapper, directory.resolved(QUrl("DockSettingsTest.qml")));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto* root = qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+        auto* settings = root->findChild<QQuickItem*>("dockSettings");
+        auto* dock = root->findChild<QQuickItem*>("benqGr10VrrRestart");
+        auto* dialog = root->findChild<QObject*>("settingsHelpDialog");
+        QVERIFY(settings && dock && dialog);
+        QVERIFY(settings->setProperty("desktopPreferences", false));
+        root->requestActivate();
+        QTRY_VERIFY(dock->isVisible());
+        dock->forceActiveFocus();
+        QTRY_VERIFY(settings->property("helpDialogOnly").toBool());
+        QVERIFY(QMetaObject::invokeMethod(settings, "optionsAction"));
+        QTRY_VERIFY(dialog->property("visible").toBool());
+        QVERIFY(dialog->property("text").toString().contains("Install the SteamOS GR10 recovery helper"));
+    }
+
     void settingsCategoriesAndFocus() {
         QQmlApplicationEngine engine;
         engine.addImportPath(QStringLiteral(CONSOLE_MOCKS_PATH));
