@@ -20,7 +20,7 @@ constexpr uint64_t gamescopeRetirementPollUs(uint64_t nowUs, uint64_t lastRetire
     const uint64_t elapsedUs = nowUs - lastRetiredUs;
     if (elapsedUs >= refreshPeriodUs && elapsedUs - refreshPeriodUs >= coarseUs) return coarseUs;
     if (elapsedUs < refreshPeriodUs && refreshPeriodUs - elapsedUs > coarseUs + fineUs) {
-        return std::min(coarseUs, refreshPeriodUs - elapsedUs - coarseUs);
+        return (std::min)(coarseUs, refreshPeriodUs - elapsedUs - coarseUs);
     }
     return fineUs;
 }

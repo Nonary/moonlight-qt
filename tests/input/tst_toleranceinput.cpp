@@ -71,7 +71,7 @@ private slots:
     void focusedEditorConsumesWholeTap() {
         QSignalSpy edits(settings, SIGNAL(toleranceEdited(int)));
         key(QEvent::KeyPress, Qt::Key_Left);
-        QCOMPARE(value(), 750);
+        QCOMPARE(value(), 950);
         QCOMPARE(edits.count(), 1);
         key(QEvent::KeyRelease, Qt::Key_Left);
         QCOMPARE(edits.count(), 1);
@@ -82,7 +82,7 @@ private slots:
         tolerance->forceActiveFocus();
         key(QEvent::KeyPress, Qt::Key_Right, Qt::ControlModifier | Qt::ShiftModifier);
         key(QEvent::KeyRelease, Qt::Key_Right, Qt::ControlModifier | Qt::ShiftModifier);
-        QCOMPARE(value(), 1250);
+        QCOMPARE(value(), 1050);
         QCOMPARE(root->property("leakedPresses").toInt(), 0);
         QCOMPARE(root->property("leakedReleases").toInt(), 0);
     }
@@ -92,13 +92,13 @@ private slots:
             key(QEvent::KeyPress, Qt::Key_Left);
             key(QEvent::KeyRelease, Qt::Key_Left);
         }
-        QCOMPARE(value(), 250);
+        QCOMPARE(value(), 850);
         QCOMPARE(edits.count(), 3);
         // Keyboard auto-repeat is one bounded adjustment per delivered press.
         key(QEvent::KeyPress, Qt::Key_Right);
         key(QEvent::KeyPress, Qt::Key_Right, Qt::NoModifier, true);
         key(QEvent::KeyRelease, Qt::Key_Right);
-        QCOMPARE(value(), 750);
+        QCOMPARE(value(), 950);
         QCOMPARE(edits.count(), 5);
         QCOMPARE(root->property("leakedPresses").toInt(), 0);
         QCOMPARE(root->property("leakedReleases").toInt(), 0);
@@ -109,19 +109,19 @@ private slots:
         key(QEvent::KeyPress, Qt::Key_Left);
         root->forceActiveFocus();
         key(QEvent::KeyRelease, Qt::Key_Left);
-        QCOMPARE(value(), 750);
+        QCOMPARE(value(), 950);
         editor->forceActiveFocus();
         key(QEvent::KeyPress, Qt::Key_Left);
         key(QEvent::KeyRelease, Qt::Key_Left);
-        QCOMPARE(value(), 500);
+        QCOMPARE(value(), 900);
     }
     void adjustmentsStayWithinLimits() {
-        for (int i = 0; i < 20; ++i) {
+        for (int i = 0; i < 40; ++i) {
             key(QEvent::KeyPress, Qt::Key_Left);
             key(QEvent::KeyRelease, Qt::Key_Left);
         }
-        QCOMPARE(value(), 250);
-        for (int i = 0; i < 20; ++i) {
+        QCOMPARE(value(), 200);
+        for (int i = 0; i < 40; ++i) {
             key(QEvent::KeyPress, Qt::Key_Right);
             key(QEvent::KeyRelease, Qt::Key_Right);
         }
