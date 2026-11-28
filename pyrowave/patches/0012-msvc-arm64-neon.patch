@@ -1,0 +1,31 @@
+Take the NEON paths when building with MSVC for ARM64.
+
+MSVC on ARM64 defines _M_ARM64 but neither __ARM_NEON nor __aarch64__, so
+simd_headers.hpp included no SIMD header and simd.hpp stopped at
+#error "Implement me." on Windows arm64. MSVC ships arm64_neon.h with the
+standard intrinsic names (vld1q_f32, vpaddq_f32, ...), so include it and
+define the two macros the vendored math code tests for. clang-cl defines
+both itself and keeps using arm_neon.h. Needed for the PyroWave decoder in
+the Windows arm64 build; no change for x86 or Linux.
+
+diff --git a/Granite/math/simd_headers.hpp b/Granite/math/simd_headers.hpp
+index 07dcefc3..04fbd8f3 100644
+--- a/Granite/math/simd_headers.hpp
++++ b/Granite/math/simd_headers.hpp
+@@ -45,4 +45,16 @@
+ #include <xmmintrin.h>
+ #elif defined(__ARM_NEON)
+ #include <arm_neon.h>
++#elif defined(_MSC_VER) && defined(_M_ARM64)
++// MSVC targeting ARM64 defines _M_ARM64 but neither __ARM_NEON nor __aarch64__,
++// which the NEON paths in simd.hpp and muglm.cpp test for. Its arm64_neon.h
++// provides the standard intrinsic names, so take the NEON paths there too.
++// (clang-cl defines both macros itself and is handled above.)
++#include <arm64_neon.h>
++#ifndef __ARM_NEON
++#define __ARM_NEON 1
++#endif
++#ifndef __aarch64__
++#define __aarch64__ 1
++#endif
+ #endif
