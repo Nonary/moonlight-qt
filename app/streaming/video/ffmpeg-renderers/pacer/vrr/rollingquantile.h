@@ -2,10 +2,54 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <utility>
 #include <vector>
 
 namespace Vrr13 {
+
+// Exact nearest-rank queries for the controller's short FIFO sample windows.
+// Keep the sorted view current so many reads between observations do not copy
+// and repartition the same samples. The FIFO retains eviction order.
+template<class T>
+class BoundedTimingSamples {
+public:
+    size_t size() const { return m_Ordered.size(); }
+    bool empty() const { return m_Ordered.empty(); }
+
+    void clear()
+    {
+        m_Samples.clear();
+        m_Ordered.clear();
+    }
+
+    void append(T value, size_t limit)
+    {
+        if (!limit) return;
+        if (size() == limit && m_Samples.front() == value) {
+            m_Samples.pop_front();
+            m_Samples.push_back(value);
+            return;
+        }
+        while (size() >= limit) {
+            m_Ordered.erase(std::lower_bound(m_Ordered.begin(), m_Ordered.end(), m_Samples.front()));
+            m_Samples.pop_front();
+        }
+        m_Samples.push_back(value);
+        m_Ordered.insert(std::upper_bound(m_Ordered.begin(), m_Ordered.end(), value), value);
+    }
+
+    T percentile(unsigned int requested) const
+    {
+        if (empty()) return 0;
+        const size_t rank = std::max<size_t>(1, (size() * std::min(100U, requested) + 99) / 100);
+        return m_Ordered[rank - 1];
+    }
+
+private:
+    std::deque<T> m_Samples;
+    std::vector<T> m_Ordered;
+};
 
 // Experimental exact segmented index. Bounds the ordinary shifted suffix to
 // one small block; retained values and nearest-rank semantics are unchanged.

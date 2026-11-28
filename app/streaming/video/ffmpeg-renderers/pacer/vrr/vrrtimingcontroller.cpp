@@ -88,30 +88,6 @@ uint64_t clampUnsigned(uint64_t value, uint64_t low, uint64_t high)
     return std::max(low, std::min(value, high));
 }
 
-template<typename T>
-T percentile(const std::deque<T>& values, unsigned int requestedPercentile)
-{
-    if (values.empty()) {
-        return 0;
-    }
-    std::vector<T> ordered(values.begin(), values.end());
-    const unsigned int percentileValue = std::min(100U, requestedPercentile);
-    const size_t rank = std::max<size_t>(
-        1, (ordered.size() * percentileValue + 99) / 100);
-    std::nth_element(ordered.begin(), ordered.begin() + rank - 1,
-                     ordered.end());
-    return ordered[rank - 1];
-}
-
-template<typename T>
-void appendBounded(std::deque<T>& values, T value, size_t limit)
-{
-    while (values.size() >= limit) {
-        values.pop_front();
-    }
-    values.push_back(value);
-}
-
 uint64_t intervalQualityWindowUs(const VrrTimingParameters& parameters)
 {
     return parameters.playoutReadinessWindowUs;
@@ -2586,10 +2562,10 @@ void VrrTimingController::noteSchedulerDelays(uint64_t renderDelayUs,
                                               bool targetDelayValid)
 {
     m_Pending.renderSchedulerUs = renderDelayUs;
-    appendBounded(m_RenderSchedulerDelays, renderDelayUs,
+    m_RenderSchedulerDelays.append(renderDelayUs,
                   m_Parameters.schedulerLearningSamples);
     if (targetDelayValid) {
-        appendBounded(m_TargetSchedulerDelays, targetDelayUs,
+        m_TargetSchedulerDelays.append(targetDelayUs,
                       m_Parameters.schedulerLearningSamples);
     }
     updateLearnedBudgets();
@@ -2827,7 +2803,7 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
         if (!cancelled) {
 
             if (m_Pending.cadenceEligible) {
-                appendBounded(m_ReadyOffsets, m_Pending.readyOffsetUs,
+                m_ReadyOffsets.append(m_Pending.readyOffsetUs,
                               readinessLearningSampleLimit());
             }
             if (m_Parameters.playoutReadinessFloorPerMille != 0 &&
@@ -2848,8 +2824,7 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                     m_ReadinessPrediction.observe(m_PlayoutHistory, m_Pending.prediction,
                         m_Pending.preparationDurationUs, m_Pending.renderSchedulerUs);
                 }
-                appendBounded(m_PreparationDurations,
-                              m_Pending.preparationDurationUs,
+                m_PreparationDurations.append(m_Pending.preparationDurationUs,
                               m_Parameters.preparationLearningSamples);
             }
             updateReadinessModel();
@@ -2952,13 +2927,10 @@ void VrrTimingController::updateLearnedBudgets()
 {
     if (!m_PreparationDurations.empty()) {
         m_RenderBaselineUs = std::min(
-            percentile(m_PreparationDurations,
-                       m_Parameters.renderBaselinePercentile),
+            m_PreparationDurations.percentile(m_Parameters.renderBaselinePercentile),
             m_SourcePeriodUs);
         m_RenderLeadUs = clampUnsigned(
-            saturatingAdd(percentile(
-                              m_PreparationDurations,
-                              m_Parameters.preparationPercentile),
+            saturatingAdd(m_PreparationDurations.percentile(m_Parameters.preparationPercentile),
                           m_Parameters.renderLeadSlackUs),
             renderLeadFloorUs(), renderLeadCeilingUs());
         // The p99 tail and readiness reserve share one hard policy budget.
@@ -2970,15 +2942,13 @@ void VrrTimingController::updateLearnedBudgets()
     if (!m_RenderSchedulerDelays.empty()) {
         m_RenderWakeLeadUs = std::min(
             m_Parameters.maximumRenderWakeLeadUs,
-            percentile(m_RenderSchedulerDelays,
-                       m_Parameters.schedulerPercentile));
+            m_RenderSchedulerDelays.percentile(m_Parameters.schedulerPercentile));
     }
 
     if (!m_TargetSchedulerDelays.empty()) {
         m_TargetWakeLeadUs = std::min(
             m_Parameters.maximumTargetWakeLeadUs,
-            percentile(m_TargetSchedulerDelays,
-                       m_Parameters.schedulerPercentile));
+            m_TargetSchedulerDelays.percentile(m_Parameters.schedulerPercentile));
     }
 }
 
@@ -2996,12 +2966,11 @@ void VrrTimingController::updateReadinessModel()
     // Near the display ceiling, preserve the p90 arrival tail because there is
     // too little cadence slack to absorb a late frame. Slower sources can use
     // p80 and avoid making the slowest fifth standing latency for every frame.
-    const int64_t lowUs = percentile(
-        m_ReadyOffsets, m_Parameters.readinessLowPercentile);
+    const int64_t lowUs = m_ReadyOffsets.percentile(m_Parameters.readinessLowPercentile);
     const unsigned int highPercentile = headroomUs() > m_DisplayPeriodUs ?
         m_Parameters.readinessLoosePercentile :
         m_Parameters.readinessTightPercentile;
-    const int64_t highUs = percentile(m_ReadyOffsets, highPercentile);
+    const int64_t highUs = m_ReadyOffsets.percentile(highPercentile);
     const uint64_t spreadUs = highUs > lowUs ?
         static_cast<uint64_t>(highUs - lowUs) : 0;
     const uint64_t candidateDemandUs = clampUnsigned(
@@ -3146,11 +3115,11 @@ uint64_t VrrTimingController::typicalRenderUs() const
         constexpr size_t kMinimumPreparationSamples = 8;
         if (m_PreparationDurations.size() < kMinimumPreparationSamples) return m_RenderLeadUs;
         const uint64_t periodUs = std::max(m_SourcePeriodUs, m_DisplayPeriodUs);
-        return std::clamp<uint64_t>(percentile(m_PreparationDurations, 50), 100,
+        return std::clamp<uint64_t>(m_PreparationDurations.percentile(50), 100,
                                     periodUs ? std::max<uint64_t>(periodUs, 100) : 100000);
     }
     return m_PreparationDurations.empty() ? m_RenderLeadUs :
-        std::clamp<uint64_t>(percentile(m_PreparationDurations, 50), 100, 100000);
+        std::clamp<uint64_t>(m_PreparationDurations.percentile(50), 100, 100000);
 }
 
 uint64_t VrrTimingController::recoveryHeadroomUs() const

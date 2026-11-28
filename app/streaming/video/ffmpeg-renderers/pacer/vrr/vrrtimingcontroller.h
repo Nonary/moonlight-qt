@@ -11,6 +11,7 @@
 #include "inputbuffer.h"
 #include "phasetrajectory.h"
 #include "receivedeadline.h"
+#include "rollingquantile.h"
 
 #include <cstddef>
 #include <algorithm>
@@ -939,15 +940,15 @@ private:
 
     std::deque<CadenceSample> m_CadenceSamples;
     std::deque<CadenceSample> m_RateCandidateSamples;
-    std::deque<int64_t> m_ReadyOffsets;
+    Vrr13::BoundedTimingSamples<int64_t> m_ReadyOffsets;
     // playoutReadinessFloorPerMille: (submission, ready offset) window.
     std::deque<std::pair<uint64_t, int64_t>> m_ReadinessFloorSamples;
     uint64_t m_ReadinessFloorUs = 0;
     uint64_t m_ReadinessFloorUpdatedUs = 0;
-    std::deque<uint64_t> m_PreparationDurations;
+    Vrr13::BoundedTimingSamples<uint64_t> m_PreparationDurations;
     bool m_PreparationInitialSampleSeen = false;
-    std::deque<uint64_t> m_RenderSchedulerDelays;
-    std::deque<uint64_t> m_TargetSchedulerDelays;
+    Vrr13::BoundedTimingSamples<uint64_t> m_RenderSchedulerDelays;
+    Vrr13::BoundedTimingSamples<uint64_t> m_TargetSchedulerDelays;
 
     PendingFrame m_Pending;
 };
