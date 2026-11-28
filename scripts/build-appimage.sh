@@ -65,6 +65,15 @@ pushd $BUILD_FOLDER
 make install || fail "Make install failed!"
 popd
 
+# appimagetool (bundled in linuxdeploy's appimage plugin) requires .DirIcon to
+# be a PNG; since 2026-10-30 an SVG one fails or loudly warns. linuxdeploy
+# always picks an SVG over raster icons for the AppDir root, so the AppImage
+# ships only the 256x256 PNG (rendered from app/res/moonlight.svg). The
+# scalable SVG stays in the regular make install for distribution packages.
+rm -f "$DEPLOY_FOLDER/usr/share/icons/hicolor/scalable/apps/moonlight.svg"
+install -Dm644 "$SOURCE_ROOT/app/deploy/linux/appimage/moonlight.png" \
+  "$DEPLOY_FOLDER/usr/share/icons/hicolor/256x256/apps/moonlight.png" || fail "Icon install failed!"
+
 export QML_SOURCES_PATHS=$SOURCE_ROOT/app/gui
 export QMAKE=qmake6
 export EXTRA_PLATFORM_PLUGINS='libqwayland-egl.so;libqwayland-generic.so'
