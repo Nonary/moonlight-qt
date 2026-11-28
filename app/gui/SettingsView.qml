@@ -2567,6 +2567,78 @@ FocusScope {
         }
 
         ConsoleSettingsSection {
+            id: clipboardSettingsGroupBox
+            visible: settingsShell.category === 3
+            width: (parent.width - (parent.leftPadding + parent.rightPadding))
+            padding: Style.px(0, settingsShell.Window.window)
+            title: qsTr("Clipboard Sync")
+            font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
+
+            Column {
+                anchors.fill: parent
+                spacing: 0
+
+                ConsoleCheckBox {
+                    id: clipboardSyncToHostCheck
+                    width: parent.width
+                    text: qsTr("Send copied text to the host")
+                    font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
+                    checked: StreamingPreferences.clipboardSyncToHost
+                    onCheckedChanged: {
+                        StreamingPreferences.clipboardSyncToHost = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Sends your local clipboard text to the host when the stream starts and whenever you return to the stream window. Requires a host that supports clipboard sync, such as Apollo or Vibepollo, with clipboard permissions granted to this client.") + "\n\n" +
+                                  qsTr("You can also send it at any time while streaming using Ctrl+Alt+Shift+U.")
+                }
+
+                ConsoleCheckBox {
+                    id: clipboardSyncFromHostCheck
+                    width: parent.width
+                    text: qsTr("Copy the host's clipboard text when leaving the stream window")
+                    font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
+                    visible: SystemProperties.hasDesktopEnvironment
+                    checked: StreamingPreferences.clipboardSyncFromHost
+                    onCheckedChanged: {
+                        StreamingPreferences.clipboardSyncFromHost = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Replaces your local clipboard with the host's clipboard text when you Alt+Tab out of the stream or click on a different window. Requires a host that supports clipboard sync, such as Apollo or Vibepollo, with clipboard permissions granted to this client.") + "\n\n" +
+                                  qsTr("You can also fetch it at any time while streaming using Ctrl+Alt+Shift+G.")
+                }
+
+                ConsoleSettingRow {
+                    width: parent.width
+                    labelItem: ConsoleText { text: qsTr("Max clipboard size (MB)") }
+                    description: qsTr("Clipboard text larger than this is not sent to or accepted from the host. Changes apply to the next stream.")
+                    editor: ConsoleSpinBox {
+                        id: clipboardSyncMaxSizeSpinBox
+                        objectName: "clipboardSyncMaxSize"
+                        from: 1
+                        to: 100
+                        stepSize: 1
+                        editable: true
+                        value: StreamingPreferences.clipboardSyncMaxSizeMB
+                        function commitSize(newValue) {
+                            StreamingPreferences.clipboardSyncMaxSizeMB = Math.max(from, Math.min(to, Math.round(newValue)))
+                        }
+                        onValueModified: commitSize(value)
+                        onSettingsCommitted: function(newValue) { commitSize(newValue) }
+                        Keys.onLeftPressed: function(event) { if (!settingsRowHost || !settingsRowHost.settingsNavigation || !settingsRowHost.settingsNavigation.handleRowKey(settingsRowHost, event)) commitSize(value - stepSize) }
+                        Keys.onRightPressed: function(event) { if (!settingsRowHost || !settingsRowHost.settingsNavigation || !settingsRowHost.settingsNavigation.handleRowKey(settingsRowHost, event)) commitSize(value + stepSize) }
+                        Accessible.name: qsTr("Maximum clipboard size in megabytes")
+                    }
+                }
+            }
+        }
+
+        ConsoleSettingsSection {
             id: uiSettingsGroupBox
             readonly property int settingsCategory: 4
             visible: settingsShell.indexing || settingsShell.category === settingsCategory

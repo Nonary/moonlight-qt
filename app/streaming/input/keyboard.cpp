@@ -66,6 +66,18 @@ void SdlInputHandler::performSpecialKeyCombo(KeyCombo combo)
             !Session::get()->getOverlayManager().isTimingGraphEnabled());
         break;
 
+    case KeyComboSendClipboard:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Detected send clipboard to host combo");
+        Session::get()->sendClipboardToHost();
+        break;
+
+    case KeyComboReceiveClipboard:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Detected receive clipboard from host combo");
+        Session::get()->receiveClipboardFromHost();
+        break;
+
     case KeyComboToggleMouseMode:
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Detected mouse mode toggle combo");
