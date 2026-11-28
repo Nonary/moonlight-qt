@@ -52,3 +52,13 @@ working manifest with the workflow's exact commit and release version, while
 preserving dependency pins and the Gamescope patch. It verifies the exported
 manifest before uploading the bundle. Windows packaging runs the deterministic
 VRR tests and includes the replay and trace decoder in the portable ZIP.
+
+## BenQ GR10 dock recovery on Steam Deck
+
+Install the recovery helper once from a Desktop Mode terminal. For the nightly Flatpak:
+
+```sh
+sudo bash "$(flatpak info --show-location com.moonlight_stream.Moonlight//master)/files/share/moonlight/gr10-vrr/install.sh"
+```
+
+With the dock connected, open **Settings → Video**, enable VRR and select **Restart BenQ dock to restore VRR**. The current workaround recognizes the captured GR10/LG failure. It waits for the dock to reconnect before launching the stream. Clearing the checkbox disables automatic recovery.

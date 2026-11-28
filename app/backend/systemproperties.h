@@ -15,6 +15,11 @@ public:
     SystemProperties();
     ~SystemProperties();
 
+    enum BenqGr10State { Gr10Absent, Gr10NeedsHelper, Gr10Ready };
+    Q_ENUM(BenqGr10State)
+    Q_INVOKABLE static BenqGr10State benqGr10State();
+    static constexpr const char* Gr10RecoverySocket = "/run/benq-gr10-vrr/preflight.sock";
+
     // Static properties queried synchronously during the constructor
     Q_PROPERTY(bool isRunningWayland MEMBER isRunningWayland CONSTANT)
     Q_PROPERTY(bool isRunningXWayland MEMBER isRunningXWayland CONSTANT)

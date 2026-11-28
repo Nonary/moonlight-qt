@@ -30,6 +30,7 @@
 #define SER_FULLSCREEN "fullscreen"
 #define SER_VSYNC "vsync"
 #define SER_ENABLEVRR "enablevrr"
+#define SER_BENQ_GR10_RESTART "benqgr10vrrrestart"
 #define SER_VRRLATENCYFIX "vrrlatencyfix"
 #define SER_VRRLATENCYMODE "vrrlatencymode"
 #define SER_VRRTIMINGPRESETREVISION "vrrtimingpresetrevision"
@@ -435,6 +436,19 @@ QString StreamingPreferences::getSuffixFromLanguage(StreamingPreferences::Langua
     case LANG_AUTO:
     default:
         return QLocale::system().name();
+    }
+}
+
+bool StreamingPreferences::benqGr10VrrRestart() const
+{
+    return QSettings().value(SER_BENQ_GR10_RESTART, false).toBool();
+}
+
+void StreamingPreferences::setBenqGr10VrrRestart(bool enabled)
+{
+    if (enabled != benqGr10VrrRestart()) {
+        QSettings().setValue(SER_BENQ_GR10_RESTART, enabled);
+        emit benqGr10VrrRestartChanged();
     }
 }
 

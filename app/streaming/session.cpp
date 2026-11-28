@@ -13,6 +13,7 @@
 #include <QDir>
 #include "session.h"
 #include "settings/streamingpreferences.h"
+#include "backend/systemproperties.h"
 #include "streaming/streamutils.h"
 #ifdef Q_OS_DARWIN
 #include "video/ffmpeg-renderers/macdisplaytiming.h"
@@ -776,9 +777,9 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
 bool Session::recoverDockVrr(QQuickWindow* window)
 {
 #ifdef Q_OS_LINUX
-    const QString endpoint = QStringLiteral("/run/benq-gr10-vrr/preflight.sock");
     if (!m_Preferences->enableVrr || !m_Preferences->enableVsync ||
-            !window || !window->screen() || !QFileInfo::exists(endpoint)) {
+            !m_Preferences->benqGr10VrrRestart() || !window || !window->screen() ||
+            SystemProperties::benqGr10State() != SystemProperties::Gr10Ready) {
         return false;
     }
 
@@ -827,7 +828,9 @@ bool Session::recoverDockVrr(QQuickWindow* window)
     });
     connect(socket, &QLocalSocket::errorOccurred, socket, [finish](auto) { finish("failed"); });
     QTimer::singleShot(75000, socket, [finish]() { finish("failed"); });
-    QTimer::singleShot(0, socket, [socket, endpoint]() { socket->connectToServer(endpoint); });
+    QTimer::singleShot(0, socket, [socket]() {
+        socket->connectToServer(QString::fromLatin1(SystemProperties::Gr10RecoverySocket));
+    });
     return true;
 #else
     Q_UNUSED(window);

@@ -737,6 +737,15 @@ unix:!macx: {
     appstream.path = $$PREFIX/$$DATADIR/metainfo/
 
     INSTALLS += target desktop icons appstream
+    linux {
+        gr10Recovery.files = ../scripts/steamos/gr10-vrr/install.sh \
+                             ../scripts/steamos/gr10-vrr/gr10-preflight.py \
+                             ../scripts/steamos/gr10-vrr/gr10-vrr-reset \
+                             ../scripts/steamos/gr10-vrr/benq-gr10-vrr.socket \
+                             ../scripts/steamos/gr10-vrr/benq-gr10-vrr@.service
+        gr10Recovery.path = $$PREFIX/$$DATADIR/moonlight/gr10-vrr
+        INSTALLS += gr10Recovery
+    }
 }
 win32 {
     RC_ICONS = moonlight.ico

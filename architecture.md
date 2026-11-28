@@ -181,7 +181,7 @@ host and game. Each unset field inherits its global preference. CLI launches
 snapshot the preferences supplied by the command line. `m_StreamConfig.fps`
 receives the resolved frame rate.
 
-On SteamOS, a locally installed BenQ GR10 helper can restore a lost VRR range before Moonlight probes the presentation settings or contacts the host to launch. The client checks the selected output, the explicit VRR and V-sync preferences, and the known broken LG EDID. The helper verifies the dock, waits for the original display range and wired route, and reports its result over a local socket. A failed display recovery offers fixed-refresh playback for that session. The optional system trace records DRM ownership, connector state, VRR range and live DP AUX responses across compositor transitions.
+On SteamOS, a locally installed BenQ GR10 helper can restore a lost VRR range before Moonlight probes the presentation settings or contacts the host to launch. The Video settings show a restart checkbox when the GR10 USB controller is present. The preference defaults to off. Before requesting recovery, the client checks the saved opt-in, the connected dock and installed helper, the selected output, the VRR and V-sync preferences, and the known broken LG EDID. The helper verifies the dock, waits for the original display range and wired route, and reports its result over a local socket. A failed display recovery offers fixed-refresh playback for that session. The optional system trace records DRM ownership, connector state, VRR range and live DP AUX responses across compositor transitions.
 
 `snapshotPresentationSettings()` resolves that request for the session:
 

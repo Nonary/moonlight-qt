@@ -2,6 +2,10 @@ pragma Singleton
 import QtQuick 2.9
 QtObject {
     property bool usesMaterial3Theme: true
+    enum BenqGr10State { Gr10Absent, Gr10NeedsHelper, Gr10Ready }
+    property int mockGr10State: SystemProperties.Gr10Absent
+    function benqGr10State() { return mockGr10State }
+
     property bool isWow64: false
     property bool hasHardwareAcceleration: true
     property bool isRunningXWayland: false

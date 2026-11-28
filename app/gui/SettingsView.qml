@@ -2038,6 +2038,40 @@ FocusScope {
                                           qsTr("VRR requires V-Sync. Enable V-Sync to change this setting.")
                     }
 
+                    Timer {
+                        id: gr10Detector
+                        property int dockState: SystemProperties.Gr10Absent
+                        interval: 2000
+                        repeat: true
+                        triggeredOnStart: true
+                        running: Qt.platform.os === "linux" && parent.visible
+                        onTriggered: dockState = SystemProperties.benqGr10State()
+                    }
+
+                    ConsoleCheckBox {
+                        id: gr10RestartCheck
+                        objectName: "benqGr10VrrRestart"
+                        width: parent.width
+                        visible: gr10Detector.dockState !== SystemProperties.Gr10Absent
+                        enabled: StreamingPreferences.enableVrr && StreamingPreferences.enableVsync
+                        text: qsTr("Restart BenQ dock to restore VRR")
+                        font.pixelSize: Style.typeSize("body", settingsShell.Window.window)
+                        checked: StreamingPreferences.benqGr10VrrRestart
+                        onToggled: StreamingPreferences.benqGr10VrrRestart = checked
+                        ToolTip.text: gr10RestartHelp.text
+                    }
+
+                    Label {
+                        id: gr10RestartHelp
+                        visible: gr10RestartCheck.visible
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: Style.typeSize("caption", settingsShell.Window.window)
+                        text: qsTr("The BenQ GR10 can lose VRR after a display mode switch. If this happens, Moonlight restarts the dock before streaming. USB and Ethernet briefly disconnect.") +
+                              (gr10Detector.dockState === SystemProperties.Gr10NeedsHelper ?
+                                   " " + qsTr("Install the SteamOS GR10 recovery helper to use this setting.") : "")
+                    }
+
                     ConsoleCheckBox {
                         width: parent.width
                         objectName: "ultraLowLatencyVrr"

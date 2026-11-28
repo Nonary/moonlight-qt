@@ -1,6 +1,9 @@
 #include "systemproperties.h"
 #include "utils.h"
 
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QLibraryInfo>
 
@@ -48,6 +51,26 @@ private:
 private:
     SystemProperties* m_Properties;
 };
+
+SystemProperties::BenqGr10State SystemProperties::benqGr10State()
+{
+#ifdef Q_OS_LINUX
+    const QDir usb(QStringLiteral("/sys/bus/usb/devices"));
+    for (const QString& name : usb.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        if (name.contains(':')) {
+            continue; // USB interface, not the device descriptor
+        }
+        const QDir device(usb.filePath(name));
+        QFile vendor(device.filePath(QStringLiteral("idVendor")));
+        QFile product(device.filePath(QStringLiteral("idProduct")));
+        if (vendor.open(QIODevice::ReadOnly) && vendor.readAll().trimmed() == "04a5" &&
+                product.open(QIODevice::ReadOnly) && product.readAll().trimmed() == "b103") {
+            return QFileInfo::exists(QString::fromLatin1(Gr10RecoverySocket)) ? Gr10Ready : Gr10NeedsHelper;
+        }
+    }
+#endif
+    return Gr10Absent;
+}
 
 SystemProperties::SystemProperties()
 {

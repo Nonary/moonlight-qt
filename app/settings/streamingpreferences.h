@@ -180,6 +180,9 @@ public:
     Q_PROPERTY(bool autoAdjustBitrate MEMBER autoAdjustBitrate NOTIFY autoAdjustBitrateChanged)
     Q_PROPERTY(bool enableVsync MEMBER enableVsync NOTIFY enableVsyncChanged)
     Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
+    Q_PROPERTY(bool benqGr10VrrRestart READ benqGr10VrrRestart WRITE setBenqGr10VrrRestart NOTIFY benqGr10VrrRestartChanged)
+    bool benqGr10VrrRestart() const;
+    void setBenqGr10VrrRestart(bool enabled);
     Q_PROPERTY(bool ultraLowLatencyVrr MEMBER ultraLowLatencyVrr NOTIFY ultraLowLatencyVrrChanged)
     Q_PROPERTY(int vrrLatencyMode MEMBER vrrLatencyMode NOTIFY vrrLatencyModeChanged)
     Q_PROPERTY(int vrrBufferPerMille READ vrrBufferPerMille WRITE setVrrBufferPerMille NOTIFY vrrTimingChanged)
@@ -378,6 +381,7 @@ signals:
     void keepAwakeChanged();
     void languageChanged();
     void rendererSelectionChanged();
+    void benqGr10VrrRestartChanged();
 
 private:
     explicit StreamingPreferences(QQmlEngine *qmlEngine);

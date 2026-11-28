@@ -1,3 +1,4 @@
+#include <QSignalSpy>
 #include "settings/streamingpreferences.h"
 #include <QSettings>
 #include <QTemporaryDir>
@@ -33,6 +34,22 @@ private slots:
         QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, directory.path());
     }
     void init() { QSettings().clear(); }
+    void benqGr10RestartIsOptIn()
+    {
+        auto* prefs = StreamingPreferences::get();
+        QVERIFY(!prefs->benqGr10VrrRestart());
+        QSignalSpy changed(prefs, &StreamingPreferences::benqGr10VrrRestartChanged);
+        prefs->setBenqGr10VrrRestart(true);
+        prefs->save();
+        prefs->reload();
+        QVERIFY(prefs->benqGr10VrrRestart());
+        prefs->setBenqGr10VrrRestart(true);
+        QCOMPARE(changed.count(), 1);
+        prefs->setBenqGr10VrrRestart(false);
+        QVERIFY(!QSettings().value("benqgr10vrrrestart").toBool());
+        QCOMPARE(changed.count(), 2);
+    }
+
     void retiredDxgiWaitablePreference()
     {
         auto* prefs = StreamingPreferences::get();
