@@ -314,7 +314,7 @@ void configure(QCommandLineParser& cli)
         {"output", "Save the inputs, metrics, assertions and optional comparison as JSON.", "file"},
         {"compare", "Compare metrics against a report from the same experiment.", "baseline.json"},
         {"budget-ms", "Fail if total wall time exceeds this many milliseconds.", "ms"},
-        {"cpu-budget-ms", "Fail if total process CPU time exceeds this many milliseconds.", "ms"}
+        {"cpu-budget-ms", "Fail if the primary simulations together or any complete case exceeds this much process CPU time.", "ms"}
     });
 }
 
@@ -491,6 +491,22 @@ int run(const QCommandLineParser& cli)
     const auto cpuBudgetMs = cli.isSet("cpu-budget-ms") ? cliInteger(cli, "cpu-budget-ms", 1, INT32_MAX) : 0;
     const auto started = Clock::now();
     const auto cpuStarted = processCpuMs();
+    const auto cpuSince = [](std::optional<double> start, std::optional<double> end) -> std::optional<double> {
+        if (!start || !end || *end < *start) return std::nullopt;
+        return *end - *start;
+    };
+    bool passed = true;
+    QJsonArray suiteFailures;
+    const auto checkCpuBudget = [&](const QString& name, std::optional<double> elapsed) {
+        if (!cpuBudgetMs || (elapsed && *elapsed <= cpuBudgetMs)) return;
+        const auto error = elapsed ?
+            QString("%1 used %2 ms of process CPU time, budget %3 ms").arg(name).arg(*elapsed, 0, 'f', 1).arg(cpuBudgetMs) :
+            QString("%1 process CPU time is unavailable").arg(name);
+        std::fprintf(stderr, "FAIL %s\n", qPrintable(error));
+        suiteFailures.append(error);
+        passed = false;
+    };
+
     auto selfFailures = checkMetricAccounting();
     if (cli.isSet("stress")) {
         const auto gapFailures = checkGapRecoveryReference();
@@ -507,15 +523,17 @@ int run(const QCommandLineParser& cli)
     auto first = measure(repeat, {});
     if (first.fingerprint != measure(repeat, {}).fingerprint || first.counts.presented < 2)
         selfFailures.push_back("Seeded stream outcomes must repeat");
-    QJsonArray suiteFailures;
+    checkCpuBudget(QStringLiteral("Simulator self-checks"), cpuSince(cpuStarted, processCpuMs()));
     for (const auto& failure : selfFailures) {
         std::fprintf(stderr, "FAIL simulator: %s\n", failure.c_str());
         suiteFailures.append(QString::fromStdString(failure));
     }
-    bool passed = selfFailures.empty();
+    passed = passed && selfFailures.empty();
+    std::optional<double> modelCpuMs = 0.0;
     QJsonArray rows;
     std::printf("workload                 Hz   at goal %%  coverage %%  mean buf us   p99 buf us    drops    run ms  checks\n");
     for (const auto& experiment : experiments) {
+        const auto caseCpuStart = processCpuMs();
         const auto& w = experiment.workload;
         const auto& o = experiment.options;
         const auto input = inputs(w, o);
@@ -528,7 +546,11 @@ int run(const QCommandLineParser& cli)
             if (drainReference->found) qualifyingReserveUs = drainReference->minimumUs;
         }
         const auto start = Clock::now();
+        const auto modelCpuStart = processCpuMs();
         const auto m = measure(w, o, qualifyingReserveUs);
+        const auto modelCpu = cpuSince(modelCpuStart, processCpuMs());
+        modelCpuMs = modelCpuMs && modelCpu ?
+            std::optional<double>(*modelCpuMs + *modelCpu) : std::nullopt;
         const double ms = elapsedMs(start);
         auto failures = checkWorkload(w, o, m, experiment.catalogChecks);
         std::optional<ForecastComparison> forecast;
@@ -618,6 +640,9 @@ int run(const QCommandLineParser& cli)
                         qPrintable(goalDeltaText), changes.value("mean_buffer_us").toDouble(), changes.value("p99_buffer_us").toDouble(),
                         changes.value("dropped").toDouble(), changes.value("runtime_ms").toDouble());
         }
+        const auto caseCpu = cpuSince(caseCpuStart, processCpuMs());
+        if (caseCpu) row.insert("case_cpu_ms", *caseCpu);
+        checkCpuBudget(QString::fromStdString(w.scenario.name), caseCpu);
         rows.append(row);
     }
     const double elapsed = elapsedMs(started);
@@ -627,25 +652,17 @@ int run(const QCommandLineParser& cli)
         suiteFailures.append(error);
         passed = false;
     }
-    const auto cpuFinished = processCpuMs();
-    const auto cpuElapsed = cpuStarted && cpuFinished && *cpuFinished >= *cpuStarted ?
-        std::optional<double>(*cpuFinished - *cpuStarted) : std::nullopt;
-    if (cpuBudgetMs && (!cpuElapsed || *cpuElapsed > cpuBudgetMs)) {
-        const auto error = cpuElapsed ?
-            QString("Process CPU time %1 ms exceeds budget %2 ms").arg(*cpuElapsed, 0, 'f', 1).arg(cpuBudgetMs) :
-            QString("Process CPU time is unavailable");
-        std::fprintf(stderr, "FAIL %s\n", qPrintable(error));
-        suiteFailures.append(error);
-        passed = false;
-    }
+    checkCpuBudget(QStringLiteral("Primary simulations"), modelCpuMs);
+    const auto cpuElapsed = cpuSince(cpuStarted, processCpuMs());
     if (cli.isSet("output")) {
         QJsonObject report{{"report_schema", 1}, {"runs", rows}, {"elapsed_ms", elapsed},
                            {"suite_failures", suiteFailures}, {"passed", passed}};
         if (cpuElapsed) report.insert("cpu_ms", *cpuElapsed);
+        if (modelCpuMs) report.insert("model_cpu_ms", *modelCpuMs);
         writeObject(cli.value("output"), report);
     }
     std::printf("%s   %zu virtual streams in %.1f ms", passed ? "PASS" : "FAIL", experiments.size(), elapsed);
-    if (cpuElapsed) std::printf(" (%.1f ms CPU)", *cpuElapsed);
+    if (cpuElapsed && modelCpuMs) std::printf(" (%.1f ms CPU total, %.1f ms for primary simulations)", *cpuElapsed, *modelCpuMs);
     std::puts("");
     return passed ? 0 : 1;
 }
