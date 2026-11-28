@@ -14,6 +14,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
+#include <optional>
+
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#endif
 #include <stdexcept>
 
 namespace {
@@ -28,6 +34,24 @@ double elapsedMs(Clock::time_point start)
 void require(bool condition, const QString& message)
 {
     if (!condition) throw std::runtime_error(message.toStdString());
+}
+
+// MSVC's clock() reports wall time. The hosted check needs the CPU time
+// charged to this process, so unrelated runner work cannot fail the gate.
+std::optional<double> processCpuMs()
+{
+#ifdef Q_OS_WIN
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return std::nullopt;
+    const auto ticks = [](const FILETIME& time) {
+        return (uint64_t(time.dwHighDateTime) << 32) | uint64_t(time.dwLowDateTime);
+    };
+    return double(ticks(kernel) + ticks(user)) / 10000.0;
+#else
+    const auto ticks = std::clock();
+    if (ticks == std::clock_t(-1)) return std::nullopt;
+    return double(ticks) * 1000.0 / CLOCKS_PER_SEC;
+#endif
 }
 
 QJsonObject readObject(const QString& path)
@@ -289,7 +313,8 @@ void configure(QCommandLineParser& cli)
         {"gap-recovery-reference", "Calculate the offline spare-slot reference at the display ceiling."},
         {"output", "Save the inputs, metrics, assertions and optional comparison as JSON.", "file"},
         {"compare", "Compare metrics against a report from the same experiment.", "baseline.json"},
-        {"budget-ms", "Fail if total run time exceeds this many milliseconds.", "ms"}
+        {"budget-ms", "Fail if total wall time exceeds this many milliseconds.", "ms"},
+        {"cpu-budget-ms", "Fail if total process CPU time exceeds this many milliseconds.", "ms"}
     });
 }
 
@@ -462,7 +487,10 @@ int run(const QCommandLineParser& cli)
     }
     if (cli.isSet("output")) checkOutputPath(cli.value("output"), cli);
     const auto budgetMs = cli.isSet("budget-ms") ? cliInteger(cli, "budget-ms", 1, INT32_MAX) : 0;
+
+    const auto cpuBudgetMs = cli.isSet("cpu-budget-ms") ? cliInteger(cli, "cpu-budget-ms", 1, INT32_MAX) : 0;
     const auto started = Clock::now();
+    const auto cpuStarted = processCpuMs();
     auto selfFailures = checkMetricAccounting();
     if (cli.isSet("stress")) {
         const auto gapFailures = checkGapRecoveryReference();
@@ -599,9 +627,26 @@ int run(const QCommandLineParser& cli)
         suiteFailures.append(error);
         passed = false;
     }
-    if (cli.isSet("output")) writeObject(cli.value("output"),
-        {{"report_schema", 1}, {"runs", rows}, {"elapsed_ms", elapsed}, {"suite_failures", suiteFailures}, {"passed", passed}});
-    std::printf("%s   %zu virtual streams in %.1f ms\n", passed ? "PASS" : "FAIL", experiments.size(), elapsed);
+    const auto cpuFinished = processCpuMs();
+    const auto cpuElapsed = cpuStarted && cpuFinished && *cpuFinished >= *cpuStarted ?
+        std::optional<double>(*cpuFinished - *cpuStarted) : std::nullopt;
+    if (cpuBudgetMs && (!cpuElapsed || *cpuElapsed > cpuBudgetMs)) {
+        const auto error = cpuElapsed ?
+            QString("Process CPU time %1 ms exceeds budget %2 ms").arg(*cpuElapsed, 0, 'f', 1).arg(cpuBudgetMs) :
+            QString("Process CPU time is unavailable");
+        std::fprintf(stderr, "FAIL %s\n", qPrintable(error));
+        suiteFailures.append(error);
+        passed = false;
+    }
+    if (cli.isSet("output")) {
+        QJsonObject report{{"report_schema", 1}, {"runs", rows}, {"elapsed_ms", elapsed},
+                           {"suite_failures", suiteFailures}, {"passed", passed}};
+        if (cpuElapsed) report.insert("cpu_ms", *cpuElapsed);
+        writeObject(cli.value("output"), report);
+    }
+    std::printf("%s   %zu virtual streams in %.1f ms", passed ? "PASS" : "FAIL", experiments.size(), elapsed);
+    if (cpuElapsed) std::printf(" (%.1f ms CPU)", *cpuElapsed);
+    std::puts("");
     return passed ? 0 : 1;
 }
 } // namespace

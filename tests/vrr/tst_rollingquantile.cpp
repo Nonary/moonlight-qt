@@ -71,4 +71,40 @@ int testBoundaryRebalancing(){
  return 0;
 }
 
-int main(){if(testRandomOperations())return 1;return testBoundaryRebalancing();}
+bool testControllerTimingSampleWindow()
+{
+    Vrr13::BoundedTimingSamples<int64_t> window;
+    std::vector<int64_t> fifo;
+    for (size_t i = 0; i < 1000; ++i) {
+        if (i % 173 == 0) {
+            window.clear();
+            fifo.clear();
+            if (!window.empty() || window.percentile(50) != 0) return false;
+        }
+        const auto limit = i % 5 ? size_t(19) : size_t(3);
+        const auto value = int64_t(i % 13) - 6;
+        window.append(value, limit);
+        while (fifo.size() >= limit) fifo.erase(fifo.begin());
+        fifo.push_back(value);
+        auto sorted = fifo;
+        std::sort(sorted.begin(), sorted.end());
+        if (window.size() != sorted.size()) return false;
+        for (unsigned int percentile : {0U, 10U, 50U, 95U, 100U, 110U}) {
+            const size_t rank = std::max<size_t>(1, (sorted.size() * std::min(100U, percentile) + 99) / 100);
+            if (window.percentile(percentile) != sorted[rank - 1]) return false;
+        }
+    }
+    Vrr13::BoundedTimingSamples<uint64_t> unsignedWindow;
+    unsignedWindow.append(UINT64_MAX, 3);
+    unsignedWindow.append(0, 3);
+    unsignedWindow.append(UINT64_MAX, 3);
+    unsignedWindow.append(UINT64_MAX, 3);
+    return unsignedWindow.percentile(0) == 0 && unsignedWindow.percentile(50) == UINT64_MAX;
+}
+
+int main()
+{
+    if (!testControllerTimingSampleWindow()) return 1;
+    if (testRandomOperations()) return 1;
+    return testBoundaryRebalancing();
+}

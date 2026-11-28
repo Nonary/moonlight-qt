@@ -98,15 +98,6 @@ struct KnownRegression {
     size_t failed, passed;
 };
 std::vector<KnownRegression> g_Known = {
-    {"display-ceiling@no-latch/",
-     {"a released starting delay actually lowers latency at the ceiling",
-      "late frames leave no more standing phase than they forced at the ceiling",
-      "planned retiming at the display ceiling stays inside its budget",
-      "on-screen retiming at the display ceiling stays inside its budget"},
-     "A presenter that cannot latch must stay a guard above its previous present, so at exactly its maximum refresh "
-     "every frame is pushed later and the interval buffer reports service overload. That blocks all input evidence "
-     "(0 eligible observations), so the starting delay never releases (+6.9 ms Balanced), and phase sawtooths between "
-     "replacements (retiming p50 1.8-2.8 ms). Latching presenters (Windows D3D11) are unaffected.", 0, 0},
     {"versus-fixed-refresh@no-latch/",
      {"no more visible stutter than fixed refresh at the display ceiling", nullptr},
      "Same cause as display-ceiling@no-latch: a guard above every previous present means the presenter cannot show "
@@ -125,10 +116,6 @@ std::vector<KnownRegression> g_Known = {
      "In the lossy 04:20 span (61-364 lost packets per frame, 20-46 ms late) Balanced shows about 54 visible events "
      "where fixed refresh's deeper queue shows 28, at 5.5 ms more latency. Ceiling policy 1 shows 56: the adaptive "
      "buffer's rise, not ceiling replacement, decides that trade, and it does not rise fast enough for chaos.", 0, 0},
-    {"versus-fixed-refresh@no-latch/smooth/reduce-judder/",
-     {"less latency than fixed refresh at the display ceiling", nullptr},
-     "Smooth with Reduce judder on a presenter that cannot latch averages 13.58 ms where fixed refresh's "
-     "common-budget queue averages 13.51 ms, in the late-4ms and frequent-2ms scenarios.", 0, 0},
 };
 
 KnownRegression* knownRegression(const std::string& scenario, const char* contract)

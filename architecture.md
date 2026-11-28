@@ -35,6 +35,9 @@ the old absolute render ceiling, base-guard latch exit, and pre-schema queue
 budget/disabled-budget alternatives. Current pacing budgets require a nonzero
 divisor. The unused extra-frame session flag is also removed from traces,
 replay and calibration identity; calibration keys use version 3.
+Preparation, readiness, and scheduler sample windows keep a sorted view of
+the same FIFO samples. Nearest-rank queries keep their existing values for
+live playback and replay without copying or repartitioning each window.
 The startup preparation predictor retains the later master safeguard: it uses
 the bounded lead until eight samples exist and caps the learned prediction at
 one source/display period. At the display ceiling, the current controller may

@@ -79,9 +79,10 @@ use the binary from the full test build. Run `vrrbuffersim --help` for the
 available settings. Running the binary directly skips the build check.
 The default suite checks named Balanced workloads and the simulator's accounting,
 repeatability, queue feedback and fixed-buffer reference. The stress tier adds
-a 30-minute run and a repeatable matrix from 30 to 240 FPS. CPU wall time is
-reported for each simulation. Use `--budget-ms 5000` for the fast-suite
-performance check on an optimized build.
+a 30-minute run and a repeatable matrix from 30 to 240 FPS. Wall time is reported for each simulation and process CPU time for the suite.
+Use `--budget-ms 5000` to check wall time on an optimized local build. Hosted
+Windows uses `--cpu-budget-ms 5000` and a separate two-minute step timeout so
+runner scheduling can delay a test without masking a CPU regression or hang.
 
 The sustained-jitter gate also checks a 99.90% target after 75 virtual
 seconds of clean input. It bounds time below goal, reserve cost against fixed
