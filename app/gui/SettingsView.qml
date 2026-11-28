@@ -288,6 +288,7 @@ FocusScope {
         text: subject ? subject.settingsHelp : ""
         standardButtons: Dialog.Close
         width: Math.min(Style.px(560, hostWindow), hostWindow ? hostWindow.width - Style.px(48, hostWindow) : 560)
+        height: hostWindow ? Math.min(implicitHeight, Math.max(0, hostWindow.height - Style.px(48, hostWindow))) : implicitHeight
         onClosed: Qt.callLater(function() { var rows = settingsShell.settingsFocusItems(); if (rows.indexOf(subject) >= 0) settingsShell.focusRow(subject); else settingsShell.focusContent() })
     }
     ConsoleBackdrop { anchors.fill: parent }
@@ -412,12 +413,17 @@ FocusScope {
     id: settingsPage
     visible: !settingsShell.searching || settingsShell.indexing
     HoverHandler {
-        parent: settingsPage
         onPointChanged: {
             if (!hovered || helpDialog.visible) return
+            // A Flickable attaches declarative pointer handlers to its content item.
+            var viewportPoint = parent.mapToItem(settingsPage, point.position.x, point.position.y)
+            if (!settingsPage.contains(viewportPoint)) {
+                settingsShell.hoverRow = null
+                return
+            }
             for (var i = 0; i < settingsShell.categoryRows.length; ++i) {
                 var row = settingsShell.categoryRows[i]
-                if (row.visible && row.contains(settingsPage.mapToItem(row, point.position.x, point.position.y))) {
+                if (row.visible && row.contains(settingsPage.mapToItem(row, viewportPoint.x, viewportPoint.y))) {
                     settingsShell.hoverRow = row
                     return
                 }

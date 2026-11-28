@@ -50,7 +50,7 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             spacing: Math.round(22 * launchView.uiScale)
 
-            Label {
+            Text {
                 objectName: "launchTitle"
                 width: parent.width
                 text: launchView.title

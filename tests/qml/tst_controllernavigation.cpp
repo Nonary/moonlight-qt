@@ -282,7 +282,15 @@ private slots:
             auto* modal = root->findChild<QObject*>("quitRunningGameDialog");
             QTRY_VERIFY(modal && modal->property("opened").toBool());
             QVERIFY(QMetaObject::invokeMethod(modal, "accept"));
-            auto* manager = engine.singletonInstance<QObject*>("ComputerManager", "ComputerManager");
+            QQmlComponent managerLookup(&engine);
+            managerLookup.setData(R"(
+                import QtQml
+                import ComputerManager 1.0
+                QtObject { property QtObject manager: ComputerManager }
+            )", QUrl());
+            std::unique_ptr<QObject> lookup(managerLookup.create());
+            QVERIFY2(lookup, qPrintable(managerLookup.errorString()));
+            auto* manager = lookup->property("manager").value<QObject*>();
             QVERIFY(manager);
             QTest::qWait(150);
             QVERIFY(QMetaObject::invokeMethod(manager, "quitAppCompleted", Q_ARG(QVariant, QVariant())));
@@ -768,6 +776,7 @@ private slots:
         QTRY_VERIFY((shelf = root->findChild<QQuickItem*>("gameShelf")) && shelf->isVisible());
 
         navigation->notifyWindowFocus(true);
+        QVERIFY(QMetaObject::invokeMethod(navigation.get(), "onPollingTimerFired"));
         const auto press = [&](Uint8 code) { button(SDL_CONTROLLERBUTTONDOWN, code); button(SDL_CONTROLLERBUTTONUP, code); };
         press(SDL_CONTROLLER_BUTTON_X);
         auto* entry = root->findChild<QQuickItem*>("gameStreamProfileButton");
