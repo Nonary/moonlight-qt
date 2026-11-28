@@ -21,6 +21,7 @@ uint32_t EncryptionFeaturesSupported;
 uint32_t EncryptionFeaturesRequested;
 uint32_t EncryptionFeaturesEnabled;
 bool AudioEncryptionEnabled;
+bool CaptureTimingEnabled;
 bool HighQualitySurroundSupported;
 bool HighQualitySurroundEnabled;
 int AudioPacketDuration;
@@ -69,6 +70,18 @@ static char* generateSdp(int format, int compression, int linkMbps) {
     return sdp;
 }
 
+static void checkCaptureTimingNegotiation(void) {
+    const char* attribute = "a=x-ml-video.captureTiming:1 \r\n";
+    for (int state = 0; state < 3; state++) {
+        CaptureTimingEnabled = state == 1;
+        char* sdp = generateSdp(VIDEO_FORMAT_H264, 0, 1000);
+        if (sdp == NULL) continue;
+        EXPECT((strstr(sdp, attribute) != NULL) == CaptureTimingEnabled,
+               "SDP advertises capture timing only after successful negotiation");
+        free(sdp);
+    }
+}
+
 static void speakerCallback(uint16_t controller, uint64_t owner,
                             uint32_t generation, uint32_t sequence,
                             uint64_t position, uint16_t flags,
@@ -114,6 +127,7 @@ int main(void) {
     const int fallbackFormats[] = {VIDEO_FORMAT_H264, VIDEO_FORMAT_H265, VIDEO_FORMAT_AV1_MAIN8};
     unsigned int i;
 
+    checkCaptureTimingNegotiation();
     checkSpeakerNegotiation();
 
     for (i = 0; i < sizeof(pyrowaveFormats) / sizeof(pyrowaveFormats[0]); i++) {
