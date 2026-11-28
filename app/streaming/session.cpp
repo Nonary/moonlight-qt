@@ -827,7 +827,12 @@ bool Session::recoverDockVrr(QQuickWindow* window)
             finish(socket->readLine().trimmed());
         }
     });
-    connect(socket, &QLocalSocket::errorOccurred, socket, [finish](auto) { finish("failed"); });
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+    auto dockErrorSignal = &QLocalSocket::errorOccurred;
+#else
+    auto dockErrorSignal = qOverload<QLocalSocket::LocalSocketError>(&QLocalSocket::error);
+#endif
+    connect(socket, dockErrorSignal, socket, [finish](auto) { finish("failed"); });
     QTimer::singleShot(75000, socket, [finish]() { finish("failed"); });
     QTimer::singleShot(0, socket, [socket]() {
         socket->connectToServer(QString::fromLatin1(SystemProperties::Gr10RecoverySocket));
