@@ -1,0 +1,10 @@
+[Unit]
+Description=Trace BenQ GR10 VRR and display ownership changes
+
+[Service]
+ExecStart=/usr/bin/python3 -I /etc/benq-gr10-vrr/gr10-preflight.py trace
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

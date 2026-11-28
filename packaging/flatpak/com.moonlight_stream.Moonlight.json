@@ -23,6 +23,7 @@
         "--env=LIBVA_DRIVERS_PATH=",
         "--unset-env=LIBVA_DRIVERS_PATH",
         "--filesystem=xdg-run/gamescope-0",
+        "--filesystem=/run/benq-gr10-vrr:ro",
         "--filesystem=host-os:ro"
     ],
     "cleanup": [

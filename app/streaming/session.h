@@ -110,6 +110,7 @@ public:
     explicit Session(NvComputer* computer, NvApp& app, StreamingPreferences *preferences = nullptr);
     virtual ~Session();
 
+    Q_INVOKABLE bool recoverDockVrr(QQuickWindow* window);
     Q_INVOKABLE bool initialize(QQuickWindow* qtWindow);
     Q_INVOKABLE void start();
     Q_INVOKABLE void interrupt();
@@ -146,6 +147,7 @@ public:
     void setShouldExit(bool quitHostApp = false);
 
 signals:
+    void dockVrrChecked(bool recovered, bool waitingForNetwork);
     void stageStarting(QString stage);
 
     void stageFailed(QString stage, int errorCode, QString failingPorts);
@@ -289,6 +291,7 @@ private:
     StreamingPreferences* m_Preferences;
     const StreamingPreferences::StreamVideoSettings m_RequestedVideo;
     ClientPacingWarning m_ClientPacingWarning;
+    bool m_DockVrrUnavailable = false;
     PresentationSettings m_PresentationSettings;
     std::unique_ptr<DiagnosticCapture> m_DiagnosticCapture;
 #ifdef HAVE_KWIN_SCANOUT_GUARD

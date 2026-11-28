@@ -1,0 +1,13 @@
+[Unit]
+Description=BenQ GR10 VRR preflight for Moonlight
+
+[Socket]
+ListenStream=/run/benq-gr10-vrr/preflight.sock
+SocketUser=deck
+SocketMode=0600
+DirectoryMode=0755
+Accept=yes
+MaxConnections=2
+
+[Install]
+WantedBy=sockets.target

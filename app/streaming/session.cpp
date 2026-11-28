@@ -1,6 +1,14 @@
 #include "streaming/input/dualsensehaptics.h"
 #include "streaming/input/steamcontroller/steamcontrollerhost.h"
 #include <QNetworkInterface>
+#ifdef Q_OS_LINUX
+#include <QCryptographicHash>
+#include <QFile>
+#include <QFileInfo>
+#include <QLocalSocket>
+#include <QScreen>
+#include <QTimer>
+#endif
 #include <QSysInfo>
 #include <QDir>
 #include "session.h"
@@ -733,7 +741,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
                         m_StreamConfig.fps, strictRefreshRate);
         }
         if (hasStrictRefreshRate && m_PresentationSettings.effectiveVsync &&
-                hasAdaptiveHeadroom && hasAdaptiveDisplay) {
+                hasAdaptiveHeadroom && hasAdaptiveDisplay && !m_DockVrrUnavailable) {
             m_PresentationSettings.enableVrr = true;
             m_PresentationSettings.effectiveWindowMode = StreamingPreferences::WM_FULLSCREEN_DESKTOP;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -763,6 +771,68 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
                 m_PresentationSettings.enableVrr ? "yes" : "no",
                 m_PresentationSettings.refreshRate,
                 static_cast<int>(m_PresentationSettings.effectiveWindowMode));
+}
+
+bool Session::recoverDockVrr(QQuickWindow* window)
+{
+#ifdef Q_OS_LINUX
+    const QString endpoint = QStringLiteral("/run/benq-gr10-vrr/preflight.sock");
+    if (!m_Preferences->enableVrr || !m_Preferences->enableVsync ||
+            !window || !window->screen() || !QFileInfo::exists(endpoint)) {
+        return false;
+    }
+
+    const QDir drm(QStringLiteral("/sys/class/drm"));
+    const QString output = window->screen()->name();
+    if (output != QStringLiteral("DP-1") && output != QStringLiteral("DP1")) {
+        // Gamescope and XWayland can give the physical output a virtual name.
+        // Only infer the target when DP-1 is the sole enabled DRM output.
+        QStringList enabled;
+        for (const QString& name : drm.entryList({"card*-*"}, QDir::Dirs)) {
+            QFile state(drm.filePath(name + "/enabled"));
+            if (state.open(QIODevice::ReadOnly) && state.readAll().trimmed() == "enabled") {
+                enabled.append(name);
+            }
+        }
+        if (enabled != QStringList{QStringLiteral("card0-DP-1")}) {
+            return false;
+        }
+    }
+    QFile edid(drm.filePath(QStringLiteral("card0-DP-1/edid")));
+    if (!edid.open(QIODevice::ReadOnly) ||
+            QCryptographicHash::hash(edid.readAll(), QCryptographicHash::Sha256).toHex() !=
+            "11bcc6aec274a455e4a9d82a310fda84fa528106907b46df1af3c7f195242e50") {
+        return false;
+    }
+
+    qInfo() << "BenQ GR10 lost the LG VRR range before launch; requesting recovery";
+    auto* socket = new QLocalSocket(this);
+    auto finish = [this, socket](const QByteArray& result) {
+        if (socket->property("finished").toBool()) {
+            return;
+        }
+        socket->setProperty("finished", true);
+        socket->deleteLater();
+        m_DockVrrUnavailable = result != "ok" && result != "network";
+        qInfo() << "BenQ GR10 preflight result:" << result;
+        emit dockVrrChecked(result == "ok", result == "network");
+    };
+    connect(socket, &QLocalSocket::connected, socket, [socket]() {
+        socket->write("preflight DP-1\n");
+    });
+    connect(socket, &QLocalSocket::readyRead, socket, [socket, finish]() {
+        if (socket->canReadLine()) {
+            finish(socket->readLine().trimmed());
+        }
+    });
+    connect(socket, &QLocalSocket::errorOccurred, socket, [finish](auto) { finish("failed"); });
+    QTimer::singleShot(75000, socket, [finish]() { finish("failed"); });
+    QTimer::singleShot(0, socket, [socket, endpoint]() { socket->connectToServer(endpoint); });
+    return true;
+#else
+    Q_UNUSED(window);
+    return false;
+#endif
 }
 
 bool Session::initialize(QQuickWindow* qtWindow)

@@ -130,7 +130,34 @@ Item {
 
         // Kick off the stream
         spinnerTimer.start()
-        streamLoader.active = true
+        session.dockVrrChecked.connect(function(recovered, waitingForNetwork) {
+            if (recovered) {
+                streamLoader.active = true
+            } else {
+                dockRecoveryDialog.waitingForNetwork = waitingForNetwork
+                dockRecoveryDialog.open()
+            }
+        })
+        if (session.recoverDockVrr(window)) {
+            stageText = qsTr("Restoring dock VRR…")
+        } else {
+            streamLoader.active = true
+        }
+    }
+
+    Dialog {
+        id: dockRecoveryDialog
+        anchors.centerIn: parent
+        property bool waitingForNetwork: false
+        title: waitingForNetwork ? qsTr("Dock Ethernet is unavailable") : qsTr("Dock VRR is unavailable")
+        modal: true
+        standardButtons: Dialog.Yes | Dialog.No
+        Label { text: dockRecoveryDialog.waitingForNetwork ? qsTr("VRR is restored. Try streaming on the available network?") : qsTr("Start this stream at fixed refresh?") }
+        onAccepted: streamLoader.active = true
+        onRejected: {
+            sessionFinished(0)
+            sessionReadyForDeletion()
+        }
     }
 
     Timer {

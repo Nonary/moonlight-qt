@@ -1,0 +1,149 @@
+#!/usr/bin/python3 -I
+"""Restart the BenQ GR10's VIA PD controller when the Deck loses LG TV VRR."""
+
+import ctypes as C
+import json
+import os
+import pwd
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+CONNECTOR = Path("/sys/class/drm/card0-DP-1")
+DEBUG = Path("/sys/kernel/debug/dri/0/DP-1")
+USB = Path("/sys/bus/usb/devices")
+LG_ID = bytes.fromhex("1e6dc8c0")  # EDID manufacturer and product ID
+
+
+def pd_address():
+    for vendor in USB.glob("*/idVendor"):
+        device = vendor.parent
+        try:
+            if vendor.read_text().strip() == "04a5" and device.joinpath("idProduct").read_text().strip() == "b103":
+                return int(device.joinpath("devnum").read_text())
+        except FileNotFoundError:
+            continue  # Expected while the dock is re-enumerating.
+    return None
+
+
+def vrr_range():
+    limits = (DEBUG / "vrr_range").read_text().splitlines()
+    low, high = (int(line.split(":")[1]) for line in limits[:2])
+    return (low, high) if 0 < low < high else None
+
+
+def plasma_4k_modes():
+    # KScreen must connect to the user's KWin session, even when invoked by sudo.
+    account = pwd.getpwnam("deck")
+    runtime = f"/run/user/{account.pw_uid}"
+    user_cmd = ["/usr/bin/runuser", "-u", account.pw_name, "--", "/usr/bin/env",
+                f"XDG_RUNTIME_DIR={runtime}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={runtime}/bus"]
+    session = subprocess.run(user_cmd + ["systemctl", "--user", "show-environment"],
+                             capture_output=True, text=True, timeout=5)
+    env = dict(line.split("=", 1) for line in session.stdout.splitlines() if "=" in line)
+    if "KDE" not in env.get("XDG_CURRENT_DESKTOP", "").split(":") or not env.get("WAYLAND_DISPLAY"):
+        return None
+    doctor = user_cmd + ["QT_QPA_PLATFORM=wayland", "WAYLAND_DISPLAY=" + env["WAYLAND_DISPLAY"],
+                         "/usr/bin/kscreen-doctor"]
+    outputs = json.loads(subprocess.check_output(doctor + ["-j"], timeout=5))["outputs"]
+    for output in outputs:
+        if output["name"] != "DP-1" or not output["enabled"]:
+            continue
+        modes = {mode["id"]: mode for mode in output["modes"]}
+        current = modes.get(output["currentModeId"], {})
+        if current.get("name") != "3840x2160@120":
+            return None
+        for mode_id in [*output["preferredModes"], *modes]:
+            if modes[mode_id]["name"] == "3840x2160@60":
+                return doctor, mode_id, current["id"]
+    return None
+
+
+def resync_plasma_picture():
+    settings = plasma_4k_modes()
+    if settings:
+        doctor, low, high = settings
+        try:
+            subprocess.run(doctor + [f"output.DP-1.mode.{low}"], check=True, timeout=8)
+            time.sleep(3)
+        finally:
+            subprocess.run(doctor + [f"output.DP-1.mode.{high}"], check=True, timeout=8)
+        print("Reapplied the TV's 4K120 mode in Plasma.")
+
+
+def restart_controller():
+    # VIA's chip reset, as implemented in fwupd/plugins/vli/fu-vli-pd-device.c.
+    usb = C.CDLL("libusb-1.0.so.0")
+    usb.libusb_init.argtypes = [C.POINTER(C.c_void_p)]
+    usb.libusb_open_device_with_vid_pid.argtypes = [C.c_void_p, C.c_uint16, C.c_uint16]
+    usb.libusb_open_device_with_vid_pid.restype = C.c_void_p
+    usb.libusb_control_transfer.argtypes = [
+        C.c_void_p, C.c_uint8, C.c_uint8, C.c_uint16, C.c_uint16,
+        C.c_void_p, C.c_uint16, C.c_uint,
+    ]
+    usb.libusb_close.argtypes = [C.c_void_p]
+    usb.libusb_exit.argtypes = [C.c_void_p]
+    context = C.c_void_p()
+    if usb.libusb_init(C.byref(context)):
+        raise RuntimeError("Could not initialize libusb.")
+    handle = usb.libusb_open_device_with_vid_pid(context, 0x04A5, 0xB103)
+    try:
+        if not handle:
+            raise RuntimeError("Could not open the GR10 PD controller.")
+        def read(request, value, length):
+            data = (C.c_ubyte * length)()
+            count = usb.libusb_control_transfer(handle, 0xC0, request, value, 0, data, length, 1000)
+            if count != length:
+                raise RuntimeError("Could not verify the PD controller identity.")
+            return bytes(data)
+
+        firmware = read(0xE2, 1, 4)
+        project = read(0xE0, 0x1801, 1)[0]
+        runtime = read(0xE0, 0xF701, 1)[0] & 0x80
+        if firmware[0] != 0x0C or project & 0xF0 != 0xA0 or not runtime:
+            raise RuntimeError("Expected a VIA VL105 running its normal firmware.")
+        print("Restarting the GR10. Video and dock Ethernet will briefly disconnect.", flush=True)
+        # The device can disappear before acknowledging. Verify the replug below.
+        return usb.libusb_control_transfer(handle, 0x40, 0xB0, 0, 0, None, 0, 1000)
+    finally:
+        if handle:
+            usb.libusb_close(handle)
+        usb.libusb_exit(context)
+
+
+def main():
+    if os.geteuid() != 0:
+        os.execv("/usr/bin/sudo", ["sudo", "--", os.path.realpath(__file__)])
+    before = pd_address()
+    if before is None or (CONNECTOR / "edid").read_bytes()[8:12] != LG_ID:
+        sys.exit("Connect the BenQ GR10 and LG TV to the Deck first.")
+    limits = vrr_range()
+    if limits:
+        print(f"VRR is already available ({limits[0]}–{limits[1]} Hz).")
+        return
+    result = restart_controller()
+    deadline = time.monotonic() + 25
+    probed = False
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        address = pd_address()
+        if address is None or address == before or (CONNECTOR / "status").read_text().strip() != "connected":
+            continue
+        if not probed:
+            (DEBUG / "trigger_hotplug").write_text("1\n")
+            probed = True
+        limits = vrr_range()
+        if limits and (CONNECTOR / "edid").read_bytes()[8:12] == LG_ID:
+            print(f"GR10 reconnected. LG TV VRR is available ({limits[0]}–{limits[1]} Hz).")
+            resync_plasma_picture()
+            return
+    sys.exit(f"VRR recovery could not be verified within 25 seconds (USB transfer result {result}).")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        sys.exit(str(error))

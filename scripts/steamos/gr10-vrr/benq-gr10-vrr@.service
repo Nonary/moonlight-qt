@@ -1,0 +1,9 @@
+[Unit]
+Description=Recover BenQ GR10 VRR before streaming
+
+[Service]
+ExecStart=/usr/bin/python3 -I /etc/benq-gr10-vrr/gr10-preflight.py preflight
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=70
