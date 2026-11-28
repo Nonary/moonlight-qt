@@ -1,10 +1,7 @@
 #include "streaming/video/ffmpeg.h"
 #include "streaming/video/ffmpeg-renderers/pacer/pacer.h"
 
-#ifdef NDEBUG
-#undef NDEBUG
-#endif
-#include <cassert>
+#include "assertions.h"
 #include <cstdlib>
 #include <iostream>
 #include <string>
