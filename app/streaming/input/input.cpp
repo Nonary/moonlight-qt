@@ -11,6 +11,14 @@
 #include <QDir>
 #include <QGuiApplication>
 
+#include <SDL_syswm.h>
+
+#ifdef Q_OS_WIN32
+#include <shobjidl.h>
+#include <propsys.h>
+#include <shellapi.h>
+#endif
+
 SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, int streamHeight)
     : m_MultiController(prefs.multiController),
       m_GamepadMouse(prefs.gamepadMouse),
@@ -335,6 +343,34 @@ SdlInputHandler::~SdlInputHandler()
 void SdlInputHandler::setWindow(SDL_Window *window)
 {
     m_Window = window;
+
+#ifdef Q_OS_WIN32
+    // Keep Windows from consuming edge swipes (Action Center, Widgets, Task View)
+    // while we're fullscreen, so those touches reach the host instead.
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (window != nullptr && SDL_GetWindowWMInfo(window, &info) && info.subsystem == SDL_SYSWM_WINDOWS) {
+        // PKEY_EdgeGesture_DisableTouchWhenFullscreen
+        static const PROPERTYKEY edgeGestureKey = {
+            { 0x32CE38B2, 0x2C9A, 0x41B1, { 0x9B, 0xC5, 0xB3, 0x78, 0x43, 0x94, 0xAA, 0x44 } }, 2
+        };
+
+        IPropertyStore* propStore;
+        if (SUCCEEDED(SHGetPropertyStoreForWindow(info.info.win.window, IID_PPV_ARGS(&propStore)))) {
+            PROPVARIANT val;
+            PropVariantInit(&val);
+            val.vt = VT_BOOL;
+            val.boolVal = VARIANT_TRUE;
+            HRESULT hr = propStore->SetValue(edgeGestureKey, val);
+            if (FAILED(hr)) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Failed to disable edge gestures: %x",
+                            (unsigned int)hr);
+            }
+            propStore->Release();
+        }
+    }
+#endif
 }
 
 void SdlInputHandler::raiseAllKeys()
